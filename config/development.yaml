@@ -39,11 +39,34 @@ auth:
       - "admin@example.com"
       - "dev@example.com"
 
+# registry:
+#   type: "oci-client-auth"
+#   registry_url: "rise-registry:5000" # Internal URL for deployment controllers
+#   namespace: "rise-apps"
+
+# JFrog Artifactory registry (via Vault):
+# registry:
+#   type: "jfrog"
+#   registry_host: "localhost:3082"
+#   client_registry_url: "rise-jfrog:3082"
+#   docker_repo_key: "rise-docker-local"
+#   token_provider:
+#     type: "vault"
+#     vault_mount_path: "artifactory"
+#     vault_role: "rise"
+#   # push_permissions: "r,w"     # default
+#   # pull_permissions: "r"       # default
+#   # default_token_ttl: 600      # default
+
+# JFrog Artifactory registry (via Direct token):
 registry:
-  type: "oci-client-auth"
-  registry_url: "rise-registry:5000" # Internal URL for deployment controllers
-  namespace: "rise-apps"
-  client_registry_url: "rise-registry:5000" # Client-facing URL for CLI push operations
+  type: "jfrog"
+  registry_host: "localhost:3082"
+  docker_repo_key: "rise-docker-local"
+  token_provider:
+    type: "direct"
+    jfrog_url: "http://localhost:3082"
+    admin_token: "${JFROG_ADMIN_TOKEN}"
 
 deployment_controller:
   type: "kubernetes"

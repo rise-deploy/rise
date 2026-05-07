@@ -296,6 +296,50 @@ registry:
 **Token requirements:**
 The GitLab token must have `read_registry` and `write_registry` scopes (or equivalent deploy token permissions).
 
+#### JFrog Artifactory
+
+JFrog supports two token-issuing backends: Vault (via `vault-plugin-secrets-artifactory`) and Direct (via JFrog's access token API).
+
+**Vault mode:**
+
+```yaml
+registry:
+  type: jfrog
+  registry_host: "jfrog.example.com"
+  docker_repo_key: "rise-docker-local"
+  token_provider:
+    type: vault
+    # vault_addr: ~             # defaults to VAULT_ADDR env
+    # vault_token: ~            # defaults to VAULT_TOKEN env
+    # vault_token_file: ~       # alternative: read token from file (supports rotation)
+    vault_mount_path: "artifactory"
+    vault_role: "rise"          # must have allow_scope_override=true
+  # push_permissions: "r,w"    # default
+  # pull_permissions: "r"      # default
+  # mint_pull_secrets: true    # default
+```
+
+**Direct mode:**
+
+```yaml
+registry:
+  type: jfrog
+  registry_host: "jfrog.example.com"
+  docker_repo_key: "rise-docker-local"
+  token_provider:
+    type: direct
+    jfrog_url: "https://jfrog.example.com"
+    admin_token: "${JFROG_ADMIN_TOKEN}"   # applied-permissions/admin scoped token
+  # client_registry_url: ~     # optional: override registry URL returned to CLI clients
+  # default_token_ttl: 600     # token lifetime in seconds (default: 600)
+```
+
+**How it works:**
+- **CLI pushes**: the backend mints a short-lived multi-scope token with `r,w` permissions scoped to the deployment tag, blob uploads, and content-addressed manifests. The token is used for `docker login` before push.
+- **Kubernetes pull secrets**: when `mint_pull_secrets: true`, the controller creates image pull secrets with a read-only scoped token (`artifact:{docker_repo_key}/{project}/**:r`).
+
+See [Registry Backend Operations](operator-registry-operations.md#jfrog-artifactory) for scope details and troubleshooting.
+
 ### Controller Settings (Optional)
 
 ```toml

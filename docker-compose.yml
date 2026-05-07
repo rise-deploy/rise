@@ -76,7 +76,7 @@ services:
       - registry
 
   # HashiCorp Vault with JFrog Artifactory secrets plugin.
-  # Automatically configures itself to talk to the JFrog container on startup.
+  # Automatically configures itself and JFrog on startup.
   # Access: VAULT_ADDR=http://localhost:8200 VAULT_TOKEN=root
   vault:
     image: hashicorp/vault:1.19

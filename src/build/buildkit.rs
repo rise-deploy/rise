@@ -24,7 +24,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// Daemon version label value. Bump this whenever the managed BuildKit daemon
 /// creation parameters change (e.g. new flags, image updates) to force
 /// recreation of stale daemons.
-const DAEMON_VERSION: &str = "2";
+const DAEMON_VERSION: &str = "3";
 
 /// Compute SHA256 hash of a file
 pub(crate) fn compute_file_hash(path: &Path) -> Result<String> {
@@ -61,10 +61,10 @@ fn generate_buildkit_config() -> Option<(String, String)> {
 
     let mut config = String::new();
     for registry in registries {
-        config.push_str(&format!(
-            "[registry.\"{}\"]\n  http = true\n  insecure = true\n\n",
-            registry
-        ));
+        // Only set http=true, NOT insecure=true. BuildKit treats insecure=true
+        // as "use HTTPS with self-signed certs" which overrides http=true and
+        // breaks plain HTTP registries. See https://github.com/moby/buildkit/issues/5872
+        config.push_str(&format!("[registry.\"{}\"]\n  http = true\n\n", registry));
     }
 
     let hash = compute_string_hash(&config);
@@ -434,6 +434,16 @@ fn create_buildkit_daemon(
         cmd.arg("--label").arg("rise.no_ssl_cert=true");
     }
 
+    // Host networking: if enabled, use --network=host instead of a named Docker network.
+    // Useful in development when BuildKit needs to reach host-bound ports (e.g. localhost:3082).
+    let use_host_network = super::env_var_non_empty("RISE_MANAGED_BUILDKIT_HOST_NETWORK").is_some();
+
+    if use_host_network {
+        cmd.arg("--network=host")
+            .arg("--label")
+            .arg("rise.host_network=true");
+    }
+
     // Add network label if network is specified
     if let Some(network) = network_name {
         cmd.arg("--label")
@@ -492,10 +502,12 @@ fn create_buildkit_daemon(
 
     info!("BuildKit daemon '{}' created successfully", daemon_name);
 
-    // Connect to network if specified
-    if let Some(network) = network_name {
-        create_network(container_cli.command(), network)?;
-        connect_to_network(container_cli.command(), network, daemon_name)?;
+    // Connect to network if specified (skip when using host networking)
+    if !use_host_network {
+        if let Some(network) = network_name {
+            create_network(container_cli.command(), network)?;
+            connect_to_network(container_cli.command(), network, daemon_name)?;
+        }
     }
 
     // Return BUILDKIT_HOST value for this daemon

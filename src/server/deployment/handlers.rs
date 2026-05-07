@@ -127,34 +127,66 @@ fn normalize_image_reference(image: &str) -> String {
 /// * `oci_client` - OCI client for registry interaction
 /// * `registry_provider` - Registry provider for credentials
 /// * `normalized_image` - Normalized image reference (e.g., "docker.io/library/nginx:latest")
+/// * `project_name` - Project name for scoped pull credentials and cross-project validation
 ///
 /// # Returns
 /// Fully-qualified digest reference (e.g., "docker.io/library/nginx@sha256:abc123...")
 ///
 /// # Errors
-/// Returns error if image doesn't exist, requires authentication, or registry is unreachable
+/// Returns error if image doesn't exist, requires authentication, registry is unreachable,
+/// or the image belongs to a different Rise project.
 async fn resolve_image_digest(
     oci_client: &crate::server::oci::OciClient,
     registry_provider: &std::sync::Arc<dyn crate::server::registry::RegistryProvider>,
     normalized_image: &str,
+    project_name: &str,
 ) -> anyhow::Result<String> {
-    // Build credentials map from registry provider
+    // Cross-project image validation: if the image is on the Rise registry,
+    // verify it belongs to this project (defense-in-depth).
+    let registry_host = registry_provider.registry_host();
+    if let Some(image_path) = normalized_image.strip_prefix(&format!("{}/", registry_host)) {
+        // The image path after registry_host is: <docker_repo_key_or_namespace>/project/tag
+        // or just <project>:<tag> depending on format. Extract the project portion.
+        // For paths like "rise-docker-local/myapp:tag" or "rise-apps/myapp:tag",
+        // the project name is the last path segment before the tag.
+        let path_without_tag = image_path.split(':').next().unwrap_or(image_path);
+        let path_without_tag = path_without_tag
+            .split('@')
+            .next()
+            .unwrap_or(path_without_tag);
+        // Get the last path segment as the project name
+        if let Some(image_project) = path_without_tag.rsplit('/').next() {
+            if image_project != project_name {
+                anyhow::bail!(
+                    "Image belongs to a different Rise project '{}' — \
+                     deployments can only use images from their own project '{}'",
+                    image_project,
+                    project_name
+                );
+            }
+        }
+    }
+
+    // Build credentials map using project-scoped pull credentials
     let mut credentials = crate::server::oci::RegistryCredentialsMap::new();
 
-    match registry_provider.get_pull_credentials().await {
-        Ok((user, pass)) if !user.is_empty() => {
+    match registry_provider
+        .get_k8s_pull_credentials(project_name)
+        .await
+    {
+        Ok(creds) if !creds.username.is_empty() => {
             debug!(
-                "Adding credentials for registry host: {}",
-                registry_provider.registry_host()
+                "Adding project-scoped credentials for registry host: {}",
+                registry_host
             );
-            credentials.insert(registry_provider.registry_host().to_string(), (user, pass));
+            credentials.insert(registry_host.to_string(), (creds.username, creds.password));
         }
         Ok(_) => {
             debug!("Registry provider returned empty credentials, using anonymous auth");
         }
         Err(e) => {
             error!(
-                "Failed to get pull credentials from registry provider: {}",
+                "Failed to get pull credentials from registry provider: {:?}",
                 e
             );
             // Continue with anonymous auth
@@ -1119,16 +1151,16 @@ pub async fn create_deployment(
             // and the controller uses get_image_tag() (the no-digest path) to pull from there.
             info!("Creating push-image deployment with image: {}", user_image);
 
-            let credentials = state
-                .registry_provider
-                .get_credentials(&payload.project)
-                .await
-                .internal_err("Failed to get credentials")?;
             let image_tag = state.registry_provider.get_image_tag(
                 &payload.project,
                 &deployment_id,
                 ImageTagType::ClientFacing,
             );
+            let credentials = state
+                .registry_provider
+                .get_credentials(&payload.project, &deployment_id)
+                .await
+                .internal_err("Failed to get credentials")?;
 
             let deployment = create_deployment_with_hooks(
                 &state,
@@ -1217,6 +1249,7 @@ pub async fn create_deployment(
             &state.oci_client,
             &state.registry_provider,
             &normalized_image,
+            &project.name,
         )
         .await
         .map_err(|e| {
@@ -1319,19 +1352,19 @@ pub async fn create_deployment(
         }))
     } else {
         // Path 2: Build from source (current behavior)
-        // Get registry credentials
-        let credentials = state
-            .registry_provider
-            .get_credentials(&payload.project)
-            .await
-            .internal_err("Failed to get credentials")?;
-
         // Get full image tag from provider for CLI client (uses client_registry_url if configured)
         let image_tag = state.registry_provider.get_image_tag(
             &payload.project,
             &deployment_id,
             ImageTagType::ClientFacing,
         );
+
+        // Get registry credentials scoped to this exact tag
+        let credentials = state
+            .registry_provider
+            .get_credentials(&payload.project, &deployment_id)
+            .await
+            .internal_err("Failed to get credentials")?;
 
         debug!("Image tag: {}", image_tag);
 

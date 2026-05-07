@@ -1264,10 +1264,10 @@ async fn build_image_pull_secret(
         }
     }
 
-    // Fetch fresh credentials
+    // Fetch fresh pull credentials (scoped to this project's repository)
     let credentials = resource_builder
         .registry_provider
-        .get_credentials(&project.name)
+        .get_k8s_pull_credentials(&project.name)
         .await?;
     let registry_host = resource_builder.registry_provider.registry_host();
 
@@ -1588,7 +1588,11 @@ mod tests {
 
     #[async_trait]
     impl RegistryProvider for TestRegistryProvider {
-        async fn get_credentials(&self, _repository: &str) -> Result<RegistryCredentials> {
+        async fn get_credentials(
+            &self,
+            _repository: &str,
+            _tag: &str,
+        ) -> Result<RegistryCredentials> {
             unreachable!("not used in these tests")
         }
 

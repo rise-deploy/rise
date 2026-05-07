@@ -812,6 +812,81 @@
       },
       "type": "object"
     },
+    "JfrogTokenProviderSettings": {
+      "description": "Token provider configuration for JFrog registry",
+      "oneOf": [
+        {
+          "description": "HashiCorp Vault with vault-plugin-secrets-artifactory",
+          "properties": {
+            "type": {
+              "const": "vault",
+              "type": "string"
+            },
+            "vault_addr": {
+              "default": null,
+              "description": "Vault server address (fallback: VAULT_ADDR env var)",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "vault_mount_path": {
+              "default": "artifactory",
+              "description": "Vault secrets engine mount path (default: \"artifactory\")",
+              "type": "string"
+            },
+            "vault_role": {
+              "description": "Vault role name (must have allow_scope_override=true)",
+              "type": "string"
+            },
+            "vault_token": {
+              "default": null,
+              "description": "Vault token (fallback: VAULT_TOKEN env var)",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "vault_token_file": {
+              "default": null,
+              "description": "Path to a file containing the Vault token (fallback: VAULT_TOKEN_FILE env var).\nRe-read on each request to support token rotation.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "vault_role"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "JFrog's own access token API with an admin token",
+          "properties": {
+            "admin_token": {
+              "description": "Admin access token for minting scoped tokens",
+              "type": "string"
+            },
+            "jfrog_url": {
+              "description": "JFrog platform URL (e.g., \"http://rise-jfrog:8082\")",
+              "type": "string"
+            },
+            "type": {
+              "const": "direct",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "jfrog_url",
+            "admin_token"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "NetworkPolicyConfig": {
       "description": "NetworkPolicy configuration for deployed apps\n\nUses Kubernetes NetworkPolicy types directly. Egress semantics:\n- null: policyTypes is [\"Ingress\"] only, Kubernetes does not restrict egress\n- Empty list: policyTypes includes \"Egress\" with no rules = deny all egress\n- Non-empty list: explicit egress rules enforced",
       "properties": {
@@ -1062,6 +1137,64 @@
             "namespace",
             "username",
             "token"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "JFrog Artifactory Docker registry — mints scoped access tokens per operation",
+          "properties": {
+            "client_registry_url": {
+              "default": null,
+              "description": "Optional client-facing registry host override for CLI push",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "default_token_ttl": {
+              "default": 600,
+              "description": "Default TTL in seconds for tokens (default: 600)",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "docker_repo_key": {
+              "description": "Docker repository key in JFrog (e.g., \"rise-docker-local\")",
+              "type": "string"
+            },
+            "mint_pull_secrets": {
+              "default": true,
+              "description": "Whether K8s controller creates image pull secrets (default: true)",
+              "type": "boolean"
+            },
+            "pull_permissions": {
+              "default": "r",
+              "description": "Artifact permission letters for pull tokens (default: \"r\")",
+              "type": "string"
+            },
+            "push_permissions": {
+              "default": "r,w",
+              "description": "Artifact permission letters for push tokens (default: \"r,w\")",
+              "type": "string"
+            },
+            "registry_host": {
+              "description": "Docker registry host:port (e.g., \"localhost:3082\")",
+              "type": "string"
+            },
+            "token_provider": {
+              "$ref": "#/$defs/JfrogTokenProviderSettings",
+              "description": "Token provider configuration"
+            },
+            "type": {
+              "const": "jfrog",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "registry_host",
+            "docker_repo_key",
+            "token_provider"
           ],
           "type": "object"
         }

@@ -66,12 +66,34 @@ curl -sf -o /dev/null -u "${JFROG_USER}:${JFROG_PASS}" \
 echo "JFrog EULA accepted."
 
 # --- 8. Create Docker repository for local dev registry usage ---
+# JFrog JCR (free edition) does not support the /api/repositories REST API.
+# We use the UI API with cookie-based session auth instead.
 echo "Creating 'rise-docker-local' Docker repository ..."
-curl -sf -o /dev/null -u "${JFROG_USER}:${JFROG_PASS}" \
+REPO_COOKIE_JAR=$(mktemp)
+curl -sf -c "$REPO_COOKIE_JAR" \
   -H "Content-Type: application/json" \
-  -X PUT \
-  -d '{"key":"rise-docker-local","rclass":"local","packageType":"docker"}' \
-  "${JFROG_URL}/artifactory/api/repositories/rise-docker-local" || true
+  -H "X-Requested-With: XMLHttpRequest" \
+  -d "{\"user\":\"${JFROG_USER}\",\"password\":\"${JFROG_PASS}\",\"type\":\"login\"}" \
+  "${JFROG_URL}/ui/api/v1/ui/auth/login" > /dev/null 2>&1
+
+REPO_ACCESS=$(sed -n 's/.*ACCESSTOKEN[[:space:]]*//p' "$REPO_COOKIE_JAR" | tr -d '[:space:]')
+REPO_REFRESH=$(sed -n 's/.*REFRESHTOKEN[[:space:]]*//p' "$REPO_COOKIE_JAR" | tr -d '[:space:]')
+
+curl -sf -o /dev/null \
+  -H "Content-Type: application/json" \
+  -H "X-Requested-With: XMLHttpRequest" \
+  -H "cookie: ACCESSTOKEN=${REPO_ACCESS}; REFRESHTOKEN=${REPO_REFRESH}" \
+  -X POST \
+  -d '{
+    "type":"localRepoConfig",
+    "typeSpecific":{"repoType":"Docker","dockerApiVersion":"V2","maxUniqueTags":0,"dockerTagRetention":0,"blockPushingSchema1":false},
+    "general":{"repoKey":"rise-docker-local"},
+    "basic":{"layout":"simple-default","includesPattern":"**/*","excludesPattern":""},
+    "advanced":{"cache":{"keepUnusedArtifactsHours":""},"distribution":{"gpgSign":false},"replication":{"blockPullReplications":false,"blockPushReplications":false}}
+  }' \
+  "${JFROG_URL}/ui/api/v1/ui/admin/repositories" || true
+
+rm -f "$REPO_COOKIE_JAR"
 echo "Docker repository 'rise-docker-local' ready."
 
 # --- 9. Create a JFrog admin access token ---
