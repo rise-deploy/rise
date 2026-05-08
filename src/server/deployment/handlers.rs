@@ -143,53 +143,53 @@ async fn resolve_image_digest(
 ) -> anyhow::Result<String> {
     // Cross-project image validation: if the image is on the Rise registry,
     // verify it belongs to this project (defense-in-depth).
-    let registry_host = registry_provider.registry_host();
-    if let Some(image_path) = normalized_image.strip_prefix(&format!("{}/", registry_host)) {
-        // The image path after registry_host is: <docker_repo_key_or_namespace>/project/tag
-        // or just <project>:<tag> depending on format. Extract the project portion.
-        // For paths like "rise-docker-local/myapp:tag" or "rise-apps/myapp:tag",
-        // the project name is the last path segment before the tag.
-        let path_without_tag = image_path.split(':').next().unwrap_or(image_path);
-        let path_without_tag = path_without_tag
-            .split('@')
-            .next()
-            .unwrap_or(path_without_tag);
-        // Get the last path segment as the project name
-        if let Some(image_project) = path_without_tag.rsplit('/').next() {
-            if image_project != project_name {
-                anyhow::bail!(
-                    "Image belongs to a different Rise project '{}' — \
-                     deployments can only use images from their own project '{}'",
-                    image_project,
-                    project_name
-                );
-            }
+    // Use registry_url() (which includes namespace/repo_key) to correctly match
+    // Rise-managed images rather than just the hostname.
+    let registry_url = registry_provider.registry_url();
+    let prefix = format!("{}/", registry_url.trim_end_matches('/'));
+    let is_rise_image = if let Some(image_path) = normalized_image.strip_prefix(&prefix) {
+        // After stripping the registry URL prefix, the first path segment is the project name.
+        let image_project = image_path.split([':', '/', '@']).next().unwrap_or("");
+        if image_project != project_name {
+            anyhow::bail!(
+                "Image belongs to a different Rise project '{}' — \
+                 deployments can only use images from their own project '{}'",
+                image_project,
+                project_name
+            );
         }
-    }
+        true
+    } else {
+        false
+    };
 
-    // Build credentials map using project-scoped pull credentials
+    // Only fetch scoped pull credentials for Rise-managed images.
+    // External images use anonymous auth.
     let mut credentials = crate::server::oci::RegistryCredentialsMap::new();
 
-    match registry_provider
-        .get_k8s_pull_credentials(project_name)
-        .await
-    {
-        Ok(creds) if !creds.username.is_empty() => {
-            debug!(
-                "Adding project-scoped credentials for registry host: {}",
-                registry_host
-            );
-            credentials.insert(registry_host.to_string(), (creds.username, creds.password));
-        }
-        Ok(_) => {
-            debug!("Registry provider returned empty credentials, using anonymous auth");
-        }
-        Err(e) => {
-            error!(
-                "Failed to get pull credentials from registry provider: {:?}",
-                e
-            );
-            // Continue with anonymous auth
+    if is_rise_image {
+        let registry_host = registry_provider.registry_host();
+        match registry_provider
+            .get_k8s_pull_credentials(project_name)
+            .await
+        {
+            Ok(creds) if !creds.username.is_empty() => {
+                debug!(
+                    "Adding project-scoped credentials for registry host: {}",
+                    registry_host
+                );
+                credentials.insert(registry_host.to_string(), (creds.username, creds.password));
+            }
+            Ok(_) => {
+                debug!("Registry provider returned empty credentials, using anonymous auth");
+            }
+            Err(e) => {
+                error!(
+                    "Failed to get pull credentials from registry provider: {:?}",
+                    e
+                );
+                // Continue with anonymous auth
+            }
         }
     }
 

@@ -60,9 +60,15 @@ impl JfrogProvider {
         let client_registry_url =
             format!("{}/{}", config.client_registry_host, config.docker_repo_key);
 
+        let http_client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .context("Failed to build HTTP client")?;
+
         Ok(Self {
             config,
-            http_client: reqwest::Client::new(),
+            http_client,
             registry_host,
             registry_url,
             client_registry_url,
@@ -248,7 +254,7 @@ impl RegistryProvider for JfrogProvider {
 
         // Check cache under read lock
         {
-            let cache = self.pull_cache.read().unwrap();
+            let cache = self.pull_cache.read().unwrap_or_else(|e| e.into_inner());
             if let Some(entry) = cache.get(&scope) {
                 if entry.created_at.elapsed() < entry.refresh_after {
                     tracing::debug!(
@@ -280,7 +286,7 @@ impl RegistryProvider for JfrogProvider {
 
         // Update cache under write lock
         {
-            let mut cache = self.pull_cache.write().unwrap();
+            let mut cache = self.pull_cache.write().unwrap_or_else(|e| e.into_inner());
             cache.insert(
                 scope,
                 CachedPullCredentials {
