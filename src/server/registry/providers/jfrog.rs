@@ -86,6 +86,10 @@ impl JfrogProvider {
     }
 
     /// Request a scoped token from the configured backend.
+    ///
+    /// `scope` is the desired JFrog artifact scope string. For Vault mode with
+    /// `scope_override: false`, the scope parameter is ignored and the Vault
+    /// role's configured scope is used instead.
     async fn request_token(&self, scope: &str, ttl: u64) -> Result<(String, String)> {
         match &self.config.token_provider {
             JfrogTokenProvider::Vault {
@@ -94,6 +98,7 @@ impl JfrogProvider {
                 vault_token_file,
                 vault_mount_path,
                 role,
+                scope_override,
             } => {
                 let token = Self::resolve_vault_token(vault_token, vault_token_file)?;
                 let url = format!(
@@ -103,12 +108,19 @@ impl JfrogProvider {
                     role
                 );
 
-                tracing::debug!(scope = scope, ttl = ttl, "Requesting JFrog token via Vault");
-
                 // The vault-plugin-secrets-artifactory uses GET with query
                 // parameters (POST returns "unsupported operation").
-                let request_url =
-                    format!("{}?scope={}&ttl={}s", url, urlencoding::encode(scope), ttl);
+                let request_url = if *scope_override {
+                    tracing::debug!(
+                        scope = scope,
+                        ttl = ttl,
+                        "Requesting JFrog token via Vault (scope override)"
+                    );
+                    format!("{}?scope={}&ttl={}s", url, urlencoding::encode(scope), ttl)
+                } else {
+                    tracing::debug!(ttl = ttl, "Requesting JFrog token via Vault (role scope)");
+                    format!("{}?ttl={}s", url, ttl)
+                };
                 let response = self
                     .http_client
                     .get(&request_url)

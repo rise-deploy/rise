@@ -300,7 +300,7 @@ The GitLab token must have `read_registry` and `write_registry` scopes (or equiv
 
 JFrog supports two token-issuing backends: Vault (via `vault-plugin-secrets-artifactory`) and Direct (via JFrog's access token API).
 
-**Vault mode:**
+**Vault mode (scope override — default):**
 
 ```yaml
 registry:
@@ -313,13 +313,32 @@ registry:
     # vault_token: ~            # defaults to VAULT_TOKEN env
     # vault_token_file: ~       # alternative: read token from file (supports rotation)
     vault_mount_path: "artifactory"
-    vault_role: "rise"          # must have allow_scope_override=true
+    vault_role: "rise"
+    # scope_override: true      # default — Rise sends per-operation scopes (requires allow_scope_override=true on the role)
   # push_permissions: "r,w"    # default
   # pull_permissions: "r"      # default
   # push_token_ttl: 600        # push token lifetime in seconds (default: 600)
   # pull_token_ttl: 86400      # pull token lifetime in seconds (default: 86400 = 24h)
   # mint_pull_secrets: true    # default
 ```
+
+**Vault mode (role scope):**
+
+```yaml
+registry:
+  type: jfrog
+  registry_host: "jfrog.example.com"
+  docker_repo_key: "rise-docker-local"
+  token_provider:
+    type: vault
+    vault_mount_path: "artifactory"
+    vault_role: "rise"
+    scope_override: false       # use the scope configured on the Vault role
+  # push_token_ttl: 600
+  # pull_token_ttl: 86400
+```
+
+When `scope_override: false`, Rise omits the `scope` query parameter and the Vault role's configured scope is used for all tokens. The `push_permissions` and `pull_permissions` settings are ignored in this mode. This is useful when the Vault admin wants full control over token scopes.
 
 > **Note (Vault mode):** The Vault role's `max_ttl` must be >= `pull_token_ttl`. If the role's `max_ttl` is lower, Vault silently clamps the token TTL and the cached credentials may expire earlier than expected.
 

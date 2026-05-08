@@ -818,6 +818,11 @@
         {
           "description": "HashiCorp Vault with vault-plugin-secrets-artifactory",
           "properties": {
+            "scope_override": {
+              "default": true,
+              "description": "When true (default), Rise sends per-operation scopes to Vault, overriding\nthe role's default scope. Requires `allow_scope_override=true` on the Vault role.\nWhen false, Rise omits the scope parameter and the role's configured scope is used.",
+              "type": "boolean"
+            },
             "type": {
               "const": "vault",
               "type": "string"
@@ -836,7 +841,7 @@
               "type": "string"
             },
             "vault_role": {
-              "description": "Vault role name (must have allow_scope_override=true)",
+              "description": "Vault role name",
               "type": "string"
             },
             "vault_token": {

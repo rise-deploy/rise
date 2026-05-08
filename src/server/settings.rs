@@ -861,8 +861,13 @@ pub enum JfrogTokenProviderSettings {
         /// Vault secrets engine mount path (default: "artifactory")
         #[serde(default = "default_vault_mount_path")]
         vault_mount_path: String,
-        /// Vault role name (must have allow_scope_override=true)
+        /// Vault role name
         vault_role: String,
+        /// When true (default), Rise sends per-operation scopes to Vault, overriding
+        /// the role's default scope. Requires `allow_scope_override=true` on the Vault role.
+        /// When false, Rise omits the scope parameter and the role's configured scope is used.
+        #[serde(default = "default_true")]
+        scope_override: bool,
     },
     /// JFrog's own access token API with an admin token
     Direct {

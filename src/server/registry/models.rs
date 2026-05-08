@@ -117,6 +117,10 @@ pub enum JfrogTokenProvider {
         vault_token_file: Option<String>,
         vault_mount_path: String,
         role: String,
+        /// When true (default), Rise sends `?scope=...&ttl=...s` to the Vault endpoint,
+        /// overriding the role's default scope. Requires `allow_scope_override=true` on the role.
+        /// When false, Rise sends only `?ttl=...s` and the role's configured scope is used.
+        scope_override: bool,
     },
     Direct {
         jfrog_url: String,

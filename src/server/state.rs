@@ -364,6 +364,7 @@ impl AppState {
                             vault_token_file,
                             vault_mount_path,
                             vault_role,
+                            scope_override,
                         } => {
                             let addr = vault_addr
                                 .clone()
@@ -406,6 +407,7 @@ impl AppState {
                                 vault_token_file: token_file,
                                 vault_mount_path: vault_mount_path.clone(),
                                 role: vault_role.clone(),
+                                scope_override: *scope_override,
                             }
                         }
                         JfrogTokenProviderSettings::Direct {
