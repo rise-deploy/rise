@@ -24,7 +24,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// Daemon version label value. Bump this whenever the managed BuildKit daemon
 /// creation parameters change (e.g. new flags, image updates) to force
 /// recreation of stale daemons.
-const DAEMON_VERSION: &str = "3";
+const DAEMON_VERSION: &str = "2";
 
 /// Compute SHA256 hash of a file
 pub(crate) fn compute_file_hash(path: &Path) -> Result<String> {
@@ -212,6 +212,28 @@ fn get_proxy_hash_label(container_cli: &str, daemon_name: &str) -> Option<String
     }
 
     None
+}
+
+/// Get host_network label from container
+fn get_host_network_label(container_cli: &str, daemon_name: &str) -> bool {
+    let output = Command::new(container_cli)
+        .args([
+            "inspect",
+            "--format",
+            "{{index .Config.Labels \"rise.host_network\"}}",
+            daemon_name,
+        ])
+        .output()
+        .ok();
+
+    if let Some(output) = output {
+        if output.status.success() {
+            let label_value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            return label_value == "true";
+        }
+    }
+
+    false
 }
 
 /// Compute expected proxy hash from proxy vars (None if no proxy vars)
@@ -439,6 +461,12 @@ fn create_buildkit_daemon(
     let use_host_network = super::env_var_non_empty("RISE_MANAGED_BUILDKIT_HOST_NETWORK").is_some();
 
     if use_host_network {
+        if network_name.is_some() {
+            warn!(
+                "RISE_MANAGED_BUILDKIT_HOST_NETWORK is set — \
+                 ignoring RISE_MANAGED_BUILDKIT_NETWORK_NAME (host networking takes precedence)"
+            );
+        }
         cmd.arg("--network=host")
             .arg("--label")
             .arg("rise.host_network=true");
@@ -559,6 +587,25 @@ pub(crate) fn ensure_managed_buildkit_daemon(
         let current_proxy_hash = get_proxy_hash_label(container_cli.command(), daemon_name);
         if current_proxy_hash != expected_proxy_hash {
             info!("Proxy configuration has changed, recreating daemon");
+            stop_buildkit_daemon(container_cli, daemon_name)?;
+            return create_buildkit_daemon(
+                container_cli,
+                daemon_name,
+                ssl_cert_file,
+                network_name.as_deref(),
+                &proxy_vars,
+            );
+        }
+
+        // Check if host networking mode has changed
+        let want_host_network =
+            super::env_var_non_empty("RISE_MANAGED_BUILDKIT_HOST_NETWORK").is_some();
+        let has_host_network = get_host_network_label(container_cli.command(), daemon_name);
+        if want_host_network != has_host_network {
+            info!(
+                "Host networking changed (was={}, want={}), recreating daemon",
+                has_host_network, want_host_network
+            );
             stop_buildkit_daemon(container_cli, daemon_name)?;
             return create_buildkit_daemon(
                 container_cli,
