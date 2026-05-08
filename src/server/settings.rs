@@ -829,9 +829,13 @@ pub enum RegistrySettings {
         /// Artifact permission letters for pull tokens (default: "r")
         #[serde(default = "default_jfrog_pull_permissions")]
         pull_permissions: String,
-        /// Default TTL in seconds for tokens (default: 600)
-        #[serde(default = "default_jfrog_token_ttl")]
-        default_token_ttl: u64,
+        /// TTL in seconds for push tokens (default: 600)
+        #[serde(default = "default_jfrog_push_token_ttl")]
+        push_token_ttl: u64,
+        /// TTL in seconds for pull tokens used by K8s image pull secrets (default: 86400)
+        /// For Vault mode, the Vault role's max_ttl must be >= this value.
+        #[serde(default = "default_jfrog_pull_token_ttl")]
+        pull_token_ttl: u64,
         /// Whether K8s controller creates image pull secrets (default: true)
         #[serde(default = "default_true")]
         mint_pull_secrets: bool,
@@ -877,8 +881,12 @@ fn default_jfrog_pull_permissions() -> String {
     "r".to_string()
 }
 
-fn default_jfrog_token_ttl() -> u64 {
+fn default_jfrog_push_token_ttl() -> u64 {
     600
+}
+
+fn default_jfrog_pull_token_ttl() -> u64 {
+    86400 // 24 hours
 }
 
 fn default_vault_mount_path() -> String {

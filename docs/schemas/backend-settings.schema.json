@@ -1151,13 +1151,6 @@
                 "null"
               ]
             },
-            "default_token_ttl": {
-              "default": 600,
-              "description": "Default TTL in seconds for tokens (default: 600)",
-              "format": "uint64",
-              "minimum": 0,
-              "type": "integer"
-            },
             "docker_repo_key": {
               "description": "Docker repository key in JFrog (e.g., \"rise-docker-local\")",
               "type": "string"
@@ -1172,10 +1165,24 @@
               "description": "Artifact permission letters for pull tokens (default: \"r\")",
               "type": "string"
             },
+            "pull_token_ttl": {
+              "default": 86400,
+              "description": "TTL in seconds for pull tokens used by K8s image pull secrets (default: 86400)\nFor Vault mode, the Vault role's max_ttl must be >= this value.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
             "push_permissions": {
               "default": "r,w",
               "description": "Artifact permission letters for push tokens (default: \"r,w\")",
               "type": "string"
+            },
+            "push_token_ttl": {
+              "default": 600,
+              "description": "TTL in seconds for push tokens (default: 600)",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
             },
             "registry_host": {
               "description": "Docker registry host:port (e.g., \"localhost:3082\")",

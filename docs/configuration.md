@@ -316,8 +316,12 @@ registry:
     vault_role: "rise"          # must have allow_scope_override=true
   # push_permissions: "r,w"    # default
   # pull_permissions: "r"      # default
+  # push_token_ttl: 600        # push token lifetime in seconds (default: 600)
+  # pull_token_ttl: 86400      # pull token lifetime in seconds (default: 86400 = 24h)
   # mint_pull_secrets: true    # default
 ```
+
+> **Note (Vault mode):** The Vault role's `max_ttl` must be >= `pull_token_ttl`. If the role's `max_ttl` is lower, Vault silently clamps the token TTL and the cached credentials may expire earlier than expected.
 
 **Direct mode:**
 
@@ -331,12 +335,13 @@ registry:
     jfrog_url: "https://jfrog.example.com"
     admin_token: "${JFROG_ADMIN_TOKEN}"   # applied-permissions/admin scoped token
   # client_registry_url: ~     # optional: override registry URL returned to CLI clients
-  # default_token_ttl: 600     # token lifetime in seconds (default: 600)
+  # push_token_ttl: 600        # push token lifetime in seconds (default: 600)
+  # pull_token_ttl: 86400      # pull token lifetime in seconds (default: 86400 = 24h)
 ```
 
 **How it works:**
 - **CLI pushes**: the backend mints a short-lived multi-scope token with `r,w` permissions scoped to the deployment tag, blob uploads, and content-addressed manifests. The token is used for `docker login` before push.
-- **Kubernetes pull secrets**: when `mint_pull_secrets: true`, the controller creates image pull secrets with a read-only scoped token (`artifact:{docker_repo_key}/{project}/**:r`).
+- **Kubernetes pull secrets**: when `mint_pull_secrets: true`, the controller creates image pull secrets with a long-lived read-only scoped token (`artifact:{docker_repo_key}/{project}/**:r`). Pull tokens are cached in memory and refreshed after 2/3 of their TTL to avoid minting a new token on every deploy.
 
 See [Registry Backend Operations](operator-registry-operations.md#jfrog-artifactory) for scope details and troubleshooting.
 

@@ -1,11 +1,22 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::sync::RwLock;
+use std::time::{Duration, Instant};
 
 use crate::server::registry::{
     models::{JfrogConfig, JfrogTokenProvider, RegistryAuthMethod, RegistryCredentials},
     ImageTagType, RegistryProvider,
 };
+
+/// Cached pull credentials for a specific scope
+struct CachedPullCredentials {
+    username: String,
+    access_token: String,
+    created_at: Instant,
+    refresh_after: Duration,
+}
 
 /// JFrog Artifactory container registry provider
 ///
@@ -19,6 +30,8 @@ pub struct JfrogProvider {
     registry_host: String,
     registry_url: String,
     client_registry_url: String,
+    /// Per-scope cache for pull credentials (keyed by scope string)
+    pull_cache: RwLock<HashMap<String, CachedPullCredentials>>,
 }
 
 #[derive(Deserialize)]
@@ -53,6 +66,7 @@ impl JfrogProvider {
             registry_host,
             registry_url,
             client_registry_url,
+            pull_cache: RwLock::new(HashMap::new()),
         })
     }
 
@@ -72,7 +86,7 @@ impl JfrogProvider {
     }
 
     /// Request a scoped token from the configured backend.
-    async fn request_token(&self, scope: &str) -> Result<(String, String)> {
+    async fn request_token(&self, scope: &str, ttl: u64) -> Result<(String, String)> {
         match &self.config.token_provider {
             JfrogTokenProvider::Vault {
                 vault_addr,
@@ -89,15 +103,12 @@ impl JfrogProvider {
                     role
                 );
 
-                tracing::debug!(scope = scope, "Requesting JFrog token via Vault");
+                tracing::debug!(scope = scope, ttl = ttl, "Requesting JFrog token via Vault");
 
                 // The vault-plugin-secrets-artifactory uses GET with query
                 // parameters (POST returns "unsupported operation").
-                let request_url = format!(
-                    "{}?scope={}",
-                    url,
-                    urlencoding::encode(scope)
-                );
+                let request_url =
+                    format!("{}?scope={}&ttl={}s", url, urlencoding::encode(scope), ttl);
                 let response = self
                     .http_client
                     .get(&request_url)
@@ -125,7 +136,11 @@ impl JfrogProvider {
             } => {
                 let url = format!("{}/access/api/v1/tokens", jfrog_url.trim_end_matches('/'));
 
-                tracing::debug!(scope = scope, "Requesting JFrog token via Direct API");
+                tracing::debug!(
+                    scope = scope,
+                    ttl = ttl,
+                    "Requesting JFrog token via Direct API"
+                );
 
                 let response = self
                     .http_client
@@ -133,7 +148,7 @@ impl JfrogProvider {
                     .header("Authorization", format!("Bearer {}", admin_token))
                     .json(&serde_json::json!({
                         "scope": scope,
-                        "expires_in": self.config.default_token_ttl,
+                        "expires_in": ttl,
                     }))
                     .send()
                     .await
@@ -197,13 +212,15 @@ impl RegistryProvider for JfrogProvider {
             "Fetching scoped JFrog push token"
         );
 
-        let (username, access_token) = self.request_token(&scope).await?;
+        let (username, access_token) = self
+            .request_token(&scope, self.config.push_token_ttl)
+            .await?;
 
         Ok(RegistryCredentials {
             registry_url: format!("{}/{}", self.client_registry_url, repository),
             username,
             password: access_token,
-            expires_in: Some(self.config.default_token_ttl),
+            expires_in: Some(self.config.push_token_ttl),
             auth_method: RegistryAuthMethod::LoginCredentials,
         })
     }
@@ -217,19 +234,57 @@ impl RegistryProvider for JfrogProvider {
     async fn get_k8s_pull_credentials(&self, repository: &str) -> Result<RegistryCredentials> {
         let scope = self.artifact_scope(repository, &self.config.pull_permissions);
 
+        // Check cache under read lock
+        {
+            let cache = self.pull_cache.read().unwrap();
+            if let Some(entry) = cache.get(&scope) {
+                if entry.created_at.elapsed() < entry.refresh_after {
+                    tracing::debug!(
+                        repository = repository,
+                        scope = %scope,
+                        "Using cached JFrog pull credentials"
+                    );
+                    return Ok(RegistryCredentials {
+                        registry_url: self.registry_host.clone(),
+                        username: entry.username.clone(),
+                        password: entry.access_token.clone(),
+                        expires_in: Some(self.config.pull_token_ttl),
+                        auth_method: RegistryAuthMethod::LoginCredentials,
+                    });
+                }
+            }
+        }
+
+        // Cache miss or expired — mint a new token
         tracing::info!(
             repository = repository,
             scope = %scope,
             "Fetching scoped JFrog pull token"
         );
 
-        let (username, access_token) = self.request_token(&scope).await?;
+        let (username, access_token) = self
+            .request_token(&scope, self.config.pull_token_ttl)
+            .await?;
+
+        // Update cache under write lock
+        {
+            let mut cache = self.pull_cache.write().unwrap();
+            cache.insert(
+                scope,
+                CachedPullCredentials {
+                    username: username.clone(),
+                    access_token: access_token.clone(),
+                    created_at: Instant::now(),
+                    refresh_after: Duration::from_secs(self.config.pull_token_ttl * 2 / 3),
+                },
+            );
+        }
 
         Ok(RegistryCredentials {
             registry_url: self.registry_host.clone(),
             username,
             password: access_token,
-            expires_in: Some(self.config.default_token_ttl),
+            expires_in: Some(self.config.pull_token_ttl),
             auth_method: RegistryAuthMethod::LoginCredentials,
         })
     }

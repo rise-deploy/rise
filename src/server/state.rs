@@ -351,7 +351,8 @@ impl AppState {
                     token_provider,
                     push_permissions,
                     pull_permissions,
-                    default_token_ttl,
+                    push_token_ttl,
+                    pull_token_ttl,
                     mint_pull_secrets,
                 } => {
                     use crate::server::settings::JfrogTokenProviderSettings;
@@ -436,7 +437,8 @@ impl AppState {
                         docker_repo_key: docker_repo_key.clone(),
                         push_permissions: push_permissions.clone(),
                         pull_permissions: pull_permissions.clone(),
-                        default_token_ttl: *default_token_ttl,
+                        push_token_ttl: *push_token_ttl,
+                        pull_token_ttl: *pull_token_ttl,
                         mint_pull_secrets: *mint_pull_secrets,
                     };
 

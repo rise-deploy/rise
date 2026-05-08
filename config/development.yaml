@@ -56,7 +56,8 @@ auth:
 #     vault_role: "rise"
 #   # push_permissions: "r,w"     # default
 #   # pull_permissions: "r"       # default
-#   # default_token_ttl: 600      # default
+#   # push_token_ttl: 600         # push token TTL in seconds (default: 600)
+#   # pull_token_ttl: 86400       # pull token TTL in seconds (default: 86400 = 24h)
 
 # JFrog Artifactory registry (via Direct token):
 registry:

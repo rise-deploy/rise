@@ -102,7 +102,8 @@ pub struct JfrogConfig {
     pub docker_repo_key: String,
     pub push_permissions: String,
     pub pull_permissions: String,
-    pub default_token_ttl: u64,
+    pub push_token_ttl: u64,
+    pub pull_token_ttl: u64,
     pub mint_pull_secrets: bool,
 }
 
