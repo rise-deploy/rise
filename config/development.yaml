@@ -47,8 +47,8 @@ auth:
 # JFrog Artifactory registry (via Vault):
 # registry:
 #   type: "jfrog"
-#   registry_host: "localhost:3082"
-#   client_registry_url: "rise-jfrog:3082"
+#   registry_host: "rise-jfrog:8082"
+#   client_registry_url: "localhost:3082"
 #   docker_repo_key: "rise-docker-local"
 #   token_provider:
 #     type: "vault"
@@ -61,7 +61,8 @@ auth:
 # JFrog Artifactory registry (via Direct token):
 registry:
   type: "jfrog"
-  registry_host: "localhost:3082"
+  registry_host: "rise-jfrog:8082"
+  client_registry_url: "localhost:3082"
   docker_repo_key: "rise-docker-local"
   token_provider:
     type: "direct"

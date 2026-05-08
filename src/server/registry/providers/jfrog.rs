@@ -91,11 +91,17 @@ impl JfrogProvider {
 
                 tracing::debug!(scope = scope, "Requesting JFrog token via Vault");
 
+                // The vault-plugin-secrets-artifactory uses GET with query
+                // parameters (POST returns "unsupported operation").
+                let request_url = format!(
+                    "{}?scope={}",
+                    url,
+                    urlencoding::encode(scope)
+                );
                 let response = self
                     .http_client
-                    .post(&url)
+                    .get(&request_url)
                     .header("X-Vault-Token", &token)
-                    .json(&serde_json::json!({ "scope": scope }))
                     .send()
                     .await
                     .context("Failed to reach Vault token endpoint")?;

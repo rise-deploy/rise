@@ -162,7 +162,8 @@ echo "Vault configured with JFrog Artifactory plugin."
 vault write artifactory/roles/rise \
   scope="applied-permissions/admin" \
   max_ttl=3600 \
-  default_ttl=600
+  default_ttl=600 \
+  allow_scope_override=true
 echo "Role 'artifactory/roles/rise' created."
 
 # --- 12. Keep container running ---
