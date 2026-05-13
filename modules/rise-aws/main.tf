@@ -188,9 +188,6 @@ data "aws_iam_policy_document" "backend" {
       effect = "Allow"
       actions = [
         "iam:CreateUser",
-        "iam:GetUser",
-        "iam:TagUser",
-        "iam:UntagUser",
       ]
       resources = ["arn:aws:iam::${local.account_id}:user/${local.s3_bucket_prefix}-s3-*"]
       condition {
@@ -201,13 +198,18 @@ data "aws_iam_policy_document" "backend" {
     }
   }
 
-  # IAM user deletion for S3
+  # IAM user management for S3 (get, tag, delete — no boundary condition needed)
   dynamic "statement" {
     for_each = var.enable_s3 ? [1] : []
     content {
-      sid    = "DeleteS3IamUsers"
+      sid    = "ManageS3IamUsers"
       effect = "Allow"
-      actions = ["iam:DeleteUser"]
+      actions = [
+        "iam:GetUser",
+        "iam:DeleteUser",
+        "iam:TagUser",
+        "iam:UntagUser",
+      ]
       resources = ["arn:aws:iam::${local.account_id}:user/${local.s3_bucket_prefix}-s3-*"]
     }
   }
