@@ -33,8 +33,9 @@ data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
 
 locals {
-  region     = data.aws_region.current.id
-  account_id = data.aws_caller_identity.current.account_id
+  region           = data.aws_region.current.id
+  account_id       = data.aws_caller_identity.current.account_id
+  s3_bucket_prefix = var.s3_bucket_prefix != null ? var.s3_bucket_prefix : var.name
 }
 
 # -----------------------------------------------------------------------------
@@ -152,6 +153,94 @@ data "aws_iam_policy_document" "backend" {
     }
   }
 
+  # S3 bucket lifecycle management (if enabled)
+  dynamic "statement" {
+    for_each = var.enable_s3 ? [1] : []
+    content {
+      sid    = "ManageS3Buckets"
+      effect = "Allow"
+      actions = [
+        "s3:CreateBucket",
+        "s3:DeleteBucket",
+        "s3:GetBucketLocation",
+        "s3:ListBucket",
+        "s3:ListBucketVersions",
+        "s3:PutBucketTagging",
+        "s3:GetBucketTagging",
+        "s3:PutBucketPublicAccessBlock",
+        "s3:GetBucketPublicAccessBlock",
+        "s3:DeleteObject",
+        "s3:DeleteObjectVersion",
+        "s3:ListAllMyBuckets",
+      ]
+      resources = [
+        "arn:aws:s3:::${local.s3_bucket_prefix}-*",
+        "arn:aws:s3:::${local.s3_bucket_prefix}-*/*",
+      ]
+    }
+  }
+
+  # IAM user creation for S3 — requires the permissions boundary to be attached
+  dynamic "statement" {
+    for_each = var.enable_s3 ? [1] : []
+    content {
+      sid    = "CreateS3IamUsers"
+      effect = "Allow"
+      actions = [
+        "iam:CreateUser",
+        "iam:GetUser",
+        "iam:TagUser",
+        "iam:UntagUser",
+      ]
+      resources = ["arn:aws:iam::${local.account_id}:user/${local.s3_bucket_prefix}-s3-*"]
+      condition {
+        test     = "StringEquals"
+        variable = "iam:PermissionsBoundary"
+        values   = [aws_iam_policy.s3_user_boundary[0].arn]
+      }
+    }
+  }
+
+  # IAM user deletion for S3
+  dynamic "statement" {
+    for_each = var.enable_s3 ? [1] : []
+    content {
+      sid    = "DeleteS3IamUsers"
+      effect = "Allow"
+      actions = ["iam:DeleteUser"]
+      resources = ["arn:aws:iam::${local.account_id}:user/${local.s3_bucket_prefix}-s3-*"]
+    }
+  }
+
+  # IAM access key and inline policy management (scoped to Rise S3 users only)
+  dynamic "statement" {
+    for_each = var.enable_s3 ? [1] : []
+    content {
+      sid    = "ManageS3IamUserCredentials"
+      effect = "Allow"
+      actions = [
+        "iam:CreateAccessKey",
+        "iam:DeleteAccessKey",
+        "iam:ListAccessKeys",
+        "iam:PutUserPolicy",
+        "iam:DeleteUserPolicy",
+        "iam:GetUserPolicy",
+      ]
+      resources = ["arn:aws:iam::${local.account_id}:user/${local.s3_bucket_prefix}-s3-*"]
+    }
+  }
+
+  # Deny removing the permissions boundary (prevents privilege escalation)
+  dynamic "statement" {
+    for_each = var.enable_s3 ? [1] : []
+    content {
+      sid    = "DenyRemoveS3UserBoundary"
+      effect = "Deny"
+      actions = ["iam:DeleteUserPermissionsBoundary"]
+      resources = ["arn:aws:iam::${local.account_id}:user/${local.s3_bucket_prefix}-s3-*"]
+    }
+  }
+
   # RDS permissions for managing database instances (if enabled)
   dynamic "statement" {
     for_each = var.enable_rds ? [1] : []
@@ -194,7 +283,7 @@ data "aws_iam_policy_document" "backend" {
 
 resource "aws_iam_policy" "backend" {
   name        = local.name
-  description = "IAM policy for Rise backend to manage ECR repositories and RDS instances"
+  description = "IAM policy for Rise backend to manage ECR repositories, RDS instances, and S3 buckets"
   policy      = data.aws_iam_policy_document.backend.json
   tags        = local.tags
 }
@@ -408,6 +497,36 @@ resource "aws_iam_user_policy_attachment" "controller_assume_push" {
 
   user       = aws_iam_user.backend[0].name
   policy_arn = aws_iam_policy.assume_push_role[0].arn
+}
+
+# -----------------------------------------------------------------------------
+# S3 User Permissions Boundary
+# -----------------------------------------------------------------------------
+# This policy is attached as a permissions boundary to every IAM user created by the
+# S3 extension, capping their effective permissions to S3 operations on the Rise bucket
+# prefix. Even if the inline policy were broader, the boundary prevents privilege escalation.
+
+resource "aws_iam_policy" "s3_user_boundary" {
+  count = var.enable_s3 ? 1 : 0
+
+  name        = "${var.name}-s3-user-boundary"
+  description = "Permissions boundary for Rise-managed S3 IAM users. Caps maximum permissions to S3 access on the Rise bucket prefix."
+  tags        = local.tags
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "S3BucketAccess"
+        Effect   = "Allow"
+        Action   = ["s3:*"]
+        Resource = [
+          "arn:aws:s3:::${local.s3_bucket_prefix}-*",
+          "arn:aws:s3:::${local.s3_bucket_prefix}-*/*",
+        ]
+      }
+    ]
+  })
 }
 
 # -----------------------------------------------------------------------------

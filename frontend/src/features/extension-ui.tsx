@@ -1321,10 +1321,137 @@ const SnowflakeOAuthExtensionAPI = {
     },
 };
 
+// AWS S3 Bucket Extension
+
+export function AwsS3ExtensionUI({ spec, schema, onChange }) {
+    // No user-configurable fields in v0 — notify parent of empty spec on mount
+    const onChangeRef = useRef(onChange);
+    useEffect(() => { onChangeRef.current = onChange; }, [onChange]);
+    useEffect(() => { onChangeRef.current({}); }, []);
+
+    return (
+        <div className="space-y-4">
+            <MonoNotice tone="info" title="Fixed Environment Variables">
+                <p>This extension automatically injects the following environment variables into every deployment. No configuration is required.</p>
+                <div className="mt-3 space-y-1 font-mono text-xs">
+                    <div><span className="text-blue-600 dark:text-blue-400">S3_BUCKET_NAME</span> — the name of the provisioned S3 bucket</div>
+                    <div><span className="text-blue-600 dark:text-blue-400">AWS_ACCESS_KEY_ID</span> — IAM access key ID</div>
+                    <div><span className="text-blue-600 dark:text-blue-400">AWS_SECRET_ACCESS_KEY</span> — IAM secret access key</div>
+                    <div><span className="text-blue-600 dark:text-blue-400">AWS_REGION</span> — AWS region of the bucket</div>
+                </div>
+            </MonoNotice>
+            <MonoNotice tone="muted" title="Bucket Deletion">
+                <p>When you delete this extension, the IAM user and access key are removed immediately. The S3 bucket is only deleted if it is empty — non-empty buckets are left in place to prevent data loss.</p>
+            </MonoNotice>
+        </div>
+    );
+}
+
+export function AwsS3DetailView({ extension, projectName }) {
+    const status = extension.status || {};
+    const isAvailable = String(status.state || '').toLowerCase() === 'available';
+    const isFailed = String(status.state || '').toLowerCase() === 'failed';
+
+    return (
+        <div className="space-y-6">
+            <section className="space-y-3">
+                <div className="flex items-center gap-3">
+                    <h2 className="text-xl font-semibold text-gray-900 dark:text-gray-100">AWS S3 Bucket</h2>
+                    {renderStatePill(status.state)}
+                </div>
+                {isAvailable ? (
+                    <MonoNotice tone="success" title="Current State">
+                        <p>S3 bucket is provisioned and credentials are ready. Deploy your project to inject the environment variables.</p>
+                    </MonoNotice>
+                ) : isFailed ? (
+                    <MonoNotice tone="bad" title="Provisioning Failed">
+                        <p>{status.error || 'An error occurred during provisioning. The reconciler will retry automatically.'}</p>
+                    </MonoNotice>
+                ) : (
+                    <MonoNotice tone="warn" title="Current State">
+                        <p>Provisioning is in progress. New deployments will be blocked until the bucket is available.</p>
+                    </MonoNotice>
+                )}
+            </section>
+
+            <section>
+                <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-200 mb-3">Bucket Details</h2>
+                <div className="bg-white dark:bg-gray-900 rounded p-4 grid grid-cols-2 gap-4">
+                    <div>
+                        <p className="text-sm text-gray-600 dark:text-gray-500">State</p>
+                        <div className="mt-1">{renderStatePill(status.state)}</div>
+                    </div>
+                    <div>
+                        <p className="text-sm text-gray-600 dark:text-gray-500">Bucket Name</p>
+                        <p className="text-gray-700 dark:text-gray-300 font-mono text-sm">{status.bucket_name || '—'}</p>
+                    </div>
+                    <div>
+                        <p className="text-sm text-gray-600 dark:text-gray-500">IAM User</p>
+                        <p className="text-gray-700 dark:text-gray-300 font-mono text-sm">{status.iam_user_name || '—'}</p>
+                    </div>
+                    <div>
+                        <p className="text-sm text-gray-600 dark:text-gray-500">Access Key ID</p>
+                        <p className="text-gray-700 dark:text-gray-300 font-mono text-sm">{status.iam_access_key_id || '—'}</p>
+                    </div>
+                </div>
+            </section>
+
+            <section>
+                <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-200 mb-3">Injected Environment Variables</h2>
+                <MonoTable>
+                    <MonoTableHead>
+                        <MonoTableRow>
+                            <MonoTh>Variable</MonoTh>
+                            <MonoTh>Value</MonoTh>
+                        </MonoTableRow>
+                    </MonoTableHead>
+                    <MonoTableBody>
+                        <MonoTableRow>
+                            <MonoTd><span className="font-mono text-sm">S3_BUCKET_NAME</span></MonoTd>
+                            <MonoTd><span className="font-mono text-sm text-gray-600 dark:text-gray-400">{status.bucket_name || '(pending)'}</span></MonoTd>
+                        </MonoTableRow>
+                        <MonoTableRow>
+                            <MonoTd><span className="font-mono text-sm">AWS_ACCESS_KEY_ID</span></MonoTd>
+                            <MonoTd><span className="font-mono text-sm text-gray-600 dark:text-gray-400">{status.iam_access_key_id || '(pending)'}</span></MonoTd>
+                        </MonoTableRow>
+                        <MonoTableRow>
+                            <MonoTd><span className="font-mono text-sm">AWS_SECRET_ACCESS_KEY</span></MonoTd>
+                            <MonoTd><MonoTag color="muted">protected</MonoTag></MonoTd>
+                        </MonoTableRow>
+                        <MonoTableRow>
+                            <MonoTd><span className="font-mono text-sm">AWS_REGION</span></MonoTd>
+                            <MonoTd><span className="font-mono text-sm text-gray-600 dark:text-gray-400">(from backend config)</span></MonoTd>
+                        </MonoTableRow>
+                    </MonoTableBody>
+                </MonoTable>
+            </section>
+        </div>
+    );
+}
+
+const AwsS3ExtensionAPI = {
+    icon: null,
+
+    renderStatusBadge(extension) {
+        const status = extension.status || {};
+        if (!status.state) return null;
+        return renderStatePill(status.state);
+    },
+
+    renderOverviewTab(extension, projectName) {
+        return <AwsS3DetailView extension={extension} projectName={projectName} />;
+    },
+
+    renderConfigureTab(spec, schema, onChange, projectName, instanceName, isEnabled) {
+        return <AwsS3ExtensionUI spec={spec} schema={schema} onChange={onChange} />;
+    },
+};
+
 // Extension UI Registry
 // Maps extension type identifiers to their UI API implementations
 const ExtensionUIRegistry = {
     'aws-rds-provisioner': AwsRdsExtensionAPI,
+    'aws-s3-bucket': AwsS3ExtensionAPI,
     'oauth': OAuthExtensionAPI,
     'snowflake-oauth-provisioner': SnowflakeOAuthExtensionAPI,
     // Add more extension UIs here as needed

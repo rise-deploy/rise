@@ -1424,6 +1424,7 @@ pub enum PrivateKeySource {
 }
 
 /// Extension provider configuration
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum ExtensionProviderConfig {
@@ -1461,6 +1462,29 @@ pub enum ExtensionProviderConfig {
         /// Preferred maintenance window (e.g., "sun:04:00-sun:05:00")
         #[serde(default)]
         maintenance_window: Option<String>,
+        #[serde(default)]
+        access_key_id: Option<String>,
+        #[serde(default)]
+        secret_access_key: Option<String>,
+    },
+
+    #[cfg(feature = "backend")]
+    #[serde(rename = "aws-s3-bucket")]
+    AwsS3BucketProvisioner {
+        region: String,
+        /// Prefix for S3 bucket and IAM user names. Must match the Terraform IAM policy prefix.
+        /// Default: "rise"
+        #[serde(default = "default_s3_bucket_prefix")]
+        bucket_prefix: String,
+        /// Template for bucket names.
+        /// Placeholders: {prefix}, {project_name}, {extension_name}
+        /// Default: "{prefix}-{project_name}-{extension_name}"
+        #[serde(default = "default_s3_bucket_name_template")]
+        bucket_name_template: String,
+        /// ARN of the IAM permissions boundary policy (output `s3_user_permissions_boundary_arn`
+        /// from the `rise-aws` Terraform module). All IAM users created by this extension will
+        /// have this boundary attached, preventing privilege escalation.
+        user_permissions_boundary_arn: String,
         #[serde(default)]
         access_key_id: Option<String>,
         #[serde(default)]
@@ -1518,6 +1542,16 @@ fn default_engine_version() -> String {
 #[allow(dead_code)]
 fn default_backup_retention_days() -> i32 {
     7 // 7 days of backup retention (reasonable default for production)
+}
+
+#[allow(dead_code)]
+fn default_s3_bucket_prefix() -> String {
+    "rise".to_string()
+}
+
+#[allow(dead_code)]
+fn default_s3_bucket_name_template() -> String {
+    "{prefix}-{project_name}-{extension_name}".to_string()
 }
 
 #[allow(dead_code)]

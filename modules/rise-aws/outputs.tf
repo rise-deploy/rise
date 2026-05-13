@@ -122,8 +122,21 @@ output "rise_config" {
         vpc_security_group_ids = [aws_security_group.rds[0].id]
         db_subnet_group_name   = aws_db_subnet_group.rds[0].name
       }
+    } : {},
+    # S3 configuration (if enabled)
+    var.enable_s3 ? {
+      s3 = {
+        region                        = local.region
+        bucket_prefix                 = local.s3_bucket_prefix
+        user_permissions_boundary_arn = aws_iam_policy.s3_user_boundary[0].arn
+      }
     } : {}
   )
+}
+
+output "s3_user_permissions_boundary_arn" {
+  description = "ARN of the IAM permissions boundary policy for Rise-managed S3 IAM users (null if S3 not enabled)"
+  value       = var.enable_s3 ? aws_iam_policy.s3_user_boundary[0].arn : null
 }
 
 output "lifecycle_policy" {
