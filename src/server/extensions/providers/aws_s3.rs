@@ -40,6 +40,10 @@ pub enum S3BucketState {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AwsS3Status {
     pub state: S3BucketState,
+    /// Random suffix included in AWS resource names to prevent collisions between
+    /// projects whose names sanitize to the same value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bucket_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -91,21 +95,38 @@ impl AwsS3Provisioner {
         }
     }
 
-    fn bucket_name_for(&self, project_name: &str, extension_name: &str) -> String {
+    fn bucket_name_for(
+        &self,
+        project_name: &str,
+        extension_name: &str,
+        resource_id: &str,
+    ) -> String {
         let raw = self
             .bucket_name_template
             .replace("{prefix}", &self.bucket_prefix)
             .replace("{project_name}", project_name)
             .replace("{extension_name}", extension_name);
-        sanitize_s3_name(&raw, 63)
+        let with_id = format!("{}-{}", raw, resource_id);
+        sanitize_s3_name(&with_id, 63)
     }
 
-    fn iam_user_name_for(&self, project_name: &str, extension_name: &str) -> String {
+    fn iam_user_name_for(
+        &self,
+        project_name: &str,
+        extension_name: &str,
+        resource_id: &str,
+    ) -> String {
         let raw = format!(
-            "{}-s3-{}-{}",
-            self.bucket_prefix, project_name, extension_name
+            "{}-s3-{}-{}-{}",
+            self.bucket_prefix, project_name, extension_name, resource_id
         );
         sanitize_iam_name(&raw, 64)
+    }
+
+    fn generate_resource_id() -> String {
+        use rand::RngExt;
+        let mut rng = rand::rng();
+        format!("{:08x}", rng.random::<u32>())
     }
 
     fn finalizer_name(&self, extension_name: &str) -> String {
@@ -123,8 +144,12 @@ impl AwsS3Provisioner {
         project_id: Uuid,
         extension_name: &str,
     ) -> Result<()> {
-        let bucket_name = self.bucket_name_for(project_name, extension_name);
-        let iam_user_name = self.iam_user_name_for(project_name, extension_name);
+        let resource_id = status
+            .resource_id
+            .get_or_insert_with(Self::generate_resource_id)
+            .clone();
+        let bucket_name = self.bucket_name_for(project_name, extension_name, &resource_id);
+        let iam_user_name = self.iam_user_name_for(project_name, extension_name, &resource_id);
 
         info!(
             "Provisioning S3 bucket '{}' and IAM user '{}' for project '{}' (extension: '{}')",
@@ -536,6 +561,9 @@ impl AwsS3Provisioner {
     }
 
     async fn handle_deletion(&self, status: &mut AwsS3Status, project_name: &str) -> Result<()> {
+        status.state = S3BucketState::Deleting;
+        status.error = None;
+
         // 1. Delete IAM access keys
         if let Some(ref iam_user_name) = status.iam_user_name.clone() {
             match self
@@ -625,11 +653,13 @@ impl AwsS3Provisioner {
                         status.state = S3BucketState::Deleted;
                         return Ok(());
                     }
-                    warn!(
+                    let msg = format!(
                         "Failed to check if S3 bucket '{}' is empty: {:?}",
                         bucket_name, e
                     );
-                    false
+                    warn!("{}", msg);
+                    status.error = Some(msg);
+                    return Ok(());
                 }
             };
 
@@ -649,16 +679,23 @@ impl AwsS3Provisioner {
                         if err_str.contains("NoSuchBucket") {
                             info!("S3 bucket '{}' already deleted", bucket_name);
                         } else {
-                            warn!("Failed to delete S3 bucket '{}': {:?}", bucket_name, e);
+                            let msg =
+                                format!("Failed to delete S3 bucket '{}': {:?}", bucket_name, e);
+                            warn!("{}", msg);
+                            status.error = Some(msg);
+                            return Ok(());
                         }
                     }
                 }
             } else {
-                warn!(
-                    "S3 bucket '{}' for project '{}' is not empty — skipping bucket deletion to prevent data loss. \
-                     The bucket must be emptied and deleted manually.",
+                let msg = format!(
+                    "S3 bucket '{}' for project '{}' is not empty — \
+                     the bucket must be emptied and deleted manually before the extension can be fully removed.",
                     bucket_name, project_name
                 );
+                warn!("{}", msg);
+                status.error = Some(msg);
+                return Ok(());
             }
         }
 
@@ -684,6 +721,7 @@ impl AwsS3Provisioner {
         let mut status: AwsS3Status = serde_json::from_value(project_extension.status.clone())
             .unwrap_or(AwsS3Status {
                 state: S3BucketState::Pending,
+                resource_id: None,
                 bucket_name: None,
                 iam_user_name: None,
                 iam_access_key_id: None,
@@ -1084,7 +1122,13 @@ impl Extension for AwsS3Provisioner {
                     "Available".to_string()
                 }
             }
-            S3BucketState::Deleting => "Deleting...".to_string(),
+            S3BucketState::Deleting => {
+                if let Some(err) = parsed.error {
+                    format!("Deleting (blocked): {}", err)
+                } else {
+                    "Deleting...".to_string()
+                }
+            }
             S3BucketState::Deleted => "Deleted".to_string(),
             S3BucketState::Failed => {
                 if let Some(err) = parsed.error {
