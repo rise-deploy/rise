@@ -63,6 +63,10 @@ pub struct AppState {
     pub production_ingress_url_template: Option<String>,
     /// Staging ingress URL template (for custom domain validation)
     pub staging_ingress_url_template: Option<String>,
+    /// Ingress URL scheme (e.g., "https" or "http")
+    pub ingress_schema: String,
+    /// Optional ingress port (for development environments)
+    pub ingress_port: Option<u16>,
     /// ResourceBuilder for Metacontroller webhook (builds K8s resource specs)
     #[cfg(feature = "backend")]
     pub resource_builder: Option<Arc<crate::server::deployment::resource_builder::ResourceBuilder>>,
@@ -798,26 +802,41 @@ impl AppState {
 
         // Extract access_classes from deployment controller settings
         // Filter out null values (used to remove inherited access classes)
-        let (access_classes, production_ingress_url_template, staging_ingress_url_template) =
-            if let Some(crate::server::settings::DeploymentControllerSettings::Kubernetes {
-                access_classes,
-                production_ingress_url_template,
-                staging_ingress_url_template,
-                ..
-            }) = &settings.deployment_controller
-            {
-                let filtered: std::collections::HashMap<_, _> = access_classes
-                    .iter()
-                    .filter_map(|(k, v)| v.as_ref().map(|ac| (k.clone(), ac.clone())))
-                    .collect();
-                (
-                    Arc::new(filtered),
-                    Some(production_ingress_url_template.clone()),
-                    staging_ingress_url_template.clone(),
-                )
-            } else {
-                (Arc::new(std::collections::HashMap::new()), None, None)
-            };
+        let (
+            access_classes,
+            production_ingress_url_template,
+            staging_ingress_url_template,
+            ingress_schema,
+            ingress_port,
+        ) = if let Some(crate::server::settings::DeploymentControllerSettings::Kubernetes {
+            access_classes,
+            production_ingress_url_template,
+            staging_ingress_url_template,
+            ingress_schema,
+            ingress_port,
+            ..
+        }) = &settings.deployment_controller
+        {
+            let filtered: std::collections::HashMap<_, _> = access_classes
+                .iter()
+                .filter_map(|(k, v)| v.as_ref().map(|ac| (k.clone(), ac.clone())))
+                .collect();
+            (
+                Arc::new(filtered),
+                Some(production_ingress_url_template.clone()),
+                staging_ingress_url_template.clone(),
+                ingress_schema.clone(),
+                *ingress_port,
+            )
+        } else {
+            (
+                Arc::new(std::collections::HashMap::new()),
+                None,
+                None,
+                "https".to_string(),
+                None,
+            )
+        };
 
         Ok(Self {
             db_pool,
@@ -840,6 +859,8 @@ impl AppState {
             access_classes,
             production_ingress_url_template,
             staging_ingress_url_template,
+            ingress_schema,
+            ingress_port,
             #[cfg(feature = "backend")]
             resource_builder,
             #[cfg(feature = "backend")]
