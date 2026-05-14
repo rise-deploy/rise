@@ -25,10 +25,18 @@ use tracing::instrument;
 /// Returns `None` if no ingress URL template is configured.
 fn build_project_url(state: &AppState, project_name: &str) -> Option<String> {
     let template = state.production_ingress_url_template.as_ref()?;
-    let host = template.replace("{project_name}", project_name);
+    let resolved = template.replace("{project_name}", project_name);
+    // Split host from optional path prefix (e.g. "rise.dev/myapp" → host="rise.dev", path="/myapp")
+    let (host, path) = match resolved.find('/') {
+        Some(pos) => (&resolved[..pos], &resolved[pos..]),
+        None => (resolved.as_str(), ""),
+    };
     match state.ingress_port {
-        Some(port) => Some(format!("{}://{}:{}", state.ingress_schema, host, port)),
-        None => Some(format!("{}://{}", state.ingress_schema, host)),
+        Some(port) => Some(format!(
+            "{}://{}:{}{}",
+            state.ingress_schema, host, port, path
+        )),
+        None => Some(format!("{}://{}{}", state.ingress_schema, host, path)),
     }
 }
 
@@ -1308,8 +1316,13 @@ pub async fn oauth_callback(
             })?;
 
         // Issue Rise JWT with user's team memberships
-        // Build project URL from ingress template for the aud claim
-        let project_url = build_project_url(&state, project)
+        // Use custom domain URL as audience when available, otherwise build from ingress template
+        let project_url = claimed_state
+            .data()
+            .custom_domain_base_url
+            .as_deref()
+            .map(|url| url.trim_end_matches('/').to_string())
+            .or_else(|| build_project_url(&state, project))
             .unwrap_or_else(|| state.public_url.trim_end_matches('/').to_string());
 
         let rise_jwt = state

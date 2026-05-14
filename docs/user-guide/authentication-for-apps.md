@@ -13,8 +13,10 @@ When a user logs into a Rise-deployed application:
 
 > **Token types**: Rise issues HS256-signed JWTs for API/CLI authentication (audience = Rise server)
 > and RS256-signed JWTs for application ingress authentication (audience = application URL).
-> Applications only see RS256 tokens. The different signing algorithms ensure tokens cannot be
-> used across contexts.
+> The different signing algorithms and audiences ensure tokens cannot be used across contexts.
+> Applications should always validate `alg` (expect RS256) and `aud` (expect their own URL).
+> When cookies share a parent domain, an HS256 session cookie may also be present — validating
+> `alg` and `aud` ensures your app only accepts tokens issued for it.
 
 ## The `rise_jwt` Cookie
 
@@ -203,8 +205,8 @@ app.get('/admin', requireTeam('admin'), (req: Request, res: Response) => {
 ## Security Considerations
 
 - The `rise_jwt` cookie is **HttpOnly** - JavaScript cannot access it (XSS protection)
-- The `rise_jwt` cookie is **application-scoped** — the `aud` claim is set to the application's URL, making the token unusable for Rise API access. Rise's API rejects tokens with non-matching audiences. Applications **must** validate the `aud` claim to ensure the token was issued for them specifically
-- The JWT is signed with RS256 - public keys fetched via OIDC discovery verify authenticity
+- The `rise_jwt` cookie is **application-scoped** — the `aud` claim is set to the application's URL, making the token unusable for Rise API access. Rise's API rejects tokens with non-matching audiences. Applications **must** validate both `alg` (expect RS256) and `aud` (expect their own URL) to ensure the token was issued for them specifically
+- The JWT is signed with RS256 - public keys fetched via OIDC discovery verify authenticity. When cookies share a parent domain, HS256 session tokens may also be present — `alg` and `aud` validation filters these out
 - Tokens expire after 24 hours by default - users must re-authenticate periodically
 
 ## Additional Resources
