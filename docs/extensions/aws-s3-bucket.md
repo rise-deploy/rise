@@ -8,7 +8,7 @@ The `aws-s3-bucket` extension provisions an S3 bucket for a project and injects 
 - Creates a scoped IAM user with full access to **only** that bucket. The user is created with a permissions boundary that prevents it from ever being granted permissions beyond S3 access on the Rise bucket prefix.
 - Generates an IAM access key and securely stores the credentials.
 - Injects the bucket name and credentials into deployments automatically.
-- On extension deletion: removes the IAM user and access key; deletes the bucket only if empty.
+- On extension deletion: removes the IAM user and access key; deletes the bucket only if empty. Non-empty buckets block deletion — you can choose "Empty bucket and delete" in the UI to have the controller empty and delete the bucket.
 
 ## Injected Environment Variables
 
@@ -40,7 +40,8 @@ extensions:
       region: us-east-1
       # user_permissions_boundary_arn is the output of the rise-aws Terraform module
       user_permissions_boundary_arn: "arn:aws:iam::123456789012:policy/rise-backend-s3-user-boundary"
-      # Optional: prefix for bucket and IAM user names (default: "rise")
+      # Prefix for bucket and IAM user names (default: "rise").
+      # Must match the Terraform module's s3_bucket_prefix for IAM permissions to work.
       # bucket_prefix: rise
       # Optional: bucket name template (default: "{prefix}-{project_name}-{extension_name}")
       # bucket_name_template: "{prefix}-{project_name}-{extension_name}"
@@ -59,7 +60,9 @@ module "rise_aws" {
 
   name       = "rise-backend"
   enable_s3  = true
-  # s3_bucket_prefix = "rise"  # optional, defaults to var.name
+  # s3_bucket_prefix must match the backend's bucket_prefix (both default differently:
+  # Terraform defaults to var.name, backend defaults to "rise"). Set explicitly to match.
+  s3_bucket_prefix = "rise"
 }
 ```
 
@@ -75,5 +78,5 @@ output "s3_user_permissions_boundary_arn" {
 ## Notes
 
 - Provisioning is synchronous and completes in seconds (unlike RDS which may take minutes).
-- Non-empty buckets are **not** deleted when the extension is removed. Empty and delete them manually if needed.
+- Non-empty buckets block deletion when the extension is removed. Use the "Empty bucket and delete" option in the UI to have the controller incrementally empty and delete the bucket.
 - One bucket per project is the intended usage for v0.

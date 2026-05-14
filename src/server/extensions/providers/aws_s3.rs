@@ -268,55 +268,62 @@ impl AwsS3Provisioner {
         }
 
         // 3. Tag bucket
-        let tags = aws_sdk_s3::types::Tagging::builder()
-            .tag_set(
-                aws_sdk_s3::types::Tag::builder()
-                    .key("rise:managed")
-                    .value("true")
-                    .build()
-                    .expect("valid tag"),
-            )
-            .tag_set(
-                aws_sdk_s3::types::Tag::builder()
-                    .key("rise:project")
-                    .value(project_name)
-                    .build()
-                    .expect("valid tag"),
-            )
-            .build()
-            .expect("valid tagging");
-
-        if let Err(e) = self
-            .s3_client
-            .put_bucket_tagging()
-            .bucket(&bucket_name)
-            .tagging(tags)
-            .send()
-            .await
-        {
-            warn!("Failed to tag S3 bucket '{}': {:?}", bucket_name, e);
+        let truncated_project_name = if project_name.len() > 256 {
+            &project_name[..256]
+        } else {
+            project_name
+        };
+        match (|| -> Result<aws_sdk_s3::types::Tagging> {
+            Ok(aws_sdk_s3::types::Tagging::builder()
+                .tag_set(
+                    aws_sdk_s3::types::Tag::builder()
+                        .key("rise:managed")
+                        .value("true")
+                        .build()?,
+                )
+                .tag_set(
+                    aws_sdk_s3::types::Tag::builder()
+                        .key("rise:project")
+                        .value(truncated_project_name)
+                        .build()?,
+                )
+                .build()?)
+        })() {
+            Ok(tags) => {
+                if let Err(e) = self
+                    .s3_client
+                    .put_bucket_tagging()
+                    .bucket(&bucket_name)
+                    .tagging(tags)
+                    .send()
+                    .await
+                {
+                    warn!("Failed to tag S3 bucket '{}': {:?}", bucket_name, e);
+                }
+            }
+            Err(e) => {
+                warn!("Failed to build S3 bucket tags: {:?}", e);
+            }
         }
 
         // 4. Create IAM user with permissions boundary
+        let iam_managed_tag = aws_sdk_iam::types::Tag::builder()
+            .key("rise:managed")
+            .value("true")
+            .build()
+            .context("Failed to build IAM tag")?;
+        let iam_project_tag = aws_sdk_iam::types::Tag::builder()
+            .key("rise:project")
+            .value(truncated_project_name)
+            .build()
+            .context("Failed to build IAM tag")?;
         match self
             .iam_client
             .create_user()
             .user_name(&iam_user_name)
             .permissions_boundary(&self.user_permissions_boundary_arn)
-            .tags(
-                aws_sdk_iam::types::Tag::builder()
-                    .key("rise:managed")
-                    .value("true")
-                    .build()
-                    .expect("valid tag"),
-            )
-            .tags(
-                aws_sdk_iam::types::Tag::builder()
-                    .key("rise:project")
-                    .value(project_name)
-                    .build()
-                    .expect("valid tag"),
-            )
+            .tags(iam_managed_tag)
+            .tags(iam_project_tag)
             .send()
             .await
         {
@@ -1074,8 +1081,8 @@ fn sanitize_s3_name(raw: &str, max_len: usize) -> String {
     result.chars().take(max_len).collect()
 }
 
-/// Sanitize a string to be a valid IAM user name (alphanumeric, hyphens, underscores, plus, equals,
-/// comma, period, @), truncated to `max_len`.
+/// Sanitize a string to be a valid IAM user name (alphanumeric, hyphens, underscores),
+/// truncated to `max_len`.
 fn sanitize_iam_name(raw: &str, max_len: usize) -> String {
     let sanitized: String = raw
         .chars()
@@ -1182,7 +1189,8 @@ impl Extension for AwsS3Provisioner {
                             if let Some((error_count, last_error)) =
                                 error_state.get(&ext.project_id)
                             {
-                                let backoff_seconds = 2_i64.pow(*error_count as u32).min(300);
+                                let backoff_seconds =
+                                    2_i64.saturating_pow((*error_count).min(8) as u32).min(300);
                                 let backoff_until =
                                     *last_error + Duration::seconds(backoff_seconds);
 

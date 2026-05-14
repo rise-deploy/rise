@@ -24,7 +24,7 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 
 app.use(express.static(path.join(__dirname, "public")));
 
 app.get("/api/files", async (req, res) => {
-  const prefix = req.query.prefix || "";
+  const prefix = String(req.query.prefix || "");
   const delimiter = "/";
   try {
     const data = await s3.send(
