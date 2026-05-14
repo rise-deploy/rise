@@ -377,11 +377,40 @@ impl JwtSigner {
         Ok(token)
     }
 
+    /// Verify and decode a Rise user JWT (HS256 only) with audience validation
+    ///
+    /// This is used by the API middleware to authenticate user requests.
+    /// Only accepts HS256 tokens (user JWTs) and validates that the audience matches
+    /// the Rise public URL, rejecting RS256 ingress tokens.
+    ///
+    /// # Arguments
+    /// * `token` - The JWT token string
+    /// * `expected_aud` - Expected audience (Rise public URL)
+    pub fn verify_user_jwt(
+        &self,
+        token: &str,
+        expected_aud: &str,
+    ) -> Result<RiseClaims, JwtSignerError> {
+        let header = jsonwebtoken::decode_header(token)?;
+        if header.alg != Algorithm::HS256 {
+            return Err(JwtSignerError::SigningFailed(
+                jsonwebtoken::errors::ErrorKind::InvalidAlgorithm.into(),
+            ));
+        }
+
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.set_issuer(&[&self.issuer]);
+        validation.set_audience(&[expected_aud]);
+
+        let token_data = decode::<RiseClaims>(token, &self.hs256_decoding_key, &validation)?;
+        Ok(token_data.claims)
+    }
+
     /// Verify and decode a Rise JWT without audience validation
     ///
-    /// This is used in the ingress_auth handler where the project URL is not readily available
-    /// and project access is validated separately. For other use cases, consider using
-    /// a more specific validation method if one becomes available.
+    /// Only used by the `ingress_auth` handler where both HS256 (user session) and RS256
+    /// (app-scoped) tokens must be accepted. Project access is validated separately via
+    /// database checks. Do not use this for API authentication — use `verify_user_jwt` instead.
     ///
     /// # Arguments
     /// * `token` - The JWT token string
@@ -504,6 +533,87 @@ mod tests {
         assert_eq!(verified_claims.sub, "user456");
         assert_eq!(verified_claims.email, "user2@example.com");
         assert_eq!(verified_claims.aud, "https://myapp.apps.rise.dev");
+    }
+
+    #[test]
+    fn test_verify_user_jwt_accepts_valid_hs256() {
+        let signer = create_test_signer();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let claims = RiseClaims {
+            sub: "user123".to_string(),
+            email: "user@example.com".to_string(),
+            name: None,
+            groups: None,
+            iat: now,
+            exp: now + 3600,
+            iss: "https://rise.test".to_string(),
+            aud: "https://rise.test".to_string(),
+        };
+
+        let header = Header::new(Algorithm::HS256);
+        let token = encode(&header, &claims, &signer.hs256_encoding_key).unwrap();
+
+        let verified = signer.verify_user_jwt(&token, "https://rise.test").unwrap();
+        assert_eq!(verified.sub, "user123");
+        assert_eq!(verified.email, "user@example.com");
+        assert_eq!(verified.aud, "https://rise.test");
+    }
+
+    #[test]
+    fn test_verify_user_jwt_rejects_rs256() {
+        let signer = create_test_signer();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let claims = RiseClaims {
+            sub: "user456".to_string(),
+            email: "user2@example.com".to_string(),
+            name: None,
+            groups: None,
+            iat: now,
+            exp: now + 3600,
+            iss: "https://rise.test".to_string(),
+            aud: "https://rise.test".to_string(),
+        };
+
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(signer.rs256_key_id.to_string());
+        let token = encode(&header, &claims, &signer.rs256_encoding_key).unwrap();
+
+        let result = signer.verify_user_jwt(&token, "https://rise.test");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_user_jwt_rejects_wrong_audience() {
+        let signer = create_test_signer();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let claims = RiseClaims {
+            sub: "user789".to_string(),
+            email: "user3@example.com".to_string(),
+            name: None,
+            groups: None,
+            iat: now,
+            exp: now + 3600,
+            iss: "https://rise.test".to_string(),
+            aud: "https://myapp.apps.rise.dev".to_string(),
+        };
+
+        let header = Header::new(Algorithm::HS256);
+        let token = encode(&header, &claims, &signer.hs256_encoding_key).unwrap();
+
+        let result = signer.verify_user_jwt(&token, "https://rise.test");
+        assert!(result.is_err());
     }
 
     #[test]

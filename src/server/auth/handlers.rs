@@ -20,30 +20,24 @@ use std::collections::HashMap;
 use tera::Tera;
 use tracing::instrument;
 
-/// Extract project URL (scheme + host + port) from a redirect URL
+/// Build the project URL for the `aud` claim from the ingress URL template
 ///
-/// This is used to set the `aud` claim in Rise JWTs for project authentication.
-/// Falls back to public_url if the redirect_url cannot be parsed.
-///
-/// # Arguments
-/// * `redirect_url` - Full URL or relative path to extract base URL from
-/// * `fallback_url` - URL to use if parsing fails (typically Rise public URL)
-///
-/// # Returns
-/// Base URL in the format "https://host:port" (port omitted for 80/443)
-fn extract_project_url_from_redirect(redirect_url: &str, fallback_url: &str) -> String {
-    if let Ok(parsed_url) = url::Url::parse(redirect_url) {
-        if let Some(host) = parsed_url.host_str() {
-            let port_part = match parsed_url.port() {
-                Some(port) if port != 80 && port != 443 => format!(":{}", port),
-                _ => String::new(),
-            };
-            return format!("{}://{}{}", parsed_url.scheme(), host, port_part);
-        }
+/// Returns `None` if no ingress URL template is configured.
+fn build_project_url(state: &AppState, project_name: &str) -> Option<String> {
+    let template = state.production_ingress_url_template.as_ref()?;
+    let resolved = template.replace("{project_name}", project_name);
+    // Split host from optional path prefix (e.g. "rise.dev/myapp" → host="rise.dev", path="/myapp")
+    let (host, path) = match resolved.find('/') {
+        Some(pos) => (&resolved[..pos], &resolved[pos..]),
+        None => (resolved.as_str(), ""),
+    };
+    match state.ingress_port {
+        Some(port) => Some(format!(
+            "{}://{}:{}{}",
+            state.ingress_schema, host, port, path
+        )),
+        None => Some(format!("{}://{}{}", state.ingress_schema, host, path)),
     }
-
-    // Fallback: use provided URL if parsing fails or host missing
-    fallback_url.trim_end_matches('/').to_string()
 }
 
 /// Validate and sanitize a redirect URL to prevent open redirect vulnerabilities
@@ -1322,8 +1316,14 @@ pub async fn oauth_callback(
             })?;
 
         // Issue Rise JWT with user's team memberships
-        // Extract project URL from redirect_url for the aud claim
-        let project_url = extract_project_url_from_redirect(&redirect_url, &state.public_url);
+        // Use custom domain URL as audience when available, otherwise build from ingress template
+        let project_url = claimed_state
+            .data()
+            .custom_domain_base_url
+            .as_deref()
+            .map(|url| url.trim_end_matches('/').to_string())
+            .or_else(|| build_project_url(&state, project))
+            .unwrap_or_else(|| state.public_url.trim_end_matches('/').to_string());
 
         let rise_jwt = state
             .jwt_signer

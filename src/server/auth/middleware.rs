@@ -138,13 +138,16 @@ pub async fn auth_middleware(
     );
 
     if is_rise_issued_jwt(&issuer, &state.public_url) {
-        // Rise-issued JWT (HS256 or RS256) - validate with JwtSigner
+        // Rise-issued JWT — only accept HS256 user tokens with correct audience
         tracing::debug!("Auth middleware: authenticating with Rise-issued JWT");
 
-        let claims = state.jwt_signer.verify_jwt_skip_aud(&token).map_err(|e| {
-            tracing::warn!("Auth middleware: Rise JWT validation failed: {:#}", e);
-            (StatusCode::UNAUTHORIZED, format!("Invalid token: {}", e))
-        })?;
+        let claims = state
+            .jwt_signer
+            .verify_user_jwt(&token, &state.public_url)
+            .map_err(|e| {
+                tracing::warn!("Auth middleware: Rise JWT validation failed: {:#}", e);
+                (StatusCode::UNAUTHORIZED, format!("Invalid token: {}", e))
+            })?;
 
         tracing::debug!("Auth middleware: Rise JWT validation successful");
 
@@ -242,8 +245,10 @@ pub async fn optional_auth_middleware(
                     if let Ok(claims) = serde_json::from_slice::<MinimalClaims>(&decoded) {
                         // Only accept Rise-issued JWTs for optional auth
                         if is_rise_issued_jwt(&claims.iss, &state.public_url) {
-                            // Try to validate Rise JWT
-                            if let Ok(rise_claims) = state.jwt_signer.verify_jwt_skip_aud(&token) {
+                            // Try to validate Rise user JWT (HS256 + correct audience)
+                            if let Ok(rise_claims) =
+                                state.jwt_signer.verify_user_jwt(&token, &state.public_url)
+                            {
                                 let email = &rise_claims.email;
                                 if let Ok(user) = users::find_or_create(&state.db_pool, email).await
                                 {
