@@ -28,10 +28,6 @@ pub struct ServerSettings {
     #[serde(default)]
     pub frontend_dev_proxy_url: Option<String>,
 
-    /// Cookie domain for session cookies (e.g., ".rise.dev" for all subdomains, "" for current host only)
-    #[serde(default)]
-    pub cookie_domain: String,
-
     /// Whether to set Secure flag on cookies (true for HTTPS, false for HTTP development)
     #[serde(default = "default_cookie_secure")]
     pub cookie_secure: bool,

@@ -187,8 +187,6 @@ app.get('/admin', requireTeam('admin'), (req: Request, res: Response) => {
 
 - **Check Authentication**: User may not be logged in
 - **Check Access Class**: Ensure your project has authentication enabled
-- **Check Cookie Domain**: For custom domains, cookies may not be shared
-
 ### Groups Missing
 
 - **Check IdP Configuration**: Groups come from your identity provider

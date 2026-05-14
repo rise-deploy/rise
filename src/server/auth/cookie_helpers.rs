@@ -19,7 +19,6 @@ fn parse_cookies(cookie_header: &str) -> impl Iterator<Item = (&str, &str)> {
 /// Settings for session cookies
 #[derive(Debug, Clone)]
 pub struct CookieSettings {
-    pub domain: String,
     pub secure: bool,
 }
 
@@ -32,9 +31,11 @@ pub struct CookieSettings {
 /// - HttpOnly: Prevents JavaScript access (XSS protection)
 /// - Secure: HTTPS-only transmission (configurable for development)
 /// - SameSite=Lax: CSRF protection while allowing navigation
-/// - Domain: Shared across subdomains (e.g., .rise.dev)
 /// - Max-Age: Matches JWT expiry time
 /// - Path=/: Valid for all paths
+///
+/// No `Domain` attribute is set — the browser scopes the cookie to the
+/// exact host that set it, preventing cross-domain leakage.
 pub fn create_rise_jwt_cookie(
     jwt: &str,
     settings: &CookieSettings,
@@ -47,11 +48,6 @@ pub fn create_rise_jwt_cookie(
         "HttpOnly".to_string(),
         "SameSite=Lax".to_string(),
     ];
-
-    // Only set Domain if it's not empty (empty means current host only)
-    if !settings.domain.is_empty() {
-        cookie_parts.push(format!("Domain={}", settings.domain));
-    }
 
     // Only set Secure flag if configured (false for HTTP development)
     if settings.secure {
@@ -85,10 +81,6 @@ pub fn clear_rise_jwt_cookie(settings: &CookieSettings) -> String {
         "SameSite=Lax".to_string(),
     ];
 
-    if !settings.domain.is_empty() {
-        cookie_parts.push(format!("Domain={}", settings.domain));
-    }
-
     if settings.secure {
         cookie_parts.push("Secure".to_string());
     }
@@ -103,10 +95,7 @@ mod tests {
 
     #[test]
     fn test_create_rise_jwt_cookie() {
-        let settings = CookieSettings {
-            domain: ".rise.dev".to_string(),
-            secure: true,
-        };
+        let settings = CookieSettings { secure: true };
 
         let cookie = create_rise_jwt_cookie("jwt_token_xyz", &settings, 3600);
 
@@ -115,7 +104,7 @@ mod tests {
         assert!(cookie.contains("Path=/"));
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("SameSite=Lax"));
-        assert!(cookie.contains("Domain=.rise.dev"));
+        assert!(!cookie.contains("Domain="));
         assert!(cookie.contains("Secure"));
     }
 
@@ -142,17 +131,14 @@ mod tests {
 
     #[test]
     fn test_clear_rise_jwt_cookie() {
-        let settings = CookieSettings {
-            domain: ".rise.dev".to_string(),
-            secure: true,
-        };
+        let settings = CookieSettings { secure: true };
 
         let cookie = clear_rise_jwt_cookie(&settings);
 
         assert!(cookie.contains("rise_jwt="));
         assert!(cookie.contains("Max-Age=0"));
         assert!(cookie.contains("HttpOnly"));
-        assert!(cookie.contains("Domain=.rise.dev"));
+        assert!(!cookie.contains("Domain="));
         assert!(cookie.contains("Secure"));
     }
 }

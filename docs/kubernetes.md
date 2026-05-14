@@ -189,8 +189,6 @@ jwt_signing_secret = "YOUR_BASE64_SECRET_HERE"
 # Optional: JWT claims to include from IdP token (default shown)
 jwt_claims = ["sub", "email", "name"]
 
-# Cookie settings for subdomain sharing
-cookie_domain = ".rise.local"  # Allows cookies to work across *.rise.local
 cookie_secure = false          # Set to false for local development (HTTP)
 ```
 
@@ -343,7 +341,6 @@ The application receives authenticated requests with these additional headers:
 #### Troubleshooting Authentication
 
 **Infinite redirect loop**:
-- Check `cookie_domain` matches your domain structure
 - Verify cookies are being set (check browser DevTools → Application → Cookies)
 - Ensure `cookie_secure` is `false` for HTTP development environments
 
@@ -360,9 +357,7 @@ The application receives authenticated requests with these additional headers:
 
 **"No session cookie" error**:
 - Cookie expired or not set
-- Cookie domain mismatch
 - Browser blocking third-party cookies
-- Check `cookie_domain` configuration
 
 **Private projects accessible without authentication**:
 - Check ingress controller logs for auth subrequest errors: `kubectl logs -n ingress-nginx <ingress-controller-pod>`

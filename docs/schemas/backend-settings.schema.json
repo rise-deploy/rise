@@ -1069,11 +1069,6 @@
     },
     "ServerSettings": {
       "properties": {
-        "cookie_domain": {
-          "default": "",
-          "description": "Cookie domain for session cookies (e.g., \".rise.dev\" for all subdomains, \"\" for current host only)",
-          "type": "string"
-        },
         "cookie_secure": {
           "default": true,
           "description": "Whether to set Secure flag on cookies (true for HTTPS, false for HTTP development)",
