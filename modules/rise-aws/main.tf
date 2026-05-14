@@ -171,7 +171,6 @@ data "aws_iam_policy_document" "backend" {
         "s3:GetBucketPublicAccessBlock",
         "s3:DeleteObject",
         "s3:DeleteObjectVersion",
-        "s3:ListAllMyBuckets",
       ]
       resources = [
         "arn:aws:s3:::${local.s3_bucket_prefix}-*",

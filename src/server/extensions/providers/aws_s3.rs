@@ -20,6 +20,7 @@ const ENV_VAR_BUCKET_NAME: &str = "S3_BUCKET_NAME";
 const ENV_VAR_ACCESS_KEY_ID: &str = "AWS_ACCESS_KEY_ID";
 const ENV_VAR_SECRET_ACCESS_KEY: &str = "AWS_SECRET_ACCESS_KEY";
 const ENV_VAR_REGION: &str = "AWS_REGION";
+const IAM_POLICY_NAME: &str = "rise-s3-access";
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct AwsS3Spec {
@@ -172,11 +173,25 @@ impl AwsS3Provisioner {
         project_name: &str,
         project_id: Uuid,
         extension_name: &str,
+        election: &LeaderElection,
     ) -> Result<()> {
         let resource_id = status
             .resource_id
             .get_or_insert_with(Self::generate_resource_id)
             .clone();
+
+        // Persist resource_id immediately so it survives crashes — without this,
+        // a crash after creating AWS resources would generate a new ID on retry,
+        // orphaning the previously created bucket/IAM user.
+        election.assert_leader().await?;
+        db_extensions::update_status(
+            &self.db_pool,
+            project_id,
+            extension_name,
+            &serde_json::to_value(&*status)?,
+        )
+        .await?;
+
         let bucket_name = self.bucket_name_for(project_name, extension_name, &resource_id);
         let iam_user_name = self.iam_user_name_for(project_name, extension_name, &resource_id);
 
@@ -243,10 +258,13 @@ impl AwsS3Provisioner {
             .send()
             .await
         {
-            warn!(
+            error!(
                 "Failed to configure public access block for bucket '{}': {:?}",
                 bucket_name, e
             );
+            status.state = S3BucketState::Failed;
+            status.error = Some(format!("Failed to configure public access block: {:?}", e));
+            return Ok(());
         }
 
         // 3. Tag bucket
@@ -336,7 +354,7 @@ impl AwsS3Provisioner {
             .iam_client
             .put_user_policy()
             .user_name(&iam_user_name)
-            .policy_name("rise-s3-access")
+            .policy_name(IAM_POLICY_NAME)
             .policy_document(policy_doc.to_string())
             .send()
             .await
@@ -421,14 +439,16 @@ impl AwsS3Provisioner {
         let bucket_name = match &status.bucket_name {
             Some(n) => n.clone(),
             None => {
-                warn!("S3 extension in Available state but bucket_name is missing");
+                warn!("S3 extension in Available state but bucket_name is missing, resetting to Pending");
+                status.state = S3BucketState::Pending;
                 return Ok(());
             }
         };
         let iam_user_name = match &status.iam_user_name {
             Some(n) => n.clone(),
             None => {
-                warn!("S3 extension in Available state but iam_user_name is missing");
+                warn!("S3 extension in Available state but iam_user_name is missing, resetting to Pending");
+                status.state = S3BucketState::Pending;
                 return Ok(());
             }
         };
@@ -605,11 +625,13 @@ impl AwsS3Provisioner {
         let mut objects_to_delete: Vec<aws_sdk_s3::types::ObjectIdentifier> = Vec::new();
 
         for version in resp.versions() {
-            if let (Some(key), Some(vid)) = (version.key(), version.version_id()) {
+            if let Some(key) = version.key() {
+                let mut builder = aws_sdk_s3::types::ObjectIdentifier::builder().key(key);
+                if let Some(vid) = version.version_id() {
+                    builder = builder.version_id(vid);
+                }
                 objects_to_delete.push(
-                    aws_sdk_s3::types::ObjectIdentifier::builder()
-                        .key(key)
-                        .version_id(vid)
+                    builder
                         .build()
                         .context("Failed to build ObjectIdentifier")?,
                 );
@@ -666,7 +688,7 @@ impl AwsS3Provisioner {
         status.error = None;
 
         // 1. Delete IAM access keys, policy, and user
-        if let Some(ref iam_user_name) = status.iam_user_name.clone() {
+        if let Some(ref iam_user_name) = status.iam_user_name {
             match self
                 .iam_client
                 .list_access_keys()
@@ -705,13 +727,22 @@ impl AwsS3Provisioner {
                 }
             }
 
-            let _ = self
+            if let Err(e) = self
                 .iam_client
                 .delete_user_policy()
                 .user_name(iam_user_name)
-                .policy_name("rise-s3-access")
+                .policy_name(IAM_POLICY_NAME)
                 .send()
-                .await;
+                .await
+            {
+                let err_str = format!("{:?}", e);
+                if !err_str.contains("NoSuchEntity") {
+                    warn!(
+                        "Failed to delete inline policy for IAM user '{}': {:?}",
+                        iam_user_name, e
+                    );
+                }
+            }
 
             match self
                 .iam_client
@@ -739,7 +770,7 @@ impl AwsS3Provisioner {
         }
 
         // 2. Delete S3 bucket (only if empty)
-        if let Some(ref bucket_name) = status.bucket_name.clone() {
+        if let Some(ref bucket_name) = status.bucket_name {
             let is_empty = match self
                 .s3_client
                 .list_objects_v2()
@@ -967,6 +998,7 @@ impl AwsS3Provisioner {
                     &project.name,
                     project.id,
                     &project_extension.extension,
+                    election,
                 )
                 .await?;
             }
@@ -1106,6 +1138,8 @@ impl Extension for AwsS3Provisioner {
                     continue;
                 }
 
+                let mut needs_active_polling = false;
+
                 match db_extensions::list_by_extension_type(
                     &provisioner.db_pool,
                     provisioner.extension_type(),
@@ -1117,7 +1151,7 @@ impl Extension for AwsS3Provisioner {
                             debug!("No S3 extensions found, waiting for work");
                         }
 
-                        for ext in extensions {
+                        for ext in &extensions {
                             let ext_status: Option<AwsS3Status> =
                                 serde_json::from_value(ext.status.clone()).ok();
                             let ext_spec: AwsS3Spec =
@@ -1130,6 +1164,20 @@ impl Extension for AwsS3Provisioner {
                                 ext.deleted_at.is_some(),
                                 ext_spec.force_empty_bucket,
                             );
+
+                            if let Some(ref status) = ext_status {
+                                if matches!(
+                                    status.state,
+                                    S3BucketState::Pending
+                                        | S3BucketState::Creating
+                                        | S3BucketState::Failed
+                                ) || (ext.deleted_at.is_some()
+                                    && (status.state != S3BucketState::DeletionBlocked
+                                        || ext_spec.force_empty_bucket))
+                                {
+                                    needs_active_polling = true;
+                                }
+                            }
 
                             if let Some((error_count, last_error)) =
                                 error_state.get(&ext.project_id)
@@ -1156,8 +1204,11 @@ impl Extension for AwsS3Provisioner {
                             }
 
                             match provisioner.reconcile_single(ext.clone(), &election).await {
-                                Ok(_) => {
+                                Ok(changed) => {
                                     error_state.remove(&ext.project_id);
+                                    if changed {
+                                        needs_active_polling = true;
+                                    }
                                 }
                                 Err(e) => {
                                     error!(
@@ -1177,33 +1228,6 @@ impl Extension for AwsS3Provisioner {
                         error!("Failed to list S3 extensions: {:?}", e);
                     }
                 }
-
-                let needs_active_polling = match db_extensions::list_by_extension_type(
-                    &provisioner.db_pool,
-                    provisioner.extension_type(),
-                )
-                .await
-                {
-                    Ok(extensions) => extensions.iter().any(|ext| {
-                        if let Ok(status) =
-                            serde_json::from_value::<AwsS3Status>(ext.status.clone())
-                        {
-                            let spec: AwsS3Spec =
-                                serde_json::from_value(ext.spec.clone()).unwrap_or_default();
-                            matches!(
-                                status.state,
-                                S3BucketState::Pending
-                                    | S3BucketState::Creating
-                                    | S3BucketState::Failed
-                            ) || (ext.deleted_at.is_some()
-                                && (status.state != S3BucketState::DeletionBlocked
-                                    || spec.force_empty_bucket))
-                        } else {
-                            false
-                        }
-                    }),
-                    Err(_) => false,
-                };
 
                 let wait_time = if needs_active_polling { 2 } else { 10 };
                 sleep(std::time::Duration::from_secs(wait_time)).await;
@@ -1373,8 +1397,10 @@ These variables are recognized by all AWS SDKs, the AWS CLI, and most S3-compati
 ## Bucket Deletion
 
 When you delete this extension, the associated IAM user and access key are removed immediately.
-The S3 bucket is only deleted **if it is empty**. If the bucket contains objects, it will be
-left in place to prevent data loss. You must empty and delete it manually in that case.
+The S3 bucket is only deleted **if it is empty**. If the bucket contains objects, deletion is
+blocked to prevent data loss. You can then choose to "Empty bucket and delete" in the UI, which
+sets `force_empty_bucket` in the spec and instructs the controller to incrementally empty the
+bucket (including all object versions) before deleting it.
 
 ## Example Spec
 
