@@ -692,6 +692,65 @@ impl AppState {
 
                         tracing::info!("AWS RDS extension provider initialized and started");
                     }
+                    #[cfg(feature = "backend")]
+                    crate::server::settings::ExtensionProviderConfig::AwsS3BucketProvisioner {
+                        region,
+                        bucket_prefix,
+                        bucket_name_template,
+                        user_permissions_boundary_arn,
+                        access_key_id,
+                        secret_access_key,
+                    } => {
+                        tracing::info!("Initializing AWS S3 bucket extension provider");
+
+                        let mut aws_config_builder =
+                            aws_config::defaults(aws_config::BehaviorVersion::latest())
+                                .region(aws_config::Region::new(region.clone()));
+
+                        if let (Some(key_id), Some(secret_key)) = (access_key_id, secret_access_key)
+                        {
+                            aws_config_builder = aws_config_builder.credentials_provider(
+                                aws_sdk_sts::config::Credentials::new(
+                                    key_id,
+                                    secret_key,
+                                    None,
+                                    None,
+                                    "static-credentials",
+                                ),
+                            );
+                        }
+
+                        let aws_config = aws_config_builder.load().await;
+                        let s3_client = aws_sdk_s3::Client::new(&aws_config);
+                        let iam_client = aws_sdk_iam::Client::new(&aws_config);
+
+                        let encryption_provider = encryption_provider.clone().ok_or_else(|| {
+                            anyhow::anyhow!("Encryption provider required for AWS S3 extension")
+                        })?;
+
+                        let aws_s3_provisioner =
+                            crate::server::extensions::providers::aws_s3::AwsS3Provisioner::new(
+                                crate::server::extensions::providers::aws_s3::AwsS3ProvisionerConfig {
+                                    s3_client,
+                                    iam_client,
+                                    db_pool: db_pool.clone(),
+                                    encryption_provider,
+                                    region: region.clone(),
+                                    bucket_prefix: bucket_prefix.clone(),
+                                    bucket_name_template: bucket_name_template.clone(),
+                                    user_permissions_boundary_arn: user_permissions_boundary_arn
+                                        .clone(),
+                                },
+                            );
+
+                        let aws_s3_arc: Arc<dyn crate::server::extensions::Extension> =
+                            Arc::new(aws_s3_provisioner);
+                        extension_registry.register_type(aws_s3_arc.clone());
+                        aws_s3_arc.start();
+
+                        tracing::info!("AWS S3 bucket extension provider initialized and started");
+                    }
+
                     // When no extension provider features are enabled, this ensures the match is exhaustive
                     #[allow(unreachable_patterns)]
                     _ => {

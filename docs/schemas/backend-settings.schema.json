@@ -620,6 +620,51 @@
           "type": "object"
         },
         {
+          "properties": {
+            "access_key_id": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "bucket_name_template": {
+              "default": "{prefix}-{project_name}-{extension_name}",
+              "description": "Template for bucket names.\nPlaceholders: {prefix}, {project_name}, {extension_name}\nDefault: \"{prefix}-{project_name}-{extension_name}\"",
+              "type": "string"
+            },
+            "bucket_prefix": {
+              "default": "rise",
+              "description": "Prefix for S3 bucket and IAM user names. Must match the Terraform IAM policy prefix.\nDefault: \"rise\"",
+              "type": "string"
+            },
+            "region": {
+              "type": "string"
+            },
+            "secret_access_key": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "aws-s3-bucket",
+              "type": "string"
+            },
+            "user_permissions_boundary_arn": {
+              "description": "ARN of the IAM permissions boundary policy (output `s3_user_permissions_boundary_arn`\nfrom the `rise-aws` Terraform module). All IAM users created by this extension will\nhave this boundary attached, preventing privilege escalation.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "region",
+            "user_permissions_boundary_arn"
+          ],
+          "type": "object"
+        },
+        {
           "description": "Snowflake authentication configuration",
           "oneOf": [
             {
