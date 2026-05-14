@@ -14,6 +14,7 @@ function statusToneFromState(state) {
     if (['available', 'configured', 'running'].includes(normalized)) return 'ok';
     if (['creating', 'pending', 'testingconnection', 'creatingintegration', 'retrievingcredentials', 'creatingoauthextension', 'waiting for auth', 'deploying', 'building', 'pushing'].includes(normalized)) return 'warn';
     if (['failed', 'error', 'terminating'].includes(normalized)) return 'bad';
+    if (['deletion_blocked'].includes(normalized)) return 'warn';
     return 'muted';
 }
 
@@ -1341,7 +1342,7 @@ export function AwsS3ExtensionUI({ spec, schema, onChange }) {
                 </div>
             </MonoNotice>
             <MonoNotice tone="muted" title="Bucket Deletion">
-                <p>When you delete this extension, the IAM user and access key are removed immediately. The S3 bucket is only deleted if it is empty — non-empty buckets are left in place to prevent data loss.</p>
+                <p>When you delete this extension, the IAM user and access key are removed immediately. The S3 bucket is only deleted if it is empty — non-empty buckets block deletion until you choose to empty them.</p>
             </MonoNotice>
         </div>
     );
@@ -1349,8 +1350,25 @@ export function AwsS3ExtensionUI({ spec, schema, onChange }) {
 
 export function AwsS3DetailView({ extension, projectName }) {
     const status = extension.status || {};
-    const isAvailable = String(status.state || '').toLowerCase() === 'available';
-    const isFailed = String(status.state || '').toLowerCase() === 'failed';
+    const stateStr = String(status.state || '').toLowerCase();
+    const isAvailable = stateStr === 'available';
+    const isFailed = stateStr === 'failed';
+    const isDeleting = stateStr === 'deleting';
+    const isDeletionBlocked = stateStr === 'deletion_blocked';
+    const [forceEmptying, setForceEmptying] = useState(false);
+    const { showToast } = useToast();
+
+    const handleForceEmpty = async () => {
+        setForceEmptying(true);
+        try {
+            await api.patchExtension(projectName, extension.extension, { force_empty_bucket: true });
+            showToast('Bucket emptying initiated — the controller will empty and delete the bucket.', 'success');
+        } catch (err) {
+            showToast(`Failed to enable force-empty: ${err.message}`, 'error');
+        } finally {
+            setForceEmptying(false);
+        }
+    };
 
     return (
         <div className="space-y-6">
@@ -1367,9 +1385,22 @@ export function AwsS3DetailView({ extension, projectName }) {
                     <MonoNotice tone="bad" title="Provisioning Failed">
                         <p>{status.error || 'An error occurred during provisioning. The reconciler will retry automatically.'}</p>
                     </MonoNotice>
+                ) : isDeletionBlocked ? (
+                    <MonoNotice tone="warn" title="Deletion Blocked">
+                        <p>{status.error || 'The S3 bucket could not be deleted because it is not empty.'}</p>
+                        <div className="mt-3">
+                            <Button variant="danger" size="sm" onClick={handleForceEmpty} disabled={forceEmptying}>
+                                {forceEmptying ? 'Enabling...' : 'Empty bucket and delete'}
+                            </Button>
+                        </div>
+                    </MonoNotice>
+                ) : isDeleting ? (
+                    <MonoNotice tone="muted" title="Deleting">
+                        <p>{status.error || 'The extension is being cleaned up. IAM user and S3 bucket will be removed.'}</p>
+                    </MonoNotice>
                 ) : (
                     <MonoNotice tone="warn" title="Current State">
-                        <p>Provisioning is in progress. New deployments will be blocked until the bucket is available.</p>
+                        <p>Provisioning is in progress. Deployments will fail until the bucket is available.</p>
                     </MonoNotice>
                 )}
             </section>
@@ -1392,6 +1423,10 @@ export function AwsS3DetailView({ extension, projectName }) {
                     <div>
                         <p className="text-sm text-gray-600 dark:text-gray-500">Access Key ID</p>
                         <p className="text-gray-700 dark:text-gray-300 font-mono text-sm">{status.iam_access_key_id || '—'}</p>
+                    </div>
+                    <div>
+                        <p className="text-sm text-gray-600 dark:text-gray-500">Region</p>
+                        <p className="text-gray-700 dark:text-gray-300 font-mono text-sm">{status.region || '—'}</p>
                     </div>
                 </div>
             </section>
@@ -1420,7 +1455,7 @@ export function AwsS3DetailView({ extension, projectName }) {
                         </MonoTableRow>
                         <MonoTableRow>
                             <MonoTd><span className="font-mono text-sm">AWS_REGION</span></MonoTd>
-                            <MonoTd><span className="font-mono text-sm text-gray-600 dark:text-gray-400">(from backend config)</span></MonoTd>
+                            <MonoTd><span className="font-mono text-sm text-gray-600 dark:text-gray-400">{status.region || '(pending)'}</span></MonoTd>
                         </MonoTableRow>
                     </MonoTableBody>
                 </MonoTable>

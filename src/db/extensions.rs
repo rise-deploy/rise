@@ -34,6 +34,7 @@ pub async fn create(
     .context("Failed to create project extension")
 }
 
+#[allow(dead_code)]
 pub async fn upsert(
     pool: &PgPool,
     project_id: Uuid,
@@ -186,7 +187,6 @@ pub async fn update_status(
 }
 
 /// Update extension spec
-#[allow(dead_code)]
 pub async fn update_spec(
     pool: &PgPool,
     project_id: Uuid,

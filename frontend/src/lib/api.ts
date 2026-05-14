@@ -357,6 +357,16 @@ class RiseAPI {
     }
 
     /**
+     * Patch an extension's spec (merge)
+     */
+    async patchExtension(projectName, extensionName, spec) {
+        return this.request(`/projects/${projectName}/extensions/${extensionName}`, {
+            method: 'PATCH',
+            body: JSON.stringify({ spec })
+        });
+    }
+
+    /**
      * Delete an extension
      */
     async deleteExtension(projectName, extensionName) {

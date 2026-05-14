@@ -21,10 +21,11 @@ const ENV_VAR_ACCESS_KEY_ID: &str = "AWS_ACCESS_KEY_ID";
 const ENV_VAR_SECRET_ACCESS_KEY: &str = "AWS_SECRET_ACCESS_KEY";
 const ENV_VAR_REGION: &str = "AWS_REGION";
 
-/// User-facing spec for the S3 bucket extension.
-/// Empty for v0 — no user-configurable fields. All env var names are fixed.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-pub struct AwsS3Spec {}
+pub struct AwsS3Spec {
+    #[serde(default)]
+    pub force_empty_bucket: bool,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -33,6 +34,8 @@ pub enum S3BucketState {
     Creating,
     Available,
     Deleting,
+    #[serde(rename = "deletion_blocked")]
+    DeletionBlocked,
     Deleted,
     Failed,
 }
@@ -52,6 +55,8 @@ pub struct AwsS3Status {
     pub iam_access_key_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub iam_secret_access_key_encrypted: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -106,8 +111,20 @@ impl AwsS3Provisioner {
             .replace("{prefix}", &self.bucket_prefix)
             .replace("{project_name}", project_name)
             .replace("{extension_name}", extension_name);
-        let with_id = format!("{}-{}", raw, resource_id);
-        sanitize_s3_name(&with_id, 63)
+        let sanitized_middle = sanitize_s3_name(&raw, raw.len());
+
+        // resource_id suffix is always "-{id}" (9 chars for 8-hex-digit ID)
+        let suffix = format!("-{}", resource_id);
+        let max_middle = 63 - suffix.len();
+        let truncated = if sanitized_middle.len() > max_middle {
+            sanitized_middle[..max_middle]
+                .trim_end_matches('-')
+                .to_string()
+        } else {
+            sanitized_middle
+        };
+
+        format!("{}{}", truncated, suffix)
     }
 
     fn iam_user_name_for(
@@ -116,11 +133,23 @@ impl AwsS3Provisioner {
         extension_name: &str,
         resource_id: &str,
     ) -> String {
-        let raw = format!(
-            "{}-s3-{}-{}-{}",
-            self.bucket_prefix, project_name, extension_name, resource_id
+        let middle = format!(
+            "{}-s3-{}-{}",
+            self.bucket_prefix, project_name, extension_name
         );
-        sanitize_iam_name(&raw, 64)
+        let sanitized_middle = sanitize_iam_name(&middle, middle.len());
+
+        let suffix = format!("-{}", resource_id);
+        let max_middle = 64 - suffix.len();
+        let truncated = if sanitized_middle.len() > max_middle {
+            sanitized_middle[..max_middle]
+                .trim_end_matches('-')
+                .to_string()
+        } else {
+            sanitized_middle
+        };
+
+        format!("{}{}", truncated, suffix)
     }
 
     fn generate_resource_id() -> String {
@@ -352,6 +381,7 @@ impl AwsS3Provisioner {
                 status.iam_user_name = Some(iam_user_name.clone());
                 status.iam_access_key_id = Some(access_key_id);
                 status.iam_secret_access_key_encrypted = Some(encrypted_secret);
+                status.region = Some(self.region.clone());
                 status.error = None;
 
                 let finalizer = self.finalizer_name(extension_name);
@@ -560,11 +590,82 @@ impl AwsS3Provisioner {
         Ok(())
     }
 
-    async fn handle_deletion(&self, status: &mut AwsS3Status, project_name: &str) -> Result<()> {
+    /// Delete one batch of object versions and delete markers from the bucket.
+    /// Returns `true` if the bucket is now empty (no versions/markers remain).
+    async fn empty_bucket_batch(&self, bucket_name: &str) -> Result<bool> {
+        let resp = self
+            .s3_client
+            .list_object_versions()
+            .bucket(bucket_name)
+            .max_keys(1000)
+            .send()
+            .await
+            .context("Failed to list object versions")?;
+
+        let mut objects_to_delete: Vec<aws_sdk_s3::types::ObjectIdentifier> = Vec::new();
+
+        for version in resp.versions() {
+            if let (Some(key), Some(vid)) = (version.key(), version.version_id()) {
+                objects_to_delete.push(
+                    aws_sdk_s3::types::ObjectIdentifier::builder()
+                        .key(key)
+                        .version_id(vid)
+                        .build()
+                        .context("Failed to build ObjectIdentifier")?,
+                );
+            }
+        }
+
+        for marker in resp.delete_markers() {
+            if let (Some(key), Some(vid)) = (marker.key(), marker.version_id()) {
+                objects_to_delete.push(
+                    aws_sdk_s3::types::ObjectIdentifier::builder()
+                        .key(key)
+                        .version_id(vid)
+                        .build()
+                        .context("Failed to build ObjectIdentifier")?,
+                );
+            }
+        }
+
+        if objects_to_delete.is_empty() {
+            return Ok(true);
+        }
+
+        let count = objects_to_delete.len();
+        let delete = aws_sdk_s3::types::Delete::builder()
+            .set_objects(Some(objects_to_delete))
+            .build()
+            .context("Failed to build Delete request")?;
+
+        self.s3_client
+            .delete_objects()
+            .bucket(bucket_name)
+            .delete(delete)
+            .send()
+            .await
+            .context("Failed to delete object versions")?;
+
+        info!(
+            "Deleted {} object version(s) from S3 bucket '{}'",
+            count, bucket_name
+        );
+
+        // If we got a full page, there are likely more objects remaining
+        Ok(count < 1000)
+    }
+
+    async fn handle_deletion(
+        &self,
+        status: &mut AwsS3Status,
+        project_name: &str,
+        spec: &AwsS3Spec,
+        election: &LeaderElection,
+    ) -> Result<()> {
         status.state = S3BucketState::Deleting;
         status.error = None;
 
-        // 1. Delete IAM access keys
+        // 1. Delete IAM access keys, policy, and user
         if let Some(ref iam_user_name) = status.iam_user_name.clone() {
             match self
                 .iam_client
@@ -604,7 +705,6 @@ impl AwsS3Provisioner {
                 }
             }
 
-            // 2. Delete inline policy
             let _ = self
                 .iam_client
                 .delete_user_policy()
@@ -613,7 +713,6 @@ impl AwsS3Provisioner {
                 .send()
                 .await;
 
-            // 3. Delete IAM user
             match self
                 .iam_client
                 .delete_user()
@@ -633,9 +732,13 @@ impl AwsS3Provisioner {
                     }
                 }
             }
+
+            status.iam_user_name = None;
+            status.iam_access_key_id = None;
+            status.iam_secret_access_key_encrypted = None;
         }
 
-        // 4. Delete S3 bucket (only if empty)
+        // 2. Delete S3 bucket (only if empty)
         if let Some(ref bucket_name) = status.bucket_name.clone() {
             let is_empty = match self
                 .s3_client
@@ -687,13 +790,64 @@ impl AwsS3Provisioner {
                         }
                     }
                 }
+                status.bucket_name = None;
+            } else if spec.force_empty_bucket {
+                info!(
+                    "Force-emptying S3 bucket '{}' for project '{}'",
+                    bucket_name, project_name
+                );
+                match self.empty_bucket_batch(bucket_name).await {
+                    Ok(now_empty) => {
+                        election.assert_leader().await?;
+                        if now_empty {
+                            // Bucket is empty — delete it now
+                            match self
+                                .s3_client
+                                .delete_bucket()
+                                .bucket(bucket_name)
+                                .send()
+                                .await
+                            {
+                                Ok(_) => {
+                                    info!("Deleted S3 bucket '{}'", bucket_name);
+                                    status.bucket_name = None;
+                                }
+                                Err(e) => {
+                                    let err_str = format!("{:?}", e);
+                                    if err_str.contains("NoSuchBucket") {
+                                        info!("S3 bucket '{}' already deleted", bucket_name);
+                                        status.bucket_name = None;
+                                    } else {
+                                        let msg = format!(
+                                            "Failed to delete S3 bucket '{}': {:?}",
+                                            bucket_name, e
+                                        );
+                                        warn!("{}", msg);
+                                        status.error = Some(msg);
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        } else {
+                            // More objects remain — stay in Deleting, continue next tick
+                            return Ok(());
+                        }
+                    }
+                    Err(e) => {
+                        let msg = format!("Failed to empty S3 bucket '{}': {:?}", bucket_name, e);
+                        warn!("{}", msg);
+                        status.error = Some(msg);
+                        return Ok(());
+                    }
+                }
             } else {
                 let msg = format!(
                     "S3 bucket '{}' for project '{}' is not empty — \
-                     the bucket must be emptied and deleted manually before the extension can be fully removed.",
+                     the bucket must be emptied before the extension can be fully removed.",
                     bucket_name, project_name
                 );
                 warn!("{}", msg);
+                status.state = S3BucketState::DeletionBlocked;
                 status.error = Some(msg);
                 return Ok(());
             }
@@ -726,12 +880,35 @@ impl AwsS3Provisioner {
                 iam_user_name: None,
                 iam_access_key_id: None,
                 iam_secret_access_key_encrypted: None,
+                region: None,
                 error: None,
             });
 
+        let spec: AwsS3Spec =
+            serde_json::from_value(project_extension.spec.clone()).unwrap_or_default();
+
         if project_extension.deleted_at.is_some() {
             if status.state != S3BucketState::Deleted {
-                self.handle_deletion(&mut status, &project.name).await?;
+                if status.state == S3BucketState::DeletionBlocked && spec.force_empty_bucket {
+                    info!(
+                        "Force-empty enabled for S3 extension '{}' on project '{}', resuming deletion",
+                        project_extension.extension, project.name
+                    );
+                    status.state = S3BucketState::Deleting;
+                } else if !matches!(
+                    status.state,
+                    S3BucketState::Deleting | S3BucketState::DeletionBlocked
+                ) {
+                    info!(
+                        "Beginning cleanup for S3 extension '{}' on project '{}'",
+                        project_extension.extension, project.name
+                    );
+                }
+
+                if status.state != S3BucketState::DeletionBlocked {
+                    self.handle_deletion(&mut status, &project.name, &spec, election)
+                        .await?;
+                }
 
                 election.assert_leader().await?;
                 db_extensions::update_status(
@@ -941,6 +1118,19 @@ impl Extension for AwsS3Provisioner {
                         }
 
                         for ext in extensions {
+                            let ext_status: Option<AwsS3Status> =
+                                serde_json::from_value(ext.status.clone()).ok();
+                            let ext_spec: AwsS3Spec =
+                                serde_json::from_value(ext.spec.clone()).unwrap_or_default();
+                            debug!(
+                                "S3 extension '{}' project={}: state={:?}, deleted={}, force_empty={}",
+                                ext.extension,
+                                ext.project_id,
+                                ext_status.as_ref().map(|s| &s.state),
+                                ext.deleted_at.is_some(),
+                                ext_spec.force_empty_bucket,
+                            );
+
                             if let Some((error_count, last_error)) =
                                 error_state.get(&ext.project_id)
                             {
@@ -950,8 +1140,11 @@ impl Extension for AwsS3Provisioner {
 
                                 if Utc::now() < backoff_until {
                                     debug!(
-                                        "Skipping S3 extension for project {} due to backoff",
-                                        ext.project_id
+                                        "Skipping S3 extension '{}' for project {} due to backoff ({} errors, {}s remaining)",
+                                        ext.extension,
+                                        ext.project_id,
+                                        error_count,
+                                        (backoff_until - Utc::now()).num_seconds(),
                                     );
                                     continue;
                                 }
@@ -995,12 +1188,16 @@ impl Extension for AwsS3Provisioner {
                         if let Ok(status) =
                             serde_json::from_value::<AwsS3Status>(ext.status.clone())
                         {
+                            let spec: AwsS3Spec =
+                                serde_json::from_value(ext.spec.clone()).unwrap_or_default();
                             matches!(
                                 status.state,
                                 S3BucketState::Pending
                                     | S3BucketState::Creating
                                     | S3BucketState::Failed
-                            ) || ext.deleted_at.is_some()
+                            ) || (ext.deleted_at.is_some()
+                                && (status.state != S3BucketState::DeletionBlocked
+                                    || spec.force_empty_bucket))
                         } else {
                             false
                         }
@@ -1122,11 +1319,12 @@ impl Extension for AwsS3Provisioner {
                     "Available".to_string()
                 }
             }
-            S3BucketState::Deleting => {
+            S3BucketState::Deleting => "Deleting...".to_string(),
+            S3BucketState::DeletionBlocked => {
                 if let Some(err) = parsed.error {
-                    format!("Deleting (blocked): {}", err)
+                    format!("Deletion blocked: {}", err)
                 } else {
-                    "Deleting...".to_string()
+                    "Deletion blocked".to_string()
                 }
             }
             S3BucketState::Deleted => "Deleted".to_string(),
@@ -1191,8 +1389,14 @@ No configuration is required for v0.
     fn spec_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
-            "properties": {},
-            "description": "No configuration required. The extension injects S3_BUCKET_NAME, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_REGION into deployments."
+            "properties": {
+                "force_empty_bucket": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "When enabled, the controller will empty the S3 bucket (including all object versions) before deleting it during extension removal."
+                }
+            },
+            "description": "The extension injects S3_BUCKET_NAME, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_REGION into deployments."
         })
     }
 }
