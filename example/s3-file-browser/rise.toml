@@ -1,0 +1,12 @@
+#:schema http://rise.local:3000/api/v1/schema/rise-toml/v1
+version = 1
+
+[project]
+name = "s3-file-browser"
+access_class = "private"
+custom_domains = []
+
+[project.env]
+# S3_BUCKET_NAME = "my-bucket"
+# AWS_REGION = "eu-central-1"
+# AWS credentials are injected via the AWS S3 bucket extension
