@@ -34,39 +34,6 @@ pub async fn create(
     .context("Failed to create project extension")
 }
 
-pub async fn upsert(
-    pool: &PgPool,
-    project_id: Uuid,
-    extension: &str,
-    extension_type: &str,
-    spec: &Value,
-) -> Result<ProjectExtension> {
-    sqlx::query_as!(
-        ProjectExtension,
-        r#"
-        INSERT INTO project_extensions (project_id, extension, extension_type, spec)
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (project_id, extension)
-        DO UPDATE SET
-            spec = EXCLUDED.spec,
-            extension_type = EXCLUDED.extension_type,
-            updated_at = NOW(),
-            deleted_at = NULL
-        RETURNING project_id, extension, extension_type,
-                  spec as "spec: Value",
-                  status as "status: Value",
-                  created_at, updated_at, deleted_at
-        "#,
-        project_id,
-        extension,
-        extension_type,
-        spec
-    )
-    .fetch_one(pool)
-    .await
-    .context("Failed to upsert project extension")
-}
-
 /// List all extensions for a project (including soft-deleted ones)
 pub async fn list_by_project(pool: &PgPool, project_id: Uuid) -> Result<Vec<ProjectExtension>> {
     sqlx::query_as!(
@@ -186,7 +153,6 @@ pub async fn update_status(
 }
 
 /// Update extension spec
-#[allow(dead_code)]
 pub async fn update_spec(
     pool: &PgPool,
     project_id: Uuid,

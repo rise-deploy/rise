@@ -26,6 +26,7 @@ use tracing::instrument;
 fn build_project_url(state: &AppState, project_name: &str) -> Option<String> {
     let template = state.production_ingress_url_template.as_ref()?;
     let resolved = template.replace("{project_name}", project_name);
+    // Split host from optional path prefix (e.g. "rise.dev/myapp" → host="rise.dev", path="/myapp")
     let (host, path) = match resolved.find('/') {
         Some(pos) => (&resolved[..pos], &resolved[pos..]),
         None => (resolved.as_str(), ""),
@@ -1099,6 +1100,7 @@ pub async fn oauth_callback(
                 )
             })?;
 
+        // Issue Rise JWT with user's team memberships
         // Use custom domain URL as audience when available, otherwise build from ingress template
         let project_url = claimed_state
             .data()

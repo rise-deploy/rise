@@ -12,6 +12,10 @@ Simple static and dynamic applications to get started with Rise.
 - **[hello-world-js](./hello-world-js/)** - Node.js Express application
 - **[hello-world-py](./hello-world-py/)** - Python Flask application
 
+### AWS Examples
+
+- **[s3-file-browser](./s3-file-browser/)** - Web-based S3 file browser with upload/download/delete
+
 ### OAuth Examples
 
 Demonstrate the OAuth 2.0 extension for end-user authentication.
