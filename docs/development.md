@@ -22,6 +22,10 @@ mise setup:docker
 mise minikube:up   # or: mise k3s:up
 ```
 
+The cluster setup task writes pod-reachable host URLs to `.env`. If you use
+direnv, run `direnv allow` once and `.envrc` will load those values
+automatically.
+
 ## Day-to-Day
 
 ```bash
@@ -166,7 +170,8 @@ Host Machine (127.0.0.1)
 
 - BuildKit connects to the `rise_default` Docker network (via `RISE_MANAGED_BUILDKIT_NETWORK_NAME`) so it can push to `rise-registry:5000`.
 - Minikube joins the same network so pods can pull images.
-- Deployed apps reach the backend via `host.minikube.internal:3000` (Minikube) or the node IP (K3s).
+- The local cluster setup writes `.env` values such as `RISE_AUTH_BACKEND_URL`
+  and `RISE_K8S_HOST_IP` so Kubernetes pods can reach the host backend.
 
 ## Troubleshooting
 

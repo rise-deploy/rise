@@ -135,7 +135,17 @@ run = "docker compose up -d"
 [tasks."backend:run"]
 description = "Run the backend server."
 depends = ["backend:deps", "db:migrate"]
-run = "cargo run --features cli,backend -- backend server"
+run = """
+if [ -f .env ]; then
+  . ./.env
+fi
+if [ -z "${RISE_AUTH_BACKEND_URL:-}" ]; then
+  HOST_IP=$(ip -4 route get 1.1.1.1 | awk '{for (i = 1; i <= NF; i++) if ($i == "src") {print $(i + 1); exit}}')
+  export RISE_K8S_HOST_IP="${HOST_IP}"
+  export RISE_AUTH_BACKEND_URL="http://${HOST_IP}:3000"
+fi
+cargo run --features cli,backend -- backend server
+"""
 alias = "br"
 env.https_proxy = ""
 env.HTTPS_PROXY = ""
@@ -143,7 +153,17 @@ env.HTTPS_PROXY = ""
 [tasks."backend:run-container"]
 description = "Build and run the backend server in its container (host network). Useful to validate the containerized version works as intended."
 depends = ["backend:deps", "db:migrate"]
-run = "docker build . -t rise --target rise && docker run --rm --network host -v $PWD/config:/etc/rise:ro -v $HOME/.kube:/root/.kube:ro -v $HOME/.minikube:$HOME/.minikube:ro -e DATABASE_URL=$DATABASE_URL -e RISE_CONFIG_DIR=/etc/rise -e RISE_CONFIG_RUN_MODE=development rise backend server"
+run = """
+if [ -f .env ]; then
+  . ./.env
+fi
+if [ -z "${RISE_AUTH_BACKEND_URL:-}" ]; then
+  HOST_IP=$(ip -4 route get 1.1.1.1 | awk '{for (i = 1; i <= NF; i++) if ($i == "src") {print $(i + 1); exit}}')
+  export RISE_K8S_HOST_IP="${HOST_IP}"
+  export RISE_AUTH_BACKEND_URL="http://${HOST_IP}:3000"
+fi
+docker build . -t rise --target rise && docker run --rm --network host -v $PWD/config:/etc/rise:ro -v $HOME/.kube:/root/.kube:ro -v $HOME/.minikube:$HOME/.minikube:ro -e DATABASE_URL=$DATABASE_URL -e RISE_CONFIG_DIR=/etc/rise -e RISE_CONFIG_RUN_MODE=development -e RISE_AUTH_BACKEND_URL=$RISE_AUTH_BACKEND_URL -e RISE_K8S_HOST_IP=$RISE_K8S_HOST_IP rise backend server
+"""
 
 [tasks."frontend:dev"]
 description = "Run the Vite frontend development server."
@@ -234,10 +254,21 @@ kubectl port-forward --namespace ingress-nginx svc/ingress-nginx-controller 8080
 echo "Port-forward running in background (PID: $!)"
 
 # Install Metacontroller + Rise CRDs for development
+HOST_IP=$(ip -4 route get 1.1.1.1 | awk '{for (i = 1; i <= NF; i++) if ($i == "src") {print $(i + 1); exit}}')
+if [ -f .env ]; then
+  sed -i '/^# BEGIN RISE K8S DEV$/,/^# END RISE K8S DEV$/d' .env
+fi
+cat >> .env <<EOF
+# BEGIN RISE K8S DEV
+export RISE_K8S_HOST_IP="${HOST_IP}"
+export RISE_AUTH_BACKEND_URL="http://${HOST_IP}:3000"
+export RISE_METACONTROLLER_WEBHOOK_BASE_URL="http://${HOST_IP}:3001"
+# END RISE K8S DEV
+EOF
 helm dependency build helm/rise
-kubectl apply --server-side --force-conflicts -f helm/rise/crds/
 helm upgrade --install rise-dev ./helm/rise \
   -f helm/rise/values-dev.yaml \
+  --set "metacontroller.webhookBaseUrl=${RISE_METACONTROLLER_WEBHOOK_BASE_URL:-http://${HOST_IP}:3001}" \
   --namespace rise \
   --create-namespace
 """
@@ -281,25 +312,32 @@ helm upgrade --install ingress-nginx ingress-nginx \
 
 # Install Metacontroller + Rise CRDs for development
 HOST_IP=$(kubectl get node $(hostname) -o jsonpath='{.metadata.annotations.k3s\\.io/internal-ip}')
+if [ -f .env ]; then
+  sed -i '/^# BEGIN RISE K8S DEV$/,/^# END RISE K8S DEV$/d' .env
+fi
+cat >> .env <<EOF
+# BEGIN RISE K8S DEV
+export RISE_K8S_HOST_IP="${HOST_IP}"
+export RISE_AUTH_BACKEND_URL="http://${HOST_IP}:3000"
+export RISE_METACONTROLLER_WEBHOOK_BASE_URL="http://${HOST_IP}:3001"
+# END RISE K8S DEV
+EOF
 helm dependency build helm/rise
 kubectl apply --server-side --force-conflicts -f helm/rise/crds/
 helm upgrade --install rise-dev ./helm/rise \
   -f helm/rise/values-dev.yaml \
-  --set "metacontroller.webhookBaseUrl=http://${HOST_IP}:3001" \
+  --set "metacontroller.webhookBaseUrl=${RISE_METACONTROLLER_WEBHOOK_BASE_URL:-http://${HOST_IP}:3001}" \
+  --skip-crds \
   --namespace rise \
   --create-namespace
 
 set +x
 echo
 echo
-echo "Note: You need to apply the configuration from config/k3s.yaml for Rise-deployed apps to work properly."
-echo "Double-check that the IP in the configuration matches that of the node in K3s:"
+echo "Note: Wrote Kubernetes host reachability settings to .env."
+echo "If you use direnv, run 'direnv reload' or restart 'mise backend:run' so Rise picks them up."
 echo
 echo "K3s internal IP: $(kubectl get node $(hostname) -o jsonpath='{.metadata.annotations.k3s\\.io/internal-ip}')"
-echo
-echo '```'
-cat config/k3s.yaml
-echo '```'
 """
 
 [tasks."test:e2e-build"]
