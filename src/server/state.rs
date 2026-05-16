@@ -381,11 +381,19 @@ impl AppState {
         // Initialize cookie settings for session management
         let cookie_settings = CookieSettings {
             secure: settings.server.cookie_secure,
+            legacy_cookie_domain: settings.server.legacy_cookie_domain.clone(),
         };
-        tracing::info!(
-            "Configured session cookies: secure={} (no Domain attribute — cookies scoped to current host)",
-            cookie_settings.secure
-        );
+        if let Some(ref domain) = cookie_settings.legacy_cookie_domain {
+            tracing::info!(
+                "Configured session cookies: secure={}, legacy_cookie_domain={} (will expire old domain-scoped cookies)",
+                cookie_settings.secure, domain
+            );
+        } else {
+            tracing::info!(
+                "Configured session cookies: secure={} (no Domain attribute — cookies scoped to current host)",
+                cookie_settings.secure
+            );
+        }
 
         let public_url = settings.server.public_url.clone();
         tracing::info!("Public URL: {}", public_url);

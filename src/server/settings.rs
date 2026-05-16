@@ -32,6 +32,13 @@ pub struct ServerSettings {
     #[serde(default = "default_cookie_secure")]
     pub cookie_secure: bool,
 
+    /// Legacy cookie domain for migration from deployments that previously set `cookie_domain`.
+    /// When configured, responses that set a new host-only `rise_jwt` cookie also include a
+    /// `Max-Age=0` Set-Cookie with this Domain attribute to expire any stale domain-scoped
+    /// cookies browsers may still be sending. Remove once the migration window has passed.
+    #[serde(default)]
+    pub legacy_cookie_domain: Option<String>,
+
     /// JWT signing secret for ingress authentication (base64-encoded, minimum 32 bytes)
     /// Generate with: openssl rand -base64 32
     /// Required for ingress authentication

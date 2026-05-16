@@ -20,6 +20,11 @@ fn parse_cookies(cookie_header: &str) -> impl Iterator<Item = (&str, &str)> {
 #[derive(Debug, Clone)]
 pub struct CookieSettings {
     pub secure: bool,
+    /// Optional domain used to expire legacy domain-scoped cookies from deployments that
+    /// previously had `cookie_domain` configured. When set, cookie-setting responses also
+    /// include a `Max-Age=0` Set-Cookie header with this Domain attribute to clear any
+    /// stale domain-scoped cookies that browsers may still be sending.
+    pub legacy_cookie_domain: Option<String>,
 }
 
 /// Create a Rise JWT cookie with the given Rise-issued JWT token
@@ -68,6 +73,29 @@ pub fn extract_rise_jwt_cookie(headers: &HeaderMap) -> Option<String> {
         .map(|(_, value)| value.to_string())
 }
 
+/// Create a cookie that expires a legacy domain-scoped `rise_jwt` cookie.
+///
+/// Browsers treat host-only and domain-scoped cookies as distinct entries (cookie identity
+/// includes the domain), so switching from `Domain=.example.com` to a host-only cookie does
+/// not automatically remove the old entry. This function produces a `Max-Age=0` cookie with
+/// the given `Domain` attribute so the browser expires the stale cookie on the next response.
+pub fn clear_legacy_domain_cookie(domain: &str, settings: &CookieSettings) -> String {
+    let mut cookie_parts = vec![
+        format!("{}=", RISE_JWT_COOKIE_NAME),
+        "Max-Age=0".to_string(),
+        "Path=/".to_string(),
+        "HttpOnly".to_string(),
+        "SameSite=Lax".to_string(),
+        format!("Domain={}", domain),
+    ];
+
+    if settings.secure {
+        cookie_parts.push("Secure".to_string());
+    }
+
+    cookie_parts.join("; ")
+}
+
 /// Create a cookie that clears the Rise JWT
 ///
 /// Sets Max-Age=0 to immediately expire the cookie
@@ -95,7 +123,10 @@ mod tests {
 
     #[test]
     fn test_create_rise_jwt_cookie() {
-        let settings = CookieSettings { secure: true };
+        let settings = CookieSettings {
+            secure: true,
+            legacy_cookie_domain: None,
+        };
 
         let cookie = create_rise_jwt_cookie("jwt_token_xyz", &settings, 3600);
 
@@ -131,7 +162,10 @@ mod tests {
 
     #[test]
     fn test_clear_rise_jwt_cookie() {
-        let settings = CookieSettings { secure: true };
+        let settings = CookieSettings {
+            secure: true,
+            legacy_cookie_domain: None,
+        };
 
         let cookie = clear_rise_jwt_cookie(&settings);
 

@@ -10,7 +10,7 @@ use crate::server::frontend::load_static_file;
 use crate::server::state::AppState;
 use axum::{
     extract::{Query, State},
-    http::{uri::Uri, HeaderMap, StatusCode},
+    http::{header, uri::Uri, HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     Json,
 };
@@ -867,6 +867,16 @@ fn extract_request_base_url(headers: &HeaderMap, state: &AppState) -> String {
     state.public_url.trim_end_matches('/').to_string()
 }
 
+/// Extract the host (with port if present) from a URL like `scheme://host:port/path`.
+fn url_host(url: &str) -> &str {
+    url.split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or("")
+}
+
 /// Initiate OAuth2 login flow for ingress auth (start of OAuth flow)
 ///
 /// This handler starts the OAuth2 authorization code flow with PKCE.
@@ -901,11 +911,26 @@ pub async fn oauth_signin_start(
     let code_challenge = generate_code_challenge(&code_verifier);
     let state_token = generate_state_token();
 
-    // For custom domain auth routing via /.rise/auth path:
-    // - IdP callback always goes to the main Rise domain (only one redirect URI needed)
-    // - After callback, we redirect to the custom domain's /.rise/auth/complete endpoint
+    // For /.rise/auth paths, determine the app base URL for cookie setting after the callback.
+    // Only use the request host as the base URL when it's a *true* custom domain — i.e. when
+    // the request host doesn't match the standard ingress template host.  For sub-path ingress
+    // (`apps.example.com/{project_name}`), extract_request_base_url would return just
+    // `https://apps.example.com`, missing the path prefix and producing a wrong JWT audience.
+    // In that case we leave custom_domain_base_url as None and let build_project_url supply the
+    // full URL (including path) in the callback handler.
     let custom_domain_base_url = if is_rise_path {
-        Some(extract_request_base_url(&headers, &state))
+        let request_base_url = extract_request_base_url(&headers, &state);
+        let is_standard_ingress = params
+            .project
+            .as_deref()
+            .and_then(|p| build_project_url(&state, p))
+            .map(|template_url| url_host(&template_url) == url_host(&request_base_url))
+            .unwrap_or(false);
+        if is_standard_ingress {
+            None
+        } else {
+            Some(request_base_url)
+        }
     } else {
         None
     };
@@ -1233,6 +1258,37 @@ pub async fn oauth_callback(
     Ok(response)
 }
 
+/// Build an HTTP response with the new host-only cookie and, when configured, an additional
+/// `Max-Age=0` Set-Cookie header to expire any legacy domain-scoped cookie.
+fn build_cookie_response<B>(
+    state: &AppState,
+    status: StatusCode,
+    cookie: &str,
+    body: B,
+) -> Result<Response, (StatusCode, String)>
+where
+    B: IntoResponse,
+{
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(cookie).map_err(|e| {
+            tracing::error!("Failed to build Set-Cookie header: {:#}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error".to_string(),
+            )
+        })?,
+    );
+    if let Some(domain) = &state.cookie_settings.legacy_cookie_domain {
+        let legacy = cookie_helpers::clear_legacy_domain_cookie(domain, &state.cookie_settings);
+        if let Ok(val) = HeaderValue::from_str(&legacy) {
+            headers.append(header::SET_COOKIE, val);
+        }
+    }
+    Ok((status, headers, body).into_response())
+}
+
 /// Helper function to render the success page with cookie
 async fn render_success_page(
     state: &AppState,
@@ -1299,9 +1355,7 @@ async fn render_success_page(
         project_name
     );
 
-    // Build response with cookie and HTML
-    let response = (StatusCode::OK, [("Set-Cookie", cookie)], Html(html)).into_response();
-
+    let response = build_cookie_response(state, StatusCode::OK, cookie, Html(html))?;
     Ok(response)
 }
 
@@ -1368,9 +1422,7 @@ async fn render_ui_login_success_page(
         redirect_url
     );
 
-    // Build response with cookie and HTML
-    let response = (StatusCode::OK, [("Set-Cookie", cookie)], Html(html)).into_response();
-
+    let response = build_cookie_response(state, StatusCode::OK, cookie, Html(html))?;
     Ok(response)
 }
 
@@ -1681,12 +1733,35 @@ pub async fn oauth_logout(
         redirect_url
     );
 
-    // Build response with Set-Cookie header and redirect
-    let response = (
-        StatusCode::FOUND,
-        [("Location", redirect_url.as_str()), ("Set-Cookie", &cookie)],
-    )
-        .into_response();
+    // Build response with Set-Cookie header(s) and redirect
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::LOCATION,
+        HeaderValue::from_str(&redirect_url).map_err(|e| {
+            tracing::error!("Invalid redirect URL: {:#}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Invalid redirect URL".to_string(),
+            )
+        })?,
+    );
+    headers.insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&cookie).map_err(|e| {
+            tracing::error!("Failed to build Set-Cookie header: {:#}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error".to_string(),
+            )
+        })?,
+    );
+    if let Some(domain) = &state.cookie_settings.legacy_cookie_domain {
+        let legacy = cookie_helpers::clear_legacy_domain_cookie(domain, &state.cookie_settings);
+        if let Ok(val) = HeaderValue::from_str(&legacy) {
+            headers.append(header::SET_COOKIE, val);
+        }
+    }
+    let response = (StatusCode::FOUND, headers).into_response();
 
     Ok(response)
 }
