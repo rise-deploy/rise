@@ -20,11 +20,11 @@ fn parse_cookies(cookie_header: &str) -> impl Iterator<Item = (&str, &str)> {
 #[derive(Debug, Clone)]
 pub struct CookieSettings {
     pub secure: bool,
-    /// Optional domain used to expire legacy domain-scoped cookies from deployments that
-    /// previously had `cookie_domain` configured. When set, cookie-setting responses also
-    /// include a `Max-Age=0` Set-Cookie header with this Domain attribute to clear any
-    /// stale domain-scoped cookies that browsers may still be sending.
-    pub legacy_cookie_domain: Option<String>,
+    /// Optional domain used to expire stale domain-scoped cookies left over from before
+    /// the host-only cookie migration. When set, cookie-setting responses also include a
+    /// `Max-Age=0` Set-Cookie header with this Domain attribute to clear any stale cookies
+    /// that browsers may still be sending.
+    pub cookie_domain: Option<String>,
 }
 
 /// Create a Rise JWT cookie with the given Rise-issued JWT token
@@ -125,7 +125,7 @@ mod tests {
     fn test_create_rise_jwt_cookie() {
         let settings = CookieSettings {
             secure: true,
-            legacy_cookie_domain: None,
+            cookie_domain: None,
         };
 
         let cookie = create_rise_jwt_cookie("jwt_token_xyz", &settings, 3600);
@@ -164,7 +164,7 @@ mod tests {
     fn test_clear_rise_jwt_cookie() {
         let settings = CookieSettings {
             secure: true,
-            legacy_cookie_domain: None,
+            cookie_domain: None,
         };
 
         let cookie = clear_rise_jwt_cookie(&settings);

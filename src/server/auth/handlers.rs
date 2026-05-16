@@ -1280,7 +1280,7 @@ where
             )
         })?,
     );
-    if let Some(domain) = &state.cookie_settings.legacy_cookie_domain {
+    if let Some(domain) = &state.cookie_settings.cookie_domain {
         let legacy = cookie_helpers::clear_legacy_domain_cookie(domain, &state.cookie_settings);
         if let Ok(val) = HeaderValue::from_str(&legacy) {
             headers.append(header::SET_COOKIE, val);
@@ -1755,7 +1755,7 @@ pub async fn oauth_logout(
             )
         })?,
     );
-    if let Some(domain) = &state.cookie_settings.legacy_cookie_domain {
+    if let Some(domain) = &state.cookie_settings.cookie_domain {
         let legacy = cookie_helpers::clear_legacy_domain_cookie(domain, &state.cookie_settings);
         if let Ok(val) = HeaderValue::from_str(&legacy) {
             headers.append(header::SET_COOKIE, val);

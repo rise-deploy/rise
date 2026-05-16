@@ -381,11 +381,11 @@ impl AppState {
         // Initialize cookie settings for session management
         let cookie_settings = CookieSettings {
             secure: settings.server.cookie_secure,
-            legacy_cookie_domain: settings.server.legacy_cookie_domain.clone(),
+            cookie_domain: settings.server.cookie_domain.clone(),
         };
-        if let Some(ref domain) = cookie_settings.legacy_cookie_domain {
+        if let Some(ref domain) = cookie_settings.cookie_domain {
             tracing::info!(
-                "Configured session cookies: secure={}, legacy_cookie_domain={} (will expire old domain-scoped cookies)",
+                "Configured session cookies: secure={}, cookie_domain={} (will expire old domain-scoped cookies)",
                 cookie_settings.secure, domain
             );
         } else {

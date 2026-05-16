@@ -1116,9 +1116,9 @@
           "description": "JWT signing secret for ingress authentication (base64-encoded, minimum 32 bytes)\nGenerate with: openssl rand -base64 32\nRequired for ingress authentication",
           "type": "string"
         },
-        "legacy_cookie_domain": {
+        "cookie_domain": {
           "default": null,
-          "description": "Legacy cookie domain for migration from deployments that previously set `cookie_domain`.\nWhen configured, responses that set a new host-only `rise_jwt` cookie also include a\n`Max-Age=0` Set-Cookie with this Domain attribute to expire any stale domain-scoped\ncookies browsers may still be sending. Remove once the migration window has passed.",
+          "description": "Cookie domain for migration from deployments that previously used domain-scoped cookies.\nWhen configured, responses that set a new host-only `rise_jwt` cookie also include a\n`Max-Age=0` Set-Cookie with this Domain attribute to expire any stale domain-scoped\ncookies browsers may still be sending. Remove once the migration window has passed.",
           "type": [
             "string",
             "null"
