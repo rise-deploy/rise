@@ -4,6 +4,7 @@ use crate::server::extensions::{Extension, InjectedEnvVar, InjectedEnvVarValue};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use aws_sdk_iam::Client as IamClient;
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::Client as S3Client;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -227,16 +228,27 @@ impl AwsS3Provisioner {
                 info!("Created S3 bucket '{}'", bucket_name);
             }
             Err(e) => {
-                let err_str = format!("{:?}", e);
-                if err_str.contains("BucketAlreadyOwnedByYou") {
+                let err = e.into_service_error();
+                if err.is_bucket_already_owned_by_you() {
                     info!(
                         "S3 bucket '{}' already exists and is owned by this account, continuing",
                         bucket_name
                     );
+                } else if err.is_bucket_already_exists() {
+                    warn!(
+                        "S3 bucket name '{}' is already taken in the global namespace, will retry with a new name",
+                        bucket_name
+                    );
+                    status.resource_id = None;
+                    status.error = Some(format!(
+                        "Bucket name '{}' is already taken globally, retrying with new name",
+                        bucket_name
+                    ));
+                    return Ok(());
                 } else {
-                    error!("Failed to create S3 bucket '{}': {:?}", bucket_name, e);
+                    error!("Failed to create S3 bucket '{}': {:?}", bucket_name, err);
                     status.state = S3BucketState::Failed;
-                    status.error = Some(format!("Failed to create bucket: {:?}", e));
+                    status.error = Some(format!("Failed to create bucket: {:?}", err));
                     return Ok(());
                 }
             }
@@ -331,13 +343,13 @@ impl AwsS3Provisioner {
                 info!("Created IAM user '{}'", iam_user_name);
             }
             Err(e) => {
-                let err_str = format!("{:?}", e);
-                if err_str.contains("EntityAlreadyExists") {
+                let err = e.into_service_error();
+                if err.is_entity_already_exists_exception() {
                     info!("IAM user '{}' already exists, continuing", iam_user_name);
                 } else {
-                    error!("Failed to create IAM user '{}': {:?}", iam_user_name, e);
+                    error!("Failed to create IAM user '{}': {:?}", iam_user_name, err);
                     status.state = S3BucketState::Failed;
-                    status.error = Some(format!("Failed to create IAM user: {:?}", e));
+                    status.error = Some(format!("Failed to create IAM user: {:?}", err));
                     return Ok(());
                 }
             }
@@ -470,8 +482,8 @@ impl AwsS3Provisioner {
         {
             Ok(_) => {}
             Err(e) => {
-                let err_str = format!("{:?}", e);
-                if err_str.contains("NoSuchBucket") || err_str.contains("NotFound") {
+                let err = e.into_service_error();
+                if err.is_not_found() {
                     warn!(
                         "S3 bucket '{}' no longer exists, marking for re-creation",
                         bucket_name
@@ -482,7 +494,7 @@ impl AwsS3Provisioner {
                     status.iam_access_key_id = None;
                     status.iam_secret_access_key_encrypted = None;
                 } else {
-                    warn!("Failed to verify S3 bucket '{}': {:?}", bucket_name, e);
+                    warn!("Failed to verify S3 bucket '{}': {:?}", bucket_name, err);
                 }
                 return Ok(());
             }
@@ -498,8 +510,8 @@ impl AwsS3Provisioner {
         {
             Ok(_) => {}
             Err(e) => {
-                let err_str = format!("{:?}", e);
-                if err_str.contains("NoSuchEntity") {
+                let err = e.into_service_error();
+                if err.is_no_such_entity_exception() {
                     warn!(
                         "IAM user '{}' no longer exists, marking for re-creation",
                         iam_user_name
@@ -509,7 +521,7 @@ impl AwsS3Provisioner {
                     status.iam_access_key_id = None;
                     status.iam_secret_access_key_encrypted = None;
                 } else {
-                    warn!("Failed to verify IAM user '{}': {:?}", iam_user_name, e);
+                    warn!("Failed to verify IAM user '{}': {:?}", iam_user_name, err);
                 }
                 return Ok(());
             }
@@ -724,17 +736,17 @@ impl AwsS3Provisioner {
                     }
                 }
                 Err(e) => {
-                    let err_str = format!("{:?}", e);
-                    if !err_str.contains("NoSuchEntity") {
+                    let err = e.into_service_error();
+                    if !err.is_no_such_entity_exception() {
                         warn!(
                             "Failed to list access keys for IAM user '{}': {:?}",
-                            iam_user_name, e
+                            iam_user_name, err
                         );
                     }
                 }
             }
 
-            if let Err(e) = self
+            match self
                 .iam_client
                 .delete_user_policy()
                 .user_name(iam_user_name)
@@ -742,12 +754,15 @@ impl AwsS3Provisioner {
                 .send()
                 .await
             {
-                let err_str = format!("{:?}", e);
-                if !err_str.contains("NoSuchEntity") {
-                    warn!(
-                        "Failed to delete inline policy for IAM user '{}': {:?}",
-                        iam_user_name, e
-                    );
+                Ok(_) => {}
+                Err(e) => {
+                    let err = e.into_service_error();
+                    if !err.is_no_such_entity_exception() {
+                        warn!(
+                            "Failed to delete inline policy for IAM user '{}': {:?}",
+                            iam_user_name, err
+                        );
+                    }
                 }
             }
 
@@ -762,11 +777,11 @@ impl AwsS3Provisioner {
                     info!("Deleted IAM user '{}'", iam_user_name);
                 }
                 Err(e) => {
-                    let err_str = format!("{:?}", e);
-                    if err_str.contains("NoSuchEntity") {
+                    let err = e.into_service_error();
+                    if err.is_no_such_entity_exception() {
                         info!("IAM user '{}' already deleted", iam_user_name);
                     } else {
-                        warn!("Failed to delete IAM user '{}': {:?}", iam_user_name, e);
+                        warn!("Failed to delete IAM user '{}': {:?}", iam_user_name, err);
                     }
                 }
             }
@@ -788,15 +803,15 @@ impl AwsS3Provisioner {
             {
                 Ok(resp) => resp.key_count().unwrap_or(0) == 0,
                 Err(e) => {
-                    let err_str = format!("{:?}", e);
-                    if err_str.contains("NoSuchBucket") {
+                    let err = e.into_service_error();
+                    if err.is_no_such_bucket() {
                         info!("S3 bucket '{}' already deleted", bucket_name);
                         status.state = S3BucketState::Deleted;
                         return Ok(());
                     }
                     let msg = format!(
                         "Failed to check if S3 bucket '{}' is empty: {:?}",
-                        bucket_name, e
+                        bucket_name, err
                     );
                     warn!("{}", msg);
                     status.error = Some(msg);
@@ -816,12 +831,12 @@ impl AwsS3Provisioner {
                         info!("Deleted S3 bucket '{}'", bucket_name);
                     }
                     Err(e) => {
-                        let err_str = format!("{:?}", e);
-                        if err_str.contains("NoSuchBucket") {
+                        let err = e.into_service_error();
+                        if err.code() == Some("NoSuchBucket") {
                             info!("S3 bucket '{}' already deleted", bucket_name);
                         } else {
                             let msg =
-                                format!("Failed to delete S3 bucket '{}': {:?}", bucket_name, e);
+                                format!("Failed to delete S3 bucket '{}': {:?}", bucket_name, err);
                             warn!("{}", msg);
                             status.error = Some(msg);
                             return Ok(());
@@ -851,14 +866,14 @@ impl AwsS3Provisioner {
                                     status.bucket_name = None;
                                 }
                                 Err(e) => {
-                                    let err_str = format!("{:?}", e);
-                                    if err_str.contains("NoSuchBucket") {
+                                    let err = e.into_service_error();
+                                    if err.code() == Some("NoSuchBucket") {
                                         info!("S3 bucket '{}' already deleted", bucket_name);
                                         status.bucket_name = None;
                                     } else {
                                         let msg = format!(
                                             "Failed to delete S3 bucket '{}': {:?}",
-                                            bucket_name, e
+                                            bucket_name, err
                                         );
                                         warn!("{}", msg);
                                         status.error = Some(msg);
