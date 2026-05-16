@@ -6,7 +6,6 @@ server:
   port: 3000
   public_url: "http://rise.local:3000"
   frontend_dev_proxy_url: "http://localhost:5173"
-  cookie_domain: "" # Empty = current host only (for localhost:3000 access)
   cookie_secure: false
   jwt_signing_secret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" # Generate with: openssl rand -base64 32
   jwt_claims: ["sub", "email", "name"]

@@ -189,8 +189,6 @@ jwt_signing_secret = "YOUR_BASE64_SECRET_HERE"
 # Optional: JWT claims to include from IdP token (default shown)
 jwt_claims = ["sub", "email", "name"]
 
-# Cookie settings for subdomain sharing
-cookie_domain = ".rise.local"  # Allows cookies to work across *.rise.local
 cookie_secure = false          # Set to false for local development (HTTP)
 ```
 
@@ -237,29 +235,31 @@ User completes OAuth at Dex
 Dex redirects to /api/v1/auth/callback?code=xyz&state=abc
   ↓
 GET /api/v1/auth/callback (Token Exchange):
-  - Retrieve OAuth2State (includes project_name='myapp' for UI context only)
+  - Retrieve OAuth2State (includes project_name='myapp')
   - Exchange code for IdP tokens
   - Validate IdP JWT
   - Extract claims (sub, email, name) and expiry
-  - Issue Rise JWT with user claims (NOT project-scoped!)
-  - 🍪 SET COOKIE: _rise_ingress = <Rise JWT>
-       (Domain: .rise.local, HttpOnly, Secure=false, SameSite=Lax)
-  - Renders auth-success.html.tera
-  - Shows: "Authentication successful! Redirecting in 3s..."
-  - JavaScript auto-redirects to http://myapp.apps.rise.local
+  - Issue Rise JWT scoped to project (aud=https://myapp.apps.rise.local)
+  - Store JWT under a one-time completion token
+  - Redirect browser to https://myapp.apps.rise.local/.rise/auth/complete?token=xxx
   ↓
-After 3 seconds, browser redirects to http://myapp.apps.rise.local
+GET https://myapp.apps.rise.local/.rise/auth/complete?token=xxx (Cookie Setting):
+  - Exchange one-time token for the stored Rise JWT
+  - 🍪 SET COOKIE: rise_jwt = <Rise JWT>
+       (HttpOnly, SameSite=Lax — host-only, no Domain attribute)
+  - Shows success page, JavaScript redirects to original URL
+  ↓
+Browser redirects to http://myapp.apps.rise.local
   ↓
 Nginx calls GET /api/v1/auth/ingress?project=myapp
-  - 🍪 READS COOKIE: _rise_ingress
+  - 🍪 READS COOKIE: rise_jwt (host-only, only sent to myapp.apps.rise.local)
   - Verifies Rise JWT signature (HS256)
   - Validates expiry
-  - Checks user has project access via database query (NOT JWT claim!)
+  - Checks user has project access via database query
   ↓ Returns 200 OK + headers (X-Auth-Request-Email, X-Auth-Request-User)
   ↓
 Nginx serves app
-  - 🍪 Rise JWT cookie is sent to app (but app cannot decode it - HttpOnly)
-  - App does NOT have access to Rise APIs (different cookie name)
+  - 🍪 rise_jwt cookie is sent to app (but app cannot read it — HttpOnly)
 ```
 
 #### JWT Structure
@@ -274,30 +274,31 @@ Rise issues symmetric HS256 JWTs with the following claims:
   "iat": 1234567890,
   "exp": 1234571490,
   "iss": "http://rise.local",
-  "aud": "rise-ingress"
+  "aud": "https://myapp.apps.rise.local"
 }
 ```
 
 **Key features**:
-- **NOT project-scoped**: JWTs do NOT contain a project claim because the cookie is set at `rise.local` domain and shared across all `*.apps.rise.local` subdomains. Project access is validated separately in the ingress auth handler by checking database permissions.
+- **Project-scoped audience**: The `aud` claim is set to the project URL, so applications that validate the JWT themselves can verify scope. Rise's own ingress auth does not check the audience — project access is validated by database permissions instead.
+- **Cookie isolation**: Cookies are host-only (no `Domain` attribute), so each app domain only receives its own `rise_jwt` cookie. A cookie set on `myapp.apps.rise.local` is never sent to `otherapp.apps.rise.local`.
 - **Configurable claims**: Include only necessary user information
 - **Expiry matching**: Token expiration matches IdP token (typically 1 hour)
 - **Symmetric signing**: HS256 with shared secret for fast validation
 
 #### Cookie Security
 
-Two separate cookies are used for different purposes:
+The `rise_jwt` cookie is used for both Rise UI sessions and project ingress authentication. What distinguishes them is the host it is set on and the JWT audience:
 
-| Cookie | Purpose | Contents | Access |
-|--------|---------|----------|--------|
-| `_rise_session` | Rise API authentication | IdP JWT | Frontend JavaScript |
-| `_rise_ingress` | Project access authentication | Rise JWT | HttpOnly (no JS access) |
+| Context | Set on host | JWT `aud` | Access |
+|---------|-------------|-----------|--------|
+| Rise UI login | `rise.local` | Rise public URL | HttpOnly |
+| Project ingress auth | `myapp.apps.rise.local` | `https://myapp.apps.rise.local` | HttpOnly |
 
 **Security attributes**:
 - `HttpOnly`: Prevents JavaScript access (XSS protection)
-- `Secure`: HTTPS-only transmission
+- `Secure`: HTTPS-only transmission (configurable for local development)
 - `SameSite=Lax`: CSRF protection while allowing navigation
-- `Domain`: Shared across subdomains (e.g., `.rise.local`)
+- **No `Domain` attribute**: Cookie is host-only; browsers only send it to the exact host it was set on
 - `Max-Age`: Matches JWT expiration
 
 #### Access Control
@@ -313,8 +314,10 @@ Access check logic:
 // - User is the project owner (owner_user_id), OR
 // - User is a member of the team that owns the project (owner_team_id)
 //
-// NOTE: JWTs are NOT project-scoped - the same JWT can be used across all projects
-// because the cookie is set at rise.local domain level and shared across *.apps.rise.local
+// NOTE: Rise validates project access via database permissions, not JWT claims.
+// Cookie isolation (host-only, no Domain) ensures a cookie for one app is never
+// sent to a different app — additional DB permission checks guard access within
+// the same host (e.g. sub-path routing where multiple projects share a host).
 ```
 
 #### Ingress Annotations
@@ -343,7 +346,6 @@ The application receives authenticated requests with these additional headers:
 #### Troubleshooting Authentication
 
 **Infinite redirect loop**:
-- Check `cookie_domain` matches your domain structure
 - Verify cookies are being set (check browser DevTools → Application → Cookies)
 - Ensure `cookie_secure` is `false` for HTTP development environments
 
@@ -360,9 +362,7 @@ The application receives authenticated requests with these additional headers:
 
 **"No session cookie" error**:
 - Cookie expired or not set
-- Cookie domain mismatch
 - Browser blocking third-party cookies
-- Check `cookie_domain` configuration
 
 **Private projects accessible without authentication**:
 - Check ingress controller logs for auth subrequest errors: `kubectl logs -n ingress-nginx <ingress-controller-pod>`

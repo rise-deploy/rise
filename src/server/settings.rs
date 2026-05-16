@@ -28,13 +28,16 @@ pub struct ServerSettings {
     #[serde(default)]
     pub frontend_dev_proxy_url: Option<String>,
 
-    /// Cookie domain for session cookies (e.g., ".rise.dev" for all subdomains, "" for current host only)
-    #[serde(default)]
-    pub cookie_domain: String,
-
     /// Whether to set Secure flag on cookies (true for HTTPS, false for HTTP development)
     #[serde(default = "default_cookie_secure")]
     pub cookie_secure: bool,
+
+    /// Cookie domain for migration from deployments that previously used domain-scoped cookies.
+    /// When configured, responses that set a new host-only `rise_jwt` cookie also include a
+    /// `Max-Age=0` Set-Cookie with this Domain attribute to expire any stale domain-scoped
+    /// cookies browsers may still be sending. Remove once the migration window has passed.
+    #[serde(default)]
+    pub cookie_domain: Option<String>,
 
     /// JWT signing secret for ingress authentication (base64-encoded, minimum 32 bytes)
     /// Generate with: openssl rand -base64 32

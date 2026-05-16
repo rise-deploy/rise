@@ -1,6 +1,6 @@
 use crate::db::{projects, users};
 use crate::server::auth::{
-    cookie_helpers::{self, CookieSettings},
+    cookie_helpers,
     token_storage::{
         generate_code_challenge, generate_code_verifier, generate_state_token,
         CompletedAuthSession, OAuth2State,
@@ -10,7 +10,7 @@ use crate::server::frontend::load_static_file;
 use crate::server::state::AppState;
 use axum::{
     extract::{Query, State},
-    http::{uri::Uri, HeaderMap, StatusCode},
+    http::{header, uri::Uri, HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     Json,
 };
@@ -727,8 +727,6 @@ pub struct SigninQuery {
     pub rd: Option<String>,
     /// Optional project name for ingress authentication flow
     pub project: Option<String>,
-    /// Skip cookie configuration warnings
-    pub skip_warning: Option<bool>,
 }
 
 /// Pre-authentication page for ingress auth
@@ -845,26 +843,6 @@ pub async fn signin_page(
     Ok(Html(html).into_response())
 }
 
-/// Checks if a hostname is covered by a cookie domain according to RFC 6265.
-///
-/// This handles both exact matches and subdomain matches. The cookie_domain
-/// is normalized by stripping a leading dot if present.
-///
-/// # Examples
-/// - `host_matches_cookie_domain("rise.local", ".rise.local")` -> `true`
-/// - `host_matches_cookie_domain("test.rise.local", ".rise.local")` -> `true`
-/// - `host_matches_cookie_domain("rise.local", "rise.local")` -> `true`
-/// - `host_matches_cookie_domain("other.com", ".rise.local")` -> `false`
-///
-/// # Note
-/// Assumes cookie_domain is non-empty. Empty cookie domains mean "current host only"
-/// and require special handling depending on context.
-fn host_matches_cookie_domain(hostname: &str, cookie_domain: &str) -> bool {
-    let cookie_domain_normalized = cookie_domain.trim_start_matches('.');
-    hostname == cookie_domain_normalized
-        || hostname.ends_with(&format!(".{}", cookie_domain_normalized))
-}
-
 /// Extract base URL (scheme + host) from request headers.
 ///
 /// Used for OAuth callback URL when handling requests via Ingress routing.
@@ -890,108 +868,14 @@ fn extract_request_base_url(headers: &HeaderMap, state: &AppState) -> String {
     state.public_url.trim_end_matches('/').to_string()
 }
 
-/// Render warning page for cookie configuration issues
-async fn render_warning_page(
-    state: &AppState,
-    params: &SigninQuery,
-    warnings: Vec<String>,
-    request_host: &str,
-) -> Result<Html<String>, (StatusCode, String)> {
-    // Load template
-    let static_dir = state.server_settings.static_dir.as_deref().ok_or_else(|| {
-        tracing::error!("static_dir not configured");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Static dir not configured".to_string(),
-        )
-    })?;
-
-    let template_content = load_static_file(static_dir, "auth-warning.html.tera")
-        .await
-        .ok_or_else(|| {
-            tracing::error!("auth-warning.html.tera template not found");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Template not found".to_string(),
-            )
-        })?;
-
-    let template_str = std::str::from_utf8(&template_content).map_err(|e| {
-        tracing::error!("Failed to parse template as UTF-8: {:#}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Template encoding error".to_string(),
-        )
-    })?;
-
-    // Create Tera instance
-    let mut tera = Tera::default();
-    tera.add_raw_template("auth-warning.html.tera", template_str)
-        .map_err(|e| {
-            tracing::error!("Failed to parse template: {:#}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Template error".to_string(),
-            )
-        })?;
-
-    // Extract redirect host
-    let redirect_url = params.redirect.as_ref().or(params.rd.as_ref());
-    let redirect_host = redirect_url.and_then(|url| {
-        url::Url::parse(url)
-            .ok()
-            .and_then(|u| u.host_str().map(|h| h.to_string()))
-    });
-
-    // Build continue URL (proceed with OAuth despite warning)
-    let mut continue_params = vec![];
-    if let Some(ref project) = params.project {
-        continue_params.push(format!("project={}", urlencoding::encode(project)));
-    }
-    if let Some(ref redirect) = params.redirect {
-        continue_params.push(format!("redirect={}", urlencoding::encode(redirect)));
-    } else if let Some(ref rd) = params.rd {
-        continue_params.push(format!("rd={}", urlencoding::encode(rd)));
-    }
-    continue_params.push("skip_warning=true".to_string());
-
-    let continue_url = format!(
-        "{}/api/v1/auth/signin/start?{}",
-        state.public_url.trim_end_matches('/'),
-        continue_params.join("&")
-    );
-
-    // Render template
-    let mut context = tera::Context::new();
-    context.insert("warnings", &warnings);
-    context.insert(
-        "project_name",
-        &params.project.as_deref().unwrap_or("Unknown"),
-    );
-    context.insert("request_host", request_host);
-    context.insert(
-        "cookie_domain",
-        &if state.cookie_settings.domain.is_empty() {
-            "(empty - current host only)"
-        } else {
-            &state.cookie_settings.domain
-        },
-    );
-    context.insert("redirect_host", &redirect_host);
-    context.insert("redirect_url", &redirect_url);
-    context.insert("continue_url", &continue_url);
-
-    let html = tera
-        .render("auth-warning.html.tera", &context)
-        .map_err(|e| {
-            tracing::error!("Failed to render template: {:#}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Template rendering error".to_string(),
-            )
-        })?;
-
-    Ok(Html(html))
+/// Extract the host (with port if present) from a URL like `scheme://host:port/path`.
+fn url_host(url: &str) -> &str {
+    url.split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or("")
 }
 
 /// Initiate OAuth2 login flow for ingress auth (start of OAuth flow)
@@ -1020,107 +904,34 @@ pub async fn oauth_signin_start(
         "OAuth signin initiated"
     );
 
-    // Determine if this is via `/.rise/auth` path (custom domain Ingress routing)
+    // Determine if this is via `/.rise/auth` path (Ingress routing)
     let is_rise_path = uri.path().starts_with("/.rise/auth");
-
-    // Extract request host for validation
-    let request_host = headers
-        .get("host")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("");
-
-    // Skip validation if skip_warning is set OR if this is via /.rise/auth path
-    // (custom domain routing handles cookies differently - always uses current host)
-    if !params.skip_warning.unwrap_or(false) && !is_rise_path {
-        // Extract redirect URL host (if provided)
-        let redirect_host = redirect_url.as_ref().and_then(|url| {
-            url::Url::parse(url)
-                .ok()
-                .and_then(|u| u.host_str().map(|h| h.to_string()))
-        });
-
-        let cookie_domain = &state.cookie_settings.domain;
-
-        // Strip port from request_host for cookie domain comparisons
-        // (ports are irrelevant for cookie domain matching)
-        let request_host_without_port = request_host.split(':').next().unwrap_or(request_host);
-
-        // Detect potential misconfigurations
-        let mut warnings = Vec::new();
-
-        // Scenario 1: Cookie won't be accessible on redirect domain
-        if let Some(ref redirect_host_str) = redirect_host {
-            let cookie_will_match_redirect = if cookie_domain.is_empty() {
-                // Empty domain = current host only (ports irrelevant for cookies)
-                redirect_host_str == request_host_without_port
-            } else {
-                // Check if redirect host is covered by cookie domain
-                host_matches_cookie_domain(redirect_host_str, cookie_domain)
-            };
-
-            if !cookie_will_match_redirect {
-                warnings.push(format!(
-                    "Authentication cookies may not work correctly. The redirect target '{}' does not match the configured cookie domain '{}'.",
-                    redirect_host_str,
-                    if cookie_domain.is_empty() {
-                        request_host_without_port
-                    } else {
-                        cookie_domain
-                    }
-                ));
-            }
-        }
-
-        // Scenario 2: Cookie domain doesn't match request host
-        if !cookie_domain.is_empty()
-            && !request_host_without_port.is_empty()
-            && !host_matches_cookie_domain(request_host_without_port, cookie_domain)
-        {
-            warnings.push(format!(
-                "Authentication configuration issue detected. The sign-in page is accessed from '{}' but cookies are configured for domain '{}'.",
-                request_host_without_port,
-                cookie_domain
-            ));
-        }
-
-        // Scenario 3: Custom domain without proper cookie configuration
-        if let Some(ref redirect_host_str) = redirect_host {
-            if request_host_without_port == redirect_host_str.as_str()
-                && !cookie_domain.is_empty()
-                && !host_matches_cookie_domain(request_host_without_port, cookie_domain)
-            {
-                warnings.push(format!(
-                    "This application ('{}') is not covered by the configured cookie domain '{}'.",
-                    request_host_without_port, cookie_domain
-                ));
-            }
-        }
-
-        // Log warnings for troubleshooting
-        if !warnings.is_empty() {
-            tracing::warn!(
-                "Cookie configuration warnings detected for project {:?}: {}",
-                params.project,
-                warnings.join(" | ")
-            );
-
-            // Show warning page to user
-            return Ok(render_warning_page(&state, &params, warnings, request_host)
-                .await?
-                .into_response());
-        }
-    }
 
     // Generate PKCE parameters
     let code_verifier = generate_code_verifier();
     let code_challenge = generate_code_challenge(&code_verifier);
     let state_token = generate_state_token();
 
-    // For custom domain auth routing via /.rise/auth path:
-    // - IdP callback always goes to the main Rise domain (only one redirect URI needed)
-    // - After callback, we redirect to the custom domain's /.rise/auth/complete endpoint
+    // For /.rise/auth paths, determine the app base URL for cookie setting after the callback.
+    // Only use the request host as the base URL when it's a *true* custom domain — i.e. when
+    // the request host doesn't match the standard ingress template host.  For sub-path ingress
+    // (`apps.example.com/{project_name}`), extract_request_base_url would return just
+    // `https://apps.example.com`, missing the path prefix and producing a wrong JWT audience.
+    // In that case we leave custom_domain_base_url as None and let build_project_url supply the
+    // full URL (including path) in the callback handler.
     let custom_domain_base_url = if is_rise_path {
-        Some(extract_request_base_url(&headers, &state))
+        let request_base_url = extract_request_base_url(&headers, &state);
+        let is_standard_ingress = params
+            .project
+            .as_deref()
+            .and_then(|p| build_project_url(&state, p))
+            .map(|template_url| url_host(&template_url) == url_host(&request_base_url))
+            .unwrap_or(false);
+        if is_standard_ingress {
+            None
+        } else {
+            Some(request_base_url)
+        }
     } else {
         None
     };
@@ -1183,10 +994,9 @@ pub struct CallbackQuery {
 /// - IdP always redirects to the main Rise domain (single pre-registered redirect URI)
 /// - If `custom_domain_callback_url` is set in state, we store a one-time token and redirect
 ///   to the custom domain's `/.rise/auth/complete` endpoint to set cookies there
-#[instrument(skip(state, params, headers))]
+#[instrument(skip(state, params))]
 pub async fn oauth_callback(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Query(params): Query<CallbackQuery>,
 ) -> Result<Response, (StatusCode, String)> {
     tracing::info!("OAuth callback received");
@@ -1265,33 +1075,8 @@ pub async fn oauth_callback(
         .clone()
         .unwrap_or_else(|| "/".to_string());
 
-    // Determine cookie domain based on request host
-    // For Rise subdomains, use the configured cookie domain for subdomain sharing
-    // Otherwise, use current host only (empty domain)
-    let cookie_settings_for_response = {
-        // Check if request host matches configured cookie domain
-        let request_host = headers
-            .get("host")
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("");
-        let request_host_without_port = request_host.split(':').next().unwrap_or(request_host);
-
-        if !state.cookie_settings.domain.is_empty()
-            && host_matches_cookie_domain(request_host_without_port, &state.cookie_settings.domain)
-        {
-            // Request is on a Rise subdomain - use configured domain for cookie sharing
-            state.cookie_settings.clone()
-        } else {
-            // Request host doesn't match configured domain - use current host only
-            CookieSettings {
-                domain: String::new(),
-                secure: state.cookie_settings.secure,
-            }
-        }
-    };
-
-    // For ingress auth flow (with project), issue Rise JWT
-    // For custom domain auth, we may need to redirect to the custom domain to set cookies there
+    // For ingress auth flow (with project), issue Rise JWT and redirect to the
+    // app's domain to set the cookie there (scoped to the app host, not shared).
     if let Some(project) = claimed_state.data().project_name.as_deref() {
         tracing::info!(
             "Issuing Rise JWT for ingress auth (project context: {})",
@@ -1337,66 +1122,63 @@ pub async fn oauth_callback(
                 )
             })?;
 
-        // Check if this is a custom domain auth flow that needs redirect
-        if let Some(custom_domain_base_url) = claimed_state.data().custom_domain_base_url.clone() {
-            // Generate a one-time token for the custom domain callback
-            let completion_token = generate_state_token();
-
-            // Store the completed session data
-            let completed_session = CompletedAuthSession {
-                rise_jwt,
-                max_age,
-                redirect_url: redirect_url.clone(),
-                project_name: project.to_string(),
-            };
-            state
-                .token_store
-                .save_completed_session(completion_token.clone(), completed_session)
-                .await
-                .map_err(|e| {
-                    tracing::error!("Failed to store completed session: {:?}", e);
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Failed to complete authentication".to_string(),
-                    )
-                })?;
-
-            // Construct the complete URL by appending the path to the base URL
-            let complete_url = format!(
-                "{}/.rise/auth/complete?token={}",
-                custom_domain_base_url.trim_end_matches('/'),
-                completion_token
-            );
-
-            tracing::info!(
-                "Redirecting to custom domain for cookie setting: {}",
-                complete_url
-            );
-
-            if let Err(e) = claimed_state.finalize().await {
-                tracing::warn!(
-                    "Failed to finalize PKCE state (response already built, row will expire via TTL): {:?}",
-                    e
+        // Build the app base URL to redirect to for cookie setting.
+        // Use custom_domain_base_url if available, otherwise build from ingress template.
+        let app_base_url = claimed_state
+            .data()
+            .custom_domain_base_url
+            .clone()
+            .or_else(|| build_project_url(&state, project))
+            .ok_or_else(|| {
+                tracing::error!(
+                    "Cannot redirect to app for cookie setting: no ingress URL template configured"
                 );
-            }
-            return Ok(Redirect::to(&complete_url).into_response());
-        }
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Ingress URL template not configured".to_string(),
+                )
+            })?;
 
-        // Normal flow: set cookie directly on main domain
-        let cookie = cookie_helpers::create_rise_jwt_cookie(
-            &rise_jwt,
-            &cookie_settings_for_response,
+        // Always redirect to the app's domain to set the cookie there.
+        // The /.rise/auth/complete handler sets the cookie scoped to the current host.
+        let completion_token = generate_state_token();
+
+        let completed_session = CompletedAuthSession {
+            rise_jwt,
             max_age,
+            redirect_url: redirect_url.clone(),
+            project_name: project.to_string(),
+        };
+        state
+            .token_store
+            .save_completed_session(completion_token.clone(), completed_session)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to store completed session: {:?}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to complete authentication".to_string(),
+                )
+            })?;
+
+        let complete_url = format!(
+            "{}/.rise/auth/complete?token={}",
+            app_base_url.trim_end_matches('/'),
+            completion_token
         );
 
-        let response = render_success_page(&state, project, &redirect_url, &cookie).await?;
+        tracing::info!(
+            "Redirecting to app domain for cookie setting: {}",
+            complete_url
+        );
+
         if let Err(e) = claimed_state.finalize().await {
             tracing::warn!(
                 "Failed to finalize PKCE state (response already built, row will expire via TTL): {:?}",
                 e
             );
         }
-        return Ok(response);
+        return Ok(Redirect::to(&complete_url).into_response());
     }
 
     // Regular OAuth flow (not ingress auth) - UI login
@@ -1460,8 +1242,7 @@ pub async fn oauth_callback(
             )
         })?;
 
-    let cookie =
-        cookie_helpers::create_rise_jwt_cookie(&rise_jwt, &cookie_settings_for_response, max_age);
+    let cookie = cookie_helpers::create_rise_jwt_cookie(&rise_jwt, &state.cookie_settings, max_age);
 
     tracing::info!(
         "Setting Rise JWT cookie and redirecting to {}",
@@ -1477,6 +1258,37 @@ pub async fn oauth_callback(
         );
     }
     Ok(response)
+}
+
+/// Build an HTTP response with the new host-only cookie and, when configured, an additional
+/// `Max-Age=0` Set-Cookie header to expire any legacy domain-scoped cookie.
+fn build_cookie_response<B>(
+    state: &AppState,
+    status: StatusCode,
+    cookie: &str,
+    body: B,
+) -> Result<Response, (StatusCode, String)>
+where
+    B: IntoResponse,
+{
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(cookie).map_err(|e| {
+            tracing::error!("Failed to build Set-Cookie header: {:#}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error".to_string(),
+            )
+        })?,
+    );
+    if let Some(domain) = &state.cookie_settings.cookie_domain {
+        let legacy = cookie_helpers::clear_legacy_domain_cookie(domain, &state.cookie_settings);
+        if let Ok(val) = HeaderValue::from_str(&legacy) {
+            headers.append(header::SET_COOKIE, val);
+        }
+    }
+    Ok((status, headers, body).into_response())
 }
 
 /// Helper function to render the success page with cookie
@@ -1545,9 +1357,7 @@ async fn render_success_page(
         project_name
     );
 
-    // Build response with cookie and HTML
-    let response = (StatusCode::OK, [("Set-Cookie", cookie)], Html(html)).into_response();
-
+    let response = build_cookie_response(state, StatusCode::OK, cookie, Html(html))?;
     Ok(response)
 }
 
@@ -1614,9 +1424,7 @@ async fn render_ui_login_success_page(
         redirect_url
     );
 
-    // Build response with cookie and HTML
-    let response = (StatusCode::OK, [("Set-Cookie", cookie)], Html(html)).into_response();
-
+    let response = build_cookie_response(state, StatusCode::OK, cookie, Html(html))?;
     Ok(response)
 }
 
@@ -1655,15 +1463,9 @@ pub async fn oauth_complete(
                 "Invalid or expired completion token. Please try logging in again.".to_string(),
             )
         })?;
-    // Create cookie for the custom domain (empty domain = current host only)
-    let cookie_settings = CookieSettings {
-        domain: String::new(),
-        secure: state.cookie_settings.secure,
-    };
-
     let cookie = cookie_helpers::create_rise_jwt_cookie(
         &claimed_session.rise_jwt,
-        &cookie_settings,
+        &state.cookie_settings,
         claimed_session.max_age,
     );
 
@@ -1933,12 +1735,35 @@ pub async fn oauth_logout(
         redirect_url
     );
 
-    // Build response with Set-Cookie header and redirect
-    let response = (
-        StatusCode::FOUND,
-        [("Location", redirect_url.as_str()), ("Set-Cookie", &cookie)],
-    )
-        .into_response();
+    // Build response with Set-Cookie header(s) and redirect
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::LOCATION,
+        HeaderValue::from_str(&redirect_url).map_err(|e| {
+            tracing::error!("Invalid redirect URL: {:#}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Invalid redirect URL".to_string(),
+            )
+        })?,
+    );
+    headers.insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&cookie).map_err(|e| {
+            tracing::error!("Failed to build Set-Cookie header: {:#}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error".to_string(),
+            )
+        })?,
+    );
+    if let Some(domain) = &state.cookie_settings.cookie_domain {
+        let legacy = cookie_helpers::clear_legacy_domain_cookie(domain, &state.cookie_settings);
+        if let Ok(val) = HeaderValue::from_str(&legacy) {
+            headers.append(header::SET_COOKIE, val);
+        }
+    }
+    let response = (StatusCode::FOUND, headers).into_response();
 
     Ok(response)
 }
