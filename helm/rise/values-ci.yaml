@@ -13,7 +13,7 @@ ingress:
 config:
   server:
     public_url: http://rise.local
-    jwt_signing_secret: test-jwt-secret-key-for-ci-testing-only-not-secure
+    jwt_signing_secret: dGVzdC1qd3Qtc2VjcmV0LWtleS1mb3ItY2ktdGVzdGluZy1vbmx5LW5vdC1zZWN1cmU=
 
   auth:
     issuer: http://dex:5556/dex
@@ -29,6 +29,8 @@ config:
   deployment_controller:
     type: kubernetes
     production_ingress_url_template: "{project_name}.apps.rise.local"
+    staging_ingress_url_template: "{project_name}-{deployment_group}.preview.rise.local"
+    environment_ingress_url_template: "{project_name}-{environment}.preview.rise.local"
     namespace_format: "rise-{project_name}"
     ingress_schema: http
     access_classes:
