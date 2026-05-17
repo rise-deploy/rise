@@ -53,6 +53,7 @@ rise_cli() {
   fi
 
   docker run "${docker_args[@]}" \
+    --entrypoint /usr/local/bin/rise \
     "${CLI_IMAGE_REPOSITORY}:${IMAGE_TAG}" \
     "$@"
 }
