@@ -88,6 +88,49 @@ fn default_namespace() -> String {
     String::new()
 }
 
+/// Configuration for JFrog Artifactory container registry
+///
+/// Supports two token-issuing backends:
+/// - Vault: Uses HashiCorp Vault with vault-plugin-secrets-artifactory
+/// - Direct: Uses JFrog's own access token API
+#[cfg(feature = "backend")]
+#[derive(Debug, Clone)]
+pub struct JfrogConfig {
+    pub token_provider: JfrogTokenProvider,
+    pub registry_host: String,
+    pub client_registry_host: String,
+    pub docker_repo_key: String,
+    pub push_permissions: String,
+    pub pull_permissions: String,
+    pub push_token_ttl: u64,
+    pub pull_token_ttl: u64,
+    pub mint_pull_secrets: bool,
+}
+
+/// Token provider backend for JFrog registry
+#[cfg(feature = "backend")]
+#[derive(Debug, Clone)]
+pub enum JfrogTokenProvider {
+    Vault {
+        vault_addr: String,
+        vault_token: String,
+        vault_token_file: Option<String>,
+        vault_mount_path: String,
+        role: String,
+        /// When true (default), Rise sends `?scope=...&ttl=...s` to the Vault endpoint,
+        /// overriding the role's default scope. With the Rise fork of
+        /// vault-plugin-secrets-artifactory, configure admin
+        /// `allow_scope_override="opt-in"` and role `allow_scope_override=true`
+        /// with narrow `allowed_scopes`.
+        /// When false, Rise sends only `?ttl=...s` and the role's configured scope is used.
+        scope_override: bool,
+    },
+    Direct {
+        jfrog_url: String,
+        admin_token: String,
+    },
+}
+
 /// Configuration for GitLab container registry
 ///
 /// Credentials are minted as short-lived scoped JWTs from GitLab's JWT auth endpoint,

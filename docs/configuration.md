@@ -295,6 +295,93 @@ registry:
 **Token requirements:**
 The GitLab token must have `read_registry` and `write_registry` scopes (or equivalent deploy token permissions).
 
+#### JFrog Artifactory
+
+JFrog supports two token-issuing backends: Vault (via Rise's [`vault-plugin-secrets-artifactory`](https://github.com/rise-deploy/vault-plugin-secrets-artifactory/releases/tag/v1.8.9-rise.2) fork) and Direct (via JFrog's access token API).
+
+**Vault mode (scope override — default):**
+
+```yaml
+registry:
+  type: jfrog
+  registry_host: "jfrog.example.com"
+  docker_repo_key: "rise-docker-local"
+  token_provider:
+    type: vault
+    # vault_addr: ~             # defaults to VAULT_ADDR env
+    # vault_token: ~            # defaults to VAULT_TOKEN env
+    # vault_token_file: ~       # alternative: read token from file (supports rotation)
+    vault_mount_path: "artifactory"
+    vault_role: "rise"
+    # scope_override: true      # default — Rise sends per-operation scopes
+  # push_permissions: "r,w"    # default
+  # pull_permissions: "r"      # default
+  # push_token_ttl: 600        # push token lifetime in seconds (default: 600)
+  # pull_token_ttl: 86400      # pull token lifetime in seconds (default: 86400 = 24h)
+  # mint_pull_secrets: true    # default
+```
+
+Configure Vault with the Rise fork so scope overrides are opt-in and restricted to the Docker repository:
+
+```sh
+vault write artifactory/config/admin \
+  url="https://jfrog.example.com" \
+  access_token="$JFROG_ADMIN_TOKEN" \
+  allow_scope_override="opt-in" \
+  use_expiring_tokens=true
+
+vault write artifactory/roles/rise \
+  scope="artifact:rise-docker-local/**:r" \
+  default_ttl=600 \
+  max_ttl=86400 \
+  allow_scope_override=true \
+  allowed_scopes='["artifact:rise-docker-local/**:r","artifact:rise-docker-local/**:r,w"]'
+```
+
+Replace `rise-docker-local` with your configured `docker_repo_key`. The role allowlist lets Rise request narrow per-project and per-tag scopes under that repository, while denying unrelated scopes such as `applied-permissions/admin`.
+
+**Vault mode (role scope):**
+
+```yaml
+registry:
+  type: jfrog
+  registry_host: "jfrog.example.com"
+  docker_repo_key: "rise-docker-local"
+  token_provider:
+    type: vault
+    vault_mount_path: "artifactory"
+    vault_role: "rise"
+    scope_override: false       # use the scope configured on the Vault role
+  # push_token_ttl: 600
+  # pull_token_ttl: 86400
+```
+
+When `scope_override: false`, Rise omits the `scope` query parameter and the Vault role's configured scope is used for all tokens. The `push_permissions` and `pull_permissions` settings are ignored in this mode. This is useful when the Vault admin wants full control over token scopes.
+
+> **Note (Vault mode):** The Vault role's `max_ttl` must be >= `pull_token_ttl`. If the role's `max_ttl` is lower, Vault silently clamps the token TTL and the cached credentials may expire earlier than expected.
+
+**Direct mode:**
+
+```yaml
+registry:
+  type: jfrog
+  registry_host: "jfrog.example.com"
+  docker_repo_key: "rise-docker-local"
+  token_provider:
+    type: direct
+    jfrog_url: "https://jfrog.example.com"
+    admin_token: "${JFROG_ADMIN_TOKEN}"   # applied-permissions/admin scoped token
+  # client_registry_url: ~     # optional: override registry URL returned to CLI clients
+  # push_token_ttl: 600        # push token lifetime in seconds (default: 600)
+  # pull_token_ttl: 86400      # pull token lifetime in seconds (default: 86400 = 24h)
+```
+
+**How it works:**
+- **CLI pushes**: the backend mints a short-lived multi-scope token with `r,w` permissions scoped to the deployment tag, blob uploads, and content-addressed manifests. The token is used for `docker login` before push.
+- **Kubernetes pull secrets**: when `mint_pull_secrets: true`, the controller creates image pull secrets with a long-lived read-only scoped token (`artifact:{docker_repo_key}/{project}/**:r`). Pull tokens are cached in memory and refreshed after 2/3 of their TTL to avoid minting a new token on every deploy.
+
+See [Registry Backend Operations](operator-registry-operations.md#jfrog-artifactory) for scope details and troubleshooting.
+
 ### Controller Settings (Optional)
 
 ```toml

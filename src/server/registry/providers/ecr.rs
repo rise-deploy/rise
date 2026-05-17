@@ -137,7 +137,7 @@ impl EcrProvider {
 
 #[async_trait]
 impl RegistryProvider for EcrProvider {
-    async fn get_credentials(&self, repository: &str) -> Result<RegistryCredentials> {
+    async fn get_credentials(&self, repository: &str, _tag: &str) -> Result<RegistryCredentials> {
         tracing::info!(
             "Getting scoped ECR credentials for repository: {}",
             repository

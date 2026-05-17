@@ -78,7 +78,7 @@ pub async fn get_deployment_registry_credentials(
 
     let credentials = state
         .registry_provider
-        .get_credentials(&repository)
+        .get_credentials(&repository, &deployment_id)
         .await
         .internal_err("Failed to get registry credentials")
         .map_err(|e| {

@@ -12,8 +12,8 @@ use crate::server::registry::{
 
 #[cfg(feature = "backend")]
 use crate::server::registry::{
-    models::{EcrConfig, GitLabRegistryConfig},
-    providers::{EcrProvider, GitLabRegistryProvider},
+    models::{EcrConfig, GitLabRegistryConfig, JfrogConfig, JfrogTokenProvider},
+    providers::{EcrProvider, GitLabRegistryProvider, JfrogProvider},
 };
 use crate::server::settings::{
     AuthSettings, EncryptionSettings, RegistrySettings, ServerSettings, Settings,
@@ -345,6 +345,123 @@ impl AppState {
                     anyhow::bail!(
                         "GitLab registry is configured ({}) but the 'backend' feature is not enabled.",
                         registry_url
+                    )
+                }
+                #[cfg(feature = "backend")]
+                RegistrySettings::Jfrog {
+                    registry_host,
+                    client_registry_url,
+                    docker_repo_key,
+                    token_provider,
+                    push_permissions,
+                    pull_permissions,
+                    push_token_ttl,
+                    pull_token_ttl,
+                    mint_pull_secrets,
+                } => {
+                    use crate::server::settings::JfrogTokenProviderSettings;
+
+                    let resolved_token_provider = match token_provider {
+                        JfrogTokenProviderSettings::Vault {
+                            vault_addr,
+                            vault_token,
+                            vault_token_file,
+                            vault_mount_path,
+                            vault_role,
+                            scope_override,
+                        } => {
+                            let addr = vault_addr
+                                .clone()
+                                .or_else(|| std::env::var("VAULT_ADDR").ok())
+                                .context("Vault address not configured. Set vault_addr in config or VAULT_ADDR env var")?;
+
+                            // Token resolution priority: config value > token_file config > VAULT_TOKEN_FILE env > VAULT_TOKEN env
+                            let (token, token_file) = if let Some(t) = vault_token {
+                                (t.clone(), None)
+                            } else {
+                                let file_path = vault_token_file
+                                    .clone()
+                                    .or_else(|| std::env::var("VAULT_TOKEN_FILE").ok());
+
+                                if let Some(ref path) = file_path {
+                                    // Read initial token from file for validation
+                                    let initial_token = std::fs::read_to_string(path)
+                                        .with_context(|| {
+                                            format!(
+                                                "Failed to read Vault token from file: {}",
+                                                path
+                                            )
+                                        })?
+                                        .trim()
+                                        .to_string();
+                                    if initial_token.is_empty() {
+                                        anyhow::bail!("Vault token file '{}' is empty", path);
+                                    }
+                                    (initial_token, Some(path.clone()))
+                                } else {
+                                    let token = std::env::var("VAULT_TOKEN")
+                                        .context("Vault token not configured. Set vault_token, vault_token_file in config, or VAULT_TOKEN/VAULT_TOKEN_FILE env var")?;
+                                    (token, None)
+                                }
+                            };
+
+                            JfrogTokenProvider::Vault {
+                                vault_addr: addr,
+                                vault_token: token,
+                                vault_token_file: token_file,
+                                vault_mount_path: vault_mount_path.clone(),
+                                role: vault_role.clone(),
+                                scope_override: *scope_override,
+                            }
+                        }
+                        JfrogTokenProviderSettings::Direct {
+                            jfrog_url,
+                            admin_token,
+                        } => {
+                            if admin_token.is_empty() {
+                                anyhow::bail!(
+                                    "JFrog Direct token provider admin_token is empty. \
+                                     Set admin_token in config or ensure the referenced \
+                                     environment variable is set."
+                                );
+                            }
+                            JfrogTokenProvider::Direct {
+                                jfrog_url: jfrog_url.clone(),
+                                admin_token: admin_token.clone(),
+                            }
+                        }
+                    };
+
+                    let resolved_client_host = client_registry_url
+                        .clone()
+                        .unwrap_or_else(|| registry_host.clone());
+
+                    let jfrog_config = JfrogConfig {
+                        token_provider: resolved_token_provider,
+                        registry_host: registry_host.clone(),
+                        client_registry_host: resolved_client_host,
+                        docker_repo_key: docker_repo_key.clone(),
+                        push_permissions: push_permissions.clone(),
+                        pull_permissions: pull_permissions.clone(),
+                        push_token_ttl: *push_token_ttl,
+                        pull_token_ttl: *pull_token_ttl,
+                        mint_pull_secrets: *mint_pull_secrets,
+                    };
+
+                    let provider = JfrogProvider::new(jfrog_config)
+                        .context("Failed to initialize JFrog registry provider")?;
+                    tracing::info!(
+                        "Initialized JFrog registry provider at {}/{}",
+                        registry_host,
+                        docker_repo_key
+                    );
+                    Arc::new(provider)
+                }
+                #[cfg(not(feature = "backend"))]
+                RegistrySettings::Jfrog { registry_host, .. } => {
+                    anyhow::bail!(
+                        "JFrog registry is configured ({}) but the 'backend' feature is not enabled.",
+                        registry_host
                     )
                 }
             },

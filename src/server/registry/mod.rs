@@ -19,14 +19,17 @@ pub enum ImageTagType {
 /// Trait for container registry providers
 #[async_trait]
 pub trait RegistryProvider: Send + Sync {
-    /// Get temporary credentials for pushing images (scoped to repository)
+    /// Get temporary credentials for pushing images (scoped to repository and tag)
     ///
     /// # Arguments
     /// * `repository` - The repository name (e.g., "my-app")
+    /// * `tag` - The image tag (e.g., deployment ID like "20251215-204525").
+    ///           Providers that support tag-level scoping use this to mint
+    ///           the narrowest possible credentials.
     ///
     /// # Returns
     /// Registry credentials including username, password, and registry URL
-    async fn get_credentials(&self, repository: &str) -> Result<RegistryCredentials>;
+    async fn get_credentials(&self, repository: &str, tag: &str) -> Result<RegistryCredentials>;
 
     /// Get credentials for pulling/reading images (registry-wide)
     ///

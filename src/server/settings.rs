@@ -814,6 +814,93 @@ pub enum RegistrySettings {
         #[serde(default)]
         client_registry_url: Option<String>,
     },
+    /// JFrog Artifactory Docker registry — mints scoped access tokens per operation
+    #[serde(rename = "jfrog")]
+    Jfrog {
+        /// Docker registry host:port (e.g., "localhost:3082")
+        registry_host: String,
+        /// Optional client-facing registry host override for CLI push
+        #[serde(default)]
+        client_registry_url: Option<String>,
+        /// Docker repository key in JFrog (e.g., "rise-docker-local")
+        docker_repo_key: String,
+        /// Token provider configuration
+        token_provider: JfrogTokenProviderSettings,
+        /// Artifact permission letters for push tokens (default: "r,w")
+        #[serde(default = "default_jfrog_push_permissions")]
+        push_permissions: String,
+        /// Artifact permission letters for pull tokens (default: "r")
+        #[serde(default = "default_jfrog_pull_permissions")]
+        pull_permissions: String,
+        /// TTL in seconds for push tokens (default: 600)
+        #[serde(default = "default_jfrog_push_token_ttl")]
+        push_token_ttl: u64,
+        /// TTL in seconds for pull tokens used by K8s image pull secrets (default: 86400)
+        /// For Vault mode, the Vault role's max_ttl must be >= this value.
+        #[serde(default = "default_jfrog_pull_token_ttl")]
+        pull_token_ttl: u64,
+        /// Whether K8s controller creates image pull secrets (default: true)
+        #[serde(default = "default_true")]
+        mint_pull_secrets: bool,
+    },
+}
+
+/// Token provider configuration for JFrog registry
+#[derive(Debug, Deserialize, Clone, JsonSchema)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum JfrogTokenProviderSettings {
+    /// HashiCorp Vault with vault-plugin-secrets-artifactory
+    Vault {
+        /// Vault server address (fallback: VAULT_ADDR env var)
+        #[serde(default)]
+        vault_addr: Option<String>,
+        /// Vault token (fallback: VAULT_TOKEN env var)
+        #[serde(default)]
+        vault_token: Option<String>,
+        /// Path to a file containing the Vault token (fallback: VAULT_TOKEN_FILE env var).
+        /// Re-read on each request to support token rotation.
+        #[serde(default)]
+        vault_token_file: Option<String>,
+        /// Vault secrets engine mount path (default: "artifactory")
+        #[serde(default = "default_vault_mount_path")]
+        vault_mount_path: String,
+        /// Vault role name
+        vault_role: String,
+        /// When true (default), Rise sends per-operation scopes to Vault, overriding
+        /// the role's default scope. With the Rise fork of vault-plugin-secrets-artifactory,
+        /// configure admin `allow_scope_override="opt-in"` and role
+        /// `allow_scope_override=true` with narrow `allowed_scopes`.
+        /// When false, Rise omits the scope parameter and the role's configured scope is used.
+        #[serde(default = "default_true")]
+        scope_override: bool,
+    },
+    /// JFrog's own access token API with an admin token
+    Direct {
+        /// JFrog platform URL (e.g., "http://rise-jfrog:8082")
+        jfrog_url: String,
+        /// Admin access token for minting scoped tokens
+        admin_token: String,
+    },
+}
+
+fn default_jfrog_push_permissions() -> String {
+    "r,w".to_string()
+}
+
+fn default_jfrog_pull_permissions() -> String {
+    "r".to_string()
+}
+
+fn default_jfrog_push_token_ttl() -> u64 {
+    600
+}
+
+fn default_jfrog_pull_token_ttl() -> u64 {
+    86400 // 24 hours
+}
+
+fn default_vault_mount_path() -> String {
+    "artifactory".to_string()
 }
 
 /// Encryption provider configuration

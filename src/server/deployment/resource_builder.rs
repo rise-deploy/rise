@@ -1372,7 +1372,11 @@ mod tests {
 
     #[async_trait]
     impl RegistryProvider for TestRegistryProvider {
-        async fn get_credentials(&self, _repository: &str) -> Result<RegistryCredentials> {
+        async fn get_credentials(
+            &self,
+            _repository: &str,
+            _tag: &str,
+        ) -> Result<RegistryCredentials> {
             unreachable!("not used in these tests")
         }
 

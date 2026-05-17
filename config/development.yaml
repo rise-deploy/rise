@@ -44,6 +44,33 @@ registry:
   namespace: "rise-apps"
   client_registry_url: "rise-registry:5000" # Client-facing URL for CLI push operations
 
+# JFrog Artifactory registry (via Vault):
+# registry:
+#   type: "jfrog"
+#   registry_host: "rise-jfrog:8082"
+#   client_registry_url: "localhost:3082"
+#   docker_repo_key: "rise-docker-local"
+#   token_provider:
+#     type: "vault"
+#     vault_mount_path: "artifactory"
+#     vault_role: "rise"
+#     # scope_override: true       # default; requires the Rise Vault plugin fork with allowed_scopes
+#   # push_permissions: "r,w"     # default (ignored when scope_override=false)
+#   # pull_permissions: "r"       # default (ignored when scope_override=false)
+#   # push_token_ttl: 600         # push token TTL in seconds (default: 600)
+#   # pull_token_ttl: 86400       # pull token TTL in seconds (default: 86400 = 24h)
+
+# JFrog Artifactory registry (via Direct token):
+# registry:
+#   type: "jfrog"
+#   registry_host: "rise-jfrog:8082"
+#   client_registry_url: "localhost:3082"
+#   docker_repo_key: "rise-docker-local"
+#   token_provider:
+#     type: "direct"
+#     jfrog_url: "http://localhost:3082"
+#     admin_token: "${JFROG_ADMIN_TOKEN}"
+
 deployment_controller:
   type: "kubernetes"
   pod_security_enabled: false
