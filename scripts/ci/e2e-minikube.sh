@@ -57,17 +57,30 @@ rise_cli() {
 
 wait_for_jfrog_vault() {
   echo "Waiting for Vault-backed JFrog registry setup"
-  for _ in {1..120}; do
+  echo "Streaming JFrog/Vault setup logs until the Vault role is available"
+  docker compose logs --follow --tail=100 jfrog vault &
+  COMPOSE_LOGS_PID=$!
+
+  for attempt in {1..120}; do
     if curl -fsS \
       -H "X-Vault-Token: root" \
       "http://127.0.0.1:8200/v1/artifactory/roles/rise" >/dev/null 2>&1; then
+      kill "${COMPOSE_LOGS_PID}" >/dev/null 2>&1 || true
+      wait "${COMPOSE_LOGS_PID}" >/dev/null 2>&1 || true
+      COMPOSE_LOGS_PID=""
       return 0
     fi
-    docker compose ps jfrog vault || true
+
+    if (( attempt % 6 == 0 )); then
+      docker compose ps jfrog vault || true
+    fi
     sleep 5
   done
 
   echo "Timed out waiting for Vault Artifactory role"
+  kill "${COMPOSE_LOGS_PID}" >/dev/null 2>&1 || true
+  wait "${COMPOSE_LOGS_PID}" >/dev/null 2>&1 || true
+  COMPOSE_LOGS_PID=""
   docker compose logs --tail=200 jfrog vault || true
   exit 1
 }
@@ -88,6 +101,10 @@ EOF
 
 cleanup() {
   local exit_code=$?
+  if [[ -n "${COMPOSE_LOGS_PID:-}" ]] && kill -0 "${COMPOSE_LOGS_PID}" >/dev/null 2>&1; then
+    kill "${COMPOSE_LOGS_PID}" >/dev/null 2>&1 || true
+    wait "${COMPOSE_LOGS_PID}" >/dev/null 2>&1 || true
+  fi
   if [[ -n "${PF_PID:-}" ]] && kill -0 "${PF_PID}" >/dev/null 2>&1; then
     kill "${PF_PID}" >/dev/null 2>&1 || true
   fi
