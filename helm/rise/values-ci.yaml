@@ -22,6 +22,10 @@ config:
     client_id: rise-backend
     client_secret: rise-backend-secret
 
+  encryption:
+    type: aes-gcm-256
+    key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+
   registry:
     type: oci-client-auth
     registry_url: localhost:5000
