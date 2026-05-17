@@ -2,8 +2,6 @@
 title: "Database"
 ---
 
-# Database
-
 Rise uses PostgreSQL for data storage with SQLX for compile-time verified SQL queries and migrations.
 
 ## Overview
@@ -30,7 +28,7 @@ Creates `migrations/<timestamp>_<description>.sql`. Edit and add SQL.
 
 **Development**: `mise db:migrate` (auto-run by `mise backend:run`)
 
-**Production**: `sqlx migrate run`
+Migrations run automatically on container startup in production.
 
 ### Migration Best Practices
 
@@ -38,21 +36,6 @@ Creates `migrations/<timestamp>_<description>.sql`. Edit and add SQL.
 2. Use `CREATE INDEX CONCURRENTLY` in PostgreSQL
 3. Avoid blocking operations on large tables
 4. Test rollback procedures
-
-## SQLX Compile-Time Verification
-
-`.sqlx/` directory contains query metadata for offline builds.
-
-```bash
-cargo sqlx prepare              # Generate metadata
-cargo sqlx prepare --check      # Verify cache
-```
-
-Regenerate after migrations or SQL query changes.
-
-### Writing Queries
-
-Use `sqlx::query!` macro for compile-time verification (syntax, types, columns).
 
 ## Database Access
 
@@ -128,78 +111,6 @@ psql postgres://rise:rise123@localhost:5432/rise
 
 # Truncate tables (preserves schema)
 TRUNCATE deployments, projects, teams, team_members, users, service_accounts RESTART IDENTITY CASCADE;
-```
-
-## Common Patterns
-
-### Transactions
-
-Use transactions for multi-step operations:
-
-```rust
-let mut tx = pool.begin().await?;
-
-sqlx::query!(
-    "INSERT INTO projects (name, owner_type, owner_id) VALUES ($1, $2, $3)",
-    name,
-    "user",
-    user_id
-)
-.execute(&mut *tx)
-.await?;
-
-sqlx::query!(
-    "INSERT INTO audit_log (action, user_id) VALUES ($1, $2)",
-    "create_project",
-    user_id
-)
-.execute(&mut *tx)
-.await?;
-
-tx.commit().await?;
-```
-
-### Optional Fields
-
-Handle NULL columns:
-
-```rust
-let deployment = sqlx::query!(
-    r#"
-    SELECT id, name, expires_at
-    FROM deployments
-    WHERE id = $1
-    "#,
-    deployment_id
-)
-.fetch_one(&pool)
-.await?;
-
-// expires_at is Option<DateTime<Utc>>
-if let Some(expiry) = deployment.expires_at {
-    println!("Expires at: {}", expiry);
-}
-```
-
-### Custom Types
-
-Use Postgres ENUM types:
-
-```sql
-CREATE TYPE visibility AS ENUM ('public', 'private');
-
-ALTER TABLE projects ADD COLUMN visibility visibility NOT NULL DEFAULT 'public';
-```
-
-In Rust:
-
-```rust
-#[derive(Debug, sqlx::Type)]
-#[sqlx(type_name = "visibility", rename_all = "lowercase")]
-enum Visibility {
-    Public,
-    Private,
-}
 ```
 
 ## Performance Considerations

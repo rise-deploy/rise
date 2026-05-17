@@ -2,8 +2,6 @@
 title: "Upgrading PostgreSQL (Helm Chart)"
 ---
 
-# Upgrading PostgreSQL (Helm Chart)
-
 This guide covers upgrading the PostgreSQL major version for the Helm chart's built-in PostgreSQL (`postgresql.enabled: true`). If you use a managed database (RDS, Cloud SQL, etc.), use your provider's upgrade tooling instead.
 
 PostgreSQL major version upgrades (e.g., 16 to 18) are **not** in-place compatible. A newer PostgreSQL binary cannot read a data directory created by an older major version. The Helm chart includes init containers that detect version mismatches and can perform the upgrade automatically using [pgautoupgrade](https://github.com/pgautoupgrade/pgautoupgrade).

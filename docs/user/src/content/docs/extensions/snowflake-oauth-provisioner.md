@@ -2,8 +2,6 @@
 title: "Snowflake OAuth Provisioner Extension"
 ---
 
-# Snowflake OAuth Provisioner Extension
-
 The `snowflake-oauth-provisioner` extension provisions Snowflake OAuth integration and creates a paired `oauth` extension.
 
 ## What It Does

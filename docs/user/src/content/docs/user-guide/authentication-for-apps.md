@@ -2,8 +2,6 @@
 title: "Authentication for Rise-Deployed Applications"
 ---
 
-# Authentication for Rise-Deployed Applications
-
 Rise provides built-in authentication for your deployed applications using JWT tokens. When users authenticate to access your application, Rise issues a signed JWT token that your application can validate to identify the user.
 
 ## Overview
@@ -213,8 +211,8 @@ app.get('/admin', requireTeam('admin'), (req: Request, res: Response) => {
 
 ## Additional Resources
 
-- [Authentication](authentication.md) — user login, service accounts, app users
-- [OAuth Extensions](oauth.md) — OAuth proxy for third-party providers
-- [Environment Variables](environment-variables.md) — auto-injected variables reference
+- [Authentication](../authentication) — user login, service accounts, app users
+- [OAuth Extensions](../oauth) — OAuth proxy for third-party providers
+- [Environment Variables](../environment-variables) — auto-injected variables reference
 - [JWT.io](https://jwt.io/) — JWT debugger and documentation
 - [JWKS Specification](https://datatracker.ietf.org/doc/html/rfc7517) — JSON Web Key Set standard

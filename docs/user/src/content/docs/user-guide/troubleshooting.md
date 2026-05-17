@@ -2,8 +2,6 @@
 title: "Troubleshooting"
 ---
 
-# Troubleshooting
-
 Common issues and solutions when using Rise.
 
 ## Deployment Issues
@@ -70,7 +68,7 @@ docker buildx create --use
 
 ### Build Fails with SSL Errors
 
-See [SSL & Proxy Configuration](ssl-proxy.md) for managed BuildKit daemon setup and certificate injection.
+See [SSL & Proxy Configuration](../ssl-proxy) for managed BuildKit daemon setup and certificate injection.
 
 ## Authentication Issues
 
@@ -117,7 +115,7 @@ Make claims more specific to avoid ambiguity (e.g., differentiate by `ref_protec
 
 Service accounts can only deploy, not manage projects. Use a regular user account for project operations.
 
-See [Authentication](authentication.md) for full service account setup.
+See [Authentication](../authentication) for full service account setup.
 
 ## Getting Help
 

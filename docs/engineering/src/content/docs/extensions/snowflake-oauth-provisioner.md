@@ -2,8 +2,6 @@
 title: "Snowflake OAuth Provisioner Extension"
 ---
 
-# Snowflake OAuth Provisioner Extension
-
 The `snowflake-oauth-provisioner` extension provisions Snowflake OAuth integration and creates a paired `oauth` extension.
 
 ## What It Does
@@ -12,7 +10,33 @@ The `snowflake-oauth-provisioner` extension provisions Snowflake OAuth integrati
 - Retrieves OAuth credentials and stores them securely.
 - Creates/manages a linked `oauth` extension instance.
 
-## Configuration
+## Provider Configuration
+
+The Snowflake OAuth provisioner is configured at the operator level under `extensions.providers`. Add it to your backend config:
+
+```yaml
+extensions:
+  providers:
+    - type: snowflake-oauth-provisioner
+      account: "myorg.us-east-1"        # Snowflake account identifier
+      user: "RISE_SERVICE_USER"         # User with CREATE INTEGRATION privilege
+      role: "ACCOUNTADMIN"              # Role with CREATE INTEGRATION ON ACCOUNT privilege
+      warehouse: "RISE_WH"             # Warehouse for executing SQL
+      auth_type: password               # "password" or "private_key"
+      password: "${SNOWFLAKE_PASSWORD}"
+      # For private key auth:
+      # auth_type: private_key
+      # private_key_path: "/etc/rise/snowflake_rsa_key.p8"
+      # private_key_password: "${SNOWFLAKE_KEY_PASSWORD}"  # optional
+      integration_name_prefix: "rise"   # prefix for SECURITY INTEGRATION names
+      # default_blocked_roles: ["ACCOUNTADMIN", "ORGADMIN", "SECURITYADMIN"]
+      # default_scopes: ["refresh_token"]
+      # refresh_token_validity_seconds: 7776000  # 90 days
+```
+
+## Project Extension Spec
+
+Users configure the extension per-project:
 
 ```json
 {

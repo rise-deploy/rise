@@ -2,28 +2,26 @@
 title: "CLI Reference"
 ---
 
-# CLI Reference
-
 The Rise CLI (`rise`) provides commands for managing projects, deployments, teams, and more. Use `rise --help` or `rise <command> --help` for full flag details.
 
 ## Commands
 
 | Command | Alias | Subcommands | Details |
 |---------|-------|-------------|---------|
-| `rise login` | | | [Authentication](authentication.md) |
-| `rise deploy` | | | [Deployments](deployments.md) |
-| `rise build` | | | [Building Images](builds.md) |
-| `rise run` | | | [Local Development](local-development.md) |
-| `rise project` | `p` | `create` (`c`), `list` (`ls`), `show` (`s`), `update` (`u`), `delete` (`rm`) | [Configuration](configuration.md) |
-| `rise project app-user` | | `add` (`a`), `list` (`ls`), `remove` (`rm`) | [Authentication](authentication.md#app-users) |
-| `rise deployment` | `d` | `create` (`c`), `list` (`ls`), `show` (`s`), `stop`, `rollback`, `logs` | [Deployments](deployments.md) |
-| `rise environment` | `envs` | `create` (`c`), `list` (`ls`), `show` (`s`), `update` (`u`), `delete` (`rm`) | [Environments](environments.md) |
-| `rise env` | `e` | `set` (`s`), `list` (`ls`), `get` (`g`), `delete` (`rm`), `import` (`i`), `show-deployment` | [Environment Variables](environment-variables.md) |
-| `rise domain` | `dom` | `add` (`a`), `list` (`ls`), `remove` (`rm`) | [Custom Domains](custom-domains.md) |
+| `rise login` | | | [Authentication](../authentication) |
+| `rise deploy` | | | [Deployments](../deployments) |
+| `rise build` | | | [Building Images](../builds) |
+| `rise run` | | | [Local Development](../local-development) |
+| `rise project` | `p` | `create` (`c`), `list` (`ls`), `show` (`s`), `update` (`u`), `delete` (`rm`) | [Configuration](../configuration) |
+| `rise project app-user` | | `add` (`a`), `list` (`ls`), `remove` (`rm`) | [Authentication](../authentication#app-users) |
+| `rise deployment` | `d` | `create` (`c`), `list` (`ls`), `show` (`s`), `stop`, `logs` | [Deployments](../deployments) |
+| `rise environment` | `envs` | `create` (`c`), `list` (`ls`), `show` (`s`), `update` (`u`), `delete` (`rm`) | [Environments](../environments) |
+| `rise env` | `e` | `set` (`s`), `list` (`ls`), `get` (`g`), `delete` (`rm`), `import` (`i`), `show-deployment` | [Environment Variables](../environment-variables) |
+| `rise domain` | `dom` | `add` (`a`), `list` (`ls`), `remove` (`rm`) | [Custom Domains](../custom-domains) |
 | `rise team` | `t` | `create` (`c`), `list` (`ls`), `show` (`s`), `update` (`u`), `delete` (`rm`) | |
-| `rise service-account` | `sa` | `create` (`c`), `list` (`ls`), `show` (`s`), `delete` (`rm`) | [Authentication](authentication.md#service-accounts-workload-identity) |
-| `rise extension` | `ext` | `create` (`c`), `update` (`u`), `patch` (`p`), `list` (`ls`), `show` (`s`), `delete` (`rm`) | [OAuth Extensions](oauth.md) |
-| `rise encrypt` | | | [OAuth Extensions](oauth.md) |
+| `rise service-account` | `sa` | `create` (`c`), `list` (`ls`), `show` (`s`), `delete` (`rm`) | [Service Accounts](../service-accounts) |
+| `rise extension` | `ext` | `create` (`c`), `update` (`u`), `patch` (`p`), `list` (`ls`), `show` (`s`), `delete` (`rm`) | [OAuth Extensions](../oauth) |
+| `rise encrypt` | | | [OAuth Extensions](../oauth) |
 | `rise backend` | | `server`, `check-config`, `config-schema` | Operator commands (requires build with `--features backend`) |
 
 `rise deploy` is a shortcut for `rise deployment create`.
@@ -47,4 +45,4 @@ Most commands accept `-p <project>` to specify the project name. If omitted, Ris
 
 ## Global Configuration
 
-CLI settings are stored in `~/.config/rise/config.json`, created on first `rise login`. See [Project Configuration](configuration.md#global-cli-config) for details.
+CLI settings are stored in `~/.config/rise/config.json`, created on first `rise login`. See [Project Configuration](../configuration#global-cli-config) for details.

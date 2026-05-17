@@ -2,8 +2,6 @@
 title: "Local Development"
 ---
 
-# Local Development
-
 The `rise run` command builds and runs your application locally in a container, simulating a deployment environment for development and testing.
 
 ## Basic Usage
@@ -47,7 +45,7 @@ Protected secrets (e.g., RDS database credentials) cannot be loaded locally and 
 
 Disable with `--use-project-env=false`.
 
-For OAuth extension support during local development, see [OAuth — Local Development](oauth.md#local-development).
+For OAuth extension support during local development, see [OAuth — Local Development](../oauth#local-development).
 
 ## Runtime Environment Overrides
 
@@ -69,7 +67,7 @@ rise run --backend railpack
 rise run --backend docker --dockerfile Dockerfile.dev
 ```
 
-All standard [build flags](builds.md) are supported.
+All standard [build flags](../builds) are supported.
 
 ## Standalone Image Build
 
@@ -85,6 +83,23 @@ Push the built image to a registry:
 ```bash
 rise build myapp:latest --push
 ```
+
+## Running Without a Container
+
+If your workflow runs the app directly (e.g. `cargo run`, `npm run dev`) rather than in a container, use `rise env export` to inject Rise's environment variables into your shell:
+
+```bash
+rise env export -p my-app > .env.rise
+# Load with your preferred tool:
+export $(cat .env.rise | xargs)
+# or: source .env.rise, direnv, dotenv, etc.
+```
+
+`rise env export` outputs the resolved set of non-secret environment variables — `PORT`, `RISE_ISSUER`, `RISE_APP_URL`, `RISE_APP_URLS`, and any user-set project variables. No image build is required.
+
+:::note
+Variables from extensions (e.g., RDS database credentials) are protected secrets and are not included. Use a local database instead and override `DATABASE_URL` in your shell.
+:::
 
 ## How It Works
 

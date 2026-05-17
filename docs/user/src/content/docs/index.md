@@ -9,7 +9,7 @@ Use these docs when you are building, configuring, deploying, or troubleshooting
 
 ## Start with
 
-- [Getting Started](user-guide/getting-started.md) to deploy your first application.
-- [Project Configuration](user-guide/configuration.md) to configure `rise.toml`.
-- [Deployments](user-guide/deployments.md) for the deployment lifecycle.
-- [CLI Reference](user-guide/cli-reference.md) for command details.
+- [Getting Started](user-guide/getting-started) to deploy your first application.
+- [Project Configuration](user-guide/configuration) to configure `rise.toml`.
+- [Deployments](user-guide/deployments) for the deployment lifecycle.
+- [CLI Reference](user-guide/cli-reference) for command details.

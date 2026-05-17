@@ -2,8 +2,6 @@
 title: "Project Extensions"
 ---
 
-# Project Extensions
-
 Project extensions add managed capabilities to a project, such as databases, object storage, or OAuth providers.
 
 ## Available Extensions

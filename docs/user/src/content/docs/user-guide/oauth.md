@@ -2,14 +2,21 @@
 title: "OAuth Extension"
 ---
 
-# OAuth Extension
-
-Rise's Generic OAuth 2.0 extension enables end-user authentication with any OAuth provider (Snowflake, Google, GitHub, custom SSO) without managing client secrets locally.
+Rise's OAuth extension makes Rise act as an OAuth/OIDC proxy between your application and any upstream provider (Google, GitHub, Snowflake, custom SSO).
 
 ## Overview
 
+**The problem it solves:** OAuth providers require pre-registering every allowed redirect URI. A Rise project has multiple URLs — a production URL, environment-specific URLs (staging, dev), dynamically-created preview URLs per branch or merge request, and localhost for development — and the full set cannot be known in advance. The OAuth extension solves this by making Rise the single registered redirect URI. You register one callback URL at the provider and Rise forwards authenticated users back to whichever app URL initiated the request.
+
+```
+App (any URL) → Rise authorize → OAuth provider
+                                       ↓
+App (original URL) ← Rise callback ←──┘
+```
+
 **Key Features:**
 
+- **Single registered redirect URI**: Register `https://<rise-url>/oidc/<project>/<extension>/callback` once; all app URLs (production, preview, localhost) work automatically
 - **Generic Provider Support**: Works with any OAuth 2.0 compliant provider
 - **Multiple Flow Support**:
   - PKCE (SPAs, RFC 7636-compliant)

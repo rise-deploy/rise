@@ -2,8 +2,6 @@
 title: "AWS RDS Provisioner Extension"
 ---
 
-# AWS RDS Provisioner Extension
-
 The `aws-rds-provisioner` extension provisions and manages a PostgreSQL instance on AWS RDS for a project.
 
 ## What It Does

@@ -2,8 +2,6 @@
 title: "Local Development"
 ---
 
-# Local Development
-
 ## Prerequisites
 
 - Docker and Docker Compose
@@ -22,8 +20,8 @@ mise install
 mise setup:hosts
 mise setup:docker
 
-# Start a local Kubernetes cluster (pick one)
-mise minikube:up   # or: mise k3s:up
+# Start a local Kubernetes cluster
+mise minikube:up   # preferred on most developer machines (see below)
 ```
 
 The cluster setup task writes pod-reachable host URLs to `.env`. If you use
@@ -78,9 +76,11 @@ mise frontend:dev  # Vite dev server only
 |------|---------|
 | `setup:hosts` | Add `rise-registry` and `rise.local` to `/etc/hosts` |
 | `setup:docker` | Configure Docker daemon insecure registries |
-| `minikube:up` | Start Minikube with registry access and ingress port-forwarding |
+| `minikube:up` | Start Minikube with registry access and ingress port-forwarding (**preferred**) |
 | `minikube:down` | Stop and delete Minikube |
-| `k3s:up` / `k3s:down` | Alternative: K3s instead of Minikube |
+| `k3s:up` / `k3s:down` | Alternative: K3s (use when Minikube doesn't work, or in ephemeral/dedicated Rise dev environments) |
+
+**Minikube vs K3s**: `minikube:up` is preferred on most developer machines — it runs a single-node Kubernetes cluster inside a Docker container, starts quickly, and integrates well with the local Docker network so pods can reach `rise-registry:5000`. Use `k3s:up` when Minikube doesn't work on your machine (e.g., nested virtualization issues) or when setting up an ephemeral or dedicated environment solely for Rise development where the slight extra K3s overhead doesn't matter.
 
 ### Development
 

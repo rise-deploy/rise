@@ -2,8 +2,6 @@
 title: "SSL & Proxy Configuration"
 ---
 
-# SSL & Proxy Configuration
-
 When building behind corporate proxies (Zscaler, Cloudflare) or in environments with custom CA certificates, builds may fail with SSL certificate verification errors. Rise provides several mechanisms to handle this.
 
 ## Quick Start

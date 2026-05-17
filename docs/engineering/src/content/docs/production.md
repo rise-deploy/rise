@@ -2,8 +2,6 @@
 title: "Production Setup"
 ---
 
-# Production Setup
-
 Guidelines for deploying Rise in production environments.
 
 ## Overview
@@ -12,13 +10,7 @@ This guide covers security, configuration, database setup, monitoring, and opera
 
 ## Deployment Backend
 
-Rise deploys applications to Kubernetes clusters. For local development, use Minikube:
-
-```bash
-mise minikube:up
-```
-
-See [Kubernetes Backend](./kubernetes.md) for Kubernetes-specific configuration and operation.
+Rise deploys applications to Kubernetes clusters. See [Kubernetes](./kubernetes/) for configuration and operational details.
 
 ## Security Best Practices
 
@@ -65,14 +57,7 @@ RISE_CONFIG_RUN_MODE="production"          # Which config file to load (producti
 
 Use managed database (AWS RDS, Cloud SQL, Azure Database).
 
-**RDS settings**: `db.t3.medium`+, 100GB GP3 with autoscaling, Multi-AZ, 7-30 day backup retention, encryption, PostgreSQL 16+
-
-### Running Migrations
-
-```bash
-export DATABASE_URL="postgres://rise:password@rds-endpoint:5432/rise"
-sqlx migrate run
-```
+**Recommended settings**: Multi-AZ, automated storage autoscaling, 7-30 day backup retention, encryption at rest, PostgreSQL 16+
 
 ### Database Backups
 
@@ -87,17 +72,6 @@ If you use the Helm chart's built-in PostgreSQL, see [Upgrading PostgreSQL](./up
 Rise uses SQLx with connection pooling. Configure pool size based on load in `config/production.toml` if needed.
 
 ## High Availability
-
-### Multi-Process Architecture
-
-| Process | Purpose | Scaling |
-|---------|---------|---------|
-| `backend-server` | HTTP API, OAuth | Horizontal |
-| `backend-deployment` | Deployment controller | Single instance* |
-| `backend-project` | Project lifecycle | Single instance* |
-| `backend-ecr` | ECR management | Single instance* |
-
-*Leader election for controllers planned for future.
 
 ### Health Checks
 
@@ -121,7 +95,7 @@ RDS Multi-AZ: automatic failover (1-2 min), backend reconnects automatically.
 
 ### Logging
 
-Rise uses structured JSON logs. Aggregate with CloudWatch, Cloud Logging, ELK, or Loki+Grafana.
+Rise writes logs to stdout. Aggregate with CloudWatch, Cloud Logging, ELK, or Loki+Grafana.
 
 ### Alerting
 
@@ -132,27 +106,27 @@ Rise uses structured JSON logs. Aggregate with CloudWatch, Cloud Logging, ELK, o
 
 ### Backup Strategy
 
-**Backup**: Database (RDS snapshots), config (git), secrets (Secrets Manager)
+**Backup**: Database (RDS snapshots — includes all Rise-managed secrets), git-tracked config
 **Don't backup**: Container images (in ECR), credentials, binaries
 
 ### Recovery
 
 1. Restore database from snapshot
-2. Deploy backend from git
-3. Run migrations: `sqlx migrate run`
-4. Restore config/secrets
-5. Start processes, verify health
+2. Redeploy backend via Helm chart
+3. Verify health (migrations run automatically on startup)
+4. Restore any externally-managed configuration
 
 ## Operational Tasks
 
 ### Updating Rise
 
+Update the image tag and upgrade the Helm release:
+
 ```bash
-git pull origin main
-cargo build --release --bin rise
-sqlx migrate run
-# Restart processes (method depends on deployment: systemd, K8s, etc.)
+helm upgrade rise ./helm/rise --namespace rise --reuse-values --set image.tag=<new-tag>
 ```
+
+Migrations run automatically on container startup.
 
 ### Cleanup
 

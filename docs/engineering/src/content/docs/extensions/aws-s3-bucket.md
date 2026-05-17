@@ -2,8 +2,6 @@
 title: "AWS S3 Bucket Extension"
 ---
 
-# AWS S3 Bucket Extension
-
 The `aws-s3-bucket` extension provisions an S3 bucket for a project and injects full-access credentials as environment variables into every deployment.
 
 ## What It Does

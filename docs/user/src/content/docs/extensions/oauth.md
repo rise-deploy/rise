@@ -2,16 +2,33 @@
 title: "OAuth Provider Extension"
 ---
 
-# OAuth Provider Extension
+The `oauth` extension makes Rise act as an OAuth/OIDC proxy between your application and an upstream provider (Google, GitHub, Snowflake, custom SSO).
 
-The `oauth` extension configures Rise as an OAuth/OIDC proxy for your application.
+## The Problem It Solves
+
+OAuth providers require pre-registering every allowed redirect URI. A Rise project can have many URLs that aren't all known in advance:
+
+- **Production**: `my-app.apps.rise.example.com`
+- **Staging environment**: `staging--my-app.preview.rise.example.com`
+- **Preview deployments**: `my-app-mr--26.preview.rise.example.com` (created dynamically per branch/MR)
+- **Local development**: `http://localhost:3000`
+
+Registering all of these at the OAuth provider is impractical, especially for preview URLs that are generated on demand. The OAuth extension solves this by making Rise the single registered redirect URI. Your application redirects users to Rise's authorize endpoint; Rise redirects to the upstream provider using Rise's own callback URL; after authentication, Rise forwards back to whichever app URL initiated the request.
+
+You register **one URL** at the provider:
+
+```
+https://<rise-url>/oidc/<project>/<extension>/callback
+```
+
+Rise allows forwarding to any URL associated with the project as well as `localhost` for local development.
 
 ## What It Does
 
-- Stores provider credentials securely.
-- Exposes Rise OAuth endpoints for auth flows.
-- Injects generated client credentials into app environments.
-- Supports local development redirects (for example `http://localhost:*`) via `redirect_uri` override, even when the upstream provider only allows the Rise callback URL.
+- Stores provider credentials securely (client secret encrypted at rest, never in client environments).
+- Exposes Rise OAuth endpoints (`authorize`, `token`, `callback`, OIDC discovery, JWKS).
+- Generates scoped client credentials injected into app environments.
+- Proxies OIDC discovery and JWKS so apps work identically in local dev and production.
 
 ## Configuration
 
@@ -49,4 +66,4 @@ Example:
 
 ## See Also
 
-- [OAuth Extensions User Guide](../user-guide/oauth.md)
+- [OAuth Extensions User Guide](../../user-guide/oauth)

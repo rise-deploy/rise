@@ -2,8 +2,6 @@
 title: "Environment Variables"
 ---
 
-# Environment Variables
-
 Rise manages environment variables at the project level. Variables are injected into containers at deployment time.
 
 ## Managing Variables
@@ -12,16 +10,16 @@ Rise manages environment variables at the project level. Variables are injected 
 
 ```bash
 # Plain text variable
-rise env set my-app LOG_LEVEL info
+rise env set -p my-app LOG_LEVEL info
 
 # Secret variable (encrypted at rest, masked in listings)
-rise env set my-app DATABASE_URL postgres://user:pass@db/mydb --secret
+rise env set -p my-app DATABASE_URL postgres://user:pass@db/mydb --secret
 
 # Protected secret (encrypted, cannot be retrieved via API)
-rise env set my-app JWT_SECRET supersecret --secret --protected
+rise env set -p my-app JWT_SECRET supersecret --secret --protected
 ```
 
-With a `rise.toml` in your directory, you can omit the project name:
+With a `rise.toml` in your directory, you can omit `-p`:
 
 ```bash
 rise env set LOG_LEVEL info
@@ -30,10 +28,10 @@ rise env set LOG_LEVEL info
 ### Listing Variables
 
 ```bash
-rise env list my-app
+rise env list -p my-app
 
 # List variables for a specific environment (shows global + scoped, merged)
-rise env list my-app -E staging
+rise env list -p my-app -E staging
 ```
 
 Secret values are masked. Protected secrets cannot be decrypted.
@@ -41,13 +39,13 @@ Secret values are masked. Protected secrets cannot be decrypted.
 ### Getting a Single Variable
 
 ```bash
-rise env get my-app LOG_LEVEL
+rise env get -p my-app LOG_LEVEL
 ```
 
 ### Deleting Variables
 
 ```bash
-rise env delete my-app LOG_LEVEL
+rise env delete -p my-app LOG_LEVEL
 ```
 
 Aliases: `rise env unset`, `rise env rm`, `rise env del`
@@ -57,7 +55,7 @@ Aliases: `rise env unset`, `rise env rm`, `rise env del`
 Import variables from a `.env`-style file:
 
 ```bash
-rise env import my-app .env
+rise env import -p my-app .env
 ```
 
 File format:
@@ -73,20 +71,20 @@ Prefix a value with `secret:` to store it as a secret variable.
 
 ## Environment-Scoped Variables
 
-Variables can be scoped to a specific [environment](environments.md) using the `-E` flag. Scoped variables override global variables with the same key when deploying to that environment.
+Variables can be scoped to a specific [environment](../environments) using the `-E` flag. Scoped variables override global variables with the same key when deploying to that environment.
 
 ```bash
 # Set a variable only for staging
 rise env set DATABASE_URL postgres://staging-db/mydb -E staging
 
 # Get a scoped variable
-rise env get my-app DATABASE_URL -E staging
+rise env get -p my-app DATABASE_URL -E staging
 
 # Delete a scoped variable
-rise env delete my-app DATABASE_URL -E staging
+rise env delete -p my-app DATABASE_URL -E staging
 
 # Import variables scoped to an environment
-rise env import my-app .env.staging -E staging
+rise env import -p my-app .env.staging -E staging
 ```
 
 Without `-E`, variables are global and apply to all environments.
@@ -96,7 +94,7 @@ Without `-E`, variables are global and apply to all environments.
 View the environment variables that were active for a specific deployment:
 
 ```bash
-rise env show-deployment my-app 20241205-1234
+rise env show-deployment -p my-app 20241205-1234
 ```
 
 This is a read-only view of the variables as they existed when the deployment was created.
@@ -115,7 +113,7 @@ Rise automatically injects these variables into every deployment:
 | `RISE_DEPLOYMENT_GROUP_NORMALIZED` | Deployment group name normalized for URLs and K8s resource names (sequences of characters not in `[A-Za-z0-9-_.]` are replaced with `--`, and non-alphanumeric leading/trailing characters are trimmed) | `mr--123` |
 | `RISE_ENVIRONMENT` | Environment name (if the deployment has an associated environment) | `staging` |
 
-`PORT` defaults to 8080. Override it per-deployment with `--http-port` on `rise deploy`, or set it permanently with `rise env set my-app PORT 3000`.
+`PORT` defaults to 8080. Override it per-deployment with `--http-port` on `rise deploy`, or set it permanently with `rise env set -p my-app PORT 3000`.
 
 ## Deploy-Time Environment Overrides
 
@@ -147,7 +145,7 @@ These overrides are applied after copying project env vars, so they take precede
 | **Storage** | Ephemeral (not persisted) | Database (encrypted for secrets) |
 | **Examples** | `NODE_ENV`, `BUILD_VERSION` | `DATABASE_URL`, `API_KEY` |
 
-See [Building Images](builds.md#build-time-arguments) for build-time variable details.
+See [Building Images](../builds#build-time-arguments) for build-time variable details.
 
 ## Variables in rise.toml
 

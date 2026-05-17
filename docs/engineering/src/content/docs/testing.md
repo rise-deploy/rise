@@ -2,8 +2,6 @@
 title: "Testing"
 ---
 
-# Testing
-
 Guidelines for testing Rise components.
 
 ## Overview

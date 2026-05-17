@@ -2,8 +2,6 @@
 title: "Custom Domains"
 ---
 
-# Custom Domains
-
 Rise projects are accessible at their default URL (e.g., `https://my-app.app.example.com`). You can add custom domains to serve your application from your own domain names.
 
 ## Adding a Domain
@@ -50,6 +48,3 @@ The exact CNAME target depends on your Rise installation.
 
 The first custom domain becomes the primary domain, used as the value of the `RISE_APP_URL` environment variable in your deployments. All domains (including the default URL) are included in `RISE_APP_URLS`.
 
-## Domains in rise.toml
-
-Custom domains are managed via the CLI (`rise domain add/remove`). They are not configured through `rise.toml`.

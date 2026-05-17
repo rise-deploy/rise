@@ -28,7 +28,16 @@ export default defineConfig({
           items: [
             { label: 'Deployments', slug: 'user-guide/deployments' },
             { label: 'Environments', slug: 'user-guide/environments' },
-            { label: 'Building Images', slug: 'user-guide/builds' },
+            { label: 'CI/CD Setup', slug: 'user-guide/ci-cd' },
+            {
+              label: 'Building Images',
+              items: [
+                { label: 'Overview', slug: 'user-guide/builds' },
+                { label: 'Docker', slug: 'user-guide/builds/docker' },
+                { label: 'Pack (Buildpacks)', slug: 'user-guide/builds/pack' },
+                { label: 'Railpack', slug: 'user-guide/builds/railpack' },
+              ],
+            },
             { label: 'Environment Variables', slug: 'user-guide/environment-variables' },
             { label: 'Custom Domains', slug: 'user-guide/custom-domains' },
             { label: 'Local Development', slug: 'user-guide/local-development' },
@@ -38,6 +47,7 @@ export default defineConfig({
           label: 'Access',
           items: [
             { label: 'Authentication', slug: 'user-guide/authentication' },
+            { label: 'Service Accounts', slug: 'user-guide/service-accounts' },
             { label: 'Authentication for Applications', slug: 'user-guide/authentication-for-apps' },
             { label: 'OAuth Extensions', slug: 'user-guide/oauth' },
             { label: 'SSL & Proxy Configuration', slug: 'user-guide/ssl-proxy' },

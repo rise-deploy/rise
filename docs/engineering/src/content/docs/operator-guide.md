@@ -2,8 +2,6 @@
 title: "Operator Guide"
 ---
 
-# Operator Guide
-
 The Operator Guide covers configuring and running Rise as a platform.
 
 Use this section if you are:

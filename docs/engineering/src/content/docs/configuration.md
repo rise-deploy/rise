@@ -2,8 +2,6 @@
 title: "Configuration Guide"
 ---
 
-# Configuration Guide
-
 Rise backend uses YAML configuration files with environment variable substitution support. TOML is also supported for backward compatibility.
 
 ## Configuration Files
@@ -25,15 +23,7 @@ In container deployments, `RISE_CONFIG_DIR` is typically `/etc/rise`.
 
 Configuration values can reference environment variables using the syntax:
 
-```toml
-# TOML example
-client_secret = "${RISE_AUTH_CLIENT_SECRET:-rise-backend-secret}"
-account_id = "${AWS_ACCOUNT_ID}"
-public_url = "https://${DOMAIN_NAME}:${PORT}"
-```
-
 ```yaml
-# YAML example
 auth:
   client_secret: "${RISE_AUTH_CLIENT_SECRET:-rise-backend-secret}"
 registry:
@@ -70,82 +60,53 @@ Configuration is loaded in this order (later values override earlier ones):
 
 **Note**: When multiple file formats exist for the same config file, TOML takes precedence over YAML.
 
-Example (TOML):
-```toml
-# In production.toml
-client_secret = "${AUTH_SECRET}" # Required in production
-
-# In local.toml
-client_secret = "my-local-secret"  # Override: hardcoded value
-```
-
-Example (YAML):
+Example:
 ```yaml
 # In production.yaml
 auth:
-  client_secret: "${AUTH_SECRET}"  # Required
+  client_secret: "${AUTH_SECRET}"  # Required in production
+
+# In local.yaml
+auth:
+  client_secret: "my-local-secret"  # Override: hardcoded value
 ```
 
 ### Special Cases
 
-**DATABASE_URL**: For convenience, the DATABASE_URL environment variable is checked after config loading and will override any `[database] url` setting. This is optional - you can use `${DATABASE_URL}` in TOML instead:
+**DATABASE_URL**: For convenience, the DATABASE_URL environment variable is checked after config loading and will override any `database.url` setting. This is optional — you can use `${DATABASE_URL}` in YAML instead:
 
-```toml
+```yaml
 # Option 1: Direct environment variable (checked after config loads)
-[database]
-url = ""  # Empty, DATABASE_URL env var will be used
+database:
+  url: ""  # Empty, DATABASE_URL env var will be used
 
 # Option 2: Explicit substitution (recommended for consistency)
-[database]
-url = "${DATABASE_URL}"
+database:
+  url: "${DATABASE_URL}"
 ```
 
 **Note**: DATABASE_URL is only required at compile time for SQLX query verification. At runtime, you can set it via either method above.
 
 ## Examples
 
-### Development (development.toml)
-
-```toml
-[server]
-host = "0.0.0.0"
-port = 3000
-public_url = "http://localhost:3000"
-
-[auth]
-issuer = "http://localhost:5556/dex"
-client_id = "rise-backend"
-client_secret = "${RISE_AUTH_CLIENT_SECRET:-rise-backend-secret}"
-```
-
-### Production with Environment Variables (TOML)
-
-```toml
-# production.toml
-[server]
-host = "0.0.0.0"
-port = "${PORT:-3000}"
-public_url = "${PUBLIC_URL}"  # Required, no default
-cookie_secure = true
-
-[auth]
-issuer = "${DEX_ISSUER}"
-client_id = "${OIDC_CLIENT_ID}"
-client_secret = "${OIDC_CLIENT_SECRET}"  # Required
-admin_users = ["${ADMIN_EMAIL}"]
-
-[registry]
-type = "ecr"
-region = "${AWS_REGION:-us-east-1}"
-account_id = "${AWS_ACCOUNT_ID}"
-role_arn = "${ECR_CONTROLLER_ROLE_ARN}"
-push_role_arn = "${ECR_PUSH_ROLE_ARN}"
-```
-
-### Production with Environment Variables (YAML)
+### Development (development.yaml)
 
 ```yaml
-# production.yaml - ideal for Kubernetes/Helm deployments
+server:
+  host: "0.0.0.0"
+  port: 3000
+  public_url: "http://localhost:3000"
+
+auth:
+  issuer: "http://localhost:5556/dex"
+  client_id: "rise-backend"
+  client_secret: "${RISE_AUTH_CLIENT_SECRET:-rise-backend-secret}"
+```
+
+### Production with Environment Variables
+
+```yaml
+# production.yaml
 server:
   host: "0.0.0.0"
   port: "${PORT:-3000}"
@@ -166,7 +127,6 @@ registry:
   type: "ecr"
   region: "${AWS_REGION:-us-east-1}"
   account_id: "${AWS_ACCOUNT_ID}"
-  role_arn: "${ECR_CONTROLLER_ROLE_ARN}"
   push_role_arn: "${ECR_PUSH_ROLE_ARN}"
 ```
 
@@ -179,41 +139,40 @@ OIDC_CLIENT_ID=rise-production
 OIDC_CLIENT_SECRET=very-secret-value
 ADMIN_EMAIL=admin@example.com
 AWS_ACCOUNT_ID=123456789012
-ECR_CONTROLLER_ROLE_ARN=arn:aws:iam::123456789012:policy/rise-backend
 ECR_PUSH_ROLE_ARN=arn:aws:iam::123456789012:role/rise-backend-ecr-push
 DATABASE_URL=postgres://rise:${DB_PASSWORD}@db.example.com/rise
 ```
 
-### Local Overrides (local.toml)
+### Local Overrides (local.yaml)
 
-For local development, create `local.toml` (not checked into git):
+For local development, create `local.yaml` (not checked into git):
 
-```toml
+```yaml
 # Override just what you need
-[auth]
-client_secret = "my-local-secret"
+auth:
+  client_secret: "my-local-secret"
 
-[registry]
-type = "oci-client-auth"
-registry_url = "localhost:5000"
+registry:
+  type: "oci-client-auth"
+  registry_url: "localhost:5000"
 ```
 
 ## Configuration Reference
 
 ### Server Settings
 
-```toml
-[server]
-host = "0.0.0.0"              # Bind address
-port = 3000                    # HTTP port
-public_url = "http://..."      # Public URL (for OAuth redirects)
-cookie_secure = false          # Set true for HTTPS
-jwt_signing_secret = "..."     # JWT signing secret (base64-encoded, min 32 bytes)
-jwt_expiry_seconds = 86400     # JWT expiry duration in seconds (default: 24 hours)
-jwt_claims = ["sub", "email", "name"]  # Claims to include from IdP
-rs256_private_key_pem = "..."  # Optional: RS256 private key (persists JWTs across restarts)
-rs256_public_key_pem = "..."   # Optional: RS256 public key (derived if not provided)
-docs_dir = "/var/rise/docs"    # Optional: directory containing built static documentation
+```yaml
+server:
+  host: "0.0.0.0"              # Bind address
+  port: 3000                   # HTTP port
+  public_url: "http://..."     # Public URL (for OAuth redirects)
+  cookie_secure: false         # Set true for HTTPS
+  jwt_signing_secret: "..."    # JWT signing secret (base64-encoded, min 32 bytes)
+  jwt_expiry_seconds: 86400    # JWT expiry duration in seconds (default: 24 hours)
+  jwt_claims: ["sub", "email", "name"]  # Claims to include from IdP
+  rs256_private_key_pem: "..."  # Optional: RS256 private key (persists JWTs across restarts)
+  rs256_public_key_pem: "..."   # Optional: RS256 public key (derived if not provided)
+  docs_dir: "/var/rise/docs"   # Optional: directory containing built static documentation
 ```
 
 **Documentation Serving (`docs_dir`):**
@@ -231,13 +190,13 @@ docs_dir = "/var/rise/docs"    # Optional: directory containing built static doc
 
 ### Auth Settings
 
-```toml
-[auth]
-issuer = "http://..."          # OIDC issuer URL
-client_id = "rise-backend"     # OAuth2 client ID
-client_secret = "..."          # OAuth2 client secret
-admin_users = ["email@..."]    # Admin user emails (array)
-allow_team_creation = true     # Allow regular users to create teams (default: true)
+```yaml
+auth:
+  issuer: "http://..."         # OIDC issuer URL
+  client_id: "rise-backend"   # OAuth2 client ID
+  client_secret: "..."        # OAuth2 client secret
+  admin_users: ["email@..."]  # Admin user emails (array)
+  allow_team_creation: true   # Allow regular users to create teams (default: true)
                               # When false, only admins can create teams
 ```
 
@@ -247,10 +206,10 @@ allow_team_creation = true     # Allow regular users to create teams (default: t
 
 ### Database Settings
 
-```toml
-[database]
-url = "postgres://..."         # PostgreSQL connection string
-                              # Or use DATABASE_URL env var
+```yaml
+database:
+  url: "postgres://..."        # PostgreSQL connection string
+                               # Or use DATABASE_URL env var
 ```
 
 ### Registry Settings
@@ -263,7 +222,6 @@ type = "ecr"
 region = "us-east-1"
 account_id = "123456789012"
 repo_prefix = "rise/"
-role_arn = "arn:aws:iam::..."
 push_role_arn = "arn:aws:iam::..."
 auto_remove = true
 ```

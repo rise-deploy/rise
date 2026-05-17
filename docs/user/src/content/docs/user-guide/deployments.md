@@ -2,8 +2,6 @@
 title: "Deployments"
 ---
 
-# Deployments
-
 A deployment is an immutable, timestamped instance of your application running in the container runtime. Each deployment has a unique ID (e.g., `my-app:20241205-1234`), tracks its own status, and can be rolled back to.
 
 ## Creating a Deployment
@@ -25,6 +23,8 @@ rise deploy -E staging
 ```
 
 `rise deploy` is a shortcut for `rise deployment create` (`rise d c`). After creating the deployment, Rise automatically follows its progress.
+
+**Environment and group selection** — when you don't pass `-E` or `--group`, Rise uses the project's default environment and its primary deployment group (typically `production` → `default`). You can deploy to a named environment with `-E <name>`, which automatically selects that environment's primary group. See [Environments](../environments#deploying-to-environments) for the full resolution rules.
 
 ### Pre-Built Images
 
@@ -74,6 +74,8 @@ Deployments progress through the following states:
 | `Healthy` | Running and passing health checks |
 | `Unhealthy` | Running but failing health checks |
 
+Once a deployment enters a running state it stays there indefinitely — Rise does **not** automatically terminate or fail a deployment that has been `Unhealthy` for a long time. An unhealthy deployment continues to receive traffic (or not, depending on your ingress health-check configuration) until you explicitly stop it or a new deployment supersedes it in the same group.
+
 ### Cancellation States (Before Infrastructure)
 
 | Status | Description |
@@ -98,7 +100,9 @@ Deployments progress through the following states:
 
 ## Deployment Groups
 
-A deployment group is a label that identifies a set of related deployments. Only one deployment per group can be active at a time — when a new deployment in a group reaches `Healthy`, the previous one is `Superseded`. Group names typically reflect the source of the deployment (e.g., the Git branch or merge request it was deployed from).
+A deployment group is a label that identifies a set of related deployments. Only one deployment per group can be active at a time — when a new deployment in a group reaches `Healthy`, the previous one is `Superseded`.
+
+**Group names are just labels — they carry no intrinsic meaning on their own.** A group name only acquires routing, URL, and variable-scoping semantics when it is set as the primary group of an [Environment](../environments). Without a matching environment, deployments in a custom group still run but receive the generic staging URL pattern and no environment-scoped variables.
 
 ```bash
 # Deploy to the default group
@@ -113,9 +117,20 @@ Group names must match `[a-z0-9][a-z0-9/-]*[a-z0-9]` (no consecutive hyphens `--
 
 ### Environments
 
-[Environments](environments.md) give semantic meaning to deployment groups. Each environment has a primary deployment group and controls URL routing, variable scoping, and access. The environment marked as **production** determines which deployments receive production traffic and the project's main URL — not the deployment group name itself.
+[Environments](../environments) give semantic meaning to deployment groups. Each environment has a primary deployment group and controls URL routing, variable scoping, and access. The environment marked as **production** determines which deployments receive production traffic and the project's main URL — not the deployment group name itself.
 
-New projects start with a `production` environment mapped to the `default` group. You can create additional environments for staging, dev, etc. See [Environments](environments.md) for details.
+New projects start with a `production` environment mapped to the `default` group. You can create additional environments for staging, dev, etc. See [Environments](../environments) for details.
+
+### CI Source Information
+
+When `rise deploy` runs inside a CI pipeline, the CLI automatically attaches deployment source metadata by reading well-known environment variables:
+
+| Metadata | GitLab CI | GitHub Actions |
+|----------|-----------|---------------|
+| Job URL | `CI_JOB_URL` | `GITHUB_SERVER_URL` + `GITHUB_REPOSITORY` + `GITHUB_RUN_ID` |
+| MR/PR URL | `CI_MERGE_REQUEST_URL` | `GITHUB_SERVER_URL` + `GITHUB_REPOSITORY` + `GITHUB_REF` (on `pull_request` events) |
+
+This metadata is stored with the deployment and displayed in the Rise web UI, making it easy to trace a running deployment back to the pipeline job and merge/pull request that created it. No extra configuration is needed — detection is fully automatic.
 
 ### Auto-Expiration
 
@@ -124,7 +139,7 @@ Set deployments to expire automatically:
 ```bash
 rise deploy --group mr/123 --expire 7d   # Days
 rise deploy --group preview --expire 24h  # Hours
-rise deploy --group temp --expire 1w      # Weeks
+rise deploy --group temp --expire 7d      # Days (max unit; no weeks shorthand)
 ```
 
 Expired deployments are automatically cleaned up.
@@ -136,41 +151,41 @@ Expired deployments are automatically cleaned up.
 `rise deploy` follows automatically. You can also follow an existing deployment:
 
 ```bash
-rise deployment show my-app:20241205-1234 --follow
-rise d s my-app:latest --follow --timeout 10m
+rise deployment show -p my-app 20241205-1234 --follow
+rise d s -p my-app latest --follow --timeout 10m
 ```
 
 ### Listing Deployments
 
 ```bash
-rise deployment list my-app
-rise d ls my-app --group staging
+rise deployment list -p my-app
+rise d ls -p my-app --group staging
 ```
 
 ### Viewing Deployment Details
 
 ```bash
-rise deployment show my-app:20241205-1234
-rise d s my-app:latest
+rise deployment show -p my-app 20241205-1234
+rise d s -p my-app latest
 ```
 
 ### Deployment Logs
 
 ```bash
 # Show recent logs
-rise deployment logs my-app 20241205-1234
+rise deployment logs -p my-app 20241205-1234
 
 # Follow logs in real-time
-rise deployment logs my-app 20241205-1234 --follow
+rise deployment logs -p my-app 20241205-1234 --follow
 
 # Show last 100 lines
-rise deployment logs my-app 20241205-1234 --tail 100
+rise deployment logs -p my-app 20241205-1234 --tail 100
 
 # Show logs since a duration ago
-rise deployment logs my-app 20241205-1234 --since 5m
+rise deployment logs -p my-app 20241205-1234 --since 5m
 
 # Show timestamps
-rise deployment logs my-app 20241205-1234 --timestamps
+rise deployment logs -p my-app 20241205-1234 --timestamps
 ```
 
 Note that logs are currently only available for active deployments (`Healthy` or `Unhealthy`) and can not be accessed
@@ -178,41 +193,33 @@ for past deployments.
 
 ## Rollback
 
-Rollback creates a new deployment using the same image as a previous one:
+The primary rollback mechanism is redeploying from a previous deployment's image:
 
 ```bash
-rise deployment rollback my-app:20241205-1234
+rise deploy --from 20241205-1234
 ```
 
 This fetches the target deployment's image digest and creates a new deployment with it. The original deployment is not modified.
+
+> **Warning — database migrations:** Rollback only restores the container image, not the database schema. If a migration ran between the current and target deployment, rolling back may leave your application running against a schema it doesn't understand, causing errors or data corruption. Before rolling back, verify whether migrations are involved and plan accordingly (e.g., ensure migrations are backward-compatible, or restore a database snapshot alongside the image rollback).
 
 ## Stopping Deployments
 
 Stop all deployments in a group:
 
 ```bash
-rise deployment stop my-app --group default
-rise d stop my-app --group mr/123
+rise deployment stop -p my-app --group default
+rise d stop -p my-app --group mr/123
 ```
 
 Stopped deployments remain in the database for rollback purposes.
 
 ## Auto-Injected Environment Variables
 
-Rise automatically injects these variables into every deployment:
+Rise injects variables like `PORT`, `RISE_ISSUER`, `RISE_APP_URL`, `RISE_APP_URLS`, and `RISE_ENVIRONMENT` into every deployment. See [Environment Variables](../environment-variables#auto-injected-variables) for the full list.
 
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `PORT` | HTTP port the container should listen on | `8080` |
-| `RISE_ISSUER` | Rise server URL and JWT issuer | `https://rise.example.com` |
-| `RISE_APP_URL` | Canonical URL where your app is accessible | `https://myapp.example.com` |
-| `RISE_APP_URLS` | JSON array of all URLs where your app is accessible | `["https://myapp.app.example.com", "https://myapp.example.com"]` |
-| `RISE_ENVIRONMENT` | Environment name (if the deployment has an associated environment) | `staging` |
-
-`PORT` defaults to 8080 and can be overridden per-deployment with `--http-port`, or set permanently with `rise env set`. `RISE_APP_URL` is your primary custom domain if set, otherwise the default project URL.
-
-For JWT validation using `RISE_ISSUER`, see [Authentication for Applications](authentication-for-apps.md).
+For JWT validation using `RISE_ISSUER`, see [Authentication for Applications](../authentication-for-apps).
 
 ## CI/CD Deployments
 
-For automated deployments from CI/CD pipelines, use service accounts with OIDC workload identity. See [Authentication](authentication.md#service-accounts-workload-identity) for setup instructions and examples for GitLab CI and GitHub Actions.
+For automated deployments from CI/CD pipelines, use service accounts with OIDC workload identity. See [Service Accounts](../service-accounts) for setup instructions and examples for GitLab CI and GitHub Actions.

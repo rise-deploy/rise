@@ -2,8 +2,6 @@
 title: "Project Configuration"
 ---
 
-# Project Configuration
-
 Rise projects are configured through a `rise.toml` file in your project directory and through CLI flags.
 
 ## rise.toml
@@ -72,7 +70,7 @@ env.DATABASE_URL = "postgres://prod-db/mydb"
 | `default` | Boolean | If `true`, this environment is used when `--environment` is not specified. At most one environment may be default. |
 | `env` | Object | Plain-text environment variables scoped to this environment (applied as deployment overrides) |
 
-See [Environment Variables](environment-variables.md#per-environment-variables-in-risetoml) for details.
+See [Environment Variables](../environment-variables#per-environment-variables-in-risetoml) for details.
 
 ### Full Example
 
