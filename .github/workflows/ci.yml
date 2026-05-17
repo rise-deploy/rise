@@ -469,6 +469,7 @@ jobs:
       - name: Start Minikube and run JFrog/Vault deploy tests
         env:
           RISE_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          RISE_CLI_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.BUILDER_IMAGE_NAME }}
           RISE_IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
           RISE_E2E_REGISTRY_MODE: jfrog-vault
         run: bash scripts/ci/e2e-minikube.sh
