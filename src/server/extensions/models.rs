@@ -14,6 +14,8 @@ pub struct Extension {
     pub status_summary: String,
     pub created: String,
     pub updated: String,
+    /// Whether the extension has been marked for deletion
+    pub deleted: bool,
 }
 
 /// Request to create an extension

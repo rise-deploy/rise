@@ -8,9 +8,9 @@ keywords:
   - kubernetes
   - deployment
   - paas
-home: https://github.com/niklasrosenstein/rise
+home: https://github.com/rise-deploy/rise
 sources:
-  - https://github.com/niklasrosenstein/rise
+  - https://github.com/rise-deploy/rise
 dependencies:
   - name: metacontroller-helm
     version: "4.15.0"

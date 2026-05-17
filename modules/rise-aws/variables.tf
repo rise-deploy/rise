@@ -105,6 +105,18 @@ variable "kms_key_alias" {
   default     = null
 }
 
+variable "enable_s3" {
+  description = "Enable S3 bucket provisioning permissions for the Rise backend. Set to true if using the AWS S3 bucket extension."
+  type        = bool
+  default     = false
+}
+
+variable "s3_bucket_prefix" {
+  description = "Prefix for S3 bucket and IAM user names managed by Rise. Must match the bucket_prefix configured in the Rise backend. Defaults to var.name."
+  type        = string
+  default     = null
+}
+
 # Lifecycle policies
 
 variable "max_image_count" {

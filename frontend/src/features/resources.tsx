@@ -1892,6 +1892,15 @@ export function ExtensionsList({ projectName }) {
 
 // Helper function to render status badges with color coding
 function renderExtensionStatusBadge(extension) {
+    // Show pending deletion badge when extension is marked for deletion
+    if (extension.deleted) {
+        const state = (extension.status?.state || '').toLowerCase();
+        if (state === 'deletion_blocked') {
+            return <MonoStatusPill tone="warn">deletion blocked</MonoStatusPill>;
+        }
+        return <MonoStatusPill tone="muted">{state === 'deleting' ? 'deleting' : 'pending deletion'}</MonoStatusPill>;
+    }
+
     // Check if extension has custom status badge renderer
     const customRenderer = getExtensionStatusBadge(extension.extension_type);
     if (customRenderer) {
@@ -1922,6 +1931,9 @@ function renderExtensionStatusBadge(extension) {
             case 'deleting':
             case 'deleted':
                 badgeTone = 'muted';
+                break;
+            case 'deletion_blocked':
+                badgeTone = 'warn';
                 break;
             default:
                 badgeTone = 'muted';

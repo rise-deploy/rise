@@ -130,7 +130,7 @@ else
 fi
 
 # Get commit messages
-COMMITS=$(git log "${COMMIT_RANGE}" --pretty=format:"%h %s" --no-merges)
+COMMITS=$(git log "${COMMIT_RANGE}" --pretty=format:"commit %h%n%B%n---" --no-merges)
 
 # Generate release notes with Claude analysis
 echo "Generating release notes..."

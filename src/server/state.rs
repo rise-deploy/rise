@@ -63,6 +63,10 @@ pub struct AppState {
     pub production_ingress_url_template: Option<String>,
     /// Staging ingress URL template (for custom domain validation)
     pub staging_ingress_url_template: Option<String>,
+    /// Ingress URL scheme (e.g., "https" or "http")
+    pub ingress_schema: String,
+    /// Optional ingress port (for development environments)
+    pub ingress_port: Option<u16>,
     /// ResourceBuilder for Metacontroller webhook (builds K8s resource specs)
     #[cfg(feature = "backend")]
     pub resource_builder: Option<Arc<crate::server::deployment::resource_builder::ResourceBuilder>>,
@@ -493,56 +497,19 @@ impl AppState {
 
         // Initialize cookie settings for session management
         let cookie_settings = CookieSettings {
-            domain: settings.server.cookie_domain.clone(),
             secure: settings.server.cookie_secure,
+            cookie_domain: settings.server.cookie_domain.clone(),
         };
-        tracing::info!(
-            "Configured session cookies with domain={:?}, secure={}",
-            if cookie_settings.domain.is_empty() {
-                "current-host-only"
-            } else {
-                &cookie_settings.domain
-            },
-            cookie_settings.secure
-        );
-
-        // Validate cookie configuration at startup
-        if !cookie_settings.domain.is_empty() {
-            #[cfg(feature = "backend")]
-            if let Some(crate::server::settings::DeploymentControllerSettings::Kubernetes {
-                auth_signin_url: signin_url,
-                ..
-            }) = &settings.deployment_controller
-            {
-                if let Ok(parsed) = url::Url::parse(signin_url) {
-                    if let Some(host) = parsed.host_str() {
-                        let cookie_domain_normalized =
-                            cookie_settings.domain.trim_start_matches('.');
-
-                        if !host.ends_with(cookie_domain_normalized)
-                            && host != cookie_domain_normalized
-                        {
-                            tracing::warn!(
-                                "⚠ Cookie domain mismatch: cookie_domain='{}' but auth_signin_url host='{}'. \
-                                 Cookies may not work correctly. Consider setting cookie_domain to '.{}' or \
-                                 ensure signin URL uses a matching domain.",
-                                cookie_settings.domain,
-                                host,
-                                host.split('.').skip(1).collect::<Vec<_>>().join(".")
-                            );
-                        }
-                    }
-                }
-
-                // Warn if using localhost with cookie domain
-                if signin_url.contains("localhost") || signin_url.contains("127.0.0.1") {
-                    tracing::warn!(
-                        "⚠ Cookie domain '{}' set but auth_signin_url uses localhost. \
-                         Use a proper domain name (e.g., rise.local) instead of localhost for cookie sharing.",
-                        cookie_settings.domain
-                    );
-                }
-            }
+        if let Some(ref domain) = cookie_settings.cookie_domain {
+            tracing::info!(
+                "Configured session cookies: secure={}, cookie_domain={} (will expire old domain-scoped cookies)",
+                cookie_settings.secure, domain
+            );
+        } else {
+            tracing::info!(
+                "Configured session cookies: secure={} (no Domain attribute — cookies scoped to current host)",
+                cookie_settings.secure
+            );
         }
 
         let public_url = settings.server.public_url.clone();
@@ -805,6 +772,65 @@ impl AppState {
 
                         tracing::info!("AWS RDS extension provider initialized and started");
                     }
+                    #[cfg(feature = "backend")]
+                    crate::server::settings::ExtensionProviderConfig::AwsS3BucketProvisioner {
+                        region,
+                        bucket_prefix,
+                        bucket_name_template,
+                        user_permissions_boundary_arn,
+                        access_key_id,
+                        secret_access_key,
+                    } => {
+                        tracing::info!("Initializing AWS S3 bucket extension provider");
+
+                        let mut aws_config_builder =
+                            aws_config::defaults(aws_config::BehaviorVersion::latest())
+                                .region(aws_config::Region::new(region.clone()));
+
+                        if let (Some(key_id), Some(secret_key)) = (access_key_id, secret_access_key)
+                        {
+                            aws_config_builder = aws_config_builder.credentials_provider(
+                                aws_sdk_sts::config::Credentials::new(
+                                    key_id,
+                                    secret_key,
+                                    None,
+                                    None,
+                                    "static-credentials",
+                                ),
+                            );
+                        }
+
+                        let aws_config = aws_config_builder.load().await;
+                        let s3_client = aws_sdk_s3::Client::new(&aws_config);
+                        let iam_client = aws_sdk_iam::Client::new(&aws_config);
+
+                        let encryption_provider = encryption_provider.clone().ok_or_else(|| {
+                            anyhow::anyhow!("Encryption provider required for AWS S3 extension")
+                        })?;
+
+                        let aws_s3_provisioner =
+                            crate::server::extensions::providers::aws_s3::AwsS3Provisioner::new(
+                                crate::server::extensions::providers::aws_s3::AwsS3ProvisionerConfig {
+                                    s3_client,
+                                    iam_client,
+                                    db_pool: db_pool.clone(),
+                                    encryption_provider,
+                                    region: region.clone(),
+                                    bucket_prefix: bucket_prefix.clone(),
+                                    bucket_name_template: bucket_name_template.clone(),
+                                    user_permissions_boundary_arn: user_permissions_boundary_arn
+                                        .clone(),
+                                },
+                            );
+
+                        let aws_s3_arc: Arc<dyn crate::server::extensions::Extension> =
+                            Arc::new(aws_s3_provisioner);
+                        extension_registry.register_type(aws_s3_arc.clone());
+                        aws_s3_arc.start();
+
+                        tracing::info!("AWS S3 bucket extension provider initialized and started");
+                    }
+
                     // When no extension provider features are enabled, this ensures the match is exhaustive
                     #[allow(unreachable_patterns)]
                     _ => {
@@ -915,26 +941,41 @@ impl AppState {
 
         // Extract access_classes from deployment controller settings
         // Filter out null values (used to remove inherited access classes)
-        let (access_classes, production_ingress_url_template, staging_ingress_url_template) =
-            if let Some(crate::server::settings::DeploymentControllerSettings::Kubernetes {
-                access_classes,
-                production_ingress_url_template,
-                staging_ingress_url_template,
-                ..
-            }) = &settings.deployment_controller
-            {
-                let filtered: std::collections::HashMap<_, _> = access_classes
-                    .iter()
-                    .filter_map(|(k, v)| v.as_ref().map(|ac| (k.clone(), ac.clone())))
-                    .collect();
-                (
-                    Arc::new(filtered),
-                    Some(production_ingress_url_template.clone()),
-                    staging_ingress_url_template.clone(),
-                )
-            } else {
-                (Arc::new(std::collections::HashMap::new()), None, None)
-            };
+        let (
+            access_classes,
+            production_ingress_url_template,
+            staging_ingress_url_template,
+            ingress_schema,
+            ingress_port,
+        ) = if let Some(crate::server::settings::DeploymentControllerSettings::Kubernetes {
+            access_classes,
+            production_ingress_url_template,
+            staging_ingress_url_template,
+            ingress_schema,
+            ingress_port,
+            ..
+        }) = &settings.deployment_controller
+        {
+            let filtered: std::collections::HashMap<_, _> = access_classes
+                .iter()
+                .filter_map(|(k, v)| v.as_ref().map(|ac| (k.clone(), ac.clone())))
+                .collect();
+            (
+                Arc::new(filtered),
+                Some(production_ingress_url_template.clone()),
+                staging_ingress_url_template.clone(),
+                ingress_schema.clone(),
+                *ingress_port,
+            )
+        } else {
+            (
+                Arc::new(std::collections::HashMap::new()),
+                None,
+                None,
+                "https".to_string(),
+                None,
+            )
+        };
 
         Ok(Self {
             db_pool,
@@ -957,6 +998,8 @@ impl AppState {
             access_classes,
             production_ingress_url_template,
             staging_ingress_url_template,
+            ingress_schema,
+            ingress_port,
             #[cfg(feature = "backend")]
             resource_builder,
             #[cfg(feature = "backend")]

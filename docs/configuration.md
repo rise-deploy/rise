@@ -203,7 +203,6 @@ registry_url = "localhost:5000"
 host = "0.0.0.0"              # Bind address
 port = 3000                    # HTTP port
 public_url = "http://..."      # Public URL (for OAuth redirects)
-cookie_domain = ""             # Cookie domain ("" = current host only)
 cookie_secure = false          # Set true for HTTPS
 jwt_signing_secret = "..."     # JWT signing secret (base64-encoded, min 32 bytes)
 jwt_expiry_seconds = 86400     # JWT expiry duration in seconds (default: 24 hours)

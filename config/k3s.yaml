@@ -1,5 +1,0 @@
-deployment_controller:
-  auth_backend_url: "http://10.97.89.198:3000" # URL for Nginx auth subrequests (Docker bridge IP for Minikube to reach host), must be resolvable by Nginx pod
-  auth_signin_url: "http://rise.local:3000" # Domain for user-facing OAuth redirects, must be resolvable by users' browsers
-  host_aliases:
-    rise.local: "10.97.89.198" # K3s host IP, allowing app pods to access Rise backend

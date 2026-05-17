@@ -119,6 +119,7 @@ pub async fn create_extension(
             status_summary,
             created: ext_record.created_at.to_rfc3339(),
             updated: ext_record.updated_at.to_rfc3339(),
+            deleted: ext_record.deleted_at.is_some(),
         },
     }))
 }
@@ -166,16 +167,10 @@ pub async fn update_extension(
         .await
         .map_err(|e| ServerError::bad_request(format!("Invalid spec: {}", e)))?;
 
-    // Update extension (upsert will update existing, keeping the extension_type)
-    let _ext_record = db_extensions::upsert(
-        &state.db_pool,
-        project.id,
-        &extension_name,
-        &existing.extension_type,
-        &payload.spec,
-    )
-    .await
-    .internal_err("Failed to update extension")?;
+    // Update extension spec (preserving deleted_at and other fields)
+    db_extensions::update_spec(&state.db_pool, project.id, &extension_name, &payload.spec)
+        .await
+        .internal_err("Failed to update extension")?;
 
     // Call extension's spec update hook
     extension
@@ -208,6 +203,7 @@ pub async fn update_extension(
             status_summary,
             created: ext_record.created_at.to_rfc3339(),
             updated: ext_record.updated_at.to_rfc3339(),
+            deleted: ext_record.deleted_at.is_some(),
         },
     }))
 }
@@ -258,16 +254,10 @@ pub async fn patch_extension(
         .await
         .map_err(|e| ServerError::bad_request(format!("Invalid spec after merge: {}", e)))?;
 
-    // Update extension with merged spec
-    let _ext_record = db_extensions::upsert(
-        &state.db_pool,
-        project.id,
-        &extension_name,
-        &existing.extension_type,
-        &merged_spec,
-    )
-    .await
-    .internal_err("Failed to update extension")?;
+    // Update extension spec (preserving deleted_at and other fields)
+    db_extensions::update_spec(&state.db_pool, project.id, &extension_name, &merged_spec)
+        .await
+        .internal_err("Failed to update extension")?;
 
     // Call extension's spec update hook
     extension
@@ -300,6 +290,7 @@ pub async fn patch_extension(
             status_summary,
             created: ext_record.created_at.to_rfc3339(),
             updated: ext_record.updated_at.to_rfc3339(),
+            deleted: ext_record.deleted_at.is_some(),
         },
     }))
 }
@@ -336,6 +327,7 @@ pub async fn list_extensions(
                 .unwrap_or_else(|| "Unknown".to_string());
 
             Extension {
+                deleted: e.deleted_at.is_some(),
                 extension: e.extension,
                 extension_type: e.extension_type,
                 spec: e.spec,
@@ -387,6 +379,7 @@ pub async fn get_extension(
         status_summary,
         created: ext.created_at.to_rfc3339(),
         updated: ext.updated_at.to_rfc3339(),
+        deleted: ext.deleted_at.is_some(),
     }))
 }
 
