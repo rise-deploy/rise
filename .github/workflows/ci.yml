@@ -472,3 +472,11 @@ jobs:
           RISE_IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
           RISE_E2E_REGISTRY_MODE: jfrog-vault
         run: bash scripts/ci/e2e-minikube.sh
+
+      - name: Upload JFrog/Vault service logs
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: jfrog-vault-service-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .rise-e2e-artifacts/jfrog-vault
+          if-no-files-found: ignore

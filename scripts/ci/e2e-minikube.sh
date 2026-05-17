@@ -7,6 +7,7 @@ IMAGE_REPOSITORY="${RISE_IMAGE_REPOSITORY:?RISE_IMAGE_REPOSITORY is required}"
 IMAGE_TAG="${RISE_IMAGE_TAG:?RISE_IMAGE_TAG is required}"
 RISE_E2E_REGISTRY_MODE="${RISE_E2E_REGISTRY_MODE:-oci-client-auth}"
 MINIKUBE_MEMORY="${MINIKUBE_MEMORY:-4096}"
+RISE_E2E_ARTIFACT_DIR="${RISE_E2E_ARTIFACT_DIR:-.rise-e2e-artifacts}"
 RISE_PUBLIC_URL="http://rise.local"
 RISE_CI_JWT_SIGNING_SECRET_B64="dGVzdC1qd3Qtc2VjcmV0LWtleS1mb3ItY2ktdGVzdGluZy1vbmx5LW5vdC1zZWN1cmU="
 
@@ -57,8 +58,8 @@ rise_cli() {
 
 wait_for_jfrog_vault() {
   echo "Waiting for Vault-backed JFrog registry setup"
-  echo "Streaming JFrog/Vault setup logs until the Vault role is available"
-  docker compose logs --follow --tail=100 jfrog vault &
+  echo "Streaming Vault setup logs until the Vault role is available"
+  docker compose logs --follow --tail=100 vault &
   COMPOSE_LOGS_PID=$!
 
   for attempt in {1..120}; do
@@ -81,8 +82,17 @@ wait_for_jfrog_vault() {
   kill "${COMPOSE_LOGS_PID}" >/dev/null 2>&1 || true
   wait "${COMPOSE_LOGS_PID}" >/dev/null 2>&1 || true
   COMPOSE_LOGS_PID=""
-  docker compose logs --tail=200 jfrog vault || true
+  collect_jfrog_vault_artifacts
   exit 1
+}
+
+collect_jfrog_vault_artifacts() {
+  local artifact_dir="${RISE_E2E_ARTIFACT_DIR}/jfrog-vault"
+
+  mkdir -p "${artifact_dir}"
+  docker compose ps jfrog vault > "${artifact_dir}/compose-ps.txt" 2>&1 || true
+  docker compose logs --no-color jfrog > "${artifact_dir}/jfrog.log" 2>&1 || true
+  docker compose logs --no-color vault > "${artifact_dir}/vault.log" 2>&1 || true
 }
 
 configure_minikube_jfrog_registry() {
@@ -113,9 +123,6 @@ cleanup() {
     kubectl get events -A --sort-by=.metadata.creationTimestamp | tail -n 200 || true
     kubectl logs -n "${NAMESPACE}" -l "app.kubernetes.io/instance=${RELEASE_NAME}" --all-containers --tail=200 || true
     kubectl logs -n "${NAMESPACE}" -l "app.kubernetes.io/instance=${RELEASE_NAME}" --all-containers --previous --tail=200 || true
-    if [[ "${RISE_E2E_REGISTRY_MODE}" == "jfrog-vault" ]]; then
-      docker compose logs --tail=200 jfrog vault || true
-    fi
     if [[ -n "${APP_NAMESPACE:-}" ]]; then
       kubectl get all -n "${APP_NAMESPACE}" || true
       kubectl describe deployments -n "${APP_NAMESPACE}" || true
@@ -128,6 +135,7 @@ cleanup() {
   echo "Cleaning up Minikube"
   minikube delete || true
   if [[ "${RISE_E2E_REGISTRY_MODE}" == "jfrog-vault" ]]; then
+    collect_jfrog_vault_artifacts
     echo "Cleaning up JFrog/Vault services"
     docker compose stop vault jfrog || true
     docker compose rm -fsv vault jfrog || true
