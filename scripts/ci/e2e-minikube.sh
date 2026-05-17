@@ -91,7 +91,6 @@ wait_for_jfrog_vault() {
 
 collect_jfrog_vault_artifacts() {
   local artifact_dir="${RISE_E2E_ARTIFACT_DIR}/jfrog-vault"
-  local backend_log="${artifact_dir}/rise-backend.log"
 
   mkdir -p "${artifact_dir}"
   docker compose ps jfrog vault > "${artifact_dir}/compose-ps.txt" 2>&1 || true
@@ -103,15 +102,10 @@ collect_jfrog_vault_artifacts() {
     kubectl get events -A --sort-by=.metadata.creationTimestamp > "${artifact_dir}/k8s-events.txt" 2>&1 || true
     kubectl logs -n "${NAMESPACE}" \
       -l "app.kubernetes.io/instance=${RELEASE_NAME},app.kubernetes.io/component=server" \
-      --all-containers > "${backend_log}" 2>&1 || true
+      --all-containers > "${artifact_dir}/rise-backend.log" 2>&1 || true
     kubectl logs -n "${NAMESPACE}" \
       -l "app.kubernetes.io/instance=${RELEASE_NAME},app.kubernetes.io/component=server" \
       --all-containers --previous > "${artifact_dir}/rise-backend-previous.log" 2>&1 || true
-
-    if [[ -f "${backend_log}" ]]; then
-      grep -E "Fetching scoped JFrog|registry-credentials|scope=" "${backend_log}" \
-        > "${artifact_dir}/rise-registry-scopes.log" || true
-    fi
   fi
 }
 
