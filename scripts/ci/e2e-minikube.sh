@@ -93,7 +93,11 @@ PF_PID=$!
 sleep 5
 
 echo "Smoke test: /health endpoint"
-curl --fail --silent --show-error --connect-timeout 5 --max-time 30 "http://127.0.0.1:3000/health" | grep -qi "ok"
+http_code="$(curl --silent --show-error --connect-timeout 5 --max-time 30 --output /dev/null --write-out "%{http_code}" "http://127.0.0.1:3000/health")"
+if [[ "${http_code}" != "200" ]]; then
+  echo "Expected 200 for health check, got ${http_code}"
+  exit 1
+fi
 
 echo "Smoke test: protected API returns auth error"
 http_code="$(curl --silent --show-error --connect-timeout 5 --max-time 30 --output /dev/null --write-out "%{http_code}" "http://127.0.0.1:3000/api/v1/projects")"
