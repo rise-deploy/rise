@@ -91,11 +91,28 @@ wait_for_jfrog_vault() {
 
 collect_jfrog_vault_artifacts() {
   local artifact_dir="${RISE_E2E_ARTIFACT_DIR}/jfrog-vault"
+  local backend_log="${artifact_dir}/rise-backend.log"
 
   mkdir -p "${artifact_dir}"
   docker compose ps jfrog vault > "${artifact_dir}/compose-ps.txt" 2>&1 || true
   docker compose logs --no-color jfrog > "${artifact_dir}/jfrog.log" 2>&1 || true
   docker compose logs --no-color vault > "${artifact_dir}/vault.log" 2>&1 || true
+
+  if kubectl cluster-info >/dev/null 2>&1; then
+    kubectl get pods -A > "${artifact_dir}/k8s-pods.txt" 2>&1 || true
+    kubectl get events -A --sort-by=.metadata.creationTimestamp > "${artifact_dir}/k8s-events.txt" 2>&1 || true
+    kubectl logs -n "${NAMESPACE}" \
+      -l "app.kubernetes.io/instance=${RELEASE_NAME},app.kubernetes.io/component=server" \
+      --all-containers > "${backend_log}" 2>&1 || true
+    kubectl logs -n "${NAMESPACE}" \
+      -l "app.kubernetes.io/instance=${RELEASE_NAME},app.kubernetes.io/component=server" \
+      --all-containers --previous > "${artifact_dir}/rise-backend-previous.log" 2>&1 || true
+
+    if [[ -f "${backend_log}" ]]; then
+      grep -E "Fetching scoped JFrog|registry-credentials|scope=" "${backend_log}" \
+        > "${artifact_dir}/rise-registry-scopes.log" || true
+    fi
+  fi
 }
 
 configure_minikube_jfrog_registry() {
