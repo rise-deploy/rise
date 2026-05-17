@@ -9,7 +9,6 @@ railpack = "0.15.1"
 buildkit = "0.28.0"
 "cargo:sqlx-cli" = "latest"
 "cargo:cargo-all-features" = "latest"
-mdbook = "latest"
 helm = "latest"
 rust = { version = "1.95.0", profile = "default" }
 kubectl = "latest"
@@ -118,8 +117,20 @@ run = "mise crd:generate && git --no-pager diff --exit-code -- helm/rise/crds/ri
 env.SQLX_OFFLINE = true
 
 [tasks."docs:serve"]
-description = "Serve documentation with live reload in port 3001."
-run = "mdbook serve -p 3001 --open"
+description = "Serve bundled user documentation with live reload on port 3001."
+run = "cd docs/user && npm install && npm run dev"
+
+[tasks."docs:build"]
+description = "Build the bundled user documentation."
+run = "cd docs/user && npm install && npm run build"
+
+[tasks."docs:engineering:serve"]
+description = "Serve engineering documentation with live reload on port 3002."
+run = "cd docs/engineering && npm install && npm run dev"
+
+[tasks."docs:engineering:build"]
+description = "Build the engineering documentation."
+run = "cd docs/engineering && npm install && npm run build"
 
 [tasks."db:nuke"]
 description = "Drop and recreate the development database. USE WITH CAUTION."

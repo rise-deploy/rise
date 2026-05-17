@@ -3,30 +3,21 @@ import { useEffect, useRef, useState } from 'react';
 import { logout, login } from './lib/auth';
 import { api } from './lib/api';
 import { CONFIG } from './lib/config';
-import { extensionTypeFromDocPath, parseDocsSummary, titleFromSlug } from './lib/docs';
 import { maybeMigrateLegacyHashRoute, navigate, usePathLocation } from './lib/navigation';
 import { Footer } from './components/ui';
 import { useToast } from './components/toast';
 import { PlatformAccessDenied } from './components/states';
 import { DeploymentDetail, EnvironmentDeploymentView } from './features/deployments';
-import { DocsPage } from './features/docs';
 import { HomePage } from './features/home';
 import { ProjectsList, ProjectDetail } from './features/projects';
 import { ExtensionDetailPage } from './features/resources';
 import { TeamDetail, TeamsList } from './features/teams';
 import { CommandPalette } from './components/command-palette';
 
-function Sidebar({ currentView, docsItems = [], availableExtensionTypes = [], currentDocSlug = '', docsDefaultSlug = '' }) {
+function Sidebar({ currentView }) {
     const isHomeActive = currentView === 'home';
     const isProjectsActive = currentView === 'projects' || currentView === 'project-detail' || currentView === 'deployment-detail' || currentView === 'environment-deployment' || currentView === 'extension-detail';
     const isTeamsActive = currentView === 'teams' || currentView === 'team-detail';
-    const isDocsActive = currentView === 'docs';
-    const enabledExtensionTypes = new Set(availableExtensionTypes || []);
-    const visibleDocsItems = docsItems.filter((item) => {
-        const extensionType = extensionTypeFromDocPath(item.path);
-        if (!extensionType) return true;
-        return enabledExtensionTypes.has(extensionType);
-    });
 
     return (
         <aside className="mono-sidebar">
@@ -56,33 +47,9 @@ function Sidebar({ currentView, docsItems = [], availableExtensionTypes = [], cu
                 >
                     Home
                 </a>
-                <a
-                    href={docsDefaultSlug ? `/docs/${docsDefaultSlug}` : '/docs'}
-                    onClick={(e) => {
-                        e.preventDefault();
-                        navigate(docsDefaultSlug ? `/docs/${docsDefaultSlug}` : '/docs');
-                    }}
-                    className={isDocsActive ? 'active' : ''}
-                >
+                <a href="/docs/">
                     Docs
                 </a>
-                {isDocsActive && visibleDocsItems.length > 0 && (
-                    <div className="mono-subnav" aria-label="Documentation pages">
-                        {visibleDocsItems.map((item) => (
-                            <a
-                                key={item.slug}
-                                href={`/docs/${item.slug}`}
-                                onClick={(e) => {
-                                    e.preventDefault();
-                                    navigate(`/docs/${item.slug}`);
-                                }}
-                                className={`${currentDocSlug === item.slug ? 'active' : ''} depth-${Math.min(item.depth || 0, 3)}`.trim()}
-                            >
-                                {item.title}
-                            </a>
-                        ))}
-                    </div>
-                )}
                 <a
                     href="/projects"
                     onClick={(e) => {
@@ -261,11 +228,8 @@ export function App() {
     const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
     const [paletteProjects, setPaletteProjects] = useState([]);
     const [paletteTeams, setPaletteTeams] = useState([]);
-    const [docsItems, setDocsItems] = useState([]);
-    const [availableExtensionTypes, setAvailableExtensionTypes] = useState([]);
     const pathname = usePathLocation();
     const { showToast } = useToast();
-    const defaultDocSlug = docsItems[0]?.slug || '';
 
     useEffect(() => {
         maybeMigrateLegacyHashRoute();
@@ -341,32 +305,6 @@ export function App() {
         window.addEventListener('keydown', handler);
         return () => window.removeEventListener('keydown', handler);
     }, []);
-
-    useEffect(() => {
-        async function loadDocsSummary() {
-            try {
-                const [summaryResponse, extensionTypesResponse] = await Promise.all([
-                    fetch('/static/docs/FRONTEND_DOCS.md'),
-                    api.getExtensionTypes().catch(() => ({ extension_types: [] })),
-                ]);
-                if (!summaryResponse.ok) return;
-
-                const summary = await summaryResponse.text();
-                setDocsItems(parseDocsSummary(summary));
-                setAvailableExtensionTypes((extensionTypesResponse.extension_types || []).map((ext) => ext.extension_type));
-            } catch (err) {
-                console.error('Failed to load docs summary:', err);
-            }
-        }
-        loadDocsSummary();
-    }, []);
-
-    useEffect(() => {
-        if (pathname === '/docs' && docsItems.length > 0) {
-            window.history.replaceState({}, '', `/docs/${docsItems[0].slug}`);
-            window.dispatchEvent(new Event('rise:navigate'));
-        }
-    }, [pathname, docsItems]);
 
     useEffect(() => {
         async function fetchVersion() {
@@ -476,10 +414,6 @@ export function App() {
         const parts = route.split('/');
         params.projectName = parts[1];
         params.deploymentId = parts[2];
-    } else if (route.startsWith('docs')) {
-        view = 'docs';
-        const parts = route.split('/');
-        params.docSlug = parts.slice(1).join('/') || '';
     } else if (route === 'home') {
         view = 'home';
     } else if (route === 'teams') {
@@ -504,33 +438,6 @@ export function App() {
             ? [{ label: 'Projects' }]
             : view === 'teams'
             ? [{ label: 'Teams' }]
-            : view === 'docs'
-            ? (() => {
-                  const slug = params.docSlug || defaultDocSlug || '';
-                  const crumbs = [{ label: 'Docs', href: defaultDocSlug ? `/docs/${defaultDocSlug}` : '/docs' }];
-                  if (slug) {
-                      const idx = docsItems.findIndex((item) => item.slug === slug);
-                      if (idx >= 0) {
-                          const item = docsItems[idx];
-                          // Walk backward to collect ancestors at each shallower depth
-                          const ancestors = [];
-                          let targetDepth = (item.depth || 0) - 1;
-                          for (let i = idx - 1; i >= 0 && targetDepth >= 0; i--) {
-                              if ((docsItems[i].depth || 0) === targetDepth) {
-                                  ancestors.unshift(docsItems[i]);
-                                  targetDepth--;
-                              }
-                          }
-                          for (const anc of ancestors) {
-                              crumbs.push({ label: anc.title, href: `/docs/${anc.slug}` });
-                          }
-                          crumbs.push({ label: item.title });
-                      } else {
-                          crumbs.push({ label: titleFromSlug(slug) });
-                      }
-                  }
-                  return crumbs;
-              })()
             : view === 'project-detail'
             ? [
                   { label: 'Projects', href: '/projects' },
@@ -607,7 +514,9 @@ export function App() {
             id: 'open-docs',
             label: 'Open: Docs',
             keywords: ['help', 'docs', 'onboarding'],
-            run: () => navigate(defaultDocSlug ? `/docs/${defaultDocSlug}` : '/docs'),
+            run: () => {
+                window.location.href = '/docs/';
+            },
         },
     ];
 
@@ -641,13 +550,7 @@ export function App() {
     return (
         <div className="mono-app">
             <div className="mono-shell">
-                <Sidebar
-                    currentView={view}
-                    docsItems={docsItems}
-                    availableExtensionTypes={availableExtensionTypes}
-                    currentDocSlug={params.docSlug || ''}
-                    docsDefaultSlug={defaultDocSlug}
-                />
+                <Sidebar currentView={view} />
                 <div className="mono-main-shell">
                     <TopBar
                         user={user}
@@ -658,7 +561,6 @@ export function App() {
                         {view === 'home' && <HomePage publicUrl={CONFIG?.backendUrl} version={version?.version} />}
                         {view === 'projects' && <ProjectsList openCreate={createIntent === 'project'} />}
                         {view === 'teams' && <TeamsList currentUser={user} openCreate={createIntent === 'team'} />}
-                        {view === 'docs' && <DocsPage initialSlug={params.docSlug} />}
                         {view === 'project-detail' && <ProjectDetail projectName={params.projectName} initialTab={params.tab} />}
                         {view === 'team-detail' && <TeamDetail teamName={params.teamName} currentUser={user} />}
                         {view === 'environment-deployment' && <EnvironmentDeploymentView projectName={params.projectName} environmentName={params.environmentName} />}

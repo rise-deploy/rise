@@ -5,8 +5,11 @@ pb_data
 /core.*
 .env
 
-# mdbook output
+# Documentation build output
 /book
+docs/*/node_modules
+docs/*/dist
+docs/*/.astro
 
 # Local config overrides
 **/config/local.*

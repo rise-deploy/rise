@@ -26,10 +26,20 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM node:24-alpine AS frontend-builder
 WORKDIR /usr/src/frontend
 
-COPY frontend/package.json ./
-RUN npm install
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
 
 COPY frontend/ ./
+RUN npm run build
+
+# Stage 2.6: Build bundled user documentation
+FROM node:24-alpine AS user-docs-builder
+WORKDIR /usr/src/docs/user
+
+COPY docs/user/package.json docs/user/package-lock.json ./
+RUN npm ci
+
+COPY docs/user/ ./
 RUN npm run build
 
 # Stage 3: Build dependencies (cached separately from source code)
@@ -72,8 +82,8 @@ COPY config /etc/rise
 # Copy static assets for filesystem-based serving (templates, SVGs, Vite build output)
 COPY --from=builder /usr/src/static /var/lib/rise/static
 
-# Copy documentation files for serving via docs_dir
-COPY docs /var/rise/docs
+# Copy built user documentation for serving via docs_dir
+COPY --from=user-docs-builder /usr/src/docs/user/dist /var/rise/docs
 
 # Default config location/run mode for containerized execution
 ENV RISE_CONFIG_DIR=/etc/rise

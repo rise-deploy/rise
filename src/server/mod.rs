@@ -205,6 +205,12 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         .merge(auth::routes::rise_auth_routes())
         // OAuth/OIDC routes at root level (before frontend fallback)
         .merge(extensions::providers::oauth::routes::oauth_routes())
+        .merge(
+            frontend::routes::docs_routes().route_layer(axum_middleware::from_fn_with_state(
+                state.clone(),
+                frontend::routes::docs_auth_middleware,
+            )),
+        )
         .merge(frontend::routes::frontend_routes())
         .with_state(state.clone())
         .layer(
