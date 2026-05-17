@@ -6,6 +6,8 @@ postgresql:
 
 dex:
   enabled: true
+  config:
+    issuer: http://rise-ci-chart-dex.rise-ci.svc.cluster.local:5556/dex
 
 ingress:
   enabled: false
@@ -16,7 +18,7 @@ config:
     jwt_signing_secret: dGVzdC1qd3Qtc2VjcmV0LWtleS1mb3ItY2ktdGVzdGluZy1vbmx5LW5vdC1zZWN1cmU=
 
   auth:
-    issuer: http://dex:5556/dex
+    issuer: http://rise-ci-chart-dex.rise-ci.svc.cluster.local:5556/dex
     client_id: rise-backend
     client_secret: rise-backend-secret
 
