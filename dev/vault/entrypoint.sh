@@ -51,8 +51,15 @@ until vault status > /dev/null 2>&1; do
 done
 echo "Vault is ready."
 
-# --- 5. Enable the secrets engine ---
-vault secrets enable -path=artifactory artifactory-secrets-plugin
+# --- 5. Register and enable the secrets engine ---
+PLUGIN_SHA256=$(sha256sum "$PLUGIN_PATH" | awk '{print $1}')
+vault plugin register \
+  -sha256="$PLUGIN_SHA256" \
+  -command="$(basename "$PLUGIN_PATH")" \
+  secret artifactory
+echo "Artifactory secrets plugin registered."
+
+vault secrets enable -path=artifactory artifactory
 echo "Artifactory secrets engine enabled at artifactory/."
 
 # --- 6. Wait for JFrog health ---
