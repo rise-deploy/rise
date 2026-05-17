@@ -85,7 +85,7 @@ The GitLab token must have `read_registry` and `write_registry` scopes. A [Deplo
 
 Rise mints short-lived, project-scoped JFrog access tokens for each push and pull operation. Two token-issuing backends are supported:
 
-- **Vault** — Uses [vault-plugin-secrets-artifactory](https://github.com/jfrog/vault-plugin-secrets-artifactory) to broker scoped tokens. The Vault role must have `allow_scope_override=true`.
+- **Vault** — Uses Rise's [`vault-plugin-secrets-artifactory`](https://github.com/rise-deploy/vault-plugin-secrets-artifactory/releases/tag/v1.8.9-rise.2) fork to broker scoped tokens with scope override allowlists. Configure admin `allow_scope_override="opt-in"` and the Rise role with `allow_scope_override=true`.
 - **Direct** — Uses JFrog's access token API (`POST /access/api/v1/tokens`) with an admin-scoped token.
 
 ### Credential flow
@@ -119,6 +119,25 @@ Push credentials use a multi-scope token covering the three path groups shown ab
 
 A simpler `{project}/**` scope also works but is less restrictive — it allows writing manifests for any tag, not just the deployment's tag.
 
+Vault should still validate overrides at the repository boundary. With the Rise plugin fork, configure the role allowlist as:
+
+```sh
+vault write artifactory/config/admin \
+  url="https://jfrog.example.com" \
+  access_token="$JFROG_ADMIN_TOKEN" \
+  allow_scope_override="opt-in" \
+  use_expiring_tokens=true
+
+vault write artifactory/roles/rise \
+  scope="artifact:{docker_repo_key}/**:r" \
+  default_ttl=600 \
+  max_ttl=86400 \
+  allow_scope_override=true \
+  allowed_scopes='["artifact:{docker_repo_key}/**:r","artifact:{docker_repo_key}/**:r,w"]'
+```
+
+This allows Rise's narrower per-operation `artifact:{docker_repo_key}/{project}/...` requests but rejects unrelated Artifactory scopes.
+
 Why `{tag}/**` alone is insufficient: remote BuildKit writes content-addressed manifests (attestations, multi-platform indexes) at `sha256:{digest}/` paths that are siblings of the tag directory, not children. The `sha256*/*` glob matches these paths (the `*` after `sha256` covers the colon and digest).
 
 The following table summarizes scope patterns tested against both `docker push` and `docker buildx build --push` (remote BuildKit with attestations):
@@ -147,7 +166,7 @@ JFrog Container Registry (JCR) does not support the `/api/repositories` REST API
 
 ### Token requirements
 
-- **Vault mode**: A Vault role with `allow_scope_override=true` and an admin-scoped token configured on the Vault plugin.
+- **Vault mode**: Rise's Vault plugin fork with admin `allow_scope_override="opt-in"`, a Rise role with `allow_scope_override=true`, `allowed_scopes` for `artifact:{docker_repo_key}/**:r` and `artifact:{docker_repo_key}/**:r,w`, and an admin-scoped token configured on the Vault plugin.
 - **Direct mode**: A JFrog access token with `applied-permissions/admin` scope. This token is used to mint short-lived scoped tokens for each operation.
 
 ### Troubleshooting

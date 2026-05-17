@@ -5,16 +5,18 @@ JFROG_URL="http://rise-jfrog:8082"
 JFROG_USER="admin"
 JFROG_PASS="password"
 
-PLUGIN_VERSION="v1.8.9"
+PLUGIN_VERSION="v1.8.9-rise.2"
+PLUGIN_REPOSITORY="rise-deploy/vault-plugin-secrets-artifactory"
 PLUGIN_DIR="/vault/plugins"
 PLUGIN_PATH="$PLUGIN_DIR/artifactory-secrets-plugin"
+PLUGIN_MARKER="$PLUGIN_PATH.version"
 
 # --- 1. Install curl (needed for cookie-based UI API auth) ---
 apk add --no-cache curl > /dev/null 2>&1
 echo "curl installed."
 
 # --- 2. Cache-aware plugin download ---
-if [ ! -f "$PLUGIN_PATH" ]; then
+if [ ! -f "$PLUGIN_PATH" ] || [ "$(cat "$PLUGIN_MARKER" 2>/dev/null || true)" != "${PLUGIN_REPOSITORY}@${PLUGIN_VERSION}" ]; then
   echo "Downloading vault-plugin-secrets-artifactory $PLUGIN_VERSION ..."
   ARCH=$(uname -m)
   case "$ARCH" in
@@ -23,8 +25,9 @@ if [ ! -f "$PLUGIN_PATH" ]; then
     *)       echo "Unsupported architecture: $ARCH"; exit 1 ;;
   esac
   wget -q -O "$PLUGIN_PATH" \
-    "https://github.com/jfrog/vault-plugin-secrets-artifactory/releases/download/${PLUGIN_VERSION}/artifactory-secrets-plugin_${PLUGIN_VERSION#v}_linux_${ARCH}"
+    "https://github.com/${PLUGIN_REPOSITORY}/releases/download/${PLUGIN_VERSION}/artifactory-secrets-plugin_${PLUGIN_VERSION#v}_linux_${ARCH}"
   chmod +x "$PLUGIN_PATH"
+  echo "${PLUGIN_REPOSITORY}@${PLUGIN_VERSION}" > "$PLUGIN_MARKER"
   echo "Plugin downloaded and installed."
 else
   echo "Plugin already cached, skipping download."
@@ -98,7 +101,7 @@ echo "Docker repository 'rise-docker-local' ready."
 
 # --- 9. Create a JFrog admin access token ---
 # Uses the UI API (the only way to get an applied-permissions/admin scoped token).
-# Ref: https://github.com/jfrog/vault-plugin-secrets-artifactory/blob/master/scripts/getArtifactoryAdminToken.sh
+# Ref: https://github.com/rise-deploy/vault-plugin-secrets-artifactory/blob/master/scripts/getArtifactoryAdminToken.sh
 echo "Creating JFrog admin access token ..."
 COOKIE_JAR=$(mktemp)
 MAX_RETRIES=30
@@ -154,16 +157,17 @@ vault write artifactory/config/admin \
   url="${JFROG_URL}" \
   access_token="$TOKEN" \
   bypass_artifactory_tls_verification=true \
-  allow_scope_override=true \
+  allow_scope_override="opt-in" \
   use_expiring_tokens=true
 echo "Vault configured with JFrog Artifactory plugin."
 
 # --- 11. Create the default role ---
 vault write artifactory/roles/rise \
-  scope="applied-permissions/admin" \
-  max_ttl=3600 \
+  scope="artifact:rise-docker-local/**:r" \
+  max_ttl=86400 \
   default_ttl=600 \
-  allow_scope_override=true
+  allow_scope_override=true \
+  allowed_scopes='["artifact:rise-docker-local/**:r","artifact:rise-docker-local/**:r,w"]'
 echo "Role 'artifactory/roles/rise' created."
 
 # --- 12. Keep container running ---

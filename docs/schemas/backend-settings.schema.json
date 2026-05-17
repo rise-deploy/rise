@@ -820,7 +820,7 @@
           "properties": {
             "scope_override": {
               "default": true,
-              "description": "When true (default), Rise sends per-operation scopes to Vault, overriding\nthe role's default scope. Requires `allow_scope_override=true` on the Vault role.\nWhen false, Rise omits the scope parameter and the role's configured scope is used.",
+              "description": "When true (default), Rise sends per-operation scopes to Vault, overriding\nthe role's default scope. With the Rise fork of vault-plugin-secrets-artifactory,\nconfigure admin `allow_scope_override=\"opt-in\"` and role\n`allow_scope_override=true` with narrow `allowed_scopes`.\nWhen false, Rise omits the scope parameter and the role's configured scope is used.",
               "type": "boolean"
             },
             "type": {

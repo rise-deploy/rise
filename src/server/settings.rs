@@ -864,7 +864,9 @@ pub enum JfrogTokenProviderSettings {
         /// Vault role name
         vault_role: String,
         /// When true (default), Rise sends per-operation scopes to Vault, overriding
-        /// the role's default scope. Requires `allow_scope_override=true` on the Vault role.
+        /// the role's default scope. With the Rise fork of vault-plugin-secrets-artifactory,
+        /// configure admin `allow_scope_override="opt-in"` and role
+        /// `allow_scope_override=true` with narrow `allowed_scopes`.
         /// When false, Rise omits the scope parameter and the role's configured scope is used.
         #[serde(default = "default_true")]
         scope_override: bool,

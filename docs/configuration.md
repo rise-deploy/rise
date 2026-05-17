@@ -298,7 +298,7 @@ The GitLab token must have `read_registry` and `write_registry` scopes (or equiv
 
 #### JFrog Artifactory
 
-JFrog supports two token-issuing backends: Vault (via `vault-plugin-secrets-artifactory`) and Direct (via JFrog's access token API).
+JFrog supports two token-issuing backends: Vault (via Rise's [`vault-plugin-secrets-artifactory`](https://github.com/rise-deploy/vault-plugin-secrets-artifactory/releases/tag/v1.8.9-rise.2) fork) and Direct (via JFrog's access token API).
 
 **Vault mode (scope override — default):**
 
@@ -314,13 +314,32 @@ registry:
     # vault_token_file: ~       # alternative: read token from file (supports rotation)
     vault_mount_path: "artifactory"
     vault_role: "rise"
-    # scope_override: true      # default — Rise sends per-operation scopes (requires allow_scope_override=true on the role)
+    # scope_override: true      # default — Rise sends per-operation scopes
   # push_permissions: "r,w"    # default
   # pull_permissions: "r"      # default
   # push_token_ttl: 600        # push token lifetime in seconds (default: 600)
   # pull_token_ttl: 86400      # pull token lifetime in seconds (default: 86400 = 24h)
   # mint_pull_secrets: true    # default
 ```
+
+Configure Vault with the Rise fork so scope overrides are opt-in and restricted to the Docker repository:
+
+```sh
+vault write artifactory/config/admin \
+  url="https://jfrog.example.com" \
+  access_token="$JFROG_ADMIN_TOKEN" \
+  allow_scope_override="opt-in" \
+  use_expiring_tokens=true
+
+vault write artifactory/roles/rise \
+  scope="artifact:rise-docker-local/**:r" \
+  default_ttl=600 \
+  max_ttl=86400 \
+  allow_scope_override=true \
+  allowed_scopes='["artifact:rise-docker-local/**:r","artifact:rise-docker-local/**:r,w"]'
+```
+
+Replace `rise-docker-local` with your configured `docker_repo_key`. The role allowlist lets Rise request narrow per-project and per-tag scopes under that repository, while denying unrelated scopes such as `applied-permissions/admin`.
 
 **Vault mode (role scope):**
 

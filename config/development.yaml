@@ -55,7 +55,7 @@ registry:
 #     type: "vault"
 #     vault_mount_path: "artifactory"
 #     vault_role: "rise"
-#     # scope_override: true       # default; set false to use role's configured scope
+#     # scope_override: true       # default; requires the Rise Vault plugin fork with allowed_scopes
 #   # push_permissions: "r,w"     # default (ignored when scope_override=false)
 #   # pull_permissions: "r"       # default (ignored when scope_override=false)
 #   # push_token_ttl: 600         # push token TTL in seconds (default: 600)
