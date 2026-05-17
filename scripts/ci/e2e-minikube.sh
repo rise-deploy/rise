@@ -41,6 +41,7 @@ rise_cli() {
     --network host
     -e "RISE_URL=http://127.0.0.1:3000"
     -e "RISE_TOKEN=${RISE_TOKEN}"
+    -e "MISE_TRUSTED_CONFIG_PATHS=${PWD}"
     -v "${PWD}:${PWD}"
     -w "${PWD}"
   )
