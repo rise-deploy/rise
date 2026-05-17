@@ -441,3 +441,34 @@ jobs:
           RISE_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           RISE_IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
         run: bash scripts/ci/e2e-minikube.sh
+
+  e2e-minikube-jfrog-vault:
+    name: Minikube JFrog/Vault deploy smoke tests
+    runs-on: ubuntu-latest
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && needs.prepare.outputs.is_trusted_pr == 'true')
+    needs:
+      - prepare
+      - package-image
+      - package-helm
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup mise
+        uses: jdx/mise-action@v4
+        with:
+          cache: true
+          experimental: true
+
+      - name: Install mise tools
+        run: mise use -g minikube kubectl helm
+
+      - name: Start Minikube and run JFrog/Vault deploy tests
+        env:
+          RISE_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          RISE_IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
+          RISE_E2E_REGISTRY_MODE: jfrog-vault
+        run: bash scripts/ci/e2e-minikube.sh

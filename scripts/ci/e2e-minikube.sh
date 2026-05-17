@@ -5,8 +5,18 @@ NAMESPACE="${NAMESPACE:-rise-ci}"
 RELEASE_NAME="${RELEASE_NAME:-rise-ci}"
 IMAGE_REPOSITORY="${RISE_IMAGE_REPOSITORY:?RISE_IMAGE_REPOSITORY is required}"
 IMAGE_TAG="${RISE_IMAGE_TAG:?RISE_IMAGE_TAG is required}"
+RISE_E2E_REGISTRY_MODE="${RISE_E2E_REGISTRY_MODE:-oci-client-auth}"
+MINIKUBE_MEMORY="${MINIKUBE_MEMORY:-4096}"
 RISE_PUBLIC_URL="http://rise.local"
 RISE_CI_JWT_SIGNING_SECRET_B64="dGVzdC1qd3Qtc2VjcmV0LWtleS1mb3ItY2ktdGVzdGluZy1vbmx5LW5vdC1zZWN1cmU="
+
+case "${RISE_E2E_REGISTRY_MODE}" in
+  oci-client-auth | jfrog-vault) ;;
+  *)
+    echo "Unsupported RISE_E2E_REGISTRY_MODE: ${RISE_E2E_REGISTRY_MODE}"
+    exit 1
+    ;;
+esac
 
 base64url() {
   openssl base64 -A | tr '+/' '-_' | tr -d '='
@@ -24,11 +34,56 @@ create_rise_ci_token() {
 }
 
 rise_cli() {
-  docker run --rm --network host \
-    -e "RISE_URL=http://127.0.0.1:3000" \
-    -e "RISE_TOKEN=${RISE_TOKEN}" \
+  local docker_args=(
+    --rm
+    --network host
+    -e "RISE_URL=http://127.0.0.1:3000"
+    -e "RISE_TOKEN=${RISE_TOKEN}"
+    -v "${PWD}:${PWD}"
+    -w "${PWD}"
+  )
+
+  if [[ "${RISE_CLI_WITH_DOCKER:-false}" == "true" ]]; then
+    docker_args+=(
+      -v /var/run/docker.sock:/var/run/docker.sock
+      -e DOCKER_CONFIG=/tmp/rise-docker-config
+    )
+  fi
+
+  docker run "${docker_args[@]}" \
     "${IMAGE_REPOSITORY}:${IMAGE_TAG}" \
     "$@"
+}
+
+wait_for_jfrog_vault() {
+  echo "Waiting for Vault-backed JFrog registry setup"
+  for _ in {1..120}; do
+    if curl -fsS \
+      -H "X-Vault-Token: root" \
+      "http://127.0.0.1:8200/v1/artifactory/roles/rise" >/dev/null 2>&1; then
+      return 0
+    fi
+    docker compose ps jfrog vault || true
+    sleep 5
+  done
+
+  echo "Timed out waiting for Vault Artifactory role"
+  docker compose logs --tail=200 jfrog vault || true
+  exit 1
+}
+
+configure_minikube_jfrog_registry() {
+  local network_name="rise_default"
+  local registry_dir="/etc/containerd/certs.d/rise-jfrog:8082"
+
+  echo "Connecting Minikube node to ${network_name}"
+  for node in $(minikube node list | awk '{print $1}'); do
+    docker network connect "${network_name}" "${node}" >/dev/null 2>&1 || true
+    docker exec "${node}" mkdir -p "${registry_dir}"
+    cat <<EOF | docker exec -i "${node}" cp /dev/stdin "${registry_dir}/hosts.toml"
+[host."http://rise-jfrog:8082"]
+EOF
+  done
 }
 
 cleanup() {
@@ -41,6 +96,9 @@ cleanup() {
     kubectl get events -A --sort-by=.metadata.creationTimestamp | tail -n 200 || true
     kubectl logs -n "${NAMESPACE}" -l "app.kubernetes.io/instance=${RELEASE_NAME}" --all-containers --tail=200 || true
     kubectl logs -n "${NAMESPACE}" -l "app.kubernetes.io/instance=${RELEASE_NAME}" --all-containers --previous --tail=200 || true
+    if [[ "${RISE_E2E_REGISTRY_MODE}" == "jfrog-vault" ]]; then
+      docker compose logs --tail=200 jfrog vault || true
+    fi
     if [[ -n "${APP_NAMESPACE:-}" ]]; then
       kubectl get all -n "${APP_NAMESPACE}" || true
       kubectl describe deployments -n "${APP_NAMESPACE}" || true
@@ -52,30 +110,68 @@ cleanup() {
   fi
   echo "Cleaning up Minikube"
   minikube delete || true
+  if [[ "${RISE_E2E_REGISTRY_MODE}" == "jfrog-vault" ]]; then
+    echo "Cleaning up JFrog/Vault services"
+    docker compose stop vault jfrog || true
+    docker compose rm -fsv vault jfrog || true
+  fi
 }
 trap cleanup EXIT
 
 echo "Ensuring clean Minikube environment"
 minikube delete || true
 
+if [[ "${RISE_E2E_REGISTRY_MODE}" == "jfrog-vault" ]]; then
+  echo "Starting JFrog and Vault services"
+  docker compose up -d jfrog vault
+  wait_for_jfrog_vault
+fi
+
 echo "Starting Minikube"
-minikube start --driver=docker --cpus=2 --memory=4096
+minikube_args=(--driver=docker --cpus=2 --memory="${MINIKUBE_MEMORY}")
+if [[ "${RISE_E2E_REGISTRY_MODE}" == "jfrog-vault" ]]; then
+  minikube_args+=(--insecure-registry=rise-jfrog:8082)
+fi
+minikube start "${minikube_args[@]}"
 minikube addons enable ingress
+
+if [[ "${RISE_E2E_REGISTRY_MODE}" == "jfrog-vault" ]]; then
+  configure_minikube_jfrog_registry
+fi
 
 echo "Installing chart with CI image ${IMAGE_REPOSITORY}:${IMAGE_TAG}"
 echo "Using CI values from helm/rise/values-ci.yaml"
 cat helm/rise/values-ci.yaml
 helm dependency build helm/rise
 
-helm upgrade --install "${RELEASE_NAME}" ./helm/rise \
-  --namespace "${NAMESPACE}" \
-  --create-namespace \
-  --values helm/rise/values-ci.yaml \
-  --set "image.repository=${IMAGE_REPOSITORY}" \
-  --set "image.tag=${IMAGE_TAG}" \
-  --set "image.pullPolicy=Always" \
-  --set-string "config.deployment_controller.auth_backend_url=http://${RELEASE_NAME}-server.${NAMESPACE}.svc.cluster.local:3000" \
+helm_args=(
+  --namespace "${NAMESPACE}"
+  --create-namespace
+  --values helm/rise/values-ci.yaml
+  --set "image.repository=${IMAGE_REPOSITORY}"
+  --set "image.tag=${IMAGE_TAG}"
+  --set "image.pullPolicy=Always"
+  --set-string "config.deployment_controller.auth_backend_url=http://${RELEASE_NAME}-server.${NAMESPACE}.svc.cluster.local:3000"
   --set-string "config.deployment_controller.auth_signin_url=http://rise.local"
+)
+
+if [[ "${RISE_E2E_REGISTRY_MODE}" == "jfrog-vault" ]]; then
+  helm_args+=(
+    --set-string "config.registry.type=jfrog"
+    --set-string "config.registry.registry_host=rise-jfrog:8082"
+    --set-string "config.registry.client_registry_url=localhost:3082"
+    --set-string "config.registry.docker_repo_key=rise-docker-local"
+    --set-string "config.registry.token_provider.type=vault"
+    --set-string "config.registry.token_provider.vault_addr=http://host.minikube.internal:8200"
+    --set-string "config.registry.token_provider.vault_token=root"
+    --set-string "config.registry.token_provider.vault_mount_path=artifactory"
+    --set-string "config.registry.token_provider.vault_role=rise"
+    --set "config.registry.mint_pull_secrets=true"
+  )
+fi
+
+helm upgrade --install "${RELEASE_NAME}" ./helm/rise \
+  "${helm_args[@]}"
 
 echo "Waiting for workloads to become ready"
 kubectl wait --namespace "${NAMESPACE}" --for=condition=Available deployment -l "app.kubernetes.io/instance=${RELEASE_NAME}" --timeout=10m
@@ -109,10 +205,20 @@ fi
 echo "Smoke test: rise project create and rise deploy"
 RISE_TOKEN="$(create_rise_ci_token)"
 export RISE_TOKEN
-PROJECT_NAME="e2e-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+PROJECT_NAME="e2e-${RISE_E2E_REGISTRY_MODE}-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
 APP_NAMESPACE="rise-${PROJECT_NAME}"
 rise_cli project create "${PROJECT_NAME}" --access-class public --no-rise-toml
-rise_cli deploy --project "${PROJECT_NAME}" --image nginxinc/nginx-unprivileged:alpine --http-port 8080 --replicas 1
+if [[ "${RISE_E2E_REGISTRY_MODE}" == "jfrog-vault" ]]; then
+  RISE_CLI_WITH_DOCKER=true rise_cli deploy \
+    --project "${PROJECT_NAME}" \
+    --backend docker:build \
+    --container-cli docker \
+    --http-port 8080 \
+    --replicas 1 \
+    tests/e2e-minikube/jfrog-vault-fixture
+else
+  rise_cli deploy --project "${PROJECT_NAME}" --image nginxinc/nginx-unprivileged:alpine --http-port 8080 --replicas 1
+fi
 
 echo "Waiting for app namespace ${APP_NAMESPACE}"
 for _ in {1..60}; do
@@ -153,12 +259,6 @@ fi
 
 echo "Smoke test: helm upgrade is idempotent"
 helm upgrade "${RELEASE_NAME}" ./helm/rise \
-  --namespace "${NAMESPACE}" \
-  --values helm/rise/values-ci.yaml \
-  --set "image.repository=${IMAGE_REPOSITORY}" \
-  --set "image.tag=${IMAGE_TAG}" \
-  --set "image.pullPolicy=Always" \
-  --set-string "config.deployment_controller.auth_backend_url=http://${RELEASE_NAME}-server.${NAMESPACE}.svc.cluster.local:3000" \
-  --set-string "config.deployment_controller.auth_signin_url=http://rise.local"
+  "${helm_args[@]}"
 
 echo "Minikube E2E smoke tests completed successfully"
