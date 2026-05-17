@@ -91,6 +91,7 @@ wait_for_jfrog_vault() {
 
 collect_jfrog_vault_artifacts() {
   local artifact_dir="${RISE_E2E_ARTIFACT_DIR}/jfrog-vault"
+  local previous_log="${artifact_dir}/rise-backend-previous.log"
 
   mkdir -p "${artifact_dir}"
   docker compose ps jfrog vault > "${artifact_dir}/compose-ps.txt" 2>&1 || true
@@ -102,10 +103,15 @@ collect_jfrog_vault_artifacts() {
     kubectl get events -A --sort-by=.metadata.creationTimestamp > "${artifact_dir}/k8s-events.txt" 2>&1 || true
     kubectl logs -n "${NAMESPACE}" \
       -l "app.kubernetes.io/instance=${RELEASE_NAME},app.kubernetes.io/component=server" \
-      --all-containers > "${artifact_dir}/rise-backend.log" 2>&1 || true
+      -c server --tail=-1 > "${artifact_dir}/rise-backend.log" 2>&1 || true
     kubectl logs -n "${NAMESPACE}" \
       -l "app.kubernetes.io/instance=${RELEASE_NAME},app.kubernetes.io/component=server" \
-      --all-containers --previous > "${artifact_dir}/rise-backend-previous.log" 2>&1 || true
+      -c wait-for-postgresql --tail=-1 > "${artifact_dir}/rise-postgresql-wait.log" 2>&1 || true
+    if ! kubectl logs -n "${NAMESPACE}" \
+      -l "app.kubernetes.io/instance=${RELEASE_NAME},app.kubernetes.io/component=server" \
+      -c server --previous --tail=-1 > "${previous_log}" 2>&1; then
+      rm -f "${previous_log}"
+    fi
   fi
 }
 
