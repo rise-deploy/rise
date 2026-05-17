@@ -22,7 +22,7 @@ Create a `values-prod.yaml` file:
 
 ```yaml
 image:
-  repository: ghcr.io/niklasrosenstein/rise
+  repository: ghcr.io/rise-deploy/rise
   tag: "0.4.0"
   pullPolicy: IfNotPresent
 
@@ -137,7 +137,7 @@ The following table lists the configurable parameters of the Rise chart and thei
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `replicaCount` | Number of server replicas | `1` |
-| `image.repository` | Image repository | `ghcr.io/niklasrosenstein/rise` |
+| `image.repository` | Image repository | `ghcr.io/rise-deploy/rise` |
 | `image.tag` | Image tag | `""` (uses Chart appVersion) |
 | `image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `config` | Rise configuration in YAML format | See values.yaml |

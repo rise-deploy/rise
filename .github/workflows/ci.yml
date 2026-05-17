@@ -19,9 +19,9 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: niklasrosenstein/rise
-  BUILDER_IMAGE_NAME: niklasrosenstein/rise-builder
-  CHART_REGISTRY: ghcr.io/niklasrosenstein/rise
+  IMAGE_NAME: rise-deploy/rise
+  BUILDER_IMAGE_NAME: rise-deploy/rise-builder
+  CHART_REGISTRY: ghcr.io/rise-deploy
   # renovate: datasource=github-tags depName=rust packageName=rust-lang/rust extractVersion=^(?<version>\d+\.\d+\.\d+)$
   RUST_VERSION: "1.95.0"
 
@@ -310,6 +310,7 @@ jobs:
           set -euo pipefail
           ci_version="${{ needs.prepare.outputs.ci_version }}"
           image_tag="${{ needs.prepare.outputs.image_tag }}"
+          sed -i "s/^name: .*/name: rise-helm/" helm/rise/Chart.yaml
           sed -i "s/^version: .*/version: ${ci_version}/" helm/rise/Chart.yaml
           sed -i "s/^appVersion: .*/appVersion: \"${image_tag}\"/" helm/rise/Chart.yaml
           cat helm/rise/Chart.yaml
@@ -414,7 +415,7 @@ jobs:
   e2e-minikube:
     name: Minikube end-to-end smoke tests
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && needs.prepare.outputs.is_trusted_pr == 'true')
     needs:
       - prepare
       - package-image
