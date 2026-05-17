@@ -146,10 +146,12 @@ cleanup() {
     fi
     cat /tmp/rise-e2e-port-forward.log || true
   fi
+  if [[ "${RISE_E2E_REGISTRY_MODE}" == "jfrog-vault" ]]; then
+    collect_jfrog_vault_artifacts
+  fi
   echo "Cleaning up Minikube"
   minikube delete || true
   if [[ "${RISE_E2E_REGISTRY_MODE}" == "jfrog-vault" ]]; then
-    collect_jfrog_vault_artifacts
     echo "Cleaning up JFrog/Vault services"
     docker compose stop vault jfrog || true
     docker compose rm -fsv vault jfrog || true
