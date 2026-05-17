@@ -9,7 +9,7 @@ PLUGIN_VERSION="v1.8.9-rise.2"
 PLUGIN_REPOSITORY="rise-deploy/vault-plugin-secrets-artifactory"
 PLUGIN_DIR="/vault/plugins"
 PLUGIN_PATH="$PLUGIN_DIR/artifactory-secrets-plugin"
-PLUGIN_MARKER="$PLUGIN_PATH.version"
+PLUGIN_MARKER="/vault/artifactory-secrets-plugin.version"
 
 # --- 1. Install curl (needed for cookie-based UI API auth) ---
 apk add --no-cache curl > /dev/null 2>&1
@@ -32,6 +32,7 @@ if [ ! -f "$PLUGIN_PATH" ] || [ "$(cat "$PLUGIN_MARKER" 2>/dev/null || true)" !=
 else
   echo "Plugin already cached, skipping download."
 fi
+rm -f "$PLUGIN_PATH.version"
 
 # --- 3. Start Vault dev server in background ---
 vault server \
