@@ -45,7 +45,7 @@ Example:
 | `iss` | Issuer, usually the Rise backend URL. |
 | `aud` | Audience, set to the deployed application's URL. |
 
-The JWT expiration time is configurable with the `jwt_expiry_seconds` server setting. The default is `86400` seconds, or 24 hours.
+JWT expiration is controlled by the Rise platform. The default is 24 hours, but your platform operator may configure a different duration.
 
 ## Security properties
 

@@ -57,7 +57,7 @@ Rise automatically injects these environment variables into deployed application
 - Check that your library expects `RS256`, not `HS256`.
 - Confirm your app can reach `${RISE_ISSUER}/.well-known/openid-configuration`.
 - Validate that the `aud` claim matches `RISE_APP_URL`.
-- Check token expiration. Tokens expire after 24 hours by default.
+- Check token expiration. App JWTs expire after 24 hours by default, unless your Rise platform uses a different duration.
 
 ### No cookie is present
 
