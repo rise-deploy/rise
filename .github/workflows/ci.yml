@@ -22,6 +22,7 @@ env:
   IMAGE_NAME: rise-deploy/rise
   BUILDER_IMAGE_NAME: rise-deploy/rise-builder
   CHART_REGISTRY: ghcr.io/rise-deploy
+  NODE_VERSION: "24"
   # renovate: datasource=github-tags depName=rust packageName=rust-lang/rust extractVersion=^(?<version>\d+\.\d+\.\d+)$
   RUST_VERSION: "1.95.0"
 
@@ -338,6 +339,103 @@ jobs:
         run: |
           chart_file=$(ls .helm-packages/*.tgz)
           helm push "$chart_file" "oci://${{ env.CHART_REGISTRY }}"
+
+  docs-preview:
+    name: Deploy docs preview
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && needs.prepare.outputs.is_trusted_pr == 'true'
+    needs: prepare
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: docs/user/package-lock.json
+
+      - name: Install docs dependencies
+        working-directory: docs/user
+        run: npm ci
+
+      - name: Build docs preview
+        working-directory: docs/user
+        env:
+          ASTRO_BASE: /preview/pr-${{ github.event.pull_request.number }}
+        run: npm run build
+
+      - name: Deploy docs preview to GitHub Pages branch
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          branch: gh-pages
+          folder: docs/user/dist
+          target-folder: preview/pr-${{ github.event.pull_request.number }}
+          clean: false
+
+      - name: Resolve preview URL
+        id: preview
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          pr_number="${{ github.event.pull_request.number }}"
+          preview_path="/preview/pr-${pr_number}/"
+          pages_url="$(gh api "repos/${GITHUB_REPOSITORY}/pages" --jq '.html_url' 2>/dev/null || true)"
+          if [[ -z "${pages_url}" ]]; then
+            repo_name="${GITHUB_REPOSITORY#*/}"
+            pages_url="https://${{ github.repository_owner }}.github.io/${repo_name}/"
+          fi
+          preview_url="${pages_url%/}${preview_path}"
+
+          echo "path=${preview_path}" >> "$GITHUB_OUTPUT"
+          echo "url=${preview_url}" >> "$GITHUB_OUTPUT"
+          echo "Docs preview deployed to ${preview_url}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment on PR
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const marker = '<!-- rise-docs-preview -->';
+            const previewUrl = '${{ steps.preview.outputs.url }}';
+            const previewPath = '${{ steps.preview.outputs.path }}';
+            const body = [
+              marker,
+              `Docs preview: [\`${previewPath}\`](${previewUrl})`,
+              '',
+              `Updated for commit \`${context.sha.slice(0, 7)}\`.`,
+            ].join('\n');
+
+            const issue_number = context.payload.pull_request.number;
+            const { owner, repo } = context.repo;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+            const existing = comments.find((comment) => comment.body?.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body,
+              });
+            }
 
   publish-crates:
     name: Publish to crates.io
