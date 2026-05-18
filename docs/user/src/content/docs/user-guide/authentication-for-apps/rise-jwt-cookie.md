@@ -1,5 +1,5 @@
 ---
-title: "`rise_jwt` Cookie"
+title: "rise_jwt Cookie"
 description: Cookie and JWT claim reference for Rise-protected applications.
 ---
 
