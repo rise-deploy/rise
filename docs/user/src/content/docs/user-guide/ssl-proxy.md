@@ -131,6 +131,12 @@ Since builds run in containers, `localhost` and `127.0.0.1` addresses are automa
 - `http://localhost:3128` → `http://host.docker.internal:3128`
 - `https://127.0.0.1:8080` → `https://host.docker.internal:8080`
 
+:::caution[Proxy bound to localhost only]
+This transformation changes the hostname used by the build container, but it does not change what address your proxy listens on. If your proxy only binds to `127.0.0.1`, the container may still fail to connect to it.
+
+Configure the proxy to listen on an address reachable from containers, such as `0.0.0.0` or the host bridge address, and keep using the `localhost` proxy URL in your shell so Rise can transform it for the build.
+:::
+
 `NO_PROXY` values are passed through unchanged.
 
 No configuration is needed — proxy support is fully automatic.
