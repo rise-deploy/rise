@@ -13,12 +13,15 @@ RUN apt-get update && apt-get install -y \
 # Stage 2: Generate recipe file for dependencies
 FROM chef AS planner
 
-# Copy single-crate project files
+# Copy workspace project files
 COPY Cargo.toml Cargo.lock ./
+COPY crates/rise-resource-api/Cargo.toml ./crates/rise-resource-api/Cargo.toml
 
-# Create dummy src/main.rs for cargo to be happy
+# Create dummy sources for cargo to be happy
 RUN mkdir -p src && \
-    echo "fn main() {}" > src/main.rs
+    echo "fn main() {}" > src/main.rs && \
+    mkdir -p crates/rise-resource-api/src && \
+    echo "" > crates/rise-resource-api/src/lib.rs
 
 RUN cargo chef prepare --recipe-path recipe.json
 
@@ -54,6 +57,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # Copy project files
 COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
 COPY src ./src
 COPY migrations ./migrations
 COPY static ./static

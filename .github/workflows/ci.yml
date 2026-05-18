@@ -134,6 +134,9 @@ jobs:
         env:
           SQLX_OFFLINE: true
 
+      - name: Run Clippy (resource API crate)
+        run: cargo clippy --package rise-resource-api --all-targets -- -D warnings
+
       - name: Run cargo audit
         run: cargo audit
 
@@ -187,7 +190,7 @@ jobs:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/rise_test
 
       - name: Run tests
-        run: cargo test --all-features
+        run: cargo test --workspace --all-features
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/rise_test
 
@@ -622,7 +625,7 @@ jobs:
         run: mise use -g pack railpack buildkit
 
       - name: Build Rise CLI
-        run: cargo build --release --features cli
+        run: cargo build --release --package rise-deploy --features cli
 
       - name: Run e2e build tests (no proxy)
         run: RISE_BIN=./target/release/rise bash tests/e2e-build/run.sh --no-proxy
