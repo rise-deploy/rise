@@ -346,8 +346,10 @@ jobs:
     if: github.event_name == 'pull_request' && needs.prepare.outputs.is_trusted_pr == 'true'
     needs: prepare
     permissions:
-      contents: write
+      contents: read
+      id-token: write
       issues: write
+      pages: write
       pull-requests: write
     steps:
       - name: Checkout repository
@@ -367,16 +369,28 @@ jobs:
       - name: Build docs preview
         working-directory: docs/user
         env:
-          ASTRO_BASE: /preview/pr-${{ github.event.pull_request.number }}
+          ASTRO_BASE: /${{ github.event.repository.name }}/preview/pr-${{ github.event.pull_request.number }}
         run: npm run build
 
-      - name: Deploy docs preview to GitHub Pages branch
-        uses: JamesIves/github-pages-deploy-action@v4
+      - name: Stage docs preview
+        shell: bash
+        run: |
+          set -euo pipefail
+          preview_path="preview/pr-${{ github.event.pull_request.number }}"
+          mkdir -p "docs-preview/${preview_path}"
+          cp -a docs/user/dist/. "docs-preview/${preview_path}/"
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload docs preview artifact
+        uses: actions/upload-pages-artifact@v4
         with:
-          branch: gh-pages
-          folder: docs/user/dist
-          target-folder: preview/pr-${{ github.event.pull_request.number }}
-          clean: false
+          path: docs-preview
+
+      - name: Deploy docs preview to GitHub Pages
+        id: pages
+        uses: actions/deploy-pages@v4
 
       - name: Resolve preview URL
         id: preview
@@ -387,7 +401,10 @@ jobs:
           set -euo pipefail
           pr_number="${{ github.event.pull_request.number }}"
           preview_path="/preview/pr-${pr_number}/"
-          pages_url="$(gh api "repos/${GITHUB_REPOSITORY}/pages" --jq '.html_url' 2>/dev/null || true)"
+          pages_url="${{ steps.pages.outputs.page_url }}"
+          if [[ -z "${pages_url}" ]]; then
+            pages_url="$(gh api "repos/${GITHUB_REPOSITORY}/pages" --jq '.html_url' 2>/dev/null || true)"
+          fi
           if [[ -z "${pages_url}" ]]; then
             repo_name="${GITHUB_REPOSITORY#*/}"
             pages_url="https://${{ github.repository_owner }}.github.io/${repo_name}/"
