@@ -59,7 +59,7 @@ pub type ResourceList<TSpec = JsonObject, TStatus = JsonObject> = Vec<Resource<T
 pub type ResourceResponse<TSpec = JsonObject, TStatus = JsonObject> = Resource<TSpec, TStatus>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CreateResourceRequest<TSpec: Default = JsonObject> {
     pub api_version: String,
     pub kind: String,
@@ -79,7 +79,7 @@ pub struct CreateResourceMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpdateResourceRequest<TSpec: Default = JsonObject> {
     pub api_version: String,
     pub kind: String,
@@ -399,12 +399,40 @@ mod tests {
 
     #[test]
     fn create_request_rejects_server_controlled_metadata_and_status() {
-        let result: Result<CreateResourceRequest, _> = serde_json::from_value(serde_json::json!({
+        let server_controlled_metadata: Result<CreateResourceRequest, _> =
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {
+                    "name": "widget-a",
+                    "uid": "5ac452d8-4e4d-45c9-bd62-5d5aff38095f"
+                },
+                "spec": {}
+            }));
+
+        assert!(server_controlled_metadata.is_err());
+
+        let status: Result<CreateResourceRequest, _> = serde_json::from_value(serde_json::json!({
+            "apiVersion": "example.dev/v1",
+            "kind": "Widget",
+            "metadata": {
+                "name": "widget-a"
+            },
+            "spec": {},
+            "status": {}
+        }));
+
+        assert!(status.is_err());
+    }
+
+    #[test]
+    fn update_request_rejects_top_level_status() {
+        let result: Result<UpdateResourceRequest, _> = serde_json::from_value(serde_json::json!({
             "apiVersion": "example.dev/v1",
             "kind": "Widget",
             "metadata": {
                 "name": "widget-a",
-                "uid": "5ac452d8-4e4d-45c9-bd62-5d5aff38095f"
+                "revision": 7
             },
             "spec": {},
             "status": {}

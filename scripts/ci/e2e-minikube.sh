@@ -62,7 +62,7 @@ rise_cli() {
 wait_for_jfrog_vault() {
   echo "Waiting for Vault-backed JFrog registry setup"
   echo "Streaming Vault setup logs until the Vault role is available"
-  docker compose logs --follow --tail=100 vault &
+  docker compose --profile jfrog-vault logs --follow --tail=100 vault &
   COMPOSE_LOGS_PID=$!
 
   for attempt in {1..120}; do
@@ -76,7 +76,7 @@ wait_for_jfrog_vault() {
     fi
 
     if (( attempt % 6 == 0 )); then
-      docker compose ps jfrog vault || true
+      docker compose --profile jfrog-vault ps jfrog vault || true
     fi
     sleep 5
   done
@@ -94,9 +94,9 @@ collect_jfrog_vault_artifacts() {
   local previous_log="${artifact_dir}/rise-backend-previous.log"
 
   mkdir -p "${artifact_dir}"
-  docker compose ps jfrog vault > "${artifact_dir}/compose-ps.txt" 2>&1 || true
-  docker compose logs --no-color jfrog > "${artifact_dir}/jfrog.log" 2>&1 || true
-  docker compose logs --no-color vault > "${artifact_dir}/vault.log" 2>&1 || true
+  docker compose --profile jfrog-vault ps jfrog vault > "${artifact_dir}/compose-ps.txt" 2>&1 || true
+  docker compose --profile jfrog-vault logs --no-color jfrog > "${artifact_dir}/jfrog.log" 2>&1 || true
+  docker compose --profile jfrog-vault logs --no-color vault > "${artifact_dir}/vault.log" 2>&1 || true
 
   if kubectl cluster-info >/dev/null 2>&1; then
     kubectl get pods -A > "${artifact_dir}/k8s-pods.txt" 2>&1 || true
@@ -159,8 +159,8 @@ cleanup() {
   minikube delete || true
   if [[ "${RISE_E2E_REGISTRY_MODE}" == "jfrog-vault" ]]; then
     echo "Cleaning up JFrog/Vault services"
-    docker compose stop vault jfrog || true
-    docker compose rm -fsv vault jfrog || true
+    docker compose --profile jfrog-vault stop vault jfrog || true
+    docker compose --profile jfrog-vault rm -fsv vault jfrog || true
   fi
 }
 trap cleanup EXIT
@@ -170,7 +170,7 @@ minikube delete || true
 
 if [[ "${RISE_E2E_REGISTRY_MODE}" == "jfrog-vault" ]]; then
   echo "Starting JFrog and Vault services"
-  docker compose up -d jfrog vault
+  docker compose --profile jfrog-vault up -d jfrog vault
   wait_for_jfrog_vault
 fi
 
