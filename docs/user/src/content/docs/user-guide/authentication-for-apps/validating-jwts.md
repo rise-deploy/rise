@@ -37,6 +37,8 @@ Always validate:
 - Audience: expect the URL of your app, usually `RISE_APP_URL`.
 - Expiration: reject expired tokens.
 
+Rise also uses a `rise_jwt` cookie for dashboard/API sessions. That token is HS256-signed and has the Rise server as its audience. Application authentication tokens are RS256-signed and have the deployed application URL as their audience, so validating both `alg` and `aud` prevents accepting a dashboard session token as an app token.
+
 Do not trust cookie contents without verification.
 
 ## Environment variables
