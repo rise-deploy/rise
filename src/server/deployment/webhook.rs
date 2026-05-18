@@ -1922,4 +1922,64 @@ mod tests {
             updated_at: chrono::Utc::now(),
         }
     }
+
+    #[tokio::test]
+    async fn resolve_deployment_env_vars_trims_whitespace_from_keys() {
+        let env_vars = vec![
+            test_env_var(" LEADING_SPACE", "value1", false, false),
+            test_env_var("TRAILING_SPACE ", "value2", false, false),
+            test_env_var("  BOTH  ", "value3", false, false),
+            test_env_var("CLEAN_KEY", "value4", false, false),
+        ];
+
+        let resolved = resolve_deployment_env_vars(env_vars, None).await.unwrap();
+
+        let names: Vec<&str> = resolved
+            .plain_env_vars
+            .iter()
+            .map(|v| v.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"LEADING_SPACE"),
+            "leading space should be trimmed"
+        );
+        assert!(
+            names.contains(&"TRAILING_SPACE"),
+            "trailing space should be trimmed"
+        );
+        assert!(
+            names.contains(&"BOTH"),
+            "both-side spaces should be trimmed"
+        );
+        assert!(names.contains(&"CLEAN_KEY"));
+        assert!(
+            !names.iter().any(|n| n.starts_with(' ') || n.ends_with(' ')),
+            "no key should retain surrounding whitespace"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_deployment_env_vars_trims_whitespace_from_secret_keys() {
+        let provider = crate::server::encryption::providers::local::LocalEncryptionProvider::new(
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        )
+        .unwrap();
+        let raw_value = "secret-value";
+        let encrypted = provider.encrypt(raw_value).await.unwrap();
+
+        let env_vars = vec![test_env_var(" SECRET_KEY", &encrypted, true, false)];
+
+        let resolved = resolve_deployment_env_vars(env_vars, Some(&provider))
+            .await
+            .unwrap();
+
+        assert!(
+            resolved.secret_env_vars.contains_key("SECRET_KEY"),
+            "trimmed key 'SECRET_KEY' should be present"
+        );
+        assert!(
+            !resolved.secret_env_vars.contains_key(" SECRET_KEY"),
+            "untrimmed key should not be present"
+        );
+    }
 }

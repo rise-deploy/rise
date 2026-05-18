@@ -15,6 +15,32 @@ use axum::{
 };
 use std::collections::HashMap;
 
+/// Validate an environment variable key from a URL path segment.
+///
+/// Keys must match `[-._a-zA-Z0-9]+` (the same pattern Kubernetes enforces for
+/// Secret data keys).  Leading/trailing whitespace is rejected rather than
+/// silently normalised — if the key contains whitespace the caller likely made
+/// a mistake and should fix the request.
+fn validate_env_var_key(key: &str) -> Result<(), ServerError> {
+    if key != key.trim() {
+        return Err(ServerError::bad_request(format!(
+            "Invalid environment variable key {:?}: leading/trailing whitespace is not allowed",
+            key
+        )));
+    }
+    if key.is_empty()
+        || !key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        return Err(ServerError::bad_request(format!(
+            "Invalid environment variable key {:?}: must consist of alphanumeric characters, '-', '_', or '.'",
+            key
+        )));
+    }
+    Ok(())
+}
+
 /// Resolve an optional environment name from query params to an environment ID.
 async fn resolve_environment_id(
     pool: &sqlx::PgPool,
@@ -56,19 +82,7 @@ pub async fn set_project_env_var(
 
     let user = auth.user()?;
     ensure_project_access_or_admin(&state, user, &project).await?;
-
-    // Trim and validate the key name
-    let key = key.trim().to_string();
-    if key.is_empty()
-        || !key
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
-    {
-        return Err(ServerError::bad_request(format!(
-            "Invalid environment variable key '{}': must consist of alphanumeric characters, '-', '_', or '.'",
-            key
-        )));
-    }
+    validate_env_var_key(&key)?;
 
     // Normalize: when is_protected is omitted, infer from is_secret
     // This preserves backward compatibility: secrets default to protected, plain vars default to unprotected
@@ -251,6 +265,7 @@ pub async fn delete_project_env_var(
 
     let user = auth.user()?;
     ensure_project_access_or_admin(&state, user, &project).await?;
+    validate_env_var_key(&key)?;
 
     // Resolve environment from query parameter
     let environment_id = resolve_environment_id(&state.db_pool, project.id, &params).await?;
@@ -300,6 +315,7 @@ pub async fn move_project_env_var(
 
     let user = auth.user()?;
     ensure_project_access_or_admin(&state, user, &project).await?;
+    validate_env_var_key(&key)?;
 
     // Resolve source environment
     let from_env_id = if let Some(ref name) = payload.from_environment {
@@ -490,6 +506,7 @@ pub async fn get_project_env_var_value(
 
     let user = auth.user()?;
     ensure_project_access_or_admin(&state, user, &project).await?;
+    validate_env_var_key(&key)?;
 
     // Resolve environment from query parameter
     let environment_id = resolve_environment_id(&state.db_pool, project.id, &params).await?;
