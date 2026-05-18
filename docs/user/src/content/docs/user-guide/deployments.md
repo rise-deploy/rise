@@ -218,7 +218,7 @@ Stopped deployments remain in the database for rollback purposes.
 
 Rise injects variables like `PORT`, `RISE_ISSUER`, `RISE_APP_URL`, `RISE_APP_URLS`, and `RISE_ENVIRONMENT` into every deployment. See [Environment Variables](../environment-variables#auto-injected-variables) for the full list.
 
-For JWT validation using `RISE_ISSUER`, see [Authentication for Applications](../authentication-for-apps).
+For JWT validation using `RISE_ISSUER`, see [Validating JWTs](../authentication-for-apps/validating-jwts).
 
 ## CI/CD Deployments
 

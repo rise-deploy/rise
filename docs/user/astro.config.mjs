@@ -50,7 +50,15 @@ export default defineConfig({
           items: [
             { label: 'Authentication', slug: 'user-guide/authentication' },
             { label: 'Service Accounts', slug: 'user-guide/service-accounts' },
-            { label: 'Authentication for Applications', slug: 'user-guide/authentication-for-apps' },
+            {
+              label: 'Authentication for Applications',
+              items: [
+                { label: 'Overview', slug: 'user-guide/authentication-for-apps' },
+                { label: 'rise_jwt Cookie', slug: 'user-guide/authentication-for-apps/rise-jwt-cookie' },
+                { label: 'Validating JWTs', slug: 'user-guide/authentication-for-apps/validating-jwts' },
+                { label: 'Example Code', slug: 'user-guide/authentication-for-apps/examples' },
+              ],
+            },
             { label: 'OAuth Extensions', slug: 'user-guide/oauth' },
             { label: 'SSL & Proxy Configuration', slug: 'user-guide/ssl-proxy' },
           ],
