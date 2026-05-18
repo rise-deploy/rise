@@ -39,6 +39,7 @@ Most commands accept `-p <project>` to specify the project name. If omitted, Ris
 | `RISE_CONTAINER_CLI` | Container CLI: `docker` or `podman` |
 | `RISE_MANAGED_BUILDKIT` | Enable managed BuildKit daemon (`true`/`false`) |
 | `RISE_MANAGED_BUILDKIT_NETWORK_NAME` | Docker network for managed BuildKit daemon |
+| `RISE_MANAGED_BUILDKIT_HOST_NETWORK` | Run managed BuildKit with host networking (`true`/`false`) |
 | `RISE_MANAGED_BUILDKIT_INSECURE_REGISTRIES` | Comma-separated list of insecure registries |
 | `SSL_CERT_FILE` | CA certificate file for SSL builds |
 | `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` | Proxy settings (auto-injected into builds) |

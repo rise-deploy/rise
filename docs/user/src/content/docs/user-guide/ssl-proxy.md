@@ -75,7 +75,7 @@ The managed daemon is recreated when any of the following change:
 
 - SSL certificate content
 - Proxy variable values (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` and lowercase variants)
-- Network configuration (`RISE_MANAGED_BUILDKIT_NETWORK_NAME`)
+- Network configuration (`RISE_MANAGED_BUILDKIT_NETWORK_NAME`, `RISE_MANAGED_BUILDKIT_HOST_NETWORK`)
 - Insecure registry configuration (`RISE_MANAGED_BUILDKIT_INSECURE_REGISTRIES`)
 - Internal Rise version updates (e.g., new daemon flags)
 
@@ -191,6 +191,15 @@ rise deploy
 ```
 
 The daemon is recreated if the network name changes.
+
+To run the managed BuildKit daemon with host networking instead, set:
+
+```bash
+export RISE_MANAGED_BUILDKIT_HOST_NETWORK=true
+rise deploy
+```
+
+Host networking can help when the build needs to reach services that are only available from the host network namespace. If both `RISE_MANAGED_BUILDKIT_HOST_NETWORK` and `RISE_MANAGED_BUILDKIT_NETWORK_NAME` are set, host networking takes precedence.
 
 ## Insecure Registries (Local Development)
 
