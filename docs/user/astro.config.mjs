@@ -7,7 +7,7 @@ export default defineConfig({
   base,
   integrations: [
     starlight({
-      title: 'Rise Docs',
+      title: 'Rise User Docs',
       favicon: '/favicon.ico',
       social: [
         {

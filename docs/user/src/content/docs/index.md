@@ -1,5 +1,5 @@
 ---
-title: Rise
+title: Rise User Docs
 description: Learn how to deploy and operate applications on Rise.
 ---
 

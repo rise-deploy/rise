@@ -1,10 +1,13 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 
+const base = process.env.ASTRO_BASE ?? '/operator-docs';
+
 export default defineConfig({
+  base,
   integrations: [
     starlight({
-      title: 'Rise Engineering Docs',
+      title: 'Rise Operator Docs',
       favicon: '/favicon.ico',
       social: [
         {

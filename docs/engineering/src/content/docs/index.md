@@ -1,5 +1,5 @@
 ---
-title: Rise Engineering Docs
+title: Rise Operator Docs
 description: Operate, configure, and develop Rise.
 ---
 
