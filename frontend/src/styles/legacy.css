@@ -536,11 +536,13 @@ a {
 }
 
 .mono-nav a,
-.mono-nav .mono-nav-action {
-    display: block;
+.mono-nav .mono-nav-action,
+.mono-nav .mono-nav-static {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
     width: 100%;
     text-align: left;
-    cursor: pointer;
     border: 0;
     border-bottom: 1px solid var(--mono-line);
     background: transparent;
@@ -549,9 +551,22 @@ a {
     padding: 0.6rem;
 }
 
+.mono-nav a,
+.mono-nav .mono-nav-action {
+    cursor: pointer;
+}
+
 .mono-nav a:last-child,
-.mono-nav .mono-nav-action:last-child {
+.mono-nav .mono-nav-action:last-child,
+.mono-nav .mono-nav-static:last-child {
     border-bottom: 0;
+}
+
+.mono-nav-vsep {
+    width: 1px;
+    align-self: stretch;
+    background: var(--mono-line);
+    flex-shrink: 0;
 }
 
 .mono-nav a.active {
@@ -611,21 +626,39 @@ a {
 .mono-subnav a.depth-3.active { padding-left: calc(3.6rem - 2px); }
 
 .mono-ghost-button {
+    display: inline-flex;
+    align-items: center;
     border: 1px solid var(--mono-line);
     background: var(--mono-panel-2);
     color: var(--mono-muted);
     padding: 0.55rem 0.75rem;
     text-align: left;
     cursor: pointer;
+    text-decoration: none;
 }
 
-.mono-ghost-button:hover {
+.mono-ghost-button:hover,
+.mono-ghost-button.active {
     color: var(--mono-text);
     border-color: #565656;
 }
 
+.mono-icon-button {
+    display: inline-flex;
+    align-items: center;
+    flex-shrink: 0;
+    border: 0;
+    background: transparent;
+    color: var(--mono-muted);
+    cursor: pointer;
+    padding: 0;
+}
+
+.mono-icon-button:hover {
+    color: var(--mono-text);
+}
+
 .mono-shortcut-hint {
-    margin-top: auto;
     border-top: 1px dashed var(--mono-line);
     padding-top: 0.65rem;
     color: var(--mono-muted);

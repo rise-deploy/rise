@@ -157,7 +157,7 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         .route("/version", axum::routing::get(version_info))
         .route(
             "/schema/rise-toml/v1",
-            axum::routing::get(rise_toml_schema_v1),
+            axum::routing::get(rise_toml_schema_v1_redirect),
         )
         .merge(auth::routes::public_routes());
 
@@ -205,6 +205,7 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         .merge(auth::routes::rise_auth_routes())
         // OAuth/OIDC routes at root level (before frontend fallback)
         .merge(extensions::providers::oauth::routes::oauth_routes())
+        .merge(frontend::routes::docs_routes())
         .merge(frontend::routes::frontend_routes())
         .with_state(state.clone())
         .layer(
@@ -342,9 +343,8 @@ async fn version_info() -> axum::Json<serde_json::Value> {
     }))
 }
 
-async fn rise_toml_schema_v1() -> axum::Json<serde_json::Value> {
-    let schema = schemars::schema_for!(crate::rise_toml::ProjectBuildConfig);
-    axum::Json(schema.to_value())
+async fn rise_toml_schema_v1_redirect() -> impl axum::response::IntoResponse {
+    axum::response::Redirect::permanent("/docs/schemas/rise-toml-v1.schema.json")
 }
 
 /// Wait for a shutdown signal (SIGTERM or SIGINT)

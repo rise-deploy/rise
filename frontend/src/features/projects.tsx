@@ -4,7 +4,7 @@ import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
 import { copyToClipboard, formatISO8601, formatRelativeTimeRounded, isSafeUrl } from '../lib/utils';
 import { useToast } from '../components/toast';
-import { AutocompleteInput, Button, ConfirmDialog, FormField, Modal, ModalActions, ModalSection, SegmentedRadioGroup } from '../components/ui';
+import { AutocompleteInput, Button, ConfirmDialog, FormField, Modal, ModalActions, ModalSection, MonoNotice, SegmentedRadioGroup } from '../components/ui';
 import { ProjectTable } from '../components/project-table';
 import { ActiveDeploymentsSummary, DeploymentDetail, DeploymentsList } from './deployments';
 import { DomainsList, EnvironmentsList, EnvVarsList, ExtensionDetailPage, ExtensionsList, ServiceAccountsList } from './resources';
@@ -144,8 +144,15 @@ export function ProjectsList({ openCreate = false }) {
 
     return (
         <section>
-            <div className="flex justify-end items-center mb-6">
-                <Button variant="primary" size="sm" onClick={handleCreateClick}>
+            <div className="flex justify-between items-center mb-6">
+                <MonoNotice tone="muted">
+                    New to Rise? Follow the{' '}
+                    <a href="/docs/user-guide/getting-started/" className="underline">
+                        Getting Started
+                    </a>{' '}
+                    guide to deploy your first app.
+                </MonoNotice>
+                <Button variant="primary" size="sm" onClick={handleCreateClick} className="ml-4 shrink-0">
                     Create Project
                 </Button>
             </div>

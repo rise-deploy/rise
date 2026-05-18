@@ -71,7 +71,7 @@ pub struct ServerSettings {
     #[serde(default = "default_static_dir")]
     pub static_dir: Option<String>,
 
-    /// Directory to serve documentation files from (e.g., "/var/rise/docs" or "docs")
+    /// Directory containing built static documentation files (e.g., "/var/rise/docs")
     /// Defaults to the RISE_DOCS_DIR environment variable.
     #[serde(default = "default_docs_dir")]
     pub docs_dir: Option<String>,

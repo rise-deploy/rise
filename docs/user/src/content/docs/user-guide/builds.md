@@ -1,0 +1,116 @@
+---
+title: "Building Container Images"
+---
+
+Rise supports multiple build backends for creating container images from your application code. Building happens automatically as part of `rise deploy`, or you can build standalone with `rise build`.
+
+## Build Backends
+
+| Backend | Tool | Details |
+|---------|------|---------|
+| `docker`, `docker:build`, `docker:buildx`, `docker:buildctl` / `buildctl` | docker / buildctl | [Docker](builds/docker) |
+| `pack` | pack CLI | [Pack](builds/pack) |
+| `railpack`, `railpack:buildx`, `railpack:buildctl` | railpack + buildx/buildctl | [Railpack](builds/railpack) |
+
+## Feature Matrix
+
+| Feature | docker:build | docker:buildx | buildctl | pack | railpack:buildx | railpack:buildctl |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| Requires BuildKit | | x | x | | x | x |
+| SSL cert injection | | x | x | x | x | x |
+| Proxy support | x | x | x | x | x | x |
+| Native `--push`* | | Partial | x | | Partial | x |
+| Local output | Direct | `--load` | `docker load` pipe | Direct | `--load` | `docker load` pipe |
+| Managed BuildKit | | x | x | N/A | x | x |
+| Build contexts | x | x | | | | |
+
+:::note[Native `--push`]
+"Partial" means some CLI frontends (e.g., Podman buildx) don't support the `--push` flag. Rise detects this and falls back to building with `--load` followed by a separate push step. Either way, images always get pushed when deploying — this only affects the internal mechanism.
+:::
+
+## Auto-Detection
+
+When `--backend` is not specified, Rise detects the build method automatically:
+
+- If `Dockerfile` or `Containerfile` exists → `docker:buildx` (or `docker:build` if buildx is unavailable)
+- Otherwise → `railpack:buildx`
+
+Override with `--backend` or in `rise.toml`:
+
+```bash
+rise deploy --backend railpack
+```
+
+```toml
+[build]
+backend = "pack"
+```
+
+## Build-Time Arguments
+
+Pass build arguments with `-b` / `--build-arg`:
+
+```bash
+rise build myapp:latest -b NODE_ENV=production -b BUILD_VERSION=1.2.3
+```
+
+Or in `rise.toml`:
+
+```toml
+[build]
+args = ["NODE_ENV=production", "BUILD_VERSION"]
+```
+
+Using `KEY` without `=VALUE` reads the variable from your shell environment (useful for CI metadata like git SHAs).
+
+**How backends use these variables:**
+
+- **Docker**: Passed as `--build-arg` (requires `ARG` declaration in Dockerfile)
+- **Pack**: Passed as `--env` to pack CLI
+- **Railpack**: Passed as BuildKit secrets
+
+Build args are for build configuration only (compiler flags, tool versions). For runtime variables, use `-e` / `--env` on `rise deploy`, or `rise env set`. See [Environment Variables](../environment-variables) for the distinction.
+
+## Build Cache Control
+
+Force a complete rebuild:
+
+```bash
+rise deploy --no-cache
+```
+
+Or in `rise.toml`:
+
+```toml
+[build]
+no_cache = true
+```
+
+## Target Platform
+
+Rise builds for `linux/amd64` by default because the backend Kubernetes cluster runs linux/amd64 containers. This is the correct setting for deployments and you typically don't need to change it.
+
+On ARM Macs or other non-amd64 machines, builds will cross-compile by default. To build a native image for local use instead:
+
+```bash
+rise build myapp:latest --platform linux/arm64
+```
+
+Or in `rise.toml`:
+
+```toml
+[build]
+platform = "linux/arm64"
+```
+
+Or via environment variable:
+
+```bash
+RISE_PLATFORM=linux/arm64 rise build myapp:latest
+```
+
+Precedence: `--platform` flag > `RISE_PLATFORM` env var > `rise.toml` > default (`linux/amd64`).
+
+## SSL and Proxy
+
+If you're behind a corporate proxy or have custom CA certificates, see [SSL & Proxy Configuration](../ssl-proxy) for managed BuildKit daemon setup, certificate injection, and proxy variable handling.

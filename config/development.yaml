@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=../docs/schemas/backend-settings.schema.json
+# yaml-language-server: $schema=../docs/user/public/schemas/backend-settings.schema.json
 # Insecure development configuration - DO NOT USE IN PRODUCTION.
 
 server:
@@ -10,7 +10,7 @@ server:
   jwt_signing_secret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" # Generate with: openssl rand -base64 32
   jwt_claims: ["sub", "email", "name"]
   static_dir: "${RISE_STATIC_DIR:-static}" # In-container: /var/lib/rise/static; local dev: static/
-  docs_dir: "${RISE_DOCS_DIR:-docs}" # In-container: /var/rise/docs; local dev: docs/
+  docs_dir: "${RISE_DOCS_DIR:-docs/user/dist}" # In-container: /var/rise/docs; local dev: build with `mise docs:build`
   ssrf:
     allow_private_networks: true # Allow private IPs for local OIDC (Dex at localhost)
     allow_http: true # Allow HTTP for local development
