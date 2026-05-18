@@ -985,19 +985,23 @@ impl ResourceBuilder {
                     spec: Some(PodSpec {
                         security_context: self.create_pod_security_context(),
                         image_pull_secrets: {
-                            if self.registry_provider.requires_pull_secret() {
-                                let secret_name = self
-                                    .image_pull_secret_name
-                                    .as_deref()
-                                    .or(Some(IMAGE_PULL_SECRET_NAME));
-                                secret_name.map(|name| {
-                                    vec![LocalObjectReference {
-                                        name: name.to_string(),
-                                    }]
-                                })
-                            } else {
-                                None
-                            }
+                            // Use the explicitly-configured secret name if present.
+                            // Fall back to the default constant only when the registry
+                            // provider needs the controller to mint pull secrets.
+                            // requires_pull_secret() == false means the cluster handles
+                            // auth itself (e.g. node IAM), but an explicit
+                            // image_pull_secret_name should still always be honoured.
+                            let secret_name =
+                                self.image_pull_secret_name.as_deref().or_else(|| {
+                                    self.registry_provider
+                                        .requires_pull_secret()
+                                        .then_some(IMAGE_PULL_SECRET_NAME)
+                                });
+                            secret_name.map(|name| {
+                                vec![LocalObjectReference {
+                                    name: name.to_string(),
+                                }]
+                            })
                         },
                         containers: vec![Container {
                             name: "app".to_string(),

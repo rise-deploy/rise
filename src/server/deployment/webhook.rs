@@ -1437,20 +1437,29 @@ async fn resolve_deployment_env_vars(
     let mut resolved = ResolvedDeploymentEnvVars::default();
 
     for var in env_vars {
+        let key = var.key.trim().to_string();
+        if key != var.key {
+            tracing::warn!(
+                "Environment variable key {:?} has surrounding whitespace; trimming to {:?}",
+                var.key,
+                key
+            );
+        }
+
         let value = if var.is_secret {
             match encryption_provider {
                 Some(provider) => provider
                     .decrypt(&var.value)
                     .await
-                    .with_context(|| format!("Failed to decrypt secret variable '{}'", var.key))?,
+                    .with_context(|| format!("Failed to decrypt secret variable '{}'", key))?,
                 None => {
                     tracing::error!(
                         "Encountered secret variable '{}' but no encryption provider configured",
-                        var.key
+                        key
                     );
                     return Err(anyhow::anyhow!(
                         "Cannot decrypt secret variable '{}': no encryption provider",
-                        var.key
+                        key
                     ));
                 }
             }
@@ -1461,10 +1470,10 @@ async fn resolve_deployment_env_vars(
         if var.is_secret {
             resolved
                 .secret_env_vars
-                .insert(var.key, ByteString(value.into_bytes()));
+                .insert(key, ByteString(value.into_bytes()));
         } else {
             resolved.plain_env_vars.push(EnvVar {
-                name: var.key,
+                name: key,
                 value: Some(value),
                 ..Default::default()
             });

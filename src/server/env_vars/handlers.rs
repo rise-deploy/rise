@@ -57,6 +57,19 @@ pub async fn set_project_env_var(
     let user = auth.user()?;
     ensure_project_access_or_admin(&state, user, &project).await?;
 
+    // Trim and validate the key name
+    let key = key.trim().to_string();
+    if key.is_empty()
+        || !key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        return Err(ServerError::bad_request(format!(
+            "Invalid environment variable key '{}': must consist of alphanumeric characters, '-', '_', or '.'",
+            key
+        )));
+    }
+
     // Normalize: when is_protected is omitted, infer from is_secret
     // This preserves backward compatibility: secrets default to protected, plain vars default to unprotected
     let is_protected = payload.is_protected.unwrap_or(payload.is_secret);
