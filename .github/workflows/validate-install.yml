@@ -3,6 +3,8 @@ name: Validate Install
 # Runs after a release is published to verify the documented installation
 # method (mise + github) actually works with the released binary.
 on:
+  push:
+    branches: [nr/validate-install]
   release:
     types: [published]
   # Allow manual re-runs if a release asset was re-uploaded
@@ -27,11 +29,7 @@ jobs:
       - name: Resolve release tag
         id: tag
         run: |
-          TAG="${{ github.event.release.tag_name || inputs.tag }}"
-          if [ -z "$TAG" ]; then
-            echo "No tag provided; cannot determine which version to test." >&2
-            exit 1
-          fi
+          TAG="${{ github.event.release.tag_name || inputs.tag || 'v0.21.1' }}"
           echo "value=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Install mise
