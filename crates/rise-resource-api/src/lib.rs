@@ -14,6 +14,7 @@ pub const RESOURCE_DEFINITION_COLLECTION: &str = "resourcedefinitions";
 
 pub const RESERVED_COLLECTION_NAMES: &[&str] = &[
     ORGANIZATION_COLLECTION,
+    RESOURCE_DEFINITION_COLLECTION,
     "projects",
     "users",
     "teams",
@@ -22,9 +23,11 @@ pub const RESERVED_COLLECTION_NAMES: &[&str] = &[
     "serviceaccounts",
 ];
 
+pub type JsonObject = BTreeMap<String, serde_json::Value>;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct Resource<TSpec: Default = serde_json::Value, TStatus: Default = serde_json::Value> {
+pub struct Resource<TSpec: Default = JsonObject, TStatus: Default = JsonObject> {
     pub api_version: String,
     pub kind: String,
     pub metadata: ResourceMetadata,
@@ -52,12 +55,49 @@ pub struct ResourceMetadata {
     pub deletion_timestamp: Option<DateTime<Utc>>,
 }
 
-pub type ResourceList<TSpec = serde_json::Value, TStatus = serde_json::Value> =
-    Vec<Resource<TSpec, TStatus>>;
-pub type CreateResourceRequest<TSpec = serde_json::Value> = Resource<TSpec, serde_json::Value>;
-pub type UpdateResourceRequest<TSpec = serde_json::Value> = Resource<TSpec, serde_json::Value>;
-pub type ResourceResponse<TSpec = serde_json::Value, TStatus = serde_json::Value> =
-    Resource<TSpec, TStatus>;
+pub type ResourceList<TSpec = JsonObject, TStatus = JsonObject> = Vec<Resource<TSpec, TStatus>>;
+pub type ResourceResponse<TSpec = JsonObject, TStatus = JsonObject> = Resource<TSpec, TStatus>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateResourceRequest<TSpec: Default = JsonObject> {
+    pub api_version: String,
+    pub kind: String,
+    pub metadata: CreateResourceMetadata,
+    #[serde(default)]
+    pub spec: TSpec,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateResourceMetadata {
+    pub name: String,
+    #[serde(default)]
+    pub annotations: BTreeMap<String, String>,
+    #[serde(default)]
+    pub finalizers: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateResourceRequest<TSpec: Default = JsonObject> {
+    pub api_version: String,
+    pub kind: String,
+    pub metadata: UpdateResourceMetadata,
+    #[serde(default)]
+    pub spec: TSpec,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateResourceMetadata {
+    pub name: String,
+    pub revision: i64,
+    #[serde(default)]
+    pub annotations: BTreeMap<String, String>,
+    #[serde(default)]
+    pub finalizers: Vec<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "camelCase")]
@@ -302,6 +342,7 @@ mod tests {
     #[test]
     fn detects_reserved_collection_names() {
         assert!(is_reserved_collection_name("organizations"));
+        assert!(is_reserved_collection_name("resourcedefinitions"));
         assert!(is_reserved_collection_name("Projects"));
         assert!(!is_reserved_collection_name("widgets"));
     }
@@ -335,6 +376,68 @@ mod tests {
         assert_eq!(value["kind"], ORGANIZATION_KIND);
         assert_eq!(value["metadata"]["name"], "default");
         assert_eq!(value["spec"]["displayName"], "Default");
+    }
+
+    #[test]
+    fn defaults_untyped_spec_and_status_to_empty_objects() {
+        let resource: Resource = serde_json::from_value(serde_json::json!({
+            "apiVersion": "example.dev/v1",
+            "kind": "Widget",
+            "metadata": {
+                "name": "widget-a"
+            }
+        }))
+        .unwrap();
+
+        assert!(resource.spec.is_empty());
+        assert!(resource.status.is_empty());
+
+        let value = serde_json::to_value(resource).unwrap();
+        assert_eq!(value["spec"], serde_json::json!({}));
+        assert_eq!(value["status"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn create_request_rejects_server_controlled_metadata_and_status() {
+        let result: Result<CreateResourceRequest, _> = serde_json::from_value(serde_json::json!({
+            "apiVersion": "example.dev/v1",
+            "kind": "Widget",
+            "metadata": {
+                "name": "widget-a",
+                "uid": "5ac452d8-4e4d-45c9-bd62-5d5aff38095f"
+            },
+            "spec": {},
+            "status": {}
+        }));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn update_request_accepts_revision_but_rejects_other_identity_metadata() {
+        let valid: UpdateResourceRequest = serde_json::from_value(serde_json::json!({
+            "apiVersion": "example.dev/v1",
+            "kind": "Widget",
+            "metadata": {
+                "name": "widget-a",
+                "revision": 7
+            },
+            "spec": {}
+        }))
+        .unwrap();
+        assert_eq!(valid.metadata.revision, 7);
+
+        let invalid: Result<UpdateResourceRequest, _> = serde_json::from_value(serde_json::json!({
+            "apiVersion": "example.dev/v1",
+            "kind": "Widget",
+            "metadata": {
+                "name": "widget-a",
+                "revision": 7,
+                "discriminator": "abc123de"
+            },
+            "spec": {}
+        }));
+        assert!(invalid.is_err());
     }
 
     #[test]
