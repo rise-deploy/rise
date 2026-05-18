@@ -50,7 +50,6 @@ Rise automatically injects these environment variables into deployed application
 | `RISE_ISSUER` | Rise server URL and JWT issuer for validation. |
 | `RISE_APP_URL` | Canonical URL where your app is accessible. |
 | `RISE_APP_URLS` | JSON array of all URLs where your app is accessible, including custom domains. |
-| `PORT` | HTTP port your container should listen on. Defaults to `8080`. |
 
 ## Troubleshooting
 
