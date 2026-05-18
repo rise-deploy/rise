@@ -34,13 +34,15 @@ RUN npm run build
 
 # Stage 2.6: Build bundled user documentation
 FROM node:24-alpine AS user-docs-builder
-WORKDIR /usr/src/docs/user
+WORKDIR /usr/src/docs
 
-COPY docs/user/package.json docs/user/package-lock.json ./
+COPY docs/package.json docs/package-lock.json ./
+COPY docs/user/package.json ./user/
+COPY docs/engineering/package.json ./engineering/
 RUN npm ci
 
-COPY docs/user/ ./
-RUN npm run build
+COPY docs/ ./
+RUN npm run build --workspace=rise-user-docs
 
 # Stage 3: Build dependencies (cached separately from source code)
 FROM chef AS builder
