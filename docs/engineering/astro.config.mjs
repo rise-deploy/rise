@@ -16,6 +16,9 @@ export default defineConfig({
           href: 'https://github.com/NiklasRosenstein/rise',
         },
       ],
+      components: {
+        Header: './src/components/Header.astro',
+      },
       sidebar: [
         {
           label: 'Operations',

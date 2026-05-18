@@ -1,0 +1,119 @@
+---
+import config from 'virtual:starlight/user-config';
+
+import LanguageSelect from '@astrojs/starlight/components/LanguageSelect.astro';
+import Search from '@astrojs/starlight/components/Search.astro';
+import SiteTitle from '@astrojs/starlight/components/SiteTitle.astro';
+import SocialIcons from '@astrojs/starlight/components/SocialIcons.astro';
+import ThemeSelect from '@astrojs/starlight/components/ThemeSelect.astro';
+
+const shouldRenderSearch =
+	config.pagefind || config.components.Search !== '@astrojs/starlight/components/Search.astro';
+
+const selectorUrl = process.env.RISE_DOCS_SELECTOR_URL;
+const switchUrl = process.env.RISE_DOCS_SWITCH_URL;
+const switchLabel = process.env.RISE_DOCS_SWITCH_LABEL ?? 'Switch docs';
+const platformUrl = process.env.RISE_DOCS_PLATFORM_URL || undefined;
+---
+
+<div class="header">
+	<div class="title-wrapper sl-flex">
+		<SiteTitle />
+	</div>
+	<div class="sl-flex print:hidden">
+		{shouldRenderSearch && <Search />}
+	</div>
+	<div class="sl-hidden md:sl-flex print:hidden right-group">
+		{
+			(selectorUrl || switchUrl || platformUrl) && (
+				<nav class="docs-nav" aria-label="Documentation navigation">
+					{selectorUrl && <a href={selectorUrl}>All docs</a>}
+					{switchUrl && <a href={switchUrl}>{switchLabel}</a>}
+					{platformUrl && <a href={platformUrl}>Back to Rise</a>}
+				</nav>
+			)
+		}
+		<div class="sl-flex social-icons">
+			<SocialIcons />
+		</div>
+		<ThemeSelect />
+		<LanguageSelect />
+	</div>
+</div>
+
+<style>
+	@layer starlight.core {
+		.header {
+			display: flex;
+			gap: var(--sl-nav-gap);
+			justify-content: space-between;
+			align-items: center;
+			height: 100%;
+		}
+
+		.title-wrapper {
+			overflow: clip;
+			padding: 0.25rem;
+			margin: -0.25rem;
+			min-width: 0;
+		}
+
+		.right-group,
+		.social-icons,
+		.docs-nav {
+			gap: 1rem;
+			align-items: center;
+		}
+
+		.docs-nav {
+			display: flex;
+			font-size: var(--sl-text-sm);
+			white-space: nowrap;
+		}
+
+		.docs-nav a {
+			color: var(--sl-color-gray-2);
+			text-decoration: none;
+		}
+
+		.docs-nav a:hover,
+		.docs-nav a:focus-visible {
+			color: var(--sl-color-white);
+			text-decoration: underline;
+		}
+
+		.social-icons::after {
+			content: '';
+			height: 2rem;
+			border-inline-end: 1px solid var(--sl-color-gray-5);
+		}
+
+		@media (min-width: 50rem) {
+			:global(:root[data-has-sidebar]) {
+				--__sidebar-pad: calc(2 * var(--sl-nav-pad-x));
+			}
+			:global(:root:not([data-has-toc])) {
+				--__toc-width: 0rem;
+			}
+			.header {
+				--__sidebar-width: max(0rem, var(--sl-content-inline-start, 0rem) - var(--sl-nav-pad-x));
+				--__main-column-fr: calc(
+					(
+							100% + var(--__sidebar-pad, 0rem) - var(--__toc-width, var(--sl-sidebar-width)) -
+								(2 * var(--__toc-width, var(--sl-nav-pad-x))) - var(--sl-content-inline-start, 0rem) -
+								var(--sl-content-width)
+						) / 2
+				);
+				display: grid;
+				grid-template-columns:
+					minmax(
+						calc(var(--__sidebar-width) + max(0rem, var(--__main-column-fr) - var(--sl-nav-gap))),
+						auto
+					)
+					1fr
+					auto;
+				align-content: center;
+			}
+		}
+	}
+</style>

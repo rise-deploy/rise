@@ -376,12 +376,18 @@ jobs:
         working-directory: docs/user
         env:
           ASTRO_BASE: /${{ github.event.repository.name }}/preview/pr-${{ github.event.pull_request.number }}/user
+          RISE_DOCS_SELECTOR_URL: /${{ github.event.repository.name }}/preview/pr-${{ github.event.pull_request.number }}/
+          RISE_DOCS_SWITCH_URL: /${{ github.event.repository.name }}/preview/pr-${{ github.event.pull_request.number }}/operator/
+          RISE_DOCS_SWITCH_LABEL: Operator docs
         run: npm run build
 
       - name: Build operator docs preview
         working-directory: docs/engineering
         env:
           ASTRO_BASE: /${{ github.event.repository.name }}/preview/pr-${{ github.event.pull_request.number }}/operator
+          RISE_DOCS_SELECTOR_URL: /${{ github.event.repository.name }}/preview/pr-${{ github.event.pull_request.number }}/
+          RISE_DOCS_SWITCH_URL: /${{ github.event.repository.name }}/preview/pr-${{ github.event.pull_request.number }}/user/
+          RISE_DOCS_SWITCH_LABEL: User docs
         run: npm run build
 
       - name: Stage docs preview
