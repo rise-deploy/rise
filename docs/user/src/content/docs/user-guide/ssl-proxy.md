@@ -15,8 +15,8 @@ export SSL_CERT_FILE=/path/to/ca-bundle.crt
 # Set your proxy (Rise auto-detects these)
 export HTTPS_PROXY=http://proxy.corp.example:3128
 
-# Deploy with managed BuildKit (recommended for SSL support)
-rise deploy --managed-buildkit
+# Deploy normally
+rise deploy
 ```
 
 Rise will automatically inject the certificate into builds and transform proxy URLs for container environments.
