@@ -102,7 +102,7 @@ pub struct UpdateResourceMetadata {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ControllerStatusMap {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub controllers: BTreeMap<String, serde_json::Value>,
 }
 
@@ -117,7 +117,7 @@ pub struct OrganizationSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct OrganizationStatus {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub controllers: BTreeMap<String, serde_json::Value>,
 }
 
@@ -156,7 +156,7 @@ pub struct ResourceDefinitionVersion {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceDefinitionStatus {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub controllers: BTreeMap<String, serde_json::Value>,
 }
 
@@ -395,6 +395,37 @@ mod tests {
         let value = serde_json::to_value(resource).unwrap();
         assert_eq!(value["spec"], serde_json::json!({}));
         assert_eq!(value["status"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn skips_empty_controller_status_maps() {
+        let controller_status = serde_json::to_value(ControllerStatusMap::default()).unwrap();
+        let organization_status = serde_json::to_value(OrganizationStatus::default()).unwrap();
+        let resource_definition_status =
+            serde_json::to_value(ResourceDefinitionStatus::default()).unwrap();
+
+        assert_eq!(controller_status, serde_json::json!({}));
+        assert_eq!(organization_status, serde_json::json!({}));
+        assert_eq!(resource_definition_status, serde_json::json!({}));
+
+        let with_controller = OrganizationStatus {
+            controllers: BTreeMap::from([(
+                "controller.example.com".to_string(),
+                serde_json::json!({"ready": true}),
+            )]),
+        };
+
+        let value = serde_json::to_value(with_controller).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "controllers": {
+                    "controller.example.com": {
+                        "ready": true
+                    }
+                }
+            })
+        );
     }
 
     #[test]
