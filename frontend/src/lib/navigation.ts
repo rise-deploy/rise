@@ -9,13 +9,14 @@ function toPath(input: string): string {
 }
 
 export function usePathLocation(): string {
-  const resolved = toPath(window.location.pathname);
-  if (resolved !== window.location.pathname) {
-    window.history.replaceState({}, '', resolved);
-  }
-  const [path, setPath] = useState(resolved);
+  const [path, setPath] = useState(() => toPath(window.location.pathname));
 
   useEffect(() => {
+    const normalized = toPath(window.location.pathname);
+    if (normalized !== window.location.pathname) {
+      window.history.replaceState({}, '', normalized);
+    }
+
     const onChange = () => {
       const next = toPath(window.location.pathname);
       if (next !== window.location.pathname) {

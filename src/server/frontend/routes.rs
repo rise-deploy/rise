@@ -145,7 +145,7 @@ async fn load_docs_static_file(settings: &ServerSettings, rel: &str) -> Option<(
 }
 
 fn docs_cache_control(path: &str) -> HeaderValue {
-    if path.contains("/_astro/") || path.starts_with("_astro/") {
+    if path.starts_with("_astro/") {
         HeaderValue::from_static("public, max-age=31536000, immutable")
     } else {
         HeaderValue::from_static("no-cache")

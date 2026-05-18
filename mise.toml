@@ -116,21 +116,33 @@ description = "Verify the committed CRD YAML is up to date with the Rust definit
 run = "mise crd:generate && git --no-pager diff --exit-code -- helm/rise/crds/riseproject-crd.yaml"
 env.SQLX_OFFLINE = true
 
+[tasks."docs:install"]
+description = "Install user documentation dependencies."
+run = "cd docs/user && npm install"
+
 [tasks."docs:serve"]
 description = "Serve bundled user documentation with live reload on port 3001."
-run = "cd docs/user && npm install && npm run dev"
+depends = ["docs:install"]
+run = "cd docs/user && npm run dev"
 
 [tasks."docs:build"]
 description = "Build the bundled user documentation."
-run = "cd docs/user && npm install && npm run build"
+depends = ["docs:install"]
+run = "cd docs/user && npm run build"
+
+[tasks."docs:engineering:install"]
+description = "Install engineering documentation dependencies."
+run = "cd docs/engineering && npm install"
 
 [tasks."docs:engineering:serve"]
 description = "Serve engineering documentation with live reload on port 3002."
-run = "cd docs/engineering && npm install && npm run dev"
+depends = ["docs:engineering:install"]
+run = "cd docs/engineering && npm run dev"
 
 [tasks."docs:engineering:build"]
 description = "Build the engineering documentation."
-run = "cd docs/engineering && npm install && npm run build"
+depends = ["docs:engineering:install"]
+run = "cd docs/engineering && npm run build"
 
 [tasks."db:nuke"]
 description = "Drop and recreate the development database. USE WITH CAUTION."
