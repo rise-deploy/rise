@@ -1,0 +1,38 @@
+name: Validate Install
+
+# Runs after a release is published to verify the documented installation
+# method (mise + ubi) actually works with the released binary.
+on:
+  release:
+    types: [published]
+  # Allow manual re-runs if a release asset was re-uploaded
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to test (e.g. v0.21.1)"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate-mise-install:
+    name: Validate `mise use -g ubi:rise-deploy/rise`
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Install mise
+        uses: jdx/mise-action@v2
+        with:
+          install: false
+
+      - name: Install Rise CLI via mise/ubi
+        run: mise use -g ubi:rise-deploy/rise
+
+      - name: Verify binary is on PATH and reports a version
+        run: |
+          which rise
+          rise --version
