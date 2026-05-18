@@ -2,7 +2,6 @@ use axum::{
     body::{to_bytes, Body},
     extract::{Path, Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
-    middleware::Next,
     response::{Html, IntoResponse, Redirect, Response},
     routing::get,
     Router,
@@ -22,37 +21,9 @@ pub fn frontend_routes() -> Router<AppState> {
 
 pub fn docs_routes() -> Router<AppState> {
     Router::new()
-        .route("/docs", get(serve_docs_index))
+        .route("/docs", get(|| async { Redirect::permanent("/docs/") }))
         .route("/docs/", get(serve_docs_index))
         .route("/docs/{*path}", get(serve_docs_path))
-}
-
-pub(crate) async fn docs_auth_middleware(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    req: Request,
-    next: Next,
-) -> Response {
-    let requested = req
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_else(|| "/docs/".to_string());
-
-    match crate::server::auth::middleware::auth_middleware(State(state.clone()), headers, req, next)
-        .await
-    {
-        Ok(response) => response,
-        Err((StatusCode::UNAUTHORIZED, _)) => {
-            let redirect_to = format!(
-                "{}/api/v1/auth/signin/start?rd={}",
-                state.public_url.trim_end_matches('/'),
-                urlencoding::encode(&requested),
-            );
-            Redirect::temporary(&redirect_to).into_response()
-        }
-        Err((status, message)) => (status, message).into_response(),
-    }
 }
 
 async fn serve_index(State(state): State<AppState>) -> Response {

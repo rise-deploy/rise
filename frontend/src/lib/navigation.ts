@@ -14,13 +14,13 @@ export function usePathLocation(): string {
   useEffect(() => {
     const normalized = toPath(window.location.pathname);
     if (normalized !== window.location.pathname) {
-      window.history.replaceState({}, '', normalized);
+      window.history.replaceState({}, '', normalized + window.location.search + window.location.hash);
     }
 
     const onChange = () => {
       const next = toPath(window.location.pathname);
       if (next !== window.location.pathname) {
-        window.history.replaceState({}, '', next);
+        window.history.replaceState({}, '', next + window.location.search + window.location.hash);
       }
       setPath(next);
     };
