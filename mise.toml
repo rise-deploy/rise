@@ -118,31 +118,37 @@ env.SQLX_OFFLINE = true
 
 [tasks."docs:install"]
 description = "Install user documentation dependencies."
-run = "cd docs/user && npm install"
+dir = "docs/user"
+run = "npm install"
 
 [tasks."docs:serve"]
 description = "Serve bundled user documentation with live reload on port 3001."
 depends = ["docs:install"]
-run = "cd docs/user && npm run dev"
+dir = "docs/user"
+run = "npm run dev"
 
 [tasks."docs:build"]
 description = "Build the bundled user documentation."
 depends = ["docs:install"]
-run = "cd docs/user && npm run build"
+dir = "docs/user"
+run = "npm run build"
 
 [tasks."docs:engineering:install"]
 description = "Install engineering documentation dependencies."
-run = "cd docs/engineering && npm install"
+dir = "docs/engineering"
+run = "npm install"
 
 [tasks."docs:engineering:serve"]
 description = "Serve engineering documentation with live reload on port 3002."
 depends = ["docs:engineering:install"]
-run = "cd docs/engineering && npm run dev"
+dir = "docs/engineering"
+run = "npm run dev"
 
 [tasks."docs:engineering:build"]
 description = "Build the engineering documentation."
 depends = ["docs:engineering:install"]
-run = "cd docs/engineering && npm run build"
+dir = "docs/engineering"
+run = "npm run build"
 
 [tasks."db:nuke"]
 description = "Drop and recreate the development database. USE WITH CAUTION."
