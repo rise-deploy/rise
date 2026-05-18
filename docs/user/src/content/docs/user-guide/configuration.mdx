@@ -2,17 +2,17 @@
 title: "Project Configuration"
 ---
 
+import TomlSchemaHint from '../../../components/TomlSchemaHint.astro';
+
 Rise projects are configured through a `rise.toml` file in your project directory and through CLI flags.
 
 ## rise.toml
 
 The `rise.toml` file defines your project metadata and build settings. Both `rise.toml` and `.rise.toml` are supported — if both exist, `rise.toml` takes precedence (with a warning).
 
-A [JSON Schema](https://rise.example.com/api/v1/schema/rise-toml/v1) is available for editor auto-completion and validation. To enable it in editors that support the [Taplo](https://taplo.tamasfe.dev/) TOML language server, add this comment as the first line of your `rise.toml`:
+A [JSON Schema](/docs/schemas/rise-toml-v1.schema.json) is available for editor auto-completion and validation. To enable it in editors that support the [Taplo](https://taplo.tamasfe.dev/) TOML language server, add this comment as the first line of your `rise.toml`:
 
-```toml
-#:schema https://rise.example.com/api/v1/schema/rise-toml/v1
-```
+<TomlSchemaHint schema="/docs/schemas/rise-toml-v1.schema.json" />
 
 ### `[project]` Section
 
@@ -134,3 +134,7 @@ The CLI stores global configuration in `~/.config/rise/config.json`, including:
 - Managed BuildKit setting
 
 This file is created automatically on first `rise login`.
+
+## Backend Configuration Schema
+
+If you're operating a Rise deployment, a JSON Schema for backend configuration (`rise.yaml`) is available at [`backend-settings.schema.json`](/docs/schemas/backend-settings.schema.json). See the [Operator Configuration guide](/operator-docs/configuration/) for details.

@@ -120,6 +120,9 @@ jobs:
       - name: Verify backend config schema is up to date
         run: mise config:schema:check
 
+      - name: Verify rise.toml schema is up to date
+        run: mise rise-toml:schema:check
+
       - name: Verify CRDs are up to date
         run: mise crd:check
 
@@ -360,16 +363,10 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
-          cache-dependency-path: |
-            docs/user/package-lock.json
-            docs/engineering/package-lock.json
+          cache-dependency-path: docs/package-lock.json
 
-      - name: Install user docs dependencies
-        working-directory: docs/user
-        run: npm ci
-
-      - name: Install operator docs dependencies
-        working-directory: docs/engineering
+      - name: Install docs dependencies
+        working-directory: docs
         run: npm ci
 
       - name: Build user docs preview

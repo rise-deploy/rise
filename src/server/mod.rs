@@ -157,7 +157,7 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         .route("/version", axum::routing::get(version_info))
         .route(
             "/schema/rise-toml/v1",
-            axum::routing::get(rise_toml_schema_v1),
+            axum::routing::get(rise_toml_schema_v1_redirect),
         )
         .merge(auth::routes::public_routes());
 
@@ -348,9 +348,8 @@ async fn version_info() -> axum::Json<serde_json::Value> {
     }))
 }
 
-async fn rise_toml_schema_v1() -> axum::Json<serde_json::Value> {
-    let schema = schemars::schema_for!(crate::rise_toml::ProjectBuildConfig);
-    axum::Json(schema.to_value())
+async fn rise_toml_schema_v1_redirect() -> impl axum::response::IntoResponse {
+    axum::response::Redirect::permanent("/docs/schemas/rise-toml-v1.schema.json")
 }
 
 /// Wait for a shutdown signal (SIGTERM or SIGINT)

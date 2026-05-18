@@ -48,6 +48,14 @@ const platformUrl =
 				</nav>
 			)
 		}
+		<a
+			class="schema-link"
+			href={`${import.meta.env.BASE_URL.replace(/\/$/, '')}/schemas/rise-toml-v1.schema.json`}
+			title="rise.toml JSON Schema"
+			aria-label="rise.toml JSON Schema"
+		>
+			rise.toml Schema
+		</a>
 		<div class="sl-flex social-icons">
 			<SocialIcons />
 		</div>
@@ -115,6 +123,29 @@ const platformUrl =
 
 		.docs-nav-button:hover,
 		.docs-nav-button:focus-visible {
+			background: var(--sl-color-gray-5);
+			color: var(--sl-color-white);
+		}
+
+		.schema-link {
+			display: inline-flex;
+			align-items: center;
+			justify-content: center;
+			min-height: 2rem;
+			padding: 0 0.75rem;
+			color: var(--sl-color-gray-2);
+			font-size: var(--sl-text-sm);
+			font-weight: 600;
+			line-height: 1;
+			text-decoration: none;
+			white-space: nowrap;
+			border: 1px solid var(--sl-color-gray-5);
+			border-radius: 999rem;
+			background: var(--sl-color-gray-6);
+		}
+
+		.schema-link:hover,
+		.schema-link:focus-visible {
 			background: var(--sl-color-gray-5);
 			color: var(--sl-color-white);
 		}

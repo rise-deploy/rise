@@ -7,6 +7,7 @@ pb_data
 
 # Documentation build output
 /book
+docs/node_modules
 docs/*/node_modules
 docs/*/dist
 docs/*/.astro
