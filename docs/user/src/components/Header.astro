@@ -30,9 +30,21 @@ const platformUrl =
 		{
 			(selectorUrl || switchUrl || platformUrl) && (
 				<nav class="docs-nav" aria-label="Documentation navigation">
-					{selectorUrl && <a href={selectorUrl}>All docs</a>}
-					{switchUrl && <a href={switchUrl}>{switchLabel}</a>}
-					{platformUrl && <a href={platformUrl}>Back to Rise</a>}
+					{selectorUrl && (
+						<a class="docs-nav-button docs-nav-back" href={selectorUrl} aria-label="All docs">
+							&larr;
+						</a>
+					)}
+					{switchUrl && (
+						<a class="docs-nav-button docs-nav-switch" href={switchUrl}>
+							{switchLabel}
+						</a>
+					)}
+					{platformUrl && (
+						<a class="docs-nav-button" href={platformUrl}>
+							&larr; Back to Rise
+						</a>
+					)}
 				</nav>
 			)
 		}
@@ -72,17 +84,39 @@ const platformUrl =
 			display: flex;
 			font-size: var(--sl-text-sm);
 			white-space: nowrap;
+			gap: 0;
+			border: 1px solid var(--sl-color-gray-5);
+			border-radius: 999rem;
+			background: var(--sl-color-gray-6);
+			overflow: hidden;
 		}
 
-		.docs-nav a {
+		.docs-nav-button {
+			display: inline-flex;
+			align-items: center;
+			justify-content: center;
+			min-height: 2rem;
+			padding: 0 0.75rem;
 			color: var(--sl-color-gray-2);
+			font-weight: 600;
+			line-height: 1;
 			text-decoration: none;
 		}
 
-		.docs-nav a:hover,
-		.docs-nav a:focus-visible {
+		.docs-nav-button + .docs-nav-button {
+			border-inline-start: 1px solid var(--sl-color-gray-5);
+		}
+
+		.docs-nav-back {
+			min-width: 2.25rem;
+			padding: 0;
+			font-size: 1rem;
+		}
+
+		.docs-nav-button:hover,
+		.docs-nav-button:focus-visible {
+			background: var(--sl-color-gray-5);
 			color: var(--sl-color-white);
-			text-decoration: underline;
 		}
 
 		.social-icons::after {
