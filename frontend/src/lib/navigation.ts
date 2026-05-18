@@ -9,10 +9,20 @@ function toPath(input: string): string {
 }
 
 export function usePathLocation(): string {
-  const [path, setPath] = useState(toPath(window.location.pathname));
+  const resolved = toPath(window.location.pathname);
+  if (resolved !== window.location.pathname) {
+    window.history.replaceState({}, '', resolved);
+  }
+  const [path, setPath] = useState(resolved);
 
   useEffect(() => {
-    const onChange = () => setPath(toPath(window.location.pathname));
+    const onChange = () => {
+      const next = toPath(window.location.pathname);
+      if (next !== window.location.pathname) {
+        window.history.replaceState({}, '', next);
+      }
+      setPath(next);
+    };
     window.addEventListener('popstate', onChange);
     window.addEventListener('rise:navigate', onChange as EventListener);
     return () => {

@@ -8,14 +8,12 @@ import { Footer } from './components/ui';
 import { useToast } from './components/toast';
 import { PlatformAccessDenied } from './components/states';
 import { DeploymentDetail, EnvironmentDeploymentView } from './features/deployments';
-import { HomePage } from './features/home';
 import { ProjectsList, ProjectDetail } from './features/projects';
 import { ExtensionDetailPage } from './features/resources';
 import { TeamDetail, TeamsList } from './features/teams';
 import { CommandPalette } from './components/command-palette';
 
-function Sidebar({ currentView }) {
-    const isHomeActive = currentView === 'home';
+function Sidebar({ currentView, user, onLogout }) {
     const isProjectsActive = currentView === 'projects' || currentView === 'project-detail' || currentView === 'deployment-detail' || currentView === 'environment-deployment' || currentView === 'extension-detail';
     const isTeamsActive = currentView === 'teams' || currentView === 'team-detail';
 
@@ -38,19 +36,6 @@ function Sidebar({ currentView }) {
 
             <nav className="mono-nav" aria-label="Main">
                 <a
-                    href="/home"
-                    onClick={(e) => {
-                        e.preventDefault();
-                        navigate('/home');
-                    }}
-                    className={isHomeActive ? 'active' : ''}
-                >
-                    Home
-                </a>
-                <a href="/docs/">
-                    Docs
-                </a>
-                <a
                     href="/projects"
                     onClick={(e) => {
                         e.preventDefault();
@@ -58,6 +43,7 @@ function Sidebar({ currentView }) {
                     }}
                     className={isProjectsActive ? 'active' : ''}
                 >
+                    <span className="w-4 h-4 svg-mask inline-block flex-shrink-0" aria-hidden="true" style={{ maskImage: 'url(/assets/lightning.svg)', WebkitMaskImage: 'url(/assets/lightning.svg)' }}></span>
                     Projects
                 </a>
                 <a
@@ -68,35 +54,57 @@ function Sidebar({ currentView }) {
                     }}
                     className={isTeamsActive ? 'active' : ''}
                 >
+                    <span className="w-4 h-4 svg-mask inline-block flex-shrink-0" aria-hidden="true" style={{ maskImage: 'url(/assets/user.svg)', WebkitMaskImage: 'url(/assets/user.svg)' }}></span>
                     Teams
                 </a>
             </nav>
 
-            <div className="mono-shortcut-hint" aria-label="Command palette shortcut">
-                <span>Command palette</span>
-                <code>Ctrl/Cmd + K</code>
+            <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                <nav className="mono-nav" aria-label="Secondary">
+                    <a href="/docs/">
+                        <span className="w-4 h-4 svg-mask inline-block flex-shrink-0" aria-hidden="true" style={{ maskImage: 'url(/assets/file.svg)', WebkitMaskImage: 'url(/assets/file.svg)' }}></span>
+                        Docs
+                    </a>
+                    <div className="mono-nav-static" style={{ minWidth: 0 }}>
+                        <span
+                            className="w-4 h-4 svg-mask inline-block flex-shrink-0"
+                            aria-hidden="true"
+                            style={{
+                                maskImage: 'url(/assets/user.svg)',
+                                WebkitMaskImage: 'url(/assets/user.svg)',
+                            }}
+                        ></span>
+                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
+                            {user?.email}
+                        </span>
+                        <span className="mono-nav-vsep" aria-hidden="true"></span>
+                        <button
+                            onClick={onLogout}
+                            className="mono-icon-button"
+                            aria-label="Logout"
+                            title="Logout"
+                        >
+                            <span
+                                className="w-4 h-4 svg-mask inline-block"
+                                aria-hidden="true"
+                                style={{
+                                    maskImage: 'url(/assets/logout.svg)',
+                                    WebkitMaskImage: 'url(/assets/logout.svg)',
+                                }}
+                            ></span>
+                        </button>
+                    </div>
+                </nav>
+                <div className="mono-shortcut-hint" aria-label="Command palette shortcut">
+                    <span>Command palette</span>
+                    <code>Ctrl/Cmd + K</code>
+                </div>
             </div>
         </aside>
     );
 }
 
-function TopBar({ user, onLogout, breadcrumbs = [] }) {
-    const [isProfileOpen, setIsProfileOpen] = useState(false);
-    const profileRef = useRef(null);
-
-    useEffect(() => {
-        function handleClickOutside(event) {
-            if (profileRef.current && !profileRef.current.contains(event.target)) {
-                setIsProfileOpen(false);
-            }
-        }
-
-        if (isProfileOpen) {
-            document.addEventListener('mousedown', handleClickOutside);
-            return () => document.removeEventListener('mousedown', handleClickOutside);
-        }
-    }, [isProfileOpen]);
-
+function TopBar({ breadcrumbs = [] }) {
     return (
         <header className="mono-topbar">
             <div>
@@ -123,48 +131,6 @@ function TopBar({ user, onLogout, breadcrumbs = [] }) {
                             </span>
                         );
                     })}
-                </div>
-            </div>
-            <div className="mono-topbar-actions">
-                <div className="mono-profile" ref={profileRef}>
-                    <button
-                        onClick={() => setIsProfileOpen(!isProfileOpen)}
-                        className="mono-ghost-button"
-                        aria-label="Account"
-                        title="Account"
-                    >
-                        <span
-                            className="w-4 h-4 svg-mask inline-block"
-                            aria-hidden="true"
-                            style={{
-                                maskImage: 'url(/assets/user.svg)',
-                                WebkitMaskImage: 'url(/assets/user.svg)',
-                            }}
-                        ></span>
-                    </button>
-                    {isProfileOpen && (
-                        <div className="mono-popover">
-                            <p>{user?.email}</p>
-                            <button
-                                onClick={() => {
-                                    setIsProfileOpen(false);
-                                    onLogout();
-                                }}
-                            >
-                                <span className="inline-flex items-center gap-2">
-                                    <span
-                                        className="w-4 h-4 svg-mask inline-block"
-                                        aria-hidden="true"
-                                        style={{
-                                            maskImage: 'url(/assets/logout.svg)',
-                                            WebkitMaskImage: 'url(/assets/logout.svg)',
-                                        }}
-                                    ></span>
-                                    Logout
-                                </span>
-                            </button>
-                        </div>
-                    )}
                 </div>
             </div>
         </header>
@@ -414,8 +380,6 @@ export function App() {
         const parts = route.split('/');
         params.projectName = parts[1];
         params.deploymentId = parts[2];
-    } else if (route === 'home') {
-        view = 'home';
     } else if (route === 'teams') {
         view = 'teams';
     } else {
@@ -432,9 +396,7 @@ export function App() {
         access: 'Access',
     };
     const breadcrumbs =
-        view === 'home'
-            ? [{ label: 'Home' }]
-            : view === 'projects'
+        view === 'projects'
             ? [{ label: 'Projects' }]
             : view === 'teams'
             ? [{ label: 'Teams' }]
@@ -485,12 +447,6 @@ export function App() {
             label: 'Navigate: Projects',
             keywords: ['projects', 'navigation', 'list'],
             run: () => navigate('/projects'),
-        },
-        {
-            id: 'go-home',
-            label: 'Navigate: Home',
-            keywords: ['home', 'welcome', 'getting started'],
-            run: () => navigate('/home'),
         },
         {
             id: 'go-teams',
@@ -550,15 +506,10 @@ export function App() {
     return (
         <div className="mono-app">
             <div className="mono-shell">
-                <Sidebar currentView={view} />
+                <Sidebar currentView={view} user={user} onLogout={handleLogout} />
                 <div className="mono-main-shell">
-                    <TopBar
-                        user={user}
-                        onLogout={handleLogout}
-                        breadcrumbs={breadcrumbs}
-                    />
+                    <TopBar breadcrumbs={breadcrumbs} />
                     <main className="mono-main">
-                        {view === 'home' && <HomePage publicUrl={CONFIG?.backendUrl} version={version?.version} />}
                         {view === 'projects' && <ProjectsList openCreate={createIntent === 'project'} />}
                         {view === 'teams' && <TeamsList currentUser={user} openCreate={createIntent === 'team'} />}
                         {view === 'project-detail' && <ProjectDetail projectName={params.projectName} initialTab={params.tab} />}
