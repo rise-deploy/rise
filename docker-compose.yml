@@ -79,7 +79,7 @@ services:
   # Automatically configures itself and JFrog on startup.
   # Access: VAULT_ADDR=http://localhost:8200 VAULT_TOKEN=root
   vault:
-    image: hashicorp/vault:1.19
+    image: hashicorp/vault:1.21
     container_name: rise-vault
     restart: unless-stopped
     ports:
@@ -100,7 +100,7 @@ services:
   # Also serves as a Docker registry at localhost:3082 (repo: rise-docker-local).
   # Login: admin / password
   jfrog:
-    image: releases-docker.jfrog.io/jfrog/artifactory-jcr:7.117.21
+    image: releases-docker.jfrog.io/jfrog/artifactory-jcr:7.146.12
     container_name: rise-jfrog
     restart: unless-stopped
     ports:
