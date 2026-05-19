@@ -31,7 +31,11 @@ pub async fn get_deployment_registry_credentials(
 
     // Resolve auth for project scope
     let (user, is_sa) = auth
-        .resolve_for_project(&state.db_pool, &project)
+        .resolve_for_project(
+            &state.db_pool,
+            &project,
+            state.controllers_by_issuer.as_ref(),
+        )
         .await
         .map_err(|e| {
             if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {

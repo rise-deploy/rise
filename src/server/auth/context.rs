@@ -1,5 +1,8 @@
 use crate::db::models::User;
 use crate::db::service_accounts;
+use crate::server::auth::controller::{
+    match_controller_identity, ControllerIdentity, ControllerMatch,
+};
 use crate::server::auth::jwt::JwtValidator;
 use crate::server::error::{ServerError, ServerErrorExt};
 use crate::server::state::AppState;
@@ -57,10 +60,40 @@ impl AuthContext {
         &self,
         pool: &PgPool,
         project: &crate::db::models::Project,
+        controllers_by_issuer: &HashMap<String, Vec<ControllerIdentity>>,
     ) -> Result<(User, bool), ServerError> {
         match self {
             AuthContext::User(user) => Ok((user.clone(), false)),
             AuthContext::ExternalToken(token) => {
+                if let Some(controller_candidates) = controllers_by_issuer.get(&token.issuer) {
+                    match match_controller_identity(&token.claims, controller_candidates) {
+                        ControllerMatch::Single(ident) => {
+                            tracing::warn!(
+                                "Controller token {} from issuer '{}' attempted service-account auth for project '{}'",
+                                ident.id,
+                                token.issuer,
+                                project.name
+                            );
+                            return Err(ServerError::unauthorized(
+                                "Controller tokens cannot be used as service accounts",
+                            ));
+                        }
+                        ControllerMatch::Multiple(matched) => {
+                            let ids: Vec<&str> =
+                                matched.iter().map(|ident| ident.id.as_str()).collect();
+                            tracing::error!(
+                                "Multiple controller identities matched JWT from issuer '{}' during service-account auth: {:?}",
+                                token.issuer,
+                                ids
+                            );
+                            return Err(ServerError::conflict(
+                                "Token matched multiple controller identities; configuration is ambiguous",
+                            ));
+                        }
+                        ControllerMatch::None(_) => {}
+                    }
+                }
+
                 // Find service accounts for this project + issuer
                 let service_accounts =
                     service_accounts::find_by_project_and_issuer(pool, project.id, &token.issuer)
@@ -186,6 +219,10 @@ mod tests {
     use crate::db::{models::ProjectStatus, projects, service_accounts, users};
     use axum::http::StatusCode;
 
+    fn empty_controller_index() -> HashMap<String, Vec<ControllerIdentity>> {
+        HashMap::new()
+    }
+
     /// Helper: create a project and an external token auth context.
     async fn setup(
         pool: &PgPool,
@@ -224,7 +261,11 @@ mod tests {
 
         let (project, auth) = setup(&pool, "https://gitlab.com", &expected, token_claims).await;
 
-        let (user, is_sa) = auth.resolve_for_project(&pool, &project).await.unwrap();
+        let controllers_by_issuer = empty_controller_index();
+        let (user, is_sa) = auth
+            .resolve_for_project(&pool, &project, &controllers_by_issuer)
+            .await
+            .unwrap();
         assert!(is_sa);
         assert!(user.email.contains("test-project"));
     }
@@ -238,9 +279,83 @@ mod tests {
 
         let (project, auth) = setup(&pool, "https://gitlab.com", &expected, token_claims).await;
 
-        let err = auth.resolve_for_project(&pool, &project).await.unwrap_err();
+        let controllers_by_issuer = empty_controller_index();
+        let err = auth
+            .resolve_for_project(&pool, &project, &controllers_by_issuer)
+            .await
+            .unwrap_err();
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
         assert!(err.message.contains("do not match"));
+    }
+
+    #[sqlx::test]
+    async fn test_resolve_rejects_controller_token_before_sa_match(pool: PgPool) {
+        let mut expected = HashMap::new();
+        expected.insert("aud".to_string(), "rise-controller".to_string());
+        expected.insert("sub".to_string(), "deploy-bot".to_string());
+
+        let token_claims = serde_json::json!({
+            "aud": "rise-controller",
+            "sub": "deploy-bot",
+            "iss": "https://issuer.example.com"
+        });
+
+        let (project, auth) =
+            setup(&pool, "https://issuer.example.com", &expected, token_claims).await;
+        let controllers_by_issuer = HashMap::from([(
+            "https://issuer.example.com".to_string(),
+            vec![ControllerIdentity {
+                id: "controller.example.com".to_string(),
+                issuer: "https://issuer.example.com".to_string(),
+                claims: HashMap::from([
+                    ("aud".to_string(), "rise-controller".to_string()),
+                    ("sub".to_string(), "deploy-bot".to_string()),
+                ]),
+            }],
+        )]);
+
+        let err = auth
+            .resolve_for_project(&pool, &project, &controllers_by_issuer)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+        assert!(err.message.contains("Controller tokens cannot be used"));
+    }
+
+    #[sqlx::test]
+    async fn test_resolve_allows_same_issuer_different_audience_sa(pool: PgPool) {
+        let mut expected = HashMap::new();
+        expected.insert("aud".to_string(), "rise-service-account".to_string());
+        expected.insert("sub".to_string(), "deploy-bot".to_string());
+
+        let token_claims = serde_json::json!({
+            "aud": "rise-service-account",
+            "sub": "deploy-bot",
+            "iss": "https://issuer.example.com"
+        });
+
+        let (project, auth) =
+            setup(&pool, "https://issuer.example.com", &expected, token_claims).await;
+        let controllers_by_issuer = HashMap::from([(
+            "https://issuer.example.com".to_string(),
+            vec![ControllerIdentity {
+                id: "controller.example.com".to_string(),
+                issuer: "https://issuer.example.com".to_string(),
+                claims: HashMap::from([
+                    ("aud".to_string(), "rise-controller".to_string()),
+                    ("sub".to_string(), "deploy-bot".to_string()),
+                ]),
+            }],
+        )]);
+
+        let (user, is_sa) = auth
+            .resolve_for_project(&pool, &project, &controllers_by_issuer)
+            .await
+            .unwrap();
+
+        assert!(is_sa);
+        assert!(user.email.contains("test-project"));
     }
 
     #[sqlx::test]
@@ -255,7 +370,11 @@ mod tests {
             .await
             .unwrap();
 
-        let err = auth.resolve_for_project(&pool, &project).await.unwrap_err();
+        let controllers_by_issuer = empty_controller_index();
+        let err = auth
+            .resolve_for_project(&pool, &project, &controllers_by_issuer)
+            .await
+            .unwrap_err();
         assert_eq!(err.status, StatusCode::CONFLICT);
     }
 
@@ -290,7 +409,11 @@ mod tests {
             claims: serde_json::json!({"sub": "12345"}),
         });
 
-        let err = auth.resolve_for_project(&pool, &project).await.unwrap_err();
+        let controllers_by_issuer = empty_controller_index();
+        let err = auth
+            .resolve_for_project(&pool, &project, &controllers_by_issuer)
+            .await
+            .unwrap_err();
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(err.message.contains("Invalid service account claims"));
     }
@@ -311,7 +434,11 @@ mod tests {
         .unwrap();
 
         let auth = AuthContext::User(user.clone());
-        let (resolved_user, is_sa) = auth.resolve_for_project(&pool, &project).await.unwrap();
+        let controllers_by_issuer = empty_controller_index();
+        let (resolved_user, is_sa) = auth
+            .resolve_for_project(&pool, &project, &controllers_by_issuer)
+            .await
+            .unwrap();
         assert!(!is_sa);
         assert_eq!(resolved_user.id, user.id);
     }

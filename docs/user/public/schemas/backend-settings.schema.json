@@ -184,7 +184,8 @@
       },
       "required": [
         "id",
-        "issuer"
+        "issuer",
+        "claims"
       ],
       "type": "object"
     },

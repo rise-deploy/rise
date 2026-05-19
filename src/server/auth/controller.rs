@@ -17,6 +17,7 @@ use regex::Regex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::server::auth::context::VerifiedExternalToken;
 use crate::server::error::ServerError;
 use crate::server::state::AppState;
 
@@ -41,9 +42,9 @@ pub struct ControllerIdentity {
     pub claims: HashMap<String, String>,
 }
 
-/// A JWKS-validated controller token, injected into request extensions by
-/// `auth_middleware` after `JwtValidator::validate_token` succeeds AND the
-/// matching `ControllerIdentity`'s claim constraints are satisfied.
+/// A JWKS-validated controller token, produced by `ControllerAuthContext` after
+/// `auth_middleware` verifies the external JWT and the matching
+/// `ControllerIdentity`'s claim constraints are satisfied.
 ///
 /// `#[allow(dead_code)]` until the generic resource controller endpoints
 /// (a later PR) consume the fields.
@@ -68,14 +69,47 @@ impl FromRequestParts<AppState> for ControllerAuthContext {
 
     async fn from_request_parts(
         parts: &mut Parts,
-        _state: &AppState,
+        state: &AppState,
     ) -> std::result::Result<Self, Self::Rejection> {
-        parts
+        let token = parts
             .extensions
-            .get::<VerifiedControllerToken>()
+            .get::<VerifiedExternalToken>()
             .cloned()
-            .map(ControllerAuthContext)
-            .ok_or_else(|| ServerError::unauthorized("Controller authentication required"))
+            .ok_or_else(|| ServerError::unauthorized("Controller authentication required"))?;
+
+        let candidates = state
+            .controllers_by_issuer
+            .get(&token.issuer)
+            .ok_or_else(|| ServerError::unauthorized("Controller authentication required"))?;
+
+        match match_controller_identity(&token.claims, candidates) {
+            ControllerMatch::Single(ident) => Ok(ControllerAuthContext(VerifiedControllerToken {
+                identity_id: ident.id.clone(),
+                issuer: token.issuer,
+                claims: token.claims,
+            })),
+            ControllerMatch::None(detail) => {
+                tracing::warn!(
+                    "Controller JWT for issuer '{}' did not match any configured identity: {}",
+                    token.issuer,
+                    detail
+                );
+                Err(ServerError::unauthorized(
+                    "Token did not match any configured controller identity",
+                ))
+            }
+            ControllerMatch::Multiple(matched) => {
+                let ids: Vec<&str> = matched.iter().map(|i| i.id.as_str()).collect();
+                tracing::error!(
+                    "Multiple controller identities matched JWT from issuer '{}': {:?}",
+                    token.issuer,
+                    ids
+                );
+                Err(ServerError::conflict(
+                    "Token matched multiple controller identities; configuration is ambiguous",
+                ))
+            }
+        }
     }
 }
 

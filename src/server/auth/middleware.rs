@@ -10,7 +10,6 @@ use serde::Deserialize;
 
 use crate::db::{service_accounts, users, User};
 use crate::server::auth::context::VerifiedExternalToken;
-use crate::server::auth::controller::VerifiedControllerToken;
 use crate::server::auth::cookie_helpers;
 use crate::server::state::AppState;
 
@@ -171,70 +170,6 @@ pub async fn auth_middleware(
 
         tracing::debug!("User authenticated: {} ({})", user.email, user.id);
         req.extensions_mut().insert(user);
-    } else if let Some(controller_candidates) = state.controllers_by_issuer.get(&issuer).cloned() {
-        // External issuer matches at least one configured controller identity.
-        // Controller identities take precedence over service-account issuers
-        // when the same `iss` is reused: we fail closed here rather than
-        // falling back to the SA path, so a misconfigured controller token
-        // can't be silently downgraded to an SA principal.
-        tracing::debug!(
-            "Auth middleware: external JWT from controller issuer '{}', {} candidate identity(ies)",
-            issuer,
-            controller_candidates.len()
-        );
-
-        let claims = state
-            .jwt_validator
-            .validate_token(&token, &issuer)
-            .await
-            .map_err(|e| {
-                tracing::warn!(
-                    "Auth middleware: controller JWT JWKS validation failed for issuer '{}': {:#}",
-                    issuer,
-                    e
-                );
-                (StatusCode::UNAUTHORIZED, format!("Invalid token: {}", e))
-            })?;
-
-        use crate::server::auth::controller::{match_controller_identity, ControllerMatch};
-        match match_controller_identity(&claims, &controller_candidates) {
-            ControllerMatch::Single(ident) => {
-                tracing::info!(
-                    "Controller authenticated: identity_id={}, issuer={}",
-                    ident.id,
-                    issuer
-                );
-                req.extensions_mut().insert(VerifiedControllerToken {
-                    identity_id: ident.id.clone(),
-                    issuer: issuer.clone(),
-                    claims,
-                });
-            }
-            ControllerMatch::None(detail) => {
-                tracing::warn!(
-                    "Controller JWT for issuer '{}' did not match any configured identity: {}",
-                    issuer,
-                    detail
-                );
-                return Err((
-                    StatusCode::UNAUTHORIZED,
-                    "Token did not match any configured controller identity".to_string(),
-                ));
-            }
-            ControllerMatch::Multiple(matched) => {
-                let ids: Vec<&str> = matched.iter().map(|i| i.id.as_str()).collect();
-                tracing::error!(
-                    "Multiple controller identities matched JWT from issuer '{}': {:?}",
-                    issuer,
-                    ids
-                );
-                return Err((
-                    StatusCode::CONFLICT,
-                    "Token matched multiple controller identities; configuration is ambiguous"
-                        .to_string(),
-                ));
-            }
-        }
     } else {
         // External issuer — phase 1: JWKS validation only
         tracing::debug!(
@@ -242,22 +177,31 @@ pub async fn auth_middleware(
             issuer
         );
 
-        // Lightweight guard: skip JWKS fetch if no SA uses this issuer
-        let exists = service_accounts::issuer_exists(&state.db_pool, &issuer)
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to check issuer existence: {:#}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Database error".to_string(),
-                )
-            })?;
+        // Lightweight guard: skip JWKS fetch if no controller or SA uses this issuer.
+        let controller_issuer_exists = state.controllers_by_issuer.contains_key(&issuer);
+        let service_account_issuer_exists = if controller_issuer_exists {
+            false
+        } else {
+            service_accounts::issuer_exists(&state.db_pool, &issuer)
+                .await
+                .map_err(|e| {
+                    tracing::error!("Failed to check issuer existence: {:#}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Database error".to_string(),
+                    )
+                })?
+        };
 
-        if !exists {
-            tracing::warn!("No service accounts configured for issuer: {}", issuer);
+        if !service_account_issuer_exists && !controller_issuer_exists {
+            tracing::warn!(
+                "No service accounts or controller identities configured for issuer: {}",
+                issuer
+            );
             return Err((
                 StatusCode::UNAUTHORIZED,
-                "No service accounts configured for this issuer".to_string(),
+                "No service accounts or controller identities configured for this issuer"
+                    .to_string(),
             ));
         }
 
@@ -280,7 +224,8 @@ pub async fn auth_middleware(
             issuer
         );
 
-        // Store the verified token for phase 2 (handler-level claim validation)
+        // Store the verified token for route-specific controller extraction or
+        // project-scoped service-account claim validation.
         req.extensions_mut().insert(VerifiedExternalToken {
             issuer: issuer.clone(),
             claims,
@@ -347,13 +292,6 @@ pub async fn platform_access_middleware(
     // Their access is validated per-project in phase 2.
     if req.extensions().get::<VerifiedExternalToken>().is_some() {
         tracing::debug!("Skipping platform access check for external token (service account)");
-        return Ok(next.run(req).await);
-    }
-
-    // Controller tokens bypass platform access checks; controller endpoints
-    // perform their own authorization based on `identity_id`.
-    if req.extensions().get::<VerifiedControllerToken>().is_some() {
-        tracing::debug!("Skipping platform access check for controller token");
         return Ok(next.run(req).await);
     }
 
