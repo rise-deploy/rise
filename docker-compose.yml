@@ -78,7 +78,9 @@ services:
   # HashiCorp Vault with JFrog Artifactory secrets plugin.
   # Automatically configures itself and JFrog on startup.
   # Access: VAULT_ADDR=http://localhost:8200 VAULT_TOKEN=root
+  # Start locally with: docker compose --profile jfrog-vault up -d jfrog vault
   vault:
+    profiles: ["jfrog-vault"]
     image: hashicorp/vault:1.21
     container_name: rise-vault
     restart: unless-stopped
@@ -99,7 +101,9 @@ services:
   # JFrog Artifactory JCR for testing the JFrog repository controller.
   # Also serves as a Docker registry at localhost:3082 (repo: rise-docker-local).
   # Login: admin / password
+  # Start locally with: docker compose --profile jfrog-vault up -d jfrog vault
   jfrog:
+    profiles: ["jfrog-vault"]
     image: releases-docker.jfrog.io/jfrog/artifactory-jcr:7.146.12
     container_name: rise-jfrog
     restart: unless-stopped

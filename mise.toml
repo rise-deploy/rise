@@ -79,17 +79,19 @@ mise run backend:run
 
 [tasks."sqlx:prepare"]
 description = "Prepare the SQLX query cache that needs to be committed for building with SQLX_OFFLINE=true."
-run = "cargo sqlx prepare -- --features cli,backend --all-targets"
+run = "cargo sqlx prepare -- --package rise-deploy --features cli,backend --all-targets"
 
 [tasks."sqlx:check"]
 description = "Check that all SQLX queries are valid."
-run = "cargo sqlx prepare --check -- --features cli,backend --all-targets"
+run = "cargo sqlx prepare --check -- --package rise-deploy --features cli,backend --all-targets"
 
 [tasks.lint]
 description = "Run all linting checks (clippy, formatting, sqlx, helm)."
 run = """
 cargo all-features check --all-targets
+cargo check --package rise-resource-api --all-targets
 cargo all-features clippy --all-targets -- -D warnings
+cargo clippy --package rise-resource-api --all-targets -- -D warnings
 cargo fmt --all -- --check
 mise sqlx:check
 helm lint helm/rise
@@ -98,7 +100,7 @@ env.SQLX_OFFLINE = true
 
 [tasks."config:schema:generate"]
 description = "Generate the backend settings JSON schema."
-run = "cargo run --features cli,backend -- backend config-schema > docs/user/public/schemas/backend-settings.schema.json"
+run = "cargo run --package rise-deploy --features cli,backend -- backend config-schema > docs/user/public/schemas/backend-settings.schema.json"
 env.SQLX_OFFLINE = true
 
 [tasks."config:schema:check"]
@@ -108,7 +110,7 @@ env.SQLX_OFFLINE = true
 
 [tasks."rise-toml:schema:generate"]
 description = "Generate the rise.toml JSON schema."
-run = "cargo run --features cli,backend -- backend rise-toml-schema > docs/user/public/schemas/rise-toml-v1.schema.json"
+run = "cargo run --package rise-deploy --features cli,backend -- backend rise-toml-schema > docs/user/public/schemas/rise-toml-v1.schema.json"
 env.SQLX_OFFLINE = true
 
 [tasks."rise-toml:schema:check"]
@@ -118,7 +120,7 @@ env.SQLX_OFFLINE = true
 
 [tasks."crd:generate"]
 description = "Generate the RiseProject CRD YAML for the Helm chart."
-run = "cargo run --features cli,backend -- backend crd-schema > helm/rise/crds/riseproject-crd.yaml"
+run = "cargo run --package rise-deploy --features cli,backend -- backend crd-schema > helm/rise/crds/riseproject-crd.yaml"
 env.SQLX_OFFLINE = true
 
 [tasks."crd:check"]

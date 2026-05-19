@@ -1,5 +1,6 @@
 [workspace]
 members = ["cargo:."]
+default-members = ["cargo:."]
 
 # Config for 'dist'
 [dist]
