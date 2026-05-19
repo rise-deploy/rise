@@ -101,13 +101,17 @@ Backend startup migration order:
   - `deletionTimestamp`
 - Standard status defaults to `{}`; the `controllers` key is optional and populated only when a controller first writes its status update. Resources with no controllers have `status: {}` as a valid state.
 - Treat SQL identity columns as canonical. The API must reject client-supplied identity metadata (`uid`, `revision`, `discriminator`, `deletionTimestamp`) on create/update/status paths.
-- Delete behavior:
-  - if child resources exist: reject parent deletion with a conflict
-  - no finalizers and no children: delete row
-  - finalizers present: set `deletionTimestamp`
-  - controllers remove their finalizers after cleanup
-  - do not use `ON DELETE CASCADE` for resource parent/child cleanup because it would bypass child finalizers
-  - additionally block deletion of an Organization that has typed children (teams or projects linked via `organization_resource_uid`); those rows are not `resources` table children so the generic child-detection check does not cover them — this guard must be explicit at the application layer
+- Delete behavior (Kubernetes-style cascade via finalizers):
+  - `delete` accepts a propagation policy: `Cascade` (default) or `Orphan`. The store collapses Kubernetes' Foreground/Background distinction into a single `Cascade` mode — tombstones are always visible, so client-observable ordering and server-side gating are the same mechanism.
+  - `Cascade`: stamp `deletionTimestamp` on the target; if children exist, append a `system.rise.dev/cascade-deletion` system finalizer and stamp `deletionTimestamp` on **immediate children only** in the same transaction. A background GC worker fans out down the tree as each subtree's controllers drain their finalizers. The parent is hard-deleted only once all children are gone and finalizers are clear.
+  - `Orphan`: detach children in the same transaction (`UPDATE resources SET parent_uid = NULL WHERE parent_uid = $1`), then proceed with normal mark/hard-delete on the parent. Admin-only — gated at the API layer, not in the store.
+  - no finalizers and no children: hard-delete the row immediately
+  - finalizers present: set `deletionTimestamp` and wait for finalizers to clear
+  - controllers remove their controller-scoped finalizers after cleanup; the `system.rise.dev/*` prefix is reserved for store-internal finalizers and is rejected by `update_controller_finalizers` regardless of `controller_id`
+  - GC sweep operates via `try_collect(uid)` (hard-deletes a tombstoned row when collectable, else stamps the next layer of children) and `list_pending_collection()` (enumerates candidates)
+  - do not use `ON DELETE CASCADE` for resource parent/child cleanup because it would bypass child finalizers; the cascade-stamping + GC sweep is the substitute
+  - tombstoned rows (with `deletionTimestamp` set) remain visible from `get`, `list`, `resolve_path`, and the HTTP API by default; filtering them out is opt-in via an explicit query param (deferred until a concrete use case appears)
+  - additionally block deletion of an Organization that has typed children (teams or projects linked via `organization_resource_uid`); those rows are not `resources` table children so the generic child-detection check does not cover them — this guard must be explicit at the application layer until those typed APIs migrate to the generic resource model
 
 ## Built-In Resources
 
@@ -178,6 +182,11 @@ Backend startup migration order:
   - `GET /api/v1/resources/organizations/{org}/{collection}/{name}`
   - `PUT /api/v1/resources/organizations/{org}/{collection}/{name}`
   - `DELETE /api/v1/resources/organizations/{org}/{collection}/{name}`
+- Path grammar is uniform `<kind>/<identifier>` per segment. The identifier is either a name or a UID-prefixed token (`uid:<uuid>`), e.g. `/api/v1/resources/organizations/acme/projects/uid:a1b2c3d4-...`. The kind is always present, so response shape is statically determinable from the URL and the store can verify that the UID's row actually has the expected kind (mismatches return 404). The HTTP layer resolves the path through the store's `resolve_path(&[PathSegment])` in a single round-trip.
+- `DELETE` accepts a `propagationPolicy` query parameter (`Cascade` default, `Orphan` admin-only).
+- Break-glass / discovery endpoints:
+  - `GET /api/v1/resources/orphans` — children of tombstoned parents (`list_orphans`)
+  - `POST /api/v1/resources/{collection}/{name}/reparent` — atomic move to a new parent, admin-only; rejects cycles and uniqueness conflicts at the destination
 - Route `{collection}` through the resource registry:
   - built-in registrations first
   - external ResourceDefinitions second
@@ -344,7 +353,14 @@ Backend startup migration order:
   - PUT without `metadata.revision` is rejected
   - revision increments
   - finalizer deletion flow
-  - parent deletion with children is rejected
+  - `Cascade` delete stamps `deletionTimestamp` on parent and immediate children and injects `system.rise.dev/cascade-deletion` on the parent
+  - `try_collect` hard-deletes a tombstoned row only when finalizers are clear AND no children remain; otherwise stamps the next layer of children
+  - cascade subtree drains bottom-up via repeated `try_collect` as controllers shed their finalizers
+  - `Orphan` delete detaches children (`parent_uid = NULL`) and then proceeds with normal mark/hard-delete on the parent
+  - controllers cannot add or remove `system.rise.dev/*` finalizers via `update_controller_finalizers`
+  - `resolve_path` walks `Name` and `Uid` segments, returns the full ancestor chain (including tombstoned rows), and rejects kind mismatches on UID segments
+  - `list_orphans` returns children of tombstoned parents, optionally scoped under a subtree
+  - `reparent` moves a resource, rejects cycles, and surfaces destination uniqueness conflicts as `NameConflict`
   - Organization with linked teams or projects (via `organization_resource_uid`) is blocked from deletion at the application layer
 - Built-ins:
   - Organization validation via Rust structs
@@ -421,10 +437,21 @@ Deliver in the following order. PRs 1–4 avoid existing data model changes, but
 
 **PR 4 — Generic HTTP API**
 - Routes under `/api/v1/resources` (root and organization-scoped)
+- Uniform `<kind>/<identifier>` path grammar with `uid:` token support; backed by store's `resolve_path`
 - Resource registry: built-in resolution first, external ResourceDefinitions second
 - Request body validation, operator-only enforcement, controller status/finalizer endpoints
+- `DELETE` accepts `propagationPolicy` (`Cascade`|`Orphan`); `Orphan` rejected for non-admin callers at the handler layer
+- Break-glass endpoints: `GET /api/v1/resources/orphans`, `POST .../{name}/reparent` (admin-only)
+- Audit logging for `Orphan` propagation and reparent operations
 - Purely additive — no existing routes change
 - Depends on: PR 2, PR 3
+
+**PR 4b — Resource GC worker**
+- Background task that periodically polls `list_pending_collection()` and drives `try_collect()` per row
+- Fans cascade down the tree as each subtree's controllers shed their finalizers
+- Until this lands, cascade-marked subtrees do not actually drain
+- Quota / fan-out rate limits and observability (metrics for backlog, time-to-collect, stuck finalizers) belong here
+- Depends on: PR 2
 
 **PR 5 — Multi-org linkage, bootstrap, and controller**
 - Root migrations: nullable `organization_resource_uid` on users, teams, projects (two-phase: add nullable, backfill, constrain later)
@@ -451,3 +478,8 @@ Deliver in the following order. PRs 1–4 avoid existing data model changes, but
 - Normal generic resource CRUD is operator-only in v1; controller JWTs may use controller-specific status/finalizer operations.
 - `auth.admin_users` are org-level admins within the default Organization only; they do not receive Operator access and cannot manage Organization resources.
 - Organization-level admins/users will be modeled later and will eventually replace current platform-level access concepts.
+- Cascade delete propagation is the default; `Orphan` is an admin-only break-glass operation. Reparent is the supported way to relocate a resource without going through orphaning.
+- Tombstoned rows are always visible to the API; controllers and operators rely on observing in-progress teardown to do their work. An `exclude_deleted` filter can be added later when there is a concrete need.
+- Reparent permission model (owner-of-source, owner-of-destination, both, admin-only) is deferred to the API layer and will be decided when reparent is exposed.
+- Orphaning a child whose kind also exists at root with the same name will fail with a `NameConflict` via the partial unique index `resources_root_kind_name_unique`; remediation (force-rename on orphan, etc.) is an API-layer policy decision and is out of scope for the store.
+- Recursive-CTE optimization for `resolve_path` is deferred; the initial implementation is a per-segment loop in a single transaction, which is fine for typical hierarchy depths.
