@@ -15,6 +15,17 @@ pub fn is_admin_user(admin_users: &[String], user_email: &str) -> bool {
         .any(|admin| admin.eq_ignore_ascii_case(user_email))
 }
 
+/// Check if a user has the Operator role (case-insensitive email match).
+///
+/// Operators are a separate role from admins: admins do NOT implicitly receive
+/// Operator access. List the email in both `auth.admin_users` and
+/// `auth.operator_users` if a user needs both.
+pub fn is_operator_user(operator_users: &[String], user_email: &str) -> bool {
+    operator_users
+        .iter()
+        .any(|op| op.eq_ignore_ascii_case(user_email))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -44,5 +55,25 @@ mod tests {
     fn test_is_admin_user_empty_list() {
         let admin_users: Vec<String> = vec![];
         assert!(!is_admin_user(&admin_users, "admin@example.com"));
+    }
+
+    #[test]
+    fn test_is_operator_user_case_insensitive() {
+        let operator_users = vec!["Ops@Example.Com".to_string(), "second@test.org".to_string()];
+
+        assert!(is_operator_user(&operator_users, "Ops@Example.Com"));
+        assert!(is_operator_user(&operator_users, "ops@example.com"));
+        assert!(is_operator_user(&operator_users, "OPS@EXAMPLE.COM"));
+        assert!(is_operator_user(&operator_users, "second@test.org"));
+        assert!(is_operator_user(&operator_users, "SECOND@TEST.ORG"));
+
+        assert!(!is_operator_user(&operator_users, "other@example.com"));
+        assert!(!is_operator_user(&operator_users, ""));
+    }
+
+    #[test]
+    fn test_is_operator_user_empty_list() {
+        let operator_users: Vec<String> = vec![];
+        assert!(!is_operator_user(&operator_users, "ops@example.com"));
     }
 }

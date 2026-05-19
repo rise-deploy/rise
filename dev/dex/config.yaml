@@ -37,6 +37,11 @@ staticPasswords:
   username: user
   userID: a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d
 
+- email: ops@example.com
+  hash: $2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W  # password
+  username: ops
+  userID: b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e
+
 oauth2:
   skipApprovalScreen: true
   passwordConnector: local

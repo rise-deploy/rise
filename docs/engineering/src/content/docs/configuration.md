@@ -192,13 +192,35 @@ server:
 
 ```yaml
 auth:
-  issuer: "http://..."         # OIDC issuer URL
-  client_id: "rise-backend"   # OAuth2 client ID
-  client_secret: "..."        # OAuth2 client secret
-  admin_users: ["email@..."]  # Admin user emails (array)
-  allow_team_creation: true   # Allow regular users to create teams (default: true)
-                              # When false, only admins can create teams
+  issuer: "http://..."          # OIDC issuer URL
+  client_id: "rise-backend"     # OAuth2 client ID
+  client_secret: "..."          # OAuth2 client secret
+  admin_users: ["email@..."]    # Default-organization admin emails (array)
+  operator_users: ["ops@..."]   # Operator role allowlist (array, optional)
+  controllers: []               # Trusted external controller identities (array, optional)
+  allow_team_creation: true     # Allow regular users to create teams (default: true)
+                                # When false, only admins can create teams
 ```
+
+**Roles:**
+- `admin_users`: Admins of the default organization. Admins do **not** implicitly receive the Operator role.
+- `operator_users`: Operators have full access to generic resource storage and built-in resource management. Operators do **not** implicitly receive platform (typed CLI/UI) access — list the email in `admin_users` or `platform_access.allowed_user_emails` separately if both are needed.
+
+**Controllers (`auth.controllers`):**
+Trusted external controllers authenticate to Rise with OIDC JWTs. Each entry registers a `ControllerIdentity` that controller endpoints use to validate incoming tokens. Controller endpoints are not yet available; this configuration takes effect when the generic resource API is introduced in a future release. Use a dedicated issuer or a dedicated audience per controller to keep identities unambiguous.
+
+```yaml
+auth:
+  controllers:
+    - id: "controller.example.com/my-ctrl"  # DNS subdomain + optional /name suffix
+      issuer: "https://controller-idp.example.com"
+      claims:                                # required; wildcard match per claim
+        aud: "rise-controller"               # required; string or array JWT `aud` may match
+        sub: "my-controller-*"               # optional subject constraint
+        scope: "controller"
+```
+
+`claims.aud` is required for every controller identity. Other constraints, including `sub`, are configured in `claims`. Controller endpoints require a token that matches one configured controller identity. Service-account endpoints still use project-scoped service-account claims; a token that matches a configured controller identity is rejected as a service-account token.
 
 **Team Creation Control:**
 - `allow_team_creation = true` (default): All authenticated users can create teams

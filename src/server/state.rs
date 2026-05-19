@@ -10,6 +10,7 @@ use crate::server::registry::{
     models::OciClientAuthConfig, providers::OciClientAuthProvider, RegistryProvider,
 };
 
+use crate::server::auth::controller::ControllerIdentity;
 #[cfg(feature = "backend")]
 use crate::server::registry::{
     models::{EcrConfig, GitLabRegistryConfig, JfrogConfig, JfrogTokenProvider},
@@ -21,6 +22,7 @@ use crate::server::settings::{
 use anyhow::{Context, Result};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,6 +47,14 @@ pub struct AppState {
     pub registry_provider: Arc<dyn RegistryProvider>,
     pub oci_client: Arc<crate::server::oci::OciClient>,
     pub admin_users: Arc<Vec<String>>,
+    /// Operator role allowlist (case-insensitive email match).
+    pub operator_users: Arc<Vec<String>>,
+    /// Controller identities keyed by `id`. Consumed by future generic
+    /// resource endpoints; unused in PR3.
+    #[allow(dead_code)]
+    pub controllers: Arc<HashMap<String, ControllerIdentity>>,
+    /// Controller identities indexed by issuer URL for middleware lookup.
+    pub controllers_by_issuer: Arc<HashMap<String, Vec<ControllerIdentity>>>,
     pub auth_settings: Arc<AuthSettings>,
     pub server_settings: Arc<ServerSettings>,
     pub token_store: Arc<dyn TokenStore>,
@@ -201,6 +211,14 @@ impl AppState {
     /// Check if a user is an admin (case-insensitive email match)
     pub fn is_admin(&self, user_email: &str) -> bool {
         crate::server::auth::admin::is_admin_user(&self.admin_users, user_email)
+    }
+
+    /// Check if a user has the Operator role (case-insensitive email match).
+    ///
+    /// Operators are a separate role from admins. Use this for access checks
+    /// on generic-resource APIs once they're wired up.
+    pub fn is_operator(&self, user_email: &str) -> bool {
+        crate::server::auth::admin::is_operator_user(&self.operator_users, user_email)
     }
 
     /// Run database migrations
@@ -488,6 +506,27 @@ impl AppState {
         let admin_users = Arc::new(settings.auth.admin_users.clone());
         if !admin_users.is_empty() {
             tracing::info!("Configured {} admin user(s)", admin_users.len());
+        }
+
+        // Store operator users list (separate role from admin)
+        let operator_users = Arc::new(settings.auth.operator_users.clone());
+        if !operator_users.is_empty() {
+            tracing::info!("Configured {} operator user(s)", operator_users.len());
+        }
+
+        // Validate and index configured controller identities
+        let controller_indexes =
+            crate::server::auth::controller::build_controller_indexes(&settings.auth.controllers)
+                .context("Failed to load controller identities from auth.controllers")?;
+        let controllers = Arc::new(controller_indexes.by_id);
+        let controllers_by_issuer = Arc::new(controller_indexes.by_issuer);
+        if !controllers.is_empty() {
+            let ids: Vec<&str> = controllers.keys().map(String::as_str).collect();
+            tracing::info!(
+                "Configured {} controller identity(ies): {:?}",
+                controllers.len(),
+                ids
+            );
         }
 
         // Store auth settings for issuer comparison
@@ -990,6 +1029,9 @@ impl AppState {
             registry_provider,
             oci_client,
             admin_users,
+            operator_users,
+            controllers,
+            controllers_by_issuer,
             auth_settings,
             server_settings,
             token_store,

@@ -639,6 +639,7 @@ pub struct MeResponse {
     pub id: String,
     pub email: String,
     pub is_admin: bool,
+    pub is_operator: bool,
     pub can_create_teams: bool,
 }
 
@@ -652,11 +653,13 @@ pub async fn me(
     // User is injected by auth middleware
     tracing::debug!("GET /me: user_id={}, email={}", user.id, user.email);
     let is_admin = state.is_admin(&user.email);
+    let is_operator = state.is_operator(&user.email);
     let can_create_teams = is_admin || state.auth_settings.allow_team_creation;
     Ok(Json(MeResponse {
         id: user.id.to_string(),
         email: user.email.clone(),
         is_admin,
+        is_operator,
         can_create_teams,
     }))
 }

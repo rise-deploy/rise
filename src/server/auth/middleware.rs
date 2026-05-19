@@ -177,23 +177,31 @@ pub async fn auth_middleware(
             issuer
         );
 
-        // Lightweight guard: skip JWKS fetch if no SA uses this issuer
-        let exists = service_accounts::issuer_exists(&state.db_pool, &issuer)
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to check issuer existence: {:#}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Database error".to_string(),
-                )
-            })?;
-
-        if !exists {
-            tracing::warn!("No service accounts configured for issuer: {}", issuer);
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                "No service accounts configured for this issuer".to_string(),
-            ));
+        // Lightweight guard: skip JWKS fetch if neither a controller nor any SA
+        // uses this issuer. Controller issuers are in static config (O(1));
+        // SA issuers require a DB round-trip and are only checked when the
+        // issuer isn't already a known controller issuer.
+        if !state.controllers_by_issuer.contains_key(&issuer) {
+            let sa_issuer_exists = service_accounts::issuer_exists(&state.db_pool, &issuer)
+                .await
+                .map_err(|e| {
+                    tracing::error!("Failed to check issuer existence: {:#}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Database error".to_string(),
+                    )
+                })?;
+            if !sa_issuer_exists {
+                tracing::warn!(
+                    "No service accounts or controller identities configured for issuer: {}",
+                    issuer
+                );
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    "No service accounts or controller identities configured for this issuer"
+                        .to_string(),
+                ));
+            }
         }
 
         // Validate signature + expiry via JWKS (no custom claim validation)
@@ -215,7 +223,8 @@ pub async fn auth_middleware(
             issuer
         );
 
-        // Store the verified token for phase 2 (handler-level claim validation)
+        // Store the verified token for route-specific controller extraction or
+        // project-scoped service-account claim validation.
         req.extensions_mut().insert(VerifiedExternalToken {
             issuer: issuer.clone(),
             claims,

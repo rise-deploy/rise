@@ -286,7 +286,7 @@ impl JwtValidator {
     ///
     /// Note: Consecutive wildcards (e.g., `app**prod`) are treated as a single wildcard
     /// due to split() creating empty parts, which always match.
-    fn matches_wildcard_pattern(pattern: &str, text: &str) -> bool {
+    pub(crate) fn matches_wildcard_pattern(pattern: &str, text: &str) -> bool {
         // Split pattern by '*' to get literal parts
         let parts: Vec<&str> = pattern.split('*').collect();
 
