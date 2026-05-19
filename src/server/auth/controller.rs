@@ -23,9 +23,8 @@ use crate::server::state::AppState;
 /// A trusted external controller identity configured under `auth.controllers`.
 ///
 /// Each entry binds a stable controller ID (the key used under
-/// `status.controllers`) to an OIDC issuer plus optional claim constraints
-/// (`audience`, `subject`, free-form `claims`). Wildcards in
-/// `audience`/`subject`/`claims` follow `JwtValidator::validate_custom_claims`
+/// `status.controllers`) to an OIDC issuer plus required claim constraints.
+/// `claims.aud` is mandatory. Wildcards follow `JwtValidator::validate_custom_claims`
 /// glob rules (`*` matches any sequence of characters).
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct ControllerIdentity {
@@ -35,16 +34,9 @@ pub struct ControllerIdentity {
     pub id: String,
     /// OIDC issuer URL. Used for JWKS discovery and `iss` validation.
     pub issuer: String,
-    /// Expected `aud` claim. Per RFC 7519 the JWT `aud` may be either a
-    /// string or an array of strings — the match succeeds when the expected
-    /// value equals the string `aud`, or when it appears in the `aud` array.
-    /// Glob `*` supported.
-    #[serde(default)]
-    pub audience: Option<String>,
-    /// Expected `sub` claim. Glob `*` supported.
-    #[serde(default)]
-    pub subject: Option<String>,
-    /// Additional string-valued claim constraints. Glob `*` supported.
+    /// Expected string-valued claim constraints. `aud` is required and may
+    /// match either a string JWT `aud` or one member of an array JWT `aud`.
+    /// Put `sub` here when a subject constraint is needed. Glob `*` supported.
     #[serde(default)]
     pub claims: HashMap<String, String>,
 }
@@ -189,13 +181,9 @@ fn audience_matches(claim: &serde_json::Value, expected: &str) -> bool {
 /// without spinning up JWKS. Caller is responsible for verifying that the
 /// JWT signature and `iss` are correct before invoking.
 ///
-/// Each identity's constraints are applied as follows:
-/// - `audience`: matched against the JWT `aud` claim, accepting either a
-///   string or an array of strings (RFC 7519 §4.1.3). Glob `*` allowed.
-/// - `subject`: matched against the JWT `sub` claim via
-///   `validate_custom_claims` (string with glob `*`).
-/// - `claims`: matched via `validate_custom_claims` (string-valued claims
-///   with glob `*`).
+/// Each identity's `claims` constraints are applied via
+/// `validate_custom_claims` (string-valued claims with glob `*`), except `aud`,
+/// which accepts either a string or an array of strings per RFC 7519 §4.1.3.
 ///
 /// Returns `Single` when exactly one identity satisfies all constraints,
 /// `Multiple` when two or more do (ambiguous configuration), and `None` with
@@ -208,21 +196,28 @@ pub fn match_controller_identity<'a>(
     let mut last_err: Option<String> = None;
 
     for ident in candidates {
-        if let Some(expected_aud) = &ident.audience {
-            let aud_claim = token_claims.get("aud").unwrap_or(&serde_json::Value::Null);
-            if !audience_matches(aud_claim, expected_aud) {
-                last_err = Some(format!(
-                    "identity {:?}: aud claim does not match expected audience {:?}",
-                    ident.id, expected_aud
-                ));
-                continue;
-            }
+        let Some(expected_aud) = ident.claims.get("aud") else {
+            last_err = Some(format!(
+                "identity {:?}: missing required claims.aud constraint",
+                ident.id
+            ));
+            continue;
+        };
+        let aud_claim = token_claims.get("aud").unwrap_or(&serde_json::Value::Null);
+        if !audience_matches(aud_claim, expected_aud) {
+            last_err = Some(format!(
+                "identity {:?}: aud claim does not match expected audience {:?}",
+                ident.id, expected_aud
+            ));
+            continue;
         }
 
-        let mut expected_string_claims = ident.claims.clone();
-        if let Some(sub) = &ident.subject {
-            expected_string_claims.insert("sub".to_string(), sub.clone());
-        }
+        let expected_string_claims: HashMap<String, String> = ident
+            .claims
+            .iter()
+            .filter(|(key, _)| key.as_str() != "aud")
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
         match crate::server::auth::jwt::JwtValidator::validate_custom_claims(
             token_claims,
             &expected_string_claims,
@@ -245,7 +240,7 @@ pub fn match_controller_identity<'a>(
 ///
 /// Validates each id, rejects duplicate ids, and returns
 /// `(by_id, by_issuer)`. Multiple identities may share an issuer (they get
-/// disambiguated by `audience`/`subject`/`claims` at request time).
+/// disambiguated by claim constraints at request time).
 pub fn build_controller_indexes(controllers: &[ControllerIdentity]) -> Result<ControllerIndexes> {
     let mut by_id: HashMap<String, ControllerIdentity> = HashMap::new();
     let mut by_issuer: HashMap<String, Vec<ControllerIdentity>> = HashMap::new();
@@ -255,6 +250,12 @@ pub fn build_controller_indexes(controllers: &[ControllerIdentity]) -> Result<Co
             .with_context(|| format!("invalid controller id for entry {:?}", c.id))?;
         if c.issuer.is_empty() {
             return Err(anyhow!("controller {:?} has empty issuer", c.id));
+        }
+        let Some(aud) = c.claims.get("aud") else {
+            return Err(anyhow!("controller {:?} must configure claims.aud", c.id));
+        };
+        if aud.is_empty() {
+            return Err(anyhow!("controller {:?} has empty claims.aud", c.id));
         }
         if by_id.insert(c.id.clone(), c.clone()).is_some() {
             return Err(anyhow!("duplicate controller id: {:?}", c.id));
@@ -351,9 +352,7 @@ mod tests {
         ControllerIdentity {
             id: id.to_string(),
             issuer: issuer.to_string(),
-            audience: None,
-            subject: None,
-            claims: HashMap::new(),
+            claims: HashMap::from([("aud".to_string(), "rise".to_string())]),
         }
     }
 
@@ -396,6 +395,28 @@ mod tests {
         let c = ident("a.example.com", "");
         let err = build_controller_indexes(&[c]).unwrap_err().to_string();
         assert!(err.contains("empty issuer"), "got: {err}");
+    }
+
+    #[test]
+    fn test_build_indexes_rejects_missing_audience_claim() {
+        let c = ControllerIdentity {
+            id: "a.example.com".to_string(),
+            issuer: "https://issuer.example.com".to_string(),
+            claims: HashMap::new(),
+        };
+        let err = build_controller_indexes(&[c]).unwrap_err().to_string();
+        assert!(err.contains("claims.aud"), "got: {err}");
+    }
+
+    #[test]
+    fn test_build_indexes_rejects_empty_audience_claim() {
+        let c = ControllerIdentity {
+            id: "a.example.com".to_string(),
+            issuer: "https://issuer.example.com".to_string(),
+            claims: HashMap::from([("aud".to_string(), "".to_string())]),
+        };
+        let err = build_controller_indexes(&[c]).unwrap_err().to_string();
+        assert!(err.contains("empty claims.aud"), "got: {err}");
     }
 
     // --- audience_matches ---
@@ -447,17 +468,10 @@ mod tests {
 
     // --- match_controller_identity ---
 
-    fn ident_full(
-        id: &str,
-        audience: Option<&str>,
-        subject: Option<&str>,
-        claims: &[(&str, &str)],
-    ) -> ControllerIdentity {
+    fn ident_full(id: &str, claims: &[(&str, &str)]) -> ControllerIdentity {
         ControllerIdentity {
             id: id.to_string(),
             issuer: "https://issuer.example.com".to_string(),
-            audience: audience.map(String::from),
-            subject: subject.map(String::from),
             claims: claims
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -466,13 +480,13 @@ mod tests {
     }
 
     #[test]
-    fn test_match_single_no_constraints() {
-        let candidates = [ident_full("a.example.com", None, None, &[])];
+    fn test_match_none_without_audience_constraint() {
+        let candidates = [ident_full("a.example.com", &[])];
         let claims = serde_json::json!({"sub": "anyone", "aud": "anything"});
         let m = match_controller_identity(&claims, &candidates);
         match m {
-            ControllerMatch::Single(i) => assert_eq!(i.id, "a.example.com"),
-            other => panic!("expected Single, got {other:?}"),
+            ControllerMatch::None(detail) => assert!(detail.contains("claims.aud"), "{detail}"),
+            other => panic!("expected None, got {other:?}"),
         }
     }
 
@@ -480,9 +494,7 @@ mod tests {
     fn test_match_single_with_constraints() {
         let candidates = [ident_full(
             "a.example.com",
-            Some("rise"),
-            Some("ctrl-*"),
-            &[("scope", "controller")],
+            &[("aud", "rise"), ("sub", "ctrl-*"), ("scope", "controller")],
         )];
         let claims = serde_json::json!({
             "sub": "ctrl-abc",
@@ -495,7 +507,7 @@ mod tests {
 
     #[test]
     fn test_match_audience_array() {
-        let candidates = [ident_full("a.example.com", Some("rise"), None, &[])];
+        let candidates = [ident_full("a.example.com", &[("aud", "rise")])];
         let claims = serde_json::json!({
             "sub": "x",
             "aud": ["other", "rise"],
@@ -506,7 +518,7 @@ mod tests {
 
     #[test]
     fn test_match_audience_array_no_match() {
-        let candidates = [ident_full("a.example.com", Some("rise"), None, &[])];
+        let candidates = [ident_full("a.example.com", &[("aud", "rise")])];
         let claims = serde_json::json!({"sub": "x", "aud": ["other"]});
         let m = match_controller_identity(&claims, &candidates);
         match m {
@@ -519,8 +531,11 @@ mod tests {
 
     #[test]
     fn test_match_none_when_subject_mismatches() {
-        let candidates = [ident_full("a.example.com", None, Some("ctrl-*"), &[])];
-        let claims = serde_json::json!({"sub": "other-bot"});
+        let candidates = [ident_full(
+            "a.example.com",
+            &[("aud", "rise"), ("sub", "ctrl-*")],
+        )];
+        let claims = serde_json::json!({"aud": "rise", "sub": "other-bot"});
         let m = match_controller_identity(&claims, &candidates);
         match m {
             ControllerMatch::None(detail) => assert!(detail.contains("a.example.com"), "{detail}"),
@@ -532,23 +547,21 @@ mod tests {
     fn test_match_none_when_extra_claim_missing() {
         let candidates = [ident_full(
             "a.example.com",
-            None,
-            None,
-            &[("scope", "controller")],
+            &[("aud", "rise"), ("scope", "controller")],
         )];
-        let claims = serde_json::json!({"sub": "x"});
+        let claims = serde_json::json!({"aud": "rise", "sub": "x"});
         let m = match_controller_identity(&claims, &candidates);
         assert!(matches!(m, ControllerMatch::None(_)), "got {m:?}");
     }
 
     #[test]
     fn test_match_multiple_when_constraints_ambiguous() {
-        // Two identities with no constraints both match any token.
+        // Two identities with the same audience both match the token.
         let candidates = [
-            ident_full("a.example.com", None, None, &[]),
-            ident_full("b.example.com", None, None, &[]),
+            ident_full("a.example.com", &[("aud", "rise")]),
+            ident_full("b.example.com", &[("aud", "rise")]),
         ];
-        let claims = serde_json::json!({"sub": "x"});
+        let claims = serde_json::json!({"aud": "rise", "sub": "x"});
         let m = match_controller_identity(&claims, &candidates);
         match m {
             ControllerMatch::Multiple(matches) => {
@@ -565,8 +578,8 @@ mod tests {
     fn test_match_disambiguates_by_audience() {
         // Same issuer, different audiences; only one should match.
         let candidates = [
-            ident_full("a.example.com", Some("rise-a"), None, &[]),
-            ident_full("b.example.com", Some("rise-b"), None, &[]),
+            ident_full("a.example.com", &[("aud", "rise-a")]),
+            ident_full("b.example.com", &[("aud", "rise-b")]),
         ];
         let claims = serde_json::json!({"sub": "x", "aud": "rise-b"});
         let m = match_controller_identity(&claims, &candidates);
@@ -579,10 +592,10 @@ mod tests {
     #[test]
     fn test_match_disambiguates_by_subject() {
         let candidates = [
-            ident_full("a.example.com", None, Some("ctrl-a"), &[]),
-            ident_full("b.example.com", None, Some("ctrl-b"), &[]),
+            ident_full("a.example.com", &[("aud", "rise"), ("sub", "ctrl-a")]),
+            ident_full("b.example.com", &[("aud", "rise"), ("sub", "ctrl-b")]),
         ];
-        let claims = serde_json::json!({"sub": "ctrl-b"});
+        let claims = serde_json::json!({"aud": "rise", "sub": "ctrl-b"});
         let m = match_controller_identity(&claims, &candidates);
         match m {
             ControllerMatch::Single(i) => assert_eq!(i.id, "b.example.com"),

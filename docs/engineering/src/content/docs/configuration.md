@@ -207,20 +207,20 @@ auth:
 - `operator_users`: Operators have full access to generic resource storage and built-in resource management. Operators do **not** implicitly receive platform (typed CLI/UI) access — list the email in `admin_users` or `platform_access.allowed_user_emails` separately if both are needed.
 
 **Controllers (`auth.controllers`):**
-Trusted external controllers authenticate to Rise with OIDC JWTs. Each entry registers a `ControllerIdentity` that the auth middleware uses to validate incoming tokens. PR3 only wires the auth context; generic-resource controller endpoints land in a later increment.
+Trusted external controllers authenticate to Rise with OIDC JWTs. Each entry registers a `ControllerIdentity` that the auth middleware uses to validate incoming tokens. PR3 only wires the auth context; generic-resource controller endpoints land in a later increment. Use a dedicated issuer or a dedicated audience for controllers; controller issuer routing is operator-owned configuration, and a JWT whose `iss` matches a configured controller issuer is evaluated as a controller token first.
 
 ```yaml
 auth:
   controllers:
     - id: "controller.example.com/my-ctrl"  # DNS subdomain + optional /name suffix
       issuer: "https://controller-idp.example.com"
-      audience: "rise"                       # optional, exact match on `aud`
-      subject: "my-controller-*"             # optional, wildcard match on `sub`
-      claims:                                # optional, wildcard match per claim
+      claims:                                # required; wildcard match per claim
+        aud: "rise-controller"               # required; string or array JWT `aud` may match
+        sub: "my-controller-*"               # optional subject constraint
         scope: "controller"
 ```
 
-When a JWT's `iss` matches a configured controller identity, the controller path runs first. If no identity's claim constraints match, the request is rejected without falling back to the service-account path.
+`claims.aud` is required for every controller identity. Other constraints, including `sub`, are configured in `claims`. When a JWT's `iss` matches a configured controller identity, the controller path runs first. If no identity's claim constraints match, the request is rejected without falling back to the service-account path.
 
 **Team Creation Control:**
 - `allow_team_creation = true` (default): All authenticated users can create teams

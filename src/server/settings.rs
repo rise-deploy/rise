@@ -234,7 +234,7 @@ pub struct AuthSettings {
     #[serde(default)]
     pub operator_users: Vec<String>,
     /// Trusted external controller identities. Each entry binds a stable
-    /// controller ID to an OIDC issuer plus optional claim constraints.
+    /// controller ID to an OIDC issuer plus required claim constraints.
     /// Used by generic-resource controller endpoints.
     #[serde(default)]
     pub controllers: Vec<crate::server::auth::controller::ControllerIdentity>,
