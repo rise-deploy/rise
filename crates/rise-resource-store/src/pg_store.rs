@@ -13,7 +13,8 @@ use crate::discriminator;
 use crate::error::StoreError;
 use crate::models::ResourceRow;
 use crate::store::{
-    CollectionInfo, CreateResourceParams, DeleteOutcome, ResourceStore, UpdateResourceParams,
+    CollectionInfo, CreateResourceParams, DeleteOutcome, PathSegment, PropagationPolicy,
+    ResourceStore, UpdateResourceParams, CASCADE_DELETION_FINALIZER, SYSTEM_FINALIZER_PREFIX,
 };
 use crate::validation::{
     JsonSchemaValidator, NoOpValidator, OrganizationValidator, ResourceDefinitionValidator,
@@ -254,38 +255,99 @@ impl ResourceStore for PgResourceStore {
         })
     }
 
-    async fn delete(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError> {
+    async fn delete(
+        &self,
+        uid: Uuid,
+        policy: PropagationPolicy,
+    ) -> Result<DeleteOutcome, StoreError> {
         let row = self.get(uid).await?.ok_or(StoreError::NotFound)?;
 
-        // Reject if children exist in the resources table
+        let mut tx = self.pool.begin().await?;
+
         let child_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM resources WHERE parent_uid = $1")
                 .bind(uid)
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *tx)
                 .await?;
-        if child_count > 0 {
-            return Err(StoreError::HasChildren);
+
+        match policy {
+            PropagationPolicy::Cascade => {
+                if child_count > 0 {
+                    // Stamp immediate children that aren't already marked. A future GC sweep
+                    // (try_collect) drives the fan-out down the remaining levels.
+                    sqlx::query(
+                        r#"
+                        UPDATE resources
+                        SET deletion_timestamp = NOW()
+                        WHERE parent_uid = $1 AND deletion_timestamp IS NULL
+                        "#,
+                    )
+                    .bind(uid)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    // Stamp the parent and attach the cascade finalizer (idempotent).
+                    let marked = sqlx::query_as::<_, ResourceRow>(
+                        r#"
+                        UPDATE resources
+                        SET deletion_timestamp = COALESCE(deletion_timestamp, NOW()),
+                            finalizers = CASE
+                                WHEN $2 = ANY(finalizers) THEN finalizers
+                                ELSE array_append(finalizers, $2)
+                            END
+                        WHERE uid = $1
+                        RETURNING *
+                        "#,
+                    )
+                    .bind(uid)
+                    .bind(CASCADE_DELETION_FINALIZER)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    tx.commit().await?;
+                    return Ok(DeleteOutcome::MarkedForDeletion(Box::new(marked)));
+                }
+            }
+            PropagationPolicy::Orphan => {
+                if child_count > 0 {
+                    // Detach children. The partial unique index on (kind, name) WHERE
+                    // parent_uid IS NULL may reject this if a name collides at the root scope.
+                    let result = sqlx::query(
+                        r#"
+                        UPDATE resources
+                        SET parent_uid = NULL
+                        WHERE parent_uid = $1
+                        "#,
+                    )
+                    .bind(uid)
+                    .execute(&mut *tx)
+                    .await;
+                    if let Err(e) = result {
+                        if Self::is_name_conflict(&e) {
+                            return Err(StoreError::NameConflict);
+                        }
+                        return Err(StoreError::Database(e));
+                    }
+                }
+            }
         }
 
-        // Finalizers present → mark for deletion instead of deleting
+        // No (remaining) children. Mark if finalizers, else hard-delete.
         if !row.finalizers.is_empty() {
             let marked = sqlx::query_as::<_, ResourceRow>(
                 r#"
                 UPDATE resources
-                SET deletion_timestamp = NOW(), updated_at = NOW()
+                SET deletion_timestamp = COALESCE(deletion_timestamp, NOW())
                 WHERE uid = $1
                 RETURNING *
                 "#,
             )
             .bind(uid)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await?;
+            tx.commit().await?;
             return Ok(DeleteOutcome::MarkedForDeletion(Box::new(marked)));
         }
 
-        // Hard delete in a transaction. Delete from the resource_definitions projection
-        // table first (ON DELETE RESTRICT prevents deleting the resources row otherwise).
-        let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM resource_definitions WHERE uid = $1")
             .bind(uid)
             .execute(&mut *tx)
@@ -297,6 +359,283 @@ impl ResourceStore for PgResourceStore {
         tx.commit().await?;
 
         Ok(DeleteOutcome::Deleted)
+    }
+
+    async fn try_collect(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError> {
+        let mut tx = self.pool.begin().await?;
+
+        let row =
+            sqlx::query_as::<_, ResourceRow>("SELECT * FROM resources WHERE uid = $1 FOR UPDATE")
+                .bind(uid)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(StoreError::NotFound)?;
+
+        // Not tombstoned: nothing to collect, return current state.
+        if row.deletion_timestamp.is_none() {
+            return Ok(DeleteOutcome::MarkedForDeletion(Box::new(row)));
+        }
+
+        let child_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM resources WHERE parent_uid = $1")
+                .bind(uid)
+                .fetch_one(&mut *tx)
+                .await?;
+
+        if child_count > 0 {
+            // Fan out: stamp any unmarked children. Ensure the cascade finalizer is present
+            // (in case the row was tombstoned by some other path that didn't add it).
+            sqlx::query(
+                r#"
+                UPDATE resources
+                SET deletion_timestamp = NOW()
+                WHERE parent_uid = $1 AND deletion_timestamp IS NULL
+                "#,
+            )
+            .bind(uid)
+            .execute(&mut *tx)
+            .await?;
+
+            let row = sqlx::query_as::<_, ResourceRow>(
+                r#"
+                UPDATE resources
+                SET finalizers = CASE
+                        WHEN $2 = ANY(finalizers) THEN finalizers
+                        ELSE array_append(finalizers, $2)
+                    END
+                WHERE uid = $1
+                RETURNING *
+                "#,
+            )
+            .bind(uid)
+            .bind(CASCADE_DELETION_FINALIZER)
+            .fetch_one(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(DeleteOutcome::MarkedForDeletion(Box::new(row)));
+        }
+
+        // No children. Drop the cascade finalizer if present.
+        let row = sqlx::query_as::<_, ResourceRow>(
+            r#"
+            UPDATE resources
+            SET finalizers = array_remove(finalizers, $2)
+            WHERE uid = $1
+            RETURNING *
+            "#,
+        )
+        .bind(uid)
+        .bind(CASCADE_DELETION_FINALIZER)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        if !row.finalizers.is_empty() {
+            tx.commit().await?;
+            return Ok(DeleteOutcome::MarkedForDeletion(Box::new(row)));
+        }
+
+        // Clear: hard-delete.
+        sqlx::query("DELETE FROM resource_definitions WHERE uid = $1")
+            .bind(uid)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM resources WHERE uid = $1")
+            .bind(uid)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        Ok(DeleteOutcome::Deleted)
+    }
+
+    async fn list_pending_collection(&self, limit: i64) -> Result<Vec<ResourceRow>, StoreError> {
+        let rows = sqlx::query_as::<_, ResourceRow>(
+            r#"
+            SELECT * FROM resources
+            WHERE deletion_timestamp IS NOT NULL
+            ORDER BY deletion_timestamp ASC
+            LIMIT $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn resolve_path(&self, segments: &[PathSegment]) -> Result<Vec<ResourceRow>, StoreError> {
+        if segments.is_empty() {
+            return Err(StoreError::EmptyPath);
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let mut chain: Vec<ResourceRow> = Vec::with_capacity(segments.len());
+        let mut current_parent: Option<Uuid> = None;
+
+        for (idx, segment) in segments.iter().enumerate() {
+            let row = match segment {
+                PathSegment::Name { kind, name } => {
+                    let row: Option<ResourceRow> = match current_parent {
+                        None => sqlx::query_as::<_, ResourceRow>(
+                            "SELECT * FROM resources WHERE kind = $1 AND name = $2 AND parent_uid IS NULL",
+                        )
+                        .bind(kind)
+                        .bind(name)
+                        .fetch_optional(&mut *tx)
+                        .await?,
+                        Some(pid) => sqlx::query_as::<_, ResourceRow>(
+                            "SELECT * FROM resources WHERE kind = $1 AND name = $2 AND parent_uid = $3",
+                        )
+                        .bind(kind)
+                        .bind(name)
+                        .bind(pid)
+                        .fetch_optional(&mut *tx)
+                        .await?,
+                    };
+                    match row {
+                        Some(r) => r,
+                        None if idx + 1 == segments.len() => return Err(StoreError::NotFound),
+                        None => return Err(StoreError::ParentNotFound),
+                    }
+                }
+                PathSegment::Uid { kind, uid } => {
+                    let row: ResourceRow = match sqlx::query_as::<_, ResourceRow>(
+                        "SELECT * FROM resources WHERE uid = $1",
+                    )
+                    .bind(uid)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    {
+                        Some(r) => r,
+                        None if idx + 1 == segments.len() => return Err(StoreError::NotFound),
+                        None => return Err(StoreError::ParentNotFound),
+                    };
+                    if row.kind != *kind {
+                        return Err(StoreError::KindMismatch {
+                            expected: kind.clone(),
+                            got: row.kind,
+                        });
+                    }
+                    if row.parent_uid != current_parent {
+                        // UID is from a different subtree.
+                        return Err(StoreError::ParentNotFound);
+                    }
+                    row
+                }
+            };
+
+            current_parent = Some(row.uid);
+            chain.push(row);
+        }
+
+        tx.commit().await?;
+        Ok(chain)
+    }
+
+    async fn list_orphans(&self, parent_uid: Option<Uuid>) -> Result<Vec<ResourceRow>, StoreError> {
+        let rows = match parent_uid {
+            None => {
+                sqlx::query_as::<_, ResourceRow>(
+                    r#"
+                SELECT c.*
+                FROM resources c
+                JOIN resources p ON c.parent_uid = p.uid
+                WHERE p.deletion_timestamp IS NOT NULL
+                ORDER BY c.kind, c.name
+                "#,
+                )
+                .fetch_all(&self.pool)
+                .await?
+            }
+            Some(pid) => {
+                sqlx::query_as::<_, ResourceRow>(
+                    r#"
+                SELECT c.*
+                FROM resources c
+                JOIN resources p ON c.parent_uid = p.uid
+                WHERE p.deletion_timestamp IS NOT NULL AND p.uid = $1
+                ORDER BY c.kind, c.name
+                "#,
+                )
+                .bind(pid)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        Ok(rows)
+    }
+
+    async fn reparent(
+        &self,
+        uid: Uuid,
+        new_parent_uid: Option<Uuid>,
+    ) -> Result<ResourceRow, StoreError> {
+        let mut tx = self.pool.begin().await?;
+
+        // Lock the target row.
+        let target =
+            sqlx::query_as::<_, ResourceRow>("SELECT * FROM resources WHERE uid = $1 FOR UPDATE")
+                .bind(uid)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(StoreError::NotFound)?;
+
+        if target.parent_uid == new_parent_uid {
+            tx.commit().await?;
+            return Ok(target);
+        }
+
+        if let Some(new_pid) = new_parent_uid {
+            if new_pid == uid {
+                return Err(StoreError::ReparentCycle);
+            }
+
+            // Verify the new parent exists and isn't an ancestor in our own subtree.
+            // Walk up from the new parent; if we hit `uid`, it would be a cycle.
+            let is_descendant: bool = sqlx::query_scalar(
+                r#"
+                WITH RECURSIVE ancestors AS (
+                    SELECT uid, parent_uid FROM resources WHERE uid = $1
+                    UNION ALL
+                    SELECT r.uid, r.parent_uid
+                    FROM resources r
+                    JOIN ancestors a ON r.uid = a.parent_uid
+                )
+                SELECT EXISTS (SELECT 1 FROM ancestors WHERE uid = $2)
+                "#,
+            )
+            .bind(new_pid)
+            .bind(uid)
+            .fetch_one(&mut *tx)
+            .await?;
+
+            if is_descendant {
+                return Err(StoreError::ReparentCycle);
+            }
+        }
+
+        let result = sqlx::query_as::<_, ResourceRow>(
+            r#"
+            UPDATE resources
+            SET parent_uid = $2
+            WHERE uid = $1
+            RETURNING *
+            "#,
+        )
+        .bind(uid)
+        .bind(new_parent_uid)
+        .fetch_one(&mut *tx)
+        .await;
+
+        let row = match result {
+            Ok(r) => r,
+            Err(e) if Self::is_name_conflict(&e) => return Err(StoreError::NameConflict),
+            Err(e) if Self::is_discriminator_conflict(&e) => return Err(StoreError::NameConflict),
+            Err(e) => return Err(StoreError::Database(e)),
+        };
+
+        tx.commit().await?;
+        Ok(row)
     }
 
     async fn update_controller_status(
@@ -340,8 +679,11 @@ impl ResourceStore for PgResourceStore {
     ) -> Result<ResourceRow, StoreError> {
         validate_controller_id(controller_id).map_err(|e| StoreError::Validation(e.to_string()))?;
 
-        // All modified finalizers must be prefixed by this controller's ID
+        // Store-managed finalizers (system.rise.dev/*) cannot be added or removed by controllers.
         for f in add.iter().chain(remove.iter()) {
+            if f.starts_with(SYSTEM_FINALIZER_PREFIX) {
+                return Err(StoreError::ReservedFinalizer(f.clone()));
+            }
             if !is_controller_finalizer(f, controller_id) {
                 return Err(StoreError::Validation(format!(
                     "finalizer '{f}' is not owned by controller '{controller_id}'"

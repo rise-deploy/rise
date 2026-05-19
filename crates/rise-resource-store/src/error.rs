@@ -14,8 +14,20 @@ pub enum StoreError {
     #[error("could not generate a unique discriminator after maximum retries")]
     DiscriminatorExhausted,
 
-    #[error("resource has child resources and cannot be deleted")]
-    HasChildren,
+    #[error("path segment kind mismatch: expected '{expected}', got '{got}'")]
+    KindMismatch { expected: String, got: String },
+
+    #[error("intermediate path segment not found")]
+    ParentNotFound,
+
+    #[error("reparent would create a cycle")]
+    ReparentCycle,
+
+    #[error("reserved finalizer namespace: '{0}'")]
+    ReservedFinalizer(String),
+
+    #[error("path resolution requires at least one segment")]
+    EmptyPath,
 
     #[error("validation error: {0}")]
     Validation(String),

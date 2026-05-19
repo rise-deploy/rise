@@ -1,7 +1,7 @@
 use rise_resource_api::{API_VERSION_V1ALPHA1, ORGANIZATION_KIND, RESOURCE_DEFINITION_KIND};
 use rise_resource_store::{
-    CreateResourceParams, DeleteOutcome, PgResourceStore, ResourceStore, StoreError,
-    UpdateResourceParams,
+    CreateResourceParams, DeleteOutcome, PathSegment, PgResourceStore, PropagationPolicy,
+    ResourceStore, StoreError, UpdateResourceParams, CASCADE_DELETION_FINALIZER,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -189,7 +189,10 @@ async fn delete_without_finalizers_removes_row(pool: sqlx::PgPool) -> sqlx::Resu
         .await
         .unwrap();
 
-    let outcome = store.delete(row.uid).await.unwrap();
+    let outcome = store
+        .delete(row.uid, PropagationPolicy::Cascade)
+        .await
+        .unwrap();
     assert!(matches!(outcome, DeleteOutcome::Deleted));
     assert!(store.get(row.uid).await.unwrap().is_none());
 
@@ -214,51 +217,16 @@ async fn delete_with_finalizers_marks_deletion_timestamp(pool: sqlx::PgPool) -> 
         .await
         .unwrap();
 
-    let outcome = store.delete(row.uid).await.unwrap();
+    let outcome = store
+        .delete(row.uid, PropagationPolicy::Cascade)
+        .await
+        .unwrap();
     let marked = match outcome {
         DeleteOutcome::MarkedForDeletion(r) => *r,
         DeleteOutcome::Deleted => panic!("expected MarkedForDeletion"),
     };
     assert!(marked.deletion_timestamp.is_some());
     assert_eq!(marked.finalizers.len(), 1);
-
-    Ok(())
-}
-
-#[sqlx::test]
-async fn delete_with_children_rejected(pool: sqlx::PgPool) -> sqlx::Result<()> {
-    let store = PgResourceStore::new(pool);
-
-    let parent = store
-        .create(CreateResourceParams {
-            api_version: API_VERSION_V1ALPHA1.to_string(),
-            kind: ORGANIZATION_KIND.to_string(),
-            name: "parent-org".to_string(),
-            parent_uid: None,
-            annotations: BTreeMap::new(),
-            finalizers: vec![],
-            spec: json!({"displayName": "Parent"}),
-            validator: None,
-        })
-        .await
-        .unwrap();
-
-    store
-        .create(CreateResourceParams {
-            api_version: "example.dev/v1".to_string(),
-            kind: "Widget".to_string(),
-            name: "widget-a".to_string(),
-            parent_uid: Some(parent.uid),
-            annotations: BTreeMap::new(),
-            finalizers: vec![],
-            spec: json!({}),
-            validator: None,
-        })
-        .await
-        .unwrap();
-
-    let err = store.delete(parent.uid).await.unwrap_err();
-    assert!(matches!(err, StoreError::HasChildren));
 
     Ok(())
 }
@@ -284,7 +252,10 @@ async fn finalizer_flow_completes_deletion(pool: sqlx::PgPool) -> sqlx::Result<(
         .unwrap();
 
     // Delete marks timestamp but doesn't remove
-    let outcome = store.delete(row.uid).await.unwrap();
+    let outcome = store
+        .delete(row.uid, PropagationPolicy::Cascade)
+        .await
+        .unwrap();
     assert!(matches!(outcome, DeleteOutcome::MarkedForDeletion(_)));
 
     // Controller removes its finalizer
@@ -294,8 +265,8 @@ async fn finalizer_flow_completes_deletion(pool: sqlx::PgPool) -> sqlx::Result<(
         .unwrap();
     assert!(without_finalizer.finalizers.is_empty());
 
-    // Second delete should now succeed
-    let outcome2 = store.delete(row.uid).await.unwrap();
+    // try_collect now succeeds: row is tombstoned, no finalizers, no children.
+    let outcome2 = store.try_collect(row.uid).await.unwrap();
     assert!(matches!(outcome2, DeleteOutcome::Deleted));
 
     Ok(())
@@ -605,12 +576,27 @@ async fn delete_already_marked_resource_is_idempotent(pool: sqlx::PgPool) -> sql
         .unwrap();
 
     // First delete: marks for deletion
-    let outcome1 = store.delete(row.uid).await.unwrap();
-    assert!(matches!(outcome1, DeleteOutcome::MarkedForDeletion(_)));
+    let outcome1 = store
+        .delete(row.uid, PropagationPolicy::Cascade)
+        .await
+        .unwrap();
+    let first_ts = match outcome1 {
+        DeleteOutcome::MarkedForDeletion(r) => r.deletion_timestamp,
+        DeleteOutcome::Deleted => panic!("expected MarkedForDeletion"),
+    };
+    assert!(first_ts.is_some());
 
-    // Second delete while finalizers are still present: re-marks (idempotent)
-    let outcome2 = store.delete(row.uid).await.unwrap();
-    assert!(matches!(outcome2, DeleteOutcome::MarkedForDeletion(_)));
+    // Second delete while finalizers are still present: re-marks (idempotent) and preserves
+    // the original deletion_timestamp.
+    let outcome2 = store
+        .delete(row.uid, PropagationPolicy::Cascade)
+        .await
+        .unwrap();
+    let second = match outcome2 {
+        DeleteOutcome::MarkedForDeletion(r) => *r,
+        DeleteOutcome::Deleted => panic!("expected MarkedForDeletion"),
+    };
+    assert_eq!(second.deletion_timestamp, first_ts);
 
     Ok(())
 }
@@ -785,6 +771,538 @@ async fn update_rejects_resource_definition(pool: sqlx::PgPool) -> sqlx::Result<
         matches!(err, StoreError::Validation(_)),
         "expected Validation error, got {err:?}"
     );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Cascade / orphan deletion
+// ---------------------------------------------------------------------------------------------
+
+async fn create_org(store: &PgResourceStore, name: &str) -> rise_resource_store::ResourceRow {
+    store
+        .create(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: ORGANIZATION_KIND.to_string(),
+            name: name.to_string(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec: json!({"displayName": name}),
+            validator: None,
+        })
+        .await
+        .unwrap()
+}
+
+async fn create_child(
+    store: &PgResourceStore,
+    parent: Uuid,
+    kind: &str,
+    name: &str,
+    finalizers: Vec<String>,
+) -> rise_resource_store::ResourceRow {
+    store
+        .create(CreateResourceParams {
+            api_version: "example.dev/v1".to_string(),
+            kind: kind.to_string(),
+            name: name.to_string(),
+            parent_uid: Some(parent),
+            annotations: BTreeMap::new(),
+            finalizers,
+            spec: json!({}),
+            validator: None,
+        })
+        .await
+        .unwrap()
+}
+
+#[sqlx::test]
+async fn cascade_delete_stamps_immediate_children(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let parent = create_org(&store, "cascade-org").await;
+    let c1 = create_child(&store, parent.uid, "Widget", "w1", vec![]).await;
+    let c2 = create_child(&store, parent.uid, "Widget", "w2", vec![]).await;
+
+    let outcome = store
+        .delete(parent.uid, PropagationPolicy::Cascade)
+        .await
+        .unwrap();
+    let marked = match outcome {
+        DeleteOutcome::MarkedForDeletion(r) => *r,
+        DeleteOutcome::Deleted => panic!("parent still has children, should be MarkedForDeletion"),
+    };
+    assert!(marked.deletion_timestamp.is_some());
+    assert!(
+        marked
+            .finalizers
+            .contains(&CASCADE_DELETION_FINALIZER.to_string()),
+        "parent missing cascade finalizer: {:?}",
+        marked.finalizers
+    );
+
+    let c1_after = store.get(c1.uid).await.unwrap().unwrap();
+    let c2_after = store.get(c2.uid).await.unwrap().unwrap();
+    assert!(c1_after.deletion_timestamp.is_some());
+    assert!(c2_after.deletion_timestamp.is_some());
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn cascade_delete_idempotent(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let parent = create_org(&store, "cascade-org").await;
+    create_child(&store, parent.uid, "Widget", "w1", vec![]).await;
+
+    let first = match store
+        .delete(parent.uid, PropagationPolicy::Cascade)
+        .await
+        .unwrap()
+    {
+        DeleteOutcome::MarkedForDeletion(r) => r.deletion_timestamp,
+        _ => panic!("expected MarkedForDeletion"),
+    };
+    let second = match store
+        .delete(parent.uid, PropagationPolicy::Cascade)
+        .await
+        .unwrap()
+    {
+        DeleteOutcome::MarkedForDeletion(r) => {
+            let count = r
+                .finalizers
+                .iter()
+                .filter(|f| f.as_str() == CASCADE_DELETION_FINALIZER)
+                .count();
+            assert_eq!(count, 1, "cascade finalizer duplicated: {:?}", r.finalizers);
+            r.deletion_timestamp
+        }
+        _ => panic!("expected MarkedForDeletion"),
+    };
+    assert_eq!(
+        first, second,
+        "deletion_timestamp must be preserved on re-delete"
+    );
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn cascade_collection_drains_bottom_up(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let parent = create_org(&store, "drain-org").await;
+    let child = create_child(
+        &store,
+        parent.uid,
+        "Widget",
+        "w1",
+        vec!["controller.example.com/cleanup".to_string()],
+    )
+    .await;
+
+    // Delete the parent. Child gets stamped, parent gets cascade finalizer.
+    store
+        .delete(parent.uid, PropagationPolicy::Cascade)
+        .await
+        .unwrap();
+
+    // try_collect on parent while child still exists: stays marked, cascade finalizer persists.
+    let outcome = store.try_collect(parent.uid).await.unwrap();
+    let p_marked = match outcome {
+        DeleteOutcome::MarkedForDeletion(r) => *r,
+        _ => panic!("parent should still be marked"),
+    };
+    assert!(p_marked
+        .finalizers
+        .contains(&CASCADE_DELETION_FINALIZER.to_string()));
+
+    // try_collect on the child while it has controller finalizers: still marked, no hard delete.
+    let outcome = store.try_collect(child.uid).await.unwrap();
+    assert!(matches!(outcome, DeleteOutcome::MarkedForDeletion(_)));
+    assert!(store.get(child.uid).await.unwrap().is_some());
+
+    // Controller clears its finalizer.
+    store
+        .update_controller_finalizers(
+            child.uid,
+            "controller.example.com",
+            &[],
+            &["controller.example.com/cleanup".to_string()],
+        )
+        .await
+        .unwrap();
+
+    // try_collect on child now hard-deletes it.
+    let outcome = store.try_collect(child.uid).await.unwrap();
+    assert!(matches!(outcome, DeleteOutcome::Deleted));
+    assert!(store.get(child.uid).await.unwrap().is_none());
+
+    // try_collect on parent: no remaining children → cascade finalizer cleared, hard-delete.
+    let outcome = store.try_collect(parent.uid).await.unwrap();
+    assert!(matches!(outcome, DeleteOutcome::Deleted));
+    assert!(store.get(parent.uid).await.unwrap().is_none());
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn try_collect_on_live_row_is_noop(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let parent = create_org(&store, "live-org").await;
+
+    let outcome = store.try_collect(parent.uid).await.unwrap();
+    match outcome {
+        DeleteOutcome::MarkedForDeletion(r) => {
+            assert!(r.deletion_timestamp.is_none());
+        }
+        DeleteOutcome::Deleted => panic!("live row should not be deleted"),
+    }
+    assert!(store.get(parent.uid).await.unwrap().is_some());
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn list_pending_collection_returns_tombstoned_only(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let alive = create_org(&store, "alive-org").await;
+    let dying = create_org(&store, "dying-org").await;
+
+    store
+        .update_controller_finalizers(
+            dying.uid,
+            "controller.example.com",
+            &["controller.example.com/cleanup".to_string()],
+            &[],
+        )
+        .await
+        .unwrap();
+    store
+        .delete(dying.uid, PropagationPolicy::Cascade)
+        .await
+        .unwrap();
+
+    let pending = store.list_pending_collection(100).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].uid, dying.uid);
+    assert!(pending.iter().all(|r| r.uid != alive.uid));
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn orphan_delete_detaches_children(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let parent = create_org(&store, "orphan-org").await;
+    let c1 = create_child(&store, parent.uid, "Widget", "w1", vec![]).await;
+    let c2 = create_child(&store, parent.uid, "Widget", "w2", vec![]).await;
+
+    let outcome = store
+        .delete(parent.uid, PropagationPolicy::Orphan)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, DeleteOutcome::Deleted));
+    assert!(store.get(parent.uid).await.unwrap().is_none());
+
+    let c1_after = store.get(c1.uid).await.unwrap().unwrap();
+    let c2_after = store.get(c2.uid).await.unwrap().unwrap();
+    assert_eq!(c1_after.parent_uid, None);
+    assert_eq!(c2_after.parent_uid, None);
+    assert!(c1_after.deletion_timestamp.is_none());
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn cascade_finalizer_not_addable_by_controller(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let row = create_org(&store, "guarded").await;
+
+    let err = store
+        .update_controller_finalizers(
+            row.uid,
+            "controller.example.com",
+            &[CASCADE_DELETION_FINALIZER.to_string()],
+            &[],
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::ReservedFinalizer(_)),
+        "expected ReservedFinalizer, got {err:?}"
+    );
+
+    let err = store
+        .update_controller_finalizers(
+            row.uid,
+            "controller.example.com",
+            &[],
+            &[CASCADE_DELETION_FINALIZER.to_string()],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ReservedFinalizer(_)));
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Path resolution
+// ---------------------------------------------------------------------------------------------
+
+#[sqlx::test]
+async fn resolve_path_walks_named_segments(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let org = create_org(&store, "acme").await;
+    let widget = create_child(&store, org.uid, "Widget", "w1", vec![]).await;
+
+    let chain = store
+        .resolve_path(&[
+            PathSegment::Name {
+                kind: ORGANIZATION_KIND.to_string(),
+                name: "acme".to_string(),
+            },
+            PathSegment::Name {
+                kind: "Widget".to_string(),
+                name: "w1".to_string(),
+            },
+        ])
+        .await
+        .unwrap();
+    assert_eq!(chain.len(), 2);
+    assert_eq!(chain[0].uid, org.uid);
+    assert_eq!(chain[1].uid, widget.uid);
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn resolve_path_supports_uid_segments(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let org = create_org(&store, "acme").await;
+    let widget = create_child(&store, org.uid, "Widget", "w1", vec![]).await;
+
+    let chain = store
+        .resolve_path(&[
+            PathSegment::Uid {
+                kind: ORGANIZATION_KIND.to_string(),
+                uid: org.uid,
+            },
+            PathSegment::Name {
+                kind: "Widget".to_string(),
+                name: "w1".to_string(),
+            },
+        ])
+        .await
+        .unwrap();
+    assert_eq!(chain.len(), 2);
+    assert_eq!(chain[1].uid, widget.uid);
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn resolve_path_rejects_kind_mismatch(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let org = create_org(&store, "acme").await;
+
+    let err = store
+        .resolve_path(&[PathSegment::Uid {
+            kind: "Widget".to_string(),
+            uid: org.uid,
+        }])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::KindMismatch { .. }),
+        "expected KindMismatch, got {err:?}"
+    );
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn resolve_path_rejects_wrong_subtree(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let org_a = create_org(&store, "org-a").await;
+    let org_b = create_org(&store, "org-b").await;
+    let widget_b = create_child(&store, org_b.uid, "Widget", "w1", vec![]).await;
+
+    let err = store
+        .resolve_path(&[
+            PathSegment::Uid {
+                kind: ORGANIZATION_KIND.to_string(),
+                uid: org_a.uid,
+            },
+            PathSegment::Uid {
+                kind: "Widget".to_string(),
+                uid: widget_b.uid,
+            },
+        ])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ParentNotFound));
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn resolve_path_returns_tombstoned_rows(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let org = create_org(&store, "acme").await;
+    let widget = create_child(
+        &store,
+        org.uid,
+        "Widget",
+        "w1",
+        vec!["controller.example.com/cleanup".to_string()],
+    )
+    .await;
+    store
+        .delete(widget.uid, PropagationPolicy::Cascade)
+        .await
+        .unwrap();
+
+    let chain = store
+        .resolve_path(&[
+            PathSegment::Name {
+                kind: ORGANIZATION_KIND.to_string(),
+                name: "acme".to_string(),
+            },
+            PathSegment::Name {
+                kind: "Widget".to_string(),
+                name: "w1".to_string(),
+            },
+        ])
+        .await
+        .unwrap();
+    assert_eq!(chain.len(), 2);
+    assert!(chain[1].deletion_timestamp.is_some());
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn resolve_path_empty_returns_error(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let err = store.resolve_path(&[]).await.unwrap_err();
+    assert!(matches!(err, StoreError::EmptyPath));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Orphan discovery / reparent
+// ---------------------------------------------------------------------------------------------
+
+#[sqlx::test]
+async fn list_orphans_returns_children_of_tombstoned_parent(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let dying_parent = create_org(&store, "dying").await;
+    store
+        .update_controller_finalizers(
+            dying_parent.uid,
+            "controller.example.com",
+            &["controller.example.com/cleanup".to_string()],
+            &[],
+        )
+        .await
+        .unwrap();
+    let child_dying = create_child(&store, dying_parent.uid, "Widget", "w1", vec![]).await;
+
+    let alive_parent = create_org(&store, "alive").await;
+    let _child_alive = create_child(&store, alive_parent.uid, "Widget", "w2", vec![]).await;
+
+    store
+        .delete(dying_parent.uid, PropagationPolicy::Cascade)
+        .await
+        .unwrap();
+
+    let orphans = store.list_orphans(None).await.unwrap();
+    assert_eq!(orphans.len(), 1);
+    assert_eq!(orphans[0].uid, child_dying.uid);
+
+    let scoped = store.list_orphans(Some(dying_parent.uid)).await.unwrap();
+    assert_eq!(scoped.len(), 1);
+
+    let none_scoped = store.list_orphans(Some(alive_parent.uid)).await.unwrap();
+    assert!(none_scoped.is_empty());
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn reparent_moves_resource(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let org_a = create_org(&store, "org-a").await;
+    let org_b = create_org(&store, "org-b").await;
+    let widget = create_child(&store, org_a.uid, "Widget", "w1", vec![]).await;
+
+    let moved = store.reparent(widget.uid, Some(org_b.uid)).await.unwrap();
+    assert_eq!(moved.parent_uid, Some(org_b.uid));
+
+    let under_a = store.list("Widget", Some(org_a.uid)).await.unwrap();
+    assert!(under_a.is_empty());
+    let under_b = store.list("Widget", Some(org_b.uid)).await.unwrap();
+    assert_eq!(under_b.len(), 1);
+    assert_eq!(under_b[0].uid, widget.uid);
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn reparent_to_root(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let org_a = create_org(&store, "org-a").await;
+    let child_org = store
+        .create(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: ORGANIZATION_KIND.to_string(),
+            name: "child".to_string(),
+            parent_uid: Some(org_a.uid),
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec: json!({"displayName": "Child"}),
+            validator: None,
+        })
+        .await
+        .unwrap();
+
+    let moved = store.reparent(child_org.uid, None).await.unwrap();
+    assert_eq!(moved.parent_uid, None);
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn reparent_rejects_cycle(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let org = create_org(&store, "root").await;
+    let child = create_child(&store, org.uid, "Widget", "w1", vec![]).await;
+
+    let err = store.reparent(org.uid, Some(org.uid)).await.unwrap_err();
+    assert!(matches!(err, StoreError::ReparentCycle));
+
+    let err = store.reparent(org.uid, Some(child.uid)).await.unwrap_err();
+    assert!(matches!(err, StoreError::ReparentCycle));
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn reparent_respects_uniqueness(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let org_a = create_org(&store, "org-a").await;
+    let org_b = create_org(&store, "org-b").await;
+    let _existing = create_child(&store, org_b.uid, "Widget", "shared", vec![]).await;
+    let moving = create_child(&store, org_a.uid, "Widget", "shared", vec![]).await;
+
+    let err = store
+        .reparent(moving.uid, Some(org_b.uid))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::NameConflict));
 
     Ok(())
 }
