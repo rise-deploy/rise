@@ -19,5 +19,11 @@ pub use validation::{
 };
 
 pub async fn run_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::migrate::MigrateError> {
-    sqlx::migrate!("./migrations").run(pool).await
+    // Both this crate and the root rise-deploy crate share the same `_sqlx_migrations`
+    // table. Without ignore_missing, this migrator would error on root migrations it
+    // doesn't know about (and vice versa). Each migrator only manages its own set.
+    let mut migrator = sqlx::migrate!("./migrations");
+    migrator.set_ignore_missing(true);
+    migrator.run(pool).await?;
+    Ok(())
 }
