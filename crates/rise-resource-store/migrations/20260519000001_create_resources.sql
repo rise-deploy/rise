@@ -20,14 +20,14 @@ ALTER TABLE resources
     CHECK (discriminator ~ '^[a-z0-9][a-z0-9-]{6}[a-z0-9]$');
 
 -- Names follow the DNS-label format for regular resources (my-org) and the DNS-subdomain
--- format for ResourceDefinitions (widgets.example.dev). Both share the same rule: starts
--- and ends with an alphanumeric character, no consecutive dots, no leading/trailing hyphens
--- per segment, max 253 chars (DNS subdomain limit).
+-- format for ResourceDefinitions (widgets.example.dev). Per RFC 1123: each dot-separated
+-- segment is a DNS label (starts and ends with alphanumeric, hyphens allowed in the middle,
+-- max 63 chars). Total length capped at 253 (DNS subdomain limit).
 ALTER TABLE resources
     ADD CONSTRAINT resources_name_format
     CHECK (
-        name ~ '^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$'
-        AND position('..' in name) = 0
+        name ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$'
+        AND length(name) <= 253
     );
 
 ALTER TABLE resources

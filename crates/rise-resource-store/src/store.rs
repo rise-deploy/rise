@@ -125,9 +125,10 @@ pub trait ResourceStore: Send + Sync {
 
     /// GC sweep entry point. Idempotent.
     ///
-    /// - If the row is not tombstoned, returns `MarkedForDeletion` with the current row unchanged
-    ///   when it has children (so callers can observe state) — but does not mutate anything; if it
-    ///   has no `deletion_timestamp` it returns `NotFound` to signal "no work here".
+    /// - If the row is not tombstoned, returns `MarkedForDeletion` with the current row unchanged.
+    ///   No mutations are performed. (The GC normally only invokes this on rows that came back
+    ///   from `list_pending_collection`, so non-tombstoned rows are an unexpected race; returning
+    ///   the row unchanged lets the caller log/observe and move on without raising an error.)
     /// - If tombstoned with children: stamps any still-unstamped children (continues the fan-out),
     ///   ensures `system.rise.dev/cascade-deletion` is set, returns `MarkedForDeletion`.
     /// - If tombstoned without children: removes `system.rise.dev/cascade-deletion` if present;

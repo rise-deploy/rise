@@ -260,9 +260,16 @@ impl ResourceStore for PgResourceStore {
         uid: Uuid,
         policy: PropagationPolicy,
     ) -> Result<DeleteOutcome, StoreError> {
-        let row = self.get(uid).await?.ok_or(StoreError::NotFound)?;
-
         let mut tx = self.pool.begin().await?;
+
+        // Lock the row inside the transaction so a concurrent update_controller_finalizers()
+        // can't add a finalizer between our read and the hard-delete branch below.
+        let row =
+            sqlx::query_as::<_, ResourceRow>("SELECT * FROM resources WHERE uid = $1 FOR UPDATE")
+                .bind(uid)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(StoreError::NotFound)?;
 
         let child_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM resources WHERE parent_uid = $1")
@@ -274,11 +281,13 @@ impl ResourceStore for PgResourceStore {
             PropagationPolicy::Cascade => {
                 if child_count > 0 {
                     // Stamp immediate children that aren't already marked. A future GC sweep
-                    // (try_collect) drives the fan-out down the remaining levels.
+                    // (try_collect) drives the fan-out down the remaining levels. Bump
+                    // revision on each affected child so concurrent updates see the change.
                     sqlx::query(
                         r#"
                         UPDATE resources
-                        SET deletion_timestamp = NOW()
+                        SET deletion_timestamp = NOW(),
+                            revision = revision + 1
                         WHERE parent_uid = $1 AND deletion_timestamp IS NULL
                         "#,
                     )
@@ -294,7 +303,8 @@ impl ResourceStore for PgResourceStore {
                             finalizers = CASE
                                 WHEN $2 = ANY(finalizers) THEN finalizers
                                 ELSE array_append(finalizers, $2)
-                            END
+                            END,
+                            revision = revision + 1
                         WHERE uid = $1
                         RETURNING *
                         "#,
@@ -311,10 +321,12 @@ impl ResourceStore for PgResourceStore {
                 if child_count > 0 {
                     // Detach children. The partial unique index on (kind, name) WHERE
                     // parent_uid IS NULL may reject this if a name collides at the root scope.
+                    // Bump revision so the detach is observable.
                     let result = sqlx::query(
                         r#"
                         UPDATE resources
-                        SET parent_uid = NULL
+                        SET parent_uid = NULL,
+                            revision = revision + 1
                         WHERE parent_uid = $1
                         "#,
                     )
@@ -336,7 +348,8 @@ impl ResourceStore for PgResourceStore {
             let marked = sqlx::query_as::<_, ResourceRow>(
                 r#"
                 UPDATE resources
-                SET deletion_timestamp = COALESCE(deletion_timestamp, NOW())
+                SET deletion_timestamp = COALESCE(deletion_timestamp, NOW()),
+                    revision = revision + 1
                 WHERE uid = $1
                 RETURNING *
                 "#,
@@ -384,11 +397,13 @@ impl ResourceStore for PgResourceStore {
 
         if child_count > 0 {
             // Fan out: stamp any unmarked children. Ensure the cascade finalizer is present
-            // (in case the row was tombstoned by some other path that didn't add it).
+            // (in case the row was tombstoned by some other path that didn't add it). Bump
+            // revision on every row we mutate so observers see the change.
             sqlx::query(
                 r#"
                 UPDATE resources
-                SET deletion_timestamp = NOW()
+                SET deletion_timestamp = NOW(),
+                    revision = revision + 1
                 WHERE parent_uid = $1 AND deletion_timestamp IS NULL
                 "#,
             )
@@ -402,6 +417,10 @@ impl ResourceStore for PgResourceStore {
                 SET finalizers = CASE
                         WHEN $2 = ANY(finalizers) THEN finalizers
                         ELSE array_append(finalizers, $2)
+                    END,
+                    revision = CASE
+                        WHEN $2 = ANY(finalizers) THEN revision
+                        ELSE revision + 1
                     END
                 WHERE uid = $1
                 RETURNING *
@@ -415,11 +434,16 @@ impl ResourceStore for PgResourceStore {
             return Ok(DeleteOutcome::MarkedForDeletion(Box::new(row)));
         }
 
-        // No children. Drop the cascade finalizer if present.
+        // No children. Drop the cascade finalizer if present. Only bump revision when the
+        // finalizer was actually removed so idempotent re-calls don't churn the version.
         let row = sqlx::query_as::<_, ResourceRow>(
             r#"
             UPDATE resources
-            SET finalizers = array_remove(finalizers, $2)
+            SET finalizers = array_remove(finalizers, $2),
+                revision = CASE
+                    WHEN $2 = ANY(finalizers) THEN revision + 1
+                    ELSE revision
+                END
             WHERE uid = $1
             RETURNING *
             "#,
@@ -617,7 +641,8 @@ impl ResourceStore for PgResourceStore {
         let result = sqlx::query_as::<_, ResourceRow>(
             r#"
             UPDATE resources
-            SET parent_uid = $2
+            SET parent_uid = $2,
+                revision = revision + 1
             WHERE uid = $1
             RETURNING *
             "#,
@@ -791,20 +816,23 @@ impl ResourceStore for PgResourceStore {
 
         let api_version = format!("{group_name}/{storage_version}");
 
-        // Use the cached validator, or compile one and store it in the cache
+        // Use the cached validator, or compile one and store it in the cache. A schema that
+        // fails to compile is a hard error: silently falling back to NoOpValidator would let
+        // invalid specs through. Registration validates compilability up front, so this
+        // branch only fires for rows that bypassed validation (e.g. via direct SQL).
         let schema_validator: Arc<dyn SpecValidator> = match cached_validator {
             Some(v) => v,
             None => {
-                let v: Arc<dyn SpecValidator> = versions
-                    .iter()
-                    .find(|v| v.storage)
-                    .and_then(|v| v.schema.clone())
-                    .map(|s| {
-                        JsonSchemaValidator::new(s)
-                            .map(|v| Arc::new(v) as Arc<dyn SpecValidator>)
-                            .unwrap_or_else(|_| Arc::new(NoOpValidator))
-                    })
-                    .unwrap_or_else(|| Arc::new(NoOpValidator));
+                let storage_version = versions.iter().find(|v| v.storage);
+                let v: Arc<dyn SpecValidator> = match storage_version.and_then(|v| v.schema.clone())
+                {
+                    Some(schema) => Arc::new(JsonSchemaValidator::new(schema).map_err(|e| {
+                        StoreError::Validation(format!(
+                            "ResourceDefinition '{collection}' has an invalid JSON schema: {e}"
+                        ))
+                    })?) as Arc<dyn SpecValidator>,
+                    None => Arc::new(NoOpValidator),
+                };
                 if let Ok(mut cache) = self.schema_cache.write() {
                     cache.insert(collection.to_string(), v.clone());
                 }
@@ -825,25 +853,36 @@ impl ResourceStore for PgResourceStore {
         &self,
         params: CreateResourceParams,
     ) -> Result<ResourceRow, StoreError> {
-        // ResourceDefinition names follow the {plural}.{group} convention so dots are allowed,
-        // unlike instance resource names. Reject empty segments (e.g. "widgets..dev").
-        if params.name.is_empty()
-            || params.name.starts_with('.')
-            || params.name.ends_with('.')
-            || params.name.contains("..")
-        {
-            return Err(StoreError::Validation(
-                "ResourceDefinition name must be a non-empty dot-separated string with no empty segments"
-                    .to_string(),
-            ));
-        }
-
-        // Validate spec format and reserved-name rules
+        // Validate spec format and reserved-name rules first so plural/group are sound.
         ResourceDefinitionValidator.validate_spec(&params.spec)?;
 
         // Parse once; safe to unwrap because validate_spec succeeded above
         let spec: ResourceDefinitionSpec = serde_json::from_value(params.spec.clone())
             .expect("spec parseable: ResourceDefinitionValidator.validate_spec succeeded");
+
+        // ResourceDefinition names follow the {plural}.{group} convention. Identity fields are
+        // immutable post-creation, so an inconsistent name becomes permanent — reject upfront.
+        let expected_name = format!("{}.{}", spec.plural, spec.group);
+        if params.name != expected_name {
+            return Err(StoreError::Validation(format!(
+                "ResourceDefinition name must equal '{{plural}}.{{group}}' \
+                 (expected '{expected_name}', got '{}')",
+                params.name
+            )));
+        }
+
+        // Validate the embedded JSON schema compiles. The `resources_name_format` DB constraint
+        // enforces DNS-label segments, so we don't re-check structure here.
+        if let Some(storage_version) = spec.versions.iter().find(|v| v.storage) {
+            if let Some(schema) = storage_version.schema.clone() {
+                JsonSchemaValidator::new(schema).map_err(|e| {
+                    StoreError::Validation(format!(
+                        "ResourceDefinition '{}' has an invalid JSON schema: {e}",
+                        params.name
+                    ))
+                })?;
+            }
+        }
 
         let mut tx = self.pool.begin().await?;
 
@@ -910,6 +949,17 @@ impl ResourceStore for PgResourceStore {
 
         let new_spec: ResourceDefinitionSpec = serde_json::from_value(params.spec.clone())
             .expect("spec parseable: ResourceDefinitionValidator.validate_spec succeeded");
+
+        // Validate that the new spec's JSON schema (if any) compiles. Symmetric with register.
+        if let Some(storage_version) = new_spec.versions.iter().find(|v| v.storage) {
+            if let Some(schema) = storage_version.schema.clone() {
+                JsonSchemaValidator::new(schema).map_err(|e| {
+                    StoreError::Validation(format!(
+                        "ResourceDefinition has an invalid JSON schema: {e}"
+                    ))
+                })?;
+            }
+        }
 
         let mut tx = self.pool.begin().await?;
 
