@@ -985,19 +985,23 @@ impl ResourceBuilder {
                     spec: Some(PodSpec {
                         security_context: self.create_pod_security_context(),
                         image_pull_secrets: {
-                            if self.registry_provider.requires_pull_secret() {
-                                let secret_name = self
-                                    .image_pull_secret_name
-                                    .as_deref()
-                                    .or(Some(IMAGE_PULL_SECRET_NAME));
-                                secret_name.map(|name| {
-                                    vec![LocalObjectReference {
-                                        name: name.to_string(),
-                                    }]
-                                })
-                            } else {
-                                None
-                            }
+                            // Use the explicitly-configured secret name if present.
+                            // Fall back to the default constant only when the registry
+                            // provider needs the controller to mint pull secrets.
+                            // requires_pull_secret() == false means the cluster handles
+                            // auth itself (e.g. node IAM), but an explicit
+                            // image_pull_secret_name should still always be honoured.
+                            let secret_name =
+                                self.image_pull_secret_name.as_deref().or_else(|| {
+                                    self.registry_provider
+                                        .requires_pull_secret()
+                                        .then_some(IMAGE_PULL_SECRET_NAME)
+                                });
+                            secret_name.map(|name| {
+                                vec![LocalObjectReference {
+                                    name: name.to_string(),
+                                }]
+                            })
                         },
                         containers: vec![Container {
                             name: "app".to_string(),
@@ -1368,11 +1372,25 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::Arc;
 
-    struct TestRegistryProvider;
+    struct TestRegistryProvider {
+        requires_pull_secret: bool,
+    }
+
+    impl Default for TestRegistryProvider {
+        fn default() -> Self {
+            Self {
+                requires_pull_secret: true,
+            }
+        }
+    }
 
     #[async_trait]
     impl RegistryProvider for TestRegistryProvider {
-        async fn get_credentials(&self, _repository: &str) -> Result<RegistryCredentials> {
+        async fn get_credentials(
+            &self,
+            _repository: &str,
+            _tag: &str,
+        ) -> Result<RegistryCredentials> {
             unreachable!("not used in these tests")
         }
 
@@ -1391,6 +1409,10 @@ mod tests {
         fn get_image_tag(&self, repository: &str, tag: &str, _tag_type: ImageTagType) -> String {
             format!("registry.example.test/rise/{repository}:{tag}")
         }
+
+        fn requires_pull_secret(&self) -> bool {
+            self.requires_pull_secret
+        }
     }
 
     fn test_resource_builder() -> ResourceBuilder {
@@ -1400,7 +1422,7 @@ mod tests {
             environment_ingress_url_template: None,
             ingress_port: None,
             ingress_schema: "https".to_string(),
-            registry_provider: Arc::new(TestRegistryProvider),
+            registry_provider: Arc::new(TestRegistryProvider::default()),
             auth_backend_url: "https://auth.example.test".to_string(),
             auth_signin_url: "https://signin.example.test".to_string(),
             backend_address: None,
@@ -1608,6 +1630,87 @@ mod tests {
 
         assert!(container.env.is_none());
         assert!(container.env_from.is_none());
+    }
+
+    fn pod_spec_from_deployment(k8s_deployment: &K8sDeployment) -> &PodSpec {
+        k8s_deployment
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+    }
+
+    fn make_deployment(
+        image_pull_secret_name: Option<&str>,
+        requires_pull_secret: bool,
+    ) -> K8sDeployment {
+        let mut builder = test_resource_builder();
+        builder.registry_provider = Arc::new(TestRegistryProvider {
+            requires_pull_secret,
+        });
+        builder.image_pull_secret_name = image_pull_secret_name.map(str::to_string);
+        builder.create_k8s_deployment(
+            &test_project(),
+            &test_deployment(),
+            "demo",
+            "registry.example.test/rise/demo:latest",
+            8080,
+            vec![],
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn image_pull_secret_explicit_name_honoured_when_requires_pull_secret_false() {
+        let d = make_deployment(Some("my-registry-creds"), false);
+        let secrets = &pod_spec_from_deployment(&d).image_pull_secrets;
+        assert_eq!(
+            secrets
+                .as_ref()
+                .and_then(|s| s.first())
+                .map(|s| s.name.as_str()),
+            Some("my-registry-creds"),
+        );
+    }
+
+    #[test]
+    fn image_pull_secret_explicit_name_honoured_when_requires_pull_secret_true() {
+        let d = make_deployment(Some("my-registry-creds"), true);
+        let secrets = &pod_spec_from_deployment(&d).image_pull_secrets;
+        assert_eq!(
+            secrets
+                .as_ref()
+                .and_then(|s| s.first())
+                .map(|s| s.name.as_str()),
+            Some("my-registry-creds"),
+        );
+    }
+
+    #[test]
+    fn image_pull_secret_defaults_to_constant_when_requires_pull_secret_true_and_no_explicit_name()
+    {
+        let d = make_deployment(None, true);
+        let secrets = &pod_spec_from_deployment(&d).image_pull_secrets;
+        assert_eq!(
+            secrets
+                .as_ref()
+                .and_then(|s| s.first())
+                .map(|s| s.name.as_str()),
+            Some(IMAGE_PULL_SECRET_NAME),
+        );
+    }
+
+    #[test]
+    fn image_pull_secret_absent_when_requires_pull_secret_false_and_no_explicit_name() {
+        let d = make_deployment(None, false);
+        let secrets = &pod_spec_from_deployment(&d).image_pull_secrets;
+        assert!(secrets.is_none());
     }
 }
 

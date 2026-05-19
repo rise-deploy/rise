@@ -2,7 +2,7 @@
 replicaCount: 1
 
 image:
-  repository: ghcr.io/niklasrosenstein/rise
+  repository: ghcr.io/rise-deploy/rise
   pullPolicy: IfNotPresent
   tag: ""  # Overrides the image tag whose default is the chart appVersion
 
@@ -134,7 +134,6 @@ config:
     host: "0.0.0.0"
     port: 3000
     public_url: "http://rise.example.com"
-    # cookie_domain: ""  # Optional: Cookie domain for session cookies (e.g., ".rise.dev" for subdomain sharing)
     # cookie_secure: true  # Optional: Set Secure flag on cookies (default: true, set false for HTTP development)
 
   auth:

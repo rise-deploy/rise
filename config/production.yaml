@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=../docs/schemas/backend-settings.schema.json
+# yaml-language-server: $schema=../docs/user/public/schemas/backend-settings.schema.json
 # Production configuration example.
 #
 # This file is intentionally complete (not layered on a base config).
@@ -8,7 +8,6 @@ server:
   host: "0.0.0.0"
   port: 3000
   public_url: "${PUBLIC_URL}"
-  cookie_domain: "${COOKIE_DOMAIN:-}"
   cookie_secure: true
   jwt_signing_secret: "${RISE_JWT_SIGNING_SECRET}" # Generate with: openssl rand -base64 32
   jwt_claims: ["sub", "email", "name"]

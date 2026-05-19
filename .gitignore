@@ -1151,9 +1151,14 @@ docs/superpowers/
 pb_data
 .claude/
 /core.*
+.env
 
-# mdbook output
+# Documentation build output
 /book
+docs/node_modules
+docs/*/node_modules
+docs/*/dist
+docs/*/.astro
 
 # Local config overrides
 **/config/local.*

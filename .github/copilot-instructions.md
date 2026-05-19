@@ -191,10 +191,11 @@ cargo test --all-features
 
 ## Documentation
 
-- User-facing documentation is in `/docs` (built with mdbook)
+- User-facing documentation is in `/docs/user` (built with Astro Starlight)
 - Keep documentation updated when making changes
 - Don't be overly verbose - focus on context and examples
-- Documentation files: `setup.md`, `development.md`, `cli.md`, `authentication.md`, etc.
+- Bundled user docs live under `docs/user/src/content/docs`
+- Engineering docs live under `docs/engineering/src/content/docs`
 
 ## Common Tasks
 

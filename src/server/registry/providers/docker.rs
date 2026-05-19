@@ -68,7 +68,7 @@ impl OciClientAuthProvider {
 
 #[async_trait]
 impl RegistryProvider for OciClientAuthProvider {
-    async fn get_credentials(&self, repository: &str) -> Result<RegistryCredentials> {
+    async fn get_credentials(&self, repository: &str, _tag: &str) -> Result<RegistryCredentials> {
         tracing::info!("Returning OCI registry info for repository: {}", repository);
 
         // Return client-facing registry URL - credentials assumed to be configured via docker login

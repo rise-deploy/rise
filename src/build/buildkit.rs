@@ -61,10 +61,10 @@ fn generate_buildkit_config() -> Option<(String, String)> {
 
     let mut config = String::new();
     for registry in registries {
-        config.push_str(&format!(
-            "[registry.\"{}\"]\n  http = true\n  insecure = true\n\n",
-            registry
-        ));
+        // Only set http=true, NOT insecure=true. BuildKit treats insecure=true
+        // as "use HTTPS with self-signed certs" which overrides http=true and
+        // breaks plain HTTP registries. See https://github.com/moby/buildkit/issues/5872
+        config.push_str(&format!("[registry.\"{}\"]\n  http = true\n\n", registry));
     }
 
     let hash = compute_string_hash(&config);
@@ -212,6 +212,28 @@ fn get_proxy_hash_label(container_cli: &str, daemon_name: &str) -> Option<String
     }
 
     None
+}
+
+/// Get host_network label from container
+fn get_host_network_label(container_cli: &str, daemon_name: &str) -> bool {
+    let output = Command::new(container_cli)
+        .args([
+            "inspect",
+            "--format",
+            "{{index .Config.Labels \"rise.host_network\"}}",
+            daemon_name,
+        ])
+        .output()
+        .ok();
+
+    if let Some(output) = output {
+        if output.status.success() {
+            let label_value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            return label_value == "true";
+        }
+    }
+
+    false
 }
 
 /// Compute expected proxy hash from proxy vars (None if no proxy vars)
@@ -434,6 +456,22 @@ fn create_buildkit_daemon(
         cmd.arg("--label").arg("rise.no_ssl_cert=true");
     }
 
+    // Host networking: if enabled, use --network=host instead of a named Docker network.
+    // Useful in development when BuildKit needs to reach host-bound ports (e.g. localhost:3082).
+    let use_host_network = super::env_var_non_empty("RISE_MANAGED_BUILDKIT_HOST_NETWORK").is_some();
+
+    if use_host_network {
+        if network_name.is_some() {
+            warn!(
+                "RISE_MANAGED_BUILDKIT_HOST_NETWORK is set — \
+                 ignoring RISE_MANAGED_BUILDKIT_NETWORK_NAME (host networking takes precedence)"
+            );
+        }
+        cmd.arg("--network=host")
+            .arg("--label")
+            .arg("rise.host_network=true");
+    }
+
     // Add network label if network is specified
     if let Some(network) = network_name {
         cmd.arg("--label")
@@ -492,10 +530,12 @@ fn create_buildkit_daemon(
 
     info!("BuildKit daemon '{}' created successfully", daemon_name);
 
-    // Connect to network if specified
-    if let Some(network) = network_name {
-        create_network(container_cli.command(), network)?;
-        connect_to_network(container_cli.command(), network, daemon_name)?;
+    // Connect to network if specified (skip when using host networking)
+    if !use_host_network {
+        if let Some(network) = network_name {
+            create_network(container_cli.command(), network)?;
+            connect_to_network(container_cli.command(), network, daemon_name)?;
+        }
     }
 
     // Return BUILDKIT_HOST value for this daemon
@@ -547,6 +587,25 @@ pub(crate) fn ensure_managed_buildkit_daemon(
         let current_proxy_hash = get_proxy_hash_label(container_cli.command(), daemon_name);
         if current_proxy_hash != expected_proxy_hash {
             info!("Proxy configuration has changed, recreating daemon");
+            stop_buildkit_daemon(container_cli, daemon_name)?;
+            return create_buildkit_daemon(
+                container_cli,
+                daemon_name,
+                ssl_cert_file,
+                network_name.as_deref(),
+                &proxy_vars,
+            );
+        }
+
+        // Check if host networking mode has changed
+        let want_host_network =
+            super::env_var_non_empty("RISE_MANAGED_BUILDKIT_HOST_NETWORK").is_some();
+        let has_host_network = get_host_network_label(container_cli.command(), daemon_name);
+        if want_host_network != has_host_network {
+            info!(
+                "Host networking changed (was={}, want={}), recreating daemon",
+                has_host_network, want_host_network
+            );
             stop_buildkit_daemon(container_cli, daemon_name)?;
             return create_buildkit_daemon(
                 container_cli,

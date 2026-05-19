@@ -31,6 +31,20 @@ spec:
       serviceAccountName: {{ include "rise.serviceAccountName" . }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if .Values.postgresql.enabled }}
+      initContainers:
+      - name: wait-for-postgresql
+        image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
+        imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
+        command:
+        - /bin/sh
+        - -c
+        - |
+          until pg_isready -h {{ include "rise.fullname" . }}-postgresql -U {{ .Values.postgresql.auth.username | quote }}; do
+            echo "waiting for PostgreSQL"
+            sleep 2
+          done
+      {{- end }}
       containers:
       # Single server container with all controllers running in the same process
       - name: server

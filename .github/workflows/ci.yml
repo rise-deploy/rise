@@ -19,9 +19,10 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: niklasrosenstein/rise
-  BUILDER_IMAGE_NAME: niklasrosenstein/rise-builder
-  CHART_REGISTRY: ghcr.io/niklasrosenstein/rise
+  IMAGE_NAME: rise-deploy/rise
+  BUILDER_IMAGE_NAME: rise-deploy/rise-builder
+  CHART_REGISTRY: ghcr.io/rise-deploy
+  NODE_VERSION: "24"
   # renovate: datasource=github-tags depName=rust packageName=rust-lang/rust extractVersion=^(?<version>\d+\.\d+\.\d+)$
   RUST_VERSION: "1.95.0"
 
@@ -118,6 +119,9 @@ jobs:
 
       - name: Verify backend config schema is up to date
         run: mise config:schema:check
+
+      - name: Verify rise.toml schema is up to date
+        run: mise rise-toml:schema:check
 
       - name: Verify CRDs are up to date
         run: mise crd:check
@@ -310,6 +314,7 @@ jobs:
           set -euo pipefail
           ci_version="${{ needs.prepare.outputs.ci_version }}"
           image_tag="${{ needs.prepare.outputs.image_tag }}"
+          sed -i "s/^name: .*/name: rise-helm/" helm/rise/Chart.yaml
           sed -i "s/^version: .*/version: ${ci_version}/" helm/rise/Chart.yaml
           sed -i "s/^appVersion: .*/appVersion: \"${image_tag}\"/" helm/rise/Chart.yaml
           cat helm/rise/Chart.yaml
@@ -337,6 +342,360 @@ jobs:
         run: |
           chart_file=$(ls .helm-packages/*.tgz)
           helm push "$chart_file" "oci://${{ env.CHART_REGISTRY }}"
+
+  docs-deploy:
+    name: Deploy docs
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    needs: prepare
+    permissions:
+      contents: read
+      id-token: write
+      pages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
+
+      - name: Install docs dependencies
+        working-directory: docs
+        run: npm ci
+
+      - name: Build user docs
+        working-directory: docs/user
+        env:
+          ASTRO_BASE: /${{ github.event.repository.name }}/user
+          RISE_DOCS_SELECTOR_URL: /${{ github.event.repository.name }}/
+          RISE_DOCS_SWITCH_URL: /${{ github.event.repository.name }}/operator/
+          RISE_DOCS_SWITCH_LABEL: Operator docs
+        run: npm run build
+
+      - name: Build operator docs
+        working-directory: docs/engineering
+        env:
+          ASTRO_BASE: /${{ github.event.repository.name }}/operator
+          RISE_DOCS_SELECTOR_URL: /${{ github.event.repository.name }}/
+          RISE_DOCS_SWITCH_URL: /${{ github.event.repository.name }}/user/
+          RISE_DOCS_SWITCH_LABEL: User docs
+        run: npm run build
+
+      - name: Stage docs
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo_name="${{ github.event.repository.name }}"
+          mkdir -p docs-prod/user docs-prod/operator
+          cp -a docs/user/dist/. docs-prod/user/
+          cp -a docs/engineering/dist/. docs-prod/operator/
+          cat > docs-prod/index.html <<HTML
+          <!doctype html>
+          <html lang="en">
+            <head>
+              <meta charset="utf-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1">
+              <title>Rise Documentation</title>
+              <style>
+                :root {
+                  color-scheme: light dark;
+                  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+                  background: #111827;
+                  color: #f9fafb;
+                }
+                body {
+                  margin: 0;
+                  min-height: 100vh;
+                  display: grid;
+                  place-items: center;
+                }
+                main {
+                  width: min(100% - 32px, 760px);
+                }
+                h1 {
+                  margin: 0 0 12px;
+                  font-size: 36px;
+                  line-height: 1.1;
+                }
+                p {
+                  margin: 0 0 28px;
+                  color: #cbd5e1;
+                  font-size: 17px;
+                }
+                .choices {
+                  display: grid;
+                  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+                  gap: 16px;
+                }
+                a {
+                  display: block;
+                  padding: 20px;
+                  border: 1px solid #334155;
+                  border-radius: 8px;
+                  background: #1f2937;
+                  color: inherit;
+                  text-decoration: none;
+                }
+                a:hover {
+                  border-color: #38bdf8;
+                }
+                strong {
+                  display: block;
+                  margin-bottom: 8px;
+                  font-size: 20px;
+                }
+                span {
+                  color: #cbd5e1;
+                }
+              </style>
+            </head>
+            <body>
+              <main>
+                <h1>Rise Documentation</h1>
+                <p>Choose which documentation set to read.</p>
+                <div class="choices">
+                  <a href="/${repo_name}/user/">
+                    <strong>Rise User Docs</strong>
+                    <span>Application deployment, CLI usage, environments, service accounts, and project extensions.</span>
+                  </a>
+                  <a href="/${repo_name}/operator/">
+                    <strong>Rise Operator Docs</strong>
+                    <span>Platform operation, Kubernetes setup, configuration, registries, and production guidance.</span>
+                  </a>
+                </div>
+              </main>
+            </body>
+          </html>
+          HTML
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload docs artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: docs-prod
+
+      - name: Deploy docs to GitHub Pages
+        uses: actions/deploy-pages@v4
+
+  docs-preview:
+    name: Deploy docs preview
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && needs.prepare.outputs.is_trusted_pr == 'true'
+    needs: prepare
+    permissions:
+      contents: read
+      id-token: write
+      issues: write
+      pages: write
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
+
+      - name: Install docs dependencies
+        working-directory: docs
+        run: npm ci
+
+      - name: Build user docs preview
+        working-directory: docs/user
+        env:
+          ASTRO_BASE: /${{ github.event.repository.name }}/preview/pr-${{ github.event.pull_request.number }}/user
+          RISE_DOCS_SELECTOR_URL: /${{ github.event.repository.name }}/preview/pr-${{ github.event.pull_request.number }}/
+          RISE_DOCS_SWITCH_URL: /${{ github.event.repository.name }}/preview/pr-${{ github.event.pull_request.number }}/operator/
+          RISE_DOCS_SWITCH_LABEL: Operator docs
+        run: npm run build
+
+      - name: Build operator docs preview
+        working-directory: docs/engineering
+        env:
+          ASTRO_BASE: /${{ github.event.repository.name }}/preview/pr-${{ github.event.pull_request.number }}/operator
+          RISE_DOCS_SELECTOR_URL: /${{ github.event.repository.name }}/preview/pr-${{ github.event.pull_request.number }}/
+          RISE_DOCS_SWITCH_URL: /${{ github.event.repository.name }}/preview/pr-${{ github.event.pull_request.number }}/user/
+          RISE_DOCS_SWITCH_LABEL: User docs
+        run: npm run build
+
+      - name: Stage docs preview
+        shell: bash
+        run: |
+          set -euo pipefail
+          preview_path="preview/pr-${{ github.event.pull_request.number }}"
+          preview_url="/${{ github.event.repository.name }}/${preview_path}"
+          mkdir -p "docs-preview/${preview_path}/user" "docs-preview/${preview_path}/operator"
+          cp -a docs/user/dist/. "docs-preview/${preview_path}/user/"
+          cp -a docs/engineering/dist/. "docs-preview/${preview_path}/operator/"
+          cat > "docs-preview/${preview_path}/index.html" <<HTML
+          <!doctype html>
+          <html lang="en">
+            <head>
+              <meta charset="utf-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1">
+              <title>Rise Docs Preview</title>
+              <style>
+                :root {
+                  color-scheme: light dark;
+                  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+                  background: #111827;
+                  color: #f9fafb;
+                }
+                body {
+                  margin: 0;
+                  min-height: 100vh;
+                  display: grid;
+                  place-items: center;
+                }
+                main {
+                  width: min(100% - 32px, 760px);
+                }
+                h1 {
+                  margin: 0 0 12px;
+                  font-size: 36px;
+                  line-height: 1.1;
+                }
+                p {
+                  margin: 0 0 28px;
+                  color: #cbd5e1;
+                  font-size: 17px;
+                }
+                .choices {
+                  display: grid;
+                  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+                  gap: 16px;
+                }
+                a {
+                  display: block;
+                  padding: 20px;
+                  border: 1px solid #334155;
+                  border-radius: 8px;
+                  background: #1f2937;
+                  color: inherit;
+                  text-decoration: none;
+                }
+                a:hover {
+                  border-color: #38bdf8;
+                }
+                strong {
+                  display: block;
+                  margin-bottom: 8px;
+                  font-size: 20px;
+                }
+                span {
+                  color: #cbd5e1;
+                }
+              </style>
+            </head>
+            <body>
+              <main>
+                <h1>Rise Docs Preview</h1>
+                <p>Choose which documentation set to read for this pull request.</p>
+                <div class="choices">
+                  <a href="${preview_url}/user/">
+                    <strong>Rise User Docs</strong>
+                    <span>Application deployment, CLI usage, environments, service accounts, and project extensions.</span>
+                  </a>
+                  <a href="${preview_url}/operator/">
+                    <strong>Rise Operator Docs</strong>
+                    <span>Platform operation, Kubernetes setup, configuration, registries, and production guidance.</span>
+                  </a>
+                </div>
+              </main>
+            </body>
+          </html>
+          HTML
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload docs preview artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: docs-preview
+
+      - name: Deploy docs preview to GitHub Pages
+        id: pages
+        uses: actions/deploy-pages@v4
+
+      - name: Resolve preview URL
+        id: preview
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          pr_number="${{ github.event.pull_request.number }}"
+          preview_path="/preview/pr-${pr_number}/"
+          pages_url="${{ steps.pages.outputs.page_url }}"
+          if [[ -z "${pages_url}" ]]; then
+            pages_url="$(gh api "repos/${GITHUB_REPOSITORY}/pages" --jq '.html_url' 2>/dev/null || true)"
+          fi
+          if [[ -z "${pages_url}" ]]; then
+            repo_name="${GITHUB_REPOSITORY#*/}"
+            pages_url="https://${{ github.repository_owner }}.github.io/${repo_name}/"
+          fi
+          preview_url="${pages_url%/}${preview_path}"
+
+          echo "path=${preview_path}" >> "$GITHUB_OUTPUT"
+          echo "url=${preview_url}" >> "$GITHUB_OUTPUT"
+          echo "Docs preview deployed to ${preview_url}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment on PR
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const marker = '<!-- rise-docs-preview -->';
+            const previewUrl = '${{ steps.preview.outputs.url }}';
+            const previewPath = '${{ steps.preview.outputs.path }}';
+            const body = [
+              marker,
+              `Docs preview: [\`${previewPath}\`](${previewUrl})`,
+              '',
+              `- [Rise User Docs](${previewUrl}user/)`,
+              `- [Rise Operator Docs](${previewUrl}operator/)`,
+              '',
+              `Updated for commit \`${context.sha.slice(0, 7)}\`.`,
+            ].join('\n');
+
+            const issue_number = context.payload.pull_request.number;
+            const { owner, repo } = context.repo;
+            try {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner,
+                repo,
+                issue_number,
+                per_page: 100,
+              });
+              const existing = comments.find((comment) => comment.body?.includes(marker));
+
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner,
+                  repo,
+                  comment_id: existing.id,
+                  body,
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number,
+                  body,
+                });
+              }
+            } catch (error) {
+              core.warning(`Unable to create or update docs preview comment: ${error.message}`);
+            }
 
   publish-crates:
     name: Publish to crates.io
@@ -414,7 +773,7 @@ jobs:
   e2e-minikube:
     name: Minikube end-to-end smoke tests
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && needs.prepare.outputs.is_trusted_pr == 'true')
     needs:
       - prepare
       - package-image
@@ -440,3 +799,43 @@ jobs:
           RISE_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           RISE_IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
         run: bash scripts/ci/e2e-minikube.sh
+
+  e2e-minikube-jfrog-vault:
+    name: Minikube JFrog/Vault deploy smoke tests
+    runs-on: ubuntu-latest
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && needs.prepare.outputs.is_trusted_pr == 'true')
+    needs:
+      - prepare
+      - package-image
+      - package-helm
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup mise
+        uses: jdx/mise-action@v4
+        with:
+          cache: true
+          experimental: true
+
+      - name: Install mise tools
+        run: mise use -g minikube kubectl helm
+
+      - name: Start Minikube and run JFrog/Vault deploy tests
+        env:
+          RISE_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          RISE_CLI_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.BUILDER_IMAGE_NAME }}
+          RISE_IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
+          RISE_E2E_REGISTRY_MODE: jfrog-vault
+        run: bash scripts/ci/e2e-minikube.sh
+
+      - name: Upload JFrog/Vault service logs
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: jfrog-vault-service-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .rise-e2e-artifacts/jfrog-vault
+          if-no-files-found: ignore

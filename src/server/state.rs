@@ -12,8 +12,8 @@ use crate::server::registry::{
 
 #[cfg(feature = "backend")]
 use crate::server::registry::{
-    models::{EcrConfig, GitLabRegistryConfig},
-    providers::{EcrProvider, GitLabRegistryProvider},
+    models::{EcrConfig, GitLabRegistryConfig, JfrogConfig, JfrogTokenProvider},
+    providers::{EcrProvider, GitLabRegistryProvider, JfrogProvider},
 };
 use crate::server::settings::{
     AuthSettings, EncryptionSettings, RegistrySettings, ServerSettings, Settings,
@@ -347,6 +347,123 @@ impl AppState {
                         registry_url
                     )
                 }
+                #[cfg(feature = "backend")]
+                RegistrySettings::Jfrog {
+                    registry_host,
+                    client_registry_url,
+                    docker_repo_key,
+                    token_provider,
+                    push_permissions,
+                    pull_permissions,
+                    push_token_ttl,
+                    pull_token_ttl,
+                    mint_pull_secrets,
+                } => {
+                    use crate::server::settings::JfrogTokenProviderSettings;
+
+                    let resolved_token_provider = match token_provider {
+                        JfrogTokenProviderSettings::Vault {
+                            vault_addr,
+                            vault_token,
+                            vault_token_file,
+                            vault_mount_path,
+                            vault_role,
+                            scope_override,
+                        } => {
+                            let addr = vault_addr
+                                .clone()
+                                .or_else(|| std::env::var("VAULT_ADDR").ok())
+                                .context("Vault address not configured. Set vault_addr in config or VAULT_ADDR env var")?;
+
+                            // Token resolution priority: config value > token_file config > VAULT_TOKEN_FILE env > VAULT_TOKEN env
+                            let (token, token_file) = if let Some(t) = vault_token {
+                                (t.clone(), None)
+                            } else {
+                                let file_path = vault_token_file
+                                    .clone()
+                                    .or_else(|| std::env::var("VAULT_TOKEN_FILE").ok());
+
+                                if let Some(ref path) = file_path {
+                                    // Read initial token from file for validation
+                                    let initial_token = std::fs::read_to_string(path)
+                                        .with_context(|| {
+                                            format!(
+                                                "Failed to read Vault token from file: {}",
+                                                path
+                                            )
+                                        })?
+                                        .trim()
+                                        .to_string();
+                                    if initial_token.is_empty() {
+                                        anyhow::bail!("Vault token file '{}' is empty", path);
+                                    }
+                                    (initial_token, Some(path.clone()))
+                                } else {
+                                    let token = std::env::var("VAULT_TOKEN")
+                                        .context("Vault token not configured. Set vault_token, vault_token_file in config, or VAULT_TOKEN/VAULT_TOKEN_FILE env var")?;
+                                    (token, None)
+                                }
+                            };
+
+                            JfrogTokenProvider::Vault {
+                                vault_addr: addr,
+                                vault_token: token,
+                                vault_token_file: token_file,
+                                vault_mount_path: vault_mount_path.clone(),
+                                role: vault_role.clone(),
+                                scope_override: *scope_override,
+                            }
+                        }
+                        JfrogTokenProviderSettings::Direct {
+                            jfrog_url,
+                            admin_token,
+                        } => {
+                            if admin_token.is_empty() {
+                                anyhow::bail!(
+                                    "JFrog Direct token provider admin_token is empty. \
+                                     Set admin_token in config or ensure the referenced \
+                                     environment variable is set."
+                                );
+                            }
+                            JfrogTokenProvider::Direct {
+                                jfrog_url: jfrog_url.clone(),
+                                admin_token: admin_token.clone(),
+                            }
+                        }
+                    };
+
+                    let resolved_client_host = client_registry_url
+                        .clone()
+                        .unwrap_or_else(|| registry_host.clone());
+
+                    let jfrog_config = JfrogConfig {
+                        token_provider: resolved_token_provider,
+                        registry_host: registry_host.clone(),
+                        client_registry_host: resolved_client_host,
+                        docker_repo_key: docker_repo_key.clone(),
+                        push_permissions: push_permissions.clone(),
+                        pull_permissions: pull_permissions.clone(),
+                        push_token_ttl: *push_token_ttl,
+                        pull_token_ttl: *pull_token_ttl,
+                        mint_pull_secrets: *mint_pull_secrets,
+                    };
+
+                    let provider = JfrogProvider::new(jfrog_config)
+                        .context("Failed to initialize JFrog registry provider")?;
+                    tracing::info!(
+                        "Initialized JFrog registry provider at {}/{}",
+                        registry_host,
+                        docker_repo_key
+                    );
+                    Arc::new(provider)
+                }
+                #[cfg(not(feature = "backend"))]
+                RegistrySettings::Jfrog { registry_host, .. } => {
+                    anyhow::bail!(
+                        "JFrog registry is configured ({}) but the 'backend' feature is not enabled.",
+                        registry_host
+                    )
+                }
             },
             None => {
                 anyhow::bail!(
@@ -380,56 +497,19 @@ impl AppState {
 
         // Initialize cookie settings for session management
         let cookie_settings = CookieSettings {
-            domain: settings.server.cookie_domain.clone(),
             secure: settings.server.cookie_secure,
+            cookie_domain: settings.server.cookie_domain.clone(),
         };
-        tracing::info!(
-            "Configured session cookies with domain={:?}, secure={}",
-            if cookie_settings.domain.is_empty() {
-                "current-host-only"
-            } else {
-                &cookie_settings.domain
-            },
-            cookie_settings.secure
-        );
-
-        // Validate cookie configuration at startup
-        if !cookie_settings.domain.is_empty() {
-            #[cfg(feature = "backend")]
-            if let Some(crate::server::settings::DeploymentControllerSettings::Kubernetes {
-                auth_signin_url: signin_url,
-                ..
-            }) = &settings.deployment_controller
-            {
-                if let Ok(parsed) = url::Url::parse(signin_url) {
-                    if let Some(host) = parsed.host_str() {
-                        let cookie_domain_normalized =
-                            cookie_settings.domain.trim_start_matches('.');
-
-                        if !host.ends_with(cookie_domain_normalized)
-                            && host != cookie_domain_normalized
-                        {
-                            tracing::warn!(
-                                "⚠ Cookie domain mismatch: cookie_domain='{}' but auth_signin_url host='{}'. \
-                                 Cookies may not work correctly. Consider setting cookie_domain to '.{}' or \
-                                 ensure signin URL uses a matching domain.",
-                                cookie_settings.domain,
-                                host,
-                                host.split('.').skip(1).collect::<Vec<_>>().join(".")
-                            );
-                        }
-                    }
-                }
-
-                // Warn if using localhost with cookie domain
-                if signin_url.contains("localhost") || signin_url.contains("127.0.0.1") {
-                    tracing::warn!(
-                        "⚠ Cookie domain '{}' set but auth_signin_url uses localhost. \
-                         Use a proper domain name (e.g., rise.local) instead of localhost for cookie sharing.",
-                        cookie_settings.domain
-                    );
-                }
-            }
+        if let Some(ref domain) = cookie_settings.cookie_domain {
+            tracing::info!(
+                "Configured session cookies: secure={}, cookie_domain={} (will expire old domain-scoped cookies)",
+                cookie_settings.secure, domain
+            );
+        } else {
+            tracing::info!(
+                "Configured session cookies: secure={} (no Domain attribute — cookies scoped to current host)",
+                cookie_settings.secure
+            );
         }
 
         let public_url = settings.server.public_url.clone();

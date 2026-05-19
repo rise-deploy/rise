@@ -87,86 +87,88 @@ fn parse_expiration(expires_in: &str) -> Result<DateTime<Utc>, String> {
     Ok(Utc::now() + duration)
 }
 
-/// Normalize image reference by adding registry hostname and namespace if missing
-///
-/// # Examples
-/// - `nginx` → `docker.io/library/nginx`
-/// - `nginx:latest` → `docker.io/library/nginx:latest`
-/// - `myorg/app:v1` → `docker.io/myorg/app:v1`
-/// - `quay.io/nginx:latest` → `quay.io/nginx:latest` (unchanged)
-fn normalize_image_reference(image: &str) -> String {
-    // Check if image already has a registry hostname (contains '.' or ':' before first '/')
-    let has_registry = image
-        .split('/')
-        .next()
-        .map(|first_part| first_part.contains('.') || first_part.contains(':'))
-        .unwrap_or(false);
-
-    if has_registry {
-        // Already has registry, return as-is
-        return image.to_string();
-    }
-
-    // No registry specified, default to docker.io
-    // Check if image has a namespace (contains '/')
-    if image.contains('/') {
-        // Has namespace: myorg/app:v1 → docker.io/myorg/app:v1
-        format!("docker.io/{}", image)
-    } else {
-        // No namespace: nginx → docker.io/library/nginx
-        format!("docker.io/library/{}", image)
-    }
-}
-
 /// Resolve image tag to digest by contacting OCI registry directly
 ///
 /// This function uses the OCI Distribution API to fetch the image manifest
 /// (without pulling the entire image) and returns the digest-pinned reference.
+/// Docker Hub shorthand (e.g. `nginx:latest`) is handled by the OCI client internally.
 ///
 /// # Arguments
 /// * `oci_client` - OCI client for registry interaction
 /// * `registry_provider` - Registry provider for credentials
-/// * `normalized_image` - Normalized image reference (e.g., "docker.io/library/nginx:latest")
+/// * `image_ref` - Image reference (e.g., "registry:5000/repo/app:tag" or "nginx:latest")
+/// * `project_name` - Project name for scoped pull credentials and cross-project validation
 ///
 /// # Returns
 /// Fully-qualified digest reference (e.g., "docker.io/library/nginx@sha256:abc123...")
 ///
 /// # Errors
-/// Returns error if image doesn't exist, requires authentication, or registry is unreachable
+/// Returns error if image doesn't exist, requires authentication, registry is unreachable,
+/// or the image belongs to a different Rise project.
 async fn resolve_image_digest(
     oci_client: &crate::server::oci::OciClient,
     registry_provider: &std::sync::Arc<dyn crate::server::registry::RegistryProvider>,
-    normalized_image: &str,
+    image_ref: &str,
+    project_name: &str,
 ) -> anyhow::Result<String> {
-    // Build credentials map from registry provider
+    // Cross-project image validation: if the image is on the Rise registry,
+    // verify it belongs to this project (defense-in-depth).
+    // Use registry_url() (which includes namespace/repo_key) to correctly match
+    // Rise-managed images rather than just the hostname.
+    let registry_url = registry_provider.registry_url();
+    let prefix = format!("{}/", registry_url.trim_end_matches('/'));
+    let is_rise_image = if let Some(image_path) = image_ref.strip_prefix(&prefix) {
+        // After stripping the registry URL prefix, the first path segment is the project name.
+        let image_project = image_path.split([':', '/', '@']).next().unwrap_or("");
+        if image_project != project_name {
+            anyhow::bail!(
+                "Image belongs to a different Rise project '{}' — \
+                 deployments can only use images from their own project '{}'",
+                image_project,
+                project_name
+            );
+        }
+        true
+    } else {
+        false
+    };
+
+    // Only fetch scoped pull credentials for Rise-managed images.
+    // External images use anonymous auth.
     let mut credentials = crate::server::oci::RegistryCredentialsMap::new();
 
-    match registry_provider.get_pull_credentials().await {
-        Ok((user, pass)) if !user.is_empty() => {
-            debug!(
-                "Adding credentials for registry host: {}",
-                registry_provider.registry_host()
-            );
-            credentials.insert(registry_provider.registry_host().to_string(), (user, pass));
-        }
-        Ok(_) => {
-            debug!("Registry provider returned empty credentials, using anonymous auth");
-        }
-        Err(e) => {
-            error!(
-                "Failed to get pull credentials from registry provider: {}",
-                e
-            );
-            // Continue with anonymous auth
+    if is_rise_image {
+        let registry_host = registry_provider.registry_host();
+        match registry_provider
+            .get_k8s_pull_credentials(project_name)
+            .await
+        {
+            Ok(creds) if !creds.username.is_empty() => {
+                debug!(
+                    "Adding project-scoped credentials for registry host: {}",
+                    registry_host
+                );
+                credentials.insert(registry_host.to_string(), (creds.username, creds.password));
+            }
+            Ok(_) => {
+                debug!("Registry provider returned empty credentials, using anonymous auth");
+            }
+            Err(e) => {
+                error!(
+                    "Failed to get pull credentials from registry provider: {:?}",
+                    e
+                );
+                // Continue with anonymous auth
+            }
         }
     }
 
     let digest_ref = oci_client
-        .resolve_image_digest(normalized_image, &credentials)
+        .resolve_image_digest(image_ref, &credentials)
         .await
-        .context(format!("Failed to resolve image '{}'", normalized_image))?;
+        .context(format!("Failed to resolve image '{}'", image_ref))?;
 
-    info!("Resolved '{}' to digest '{}'", normalized_image, digest_ref);
+    info!("Resolved '{}' to digest '{}'", image_ref, digest_ref);
     Ok(digest_ref)
 }
 
@@ -1119,16 +1121,16 @@ pub async fn create_deployment(
             // and the controller uses get_image_tag() (the no-digest path) to pull from there.
             info!("Creating push-image deployment with image: {}", user_image);
 
-            let credentials = state
-                .registry_provider
-                .get_credentials(&payload.project)
-                .await
-                .internal_err("Failed to get credentials")?;
             let image_tag = state.registry_provider.get_image_tag(
                 &payload.project,
                 &deployment_id,
                 ImageTagType::ClientFacing,
             );
+            let credentials = state
+                .registry_provider
+                .get_credentials(&payload.project, &deployment_id)
+                .await
+                .internal_err("Failed to get credentials")?;
 
             let deployment = create_deployment_with_hooks(
                 &state,
@@ -1204,19 +1206,14 @@ pub async fn create_deployment(
         // Path 1b: Direct pre-built image deployment (no push)
         info!("Creating deployment with pre-built image: {}", user_image);
 
-        // Normalize image reference (add registry and namespace if missing)
-        let normalized_image = normalize_image_reference(user_image);
-        info!(
-            "Normalized image reference: {} -> {}",
-            user_image, normalized_image
-        );
-
-        // Resolve image to digest
-        info!("Resolving image '{}' to digest...", normalized_image);
+        // Resolve image to digest (the OCI client handles Docker Hub shorthand
+        // normalization like nginx → docker.io/library/nginx internally)
+        info!("Resolving image '{}' to digest...", user_image);
         let image_digest = resolve_image_digest(
             &state.oci_client,
             &state.registry_provider,
-            &normalized_image,
+            user_image,
+            &project.name,
         )
         .await
         .map_err(|e| {
@@ -1319,19 +1316,19 @@ pub async fn create_deployment(
         }))
     } else {
         // Path 2: Build from source (current behavior)
-        // Get registry credentials
-        let credentials = state
-            .registry_provider
-            .get_credentials(&payload.project)
-            .await
-            .internal_err("Failed to get credentials")?;
-
         // Get full image tag from provider for CLI client (uses client_registry_url if configured)
         let image_tag = state.registry_provider.get_image_tag(
             &payload.project,
             &deployment_id,
             ImageTagType::ClientFacing,
         );
+
+        // Get registry credentials scoped to this exact tag
+        let credentials = state
+            .registry_provider
+            .get_credentials(&payload.project, &deployment_id)
+            .await
+            .internal_err("Failed to get credentials")?;
 
         debug!("Image tag: {}", image_tag);
 

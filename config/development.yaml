@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=../docs/schemas/backend-settings.schema.json
+# yaml-language-server: $schema=../docs/user/public/schemas/backend-settings.schema.json
 # Insecure development configuration - DO NOT USE IN PRODUCTION.
 
 server:
@@ -6,12 +6,11 @@ server:
   port: 3000
   public_url: "http://rise.local:3000"
   frontend_dev_proxy_url: "http://localhost:5173"
-  cookie_domain: "" # Empty = current host only (for localhost:3000 access)
   cookie_secure: false
   jwt_signing_secret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" # Generate with: openssl rand -base64 32
   jwt_claims: ["sub", "email", "name"]
   static_dir: "${RISE_STATIC_DIR:-static}" # In-container: /var/lib/rise/static; local dev: static/
-  docs_dir: "${RISE_DOCS_DIR:-docs}" # In-container: /var/rise/docs; local dev: docs/
+  docs_dir: "${RISE_DOCS_DIR:-docs/user/dist}" # In-container: /var/rise/docs; local dev: build with `mise docs:build`
   ssrf:
     allow_private_networks: true # Allow private IPs for local OIDC (Dex at localhost)
     allow_http: true # Allow HTTP for local development
@@ -45,6 +44,33 @@ registry:
   namespace: "rise-apps"
   client_registry_url: "rise-registry:5000" # Client-facing URL for CLI push operations
 
+# JFrog Artifactory registry (via Vault):
+# registry:
+#   type: "jfrog"
+#   registry_host: "rise-jfrog:8082"
+#   client_registry_url: "localhost:3082"
+#   docker_repo_key: "rise-docker-local"
+#   token_provider:
+#     type: "vault"
+#     vault_mount_path: "artifactory"
+#     vault_role: "rise"
+#     # scope_override: true       # default; requires the Rise Vault plugin fork with allowed_scopes
+#   # push_permissions: "r,w"     # default (ignored when scope_override=false)
+#   # pull_permissions: "r"       # default (ignored when scope_override=false)
+#   # push_token_ttl: 600         # push token TTL in seconds (default: 600)
+#   # pull_token_ttl: 86400       # pull token TTL in seconds (default: 86400 = 24h)
+
+# JFrog Artifactory registry (via Direct token):
+# registry:
+#   type: "jfrog"
+#   registry_host: "rise-jfrog:8082"
+#   client_registry_url: "localhost:3082"
+#   docker_repo_key: "rise-docker-local"
+#   token_provider:
+#     type: "direct"
+#     jfrog_url: "http://localhost:3082"
+#     admin_token: "${JFROG_ADMIN_TOKEN}"
+
 deployment_controller:
   type: "kubernetes"
   pod_security_enabled: false
@@ -55,14 +81,14 @@ deployment_controller:
   staging_ingress_url_template: "{deployment_group}--{project_name}.preview.rise.local"
   environment_ingress_url_template: "{environment}--{project_name}.preview.rise.local"
   namespace_format: "rise-{project_name}"
-  auth_backend_url: "http://host.minikube.internal:3000" # URL for Nginx auth subrequests (Docker bridge IP for Minikube to reach host), must be resolvable by Nginx pod
+  auth_backend_url: "${RISE_AUTH_BACKEND_URL:-http://host.minikube.internal:3000}" # URL for Nginx auth subrequests, must be reachable from ingress-nginx pods
   auth_signin_url: "http://rise.local:3000" # Domain for user-facing OAuth redirects, must be resolvable by users' browsers
   ingress_annotations:
     nginx.ingress.kubernetes.io/ssl-redirect: "false"
   ingress_port: 8080 # `mise minikube:up` port-forwards ingress to this port
   ingress_schema: "http" # Use http for local development
   host_aliases:
-    rise.local: "192.168.49.1" # Minikube host IP, allowing app pods to access Rise backend
+    rise.local: "${RISE_K8S_HOST_IP:-192.168.49.1}" # Host IP reachable from Kubernetes pods
   # Extra projected service account tokens mounted in every app pod at
   # /var/run/secrets/rise/tokens/<name>
   # extra_service_token_audiences:

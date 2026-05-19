@@ -1,13 +1,12 @@
 use axum::{
     body::{to_bytes, Body},
-    extract::{Request, State},
-    http::{header, HeaderMap, Method, StatusCode, Uri},
-    response::{Html, IntoResponse, Response},
+    extract::{Path, Request, State},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::get,
     Router,
 };
 use serde_json::json;
-use std::path::{Component, PathBuf};
 
 use crate::server::settings::ServerSettings;
 use crate::server::state::AppState;
@@ -18,6 +17,13 @@ pub fn frontend_routes() -> Router<AppState> {
     Router::new()
         .route("/", get(serve_index))
         .fallback(fallback_handler)
+}
+
+pub fn docs_routes() -> Router<AppState> {
+    Router::new()
+        .route("/docs", get(|| async { Redirect::permanent("/docs/") }))
+        .route("/docs/", get(serve_docs_index))
+        .route("/docs/{*path}", get(serve_docs_path))
 }
 
 async fn serve_index(State(state): State<AppState>) -> Response {
@@ -56,21 +62,6 @@ async fn fallback_handler(State(state): State<AppState>, request: Request) -> Re
         }
     }
 
-    // Virtual docs route: /static/docs/* — served from configured docs_dir
-    if let Some(rel) = path.strip_prefix("static/docs/") {
-        if let Some((bytes, mime)) =
-            load_docs_content_from_filesystem(&state.server_settings, rel).await
-        {
-            return Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, mime)
-                .header(header::CACHE_CONTROL, "no-cache")
-                .body(Body::from(bytes))
-                .unwrap();
-        }
-        return (StatusCode::NOT_FOUND, "Documentation content not found").into_response();
-    }
-
     // In development, proxy frontend requests to Vite dev server.
     if state.server_settings.frontend_dev_proxy_url.is_some() {
         return proxy_to_vite(&state, parts.method, parts.uri, parts.headers, body).await;
@@ -80,25 +71,56 @@ async fn fallback_handler(State(state): State<AppState>, request: Request) -> Re
     render_index(&state).await
 }
 
-async fn load_docs_content_from_filesystem(
-    settings: &ServerSettings,
-    rel: &str,
-) -> Option<(Vec<u8>, &'static str)> {
-    let docs_dir = settings.docs_dir.as_deref()?;
+async fn serve_docs_index(State(state): State<AppState>) -> Response {
+    serve_docs_file(&state.server_settings, "").await
+}
 
-    // Prevent traversal and absolute paths
-    let mut rel_buf = PathBuf::new();
-    for part in PathBuf::from(rel).components() {
-        match part {
-            Component::Normal(seg) => rel_buf.push(seg),
-            _ => return None,
+async fn serve_docs_path(State(state): State<AppState>, Path(path): Path<String>) -> Response {
+    serve_docs_file(&state.server_settings, &path).await
+}
+
+async fn serve_docs_file(settings: &ServerSettings, rel: &str) -> Response {
+    match load_docs_static_file(settings, rel).await {
+        Some((bytes, served_path)) => {
+            let mime = mime_guess::from_path(&served_path).first_or_octet_stream();
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, mime.as_ref())
+                .header(header::CACHE_CONTROL, docs_cache_control(&served_path))
+                .body(Body::from(bytes))
+                .unwrap()
+        }
+        None => (StatusCode::NOT_FOUND, "Documentation content not found").into_response(),
+    }
+}
+
+async fn load_docs_static_file(settings: &ServerSettings, rel: &str) -> Option<(Vec<u8>, String)> {
+    let docs_dir = settings.docs_dir.as_deref()?;
+    let rel = rel.trim_start_matches('/');
+
+    let candidates = if rel.is_empty() {
+        vec!["index.html".to_string()]
+    } else if rel.ends_with('/') {
+        vec![format!("{rel}index.html")]
+    } else {
+        vec![rel.to_string(), format!("{rel}/index.html")]
+    };
+
+    for candidate in candidates {
+        if let Some(bytes) = load_static_file(docs_dir, &candidate).await {
+            return Some((bytes, candidate));
         }
     }
 
-    let fs_path = PathBuf::from(docs_dir).join(rel_buf);
+    None
+}
 
-    let bytes = tokio::fs::read(&fs_path).await.ok()?;
-    Some((bytes, "text/markdown; charset=utf-8"))
+fn docs_cache_control(path: &str) -> HeaderValue {
+    if path.starts_with("_astro/") {
+        HeaderValue::from_static("public, max-age=31536000, immutable")
+    } else {
+        HeaderValue::from_static("no-cache")
+    }
 }
 
 async fn render_index(state: &AppState) -> Response {
@@ -254,4 +276,90 @@ fn is_hop_by_hop_header(header_name: &str) -> bool {
             | "transfer-encoding"
             | "upgrade"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::settings::OAuthRateLimitSettings;
+
+    fn docs_settings(docs_dir: String) -> ServerSettings {
+        ServerSettings {
+            host: "127.0.0.1".to_string(),
+            port: 3000,
+            public_url: "http://localhost:3000".to_string(),
+            frontend_dev_proxy_url: None,
+            cookie_secure: false,
+            cookie_domain: None,
+            jwt_signing_secret: "01234567890123456789012345678901".to_string(),
+            rs256_private_key_pem: None,
+            rs256_public_key_pem: None,
+            jwt_claims: vec!["sub".to_string(), "email".to_string(), "name".to_string()],
+            jwt_expiry_seconds: 86400,
+            static_dir: None,
+            docs_dir: Some(docs_dir),
+            ssrf: Default::default(),
+            oauth_rate_limit: OAuthRateLimitSettings::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn docs_static_file_serves_root_index() {
+        let temp = tempfile::tempdir().unwrap();
+        tokio::fs::write(temp.path().join("index.html"), "home")
+            .await
+            .unwrap();
+        let settings = docs_settings(temp.path().to_string_lossy().to_string());
+
+        let (bytes, path) = load_docs_static_file(&settings, "").await.unwrap();
+
+        assert_eq!(bytes, b"home");
+        assert_eq!(path, "index.html");
+    }
+
+    #[tokio::test]
+    async fn docs_static_file_serves_nested_page_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let page_dir = temp.path().join("user-guide/getting-started");
+        tokio::fs::create_dir_all(&page_dir).await.unwrap();
+        tokio::fs::write(page_dir.join("index.html"), "page")
+            .await
+            .unwrap();
+        let settings = docs_settings(temp.path().to_string_lossy().to_string());
+
+        let (bytes, path) = load_docs_static_file(&settings, "user-guide/getting-started")
+            .await
+            .unwrap();
+
+        assert_eq!(bytes, b"page");
+        assert_eq!(path, "user-guide/getting-started/index.html");
+    }
+
+    #[tokio::test]
+    async fn docs_static_file_serves_exact_assets() {
+        let temp = tempfile::tempdir().unwrap();
+        let asset_dir = temp.path().join("_astro");
+        tokio::fs::create_dir_all(&asset_dir).await.unwrap();
+        tokio::fs::write(asset_dir.join("app.css"), "asset")
+            .await
+            .unwrap();
+        let settings = docs_settings(temp.path().to_string_lossy().to_string());
+
+        let (bytes, path) = load_docs_static_file(&settings, "_astro/app.css")
+            .await
+            .unwrap();
+
+        assert_eq!(bytes, b"asset");
+        assert_eq!(path, "_astro/app.css");
+    }
+
+    #[tokio::test]
+    async fn docs_static_file_rejects_traversal() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings = docs_settings(temp.path().to_string_lossy().to_string());
+
+        let result = load_docs_static_file(&settings, "../secret.txt").await;
+
+        assert!(result.is_none());
+    }
 }

@@ -1,0 +1,237 @@
+{
+  "$defs": {
+    "BuildConfig": {
+      "description": "Build configuration options for a project",
+      "properties": {
+        "args": {
+          "description": "Build arguments to pass to the build\nFormat: KEY=VALUE or KEY (to pass from environment)",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "backend": {
+          "description": "Build backend (docker, docker:build, docker:buildx, buildctl, pack, railpack[:buildx], railpack:buildctl)",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "build_context": {
+          "description": "Default build context (docker/podman only) - the context directory for the build\nThis is the path argument to `docker build <path>`. Defaults to rise.toml location.\nPath is relative to the rise.toml file location.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "build_contexts": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": null,
+          "description": "Build contexts (docker/podman only) - additional named contexts for multi-stage builds\nFormat: { \"name\" = \"path\" } where path is relative to the rise.toml file location",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "builder": {
+          "description": "Buildpack builder to use (only for pack backend)",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "buildpacks": {
+          "description": "Buildpack(s) to use (only for pack backend)",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "container_cli": {
+          "description": "Container CLI to use (docker or podman)",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dockerfile": {
+          "description": "Path to Dockerfile (relative to rise.toml location). Defaults to \"Dockerfile\" or \"Containerfile\"",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "managed_buildkit": {
+          "description": "Enable managed BuildKit daemon with SSL certificate support",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "no_cache": {
+          "description": "Disable build cache",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "platform": {
+          "description": "Target platform for the container image build (e.g., \"linux/amd64\", \"linux/arm64\").\nDefaults to linux/amd64.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "DeployConfig": {
+      "description": "Deployment resource configuration",
+      "properties": {
+        "cpu": {
+          "description": "CPU allocation (e.g., \"500m\", \"1\") — sets both K8s request and limit",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "memory": {
+          "description": "Memory allocation (e.g., \"256Mi\", \"1Gi\") — sets both K8s request and limit",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "replicas": {
+          "description": "Number of replicas",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "EnvironmentConfig": {
+      "description": "Per-environment configuration",
+      "properties": {
+        "default": {
+          "default": false,
+          "description": "Whether this is the default environment for local deployments",
+          "type": "boolean"
+        },
+        "deploy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeployConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Environment-specific deployment resource overrides"
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Plain-text environment variables scoped to this environment",
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "ProjectConfig": {
+      "description": "Project metadata configuration",
+      "properties": {
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Plain-text environment variables (non-secret)",
+          "type": "object"
+        },
+        "name": {
+          "description": "Project name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Root structure for rise.toml / .rise.toml configuration file",
+  "properties": {
+    "build": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/BuildConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Build configuration (optional)"
+    },
+    "deploy": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DeployConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Deployment resource configuration (optional)"
+    },
+    "environments": {
+      "additionalProperties": {
+        "$ref": "#/$defs/EnvironmentConfig"
+      },
+      "default": {},
+      "description": "Per-environment configuration (optional)",
+      "type": "object"
+    },
+    "project": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ProjectConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Project metadata (optional)"
+    },
+    "version": {
+      "description": "Optional version (must be 1 if present)",
+      "format": "uint32",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    }
+  },
+  "title": "ProjectBuildConfig",
+  "type": "object"
+}

@@ -1264,10 +1264,10 @@ async fn build_image_pull_secret(
         }
     }
 
-    // Fetch fresh credentials
+    // Fetch fresh pull credentials (scoped to this project's repository)
     let credentials = resource_builder
         .registry_provider
-        .get_credentials(&project.name)
+        .get_k8s_pull_credentials(&project.name)
         .await?;
     let registry_host = resource_builder.registry_provider.registry_host();
 
@@ -1437,20 +1437,29 @@ async fn resolve_deployment_env_vars(
     let mut resolved = ResolvedDeploymentEnvVars::default();
 
     for var in env_vars {
+        let key = var.key.trim().to_string();
+        if key != var.key {
+            tracing::warn!(
+                "Environment variable key {:?} has surrounding whitespace; trimming to {:?}",
+                var.key,
+                key
+            );
+        }
+
         let value = if var.is_secret {
             match encryption_provider {
                 Some(provider) => provider
                     .decrypt(&var.value)
                     .await
-                    .with_context(|| format!("Failed to decrypt secret variable '{}'", var.key))?,
+                    .with_context(|| format!("Failed to decrypt secret variable '{}'", key))?,
                 None => {
                     tracing::error!(
                         "Encountered secret variable '{}' but no encryption provider configured",
-                        var.key
+                        key
                     );
                     return Err(anyhow::anyhow!(
                         "Cannot decrypt secret variable '{}': no encryption provider",
-                        var.key
+                        key
                     ));
                 }
             }
@@ -1461,10 +1470,10 @@ async fn resolve_deployment_env_vars(
         if var.is_secret {
             resolved
                 .secret_env_vars
-                .insert(var.key, ByteString(value.into_bytes()));
+                .insert(key, ByteString(value.into_bytes()));
         } else {
             resolved.plain_env_vars.push(EnvVar {
-                name: var.key,
+                name: key,
                 value: Some(value),
                 ..Default::default()
             });
@@ -1588,7 +1597,11 @@ mod tests {
 
     #[async_trait]
     impl RegistryProvider for TestRegistryProvider {
-        async fn get_credentials(&self, _repository: &str) -> Result<RegistryCredentials> {
+        async fn get_credentials(
+            &self,
+            _repository: &str,
+            _tag: &str,
+        ) -> Result<RegistryCredentials> {
             unreachable!("not used in these tests")
         }
 
@@ -1908,5 +1921,65 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
+    }
+
+    #[tokio::test]
+    async fn resolve_deployment_env_vars_trims_whitespace_from_keys() {
+        let env_vars = vec![
+            test_env_var(" LEADING_SPACE", "value1", false, false),
+            test_env_var("TRAILING_SPACE ", "value2", false, false),
+            test_env_var("  BOTH  ", "value3", false, false),
+            test_env_var("CLEAN_KEY", "value4", false, false),
+        ];
+
+        let resolved = resolve_deployment_env_vars(env_vars, None).await.unwrap();
+
+        let names: Vec<&str> = resolved
+            .plain_env_vars
+            .iter()
+            .map(|v| v.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"LEADING_SPACE"),
+            "leading space should be trimmed"
+        );
+        assert!(
+            names.contains(&"TRAILING_SPACE"),
+            "trailing space should be trimmed"
+        );
+        assert!(
+            names.contains(&"BOTH"),
+            "both-side spaces should be trimmed"
+        );
+        assert!(names.contains(&"CLEAN_KEY"));
+        assert!(
+            !names.iter().any(|n| n.starts_with(' ') || n.ends_with(' ')),
+            "no key should retain surrounding whitespace"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_deployment_env_vars_trims_whitespace_from_secret_keys() {
+        let provider = crate::server::encryption::providers::local::LocalEncryptionProvider::new(
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        )
+        .unwrap();
+        let raw_value = "secret-value";
+        let encrypted = provider.encrypt(raw_value).await.unwrap();
+
+        let env_vars = vec![test_env_var(" SECRET_KEY", &encrypted, true, false)];
+
+        let resolved = resolve_deployment_env_vars(env_vars, Some(&provider))
+            .await
+            .unwrap();
+
+        assert!(
+            resolved.secret_env_vars.contains_key("SECRET_KEY"),
+            "trimmed key 'SECRET_KEY' should be present"
+        );
+        assert!(
+            !resolved.secret_env_vars.contains_key(" SECRET_KEY"),
+            "untrimmed key should not be present"
+        );
     }
 }

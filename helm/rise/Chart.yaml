@@ -2,15 +2,15 @@ apiVersion: v2
 name: rise
 description: A Helm chart for Rise - a Kubernetes deployment platform
 type: application
-version: 0.21.1
-appVersion: "0.21.1"
+version: 0.22.1
+appVersion: "0.22.1"
 keywords:
   - kubernetes
   - deployment
   - paas
-home: https://github.com/niklasrosenstein/rise
+home: https://github.com/rise-deploy/rise
 sources:
-  - https://github.com/niklasrosenstein/rise
+  - https://github.com/rise-deploy/rise
 dependencies:
   - name: metacontroller-helm
     version: "4.15.0"
