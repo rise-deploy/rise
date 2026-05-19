@@ -16,12 +16,15 @@ FROM chef AS planner
 # Copy workspace project files
 COPY Cargo.toml Cargo.lock ./
 COPY crates/rise-resource-api/Cargo.toml ./crates/rise-resource-api/Cargo.toml
+COPY crates/rise-resource-store/Cargo.toml ./crates/rise-resource-store/Cargo.toml
 
 # Create dummy sources for cargo to be happy
 RUN mkdir -p src && \
     echo "fn main() {}" > src/main.rs && \
     mkdir -p crates/rise-resource-api/src && \
-    echo "" > crates/rise-resource-api/src/lib.rs
+    echo "" > crates/rise-resource-api/src/lib.rs && \
+    mkdir -p crates/rise-resource-store/src && \
+    echo "" > crates/rise-resource-store/src/lib.rs
 
 RUN cargo chef prepare --recipe-path recipe.json
 
