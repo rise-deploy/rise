@@ -100,4 +100,13 @@ pub trait ResourceStore: Send + Sync {
         &self,
         params: CreateResourceParams,
     ) -> Result<ResourceRow, StoreError>;
+
+    /// Update a ResourceDefinition resource. Keeps the `resource_definitions` projection table in
+    /// sync with the `resources` row and enforces that identity fields (group, kind, plural, scope)
+    /// are immutable once set.
+    async fn update_resource_definition(
+        &self,
+        uid: Uuid,
+        params: UpdateResourceParams,
+    ) -> Result<ResourceRow, StoreError>;
 }

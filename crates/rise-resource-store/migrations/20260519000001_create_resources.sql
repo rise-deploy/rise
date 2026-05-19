@@ -19,6 +19,17 @@ ALTER TABLE resources
     ADD CONSTRAINT resources_discriminator_format
     CHECK (discriminator ~ '^[a-z0-9][a-z0-9-]{6}[a-z0-9]$');
 
+-- Names follow the DNS-label format for regular resources (my-org) and the DNS-subdomain
+-- format for ResourceDefinitions (widgets.example.dev). Both share the same rule: starts
+-- and ends with an alphanumeric character, no consecutive dots, no leading/trailing hyphens
+-- per segment, max 253 chars (DNS subdomain limit).
+ALTER TABLE resources
+    ADD CONSTRAINT resources_name_format
+    CHECK (
+        name ~ '^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$'
+        AND position('..' in name) = 0
+    );
+
 ALTER TABLE resources
     ADD CONSTRAINT resources_metadata_is_object
     CHECK (jsonb_typeof(metadata) = 'object');

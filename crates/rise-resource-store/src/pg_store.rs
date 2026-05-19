@@ -1,12 +1,13 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
 use rise_resource_api::{
-    validate_controller_id, ResourceDefinitionSpec, ResourceScope, API_VERSION_V1ALPHA1,
-    ORGANIZATION_COLLECTION, ORGANIZATION_KIND, RESOURCE_DEFINITION_COLLECTION,
-    RESOURCE_DEFINITION_KIND,
+    validate_controller_id, validate_resource_name, ResourceDefinitionSpec, ResourceScope,
+    API_VERSION_V1ALPHA1, ORGANIZATION_COLLECTION, ORGANIZATION_KIND,
+    RESOURCE_DEFINITION_COLLECTION, RESOURCE_DEFINITION_KIND,
 };
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 
 use crate::discriminator;
 use crate::error::StoreError;
@@ -21,11 +22,17 @@ use crate::validation::{
 
 pub struct PgResourceStore {
     pool: PgPool,
+    /// Cache of compiled JSON schema validators keyed by collection plural name.
+    /// Populated on first resolve_collection call; invalidated on register/update.
+    schema_cache: RwLock<HashMap<String, Arc<dyn SpecValidator>>>,
 }
 
 impl PgResourceStore {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            schema_cache: RwLock::new(HashMap::new()),
+        }
     }
 
     fn is_name_conflict(err: &sqlx::Error) -> bool {
@@ -65,23 +72,14 @@ impl PgResourceStore {
             _ => None,
         }
     }
-}
 
-#[async_trait::async_trait]
-impl ResourceStore for PgResourceStore {
-    async fn create(&self, params: CreateResourceParams) -> Result<ResourceRow, StoreError> {
-        rise_resource_api::validate_resource_name(&params.name)
-            .map_err(|e| StoreError::Validation(e.to_string()))?;
-
-        if let Some(v) = &params.validator {
-            v.validate_spec(&params.spec)?;
-        }
-
-        let metadata = serde_json::to_value(&params.annotations).unwrap_or_default();
-
-        // Retry the INSERT up to 10 times, generating a new discriminator on each
-        // discriminator collision. This handles concurrent creators racing to the same
-        // randomly generated discriminator without a pre-check TOCTOU window.
+    /// Retry an INSERT into `resources` up to 10 times, generating a fresh discriminator on each
+    /// discriminator collision. Returns the inserted row or a `StoreError`.
+    async fn insert_resource_row_with_retry(
+        conn: &mut sqlx::PgConnection,
+        params: &CreateResourceParams,
+        metadata: serde_json::Value,
+    ) -> Result<ResourceRow, StoreError> {
         for _ in 0..10 {
             let discriminator = discriminator::generate();
             let result = sqlx::query_as::<_, ResourceRow>(
@@ -100,7 +98,7 @@ impl ResourceStore for PgResourceStore {
             .bind(metadata.clone())
             .bind(&params.spec)
             .bind(&params.finalizers)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *conn)
             .await;
 
             match result {
@@ -112,6 +110,22 @@ impl ResourceStore for PgResourceStore {
         }
 
         Err(StoreError::DiscriminatorExhausted)
+    }
+}
+
+#[async_trait::async_trait]
+impl ResourceStore for PgResourceStore {
+    async fn create(&self, params: CreateResourceParams) -> Result<ResourceRow, StoreError> {
+        validate_resource_name(&params.name).map_err(|e| StoreError::Validation(e.to_string()))?;
+
+        if let Some(v) = &params.validator {
+            v.validate_spec(&params.spec)?;
+        }
+
+        let metadata = serde_json::to_value(&params.annotations).unwrap_or_default();
+
+        let mut conn = self.pool.acquire().await.map_err(StoreError::Database)?;
+        Self::insert_resource_row_with_retry(&mut conn, &params, metadata).await
     }
 
     async fn get(&self, uid: Uuid) -> Result<Option<ResourceRow>, StoreError> {
@@ -182,6 +196,23 @@ impl ResourceStore for PgResourceStore {
         uid: Uuid,
         params: UpdateResourceParams,
     ) -> Result<ResourceRow, StoreError> {
+        // ResourceDefinitions must go through update_resource_definition to keep the
+        // resource_definitions projection table in sync.
+        let kind: Option<String> = sqlx::query_scalar("SELECT kind FROM resources WHERE uid = $1")
+            .bind(uid)
+            .fetch_optional(&self.pool)
+            .await?;
+        match kind.as_deref() {
+            None => return Err(StoreError::NotFound),
+            Some(RESOURCE_DEFINITION_KIND) => {
+                return Err(StoreError::Validation(
+                    "ResourceDefinitions must be updated through update_resource_definition"
+                        .to_string(),
+                ))
+            }
+            _ => {}
+        }
+
         if let Some(v) = &params.validator {
             v.validate_spec(&params.spec)?;
         }
@@ -215,14 +246,12 @@ impl ResourceStore for PgResourceStore {
             return Ok(row);
         }
 
-        // Zero rows affected — determine why so we can return the right error
-        match self.get(uid).await? {
-            None => Err(StoreError::NotFound),
-            Some(current) => Err(StoreError::RevisionConflict {
-                expected: params.revision,
-                found: current.revision,
-            }),
-        }
+        // Zero rows affected — revision mismatch (NotFound already handled above)
+        let current = self.get(uid).await?.ok_or(StoreError::NotFound)?;
+        Err(StoreError::RevisionConflict {
+            expected: params.revision,
+            found: current.revision,
+        })
     }
 
     async fn delete(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError> {
@@ -320,7 +349,16 @@ impl ResourceStore for PgResourceStore {
             }
         }
 
-        let current = self.get(uid).await?.ok_or(StoreError::NotFound)?;
+        // Use SELECT FOR UPDATE inside a transaction to serialise concurrent finalizer
+        // mutations from different controllers on the same resource, preventing lost updates.
+        let mut tx = self.pool.begin().await?;
+
+        let current =
+            sqlx::query_as::<_, ResourceRow>("SELECT * FROM resources WHERE uid = $1 FOR UPDATE")
+                .bind(uid)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(StoreError::NotFound)?;
 
         let remove_set: std::collections::HashSet<&str> =
             remove.iter().map(String::as_str).collect();
@@ -345,8 +383,10 @@ impl ResourceStore for PgResourceStore {
         )
         .bind(&new_finalizers)
         .bind(uid)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+
+        tx.commit().await?;
 
         Ok(row)
     }
@@ -360,7 +400,13 @@ impl ResourceStore for PgResourceStore {
             return Ok(Some(info));
         }
 
-        // Look up external ResourceDefinitions
+        // Check for a pre-compiled validator to avoid re-compiling JSON schema on every call
+        let cached_validator = self
+            .schema_cache
+            .read()
+            .ok()
+            .and_then(|c| c.get(collection).cloned());
+
         let row = sqlx::query(
             r#"
             SELECT rd.uid, rd.group_name, rd.kind, rd.scope, rd.versions,
@@ -403,17 +449,26 @@ impl ResourceStore for PgResourceStore {
 
         let api_version = format!("{group_name}/{storage_version}");
 
-        // Build a pre-compiled JSON schema validator from the storage version's schema
-        let schema_validator: Arc<dyn SpecValidator> = versions
-            .iter()
-            .find(|v| v.storage)
-            .and_then(|v| v.schema.clone())
-            .map(|s| {
-                JsonSchemaValidator::new(s)
-                    .map(|v| Arc::new(v) as Arc<dyn SpecValidator>)
-                    .unwrap_or_else(|_| Arc::new(NoOpValidator))
-            })
-            .unwrap_or_else(|| Arc::new(NoOpValidator));
+        // Use the cached validator, or compile one and store it in the cache
+        let schema_validator: Arc<dyn SpecValidator> = match cached_validator {
+            Some(v) => v,
+            None => {
+                let v: Arc<dyn SpecValidator> = versions
+                    .iter()
+                    .find(|v| v.storage)
+                    .and_then(|v| v.schema.clone())
+                    .map(|s| {
+                        JsonSchemaValidator::new(s)
+                            .map(|v| Arc::new(v) as Arc<dyn SpecValidator>)
+                            .unwrap_or_else(|_| Arc::new(NoOpValidator))
+                    })
+                    .unwrap_or_else(|| Arc::new(NoOpValidator));
+                if let Ok(mut cache) = self.schema_cache.write() {
+                    cache.insert(collection.to_string(), v.clone());
+                }
+                v
+            }
+        };
 
         Ok(Some(CollectionInfo {
             api_version,
@@ -428,51 +483,31 @@ impl ResourceStore for PgResourceStore {
         &self,
         params: CreateResourceParams,
     ) -> Result<ResourceRow, StoreError> {
-        // Validate the spec first (checks reserved names, format, etc.)
-        let validator = Arc::new(ResourceDefinitionValidator);
-        validator.validate_spec(&params.spec)?;
+        // ResourceDefinition names follow the {plural}.{group} convention so dots are allowed,
+        // unlike instance resource names. Reject empty segments (e.g. "widgets..dev").
+        if params.name.is_empty()
+            || params.name.starts_with('.')
+            || params.name.ends_with('.')
+            || params.name.contains("..")
+        {
+            return Err(StoreError::Validation(
+                "ResourceDefinition name must be a non-empty dot-separated string with no empty segments"
+                    .to_string(),
+            ));
+        }
 
+        // Validate spec format and reserved-name rules
+        ResourceDefinitionValidator.validate_spec(&params.spec)?;
+
+        // Parse once; safe to unwrap because validate_spec succeeded above
         let spec: ResourceDefinitionSpec = serde_json::from_value(params.spec.clone())
-            .map_err(|e| StoreError::Validation(format!("invalid ResourceDefinition spec: {e}")))?;
+            .expect("spec parseable: ResourceDefinitionValidator.validate_spec succeeded");
 
         let mut tx = self.pool.begin().await?;
 
         let metadata = serde_json::to_value(&params.annotations).unwrap_or_default();
 
-        // Retry INSERT up to 10 times on discriminator collision (same as create())
-        let resource_row = 'retry: {
-            for _ in 0..10 {
-                let discriminator = discriminator::generate();
-                let result = sqlx::query_as::<_, ResourceRow>(
-                    r#"
-                    INSERT INTO resources
-                        (api_version, kind, parent_uid, name, discriminator, metadata, spec, finalizers)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                    RETURNING *
-                    "#,
-                )
-                .bind(&params.api_version)
-                .bind(&params.kind)
-                .bind(params.parent_uid)
-                .bind(&params.name)
-                .bind(&discriminator)
-                .bind(metadata.clone())
-                .bind(&params.spec)
-                .bind(&params.finalizers)
-                .fetch_one(&mut *tx)
-                .await;
-
-                match result {
-                    Ok(row) => break 'retry row,
-                    Err(ref e) if Self::is_name_conflict(e) => {
-                        return Err(StoreError::NameConflict)
-                    }
-                    Err(ref e) if Self::is_discriminator_conflict(e) => continue,
-                    Err(e) => return Err(StoreError::Database(e)),
-                }
-            }
-            return Err(StoreError::DiscriminatorExhausted);
-        };
+        let resource_row = Self::insert_resource_row_with_retry(&mut tx, &params, metadata).await?;
 
         // Insert into the resource_definitions projection table
         let scope_val = serde_json::to_value(&spec.scope).unwrap_or_default();
@@ -515,27 +550,117 @@ impl ResourceStore for PgResourceStore {
 
         tx.commit().await?;
 
+        // Evict any stale cached validator for this plural
+        if let Ok(mut cache) = self.schema_cache.write() {
+            cache.remove(&spec.plural);
+        }
+
         Ok(resource_row)
+    }
+
+    async fn update_resource_definition(
+        &self,
+        uid: Uuid,
+        params: UpdateResourceParams,
+    ) -> Result<ResourceRow, StoreError> {
+        // Validate the new spec
+        ResourceDefinitionValidator.validate_spec(&params.spec)?;
+
+        let new_spec: ResourceDefinitionSpec = serde_json::from_value(params.spec.clone())
+            .expect("spec parseable: ResourceDefinitionValidator.validate_spec succeeded");
+
+        let mut tx = self.pool.begin().await?;
+
+        // Lock the row and fetch current state
+        let current =
+            sqlx::query_as::<_, ResourceRow>("SELECT * FROM resources WHERE uid = $1 FOR UPDATE")
+                .bind(uid)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(StoreError::NotFound)?;
+
+        if current.kind != RESOURCE_DEFINITION_KIND {
+            return Err(StoreError::Validation(
+                "resource is not a ResourceDefinition".to_string(),
+            ));
+        }
+
+        // Enforce immutability of identity fields
+        let old_spec: ResourceDefinitionSpec = serde_json::from_value(current.spec.clone())
+            .map_err(|e| {
+                StoreError::Validation(format!("stored ResourceDefinition spec is invalid: {e}"))
+            })?;
+
+        if new_spec.group != old_spec.group
+            || new_spec.kind != old_spec.kind
+            || new_spec.plural != old_spec.plural
+            || new_spec.scope != old_spec.scope
+        {
+            return Err(StoreError::Validation(
+                "ResourceDefinition identity fields (group, kind, plural, scope) are immutable"
+                    .to_string(),
+            ));
+        }
+
+        let metadata = serde_json::to_value(&params.annotations).unwrap_or_default();
+
+        // Update the resources row with optimistic concurrency
+        let updated = sqlx::query_as::<_, ResourceRow>(
+            r#"
+            UPDATE resources
+            SET metadata   = $1,
+                spec       = $2,
+                finalizers = $3,
+                revision   = revision + 1,
+                updated_at = NOW()
+            WHERE uid = $4 AND revision = $5
+            RETURNING *
+            "#,
+        )
+        .bind(metadata)
+        .bind(&params.spec)
+        .bind(&params.finalizers)
+        .bind(uid)
+        .bind(params.revision)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let row = match updated {
+            Some(r) => r,
+            None => {
+                return Err(StoreError::RevisionConflict {
+                    expected: params.revision,
+                    found: current.revision,
+                })
+            }
+        };
+
+        // Sync the projection table (mutable fields only: versions and allowed controllers)
+        let versions_val = serde_json::to_value(&new_spec.versions).unwrap_or_default();
+        sqlx::query(
+            r#"
+            UPDATE resource_definitions
+            SET versions = $1, allowed_status_controller_ids = $2
+            WHERE uid = $3
+            "#,
+        )
+        .bind(versions_val)
+        .bind(&new_spec.allowed_status_controller_ids)
+        .bind(uid)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        // Evict stale cached validator for this collection
+        if let Ok(mut cache) = self.schema_cache.write() {
+            cache.remove(&new_spec.plural);
+        }
+
+        Ok(row)
     }
 }
 
 fn is_controller_finalizer(finalizer: &str, controller_id: &str) -> bool {
     finalizer == controller_id || finalizer.starts_with(&format!("{controller_id}/"))
-}
-
-// Helpers to extract typed values from a sqlx::postgres::PgRow
-trait PgRowExt {
-    fn try_get<'r, T: sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>>(
-        &'r self,
-        column: &str,
-    ) -> Result<T, sqlx::Error>;
-}
-
-impl PgRowExt for sqlx::postgres::PgRow {
-    fn try_get<'r, T: sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>>(
-        &'r self,
-        column: &str,
-    ) -> Result<T, sqlx::Error> {
-        sqlx::Row::try_get(self, column)
-    }
 }
