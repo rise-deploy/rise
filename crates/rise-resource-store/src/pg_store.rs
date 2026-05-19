@@ -2,8 +2,9 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use rise_resource_api::{
-    ResourceDefinitionSpec, ResourceScope, API_VERSION_V1ALPHA1, ORGANIZATION_COLLECTION,
-    ORGANIZATION_KIND, RESOURCE_DEFINITION_COLLECTION, RESOURCE_DEFINITION_KIND,
+    validate_controller_id, ResourceDefinitionSpec, ResourceScope, API_VERSION_V1ALPHA1,
+    ORGANIZATION_COLLECTION, ORGANIZATION_KIND, RESOURCE_DEFINITION_COLLECTION,
+    RESOURCE_DEFINITION_KIND,
 };
 use sqlx::PgPool;
 
@@ -27,48 +28,20 @@ impl PgResourceStore {
         Self { pool }
     }
 
-    async fn discriminator_exists(
-        &self,
-        parent_uid: Option<Uuid>,
-        disc: &str,
-    ) -> Result<bool, StoreError> {
-        let exists: bool = match parent_uid {
-            None => {
-                sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM resources WHERE parent_uid IS NULL AND discriminator = $1)",
-                )
-                .bind(disc)
-                .fetch_one(&self.pool)
-                .await?
-            }
-            Some(pid) => {
-                sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM resources WHERE parent_uid = $1 AND discriminator = $2)",
-                )
-                .bind(pid)
-                .bind(disc)
-                .fetch_one(&self.pool)
-                .await?
-            }
-        };
-        Ok(exists)
-    }
-
-    async fn generate_discriminator(&self, parent_uid: Option<Uuid>) -> Result<String, StoreError> {
-        for _ in 0..10 {
-            let disc = discriminator::generate();
-            if !self.discriminator_exists(parent_uid, &disc).await? {
-                return Ok(disc);
-            }
-        }
-        Err(StoreError::DiscriminatorExhausted)
-    }
-
     fn is_name_conflict(err: &sqlx::Error) -> bool {
         if let sqlx::Error::Database(db) = err {
-            let constraint = db.constraint().unwrap_or("");
-            return constraint == "resources_child_kind_name_unique"
-                || constraint == "resources_root_kind_name_unique";
+            let c = db.constraint().unwrap_or("");
+            return c == "resources_child_kind_name_unique"
+                || c == "resources_root_kind_name_unique";
+        }
+        false
+    }
+
+    fn is_discriminator_conflict(err: &sqlx::Error) -> bool {
+        if let sqlx::Error::Database(db) = err {
+            let c = db.constraint().unwrap_or("");
+            return c == "resources_child_discriminator_unique"
+                || c == "resources_root_discriminator_unique";
         }
         false
     }
@@ -104,36 +77,41 @@ impl ResourceStore for PgResourceStore {
             v.validate_spec(&params.spec)?;
         }
 
-        let discriminator = self.generate_discriminator(params.parent_uid).await?;
         let metadata = serde_json::to_value(&params.annotations).unwrap_or_default();
 
-        let row = sqlx::query_as::<_, ResourceRow>(
-            r#"
-            INSERT INTO resources
-                (api_version, kind, parent_uid, name, discriminator, metadata, spec, finalizers)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            RETURNING *
-            "#,
-        )
-        .bind(&params.api_version)
-        .bind(&params.kind)
-        .bind(params.parent_uid)
-        .bind(&params.name)
-        .bind(&discriminator)
-        .bind(metadata)
-        .bind(&params.spec)
-        .bind(&params.finalizers)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| {
-            if Self::is_name_conflict(&e) {
-                StoreError::NameConflict
-            } else {
-                StoreError::Database(e)
-            }
-        })?;
+        // Retry the INSERT up to 10 times, generating a new discriminator on each
+        // discriminator collision. This handles concurrent creators racing to the same
+        // randomly generated discriminator without a pre-check TOCTOU window.
+        for _ in 0..10 {
+            let discriminator = discriminator::generate();
+            let result = sqlx::query_as::<_, ResourceRow>(
+                r#"
+                INSERT INTO resources
+                    (api_version, kind, parent_uid, name, discriminator, metadata, spec, finalizers)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                RETURNING *
+                "#,
+            )
+            .bind(&params.api_version)
+            .bind(&params.kind)
+            .bind(params.parent_uid)
+            .bind(&params.name)
+            .bind(&discriminator)
+            .bind(metadata.clone())
+            .bind(&params.spec)
+            .bind(&params.finalizers)
+            .fetch_one(&self.pool)
+            .await;
 
-        Ok(row)
+            match result {
+                Ok(row) => return Ok(row),
+                Err(ref e) if Self::is_name_conflict(e) => return Err(StoreError::NameConflict),
+                Err(ref e) if Self::is_discriminator_conflict(e) => continue,
+                Err(e) => return Err(StoreError::Database(e)),
+            }
+        }
+
+        Err(StoreError::DiscriminatorExhausted)
     }
 
     async fn get(&self, uid: Uuid) -> Result<Option<ResourceRow>, StoreError> {
@@ -204,22 +182,16 @@ impl ResourceStore for PgResourceStore {
         uid: Uuid,
         params: UpdateResourceParams,
     ) -> Result<ResourceRow, StoreError> {
-        let current = self.get(uid).await?.ok_or(StoreError::NotFound)?;
-
-        if current.revision != params.revision {
-            return Err(StoreError::RevisionConflict {
-                expected: params.revision,
-                found: current.revision,
-            });
-        }
-
         if let Some(v) = &params.validator {
             v.validate_spec(&params.spec)?;
         }
 
         let metadata = serde_json::to_value(&params.annotations).unwrap_or_default();
 
-        let row = sqlx::query_as::<_, ResourceRow>(
+        // Include the expected revision in the WHERE clause so the update is atomic:
+        // a concurrent write that already incremented the revision will cause zero rows
+        // to be affected, which we detect and map to RevisionConflict.
+        let updated = sqlx::query_as::<_, ResourceRow>(
             r#"
             UPDATE resources
             SET metadata   = $1,
@@ -227,7 +199,7 @@ impl ResourceStore for PgResourceStore {
                 finalizers = $3,
                 revision   = revision + 1,
                 updated_at = NOW()
-            WHERE uid = $4
+            WHERE uid = $4 AND revision = $5
             RETURNING *
             "#,
         )
@@ -235,10 +207,22 @@ impl ResourceStore for PgResourceStore {
         .bind(&params.spec)
         .bind(&params.finalizers)
         .bind(uid)
-        .fetch_one(&self.pool)
+        .bind(params.revision)
+        .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row)
+        if let Some(row) = updated {
+            return Ok(row);
+        }
+
+        // Zero rows affected — determine why so we can return the right error
+        match self.get(uid).await? {
+            None => Err(StoreError::NotFound),
+            Some(current) => Err(StoreError::RevisionConflict {
+                expected: params.revision,
+                found: current.revision,
+            }),
+        }
     }
 
     async fn delete(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError> {
@@ -270,10 +254,18 @@ impl ResourceStore for PgResourceStore {
             return Ok(DeleteOutcome::MarkedForDeletion(Box::new(marked)));
         }
 
+        // Hard delete in a transaction. Delete from the resource_definitions projection
+        // table first (ON DELETE RESTRICT prevents deleting the resources row otherwise).
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM resource_definitions WHERE uid = $1")
+            .bind(uid)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM resources WHERE uid = $1")
             .bind(uid)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
 
         Ok(DeleteOutcome::Deleted)
     }
@@ -284,6 +276,8 @@ impl ResourceStore for PgResourceStore {
         controller_id: &str,
         status_value: serde_json::Value,
     ) -> Result<ResourceRow, StoreError> {
+        validate_controller_id(controller_id).map_err(|e| StoreError::Validation(e.to_string()))?;
+
         let row = sqlx::query_as::<_, ResourceRow>(
             r#"
             UPDATE resources
@@ -315,7 +309,9 @@ impl ResourceStore for PgResourceStore {
         add: &[String],
         remove: &[String],
     ) -> Result<ResourceRow, StoreError> {
-        // Validate ownership: all modified finalizers must be prefixed by controller_id
+        validate_controller_id(controller_id).map_err(|e| StoreError::Validation(e.to_string()))?;
+
+        // All modified finalizers must be prefixed by this controller's ID
         for f in add.iter().chain(remove.iter()) {
             if !is_controller_finalizer(f, controller_id) {
                 return Err(StoreError::Validation(format!(
@@ -405,14 +401,18 @@ impl ResourceStore for PgResourceStore {
             .map(|v| v.name.clone())
             .unwrap_or_else(|| "v1".to_string());
 
-        let api_version = format!("{}/{}", group_name, storage_version);
+        let api_version = format!("{group_name}/{storage_version}");
 
-        // Build a JSON schema validator from the storage version's schema (if present)
+        // Build a pre-compiled JSON schema validator from the storage version's schema
         let schema_validator: Arc<dyn SpecValidator> = versions
             .iter()
             .find(|v| v.storage)
             .and_then(|v| v.schema.clone())
-            .map(|s| Arc::new(JsonSchemaValidator::new(s)) as Arc<dyn SpecValidator>)
+            .map(|s| {
+                JsonSchemaValidator::new(s)
+                    .map(|v| Arc::new(v) as Arc<dyn SpecValidator>)
+                    .unwrap_or_else(|_| Arc::new(NoOpValidator))
+            })
             .unwrap_or_else(|| Arc::new(NoOpValidator));
 
         Ok(Some(CollectionInfo {
@@ -437,35 +437,42 @@ impl ResourceStore for PgResourceStore {
 
         let mut tx = self.pool.begin().await?;
 
-        // Insert the base resource row
-        let discriminator = self.generate_discriminator(params.parent_uid).await?;
         let metadata = serde_json::to_value(&params.annotations).unwrap_or_default();
 
-        let resource_row = sqlx::query_as::<_, ResourceRow>(
-            r#"
-            INSERT INTO resources
-                (api_version, kind, parent_uid, name, discriminator, metadata, spec, finalizers)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            RETURNING *
-            "#,
-        )
-        .bind(&params.api_version)
-        .bind(&params.kind)
-        .bind(params.parent_uid)
-        .bind(&params.name)
-        .bind(&discriminator)
-        .bind(metadata)
-        .bind(&params.spec)
-        .bind(&params.finalizers)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| {
-            if Self::is_name_conflict(&e) {
-                StoreError::NameConflict
-            } else {
-                StoreError::Database(e)
+        // Retry INSERT up to 10 times on discriminator collision (same as create())
+        let resource_row = 'retry: {
+            for _ in 0..10 {
+                let discriminator = discriminator::generate();
+                let result = sqlx::query_as::<_, ResourceRow>(
+                    r#"
+                    INSERT INTO resources
+                        (api_version, kind, parent_uid, name, discriminator, metadata, spec, finalizers)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    RETURNING *
+                    "#,
+                )
+                .bind(&params.api_version)
+                .bind(&params.kind)
+                .bind(params.parent_uid)
+                .bind(&params.name)
+                .bind(&discriminator)
+                .bind(metadata.clone())
+                .bind(&params.spec)
+                .bind(&params.finalizers)
+                .fetch_one(&mut *tx)
+                .await;
+
+                match result {
+                    Ok(row) => break 'retry row,
+                    Err(ref e) if Self::is_name_conflict(e) => {
+                        return Err(StoreError::NameConflict)
+                    }
+                    Err(ref e) if Self::is_discriminator_conflict(e) => continue,
+                    Err(e) => return Err(StoreError::Database(e)),
+                }
             }
-        })?;
+            return Err(StoreError::DiscriminatorExhausted);
+        };
 
         // Insert into the resource_definitions projection table
         let scope_val = serde_json::to_value(&spec.scope).unwrap_or_default();

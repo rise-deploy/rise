@@ -84,21 +84,25 @@ impl SpecValidator for ResourceDefinitionValidator {
 }
 
 pub struct JsonSchemaValidator {
-    schema: serde_json::Value,
+    validator: jsonschema::Validator,
 }
 
 impl JsonSchemaValidator {
-    pub fn new(schema: serde_json::Value) -> Self {
-        Self { schema }
+    pub fn new(schema: serde_json::Value) -> Result<Self, StoreError> {
+        let validator = jsonschema::validator_for(&schema).map_err(|e| {
+            StoreError::Validation(format!("invalid JSON schema in ResourceDefinition: {e}"))
+        })?;
+        Ok(Self { validator })
     }
 }
 
 impl SpecValidator for JsonSchemaValidator {
     fn validate_spec(&self, spec: &serde_json::Value) -> Result<(), StoreError> {
-        let compiled = jsonschema::validator_for(&self.schema).map_err(|e| {
-            StoreError::Validation(format!("invalid JSON schema in ResourceDefinition: {e}"))
-        })?;
-        let errors: Vec<String> = compiled.iter_errors(spec).map(|e| e.to_string()).collect();
+        let errors: Vec<String> = self
+            .validator
+            .iter_errors(spec)
+            .map(|e| e.to_string())
+            .collect();
         if !errors.is_empty() {
             return Err(StoreError::Validation(format!(
                 "spec validation failed: {}",
