@@ -163,11 +163,11 @@
       "type": "object"
     },
     "ControllerIdentity": {
-      "description": "A trusted external controller identity configured under `auth.controllers`.\n\nEach entry binds a stable controller ID (the key used under\n`status.controllers`) to an OIDC issuer plus optional claim constraints\n(`audience`, `subject`, free-form `claims`). Wildcards in\n`subject`/`claims` follow `JwtValidator::validate_custom_claims` rules.",
+      "description": "A trusted external controller identity configured under `auth.controllers`.\n\nEach entry binds a stable controller ID (the key used under\n`status.controllers`) to an OIDC issuer plus optional claim constraints\n(`audience`, `subject`, free-form `claims`). Wildcards in\n`audience`/`subject`/`claims` follow `JwtValidator::validate_custom_claims`\nglob rules (`*` matches any sequence of characters).",
       "properties": {
         "audience": {
           "default": null,
-          "description": "Expected `aud` claim. Exact match when set.",
+          "description": "Expected `aud` claim. Per RFC 7519 the JWT `aud` may be either a\nstring or an array of strings — the match succeeds when the expected\nvalue equals the string `aud`, or when it appears in the `aud` array.\nGlob `*` supported.",
           "type": [
             "string",
             "null"
@@ -178,7 +178,7 @@
             "type": "string"
           },
           "default": {},
-          "description": "Additional claim constraints. Wildcards supported.",
+          "description": "Additional string-valued claim constraints. Glob `*` supported.",
           "type": "object"
         },
         "id": {
@@ -191,7 +191,7 @@
         },
         "subject": {
           "default": null,
-          "description": "Expected `sub` claim. Wildcards supported.",
+          "description": "Expected `sub` claim. Glob `*` supported.",
           "type": [
             "string",
             "null"

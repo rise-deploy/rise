@@ -12,7 +12,6 @@ use crate::db::{service_accounts, users, User};
 use crate::server::auth::context::VerifiedExternalToken;
 use crate::server::auth::controller::VerifiedControllerToken;
 use crate::server::auth::cookie_helpers;
-use crate::server::auth::jwt::JwtValidator;
 use crate::server::state::AppState;
 
 /// Check if a JWT issuer is a Rise-issued JWT
@@ -197,31 +196,9 @@ pub async fn auth_middleware(
                 (StatusCode::UNAUTHORIZED, format!("Invalid token: {}", e))
             })?;
 
-        let mut matched: Vec<&crate::server::auth::controller::ControllerIdentity> = Vec::new();
-        let mut last_err: Option<String> = None;
-        for ident in &controller_candidates {
-            let mut expected = ident.claims.clone();
-            if let Some(aud) = &ident.audience {
-                expected.insert("aud".to_string(), aud.clone());
-            }
-            if let Some(sub) = &ident.subject {
-                expected.insert("sub".to_string(), sub.clone());
-            }
-            match JwtValidator::validate_custom_claims(&claims, &expected) {
-                Ok(()) => matched.push(ident),
-                Err(e) => {
-                    tracing::debug!(
-                        "Controller identity {:?} did not match token claims: {}",
-                        ident.id,
-                        e
-                    );
-                    last_err = Some(e.to_string());
-                }
-            }
-        }
-
-        match matched.as_slice() {
-            [ident] => {
+        use crate::server::auth::controller::{match_controller_identity, ControllerMatch};
+        match match_controller_identity(&claims, &controller_candidates) {
+            ControllerMatch::Single(ident) => {
                 tracing::info!(
                     "Controller authenticated: identity_id={}, issuer={}",
                     ident.id,
@@ -233,8 +210,7 @@ pub async fn auth_middleware(
                     claims,
                 });
             }
-            [] => {
-                let detail = last_err.unwrap_or_else(|| "unknown".to_string());
+            ControllerMatch::None(detail) => {
                 tracing::warn!(
                     "Controller JWT for issuer '{}' did not match any configured identity: {}",
                     issuer,
@@ -245,7 +221,7 @@ pub async fn auth_middleware(
                     "Token did not match any configured controller identity".to_string(),
                 ));
             }
-            _ => {
+            ControllerMatch::Multiple(matched) => {
                 let ids: Vec<&str> = matched.iter().map(|i| i.id.as_str()).collect();
                 tracing::error!(
                     "Multiple controller identities matched JWT from issuer '{}': {:?}",

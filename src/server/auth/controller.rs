@@ -25,7 +25,8 @@ use crate::server::state::AppState;
 /// Each entry binds a stable controller ID (the key used under
 /// `status.controllers`) to an OIDC issuer plus optional claim constraints
 /// (`audience`, `subject`, free-form `claims`). Wildcards in
-/// `subject`/`claims` follow `JwtValidator::validate_custom_claims` rules.
+/// `audience`/`subject`/`claims` follow `JwtValidator::validate_custom_claims`
+/// glob rules (`*` matches any sequence of characters).
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct ControllerIdentity {
     /// Stable controller ID written under `status.controllers`. Must be a
@@ -34,13 +35,16 @@ pub struct ControllerIdentity {
     pub id: String,
     /// OIDC issuer URL. Used for JWKS discovery and `iss` validation.
     pub issuer: String,
-    /// Expected `aud` claim. Exact match when set.
+    /// Expected `aud` claim. Per RFC 7519 the JWT `aud` may be either a
+    /// string or an array of strings — the match succeeds when the expected
+    /// value equals the string `aud`, or when it appears in the `aud` array.
+    /// Glob `*` supported.
     #[serde(default)]
     pub audience: Option<String>,
-    /// Expected `sub` claim. Wildcards supported.
+    /// Expected `sub` claim. Glob `*` supported.
     #[serde(default)]
     pub subject: Option<String>,
-    /// Additional claim constraints. Wildcards supported.
+    /// Additional string-valued claim constraints. Glob `*` supported.
     #[serde(default)]
     pub claims: HashMap<String, String>,
 }
@@ -83,29 +87,52 @@ impl FromRequestParts<AppState> for ControllerAuthContext {
     }
 }
 
-// DNS-1123 subdomain followed by an optional single `/name` suffix.
-// - Host: one or more lowercase DNS labels joined by `.`, at least one `.` (so
-//   single-word hosts like `localhost` are rejected — controller IDs must be
-//   fully-qualified to act as Kubernetes annotation key prefixes).
-// - Optional path segment after `/`: `[A-Za-z0-9_.-]+` (matches Kubernetes
-//   annotation key name format).
+// DNS-1123 subdomain followed by an optional `/name` suffix where `name`
+// follows Kubernetes annotation key name rules.
+//
+// Host portion: one or more lowercase DNS labels joined by `.`, at least one
+// `.` (so single-word hosts like `localhost` are rejected — controller IDs
+// must be fully-qualified to act as Kubernetes annotation key prefixes).
+//
+// Name portion: matches the rule from
+// <https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#syntax-and-character-set>:
+// "must be 63 characters or less, beginning and ending with an alphanumeric
+// character ([a-z0-9A-Z]) with dashes (-), underscores (_), dots (.), and
+// alphanumerics between". Length is enforced separately in
+// `validate_controller_id` so the regex stays readable.
 static CONTROLLER_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)+(/[A-Za-z0-9_.-]+)?$",
+        r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)+(/[A-Za-z0-9]([A-Za-z0-9_.-]*[A-Za-z0-9])?)?$",
     )
     .expect("controller id regex compiles")
 });
 
+/// Maximum length of the `/name` portion of a controller id, per Kubernetes
+/// annotation key name rules.
+const CONTROLLER_ID_NAME_MAX_LEN: usize = 63;
+
 /// Validate a controller `id` value.
 ///
 /// Format: DNS-1123 subdomain (at least one `.`) optionally followed by a
-/// single `/name` segment, max 253 chars total.
+/// single `/name` segment matching the Kubernetes annotation key name rules
+/// (alphanumeric start/end, `-`/`_`/`.` allowed in between, max 63 chars).
+/// Whole id is capped at 253 chars.
 pub fn validate_controller_id(id: &str) -> Result<()> {
     if id.is_empty() {
         bail!("controller id is empty");
     }
     if id.len() > 253 {
         bail!("controller id too long (>{} chars)", 253);
+    }
+    if let Some(slash_pos) = id.find('/') {
+        let name = &id[slash_pos + 1..];
+        if name.len() > CONTROLLER_ID_NAME_MAX_LEN {
+            bail!(
+                "controller id name portion too long ({} > {} chars)",
+                name.len(),
+                CONTROLLER_ID_NAME_MAX_LEN
+            );
+        }
     }
     if !CONTROLLER_ID_RE.is_match(id) {
         bail!(
@@ -121,6 +148,98 @@ pub type ControllerIndexes = (
     HashMap<String, ControllerIdentity>,
     HashMap<String, Vec<ControllerIdentity>>,
 );
+
+/// Outcome of matching JWT claims against a set of controller identity
+/// candidates that share the token's issuer.
+#[derive(Debug)]
+pub enum ControllerMatch<'a> {
+    /// Exactly one identity matched the token's claim constraints.
+    Single(&'a ControllerIdentity),
+    /// No identity matched. The contained string explains the most recent
+    /// failure (for diagnostics / 401 detail).
+    None(String),
+    /// Two or more identities matched — configuration is ambiguous.
+    Multiple(Vec<&'a ControllerIdentity>),
+}
+
+/// Check whether a JWT `aud` claim matches the expected audience.
+///
+/// `aud` may be a single string or an array of strings per RFC 7519 §4.1.3
+/// (`aud` is "a single case-sensitive string or a JSON array of case-sensitive
+/// strings"). When the expected audience contains a `*` it is matched as a
+/// glob pattern using the same rules as `JwtValidator::validate_custom_claims`.
+fn audience_matches(claim: &serde_json::Value, expected: &str) -> bool {
+    let check = |actual: &str| -> bool {
+        if expected.contains('*') {
+            crate::server::auth::jwt::JwtValidator::matches_wildcard_pattern(expected, actual)
+        } else {
+            actual == expected
+        }
+    };
+    match claim {
+        serde_json::Value::String(s) => check(s),
+        serde_json::Value::Array(arr) => arr.iter().filter_map(|v| v.as_str()).any(check),
+        _ => false,
+    }
+}
+
+/// Match a verified JWT's claims against a list of candidate identities.
+///
+/// Pure helper extracted from `auth_middleware` so it can be unit-tested
+/// without spinning up JWKS. Caller is responsible for verifying that the
+/// JWT signature and `iss` are correct before invoking.
+///
+/// Each identity's constraints are applied as follows:
+/// - `audience`: matched against the JWT `aud` claim, accepting either a
+///   string or an array of strings (RFC 7519 §4.1.3). Glob `*` allowed.
+/// - `subject`: matched against the JWT `sub` claim via
+///   `validate_custom_claims` (string with glob `*`).
+/// - `claims`: matched via `validate_custom_claims` (string-valued claims
+///   with glob `*`).
+///
+/// Returns `Single` when exactly one identity satisfies all constraints,
+/// `Multiple` when two or more do (ambiguous configuration), and `None` with
+/// the most recent failure detail when none match.
+pub fn match_controller_identity<'a>(
+    token_claims: &serde_json::Value,
+    candidates: &'a [ControllerIdentity],
+) -> ControllerMatch<'a> {
+    let mut matched: Vec<&'a ControllerIdentity> = Vec::new();
+    let mut last_err: Option<String> = None;
+
+    for ident in candidates {
+        if let Some(expected_aud) = &ident.audience {
+            let aud_claim = token_claims.get("aud").unwrap_or(&serde_json::Value::Null);
+            if !audience_matches(aud_claim, expected_aud) {
+                last_err = Some(format!(
+                    "identity {:?}: aud claim does not match expected audience {:?}",
+                    ident.id, expected_aud
+                ));
+                continue;
+            }
+        }
+
+        let mut expected_string_claims = ident.claims.clone();
+        if let Some(sub) = &ident.subject {
+            expected_string_claims.insert("sub".to_string(), sub.clone());
+        }
+        match crate::server::auth::jwt::JwtValidator::validate_custom_claims(
+            token_claims,
+            &expected_string_claims,
+        ) {
+            Ok(()) => matched.push(ident),
+            Err(e) => {
+                last_err = Some(format!("identity {:?}: {}", ident.id, e));
+            }
+        }
+    }
+
+    match matched.len() {
+        1 => ControllerMatch::Single(matched.into_iter().next().unwrap()),
+        0 => ControllerMatch::None(last_err.unwrap_or_else(|| "no candidates".to_string())),
+        _ => ControllerMatch::Multiple(matched),
+    }
+}
 
 /// Index a list of `ControllerIdentity` values by id and by issuer.
 ///
@@ -182,6 +301,12 @@ mod tests {
             "controller.example.com/a/b",        // nested path segments not allowed
             "controller.example.com//x",         // empty path segment
             "controller.example.com/with space", // invalid path char
+            "controller.example.com/-leading",   // leading hyphen in name
+            "controller.example.com/trailing-",  // trailing hyphen in name
+            "controller.example.com/.dot",       // leading dot in name
+            "controller.example.com/dot.",       // trailing dot in name
+            "controller.example.com/_under",     // leading underscore in name
+            "controller.example.com/under_",     // trailing underscore in name
         ] {
             assert!(
                 validate_controller_id(id).is_err(),
@@ -192,19 +317,34 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_controller_id_rejects_too_long() {
-        // Build a 254-char id: many short labels.
+    fn test_validate_controller_id_rejects_too_long_total() {
+        // Build a host >253 chars so the whole-id length check fires.
         let host = (0..50).map(|_| "ab").collect::<Vec<_>>().join(".");
-        // host is 50 labels of 2 chars + 49 dots = 100 + 49 = 149 chars
-        let mut id = host.clone();
+        let mut id = host;
         while id.len() <= 253 {
             id.push_str(".ab");
         }
         assert!(id.len() > 253);
-        // Strip until valid form check would matter; format may also fail format check
-        // but length check fires first.
         let err = validate_controller_id(&id).unwrap_err().to_string();
         assert!(err.contains("too long"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_controller_id_rejects_name_over_63_chars() {
+        // 64-character name segment (alphanumeric so the format check would pass,
+        // forcing the length check to fire first).
+        let id = format!("controller.example.com/{}", "a".repeat(64));
+        let err = validate_controller_id(&id).unwrap_err().to_string();
+        assert!(
+            err.contains("name portion too long"),
+            "expected name length error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_controller_id_accepts_name_exactly_63_chars() {
+        let id = format!("controller.example.com/{}", "a".repeat(63));
+        validate_controller_id(&id).expect("63-char name should be accepted");
     }
 
     fn ident(id: &str, issuer: &str) -> ControllerIdentity {
@@ -256,5 +396,203 @@ mod tests {
         let c = ident("a.example.com", "");
         let err = build_controller_indexes(&[c]).unwrap_err().to_string();
         assert!(err.contains("empty issuer"), "got: {err}");
+    }
+
+    // --- audience_matches ---
+
+    #[test]
+    fn test_audience_matches_string_exact() {
+        assert!(audience_matches(&serde_json::json!("rise"), "rise"));
+        assert!(!audience_matches(&serde_json::json!("rise"), "other"));
+    }
+
+    #[test]
+    fn test_audience_matches_string_glob() {
+        assert!(audience_matches(&serde_json::json!("rise-prod"), "rise-*"));
+        assert!(audience_matches(&serde_json::json!("rise"), "*"));
+        assert!(!audience_matches(&serde_json::json!("other"), "rise-*"));
+    }
+
+    #[test]
+    fn test_audience_matches_array_contains_expected() {
+        let claim = serde_json::json!(["other-aud", "rise", "extra"]);
+        assert!(audience_matches(&claim, "rise"));
+    }
+
+    #[test]
+    fn test_audience_matches_array_no_match() {
+        let claim = serde_json::json!(["a", "b", "c"]);
+        assert!(!audience_matches(&claim, "rise"));
+    }
+
+    #[test]
+    fn test_audience_matches_array_glob() {
+        let claim = serde_json::json!(["api-prod", "web-dev"]);
+        assert!(audience_matches(&claim, "api-*"));
+        assert!(audience_matches(&claim, "*-dev"));
+        assert!(!audience_matches(&claim, "api-dev"));
+    }
+
+    #[test]
+    fn test_audience_matches_array_ignores_non_string_entries() {
+        let claim = serde_json::json!([42, true, "rise"]);
+        assert!(audience_matches(&claim, "rise"));
+    }
+
+    #[test]
+    fn test_audience_matches_missing_claim() {
+        assert!(!audience_matches(&serde_json::Value::Null, "rise"));
+        assert!(!audience_matches(&serde_json::json!(42), "rise"));
+    }
+
+    // --- match_controller_identity ---
+
+    fn ident_full(
+        id: &str,
+        audience: Option<&str>,
+        subject: Option<&str>,
+        claims: &[(&str, &str)],
+    ) -> ControllerIdentity {
+        ControllerIdentity {
+            id: id.to_string(),
+            issuer: "https://issuer.example.com".to_string(),
+            audience: audience.map(String::from),
+            subject: subject.map(String::from),
+            claims: claims
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn test_match_single_no_constraints() {
+        let candidates = [ident_full("a.example.com", None, None, &[])];
+        let claims = serde_json::json!({"sub": "anyone", "aud": "anything"});
+        let m = match_controller_identity(&claims, &candidates);
+        match m {
+            ControllerMatch::Single(i) => assert_eq!(i.id, "a.example.com"),
+            other => panic!("expected Single, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_match_single_with_constraints() {
+        let candidates = [ident_full(
+            "a.example.com",
+            Some("rise"),
+            Some("ctrl-*"),
+            &[("scope", "controller")],
+        )];
+        let claims = serde_json::json!({
+            "sub": "ctrl-abc",
+            "aud": "rise",
+            "scope": "controller",
+        });
+        let m = match_controller_identity(&claims, &candidates);
+        assert!(matches!(m, ControllerMatch::Single(_)), "got {m:?}");
+    }
+
+    #[test]
+    fn test_match_audience_array() {
+        let candidates = [ident_full("a.example.com", Some("rise"), None, &[])];
+        let claims = serde_json::json!({
+            "sub": "x",
+            "aud": ["other", "rise"],
+        });
+        let m = match_controller_identity(&claims, &candidates);
+        assert!(matches!(m, ControllerMatch::Single(_)), "got {m:?}");
+    }
+
+    #[test]
+    fn test_match_audience_array_no_match() {
+        let candidates = [ident_full("a.example.com", Some("rise"), None, &[])];
+        let claims = serde_json::json!({"sub": "x", "aud": ["other"]});
+        let m = match_controller_identity(&claims, &candidates);
+        match m {
+            ControllerMatch::None(detail) => {
+                assert!(detail.contains("aud claim does not match"), "got: {detail}")
+            }
+            other => panic!("expected None, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_match_none_when_subject_mismatches() {
+        let candidates = [ident_full("a.example.com", None, Some("ctrl-*"), &[])];
+        let claims = serde_json::json!({"sub": "other-bot"});
+        let m = match_controller_identity(&claims, &candidates);
+        match m {
+            ControllerMatch::None(detail) => assert!(detail.contains("a.example.com"), "{detail}"),
+            other => panic!("expected None, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_match_none_when_extra_claim_missing() {
+        let candidates = [ident_full(
+            "a.example.com",
+            None,
+            None,
+            &[("scope", "controller")],
+        )];
+        let claims = serde_json::json!({"sub": "x"});
+        let m = match_controller_identity(&claims, &candidates);
+        assert!(matches!(m, ControllerMatch::None(_)), "got {m:?}");
+    }
+
+    #[test]
+    fn test_match_multiple_when_constraints_ambiguous() {
+        // Two identities with no constraints both match any token.
+        let candidates = [
+            ident_full("a.example.com", None, None, &[]),
+            ident_full("b.example.com", None, None, &[]),
+        ];
+        let claims = serde_json::json!({"sub": "x"});
+        let m = match_controller_identity(&claims, &candidates);
+        match m {
+            ControllerMatch::Multiple(matches) => {
+                let ids: Vec<&str> = matches.iter().map(|i| i.id.as_str()).collect();
+                assert_eq!(ids.len(), 2);
+                assert!(ids.contains(&"a.example.com"));
+                assert!(ids.contains(&"b.example.com"));
+            }
+            other => panic!("expected Multiple, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_match_disambiguates_by_audience() {
+        // Same issuer, different audiences; only one should match.
+        let candidates = [
+            ident_full("a.example.com", Some("rise-a"), None, &[]),
+            ident_full("b.example.com", Some("rise-b"), None, &[]),
+        ];
+        let claims = serde_json::json!({"sub": "x", "aud": "rise-b"});
+        let m = match_controller_identity(&claims, &candidates);
+        match m {
+            ControllerMatch::Single(i) => assert_eq!(i.id, "b.example.com"),
+            other => panic!("expected Single, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_match_disambiguates_by_subject() {
+        let candidates = [
+            ident_full("a.example.com", None, Some("ctrl-a"), &[]),
+            ident_full("b.example.com", None, Some("ctrl-b"), &[]),
+        ];
+        let claims = serde_json::json!({"sub": "ctrl-b"});
+        let m = match_controller_identity(&claims, &candidates);
+        match m {
+            ControllerMatch::Single(i) => assert_eq!(i.id, "b.example.com"),
+            other => panic!("expected Single, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_match_empty_candidates() {
+        let m = match_controller_identity(&serde_json::json!({}), &[]);
+        assert!(matches!(m, ControllerMatch::None(_)));
     }
 }
