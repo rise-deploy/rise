@@ -1,0 +1,23 @@
+[package]
+name = "rise-resource-store"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rise-resource-api = { path = "../rise-resource-api" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+jsonschema = "0.29"
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
