@@ -334,7 +334,11 @@ impl ResourceStore for PgResourceStore {
                     .execute(&mut *tx)
                     .await;
                     if let Err(e) = result {
-                        if Self::is_name_conflict(&e) {
+                        // A child's name or discriminator may collide at the root scope
+                        // (partial unique indexes on (kind, name) and discriminator when
+                        // parent_uid IS NULL). Surface both as NameConflict for parity
+                        // with reparent() rather than leaking an internal Database error.
+                        if Self::is_name_conflict(&e) || Self::is_discriminator_conflict(&e) {
                             return Err(StoreError::NameConflict);
                         }
                         return Err(StoreError::Database(e));
