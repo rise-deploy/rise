@@ -90,7 +90,7 @@ impl AuthContext {
                                 "Token matched multiple controller identities; configuration is ambiguous",
                             ));
                         }
-                        ControllerMatch::None(_) => {}
+                        ControllerMatch::Unmatched(_) => {}
                     }
                 }
 

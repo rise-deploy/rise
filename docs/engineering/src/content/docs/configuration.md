@@ -207,7 +207,7 @@ auth:
 - `operator_users`: Operators have full access to generic resource storage and built-in resource management. Operators do **not** implicitly receive platform (typed CLI/UI) access — list the email in `admin_users` or `platform_access.allowed_user_emails` separately if both are needed.
 
 **Controllers (`auth.controllers`):**
-Trusted external controllers authenticate to Rise with OIDC JWTs. Each entry registers a `ControllerIdentity` that controller endpoints use to validate incoming tokens. PR3 only wires the auth context; generic-resource controller endpoints land in a later increment. Use a dedicated issuer or a dedicated audience for controllers.
+Trusted external controllers authenticate to Rise with OIDC JWTs. Each entry registers a `ControllerIdentity` that controller endpoints use to validate incoming tokens. Controller endpoints are not yet available; this configuration takes effect when the generic resource API is introduced in a future release. Use a dedicated issuer or a dedicated audience per controller to keep identities unambiguous.
 
 ```yaml
 auth:

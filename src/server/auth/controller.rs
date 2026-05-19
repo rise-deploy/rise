@@ -6,8 +6,8 @@
 //! JWTs and project-scoped service-account JWTs) so the type system rules out
 //! mixing controller tokens with user/SA flows.
 //!
-//! Wiring is added in PR3 but no HTTP route consumes the extractor yet — that
-//! lands with PR4 (the generic resource API).
+//! No HTTP route consumes the extractor yet — that lands with the generic
+//! resource API in a future release.
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
@@ -88,7 +88,7 @@ impl FromRequestParts<AppState> for ControllerAuthContext {
                 issuer: token.issuer,
                 claims: token.claims,
             })),
-            ControllerMatch::None(detail) => {
+            ControllerMatch::Unmatched(detail) => {
                 tracing::warn!(
                     "Controller JWT for issuer '{}' did not match any configured identity: {}",
                     token.issuer,
@@ -169,11 +169,14 @@ pub fn validate_controller_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Maps used by middleware to look up controller identities at request time.
-pub type ControllerIndexes = (
-    HashMap<String, ControllerIdentity>,
-    HashMap<String, Vec<ControllerIdentity>>,
-);
+/// Indexes built at startup from the configured controller identities.
+#[derive(Debug)]
+pub struct ControllerIndexes {
+    /// Controller identities keyed by `id`.
+    pub by_id: HashMap<String, ControllerIdentity>,
+    /// Controller identities keyed by issuer URL for O(1) middleware lookup.
+    pub by_issuer: HashMap<String, Vec<ControllerIdentity>>,
+}
 
 /// Outcome of matching JWT claims against a set of controller identity
 /// candidates that share the token's issuer.
@@ -181,9 +184,9 @@ pub type ControllerIndexes = (
 pub enum ControllerMatch<'a> {
     /// Exactly one identity matched the token's claim constraints.
     Single(&'a ControllerIdentity),
-    /// No identity matched. The contained string explains the most recent
-    /// failure (for diagnostics / 401 detail).
-    None(String),
+    /// No identity matched. The contained string lists all per-identity
+    /// rejection reasons, joined by `"; "`, for diagnostics.
+    Unmatched(String),
     /// Two or more identities matched — configuration is ambiguous.
     Multiple(Vec<&'a ControllerIdentity>),
 }
@@ -220,18 +223,18 @@ fn audience_matches(claim: &serde_json::Value, expected: &str) -> bool {
 /// which accepts either a string or an array of strings per RFC 7519 §4.1.3.
 ///
 /// Returns `Single` when exactly one identity satisfies all constraints,
-/// `Multiple` when two or more do (ambiguous configuration), and `None` with
-/// the most recent failure detail when none match.
+/// `Multiple` when two or more do (ambiguous configuration), and `Unmatched`
+/// with all per-identity rejection reasons when none match.
 pub fn match_controller_identity<'a>(
     token_claims: &serde_json::Value,
     candidates: &'a [ControllerIdentity],
 ) -> ControllerMatch<'a> {
     let mut matched: Vec<&'a ControllerIdentity> = Vec::new();
-    let mut last_err: Option<String> = None;
+    let mut errors: Vec<String> = Vec::new();
 
     for ident in candidates {
         let Some(expected_aud) = ident.claims.get("aud") else {
-            last_err = Some(format!(
+            errors.push(format!(
                 "identity {:?}: missing required claims.aud constraint",
                 ident.id
             ));
@@ -239,7 +242,7 @@ pub fn match_controller_identity<'a>(
         };
         let aud_claim = token_claims.get("aud").unwrap_or(&serde_json::Value::Null);
         if !audience_matches(aud_claim, expected_aud) {
-            last_err = Some(format!(
+            errors.push(format!(
                 "identity {:?}: aud claim does not match expected audience {:?}",
                 ident.id, expected_aud
             ));
@@ -258,23 +261,27 @@ pub fn match_controller_identity<'a>(
         ) {
             Ok(()) => matched.push(ident),
             Err(e) => {
-                last_err = Some(format!("identity {:?}: {}", ident.id, e));
+                errors.push(format!("identity {:?}: {}", ident.id, e));
             }
         }
     }
 
     match matched.len() {
         1 => ControllerMatch::Single(matched.into_iter().next().unwrap()),
-        0 => ControllerMatch::None(last_err.unwrap_or_else(|| "no candidates".to_string())),
+        0 => ControllerMatch::Unmatched(if errors.is_empty() {
+            "no candidates".to_string()
+        } else {
+            errors.join("; ")
+        }),
         _ => ControllerMatch::Multiple(matched),
     }
 }
 
 /// Index a list of `ControllerIdentity` values by id and by issuer.
 ///
-/// Validates each id, rejects duplicate ids, and returns
-/// `(by_id, by_issuer)`. Multiple identities may share an issuer (they get
-/// disambiguated by claim constraints at request time).
+/// Validates each id, rejects duplicate ids, and returns a `ControllerIndexes`.
+/// Multiple identities may share an issuer (they get disambiguated by claim
+/// constraints at request time).
 pub fn build_controller_indexes(controllers: &[ControllerIdentity]) -> Result<ControllerIndexes> {
     let mut by_id: HashMap<String, ControllerIdentity> = HashMap::new();
     let mut by_issuer: HashMap<String, Vec<ControllerIdentity>> = HashMap::new();
@@ -300,7 +307,7 @@ pub fn build_controller_indexes(controllers: &[ControllerIdentity]) -> Result<Co
             .push(c.clone());
     }
 
-    Ok((by_id, by_issuer))
+    Ok(ControllerIndexes { by_id, by_issuer })
 }
 
 #[cfg(test)]
@@ -396,16 +403,16 @@ mod tests {
         let c2 = ident("b.example.com/x", "https://issuer.example.com");
         let c3 = ident("c.example.com", "https://other.example.com");
 
-        let (by_id, by_iss) = build_controller_indexes(&[c1, c2, c3]).unwrap();
+        let indexes = build_controller_indexes(&[c1, c2, c3]).unwrap();
 
-        assert_eq!(by_id.len(), 3);
-        assert!(by_id.contains_key("a.example.com"));
-        assert!(by_id.contains_key("b.example.com/x"));
-        assert!(by_id.contains_key("c.example.com"));
+        assert_eq!(indexes.by_id.len(), 3);
+        assert!(indexes.by_id.contains_key("a.example.com"));
+        assert!(indexes.by_id.contains_key("b.example.com/x"));
+        assert!(indexes.by_id.contains_key("c.example.com"));
 
-        assert_eq!(by_iss.len(), 2);
-        assert_eq!(by_iss["https://issuer.example.com"].len(), 2);
-        assert_eq!(by_iss["https://other.example.com"].len(), 1);
+        assert_eq!(indexes.by_issuer.len(), 2);
+        assert_eq!(indexes.by_issuer["https://issuer.example.com"].len(), 2);
+        assert_eq!(indexes.by_issuer["https://other.example.com"].len(), 1);
     }
 
     #[test]
@@ -519,7 +526,9 @@ mod tests {
         let claims = serde_json::json!({"sub": "anyone", "aud": "anything"});
         let m = match_controller_identity(&claims, &candidates);
         match m {
-            ControllerMatch::None(detail) => assert!(detail.contains("claims.aud"), "{detail}"),
+            ControllerMatch::Unmatched(detail) => {
+                assert!(detail.contains("claims.aud"), "{detail}")
+            }
             other => panic!("expected None, got {other:?}"),
         }
     }
@@ -556,7 +565,7 @@ mod tests {
         let claims = serde_json::json!({"sub": "x", "aud": ["other"]});
         let m = match_controller_identity(&claims, &candidates);
         match m {
-            ControllerMatch::None(detail) => {
+            ControllerMatch::Unmatched(detail) => {
                 assert!(detail.contains("aud claim does not match"), "got: {detail}")
             }
             other => panic!("expected None, got {other:?}"),
@@ -572,7 +581,9 @@ mod tests {
         let claims = serde_json::json!({"aud": "rise", "sub": "other-bot"});
         let m = match_controller_identity(&claims, &candidates);
         match m {
-            ControllerMatch::None(detail) => assert!(detail.contains("a.example.com"), "{detail}"),
+            ControllerMatch::Unmatched(detail) => {
+                assert!(detail.contains("a.example.com"), "{detail}")
+            }
             other => panic!("expected None, got {other:?}"),
         }
     }
@@ -585,7 +596,7 @@ mod tests {
         )];
         let claims = serde_json::json!({"aud": "rise", "sub": "x"});
         let m = match_controller_identity(&claims, &candidates);
-        assert!(matches!(m, ControllerMatch::None(_)), "got {m:?}");
+        assert!(matches!(m, ControllerMatch::Unmatched(_)), "got {m:?}");
     }
 
     #[test]
@@ -640,6 +651,6 @@ mod tests {
     #[test]
     fn test_match_empty_candidates() {
         let m = match_controller_identity(&serde_json::json!({}), &[]);
-        assert!(matches!(m, ControllerMatch::None(_)));
+        assert!(matches!(m, ControllerMatch::Unmatched(_)));
     }
 }
