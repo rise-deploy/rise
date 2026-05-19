@@ -1,5 +1,5 @@
-CREATE TABLE resource_definitions (
-    uid                          UUID        PRIMARY KEY REFERENCES resources(uid) ON DELETE RESTRICT,
+CREATE TABLE resource_store.resource_definitions (
+    uid                          UUID        PRIMARY KEY REFERENCES resource_store.resources(uid) ON DELETE RESTRICT,
     group_name                   TEXT        NOT NULL,
     kind                         TEXT        NOT NULL,
     plural                       TEXT        NOT NULL,
@@ -11,12 +11,12 @@ CREATE TABLE resource_definitions (
 );
 
 CREATE UNIQUE INDEX resource_definitions_plural_unique
-    ON resource_definitions (plural);
+    ON resource_store.resource_definitions (plural);
 
 CREATE UNIQUE INDEX resource_definitions_group_kind_unique
-    ON resource_definitions (group_name, kind);
+    ON resource_store.resource_definitions (group_name, kind);
 
-CREATE OR REPLACE FUNCTION resource_definitions_set_updated_at()
+CREATE OR REPLACE FUNCTION resource_store.resource_definitions_set_updated_at()
 RETURNS TRIGGER AS $$
 BEGIN
     NEW.updated_at = NOW();
@@ -25,5 +25,5 @@ END;
 $$ LANGUAGE plpgsql;
 
 CREATE TRIGGER resource_definitions_updated_at
-    BEFORE UPDATE ON resource_definitions
-    FOR EACH ROW EXECUTE FUNCTION resource_definitions_set_updated_at();
+    BEFORE UPDATE ON resource_store.resource_definitions
+    FOR EACH ROW EXECUTE FUNCTION resource_store.resource_definitions_set_updated_at();

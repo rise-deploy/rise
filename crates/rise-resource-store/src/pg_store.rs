@@ -85,7 +85,7 @@ impl PgResourceStore {
             let discriminator = discriminator::generate();
             let result = sqlx::query_as::<_, ResourceRow>(
                 r#"
-                INSERT INTO resources
+                INSERT INTO resource_store.resources
                     (api_version, kind, parent_uid, name, discriminator, metadata, spec, finalizers)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 RETURNING *
@@ -130,10 +130,12 @@ impl ResourceStore for PgResourceStore {
     }
 
     async fn get(&self, uid: Uuid) -> Result<Option<ResourceRow>, StoreError> {
-        let row = sqlx::query_as::<_, ResourceRow>("SELECT * FROM resources WHERE uid = $1")
-            .bind(uid)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row = sqlx::query_as::<_, ResourceRow>(
+            "SELECT * FROM resource_store.resources WHERE uid = $1",
+        )
+        .bind(uid)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row)
     }
 
@@ -146,7 +148,7 @@ impl ResourceStore for PgResourceStore {
         let row =
             match parent_uid {
                 None => sqlx::query_as::<_, ResourceRow>(
-                    "SELECT * FROM resources WHERE kind = $1 AND name = $2 AND parent_uid IS NULL",
+                    "SELECT * FROM resource_store.resources WHERE kind = $1 AND name = $2 AND parent_uid IS NULL",
                 )
                 .bind(kind)
                 .bind(name)
@@ -154,7 +156,7 @@ impl ResourceStore for PgResourceStore {
                 .await?,
                 Some(pid) => {
                     sqlx::query_as::<_, ResourceRow>(
-                        "SELECT * FROM resources WHERE kind = $1 AND name = $2 AND parent_uid = $3",
+                        "SELECT * FROM resource_store.resources WHERE kind = $1 AND name = $2 AND parent_uid = $3",
                     )
                     .bind(kind)
                     .bind(name)
@@ -174,14 +176,14 @@ impl ResourceStore for PgResourceStore {
         let rows =
             match parent_uid {
                 None => sqlx::query_as::<_, ResourceRow>(
-                    "SELECT * FROM resources WHERE kind = $1 AND parent_uid IS NULL ORDER BY name",
+                    "SELECT * FROM resource_store.resources WHERE kind = $1 AND parent_uid IS NULL ORDER BY name",
                 )
                 .bind(kind)
                 .fetch_all(&self.pool)
                 .await?,
                 Some(pid) => {
                     sqlx::query_as::<_, ResourceRow>(
-                        "SELECT * FROM resources WHERE kind = $1 AND parent_uid = $2 ORDER BY name",
+                        "SELECT * FROM resource_store.resources WHERE kind = $1 AND parent_uid = $2 ORDER BY name",
                     )
                     .bind(kind)
                     .bind(pid)
@@ -199,10 +201,11 @@ impl ResourceStore for PgResourceStore {
     ) -> Result<ResourceRow, StoreError> {
         // ResourceDefinitions must go through update_resource_definition to keep the
         // resource_definitions projection table in sync.
-        let kind: Option<String> = sqlx::query_scalar("SELECT kind FROM resources WHERE uid = $1")
-            .bind(uid)
-            .fetch_optional(&self.pool)
-            .await?;
+        let kind: Option<String> =
+            sqlx::query_scalar("SELECT kind FROM resource_store.resources WHERE uid = $1")
+                .bind(uid)
+                .fetch_optional(&self.pool)
+                .await?;
         match kind.as_deref() {
             None => return Err(StoreError::NotFound),
             Some(RESOURCE_DEFINITION_KIND) => {
@@ -225,7 +228,7 @@ impl ResourceStore for PgResourceStore {
         // to be affected, which we detect and map to RevisionConflict.
         let updated = sqlx::query_as::<_, ResourceRow>(
             r#"
-            UPDATE resources
+            UPDATE resource_store.resources
             SET metadata   = $1,
                 spec       = $2,
                 finalizers = $3,
@@ -264,18 +267,20 @@ impl ResourceStore for PgResourceStore {
 
         // Lock the row inside the transaction so a concurrent update_controller_finalizers()
         // can't add a finalizer between our read and the hard-delete branch below.
-        let row =
-            sqlx::query_as::<_, ResourceRow>("SELECT * FROM resources WHERE uid = $1 FOR UPDATE")
-                .bind(uid)
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or(StoreError::NotFound)?;
+        let row = sqlx::query_as::<_, ResourceRow>(
+            "SELECT * FROM resource_store.resources WHERE uid = $1 FOR UPDATE",
+        )
+        .bind(uid)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StoreError::NotFound)?;
 
-        let child_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM resources WHERE parent_uid = $1")
-                .bind(uid)
-                .fetch_one(&mut *tx)
-                .await?;
+        let child_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM resource_store.resources WHERE parent_uid = $1",
+        )
+        .bind(uid)
+        .fetch_one(&mut *tx)
+        .await?;
 
         match policy {
             PropagationPolicy::Cascade => {
@@ -285,7 +290,7 @@ impl ResourceStore for PgResourceStore {
                     // revision on each affected child so concurrent updates see the change.
                     sqlx::query(
                         r#"
-                        UPDATE resources
+                        UPDATE resource_store.resources
                         SET deletion_timestamp = NOW(),
                             revision = revision + 1
                         WHERE parent_uid = $1 AND deletion_timestamp IS NULL
@@ -298,7 +303,7 @@ impl ResourceStore for PgResourceStore {
                     // Stamp the parent and attach the cascade finalizer (idempotent).
                     let marked = sqlx::query_as::<_, ResourceRow>(
                         r#"
-                        UPDATE resources
+                        UPDATE resource_store.resources
                         SET deletion_timestamp = COALESCE(deletion_timestamp, NOW()),
                             finalizers = CASE
                                 WHEN $2 = ANY(finalizers) THEN finalizers
@@ -324,7 +329,7 @@ impl ResourceStore for PgResourceStore {
                     // Bump revision so the detach is observable.
                     let result = sqlx::query(
                         r#"
-                        UPDATE resources
+                        UPDATE resource_store.resources
                         SET parent_uid = NULL,
                             revision = revision + 1
                         WHERE parent_uid = $1
@@ -351,7 +356,7 @@ impl ResourceStore for PgResourceStore {
         if !row.finalizers.is_empty() {
             let marked = sqlx::query_as::<_, ResourceRow>(
                 r#"
-                UPDATE resources
+                UPDATE resource_store.resources
                 SET deletion_timestamp = COALESCE(deletion_timestamp, NOW()),
                     revision = revision + 1
                 WHERE uid = $1
@@ -365,11 +370,11 @@ impl ResourceStore for PgResourceStore {
             return Ok(DeleteOutcome::MarkedForDeletion(Box::new(marked)));
         }
 
-        sqlx::query("DELETE FROM resource_definitions WHERE uid = $1")
+        sqlx::query("DELETE FROM resource_store.resource_definitions WHERE uid = $1")
             .bind(uid)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("DELETE FROM resources WHERE uid = $1")
+        sqlx::query("DELETE FROM resource_store.resources WHERE uid = $1")
             .bind(uid)
             .execute(&mut *tx)
             .await?;
@@ -381,23 +386,25 @@ impl ResourceStore for PgResourceStore {
     async fn try_collect(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError> {
         let mut tx = self.pool.begin().await?;
 
-        let row =
-            sqlx::query_as::<_, ResourceRow>("SELECT * FROM resources WHERE uid = $1 FOR UPDATE")
-                .bind(uid)
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or(StoreError::NotFound)?;
+        let row = sqlx::query_as::<_, ResourceRow>(
+            "SELECT * FROM resource_store.resources WHERE uid = $1 FOR UPDATE",
+        )
+        .bind(uid)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StoreError::NotFound)?;
 
         // Not tombstoned: nothing to collect, return current state.
         if row.deletion_timestamp.is_none() {
             return Ok(DeleteOutcome::MarkedForDeletion(Box::new(row)));
         }
 
-        let child_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM resources WHERE parent_uid = $1")
-                .bind(uid)
-                .fetch_one(&mut *tx)
-                .await?;
+        let child_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM resource_store.resources WHERE parent_uid = $1",
+        )
+        .bind(uid)
+        .fetch_one(&mut *tx)
+        .await?;
 
         if child_count > 0 {
             // Fan out: stamp any unmarked children. Ensure the cascade finalizer is present
@@ -405,7 +412,7 @@ impl ResourceStore for PgResourceStore {
             // revision on every row we mutate so observers see the change.
             sqlx::query(
                 r#"
-                UPDATE resources
+                UPDATE resource_store.resources
                 SET deletion_timestamp = NOW(),
                     revision = revision + 1
                 WHERE parent_uid = $1 AND deletion_timestamp IS NULL
@@ -417,7 +424,7 @@ impl ResourceStore for PgResourceStore {
 
             let row = sqlx::query_as::<_, ResourceRow>(
                 r#"
-                UPDATE resources
+                UPDATE resource_store.resources
                 SET finalizers = CASE
                         WHEN $2 = ANY(finalizers) THEN finalizers
                         ELSE array_append(finalizers, $2)
@@ -442,7 +449,7 @@ impl ResourceStore for PgResourceStore {
         // finalizer was actually removed so idempotent re-calls don't churn the version.
         let row = sqlx::query_as::<_, ResourceRow>(
             r#"
-            UPDATE resources
+            UPDATE resource_store.resources
             SET finalizers = array_remove(finalizers, $2),
                 revision = CASE
                     WHEN $2 = ANY(finalizers) THEN revision + 1
@@ -463,11 +470,11 @@ impl ResourceStore for PgResourceStore {
         }
 
         // Clear: hard-delete.
-        sqlx::query("DELETE FROM resource_definitions WHERE uid = $1")
+        sqlx::query("DELETE FROM resource_store.resource_definitions WHERE uid = $1")
             .bind(uid)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("DELETE FROM resources WHERE uid = $1")
+        sqlx::query("DELETE FROM resource_store.resources WHERE uid = $1")
             .bind(uid)
             .execute(&mut *tx)
             .await?;
@@ -479,7 +486,7 @@ impl ResourceStore for PgResourceStore {
     async fn list_pending_collection(&self, limit: i64) -> Result<Vec<ResourceRow>, StoreError> {
         let rows = sqlx::query_as::<_, ResourceRow>(
             r#"
-            SELECT * FROM resources
+            SELECT * FROM resource_store.resources
             WHERE deletion_timestamp IS NOT NULL
             ORDER BY deletion_timestamp ASC
             LIMIT $1
@@ -505,14 +512,14 @@ impl ResourceStore for PgResourceStore {
                 PathSegment::Name { kind, name } => {
                     let row: Option<ResourceRow> = match current_parent {
                         None => sqlx::query_as::<_, ResourceRow>(
-                            "SELECT * FROM resources WHERE kind = $1 AND name = $2 AND parent_uid IS NULL",
+                            "SELECT * FROM resource_store.resources WHERE kind = $1 AND name = $2 AND parent_uid IS NULL",
                         )
                         .bind(kind)
                         .bind(name)
                         .fetch_optional(&mut *tx)
                         .await?,
                         Some(pid) => sqlx::query_as::<_, ResourceRow>(
-                            "SELECT * FROM resources WHERE kind = $1 AND name = $2 AND parent_uid = $3",
+                            "SELECT * FROM resource_store.resources WHERE kind = $1 AND name = $2 AND parent_uid = $3",
                         )
                         .bind(kind)
                         .bind(name)
@@ -528,7 +535,7 @@ impl ResourceStore for PgResourceStore {
                 }
                 PathSegment::Uid { kind, uid } => {
                     let row: ResourceRow = match sqlx::query_as::<_, ResourceRow>(
-                        "SELECT * FROM resources WHERE uid = $1",
+                        "SELECT * FROM resource_store.resources WHERE uid = $1",
                     )
                     .bind(uid)
                     .fetch_optional(&mut *tx)
@@ -566,8 +573,8 @@ impl ResourceStore for PgResourceStore {
                 sqlx::query_as::<_, ResourceRow>(
                     r#"
                 SELECT c.*
-                FROM resources c
-                JOIN resources p ON c.parent_uid = p.uid
+                FROM resource_store.resources c
+                JOIN resource_store.resources p ON c.parent_uid = p.uid
                 WHERE p.deletion_timestamp IS NOT NULL
                 ORDER BY c.kind, c.name
                 "#,
@@ -579,8 +586,8 @@ impl ResourceStore for PgResourceStore {
                 sqlx::query_as::<_, ResourceRow>(
                     r#"
                 SELECT c.*
-                FROM resources c
-                JOIN resources p ON c.parent_uid = p.uid
+                FROM resource_store.resources c
+                JOIN resource_store.resources p ON c.parent_uid = p.uid
                 WHERE p.deletion_timestamp IS NOT NULL AND p.uid = $1
                 ORDER BY c.kind, c.name
                 "#,
@@ -601,12 +608,13 @@ impl ResourceStore for PgResourceStore {
         let mut tx = self.pool.begin().await?;
 
         // Lock the target row.
-        let target =
-            sqlx::query_as::<_, ResourceRow>("SELECT * FROM resources WHERE uid = $1 FOR UPDATE")
-                .bind(uid)
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or(StoreError::NotFound)?;
+        let target = sqlx::query_as::<_, ResourceRow>(
+            "SELECT * FROM resource_store.resources WHERE uid = $1 FOR UPDATE",
+        )
+        .bind(uid)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StoreError::NotFound)?;
 
         if target.parent_uid == new_parent_uid {
             tx.commit().await?;
@@ -623,10 +631,10 @@ impl ResourceStore for PgResourceStore {
             let is_descendant: bool = sqlx::query_scalar(
                 r#"
                 WITH RECURSIVE ancestors AS (
-                    SELECT uid, parent_uid FROM resources WHERE uid = $1
+                    SELECT uid, parent_uid FROM resource_store.resources WHERE uid = $1
                     UNION ALL
                     SELECT r.uid, r.parent_uid
-                    FROM resources r
+                    FROM resource_store.resources r
                     JOIN ancestors a ON r.uid = a.parent_uid
                 )
                 SELECT EXISTS (SELECT 1 FROM ancestors WHERE uid = $2)
@@ -644,7 +652,7 @@ impl ResourceStore for PgResourceStore {
 
         let result = sqlx::query_as::<_, ResourceRow>(
             r#"
-            UPDATE resources
+            UPDATE resource_store.resources
             SET parent_uid = $2,
                 revision = revision + 1
             WHERE uid = $1
@@ -677,7 +685,7 @@ impl ResourceStore for PgResourceStore {
 
         let row = sqlx::query_as::<_, ResourceRow>(
             r#"
-            UPDATE resources
+            UPDATE resource_store.resources
             SET status = status || jsonb_build_object(
                     'controllers',
                     COALESCE(status->'controllers', '{}'::jsonb)
@@ -724,12 +732,13 @@ impl ResourceStore for PgResourceStore {
         // mutations from different controllers on the same resource, preventing lost updates.
         let mut tx = self.pool.begin().await?;
 
-        let current =
-            sqlx::query_as::<_, ResourceRow>("SELECT * FROM resources WHERE uid = $1 FOR UPDATE")
-                .bind(uid)
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or(StoreError::NotFound)?;
+        let current = sqlx::query_as::<_, ResourceRow>(
+            "SELECT * FROM resource_store.resources WHERE uid = $1 FOR UPDATE",
+        )
+        .bind(uid)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StoreError::NotFound)?;
 
         let remove_set: std::collections::HashSet<&str> =
             remove.iter().map(String::as_str).collect();
@@ -746,7 +755,7 @@ impl ResourceStore for PgResourceStore {
 
         let row = sqlx::query_as::<_, ResourceRow>(
             r#"
-            UPDATE resources
+            UPDATE resource_store.resources
             SET finalizers = $1, revision = revision + 1, updated_at = NOW()
             WHERE uid = $2
             RETURNING *
@@ -782,7 +791,7 @@ impl ResourceStore for PgResourceStore {
             r#"
             SELECT rd.uid, rd.group_name, rd.kind, rd.scope, rd.versions,
                    rd.allowed_status_controller_ids
-            FROM resource_definitions rd
+            FROM resource_store.resource_definitions rd
             WHERE rd.plural = $1
             "#,
         )
@@ -900,7 +909,7 @@ impl ResourceStore for PgResourceStore {
 
         sqlx::query(
             r#"
-            INSERT INTO resource_definitions
+            INSERT INTO resource_store.resource_definitions
                 (uid, group_name, kind, plural, scope, versions, allowed_status_controller_ids)
             VALUES ($1, $2, $3, $4, $5, $6, $7)
             "#,
@@ -968,12 +977,13 @@ impl ResourceStore for PgResourceStore {
         let mut tx = self.pool.begin().await?;
 
         // Lock the row and fetch current state
-        let current =
-            sqlx::query_as::<_, ResourceRow>("SELECT * FROM resources WHERE uid = $1 FOR UPDATE")
-                .bind(uid)
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or(StoreError::NotFound)?;
+        let current = sqlx::query_as::<_, ResourceRow>(
+            "SELECT * FROM resource_store.resources WHERE uid = $1 FOR UPDATE",
+        )
+        .bind(uid)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StoreError::NotFound)?;
 
         if current.kind != RESOURCE_DEFINITION_KIND {
             return Err(StoreError::Validation(
@@ -1003,7 +1013,7 @@ impl ResourceStore for PgResourceStore {
         // Update the resources row with optimistic concurrency
         let updated = sqlx::query_as::<_, ResourceRow>(
             r#"
-            UPDATE resources
+            UPDATE resource_store.resources
             SET metadata   = $1,
                 spec       = $2,
                 finalizers = $3,
@@ -1035,7 +1045,7 @@ impl ResourceStore for PgResourceStore {
         let versions_val = serde_json::to_value(&new_spec.versions).unwrap_or_default();
         sqlx::query(
             r#"
-            UPDATE resource_definitions
+            UPDATE resource_store.resource_definitions
             SET versions = $1, allowed_status_controller_ids = $2
             WHERE uid = $3
             "#,

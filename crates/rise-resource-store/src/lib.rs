@@ -18,12 +18,30 @@ pub use validation::{
     SpecValidator,
 };
 
+/// Run resource-store migrations in their own Postgres schema (`resource_store`),
+/// keeping both the application tables and the `_sqlx_migrations` tracking table
+/// isolated from the root rise-deploy crate, which owns its own migrations against
+/// the same database.
+///
+/// sqlx 0.8 hard-codes the unqualified `_sqlx_migrations` name, so we acquire a
+/// dedicated connection, ensure the schema exists, switch `search_path` so the
+/// migrator resolves `_sqlx_migrations` inside `resource_store`, run migrations,
+/// then reset `search_path` before the connection returns to the pool.
 pub async fn run_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::migrate::MigrateError> {
-    // Both this crate and the root rise-deploy crate share the same `_sqlx_migrations`
-    // table. Without ignore_missing, this migrator would error on root migrations it
-    // doesn't know about (and vice versa). Each migrator only manages its own set.
-    let mut migrator = sqlx::migrate!("./migrations");
-    migrator.set_ignore_missing(true);
-    migrator.run(pool).await?;
-    Ok(())
+    use sqlx::Executor;
+
+    let mut conn = pool.acquire().await?;
+
+    conn.execute("CREATE SCHEMA IF NOT EXISTS resource_store")
+        .await?;
+    conn.execute("SET search_path TO resource_store, public")
+        .await?;
+
+    let result = sqlx::migrate!("./migrations").run(&mut *conn).await;
+
+    // Reset before the connection returns to the pool so other consumers see the
+    // default search_path. Best-effort: if migrate failed we still try to reset.
+    let _ = conn.execute("RESET search_path").await;
+
+    result
 }

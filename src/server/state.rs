@@ -206,11 +206,7 @@ impl AppState {
     /// Run database migrations
     async fn run_migrations(pool: &PgPool) -> Result<()> {
         tracing::info!("Running database migrations...");
-        // Ignore migrations recorded in `_sqlx_migrations` that we don't own — the
-        // `rise-resource-store` crate uses the same table for its own migrations.
-        let mut migrator = sqlx::migrate!("./migrations");
-        migrator.set_ignore_missing(true);
-        migrator
+        sqlx::migrate!("./migrations")
             .run(pool)
             .await
             .context("Failed to run migrations")?;
