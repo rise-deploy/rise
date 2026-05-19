@@ -85,13 +85,23 @@ run = "cargo sqlx prepare -- --package rise-deploy --features cli,backend --all-
 description = "Check that all SQLX queries are valid."
 run = "cargo sqlx prepare --check -- --package rise-deploy --features cli,backend --all-targets"
 
+[tasks."resource-store:sqlx:prepare"]
+description = "Prepare the SQLX query cache for rise-resource-store (requires running DB)."
+run = "cargo sqlx prepare -- --package rise-resource-store --all-targets"
+
+[tasks."resource-store:sqlx:check"]
+description = "Verify the SQLX query cache for rise-resource-store is up to date."
+run = "cargo sqlx prepare --check -- --package rise-resource-store --all-targets"
+
 [tasks.lint]
 description = "Run all linting checks (clippy, formatting, sqlx, helm)."
 run = """
 cargo all-features check --all-targets
 cargo check --package rise-resource-api --all-targets
+cargo check --package rise-resource-store --all-targets
 cargo all-features clippy --all-targets -- -D warnings
 cargo clippy --package rise-resource-api --all-targets -- -D warnings
+cargo clippy --package rise-resource-store --all-targets -- -D warnings
 cargo fmt --all -- --check
 mise sqlx:check
 helm lint helm/rise

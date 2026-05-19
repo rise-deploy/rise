@@ -227,8 +227,13 @@ impl AppState {
 
         tracing::info!("Successfully connected to PostgreSQL");
 
-        // Run migrations (server-only)
+        // Run root migrations
         Self::run_migrations(&db_pool).await?;
+
+        // Run resource-store migrations immediately after root migrations
+        rise_resource_store::run_migrations(&db_pool)
+            .await
+            .context("Failed to run resource store migrations")?;
 
         // Initialize JWT validator (JWKS is fetched on-demand)
         let jwt_validator = Arc::new(JwtValidator::new(settings.server.ssrf.clone()));
