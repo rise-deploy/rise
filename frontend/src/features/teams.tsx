@@ -9,11 +9,13 @@ import { ProjectTable } from '../components/project-table';
 import { MonoSortButton, MonoTable, MonoTableBody, MonoTableEmptyRow, MonoTableFrame, MonoTableHead, MonoTableRow, MonoTd, MonoTh } from '../components/table';
 import { EmptyState, ErrorState, LoadingState } from '../components/states';
 import { useRowKeyboardNavigation, useSortableData } from '../lib/table';
+import { Panel, PanelBody, PanelHead, Button as RButton, Empty, colorFor } from '../components/r-ui';
 
 
 // Teams List Component
 export function TeamsList({ currentUser, openCreate = false }) {
     const [teams, setTeams] = useState([]);
+    const [projects, setProjects] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
     const [isModalOpen, setIsModalOpen] = useState(false);
@@ -43,6 +45,7 @@ export function TeamsList({ currentUser, openCreate = false }) {
 
     useEffect(() => {
         loadTeams();
+        api.getProjects().then(setProjects).catch(() => {});
     }, [loadTeams]);
 
     const handleCreateClick = () => {
@@ -118,60 +121,30 @@ export function TeamsList({ currentUser, openCreate = false }) {
 
     return (
         <section>
-            {currentUser?.can_create_teams && (
-                <div className="flex justify-end items-center mb-6">
-                    <Button variant="primary" size="sm" onClick={handleCreateClick}>
-                        Create Team
+            <div className="r-page-head">
+                <div className="title-stack">
+                    <h1 className="r-page-title">Teams</h1>
+                    <div className="r-page-sub">
+                        {sortedTeams.length} team{sortedTeams.length === 1 ? '' : 's'} ·{' '}
+                        {sortedTeams.reduce((n, t) => n + (t.members?.length || 0), 0)} members total
+                    </div>
+                </div>
+                {currentUser?.can_create_teams && (
+                    <Button variant="primary" onClick={handleCreateClick}>
+                        New team
                     </Button>
+                )}
+            </div>
+            {actionStatus && <p className="mono-inline-status mb-3">{actionStatus}</p>}
+            {sortedTeams.length === 0 ? (
+                <Empty title="No teams yet">Create a team to share project ownership across people.</Empty>
+            ) : (
+                <div className="r-grid-2">
+                    {sortedTeams.map(t => (
+                        <TeamCard key={t.id} team={t} projectCount={countProjectsForTeam(projects, t)} onOpen={() => navigate(`/team/${t.name}`)} />
+                    ))}
                 </div>
             )}
-            {actionStatus && <p className="mono-inline-status mb-3">{actionStatus}</p>}
-            <MonoTableFrame>
-                <MonoTable className="mono-sticky-table mono-table--sticky" onKeyDown={onKeyDown}>
-                    <MonoTableHead>
-                        <tr>
-                            <MonoTh stickyCol className="px-6 py-3 text-left">
-                                <MonoSortButton label="Name" active={sortKey === 'name'} direction={sortDirection} onClick={() => requestSort('name')} />
-                            </MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">Members</MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">Owners</MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">
-                                <MonoSortButton label="Created" active={sortKey === 'created'} direction={sortDirection} onClick={() => requestSort('created')} />
-                            </MonoTh>
-                        </tr>
-                    </MonoTableHead>
-                    <MonoTableBody>
-                        {sortedTeams.length === 0 ? (
-                            <MonoTableEmptyRow colSpan={4}>No teams.</MonoTableEmptyRow>
-                        ) : (
-                            sortedTeams.map((t, idx) => (
-                                <MonoTableRow
-                                    key={t.id}
-                                    onClick={() => navigate(`/team/${t.name}`)}
-                                    onFocus={() => setActiveIndex(idx)}
-                                    tabIndex={0}
-                                    aria-label={`Team ${t.name}`}
-                                    interactive
-                                    active={activeIndex === idx}
-                                    className={activeIndex === idx ? 'mono-row-active transition-colors' : 'transition-colors'}
-                                >
-                                    <MonoTd stickyCol className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-gray-100">
-                                        <div className="flex items-center gap-2">
-                                            {t.name}
-                                            {t.idp_managed && (
-                                                <span className="text-xs bg-purple-600 text-white px-2 py-0.5 rounded">IDP</span>
-                                            )}
-                                        </div>
-                                    </MonoTd>
-                                    <MonoTd className="px-6 py-4 whitespace-nowrap text-sm text-gray-700 dark:text-gray-300">{t.members.length}</MonoTd>
-                                    <MonoTd className="px-6 py-4 whitespace-nowrap text-sm text-gray-700 dark:text-gray-300">{t.owners.length}</MonoTd>
-                                    <MonoTd className="px-6 py-4 whitespace-nowrap text-sm text-gray-700 dark:text-gray-300">{formatDate(t.created)}</MonoTd>
-                                </MonoTableRow>
-                            ))
-                        )}
-                    </MonoTableBody>
-                </MonoTable>
-            </MonoTableFrame>
 
             <Modal
                 isOpen={isModalOpen}
@@ -244,6 +217,85 @@ export function TeamsList({ currentUser, openCreate = false }) {
                 </ModalSection>
             </Modal>
         </section>
+    );
+}
+
+// Counts projects owned by a given team across the project list. We match by
+// id when available (preferred), then fall back to comparing names so that
+// callers with a partially populated project list (no owner.id) still work.
+function countProjectsForTeam(projects, team) {
+    if (!Array.isArray(projects) || projects.length === 0) return 0;
+    return projects.filter(p => {
+        const owner = p.owner;
+        if (!owner) return false;
+        if (owner.id && team.id) return owner.id === team.id;
+        if (owner.name && team.name) return owner.name === team.name;
+        return false;
+    }).length;
+}
+
+function TeamCard({ team, projectCount, onOpen }) {
+    const members = team.members || [];
+    const owners = team.owners || [];
+    const leadEmail = owners[0]?.email || members[0]?.email;
+    const visibleMembers = members.slice(0, 8);
+    const overflow = Math.max(0, members.length - visibleMembers.length);
+
+    return (
+        <Panel>
+            <PanelHead>
+                <div style={{ minWidth: 0 }}>
+                    <div className="r-panel-title" style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                        <span>{team.name}</span>
+                        {team.idp_managed && (
+                            <span className="r-pill accent" style={{ fontSize: 10.5, padding: '1px 6px' }}>IDP</span>
+                        )}
+                    </div>
+                    <div className="r-panel-sub">
+                        {members.length} member{members.length === 1 ? '' : 's'}
+                        {' · '}{projectCount} project{projectCount === 1 ? '' : 's'}
+                    </div>
+                </div>
+                <RButton size="sm" onClick={onOpen}>Manage</RButton>
+            </PanelHead>
+            <PanelBody>
+                {leadEmail && (
+                    <div className="r-meta-bar" style={{ marginBottom: 14 }}>
+                        <span style={{ color: 'var(--text-soft)' }}>Lead</span>
+                        <span className="dot-sep" />
+                        <a className="r-link">{leadEmail}</a>
+                    </div>
+                )}
+                {visibleMembers.length > 0 ? (
+                    <div className="r-member-stack">
+                        {visibleMembers.map(m => {
+                            const label = m.email || m.name || '?';
+                            return (
+                                <span
+                                    key={m.id || label}
+                                    className="r-ava-sm"
+                                    style={{ background: colorFor(label), width: 22, height: 22, fontSize: 10 }}
+                                    title={label}
+                                >
+                                    {label.trim()[0]?.toUpperCase() || '?'}
+                                </span>
+                            );
+                        })}
+                        {overflow > 0 && (
+                            <span
+                                className="r-ava-sm"
+                                style={{ background: 'var(--surface-2)', color: 'var(--text-muted)', width: 22, height: 22, fontSize: 10 }}
+                                title={`${overflow} more`}
+                            >
+                                +{overflow}
+                            </span>
+                        )}
+                    </div>
+                ) : (
+                    <div style={{ color: 'var(--text-soft)', fontSize: 12.5 }}>No members yet</div>
+                )}
+            </PanelBody>
+        </Panel>
     );
 }
 

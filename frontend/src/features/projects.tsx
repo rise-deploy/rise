@@ -901,7 +901,7 @@ function Combobox({ value, onChange, options, placeholder = '', disabled = false
 }
 
 // Access tab component - manages access class and app-level user/team access
-function AppUsersList({ projectName, project, accessClasses, currentUserEmail, onProjectUpdated }) {
+export function AppUsersList({ projectName, project, accessClasses, currentUserEmail, onProjectUpdated }) {
     const [newUserEmail, setNewUserEmail] = useState('');
     const [selectedTeamId, setSelectedTeamId] = useState('');
     const [teams, setTeams] = useState([]);
