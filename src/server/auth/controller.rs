@@ -150,6 +150,14 @@ pub fn validate_controller_id(id: &str) -> Result<()> {
     if id.len() > 253 {
         bail!("controller id too long (>{} chars)", 253);
     }
+    let host = id.split('/').next().unwrap_or(id);
+    if let Some(label) = host.split('.').find(|label| label.len() > 63) {
+        bail!(
+            "controller id DNS label too long ({} > 63 chars): {:?}",
+            label.len(),
+            label
+        );
+    }
     if let Some(slash_pos) = id.find('/') {
         let name = &id[slash_pos + 1..];
         if name.len() > CONTROLLER_ID_NAME_MAX_LEN {
@@ -369,6 +377,13 @@ mod tests {
         assert!(id.len() > 253);
         let err = validate_controller_id(&id).unwrap_err().to_string();
         assert!(err.contains("too long"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_controller_id_rejects_too_long_dns_label() {
+        let id = format!("{}.example.com", "a".repeat(64));
+        let err = validate_controller_id(&id).unwrap_err().to_string();
+        assert!(err.contains("DNS label too long"), "got: {err}");
     }
 
     #[test]
