@@ -88,7 +88,7 @@
         },
         "admin_users": {
           "default": [],
-          "description": "List of admin user emails (have full permissions)",
+          "description": "List of admin user emails for the default organization. Admins do NOT\nimplicitly receive the Operator role — list the email in\n`operator_users` separately if needed.",
           "items": {
             "type": "string"
           },
@@ -118,6 +118,14 @@
         "client_secret": {
           "type": "string"
         },
+        "controllers": {
+          "default": [],
+          "description": "Trusted external controller identities. Each entry binds a stable\ncontroller ID to an OIDC issuer plus optional claim constraints.\nUsed by generic-resource controller endpoints.",
+          "items": {
+            "$ref": "#/$defs/ControllerIdentity"
+          },
+          "type": "array"
+        },
         "idp_group_sync_enabled": {
           "default": true,
           "description": "Enable IdP group synchronization (default: true)\nWhen enabled, user team memberships are automatically synced from IdP groups claim on login",
@@ -125,6 +133,14 @@
         },
         "issuer": {
           "type": "string"
+        },
+        "operator_users": {
+          "default": [],
+          "description": "List of Operator user emails. Operators have full access to generic\nresource storage and built-in resource management. This is a separate\nrole from `admin_users`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         },
         "platform_access": {
           "$ref": "#/$defs/PlatformAccessConfig",
@@ -143,6 +159,48 @@
         "issuer",
         "client_id",
         "client_secret"
+      ],
+      "type": "object"
+    },
+    "ControllerIdentity": {
+      "description": "A trusted external controller identity configured under `auth.controllers`.\n\nEach entry binds a stable controller ID (the key used under\n`status.controllers`) to an OIDC issuer plus optional claim constraints\n(`audience`, `subject`, free-form `claims`). Wildcards in\n`subject`/`claims` follow `JwtValidator::validate_custom_claims` rules.",
+      "properties": {
+        "audience": {
+          "default": null,
+          "description": "Expected `aud` claim. Exact match when set.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "claims": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Additional claim constraints. Wildcards supported.",
+          "type": "object"
+        },
+        "id": {
+          "description": "Stable controller ID written under `status.controllers`. Must be a\nDNS subdomain with an optional single `/name` suffix, e.g.\n`controller.example.com` or `controller.example.com/my-ctrl`.",
+          "type": "string"
+        },
+        "issuer": {
+          "description": "OIDC issuer URL. Used for JWKS discovery and `iss` validation.",
+          "type": "string"
+        },
+        "subject": {
+          "default": null,
+          "description": "Expected `sub` claim. Wildcards supported.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "issuer"
       ],
       "type": "object"
     },

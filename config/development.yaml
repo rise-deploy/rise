@@ -28,6 +28,11 @@ auth:
   client_secret: "rise-backend-secret"
   admin_users:
     - "admin@example.com"
+  # Operator role allowlist. Separate from admin_users — an Operator must
+  # also be listed in admin_users or platform_access.allowed_user_emails to
+  # use the typed CLI/UI (e.g. to log in via the frontend).
+  operator_users:
+    - "ops@example.com"
   # Allow all users to create teams (default: true). Set to false to restrict team creation to admins only.
   allow_team_creation: true
   # Allow all users to list all teams (default: true). Set to false so non-admins only see their own teams.
@@ -37,6 +42,7 @@ auth:
     allowed_user_emails:
       - "admin@example.com"
       - "dev@example.com"
+      - "ops@example.com"
 
 registry:
   type: "oci-client-auth"

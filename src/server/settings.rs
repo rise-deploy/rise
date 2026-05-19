@@ -223,9 +223,21 @@ pub struct AuthSettings {
     pub issuer: String,
     pub client_id: String,
     pub client_secret: String,
-    /// List of admin user emails (have full permissions)
+    /// List of admin user emails for the default organization. Admins do NOT
+    /// implicitly receive the Operator role — list the email in
+    /// `operator_users` separately if needed.
     #[serde(default)]
     pub admin_users: Vec<String>,
+    /// List of Operator user emails. Operators have full access to generic
+    /// resource storage and built-in resource management. This is a separate
+    /// role from `admin_users`.
+    #[serde(default)]
+    pub operator_users: Vec<String>,
+    /// Trusted external controller identities. Each entry binds a stable
+    /// controller ID to an OIDC issuer plus optional claim constraints.
+    /// Used by generic-resource controller endpoints.
+    #[serde(default)]
+    pub controllers: Vec<crate::server::auth::controller::ControllerIdentity>,
     /// Platform access control configuration
     #[serde(default)]
     pub platform_access: PlatformAccessConfig,

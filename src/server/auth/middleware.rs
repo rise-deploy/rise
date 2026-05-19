@@ -10,7 +10,9 @@ use serde::Deserialize;
 
 use crate::db::{service_accounts, users, User};
 use crate::server::auth::context::VerifiedExternalToken;
+use crate::server::auth::controller::VerifiedControllerToken;
 use crate::server::auth::cookie_helpers;
+use crate::server::auth::jwt::JwtValidator;
 use crate::server::state::AppState;
 
 /// Check if a JWT issuer is a Rise-issued JWT
@@ -170,6 +172,93 @@ pub async fn auth_middleware(
 
         tracing::debug!("User authenticated: {} ({})", user.email, user.id);
         req.extensions_mut().insert(user);
+    } else if let Some(controller_candidates) = state.controllers_by_issuer.get(&issuer).cloned() {
+        // External issuer matches at least one configured controller identity.
+        // Controller identities take precedence over service-account issuers
+        // when the same `iss` is reused: we fail closed here rather than
+        // falling back to the SA path, so a misconfigured controller token
+        // can't be silently downgraded to an SA principal.
+        tracing::debug!(
+            "Auth middleware: external JWT from controller issuer '{}', {} candidate identity(ies)",
+            issuer,
+            controller_candidates.len()
+        );
+
+        let claims = state
+            .jwt_validator
+            .validate_token(&token, &issuer)
+            .await
+            .map_err(|e| {
+                tracing::warn!(
+                    "Auth middleware: controller JWT JWKS validation failed for issuer '{}': {:#}",
+                    issuer,
+                    e
+                );
+                (StatusCode::UNAUTHORIZED, format!("Invalid token: {}", e))
+            })?;
+
+        let mut matched: Vec<&crate::server::auth::controller::ControllerIdentity> = Vec::new();
+        let mut last_err: Option<String> = None;
+        for ident in &controller_candidates {
+            let mut expected = ident.claims.clone();
+            if let Some(aud) = &ident.audience {
+                expected.insert("aud".to_string(), aud.clone());
+            }
+            if let Some(sub) = &ident.subject {
+                expected.insert("sub".to_string(), sub.clone());
+            }
+            match JwtValidator::validate_custom_claims(&claims, &expected) {
+                Ok(()) => matched.push(ident),
+                Err(e) => {
+                    tracing::debug!(
+                        "Controller identity {:?} did not match token claims: {}",
+                        ident.id,
+                        e
+                    );
+                    last_err = Some(e.to_string());
+                }
+            }
+        }
+
+        match matched.as_slice() {
+            [ident] => {
+                tracing::info!(
+                    "Controller authenticated: identity_id={}, issuer={}",
+                    ident.id,
+                    issuer
+                );
+                req.extensions_mut().insert(VerifiedControllerToken {
+                    identity_id: ident.id.clone(),
+                    issuer: issuer.clone(),
+                    claims,
+                });
+            }
+            [] => {
+                let detail = last_err.unwrap_or_else(|| "unknown".to_string());
+                tracing::warn!(
+                    "Controller JWT for issuer '{}' did not match any configured identity: {}",
+                    issuer,
+                    detail
+                );
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    "Token did not match any configured controller identity".to_string(),
+                ));
+            }
+            _ => {
+                let ids: Vec<&str> = matched.iter().map(|i| i.id.as_str()).collect();
+                tracing::error!(
+                    "Multiple controller identities matched JWT from issuer '{}': {:?}",
+                    issuer,
+                    ids
+                );
+                return Err((
+                    StatusCode::CONFLICT,
+                    "Token matched multiple controller identities; configuration is ambiguous"
+                        .to_string(),
+                ));
+            }
+        }
     } else {
         // External issuer — phase 1: JWKS validation only
         tracing::debug!(
@@ -282,6 +371,13 @@ pub async fn platform_access_middleware(
     // Their access is validated per-project in phase 2.
     if req.extensions().get::<VerifiedExternalToken>().is_some() {
         tracing::debug!("Skipping platform access check for external token (service account)");
+        return Ok(next.run(req).await);
+    }
+
+    // Controller tokens bypass platform access checks; controller endpoints
+    // perform their own authorization based on `identity_id`.
+    if req.extensions().get::<VerifiedControllerToken>().is_some() {
+        tracing::debug!("Skipping platform access check for controller token");
         return Ok(next.run(req).await);
     }
 

@@ -192,13 +192,35 @@ server:
 
 ```yaml
 auth:
-  issuer: "http://..."         # OIDC issuer URL
-  client_id: "rise-backend"   # OAuth2 client ID
-  client_secret: "..."        # OAuth2 client secret
-  admin_users: ["email@..."]  # Admin user emails (array)
-  allow_team_creation: true   # Allow regular users to create teams (default: true)
-                              # When false, only admins can create teams
+  issuer: "http://..."          # OIDC issuer URL
+  client_id: "rise-backend"     # OAuth2 client ID
+  client_secret: "..."          # OAuth2 client secret
+  admin_users: ["email@..."]    # Default-organization admin emails (array)
+  operator_users: ["ops@..."]   # Operator role allowlist (array, optional)
+  controllers: []               # Trusted external controller identities (array, optional)
+  allow_team_creation: true     # Allow regular users to create teams (default: true)
+                                # When false, only admins can create teams
 ```
+
+**Roles:**
+- `admin_users`: Admins of the default organization. Admins do **not** implicitly receive the Operator role.
+- `operator_users`: Operators have full access to generic resource storage and built-in resource management. Operators do **not** implicitly receive platform (typed CLI/UI) access — list the email in `admin_users` or `platform_access.allowed_user_emails` separately if both are needed.
+
+**Controllers (`auth.controllers`):**
+Trusted external controllers authenticate to Rise with OIDC JWTs. Each entry registers a `ControllerIdentity` that the auth middleware uses to validate incoming tokens. PR3 only wires the auth context; generic-resource controller endpoints land in a later increment.
+
+```yaml
+auth:
+  controllers:
+    - id: "controller.example.com/my-ctrl"  # DNS subdomain + optional /name suffix
+      issuer: "https://controller-idp.example.com"
+      audience: "rise"                       # optional, exact match on `aud`
+      subject: "my-controller-*"             # optional, wildcard match on `sub`
+      claims:                                # optional, wildcard match per claim
+        scope: "controller"
+```
+
+When a JWT's `iss` matches a configured controller identity, the controller path runs first. If no identity's claim constraints match, the request is rejected without falling back to the service-account path.
 
 **Team Creation Control:**
 - `allow_team_creation = true` (default): All authenticated users can create teams
