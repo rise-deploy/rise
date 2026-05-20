@@ -3,158 +3,118 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{% if success %}Authentication Successful{% else %}Authentication Failed{% endif %} - Rise</title>
+    <title>{% if success %}Signed in{% else %}Authentication failed{% endif %} - Rise</title>
     <link rel="icon" type="image/x-icon" href="/assets/favicon.ico">
     <link rel="icon" type="image/png" sizes="16x16" href="/assets/favicon-16x16.png">
     <link rel="icon" type="image/png" sizes="32x32" href="/assets/favicon-32x32.png">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     <style>
         :root {
-            --bg: #111111;
-            --panel: #141414;
-            --line: #3a3a3a;
-            --text: #ececec;
-            --muted: #b8b8b8;
-            --ok: #b7ffce;
-            --bad: #ffc0c0;
+            --bg: oklch(0.985 0.009 270);
+            --surface: #ffffff;
+            --surface-2: oklch(0.96 0.012 270);
+            --border-faint: oklch(0.94 0.006 270);
+            --border: oklch(0.91 0.008 270);
+            --text: oklch(0.20 0.006 80);
+            --muted: oklch(0.50 0.006 80);
+            --soft: oklch(0.62 0.006 80);
+            --accent: oklch(0.55 0.17 270);
+            --ok: oklch(0.62 0.13 150);
+            --ok-bg: oklch(0.96 0.04 150);
+            --err: oklch(0.58 0.18 25);
+            --err-bg: oklch(0.96 0.04 25);
         }
         * { box-sizing: border-box; }
         body {
-            margin: 0;
-            min-height: 100vh;
-            font-family: "IBM Plex Mono", ui-monospace, monospace;
-            color: var(--text);
-            background: radial-gradient(circle at 0 0, #202020 0%, #101010 40%), var(--bg);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 1rem;
+            margin: 0; min-height: 100vh;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+            color: var(--text); background: var(--bg);
+            display: flex; align-items: center; justify-content: center;
+            padding: 24px; letter-spacing: -0.005em;
+            -webkit-font-smoothing: antialiased;
         }
         .card {
-            width: 100%;
-            max-width: 48rem;
-            background: var(--panel);
-            border: 1px solid var(--line);
-            padding: 1.2rem;
-            text-align: center;
+            width: 100%; max-width: 420px;
+            background: var(--surface);
+            border: 1px solid var(--border-faint);
+            border-radius: 14px;
+            box-shadow: 0 4px 18px rgba(20, 20, 15, .05), 0 1px 2px rgba(20, 20, 15, .04);
+            padding: 36px 32px; text-align: center;
         }
         .logo {
-            width: 2rem;
-            height: 2rem;
-            margin: 0 auto 0.75rem;
-            background-color: currentColor;
-            mask-size: contain;
-            mask-repeat: no-repeat;
-            mask-position: center;
-            -webkit-mask-size: contain;
-            -webkit-mask-repeat: no-repeat;
-            -webkit-mask-position: center;
-            mask-image: url(/assets/logo.svg);
-            -webkit-mask-image: url(/assets/logo.svg);
+            width: 48px; height: 48px; margin: 0 auto;
+            border-radius: 12px;
+            background: linear-gradient(135deg, var(--accent), oklch(0.62 0.18 245));
+            display: grid; place-items: center;
+            color: #fff; font-weight: 700; font-size: 22px;
         }
-        .state-ok { color: var(--ok); font-size: 2rem; margin-bottom: 0.5rem; }
-        .state-bad { color: var(--bad); font-size: 2rem; margin-bottom: 0.5rem; }
-        h2 { margin: 0 0 0.8rem; font-size: 1.2rem; }
-        p { color: var(--muted); }
-        .mono-code {
-            color: var(--text);
-            background: #1a1a1a;
-            border: 1px solid var(--line);
-            padding: 0.1rem 0.35rem;
+        .badge {
+            width: 44px; height: 44px; border-radius: 50%;
+            display: grid; place-items: center; margin: 18px auto 0;
+            font-size: 22px; font-weight: 700;
+        }
+        .badge.ok { background: var(--ok-bg); color: var(--ok); }
+        .badge.bad { background: var(--err-bg); color: var(--err); }
+        h1 { font-size: 20px; font-weight: 600; letter-spacing: -0.02em; margin: 14px 0 0; }
+        p { color: var(--muted); font-size: 13.5px; line-height: 1.55; margin: 10px 0 0; }
+        .mono {
+            font-family: 'JetBrains Mono', ui-monospace, monospace;
+            background: var(--surface-2); border: 1px solid var(--border-faint);
+            border-radius: 5px; padding: 1px 6px; font-size: 12.5px;
+            color: var(--text); word-break: break-all;
         }
         .progress {
-            width: 100%;
-            background: #1a1a1a;
-            border: 1px solid var(--line);
-            height: 8px;
-            margin: 1rem 0;
+            width: 100%; height: 6px; background: var(--surface-2);
+            border-radius: 999px; overflow: hidden; margin: 20px 0 0;
         }
-        .progress > div {
-            background: #d6d6d6;
-            height: 100%;
-            width: 0%;
-            transition: width 1000ms;
-        }
+        .progress > div { height: 100%; width: 0%; background: var(--accent); border-radius: 999px; transition: width 1000ms; }
         .btn {
-            display: inline-block;
-            border: 1px solid var(--line);
-            background: #1a1a1a;
-            color: var(--text);
-            text-decoration: none;
-            padding: 0.55rem 0.75rem;
+            display: inline-block; text-align: center;
+            background: var(--accent); color: #fff;
+            border: none; border-radius: 7px;
+            padding: 10px 16px; margin-top: 20px;
+            font-size: 13px; font-weight: 500; text-decoration: none;
+            font-family: inherit; cursor: pointer;
         }
-        .subtle-link {
-            color: #888888;
-            text-decoration: underline;
-        }
-        .subtle-link:hover {
-            color: #aaaaaa;
-        }
+        .btn:hover { filter: brightness(1.06); }
         .errbox {
-            border: 1px solid #7d4b4b;
-            color: var(--bad);
-            background: #1a1212;
-            padding: 0.6rem;
-            margin: 0.9rem 0;
+            background: var(--err-bg); color: oklch(0.40 0.14 25);
+            border: 1px solid color-mix(in oklch, var(--err) 30%, transparent);
+            border-radius: 7px; padding: 10px 12px; font-size: 12.5px;
+            margin: 14px 0 0; text-align: left;
         }
+        .subtle-link { color: var(--accent); text-decoration: none; }
+        .subtle-link:hover { text-decoration: underline; }
+        small { font-size: 12px; color: var(--soft); }
     </style>
 </head>
 <body>
     <div class="card">
-            {% if success %}
-            <div>
-                <div class="logo" aria-hidden="true"></div>
-                <div class="state-ok">[ok]</div>
-                <h2>Authentication Successful</h2>
-
-                <p>
-                    Signing you in to project
-                    <strong class="mono-code">{{ project_name }}</strong>...
-                </p>
-
-                <div class="progress">
-                    <div id="progress-bar"></div>
-                </div>
-
-                <p>
-                    <small>You will be redirected shortly. <a href="{{ redirect_url }}" class="subtle-link">Click here if not redirected automatically</a></small>
-                </p>
-            </div>
-
-            <script>
-                const redirectUrl = {{ redirect_url | json_encode() }};
-                const progressBar = document.getElementById('progress-bar');
-
-                // Start progress bar animation
-                setTimeout(() => progressBar.style.width = '100%', 100);
-
-                // Redirect after 1 second to ensure cookie is set
-                setTimeout(() => {
-                    window.location.href = redirectUrl;
-                }, 1000);
-            </script>
-            {% else %}
-            <div>
-                <div class="logo" aria-hidden="true"></div>
-                <div class="state-bad">[error]</div>
-                <h2>Authentication Failed</h2>
-
-                <p>
-                    Failed to authenticate for project
-                    <strong class="mono-code">{{ project_name }}</strong>.
-                </p>
-
-                {% if error_message %}
-                <p class="errbox">
-                    {{ error_message }}
-                </p>
-                {% endif %}
-
-                <a href="/api/v1/auth/signin?project={{ project_name }}{% if redirect_url %}&redirect={{ redirect_url | urlencode }}{% endif %}"
-                   class="btn">
-                    Try Again
-                </a>
-            </div>
-            {% endif %}
+        {% if success %}
+        <div class="logo" aria-hidden="true">R</div>
+        <div class="badge ok" aria-hidden="true">&check;</div>
+        <h1>Signed in</h1>
+        <p>Signing you in to <span class="mono">{{ project_name }}</span>…</p>
+        <div class="progress"><div id="progress-bar"></div></div>
+        <p><small>You'll be redirected shortly. <a href="{{ redirect_url }}" class="subtle-link">Continue now</a> if nothing happens.</small></p>
+        <script>
+            const redirectUrl = {{ redirect_url | json_encode() }};
+            const progressBar = document.getElementById('progress-bar');
+            setTimeout(() => progressBar.style.width = '100%', 100);
+            setTimeout(() => { window.location.href = redirectUrl; }, 1000);
+        </script>
+        {% else %}
+        <div class="logo" aria-hidden="true">R</div>
+        <div class="badge bad" aria-hidden="true">!</div>
+        <h1>Authentication failed</h1>
+        <p>Failed to authenticate for <span class="mono">{{ project_name }}</span>.</p>
+        {% if error_message %}
+        <div class="errbox">{{ error_message }}</div>
+        {% endif %}
+        <a href="/api/v1/auth/signin?project={{ project_name }}{% if redirect_url %}&redirect={{ redirect_url | urlencode }}{% endif %}" class="btn">Try again</a>
+        {% endif %}
     </div>
 </body>
 </html>
