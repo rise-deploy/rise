@@ -833,6 +833,17 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
         }
     }, [projectName, deploymentId, tailLines]);
 
+    // Auto-follow logs on open when the deployment is still active.
+    const autoFollowedRef = useRef(false);
+    useEffect(() => {
+        if (autoFollowedRef.current) return;
+        autoFollowedRef.current = true;
+        const terminal = ['Cancelled', 'Stopped', 'Superseded', 'Failed', 'Expired'].includes(deploymentStatus);
+        if (!terminal && isLoggable(deploymentStatus)) {
+            startStreaming();
+        }
+    }, [deploymentStatus, startStreaming]);
+
     const clearLogs = () => {
         setLogs([]);
     };

@@ -9,6 +9,7 @@ import { Button, ConfirmDialog, EnvironmentColorDot, EnvironmentColorPicker, Env
 import {
     Alert as RAlert,
     Button as RButton,
+    Combobox as RCombobox,
     ConfirmDialog as RConfirmDialog,
     Empty as REmpty,
     Field as RField,
@@ -16,6 +17,7 @@ import {
     Input as RInput,
     KV as RKV,
     KVRow as RKVRow,
+    Modal as RModal,
     Panel as RPanel,
     PanelBody as RPanelBody,
     PanelHead as RPanelHead,
@@ -24,6 +26,7 @@ import {
     Segmented as RSegmented,
     Status as RStatus,
     Tabs as RTabs,
+    Textarea as RTextarea,
 } from '../components/r-ui';
 import { validateJson } from '../lib/json-validate';
 import { MonoTable, MonoTableBody, MonoTableEmptyRow, MonoTableFrame, MonoTableHead, MonoTableRow, MonoTd, MonoTh } from '../components/table';
@@ -1233,13 +1236,13 @@ function EnvVarSourceTag({ source, environments = [] }) {
         const envName = source.slice(envPrefix.length);
         const envColor = environments.find(e => e.name === envName)?.color;
         return (
-            <span className="inline-flex items-center gap-1.5">
-                <EnvironmentColorDot color={envColor} />
-                <MonoTag color="blue">{envName}</MonoTag>
+            <span className="r-pill">
+                <EnvironmentColorDot color={envColor} size="0.5rem" />
+                {envName}
             </span>
         );
     }
-    return <MonoTag color={ENV_VAR_SOURCE_COLORS[source] || 'gray'}>{source}</MonoTag>;
+    return <span className="r-pill">{source}</span>;
 }
 
 // One collapsible scope panel (Global, or a single environment) of env vars.
@@ -1683,75 +1686,64 @@ export function EnvVarsList({ projectName, deploymentId }) {
                 apply to new deployments, not existing ones. Secret values are always masked unless revealed.
             </p>
 
-            <Modal
+            <RModal
                 isOpen={isModalOpen}
                 onClose={() => setIsModalOpen(false)}
-                title={editingEnvVar ? 'Edit Environment Variable' : 'Add Environment Variable'}
+                title={editingEnvVar ? 'Edit environment variable' : 'Add environment variable'}
+                footer={
+                    <>
+                        <RButton onClick={() => setIsModalOpen(false)} disabled={saving}>Cancel</RButton>
+                        <RButton variant="primary" onClick={handleSave} loading={saving}>
+                            {editingEnvVar ? 'Update' : 'Add'}
+                        </RButton>
+                    </>
+                }
             >
-                <ModalSection>
-                    {!deploymentId && environments.length > 0 && (
-                        <div>
-                            <span className="mono-label">Environment</span>
-                            <EnvironmentDropdown
-                                environments={environments}
-                                value={formData.environment}
-                                onChange={(env) => setFormData({ ...formData, environment: env })}
-                            />
-                        </div>
-                    )}
-                    <FormField
-                        label="Key"
-                        id="env-key"
+                {!deploymentId && environments.length > 0 && (
+                    <RField label="Environment">
+                        <RCombobox
+                            value={formData.environment || ''}
+                            onChange={(v) => setFormData({ ...formData, environment: v || null })}
+                            options={[
+                                { value: '', label: 'Global (all environments)' },
+                                ...environments.map(env => ({ value: env.name, label: env.name })),
+                            ]}
+                            placeholder="Global (all environments)"
+                        />
+                    </RField>
+                )}
+                <RField label="Key">
+                    <RInput
                         value={formData.key}
                         onChange={(e) => setFormData({ ...formData, key: e.target.value })}
                         placeholder="DATABASE_URL"
                         disabled={editingEnvVar !== null}
-                        required
+                        autoFocus={!editingEnvVar}
                     />
-                    <FormField
-                        label="Value"
-                        id="env-value"
-                        type="textarea"
+                </RField>
+                <RField label="Value">
+                    <RTextarea
                         value={formData.value}
                         onChange={(e) => setFormData({ ...formData, value: e.target.value })}
-                        placeholder="postgres://..."
-                        required
+                        placeholder="postgres://…"
                         rows={3}
                     />
-                    <SegmentedRadioGroup
-                        label="Type"
-                        name="env-var-type"
+                </RField>
+                <RField
+                    label="Type"
+                    hint="Protected secrets are write-only and cannot be read back. Secret values can be retrieved for development and CI."
+                >
+                    <RSegmented
                         value={formData.type}
-                        onChange={(type) => setFormData({ ...formData, type })}
-                        ariaLabel="Variable type"
                         options={[
-                            { value: 'plain', label: 'PLAIN' },
-                            { value: 'secret', label: 'SECRET' },
-                            { value: 'protected', label: 'PROTECTED' },
+                            { value: 'plain', label: 'Plain' },
+                            { value: 'secret', label: 'Secret' },
+                            { value: 'protected', label: 'Protected' },
                         ]}
+                        onChange={(type) => setFormData({ ...formData, type })}
                     />
-                    <p className="text-xs text-gray-500 dark:text-gray-400 -mt-2">
-                        Protected secrets are write-only and cannot be read back. Secret values can be retrieved for development and CI.
-                    </p>
-
-                    <ModalActions>
-                        <Button
-                            variant="secondary"
-                            onClick={() => setIsModalOpen(false)}
-                            disabled={saving}
-                        >
-                            Cancel
-                        </Button>
-                        <Button
-                            variant="primary"
-                            onClick={handleSave}
-                            loading={saving}
-                        >
-                            {editingEnvVar ? 'Update' : 'Add'}
-                        </Button>
-                    </ModalActions>
-                </ModalSection>
-            </Modal>
+                </RField>
+            </RModal>
 
             <ConfirmDialog
                 isOpen={confirmDialogOpen}
