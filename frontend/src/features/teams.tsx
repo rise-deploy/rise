@@ -141,7 +141,13 @@ export function TeamsList({ currentUser, openCreate = false }) {
             ) : (
                 <div className="r-grid-2">
                     {sortedTeams.map(t => (
-                        <TeamCard key={t.id} team={t} projectCount={countProjectsForTeam(projects, t)} onOpen={() => navigate(`/team/${t.name}`)} />
+                        <TeamCard
+                            key={t.id}
+                            team={t}
+                            projectCount={countProjectsForTeam(projects, t)}
+                            isOwner={!!currentUser && (t.owners || []).some(o => o.email === currentUser.email)}
+                            onOpen={() => navigate(`/team/${t.name}`)}
+                        />
                     ))}
                 </div>
             )}
@@ -219,7 +225,7 @@ function countProjectsForTeam(projects, team) {
     }).length;
 }
 
-function TeamCard({ team, projectCount, onOpen }) {
+function TeamCard({ team, projectCount, onOpen, isOwner }) {
     const members = team.members || [];
     const owners = team.owners || [];
     const leadEmail = owners[0]?.email || members[0]?.email;
@@ -227,7 +233,7 @@ function TeamCard({ team, projectCount, onOpen }) {
     const overflow = Math.max(0, members.length - visibleMembers.length);
 
     return (
-        <Panel>
+        <Panel onClick={onOpen} className={isOwner ? 'r-panel-own' : undefined}>
             <PanelHead>
                 <div style={{ minWidth: 0 }}>
                     <div className="r-panel-title" style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
@@ -241,7 +247,6 @@ function TeamCard({ team, projectCount, onOpen }) {
                         {' · '}{projectCount} project{projectCount === 1 ? '' : 's'}
                     </div>
                 </div>
-                <RButton size="sm" onClick={onOpen}>Manage</RButton>
             </PanelHead>
             <PanelBody>
                 {leadEmail && (

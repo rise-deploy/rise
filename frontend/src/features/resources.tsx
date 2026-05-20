@@ -1664,12 +1664,11 @@ export function ExtensionsList({ projectName }) {
                         const abbr = (ext.extension_type || '').replace(/[^a-zA-Z]/g, '').slice(0, 2).toUpperCase() || '?';
 
                         return (
-                            <RPanel key={ext.extension}>
-                                <div
-                                    className="r-panel-head"
-                                    style={{ cursor: 'pointer' }}
-                                    onClick={() => navigate(`/project/${projectName}/extensions/${ext.extension_type}/${ext.extension}`)}
-                                >
+                            <RPanel
+                                key={ext.extension}
+                                onClick={() => navigate(`/project/${projectName}/extensions/${ext.extension_type}/${ext.extension}`)}
+                            >
+                                <div className="r-panel-head">
                                     <div style={{ display: 'flex', alignItems: 'center', gap: 12, minWidth: 0 }}>
                                         {iconUrl ? (
                                             <img src={iconUrl} alt={ext.extension} style={{ width: 36, height: 36, borderRadius: 8, objectFit: 'contain' }} />
@@ -1694,15 +1693,6 @@ export function ExtensionsList({ projectName }) {
                                         <RKVRow k="Status">{ext.status_summary || '—'}</RKVRow>
                                         <RKVRow k="Updated">{formatDate(ext.updated)}</RKVRow>
                                     </RKV>
-                                    <div style={{ display: 'flex', gap: 6, marginTop: 14 }}>
-                                        <RButton
-                                            size="sm"
-                                            icon="arrow"
-                                            onClick={() => navigate(`/project/${projectName}/extensions/${ext.extension_type}/${ext.extension}`)}
-                                        >
-                                            Manage
-                                        </RButton>
-                                    </div>
                                 </div>
                             </RPanel>
                         );

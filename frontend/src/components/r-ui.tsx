@@ -51,7 +51,21 @@ export function Button({ variant = 'default', size = 'md', loading, icon, childr
 }
 
 // ---------- Panel ----------
-export function Panel({ children, className, style }: { children: React.ReactNode; className?: string; style?: React.CSSProperties }) {
+export function Panel({ children, className, style, onClick }: { children: React.ReactNode; className?: string; style?: React.CSSProperties; onClick?: () => void }) {
+    if (onClick) {
+        return (
+            <div
+                className={cx('r-panel', 'r-panel-clickable', className)}
+                style={style}
+                onClick={onClick}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onClick(); } }}
+            >
+                {children}
+            </div>
+        );
+    }
     return <div className={cx('r-panel', className)} style={style}>{children}</div>;
 }
 
