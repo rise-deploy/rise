@@ -1161,7 +1161,7 @@ function EnvVarScopeGroup({ scope, vars, searching, defaultOpen, environments, r
                         No variables in this scope.
                     </div>
                 ) : (
-                    <table className="r-table fixed">
+                    <table className="r-table r-table-fixed">
                         <colgroup>
                             <col style={{ width: '28%' }} />
                             <col />
@@ -1387,7 +1387,7 @@ export function EnvVarsList({ projectName, deploymentId }) {
                             </div>
                         </REmpty>
                     ) : (
-                        <table className="r-table fixed">
+                        <table className="r-table r-table-fixed">
                             <colgroup>
                                 <col style={{ width: '28%' }} />
                                 <col />

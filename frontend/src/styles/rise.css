@@ -735,9 +735,9 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
 
 /* ---------- Tables ---------- */
 .r-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-.r-table.fixed { table-layout: fixed; }
-.r-table.fixed td, .r-table.fixed th { overflow: hidden; text-overflow: ellipsis; }
-.r-table.fixed td > *:not(.row-actions) { max-width: 100%; }
+.r-table.r-table-fixed { table-layout: fixed; }
+.r-table.r-table-fixed td, .r-table.r-table-fixed th { overflow: hidden; text-overflow: ellipsis; }
+.r-table.r-table-fixed td > *:not(.row-actions) { max-width: 100%; }
 .r-table th {
     text-align: left;
     font-weight: 500;
