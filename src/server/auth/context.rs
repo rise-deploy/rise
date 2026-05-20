@@ -6,7 +6,7 @@ use crate::server::auth::controller::{
 use crate::server::auth::jwt::JwtValidator;
 use crate::server::error::{ServerError, ServerErrorExt};
 use crate::server::state::AppState;
-use axum::{extract::FromRequestParts, http::request::Parts};
+use axum::{extract::FromRequestParts, http::request::Parts, http::StatusCode};
 use sqlx::PgPool;
 use std::collections::HashMap;
 
@@ -219,6 +219,7 @@ impl FromRequestParts<AppState> for AuthContext {
 /// Controller auth is tried first (it is more specific — requires both a
 /// `VerifiedExternalToken` extension *and* matching `ControllerIdentity` claims).
 /// If that fails, regular user/SA auth is attempted.
+// TODO: remove #[allow(dead_code)] once dispatch_put handler consumes AnyAuth
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum AnyAuth {
@@ -234,9 +235,13 @@ impl FromRequestParts<AppState> for AnyAuth {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         // Try controller first (more specific — requires VerifiedExternalToken
-        // AND matching ControllerIdentity claims)
-        if let Ok(ctrl) = ControllerAuthContext::from_request_parts(parts, state).await {
-            return Ok(AnyAuth::Controller(ctrl));
+        // AND matching ControllerIdentity claims).
+        // Only fall back to user/SA auth on 401 (not a controller token).
+        // Any other error (e.g. 409 ambiguous config) is propagated immediately.
+        match ControllerAuthContext::from_request_parts(parts, state).await {
+            Ok(ctrl) => return Ok(AnyAuth::Controller(ctrl)),
+            Err(e) if e.status == StatusCode::UNAUTHORIZED => {}
+            Err(e) => return Err(e),
         }
         // Fall back to user/SA auth
         Ok(AnyAuth::User(
@@ -249,7 +254,6 @@ impl FromRequestParts<AppState> for AnyAuth {
 mod tests {
     use super::*;
     use crate::db::{models::ProjectStatus, projects, service_accounts, users};
-    use axum::http::StatusCode;
 
     fn empty_controller_index() -> HashMap<String, Vec<ControllerIdentity>> {
         HashMap::new()
