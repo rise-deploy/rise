@@ -305,15 +305,10 @@ export function TeamDetail({ teamName, currentUser }) {
         try {
             const [data, projects] = await Promise.all([
                 api.getTeam(teamName),
-                api.getProjects(),
+                api.getTeamProjects(teamName),
             ]);
             setTeam(data);
-            const ownedProjects = (projects || []).filter((p) => {
-                if (p.owner?.name && p.owner.name === data.name) return true;
-                if (p.owner?.id && data.id && p.owner.id === data.id) return true;
-                return false;
-            });
-            setTeamProjects(ownedProjects);
+            setTeamProjects(projects || []);
         } catch (err) {
             setError(err.message);
         } finally {
@@ -342,7 +337,6 @@ export function TeamDetail({ teamName, currentUser }) {
 
         setAddingOwner(true);
         try {
-            setDetailActionStatus(`Adding owner ${newOwnerEmail}...`);
             // Look up user ID by email
             const lookupResult = await api.lookupUsers([newOwnerEmail.trim()]);
             if (!lookupResult.users || lookupResult.users.length === 0) {
@@ -357,13 +351,11 @@ export function TeamDetail({ teamName, currentUser }) {
                 owners: [...currentOwnerIds, newOwnerId]
             });
             showToast(`Added ${newOwnerEmail} as owner`, 'success');
-            setDetailActionStatus(`Added owner ${newOwnerEmail}.`);
             setNewOwnerEmail('');
             setAddOwnerOpen(false);
             await loadTeam();
         } catch (err) {
             showToast(`Failed to add owner: ${err.message}`, 'error');
-            setDetailActionStatus(`Failed to add owner ${newOwnerEmail}.`);
         } finally {
             setAddingOwner(false);
         }
@@ -371,7 +363,6 @@ export function TeamDetail({ teamName, currentUser }) {
 
     const handleRemoveOwner = async (ownerId, email) => {
         try {
-            setDetailActionStatus(`Removing owner ${email}...`);
             const currentOwnerIds = team.owners?.map(o => o.id) || [];
             const updatedOwnerIds = currentOwnerIds.filter(id => id !== ownerId);
 
@@ -382,11 +373,9 @@ export function TeamDetail({ teamName, currentUser }) {
 
             await api.updateTeam(team.id, { owners: updatedOwnerIds });
             showToast(`Removed ${email} from owners`, 'success');
-            setDetailActionStatus(`Removed owner ${email}.`);
             await loadTeam();
         } catch (err) {
             showToast(`Failed to remove owner: ${err.message}`, 'error');
-            setDetailActionStatus(`Failed to remove owner ${email}.`);
         }
     };
 
@@ -398,7 +387,6 @@ export function TeamDetail({ teamName, currentUser }) {
 
         setAddingMember(true);
         try {
-            setDetailActionStatus(`Adding member ${newMemberEmail}...`);
             // Look up user ID by email
             const lookupResult = await api.lookupUsers([newMemberEmail.trim()]);
             if (!lookupResult.users || lookupResult.users.length === 0) {
@@ -413,13 +401,11 @@ export function TeamDetail({ teamName, currentUser }) {
                 members: [...currentMemberIds, newMemberId]
             });
             showToast(`Added ${newMemberEmail} as member`, 'success');
-            setDetailActionStatus(`Added member ${newMemberEmail}.`);
             setNewMemberEmail('');
             setAddMemberOpen(false);
             await loadTeam();
         } catch (err) {
             showToast(`Failed to add member: ${err.message}`, 'error');
-            setDetailActionStatus(`Failed to add member ${newMemberEmail}.`);
         } finally {
             setAddingMember(false);
         }
@@ -427,30 +413,24 @@ export function TeamDetail({ teamName, currentUser }) {
 
     const handleRemoveMember = async (memberId, email) => {
         try {
-            setDetailActionStatus(`Removing member ${email}...`);
             const currentMemberIds = team.members?.map(m => m.id) || [];
             const updatedMemberIds = currentMemberIds.filter(id => id !== memberId);
             await api.updateTeam(team.id, { members: updatedMemberIds });
             showToast(`Removed ${email} from members`, 'success');
-            setDetailActionStatus(`Removed member ${email}.`);
             await loadTeam();
         } catch (err) {
             showToast(`Failed to remove member: ${err.message}`, 'error');
-            setDetailActionStatus(`Failed to remove member ${email}.`);
         }
     };
 
     const handleDeleteTeam = async () => {
         setDeleting(true);
-        setDetailActionStatus(`Deleting team ${team.name}...`);
         try {
             await api.deleteTeam(team.id);
             showToast(`Team ${team.name} deleted successfully`, 'success');
-            setDetailActionStatus(`Deleted team ${team.name}.`);
             navigate('/teams');
         } catch (err) {
             showToast(`Failed to delete team: ${err.message}`, 'error');
-            setDetailActionStatus(`Failed to delete team ${team.name}.`);
             setDeleting(false);
         }
     };
@@ -552,7 +532,7 @@ export function TeamDetail({ teamName, currentUser }) {
                     ) : (
                         <Panel>
                             <div className="r-panel-body">
-                                <Empty title="No projects owned by this team" />
+                                <Empty title="No projects owned by or shared with this team" />
                             </div>
                         </Panel>
                     )}

@@ -261,6 +261,16 @@ pub async fn list_projects(
             .map_err(|e| e.with_context("user_id", user.id.to_string()))?
     };
 
+    let api_projects = projects_to_api(&state, projects).await?;
+    Ok(Json(api_projects))
+}
+
+/// Convert DB projects into API projects, batch-fetching deployment info, URLs
+/// and owner details. Shared by the project list and team-projects endpoints.
+async fn projects_to_api(
+    state: &AppState,
+    projects: Vec<crate::db::models::Project>,
+) -> Result<Vec<ApiProject>, ServerError> {
     // Batch fetch active deployment info for efficiency
     let project_ids: Vec<uuid::Uuid> = projects.iter().map(|p| p.id).collect();
     let active_deployment_info =
@@ -374,6 +384,23 @@ pub async fn list_projects(
         });
     }
 
+    Ok(api_projects)
+}
+
+/// List projects a team can access: owned by the team or granted view access.
+pub async fn list_team_projects(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(id_or_name): Path<String>,
+) -> Result<Json<Vec<ApiProject>>, ServerError> {
+    let _user = auth.user()?;
+    let team_id = resolve_team_identifier(&state.db_pool, &id_or_name).await?;
+
+    let projects = projects::list_accessible_by_team(&state.db_pool, team_id)
+        .await
+        .internal_err("Failed to list team projects")?;
+
+    let api_projects = projects_to_api(&state, projects).await?;
     Ok(Json(api_projects))
 }
 
