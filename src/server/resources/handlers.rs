@@ -205,6 +205,20 @@ fn enforce_parent_type(
     }
 }
 
+fn enforce_orphan_collection(info: &CollectionInfo, collection: &str) -> Result<(), ServerError> {
+    if info.scope == ResourceScope::Root {
+        return Err(ServerError::bad_request(format!(
+            "collection '{collection}' is root-scoped and does not use orphan type paths"
+        )));
+    }
+    if info.parent.is_none() {
+        return Err(ServerError::bad_request(format!(
+            "collection '{collection}' does not declare a parent and cannot have scoped orphans"
+        )));
+    }
+    Ok(())
+}
+
 /// Authorize a controller token for status/finalizer writes against a
 /// collection. The collection's `allowed_status_controller_ids` is the gate;
 /// an empty list is default-deny. Built-in collections currently carry an
@@ -338,6 +352,22 @@ async fn resolve_ancestors(
     Ok((segs, parent))
 }
 
+async fn resolve_orphan_item(
+    store: &Arc<dyn ResourceStore>,
+    info: &CollectionInfo,
+    identifier: &str,
+) -> Result<ResourceRow, ServerError> {
+    let seg = path_segment(&info.served_api_versions, &info.kind, identifier)?;
+    let chain = store
+        .resolve_path(&[seg])
+        .await
+        .map_err(store_error_to_server_error)?;
+    chain
+        .into_iter()
+        .last()
+        .ok_or_else(|| ServerError::not_found(format!("orphan resource '{identifier}' not found")))
+}
+
 // -----------------------------------------------------------------------------
 // Dispatch handlers
 // -----------------------------------------------------------------------------
@@ -398,6 +428,51 @@ pub async fn dispatch_get(
             })
             .into_response())
         }
+        ResourcePath::TypeOrphanList { collection } => {
+            let user = require_admin_operator(&state, &auth)?;
+            let resolved = resolve_collection(&state.resource_store, &collection).await?;
+            enforce_orphan_collection(&resolved.info, &resolved.collection)?;
+            let rows = state
+                .resource_store
+                .list_unparented_versions(&resolved.info.served_api_versions, &resolved.info.kind)
+                .await
+                .map_err(store_error_to_server_error)?;
+            tracing::info!(
+                target: "rise::audit",
+                actor = %user.email,
+                collection = %resolved.collection,
+                count = rows.len(),
+                "resource.type_orphans_listed"
+            );
+            Ok(Json(ResourceList {
+                api_version: resolved.info.api_version.clone(),
+                kind: resolved.info.kind,
+                items: rows
+                    .iter()
+                    .map(|row| row_to_resource_with_api_version(row, &resolved.info.api_version))
+                    .collect(),
+            })
+            .into_response())
+        }
+        ResourcePath::TypeOrphanItem {
+            collection,
+            identifier,
+        } => {
+            let _user = require_admin_operator(&state, &auth)?;
+            let resolved = resolve_collection(&state.resource_store, &collection).await?;
+            enforce_orphan_collection(&resolved.info, &resolved.collection)?;
+            let row =
+                resolve_orphan_item(&state.resource_store, &resolved.info, &identifier).await?;
+            Ok(Json(row_to_resource_with_api_version(
+                &row,
+                &resolved.info.api_version,
+            ))
+            .into_response())
+        }
+        ResourcePath::TypeOrphanSubresource { .. } => Err(ServerError::new(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "GET is not supported for orphan subresource paths",
+        )),
         ResourcePath::Item {
             ancestors,
             collection,
@@ -475,6 +550,21 @@ pub async fn dispatch_post(
                 &identifier,
             )
             .await?;
+            let resp = apply_reparent(&state, &resolved.info, &row, body, &user).await?;
+            Ok(resp.into_response())
+        }
+        ResourcePath::TypeOrphanSubresource {
+            collection,
+            identifier,
+            subresource: Subresource::Reparent,
+        } => {
+            let user = require_admin_operator(&state, &auth)?;
+            let body: ReparentRequest = serde_json::from_value(body)
+                .map_err(|e| ServerError::bad_request(format!("invalid request body: {e}")))?;
+            let resolved = resolve_collection(&state.resource_store, &collection).await?;
+            enforce_orphan_collection(&resolved.info, &resolved.collection)?;
+            let row =
+                resolve_orphan_item(&state.resource_store, &resolved.info, &identifier).await?;
             let resp = apply_reparent(&state, &resolved.info, &row, body, &user).await?;
             Ok(resp.into_response())
         }
@@ -594,6 +684,12 @@ pub async fn dispatch_put(
                 )),
             }
         }
+        ResourcePath::TypeOrphanList { .. }
+        | ResourcePath::TypeOrphanItem { .. }
+        | ResourcePath::TypeOrphanSubresource { .. } => Err(ServerError::new(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "PUT is not valid for orphan type paths",
+        )),
         _ => Err(ServerError::new(
             StatusCode::METHOD_NOT_ALLOWED,
             "PUT is only valid for item and subresource paths",
@@ -632,6 +728,20 @@ pub async fn dispatch_delete(
                 &identifier,
             )
             .await?;
+            let resp =
+                delete_resource(&state, &row, policy, &user, &resolved.info.api_version).await?;
+            Ok(resp.into_response())
+        }
+        ResourcePath::TypeOrphanItem {
+            collection,
+            identifier,
+        } => {
+            let policy = parse_propagation(q.propagation_policy)?;
+            let user = require_admin_operator(&state, &auth)?;
+            let resolved = resolve_collection(&state.resource_store, &collection).await?;
+            enforce_orphan_collection(&resolved.info, &resolved.collection)?;
+            let row =
+                resolve_orphan_item(&state.resource_store, &resolved.info, &identifier).await?;
             let resp =
                 delete_resource(&state, &row, policy, &user, &resolved.info.api_version).await?;
             Ok(resp.into_response())

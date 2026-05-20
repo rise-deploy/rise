@@ -205,6 +205,37 @@ impl PgResourceStore {
     fn api_version(group: &str, version: &str) -> String {
         format!("{group}/{version}")
     }
+
+    fn invalidate_schema_cache(&self, group: &str, plural: &str) {
+        if let Ok(mut cache) = self.schema_cache.write() {
+            cache.retain(|key, _| {
+                let Some((key_group, rest)) = key.split_once('/') else {
+                    return true;
+                };
+                let Some((_, key_plural)) = rest.rsplit_once('/') else {
+                    return true;
+                };
+                key_group != group || key_plural != plural
+            });
+        }
+    }
+
+    fn validate_version_schemas(
+        spec: &ResourceDefinitionSpec,
+        context: &str,
+    ) -> Result<(), StoreError> {
+        for version in &spec.versions {
+            if let Some(schema) = version.schema.clone() {
+                JsonSchemaValidator::new(schema).map_err(|e| {
+                    StoreError::Validation(format!(
+                        "ResourceDefinition {context} version '{}' has an invalid JSON schema: {e}",
+                        version.name
+                    ))
+                })?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -782,6 +813,27 @@ impl ResourceStore for PgResourceStore {
         Ok(rows)
     }
 
+    async fn list_unparented_versions(
+        &self,
+        api_versions: &[String],
+        kind: &str,
+    ) -> Result<Vec<ResourceRow>, StoreError> {
+        let rows = sqlx::query_as::<_, ResourceRow>(
+            r#"
+            SELECT * FROM resource_store.resources
+            WHERE api_version = ANY($1)
+              AND kind = $2
+              AND parent_uid IS NULL
+            ORDER BY name
+            "#,
+        )
+        .bind(api_versions)
+        .bind(kind)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     async fn reparent(
         &self,
         uid: Uuid,
@@ -1168,18 +1220,10 @@ impl ResourceStore for PgResourceStore {
             )));
         }
 
-        // Validate the embedded JSON schema compiles. The `resources_name_format` DB constraint
-        // enforces DNS-label segments, so we don't re-check structure here.
-        if let Some(storage_version) = spec.versions.iter().find(|v| v.storage) {
-            if let Some(schema) = storage_version.schema.clone() {
-                JsonSchemaValidator::new(schema).map_err(|e| {
-                    StoreError::Validation(format!(
-                        "ResourceDefinition '{}' has an invalid JSON schema: {e}",
-                        params.name
-                    ))
-                })?;
-            }
-        }
+        // Validate every declared JSON schema compiles. Any served version can
+        // be resolved independently later, so deferring this would make the API
+        // fail only when that version is first used.
+        Self::validate_version_schemas(&spec, &format!("'{}'", params.name))?;
 
         let mut tx = self.pool.begin().await?;
 
@@ -1228,10 +1272,7 @@ impl ResourceStore for PgResourceStore {
 
         tx.commit().await?;
 
-        // Evict any stale cached validator for this plural
-        if let Ok(mut cache) = self.schema_cache.write() {
-            cache.remove(&spec.plural);
-        }
+        self.invalidate_schema_cache(&spec.group, &spec.plural);
 
         Ok(resource_row)
     }
@@ -1247,16 +1288,8 @@ impl ResourceStore for PgResourceStore {
         let new_spec: ResourceDefinitionSpec = serde_json::from_value(params.spec.clone())
             .expect("spec parseable: ResourceDefinitionValidator.validate_spec succeeded");
 
-        // Validate that the new spec's JSON schema (if any) compiles. Symmetric with register.
-        if let Some(storage_version) = new_spec.versions.iter().find(|v| v.storage) {
-            if let Some(schema) = storage_version.schema.clone() {
-                JsonSchemaValidator::new(schema).map_err(|e| {
-                    StoreError::Validation(format!(
-                        "ResourceDefinition has an invalid JSON schema: {e}"
-                    ))
-                })?;
-            }
-        }
+        // Validate every declared JSON schema compiles. Symmetric with register.
+        Self::validate_version_schemas(&new_spec, "")?;
 
         let mut tx = self.pool.begin().await?;
 
@@ -1285,9 +1318,10 @@ impl ResourceStore for PgResourceStore {
             || new_spec.kind != old_spec.kind
             || new_spec.plural != old_spec.plural
             || new_spec.scope != old_spec.scope
+            || new_spec.parent != old_spec.parent
         {
             return Err(StoreError::Validation(
-                "ResourceDefinition identity fields (group, kind, plural, scope) are immutable"
+                "ResourceDefinition identity fields (group, kind, plural, scope, parent) are immutable"
                     .to_string(),
             ));
         }
@@ -1344,10 +1378,7 @@ impl ResourceStore for PgResourceStore {
 
         tx.commit().await?;
 
-        // Evict stale cached validator for this collection
-        if let Ok(mut cache) = self.schema_cache.write() {
-            cache.remove(&new_spec.plural);
-        }
+        self.invalidate_schema_cache(&new_spec.group, &new_spec.plural);
 
         Ok(row)
     }

@@ -1041,6 +1041,210 @@ async fn update_resource_definition_rejects_identity_change(
 }
 
 #[sqlx::test]
+async fn update_resource_definition_rejects_parent_change(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+
+    let spec = json!({
+        "group": "example.dev",
+        "kind": "Widget",
+        "plural": "widgets",
+        "scope": "organization",
+        "parent": {"apiVersion": API_VERSION_V1ALPHA1, "kind": ORGANIZATION_KIND},
+        "versions": [{"name": "v1", "served": true, "storage": true}],
+        "allowedStatusControllerIds": []
+    });
+
+    let row = store
+        .register_resource_definition(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: RESOURCE_DEFINITION_KIND.to_string(),
+            name: "widgets.example.dev".to_string(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec,
+            validator: None,
+        })
+        .await
+        .unwrap();
+
+    let changed_parent_spec = json!({
+        "group": "example.dev",
+        "kind": "Widget",
+        "plural": "widgets",
+        "scope": "organization",
+        "parent": {"apiVersion": API_VERSION_V1ALPHA1, "kind": "Project"},
+        "versions": [{"name": "v1", "served": true, "storage": true}],
+        "allowedStatusControllerIds": []
+    });
+
+    let err = store
+        .update_resource_definition(
+            row.uid,
+            UpdateResourceParams {
+                api_version: None,
+                revision: row.revision,
+                annotations: BTreeMap::new(),
+                finalizers: vec![],
+                spec: changed_parent_spec,
+                validator: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, StoreError::Validation(_)),
+        "expected Validation error for parent change, got {err:?}"
+    );
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn register_resource_definition_rejects_invalid_non_storage_schema(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+
+    let spec = json!({
+        "group": "example.dev",
+        "kind": "Widget",
+        "plural": "widgets",
+        "scope": "root",
+        "versions": [
+            {"name": "v1", "served": true, "storage": true},
+            {"name": "v2", "served": true, "storage": false, "schema": {"type": "not-a-json-schema-type"}}
+        ],
+        "allowedStatusControllerIds": []
+    });
+
+    let err = store
+        .register_resource_definition(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: RESOURCE_DEFINITION_KIND.to_string(),
+            name: "widgets.example.dev".to_string(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec,
+            validator: None,
+        })
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, StoreError::Validation(_)),
+        "expected invalid schema validation error, got {err:?}"
+    );
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn update_resource_definition_invalidates_schema_cache(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+
+    let spec_v1 = json!({
+        "group": "example.dev",
+        "kind": "Widget",
+        "plural": "widgets",
+        "scope": "root",
+        "versions": [{
+            "name": "v1",
+            "served": true,
+            "storage": true,
+            "schema": {
+                "type": "object",
+                "required": ["color"],
+                "properties": {"color": {"type": "string"}}
+            }
+        }],
+        "allowedStatusControllerIds": []
+    });
+
+    let row = store
+        .register_resource_definition(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: RESOURCE_DEFINITION_KIND.to_string(),
+            name: "widgets.example.dev".to_string(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec: spec_v1,
+            validator: None,
+        })
+        .await
+        .unwrap();
+
+    let cached_info = store
+        .resolve_collection_version("example.dev", "v1", "widgets")
+        .await
+        .unwrap()
+        .unwrap();
+    cached_info
+        .spec_validator
+        .validate_spec(&json!({"color": "blue"}))
+        .unwrap();
+
+    let spec_v2 = json!({
+        "group": "example.dev",
+        "kind": "Widget",
+        "plural": "widgets",
+        "scope": "root",
+        "versions": [{
+            "name": "v1",
+            "served": true,
+            "storage": true,
+            "schema": {
+                "type": "object",
+                "required": ["size"],
+                "properties": {"size": {"type": "number"}}
+            }
+        }],
+        "allowedStatusControllerIds": []
+    });
+
+    store
+        .update_resource_definition(
+            row.uid,
+            UpdateResourceParams {
+                api_version: None,
+                revision: row.revision,
+                annotations: BTreeMap::new(),
+                finalizers: vec![],
+                spec: spec_v2,
+                validator: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let refreshed_info = store
+        .resolve_collection_version("example.dev", "v1", "widgets")
+        .await
+        .unwrap()
+        .unwrap();
+
+    let err = refreshed_info
+        .spec_validator
+        .validate_spec(&json!({"color": "blue"}))
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Validation(_)),
+        "expected refreshed schema to reject old shape, got {err:?}"
+    );
+    refreshed_info
+        .spec_validator
+        .validate_spec(&json!({"size": 3}))
+        .unwrap();
+
+    Ok(())
+}
+
+#[sqlx::test]
 async fn update_rejects_resource_definition(pool: sqlx::PgPool) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
 
@@ -1325,6 +1529,43 @@ async fn orphan_delete_detaches_children(pool: sqlx::PgPool) -> sqlx::Result<()>
     assert_eq!(c1_after.parent_uid, None);
     assert_eq!(c2_after.parent_uid, None);
     assert!(c1_after.deletion_timestamp.is_none());
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn orphan_delete_children_are_discoverable_by_type_and_reparentable(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let org_a = create_org(&store, "orphan-source").await;
+    let org_b = create_org(&store, "orphan-destination").await;
+    let child = create_child(&store, org_a.uid, "Widget", "w1", vec![]).await;
+
+    store
+        .delete(org_a.uid, PropagationPolicy::Orphan)
+        .await
+        .unwrap();
+
+    let unparented = store
+        .list_unparented_versions(&["example.dev/v1".to_string()], "Widget")
+        .await
+        .unwrap();
+    assert_eq!(unparented.len(), 1);
+    assert_eq!(unparented[0].uid, child.uid);
+    assert_eq!(unparented[0].parent_uid, None);
+
+    let moved = store
+        .reparent(child.uid, Some(org_b.uid), ResourceScope::Organization)
+        .await
+        .unwrap();
+    assert_eq!(moved.parent_uid, Some(org_b.uid));
+
+    let remaining = store
+        .list_unparented_versions(&["example.dev/v1".to_string()], "Widget")
+        .await
+        .unwrap();
+    assert!(remaining.is_empty());
 
     Ok(())
 }

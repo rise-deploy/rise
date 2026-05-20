@@ -123,6 +123,15 @@ pub trait ResourceStore: Send + Sync {
         parent_uid: Option<Uuid>,
     ) -> Result<Vec<ResourceRow>, StoreError>;
 
+    /// List parentless resources for a non-root-scoped collection. These are
+    /// not root-scoped resources; they are scoped resources whose parent was
+    /// intentionally detached by an administrative break-glass operation.
+    async fn list_unparented_versions(
+        &self,
+        api_versions: &[String],
+        kind: &str,
+    ) -> Result<Vec<ResourceRow>, StoreError>;
+
     async fn update(
         &self,
         uid: Uuid,
@@ -136,8 +145,9 @@ pub trait ResourceStore: Send + Sync {
     ///   removal of the parent row happens when the subtree has drained and all finalizers are
     ///   gone, via `try_collect`.
     /// - `Orphan`: clears `parent_uid` on immediate children, then deletes the parent normally
-    ///   (marked if it carries finalizers, hard-deleted otherwise). Admin gate is the caller's
-    ///   responsibility.
+    ///   (marked if it carries finalizers, hard-deleted otherwise). Non-root-scoped children
+    ///   remain parentless scoped resources and must be discovered through orphan-aware APIs.
+    ///   Admin gate is the caller's responsibility.
     async fn delete(
         &self,
         uid: Uuid,

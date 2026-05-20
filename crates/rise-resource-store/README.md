@@ -14,6 +14,8 @@ parent_uid UUID NULL REFERENCES resources(uid)
 
 Uniqueness of `(api_version, kind, name)` within a parent scope is enforced by partial
 unique indexes — one for `parent_uid IS NULL` (root) and one for `parent_uid IS NOT NULL`.
+For non-root-scoped types, `parent_uid IS NULL` means the resource is parentless/orphaned;
+scope still comes from the `ResourceDefinition`.
 
 `resource_definitions` is a projection table holding the indexed/queryable identity fields
 (group, kind, plural, scope) of `ResourceDefinition` rows; it stays in sync via
@@ -50,9 +52,10 @@ and resolution paths all need to observe in-progress teardown.
   observable until the entire subtree has been collected.
 
 - **`Orphan`**. Detaches immediate children (`UPDATE resources SET parent_uid = NULL WHERE
-  parent_uid = $1`) and then deletes the parent normally. Children continue as root-level
-  resources. This is an admin/break-glass operation; **admin gating is the caller's
-  responsibility** (the store accepts the policy unconditionally).
+  parent_uid = $1`) and then deletes the parent normally. Non-root-scoped children remain
+  parentless scoped resources and require orphan-aware discovery/reparenting. This is an
+  admin/break-glass operation; **admin gating is the caller's responsibility** (the store
+  accepts the policy unconditionally).
 
 ### Finalizer ownership
 
@@ -90,8 +93,9 @@ the API layer:
 (i.e. children of an in-progress teardown). Scoped optionally to a single subtree. Useful
 for admin tooling that needs to inspect or repair in-flight cascade operations.
 
-Note: the FK on `parent_uid` makes "dangling" orphans (parent row gone) impossible. Orphan
-mode explicitly nulls `parent_uid` instead.
+`list_unparented_versions(api_versions, kind)` returns parentless resources of a specific
+type. For non-root-scoped collections these rows are scoped orphans created by break-glass
+orphan deletion and should be repaired with `reparent`.
 
 ## Reparenting
 

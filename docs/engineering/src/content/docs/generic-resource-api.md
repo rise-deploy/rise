@@ -17,6 +17,9 @@ Resource collection paths are versioned, following the same group/version shape 
 | `apis/{group}/{version}/{plural}/{id}/reparent` | POST | Break-glass reparent |
 | `apis/{groupA}/{versionA}/{pluralA}/{idA}/apis/{groupB}/{versionB}/{pluralB}` | GET, POST | List / create children under a typed parent |
 | `orphans` | GET | Break-glass orphan listing |
+| `apis/{group}/{version}/{plural}/orphans` | GET | List parentless resources of a non-root-scoped type |
+| `apis/{group}/{version}/{plural}/orphans/{id}` | GET, DELETE | Get / delete a parentless resource of a non-root-scoped type |
+| `apis/{group}/{version}/{plural}/orphans/{id}/reparent` | POST | Reparent a parentless resource of a non-root-scoped type |
 
 Unversioned resource paths are not supported.
 
@@ -48,6 +51,7 @@ Controller tokens cannot perform item-level PUT or other operator operations.
 - Root-scoped resources set `scope: "root"` and do not declare `parent`.
 - Non-root resources must declare `parent: { "apiVersion": "...", "kind": "..." }`.
 - Children may only exist directly under a parent whose stored `apiVersion` and `kind` exactly match the declared parent.
+- The type decides scope. A non-root-scoped resource with no current `parent_uid` is a parentless scoped resource, not a root-scoped resource.
 - A `ResourceDefinition` cannot be deleted while any related resources exist in any declared version.
 
 Version behavior follows Kubernetes-style semantics:
@@ -65,7 +69,7 @@ DELETE accepts `propagationPolicy`:
 | Value | Behaviour | Requirement |
 |---|---|---|
 | `Cascade` (default) | Deletes the resource and descendants | Operator |
-| `Orphan` | Deletes only the resource; children are detached | Admin + operator |
+| `Orphan` | Deletes only the resource; children are detached and become discoverable through type orphan paths | Admin + operator |
 
 ```bash
 curl -X DELETE \
