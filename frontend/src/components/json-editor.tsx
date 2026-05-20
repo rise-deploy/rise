@@ -12,6 +12,12 @@ const baseTheme = EditorView.theme({
     '&.cm-editor.cm-focused': { outline: 'none' },
 });
 
+// An empty document is treated as "no error" — an empty optional JSON field
+// should not show a parse error until the user actually types something.
+const parseLint = jsonParseLinter();
+const tolerantJsonLinter = (view: any) =>
+    view.state.doc.toString().trim() === '' ? [] : parseLint(view);
+
 export function JsonEditor({
     value,
     onChange,
@@ -31,7 +37,7 @@ export function JsonEditor({
 
     const extensions = useMemo(() => {
         const ext: any[] = [json(), baseTheme, EditorView.lineWrapping];
-        if (!readOnly) ext.push(linter(jsonParseLinter()));
+        if (!readOnly) ext.push(linter(tolerantJsonLinter));
         return ext;
     }, [readOnly]);
 

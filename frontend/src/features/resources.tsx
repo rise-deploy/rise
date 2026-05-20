@@ -662,7 +662,7 @@ export function ServiceAccountsList({ projectName }) {
     const [isModalOpen, setIsModalOpen] = useState(false);
     const [editingSA, setEditingSA] = useState(null);
     const [formData, setFormData] = useState({ issuer_url: '', aud: '', claims: {} });
-    const [claimsText, setClaimsText] = useState('');
+    const [claimsText, setClaimsText] = useState('{}');
     const [confirmDialogOpen, setConfirmDialogOpen] = useState(false);
     const [saToDelete, setSAToDelete] = useState(null);
     const [deleting, setDeleting] = useState(false);
@@ -697,7 +697,7 @@ export function ServiceAccountsList({ projectName }) {
         // Default aud to Rise backend URL (where the API is hosted)
         const defaultAud = CONFIG.backendUrl;
         setFormData({ issuer_url: '', aud: defaultAud, claims: {} });
-        setClaimsText('');
+        setClaimsText('{}');
         setSelectedEnvs([]);
         setIsModalOpen(true);
     };
@@ -903,12 +903,14 @@ export function ServiceAccountsList({ projectName }) {
                     label="Additional claims (JSON)"
                     hint={<>Provide a JSON object. The <span className="mono">aud</span> claim is configured separately above.</>}
                 >
-                    <RTextarea
-                        value={claimsText}
-                        onChange={(e) => setClaimsText(e.target.value)}
-                        placeholder={'{\n  "sub": "repo:myorg/myrepo:*"\n}'}
-                        rows={5}
-                    />
+                    <Suspense fallback={<JsonEditorFallback />}>
+                        <JsonEditor
+                            value={claimsText}
+                            onChange={setClaimsText}
+                            minHeight="120px"
+                            ariaLabel="Additional claims JSON"
+                        />
+                    </Suspense>
                 </RField>
             </RModal>
 
