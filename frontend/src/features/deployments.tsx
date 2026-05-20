@@ -1369,35 +1369,52 @@ function PodStatusSection({ podStatus }: { podStatus: PodStatus }) {
     );
 }
 
-export function EnvironmentDeploymentView({ projectName, environmentName }) {
+// Resolves a stable URL — the active deployment of an environment (via its
+// primary deployment group) or of an explicit deployment group — to the
+// concrete deployment, then renders the deployment detail.
+export function EnvironmentDeploymentView({ projectName, environmentName, groupName }) {
     const [activeDeploymentId, setActiveDeploymentId] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
 
     useEffect(() => {
-        async function findActiveDeployment() {
+        let cancelled = false;
+        async function resolve() {
             try {
+                let group = groupName || null;
+                if (!group) {
+                    // Environment URL: resolve the environment's primary group.
+                    const envs = await api.getProjectEnvironments(projectName);
+                    group = (envs || []).find((e) => e.name === environmentName)?.primary_deployment_group || null;
+                }
                 const deployments = await api.getProjectDeployments(projectName, { limit: 100 });
                 const active = deployments.find(
-                    (d) => d.environment === environmentName && d.is_active
+                    (d) => d.environment === environmentName
+                        && d.is_active
+                        && (!group || (d.deployment_group || 'default') === group)
                 );
-                setActiveDeploymentId(active ? active.deployment_id : null);
-                setLoading(false);
+                if (!cancelled) {
+                    setActiveDeploymentId(active ? active.deployment_id : null);
+                    setLoading(false);
+                }
             } catch (err) {
-                setError(err.message);
-                setLoading(false);
+                if (!cancelled) { setError(err.message); setLoading(false); }
             }
         }
-        findActiveDeployment();
-    }, [projectName, environmentName]);
+        resolve();
+        return () => { cancelled = true; };
+    }, [projectName, environmentName, groupName]);
 
-    if (loading) return <LoadingState label="Loading environment deployment..." />;
+    if (loading) return <LoadingState label="Loading deployment…" />;
     if (error) return <ErrorState message={`Error: ${error}`} />;
     if (!activeDeploymentId) {
+        const scope = groupName
+            ? <>the <strong>{groupName}</strong> group of <strong>{environmentName}</strong></>
+            : <>the <strong>{environmentName}</strong> environment</>;
         return (
             <div>
-                <p className="text-gray-600 dark:text-gray-400 mb-4">
-                    No active deployment in the <strong>{environmentName}</strong> environment.
+                <p style={{ color: 'var(--text-muted)', marginBottom: 16 }}>
+                    No active deployment in {scope}.
                 </p>
                 <Button variant="secondary" size="sm" onClick={() => navigate(`/project/${projectName}/environments`)}>
                     Back to Environments

@@ -888,6 +888,11 @@ export function AppUsersList({ projectName, project, accessClasses, currentUserE
     const [newUserEmail, setNewUserEmail] = useState('');
     const [selectedTeamId, setSelectedTeamId] = useState('');
     const [teams, setTeams] = useState([]);
+    const [editingOwner, setEditingOwner] = useState(false);
+    const [newOwnerType, setNewOwnerType] = useState('user');
+    const [newOwnerEmail, setNewOwnerEmail] = useState('');
+    const [newOwnerTeamId, setNewOwnerTeamId] = useState('');
+    const [updatingOwner, setUpdatingOwner] = useState(false);
     const { showToast } = useToast();
 
     const appUsers = project?.app_users || [];
@@ -938,6 +943,49 @@ export function AppUsersList({ projectName, project, accessClasses, currentUserE
             onProjectUpdated();
         } catch (err) {
             showToast(`Failed to update access class: ${err.message}`, 'error');
+        }
+    };
+
+    const handleEditOwner = () => {
+        if (owner?.email) {
+            setNewOwnerType('user');
+            setNewOwnerEmail(owner.email);
+            setNewOwnerTeamId('');
+        } else if (owner?.name) {
+            setNewOwnerType('team');
+            setNewOwnerEmail('');
+            const match = teams.find(t => t.id === owner.id || t.name === owner.name);
+            setNewOwnerTeamId(match?.id || owner.id || '');
+        } else {
+            setNewOwnerType('user');
+            setNewOwnerEmail('');
+            setNewOwnerTeamId('');
+        }
+        setEditingOwner(true);
+    };
+
+    const handleSaveOwner = async () => {
+        if (newOwnerType === 'user' && !newOwnerEmail.trim()) {
+            showToast('Owner email is required', 'error');
+            return;
+        }
+        if (newOwnerType === 'team' && !newOwnerTeamId) {
+            showToast('Owner team is required', 'error');
+            return;
+        }
+        setUpdatingOwner(true);
+        try {
+            const payload = newOwnerType === 'user'
+                ? { user: newOwnerEmail.trim() }
+                : { team: newOwnerTeamId };
+            await api.updateProject(projectName, { owner: payload });
+            showToast('Project owner updated', 'success');
+            setEditingOwner(false);
+            onProjectUpdated();
+        } catch (err) {
+            showToast(`Failed to update owner: ${err.message}`, 'error');
+        } finally {
+            setUpdatingOwner(false);
         }
     };
 
@@ -1005,6 +1053,20 @@ export function AppUsersList({ projectName, project, accessClasses, currentUserE
 
     return (
         <div className="r-stack">
+            <div className="r-section-head">
+                <div>
+                    <div className="r-section-title">Owner</div>
+                    <div className="r-section-sub">
+                        {ownerUserEmail
+                            ? `Owned by user ${ownerUserEmail}.`
+                            : ownerTeamName
+                                ? `Owned by team ${ownerTeamName}.`
+                                : 'No owner set.'}
+                    </div>
+                </div>
+                <RButton size="sm" icon="edit" onClick={handleEditOwner}>Transfer ownership</RButton>
+            </div>
+
             <div className="r-section-head">
                 <div>
                     <div className="r-section-title">Access class</div>
@@ -1132,6 +1194,54 @@ export function AppUsersList({ projectName, project, accessClasses, currentUserE
                     </div>
                 </Panel>
             </div>
+
+            <RModal
+                isOpen={editingOwner}
+                onClose={() => setEditingOwner(false)}
+                title="Transfer project ownership"
+                footer={
+                    <>
+                        <RButton onClick={() => setEditingOwner(false)} disabled={updatingOwner}>Cancel</RButton>
+                        <RButton variant="primary" onClick={handleSaveOwner} loading={updatingOwner}>
+                            Transfer ownership
+                        </RButton>
+                    </>
+                }
+            >
+                <RField label="Owner type">
+                    <Segmented
+                        value={newOwnerType}
+                        onChange={setNewOwnerType}
+                        options={[
+                            { value: 'user', label: 'User' },
+                            { value: 'team', label: 'Team' },
+                        ]}
+                    />
+                </RField>
+                {newOwnerType === 'user' ? (
+                    <RField label="Owner email">
+                        <AutocompleteInput
+                            type="email"
+                            id="transfer-owner-email"
+                            value={newOwnerEmail}
+                            onChange={setNewOwnerEmail}
+                            options={currentUserEmail ? [currentUserEmail] : []}
+                            placeholder="owner@example.com"
+                            onEnter={handleSaveOwner}
+                        />
+                    </RField>
+                ) : (
+                    <RField label="Owner team">
+                        <RCombobox
+                            value={newOwnerTeamId}
+                            onChange={setNewOwnerTeamId}
+                            options={teams.map(t => ({ value: t.id, label: t.name }))}
+                            placeholder="Select a team"
+                            searchPlaceholder="Search teams…"
+                        />
+                    </RField>
+                )}
+            </RModal>
         </div>
     );
 }

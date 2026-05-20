@@ -191,6 +191,7 @@ export function App() {
             view = 'environment-deployment';
             params.projectName = parts[1];
             params.environmentName = parts[3];
+            if (parts[4] === 'group' && parts[5]) params.groupName = parts[5];
         } else if (parts[2] === 'extensions') {
             if (parts.length === 3) { view = 'project-detail'; params.projectName = parts[1]; params.tab = 'extensions'; }
             else if (parts.length === 4 && parts[3] === '@new') { view = 'extension-create'; params.projectName = parts[1]; params.extensionType = null; }
@@ -237,7 +238,7 @@ export function App() {
             { label: 'Projects', href: '/projects' },
             { label: params.projectName, href: `/project/${params.projectName}` },
             { label: 'Environments', href: `/project/${params.projectName}/environments` },
-            { label: params.environmentName },
+            { label: params.environmentName + (params.groupName ? ` / ${params.groupName}` : '') },
         ]; break;
         case 'deployment-detail': breadcrumbs = [
             { label: 'Projects', href: '/projects' },
@@ -293,7 +294,7 @@ export function App() {
                     {view === 'teams' && <TeamsList currentUser={user} openCreate={createIntent === 'team'} />}
                     {view === 'project-detail' && <ProjectDetail projectName={params.projectName} initialTab={params.tab} />}
                     {view === 'team-detail' && <TeamDetail teamName={params.teamName} currentUser={user} />}
-                    {view === 'environment-deployment' && <EnvironmentDeploymentView projectName={params.projectName} environmentName={params.environmentName} />}
+                    {view === 'environment-deployment' && <EnvironmentDeploymentView projectName={params.projectName} environmentName={params.environmentName} groupName={params.groupName} />}
                     {view === 'deployment-detail' && <DeploymentDetail projectName={params.projectName} deploymentId={params.deploymentId} />}
                     {view === 'extension-detail' && <ExtensionDetailPage projectName={params.projectName} extensionType={params.extensionType} extensionInstance={params.extensionInstance} />}
                 </ErrorBoundary>

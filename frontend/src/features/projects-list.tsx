@@ -134,7 +134,6 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
             <StatGrid cols={3}>
                 <Stat label="Healthy" value={counts.healthy} unit={` / ${projects.length}`} delta={counts.unhealthy ? `${counts.unhealthy} need attention` : 'all probes passing'} deltaTone={counts.unhealthy ? 'down' : undefined} />
                 <Stat label="Deploying" value={counts.deploying} delta={counts.deploying ? 'builds or rollouts in progress' : 'no active deploys'} />
-                <Stat label="Access classes" value={accessClasses.length || '—'} delta="configured for this workspace" />
             </StatGrid>
 
             <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', marginBottom: 16 }}>

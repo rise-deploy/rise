@@ -197,7 +197,7 @@ function formatDuration(start, end) {
 }
 
 // Collapsible deployment-group card: GroupBar header + deployment history table.
-function DeploymentGroupCard({ groupName, deployments, projectName, defaultOpen }) {
+function DeploymentGroupCard({ groupName, deployments, projectName, environmentName, defaultOpen }) {
     const [open, setOpen] = useState(defaultOpen);
     const active = deployments.find(d => d.is_active);
     const replicas = active?.replicas;
@@ -217,7 +217,17 @@ function DeploymentGroupCard({ groupName, deployments, projectName, defaultOpen 
                     </>
                 }
             >
-                <strong>{groupName}</strong>
+                <a
+                    className="r-link"
+                    style={{ fontWeight: 600, fontSize: 13 }}
+                    onClick={(e) => {
+                        e.stopPropagation();
+                        navigate(`/project/${projectName}/environment/${environmentName}/group/${groupName}`);
+                    }}
+                    title="View the active deployment of this group"
+                >
+                    {groupName}
+                </a>
                 <span style={{ fontSize: 11.5, color: 'var(--text-soft)' }}>
                     · {deployments.length} deployment{deployments.length === 1 ? '' : 's'}
                 </span>
@@ -510,9 +520,14 @@ export function EnvironmentsList({ projectName, platformConstraints = null }) {
                                     <div>
                                         <div style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
                                             <EnvironmentColorDot color={env.color} size="0.7rem" />
-                                            <span style={{ fontSize: 15, fontWeight: 600, letterSpacing: '-0.01em', textTransform: 'capitalize' }}>
+                                            <a
+                                                className="r-link"
+                                                style={{ fontSize: 15, fontWeight: 600, letterSpacing: '-0.01em', textTransform: 'capitalize' }}
+                                                onClick={() => navigate(`/project/${projectName}/environment/${env.name}`)}
+                                                title="View the active deployment of this environment"
+                                            >
                                                 {env.name}
-                                            </span>
+                                            </a>
                                             {env.is_production && env.name.toLowerCase() !== 'production' && (
                                                 <span className="r-pill env-prod">production</span>
                                             )}
@@ -547,6 +562,7 @@ export function EnvironmentsList({ projectName, platformConstraints = null }) {
                                             groupName={g.name}
                                             deployments={g.deployments}
                                             projectName={projectName}
+                                            environmentName={env.name}
                                             defaultOpen={i === 0 || g.name === env.primary_deployment_group}
                                         />
                                     ))
