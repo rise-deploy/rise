@@ -149,12 +149,13 @@ pub trait ResourceStore: Send + Sync {
     /// teardowns.
     async fn list_orphans(&self, parent_uid: Option<Uuid>) -> Result<Vec<ResourceRow>, StoreError>;
 
-    /// Atomically move a resource to a new parent (or to root with `None`). Rejects cycles and
-    /// respects the partial unique indexes on name/discriminator at the destination scope.
+    /// Atomically move a resource while preserving the collection's declared scope. Rejects cycles
+    /// and respects the partial unique indexes on name/discriminator at the destination scope.
     async fn reparent(
         &self,
         uid: Uuid,
         new_parent_uid: Option<Uuid>,
+        scope: ResourceScope,
     ) -> Result<ResourceRow, StoreError>;
 
     async fn update_controller_status(

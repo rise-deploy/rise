@@ -1,4 +1,6 @@
-use rise_resource_api::{API_VERSION_V1ALPHA1, ORGANIZATION_KIND, RESOURCE_DEFINITION_KIND};
+use rise_resource_api::{
+    ResourceScope, API_VERSION_V1ALPHA1, ORGANIZATION_KIND, RESOURCE_DEFINITION_KIND,
+};
 use rise_resource_store::{
     CreateResourceParams, DeleteOutcome, PathSegment, PgResourceStore, PropagationPolicy,
     ResourceStore, StoreError, UpdateResourceParams, CASCADE_DELETION_FINALIZER,
@@ -1239,7 +1241,10 @@ async fn reparent_moves_resource(pool: sqlx::PgPool) -> sqlx::Result<()> {
     let org_b = create_org(&store, "org-b").await;
     let widget = create_child(&store, org_a.uid, "Widget", "w1", vec![]).await;
 
-    let moved = store.reparent(widget.uid, Some(org_b.uid)).await.unwrap();
+    let moved = store
+        .reparent(widget.uid, Some(org_b.uid), ResourceScope::Organization)
+        .await
+        .unwrap();
     assert_eq!(moved.parent_uid, Some(org_b.uid));
 
     let under_a = store.list("Widget", Some(org_a.uid)).await.unwrap();
@@ -1269,7 +1274,10 @@ async fn reparent_to_root(pool: sqlx::PgPool) -> sqlx::Result<()> {
         .await
         .unwrap();
 
-    let moved = store.reparent(child_org.uid, None).await.unwrap();
+    let moved = store
+        .reparent(child_org.uid, None, ResourceScope::Root)
+        .await
+        .unwrap();
     assert_eq!(moved.parent_uid, None);
 
     Ok(())
@@ -1279,13 +1287,103 @@ async fn reparent_to_root(pool: sqlx::PgPool) -> sqlx::Result<()> {
 async fn reparent_rejects_cycle(pool: sqlx::PgPool) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
     let org = create_org(&store, "root").await;
-    let child = create_child(&store, org.uid, "Widget", "w1", vec![]).await;
+    let child_org = store
+        .create(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: ORGANIZATION_KIND.to_string(),
+            name: "child".to_string(),
+            parent_uid: Some(org.uid),
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec: json!({"displayName": "Child"}),
+            validator: None,
+        })
+        .await
+        .unwrap();
 
-    let err = store.reparent(org.uid, Some(org.uid)).await.unwrap_err();
+    let err = store
+        .reparent(org.uid, Some(org.uid), ResourceScope::Organization)
+        .await
+        .unwrap_err();
     assert!(matches!(err, StoreError::ReparentCycle));
 
-    let err = store.reparent(org.uid, Some(child.uid)).await.unwrap_err();
+    let err = store
+        .reparent(org.uid, Some(child_org.uid), ResourceScope::Organization)
+        .await
+        .unwrap_err();
     assert!(matches!(err, StoreError::ReparentCycle));
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn reparent_rejects_root_scoped_resource_under_parent(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let org_a = create_org(&store, "org-a").await;
+    let org_b = create_org(&store, "org-b").await;
+
+    let err = store
+        .reparent(org_a.uid, Some(org_b.uid), ResourceScope::Root)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Validation(_)),
+        "expected scope validation error, got {err:?}"
+    );
+
+    let unchanged = store.get(org_a.uid).await.unwrap().unwrap();
+    assert_eq!(unchanged.parent_uid, None);
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn reparent_rejects_org_scoped_resource_to_root(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let org = create_org(&store, "org").await;
+    let widget = create_child(&store, org.uid, "Widget", "w1", vec![]).await;
+
+    let err = store
+        .reparent(widget.uid, None, ResourceScope::Organization)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Validation(_)),
+        "expected scope validation error, got {err:?}"
+    );
+
+    let unchanged = store.get(widget.uid).await.unwrap().unwrap();
+    assert_eq!(unchanged.parent_uid, Some(org.uid));
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn reparent_rejects_org_scoped_resource_under_non_org(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let org = create_org(&store, "org").await;
+    let widget = create_child(&store, org.uid, "Widget", "w1", vec![]).await;
+    let other_widget = create_child(&store, org.uid, "Widget", "w2", vec![]).await;
+
+    let err = store
+        .reparent(
+            widget.uid,
+            Some(other_widget.uid),
+            ResourceScope::Organization,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Validation(_)),
+        "expected scope validation error, got {err:?}"
+    );
+
+    let unchanged = store.get(widget.uid).await.unwrap().unwrap();
+    assert_eq!(unchanged.parent_uid, Some(org.uid));
 
     Ok(())
 }
@@ -1299,7 +1397,7 @@ async fn reparent_respects_uniqueness(pool: sqlx::PgPool) -> sqlx::Result<()> {
     let moving = create_child(&store, org_a.uid, "Widget", "shared", vec![]).await;
 
     let err = store
-        .reparent(moving.uid, Some(org_b.uid))
+        .reparent(moving.uid, Some(org_b.uid), ResourceScope::Organization)
         .await
         .unwrap_err();
     assert!(matches!(err, StoreError::NameConflict));

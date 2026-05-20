@@ -604,6 +604,7 @@ impl ResourceStore for PgResourceStore {
         &self,
         uid: Uuid,
         new_parent_uid: Option<Uuid>,
+        scope: ResourceScope,
     ) -> Result<ResourceRow, StoreError> {
         let mut tx = self.pool.begin().await?;
 
@@ -615,6 +616,39 @@ impl ResourceStore for PgResourceStore {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or(StoreError::NotFound)?;
+
+        match scope {
+            ResourceScope::Root => {
+                if new_parent_uid.is_some() {
+                    return Err(StoreError::Validation(
+                        "root-scoped resources cannot be reparented under another resource"
+                            .to_string(),
+                    ));
+                }
+            }
+            ResourceScope::Organization => {
+                let Some(new_pid) = new_parent_uid else {
+                    return Err(StoreError::Validation(
+                        "organization-scoped resources must stay under an Organization".to_string(),
+                    ));
+                };
+
+                let parent = sqlx::query_as::<_, ResourceRow>(
+                    "SELECT * FROM resource_store.resources WHERE uid = $1",
+                )
+                .bind(new_pid)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(StoreError::ParentNotFound)?;
+
+                if parent.kind != ORGANIZATION_KIND {
+                    return Err(StoreError::Validation(format!(
+                        "organization-scoped resources can only be reparented under an Organization, got '{}'",
+                        parent.kind
+                    )));
+                }
+            }
+        }
 
         if target.parent_uid == new_parent_uid {
             tx.commit().await?;

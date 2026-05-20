@@ -540,7 +540,7 @@ pub async fn reparent_root(
     let resolved = resolve_collection(&state.resource_store, &collection).await?;
     enforce_scope(&resolved.info, ResourceScope::Root, &resolved.collection)?;
     let row = resolve_leaf(&state.resource_store, &resolved.info, None, &name).await?;
-    apply_reparent(&state, &row, body, &user).await
+    apply_reparent(&state, &resolved.info, &row, body, &user).await
 }
 
 pub async fn reparent_org(
@@ -558,7 +558,7 @@ pub async fn reparent_org(
         &resolved.collection,
     )?;
     let row = resolve_leaf(&state.resource_store, &resolved.info, Some(org_uid), &name).await?;
-    apply_reparent(&state, &row, body, &user).await
+    apply_reparent(&state, &resolved.info, &row, body, &user).await
 }
 
 // -----------------------------------------------------------------------------
@@ -733,13 +733,14 @@ async fn apply_controller_finalizers(
 
 async fn apply_reparent(
     state: &AppState,
+    info: &CollectionInfo,
     row: &ResourceRow,
     body: ReparentRequest,
     user: &User,
 ) -> Result<Json<rise_resource_api::Resource>, ServerError> {
     let updated = state
         .resource_store
-        .reparent(row.uid, body.new_parent_uid)
+        .reparent(row.uid, body.new_parent_uid, info.scope.clone())
         .await
         .map_err(store_error_to_server_error)?;
     tracing::info!(
