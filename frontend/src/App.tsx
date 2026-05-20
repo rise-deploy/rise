@@ -29,6 +29,10 @@ const TAB_LABELS = {
     access: 'Access',
 };
 
+function normalizeProjectTab(tab?: string) {
+    return tab === 'service-accounts' ? 'access' : (tab || 'overview');
+}
+
 function LoginPage() {
     const [status, setStatus] = useState('');
     const [loading, setLoading] = useState(false);
@@ -203,7 +207,7 @@ export function App() {
         } else {
             view = 'project-detail';
             params.projectName = parts[1];
-            params.tab = parts[2] || 'overview';
+            params.tab = normalizeProjectTab(parts[2]);
         }
     } else if (route.startsWith('team/')) {
         view = 'team-detail';

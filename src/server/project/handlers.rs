@@ -393,12 +393,23 @@ pub async fn list_team_projects(
     auth: AuthContext,
     Path(id_or_name): Path<String>,
 ) -> Result<Json<Vec<ApiProject>>, ServerError> {
-    let _user = auth.user()?;
+    let user = auth.user()?;
     let team_id = resolve_team_identifier(&state.db_pool, &id_or_name).await?;
 
-    let projects = projects::list_accessible_by_team(&state.db_pool, team_id)
+    let mut projects = projects::list_accessible_by_team(&state.db_pool, team_id)
         .await
         .internal_err("Failed to list team projects")?;
+
+    if !state.is_admin(&user.email) {
+        let user_project_ids: std::collections::HashSet<_> =
+            projects::list_accessible_by_user(&state.db_pool, user.id)
+                .await
+                .internal_err("Failed to list user projects")?
+                .into_iter()
+                .map(|p| p.id)
+                .collect();
+        projects.retain(|project| user_project_ids.contains(&project.id));
+    }
 
     let api_projects = projects_to_api(&state, projects).await?;
     Ok(Json(api_projects))

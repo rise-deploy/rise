@@ -25,10 +25,15 @@ const TAB_LABELS: Record<string, string> = {
 
 const TAB_IDS = ['overview', 'environments', 'deployments', 'env-vars', 'domains', 'extensions', 'access'];
 
+function normalizeTab(tab?: string): string {
+    if (tab === 'service-accounts') return 'access';
+    return tab && TAB_IDS.includes(tab) ? tab : 'overview';
+}
+
 export function ProjectDetail({ projectName, initialTab }: { projectName: string; initialTab?: string }) {
     const [project, setProject] = useState<any>(null);
     const [error, setError] = useState<string | null>(null);
-    const [activeTab, setActiveTab] = useState(initialTab || 'overview');
+    const [activeTab, setActiveTab] = useState(normalizeTab(initialTab));
     const [confirmOpen, setConfirmOpen] = useState(false);
     const [deleting, setDeleting] = useState(false);
     const [accessClasses, setAccessClasses] = useState<any[]>([]);
@@ -37,7 +42,7 @@ export function ProjectDetail({ projectName, initialTab }: { projectName: string
     const [tabCounts, setTabCounts] = useState<Record<string, number>>({});
     const { showToast } = useToast();
 
-    useEffect(() => { if (initialTab && TAB_IDS.includes(initialTab)) setActiveTab(initialTab); }, [initialTab]);
+    useEffect(() => { setActiveTab(normalizeTab(initialTab)); }, [initialTab]);
 
     const loadProject = useCallback(async () => {
         try {
