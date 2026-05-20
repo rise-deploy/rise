@@ -6,10 +6,10 @@ import { formatDate } from '../lib/utils';
 import { useToast } from '../components/toast';
 import { AutocompleteInput, Button, ConfirmDialog } from '../components/ui';
 import { ProjectTable } from '../components/project-table';
-import { MonoSortButton, MonoTable, MonoTableBody, MonoTableEmptyRow, MonoTableFrame, MonoTableHead, MonoTableRow, MonoTd, MonoTh } from '../components/table';
 import { EmptyState, ErrorState, LoadingState } from '../components/states';
 import { useRowKeyboardNavigation, useSortableData } from '../lib/table';
-import { Panel, PanelBody, PanelHead, Button as RButton, Empty, Field as RField, Input as RInput, Modal as RModal, colorFor } from '../components/r-ui';
+import { Alert, Panel, PanelBody, PanelHead, Button as RButton, Empty, Field as RField, Input as RInput, Modal as RModal, Pill, colorFor } from '../components/r-ui';
+import { AddMenu, RosterTable } from '../components/roster-table';
 
 
 // Teams List Component
@@ -292,9 +292,13 @@ export function TeamDetail({ teamName, currentUser }) {
     const [error, setError] = useState(null);
     const [newOwnerEmail, setNewOwnerEmail] = useState('');
     const [newMemberEmail, setNewMemberEmail] = useState('');
+    const [addOwnerOpen, setAddOwnerOpen] = useState(false);
+    const [addMemberOpen, setAddMemberOpen] = useState(false);
+    const [addingOwner, setAddingOwner] = useState(false);
+    const [addingMember, setAddingMember] = useState(false);
+    const [roleFilter, setRoleFilter] = useState('all');
     const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
     const [deleting, setDeleting] = useState(false);
-    const [detailActionStatus, setDetailActionStatus] = useState('');
     const { showToast } = useToast();
 
     const loadTeam = useCallback(async () => {
@@ -336,6 +340,7 @@ export function TeamDetail({ teamName, currentUser }) {
             return;
         }
 
+        setAddingOwner(true);
         try {
             setDetailActionStatus(`Adding owner ${newOwnerEmail}...`);
             // Look up user ID by email
@@ -354,10 +359,13 @@ export function TeamDetail({ teamName, currentUser }) {
             showToast(`Added ${newOwnerEmail} as owner`, 'success');
             setDetailActionStatus(`Added owner ${newOwnerEmail}.`);
             setNewOwnerEmail('');
+            setAddOwnerOpen(false);
             await loadTeam();
         } catch (err) {
             showToast(`Failed to add owner: ${err.message}`, 'error');
             setDetailActionStatus(`Failed to add owner ${newOwnerEmail}.`);
+        } finally {
+            setAddingOwner(false);
         }
     };
 
@@ -388,6 +396,7 @@ export function TeamDetail({ teamName, currentUser }) {
             return;
         }
 
+        setAddingMember(true);
         try {
             setDetailActionStatus(`Adding member ${newMemberEmail}...`);
             // Look up user ID by email
@@ -406,10 +415,13 @@ export function TeamDetail({ teamName, currentUser }) {
             showToast(`Added ${newMemberEmail} as member`, 'success');
             setDetailActionStatus(`Added member ${newMemberEmail}.`);
             setNewMemberEmail('');
+            setAddMemberOpen(false);
             await loadTeam();
         } catch (err) {
             showToast(`Failed to add member: ${err.message}`, 'error');
             setDetailActionStatus(`Failed to add member ${newMemberEmail}.`);
+        } finally {
+            setAddingMember(false);
         }
     };
 
@@ -447,169 +459,155 @@ export function TeamDetail({ teamName, currentUser }) {
     if (error) return <ErrorState message={`Error loading team: ${error}`} onRetry={loadTeam} />;
     if (!team) return <EmptyState message="Team not found." />;
 
+    // --- Unified members roster ---
+    const owners = team.owners || [];
+    const members = team.members || [];
+    const allRows = [
+        ...owners.map(o => ({ ...o, role: 'owner' })),
+        ...members.map(m => ({ ...m, role: 'member' })),
+    ];
+    const visiblePeople = allRows.filter(p => {
+        if (roleFilter === 'owners') return p.role === 'owner';
+        if (roleFilter === 'members') return p.role === 'member';
+        return true;
+    });
+    const rosterRows = visiblePeople.map(p => ({
+        key: `${p.role}-${p.id || p.email}`,
+        icon: 'user',
+        name: <span style={{ fontWeight: 500 }}>{p.email}</span>,
+        kindLabel: p.role === 'owner' ? 'Owner' : 'Member',
+        actions: canEdit ? (
+            <RButton
+                variant="danger"
+                size="sm"
+                icon="trash"
+                onClick={() => p.role === 'owner'
+                    ? handleRemoveOwner(p.id, p.email)
+                    : handleRemoveMember(p.id, p.email)}
+            >
+                Remove
+            </RButton>
+        ) : null,
+    }));
+
     return (
         <section>
-            <div className="flex items-center justify-between mb-4">
-                <div>
-                    {team.idp_managed && (
-                        <span className="text-xs bg-purple-600 text-white px-2 py-1 rounded">IDP</span>
-                    )}
+            <div className="r-page-head">
+                <div className="title-stack">
+                    <h1 className="r-page-title" style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                        <span>{team.name}</span>
+                        {team.idp_managed && <Pill kind="accent">IDP</Pill>}
+                    </h1>
+                    <div className="r-page-sub">Updated {formatDate(team.updated)}</div>
                 </div>
                 {canEdit && (
-                    <Button
-                        variant="danger"
-                        size="sm"
-                        onClick={() => setDeleteDialogOpen(true)}
-                    >
-                        Delete Team
-                    </Button>
+                    <RButton variant="danger" onClick={() => setDeleteDialogOpen(true)}>
+                        Delete
+                    </RButton>
                 )}
             </div>
 
-            <div className="mono-status-strip mb-4">
-                <div><span>team</span><strong>{team.name}</strong></div>
-                <div><span>updated</span><strong>{formatDate(team.updated)}</strong></div>
-            </div>
-
-            {detailActionStatus && <p className="mono-inline-status mb-4">{detailActionStatus}</p>}
-
             {team.idp_managed && !currentUser?.is_admin && (
-                <div className="mb-6 p-3 bg-purple-900/20 border border-purple-700 rounded text-sm text-purple-300">
-                    This team is managed by your identity provider and can only be modified by administrators.
+                <div style={{ marginBottom: 20 }}>
+                    <Alert tone="info" icon="info">
+                        This team is managed by your identity provider and can only be modified by administrators.
+                    </Alert>
                 </div>
             )}
 
-            <div className="mb-6">
-                <div className="flex justify-between items-center mb-4">
-                    <h4 className="text-lg font-bold">Projects ({teamProjects.length})</h4>
+            <div className="r-stack">
+                <RosterTable
+                    title="People"
+                    sub="Owners can manage the team. Members can use it for project ownership."
+                    addControl={canEdit ? (
+                        <AddMenu
+                            items={[
+                                { label: 'Add owner', icon: 'user', onClick: () => { setNewOwnerEmail(''); setAddOwnerOpen(true); } },
+                                { label: 'Add member', icon: 'user', onClick: () => { setNewMemberEmail(''); setAddMemberOpen(true); } },
+                            ]}
+                        />
+                    ) : undefined}
+                    filter={{
+                        value: roleFilter,
+                        options: [
+                            { value: 'all', label: 'All' },
+                            { value: 'owners', label: 'Owners' },
+                            { value: 'members', label: 'Members' },
+                        ],
+                        onChange: setRoleFilter,
+                    }}
+                    rows={rosterRows}
+                    emptyText="No people in this team"
+                />
+
+                <div>
+                    <div className="r-section-title" style={{ marginBottom: 14 }}>
+                        Projects ({teamProjects.length})
+                    </div>
+                    {teamProjects.length > 0 ? (
+                        <ProjectTable
+                            projects={teamProjects.slice().sort((a, b) => a.name.localeCompare(b.name))}
+                            onRowClick={(project) => navigate(`/project/${project.name}`)}
+                        />
+                    ) : (
+                        <Panel>
+                            <div className="r-panel-body">
+                                <Empty title="No projects owned by this team" />
+                            </div>
+                        </Panel>
+                    )}
                 </div>
-                {teamProjects.length > 0 ? (
-                    <ProjectTable
-                        projects={teamProjects.slice().sort((a, b) => a.name.localeCompare(b.name))}
-                        onRowClick={(project) => navigate(`/project/${project.name}`)}
+            </div>
+
+            <RModal
+                isOpen={addOwnerOpen}
+                onClose={() => setAddOwnerOpen(false)}
+                title="Add owner"
+                sub="Owners can manage this team."
+                footer={
+                    <>
+                        <RButton onClick={() => setAddOwnerOpen(false)} disabled={addingOwner}>Cancel</RButton>
+                        <RButton variant="primary" onClick={handleAddOwner} loading={addingOwner}>Add owner</RButton>
+                    </>
+                }
+            >
+                <RField label="Owner email">
+                    <AutocompleteInput
+                        type="email"
+                        id="add-owner-email"
+                        value={newOwnerEmail}
+                        onChange={setNewOwnerEmail}
+                        options={currentUser?.email ? [currentUser.email] : []}
+                        placeholder="owner@example.com"
+                        onEnter={handleAddOwner}
                     />
-                ) : (
-                    <p className="text-gray-600 dark:text-gray-400">No projects owned by this team.</p>
-                )}
-            </div>
+                </RField>
+            </RModal>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
-                <div>
-                    <div className="flex justify-between items-center mb-4">
-                        <h4 className="text-lg font-bold">Owners ({team.owners?.length || 0})</h4>
-                    </div>
-                    {team.owners && team.owners.length > 0 ? (
-                        <MonoTableFrame className="mb-4">
-                            <MonoTable>
-                                <MonoTableHead>
-                                    <tr>
-                                        <MonoTh className="px-6 py-3 text-left">Email</MonoTh>
-                                        {canEdit && <MonoTh className="px-6 py-3 text-right">Actions</MonoTh>}
-                                    </tr>
-                                </MonoTableHead>
-                                <MonoTableBody>
-                                    {team.owners.map(owner => (
-                                        <MonoTableRow key={owner.id} interactive className="transition-colors">
-                                            <MonoTd className="px-6 py-4 text-sm text-gray-900 dark:text-gray-200">{owner.email}</MonoTd>
-                                            {canEdit && (
-                                                <MonoTd className="px-6 py-4">
-                                                    <div className="flex justify-end">
-                                                        <Button
-                                                            variant="danger"
-                                                            size="sm"
-                                                            onClick={() => handleRemoveOwner(owner.id, owner.email)}
-                                                        >
-                                                            Remove
-                                                        </Button>
-                                                    </div>
-                                                </MonoTd>
-                                            )}
-                                        </MonoTableRow>
-                                    ))}
-                                </MonoTableBody>
-                            </MonoTable>
-                        </MonoTableFrame>
-                    ) : (
-                        <p className="text-gray-600 dark:text-gray-400 mb-4">No owners</p>
-                    )}
-                    {canEdit && (
-                        <div className="flex justify-end">
-                            <div className="flex gap-2">
-                                <AutocompleteInput
-                                    type="email"
-                                    value={newOwnerEmail}
-                                    onChange={setNewOwnerEmail}
-                                    options={currentUser?.email ? [currentUser.email] : []}
-                                    placeholder="owner@example.com"
-                                    className="w-64"
-                                    onEnter={handleAddOwner}
-                                />
-                                <Button variant="primary" size="sm" onClick={handleAddOwner}>
-                                    Add
-                                </Button>
-                            </div>
-                        </div>
-                    )}
-                </div>
-
-                <div>
-                    <div className="flex justify-between items-center mb-4">
-                        <h4 className="text-lg font-bold">Members ({team.members?.length || 0})</h4>
-                    </div>
-                    {team.members && team.members.length > 0 ? (
-                        <MonoTableFrame className="mb-4">
-                            <MonoTable>
-                                <MonoTableHead>
-                                    <tr>
-                                        <MonoTh className="px-6 py-3 text-left">Email</MonoTh>
-                                        {canEdit && <MonoTh className="px-6 py-3 text-right">Actions</MonoTh>}
-                                    </tr>
-                                </MonoTableHead>
-                                <MonoTableBody>
-                                    {team.members.map(member => (
-                                        <MonoTableRow key={member.id} interactive className="transition-colors">
-                                            <MonoTd className="px-6 py-4 text-sm text-gray-900 dark:text-gray-200">{member.email}</MonoTd>
-                                            {canEdit && (
-                                                <MonoTd className="px-6 py-4">
-                                                    <div className="flex justify-end">
-                                                        <Button
-                                                            variant="danger"
-                                                            size="sm"
-                                                            onClick={() => handleRemoveMember(member.id, member.email)}
-                                                        >
-                                                            Remove
-                                                        </Button>
-                                                    </div>
-                                                </MonoTd>
-                                            )}
-                                        </MonoTableRow>
-                                    ))}
-                                </MonoTableBody>
-                            </MonoTable>
-                        </MonoTableFrame>
-                    ) : (
-                        <p className="text-gray-600 dark:text-gray-400 mb-4">No members</p>
-                    )}
-                    {canEdit && (
-                        <div className="flex justify-end">
-                            <div className="flex gap-2">
-                                <AutocompleteInput
-                                    type="email"
-                                    value={newMemberEmail}
-                                    onChange={setNewMemberEmail}
-                                    options={currentUser?.email ? [currentUser.email] : []}
-                                    placeholder="member@example.com"
-                                    className="w-64"
-                                    onEnter={handleAddMember}
-                                />
-                                <Button variant="primary" size="sm" onClick={handleAddMember}>
-                                    Add
-                                </Button>
-                            </div>
-                        </div>
-                    )}
-                </div>
-            </div>
+            <RModal
+                isOpen={addMemberOpen}
+                onClose={() => setAddMemberOpen(false)}
+                title="Add member"
+                sub="Members can use this team for project ownership."
+                footer={
+                    <>
+                        <RButton onClick={() => setAddMemberOpen(false)} disabled={addingMember}>Cancel</RButton>
+                        <RButton variant="primary" onClick={handleAddMember} loading={addingMember}>Add member</RButton>
+                    </>
+                }
+            >
+                <RField label="Member email">
+                    <AutocompleteInput
+                        type="email"
+                        id="add-member-email"
+                        value={newMemberEmail}
+                        onChange={setNewMemberEmail}
+                        options={currentUser?.email ? [currentUser.email] : []}
+                        placeholder="member@example.com"
+                        onEnter={handleAddMember}
+                    />
+                </RField>
+            </RModal>
 
             <ConfirmDialog
                 isOpen={deleteDialogOpen}

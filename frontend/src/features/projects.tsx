@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { lazy, Suspense, useEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useEffect, useState } from 'react';
 import { api } from '../lib/api';
 import { CONFIG } from '../lib/config';
 import { navigate } from '../lib/navigation';
@@ -9,15 +9,12 @@ import {
     Button as RButton,
     Combobox as RCombobox,
     ConfirmDialog as RConfirmDialog,
-    Empty,
     Field as RField,
     Input as RInput,
     Modal as RModal,
-    Panel,
-    Pill,
     Segmented,
 } from '../components/r-ui';
-import { Icon } from '../components/icon';
+import { AddMenu, RosterTable } from '../components/roster-table';
 
 // CodeMirror is heavy; load it only when the service-account modal is opened.
 const JsonEditor = lazy(() => import('../components/json-editor'));
@@ -27,75 +24,10 @@ const JsonEditorFallback = () => (
     </div>
 );
 
-// Small inline dropdown menu (button + absolutely-positioned list, close on click-away).
-function AddMenu({ items }) {
-    const [open, setOpen] = useState(false);
-    const ref = useRef(null);
-
-    useEffect(() => {
-        if (!open) return;
-        const onClick = (e) => {
-            if (ref.current && !ref.current.contains(e.target)) setOpen(false);
-        };
-        document.addEventListener('mousedown', onClick);
-        return () => document.removeEventListener('mousedown', onClick);
-    }, [open]);
-
-    return (
-        <div ref={ref} style={{ position: 'relative', display: 'inline-block' }}>
-            <RButton variant="primary" icon="plus" onClick={() => setOpen(o => !o)}>Add</RButton>
-            {open && (
-                <div
-                    style={{
-                        position: 'absolute',
-                        top: 'calc(100% + 4px)',
-                        right: 0,
-                        zIndex: 30,
-                        minWidth: 180,
-                        background: 'var(--surface)',
-                        border: '1px solid var(--border)',
-                        borderRadius: 'var(--radius-sm)',
-                        boxShadow: 'var(--shadow-md, 0 8px 24px rgba(0,0,0,0.18))',
-                        padding: 4,
-                    }}
-                >
-                    {items.map(item => (
-                        <button
-                            key={item.label}
-                            type="button"
-                            className="r-menu-item"
-                            style={{
-                                display: 'flex',
-                                alignItems: 'center',
-                                gap: 8,
-                                width: '100%',
-                                padding: '7px 10px',
-                                background: 'transparent',
-                                border: 'none',
-                                borderRadius: 'var(--radius-xs, 4px)',
-                                cursor: 'pointer',
-                                fontSize: 13,
-                                color: 'var(--text)',
-                                textAlign: 'left',
-                            }}
-                            onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--surface-2)'; }}
-                            onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
-                            onClick={() => { setOpen(false); item.onClick(); }}
-                        >
-                            {item.icon && <Icon name={item.icon} size={14} />}
-                            {item.label}
-                        </button>
-                    ))}
-                </div>
-            )}
-        </div>
-    );
-}
-
 const KIND_META = {
     user: { icon: 'user', label: 'User' },
     team: { icon: 'users', label: 'Team' },
-    sa: { icon: 'key', label: 'Service account' },
+    sa: { icon: 'key', label: 'Service Account' },
 };
 
 // Access tab component - manages access class and unified user/team/service-account access
@@ -361,14 +293,25 @@ export function AppUsersList({ projectName, project, accessClasses, currentUserE
     };
 
     // --- Unified row model ---
+    const removeAction = (onClick) => (
+        <RButton variant="danger" size="sm" icon="trash" onClick={onClick}>Remove</RButton>
+    );
+    const ownerAction = (
+        <RButton size="sm" icon="edit" onClick={handleEditOwner}>Change owner</RButton>
+    );
+
     const rows = [
         ...displayedUsers.map(u => ({
             key: `user-${u.id || u.email}`,
             kind: 'user',
-            name: u.email,
-            isOwnerFixed: !!u.isOwnerFixed,
-            members: null,
-            remove: () => setConfirmRemove({ kind: 'user', email: u.email, name: u.email }),
+            icon: KIND_META.user.icon,
+            name: <span style={{ fontWeight: 500 }}>{u.email}</span>,
+            kindLabel: KIND_META.user.label,
+            badge: u.isOwnerFixed ? 'Owner' : undefined,
+            extra: null,
+            actions: u.isOwnerFixed
+                ? ownerAction
+                : removeAction(() => setConfirmRemove({ kind: 'user', email: u.email, name: u.email })),
         })),
         ...displayedTeams.map(t => {
             const matched = teams.find(team => team.id === t.id || team.name === t.name);
@@ -376,20 +319,24 @@ export function AppUsersList({ projectName, project, accessClasses, currentUserE
             return {
                 key: `team-${t.id || t.name}`,
                 kind: 'team',
-                name: t.name,
-                teamName: t.name,
-                isOwnerFixed: !!t.isOwnerFixed,
-                members: typeof memberCount === 'number' ? memberCount : null,
-                remove: () => setConfirmRemove({ kind: 'team', teamId: t.id, name: t.name }),
+                icon: KIND_META.team.icon,
+                name: <a className="r-link" onClick={() => navigate(`/team/${t.name}`)}>{t.name}</a>,
+                kindLabel: KIND_META.team.label,
+                badge: t.isOwnerFixed ? 'Owner' : undefined,
+                extra: typeof memberCount === 'number' ? memberCount : null,
+                actions: t.isOwnerFixed
+                    ? ownerAction
+                    : removeAction(() => setConfirmRemove({ kind: 'team', teamId: t.id, name: t.name })),
             };
         }),
         ...serviceAccounts.map(sa => ({
             key: `sa-${sa.id}`,
             kind: 'sa',
-            name: sa.email,
-            isOwnerFixed: false,
-            members: null,
-            remove: () => setConfirmRemove({ kind: 'sa', sa, name: sa.email }),
+            icon: KIND_META.sa.icon,
+            name: <span style={{ fontWeight: 500 }}>{sa.email}</span>,
+            kindLabel: KIND_META.sa.label,
+            extra: null,
+            actions: removeAction(() => setConfirmRemove({ kind: 'sa', sa, name: sa.email })),
         })),
     ];
 
@@ -403,20 +350,6 @@ export function AppUsersList({ projectName, project, accessClasses, currentUserE
 
     return (
         <div className="r-stack">
-            <div className="r-section-head">
-                <div>
-                    <div className="r-section-title">Owner</div>
-                    <div className="r-section-sub">
-                        {ownerUserEmail
-                            ? `Owned by user ${ownerUserEmail}.`
-                            : ownerTeamName
-                                ? `Owned by team ${ownerTeamName}.`
-                                : 'No owner set.'}
-                    </div>
-                </div>
-                <RButton size="sm" icon="edit" onClick={handleEditOwner}>Transfer ownership</RButton>
-            </div>
-
             <div className="r-section-head">
                 <div>
                     <div className="r-section-title">Access class</div>
@@ -433,91 +366,32 @@ export function AppUsersList({ projectName, project, accessClasses, currentUserE
                 )}
             </div>
 
-            <div className="r-section-head">
-                <div>
-                    <div className="r-section-title">Who can access this project</div>
-                    <div className="r-section-sub">
-                        Users, teams and service accounts with access. The project owner always has access.
-                    </div>
-                </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                    <Segmented
-                        value={typeFilter}
-                        options={[
-                            { value: 'all', label: 'All' },
-                            { value: 'users', label: 'Users' },
-                            { value: 'teams', label: 'Teams' },
-                            { value: 'sas', label: 'Service accounts' },
-                        ]}
-                        onChange={setTypeFilter}
-                    />
+            <RosterTable
+                title="Who can access this project"
+                sub="Users, teams and service accounts with access. The project owner always has access."
+                addControl={
                     <AddMenu
                         items={[
                             { label: 'Add user', icon: 'user', onClick: openAddUser },
                             { label: 'Add team', icon: 'users', onClick: openAddTeam },
-                            { label: 'Add service account', icon: 'key', onClick: openAddSa },
+                            { label: 'Add Service Account', icon: 'key', onClick: openAddSa },
                         ]}
                     />
-                </div>
-            </div>
-
-            <Panel>
-                {visibleRows.length > 0 ? (
-                    <table className="r-table">
-                        <thead>
-                            <tr>
-                                <th>Subject</th>
-                                <th>Kind</th>
-                                <th>Members</th>
-                                <th style={{ textAlign: 'right' }}>Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {visibleRows.map(row => {
-                                const meta = KIND_META[row.kind];
-                                return (
-                                    <tr key={row.key}>
-                                        <td>
-                                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-                                                <Icon name={meta.icon} size={14} />
-                                                {row.kind === 'team' ? (
-                                                    <a className="r-link" onClick={() => navigate(`/team/${row.teamName}`)}>{row.name}</a>
-                                                ) : (
-                                                    <span style={{ fontWeight: 500 }}>{row.name}</span>
-                                                )}
-                                                {row.isOwnerFixed && <Pill>Owner</Pill>}
-                                            </span>
-                                        </td>
-                                        <td><Pill>{meta.label}</Pill></td>
-                                        <td>
-                                            {row.kind === 'team'
-                                                ? (row.members != null ? row.members : <span style={{ color: 'var(--text-soft)' }}>—</span>)
-                                                : <span style={{ color: 'var(--text-soft)' }}>—</span>}
-                                        </td>
-                                        <td style={{ textAlign: 'right' }}>
-                                            {row.isOwnerFixed ? (
-                                                <span style={{ fontSize: 12, color: 'var(--text-soft)' }}>Always has access</span>
-                                            ) : (
-                                                <RButton variant="danger" size="sm" icon="trash" onClick={row.remove}>
-                                                    Remove
-                                                </RButton>
-                                            )}
-                                        </td>
-                                    </tr>
-                                );
-                            })}
-                        </tbody>
-                    </table>
-                ) : (
-                    <div className="r-panel-body">
-                        <Empty title="No access entries">
-                            <div style={{ color: 'var(--text-soft)', fontSize: 13 }}>
-                                Use "Add" to grant a user, team or service account access to this project.
-                            </div>
-                        </Empty>
-                    </div>
-                )}
-            </Panel>
+                }
+                filter={{
+                    value: typeFilter,
+                    options: [
+                        { value: 'all', label: 'All' },
+                        { value: 'users', label: 'Users' },
+                        { value: 'teams', label: 'Teams' },
+                        { value: 'sas', label: 'Service Accounts' },
+                    ],
+                    onChange: setTypeFilter,
+                }}
+                rows={visibleRows}
+                extraColumnLabel="Members"
+                emptyText="No access entries"
+            />
 
             <RModal
                 isOpen={editingOwner}
@@ -619,13 +493,13 @@ export function AppUsersList({ projectName, project, accessClasses, currentUserE
             <RModal
                 isOpen={addSaOpen}
                 onClose={() => setAddSaOpen(false)}
-                title="Add service account"
+                title="Add Service Account"
                 sub="Service accounts grant workload identity access for CI/CD or external systems."
                 footer={
                     <>
                         <RButton onClick={() => setAddSaOpen(false)} disabled={addingSa}>Cancel</RButton>
                         <RButton variant="primary" onClick={handleAddServiceAccount} loading={addingSa}>
-                            Create service account
+                            Create Service Account
                         </RButton>
                     </>
                 }
