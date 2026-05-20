@@ -4,9 +4,9 @@ import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
 import { copyToClipboard, formatDate, formatISO8601, formatRelativeTimeRounded, formatTimeRemaining } from '../lib/utils';
 import { useToast } from '../components/toast';
-import { Button, ConfirmDialog, ENV_COLOR_STYLES, EnvironmentColorDot, Modal, ModalActions, ModalSection, SourceLinkGroup, SourceLinkGroupAction, StatusBadge } from '../components/ui';
+import { Button, ConfirmDialog, ENV_COLOR_STYLES, EnvironmentColorDot, SourceLinkGroup, SourceLinkGroupAction, StatusBadge } from '../components/ui';
 import { MonoSortButton, MonoTable, MonoTableBody, MonoTableEmptyRow, MonoTableFrame, MonoTableHead, MonoTableRow, MonoTd, MonoTh } from '../components/table';
-import { Button as RButton, Combobox, Empty, KV, KVRow, Panel, PanelBody, PanelHead, Pill, SearchInput, Segmented, Status, Tabs } from '../components/r-ui';
+import { Button as RButton, Combobox, Empty, KV, KVRow, Modal, Panel, PanelBody, PanelHead, Pill, SearchInput, Segmented, Status, Tabs } from '../components/r-ui';
 import { Icon } from '../components/icon';
 import { EnvVarsList } from './resources';
 import { EmptyState, ErrorState, LoadingState } from '../components/states';
@@ -616,38 +616,9 @@ export function DeploymentsList({ projectName }) {
                     setUseSourceEnvVars(false);
                 }}
                 title={deploymentToRollback?.is_active ? 'Redeploy' : 'Rollback to Deployment'}
-            >
-                <ModalSection>
-                    <p className="text-gray-700 dark:text-gray-300">
-                        {deploymentToRollback?.is_active
-                            ? `Are you sure you want to redeploy ${deploymentToRollback?.deployment_id}? This will create a new deployment with the same image.`
-                            : `Are you sure you want to rollback to deployment ${deploymentToRollback?.deployment_id}? This will create a new deployment with the same image.`}
-                    </p>
-                    
-                    <div className="bg-gray-50 dark:bg-gray-800 p-4 rounded-lg">
-                        <label className="flex items-start gap-3 cursor-pointer">
-                            <input
-                                type="checkbox"
-                                checked={useSourceEnvVars}
-                                onChange={(e) => setUseSourceEnvVars(e.target.checked)}
-                                className="mt-1 w-4 h-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500"
-                            />
-                            <div className="flex-1">
-                                <div className="text-sm font-medium text-gray-900 dark:text-gray-100">
-                                    Use source deployment's environment variables
-                                </div>
-                                <div className="text-xs text-gray-600 dark:text-gray-400 mt-1">
-                                    {useSourceEnvVars 
-                                        ? "Will copy environment variables from the source deployment" 
-                                        : "Will use the current project's environment variables (default)"}
-                                </div>
-                            </div>
-                        </label>
-                    </div>
-
-                    <ModalActions>
-                        <Button
-                            variant="secondary"
+                footer={
+                    <>
+                        <RButton
                             onClick={() => {
                                 setRollbackDialogOpen(false);
                                 setDeploymentToRollback(null);
@@ -656,17 +627,44 @@ export function DeploymentsList({ projectName }) {
                             disabled={rollingBack}
                         >
                             Cancel
-                        </Button>
-                        <Button
+                        </RButton>
+                        <RButton
                             variant="primary"
                             onClick={handleRollbackConfirm}
                             loading={rollingBack}
                             disabled={rollingBack}
                         >
                             {deploymentToRollback?.is_active ? 'Redeploy' : 'Rollback'}
-                        </Button>
-                    </ModalActions>
-                </ModalSection>
+                        </RButton>
+                    </>
+                }
+            >
+                <p style={{ fontSize: 13, color: 'var(--text-muted)', margin: 0, lineHeight: 1.6 }}>
+                    {deploymentToRollback?.is_active
+                        ? `Are you sure you want to redeploy ${deploymentToRollback?.deployment_id}? This will create a new deployment with the same image.`
+                        : `Are you sure you want to rollback to deployment ${deploymentToRollback?.deployment_id}? This will create a new deployment with the same image.`}
+                </p>
+
+                <div style={{ background: 'var(--surface-2)', border: '1px solid var(--border-faint)', borderRadius: 'var(--radius-sm)', padding: 14 }}>
+                    <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer' }}>
+                        <input
+                            type="checkbox"
+                            checked={useSourceEnvVars}
+                            onChange={(e) => setUseSourceEnvVars(e.target.checked)}
+                            style={{ marginTop: 2 }}
+                        />
+                        <div style={{ flex: 1 }}>
+                            <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text)' }}>
+                                Use source deployment's environment variables
+                            </div>
+                            <div style={{ fontSize: 12, color: 'var(--text-soft)', marginTop: 4 }}>
+                                {useSourceEnvVars
+                                    ? 'Will copy environment variables from the source deployment'
+                                    : "Will use the current project's environment variables (default)"}
+                            </div>
+                        </div>
+                    </label>
+                </div>
             </Modal>
         </div>
     );
@@ -1745,38 +1743,9 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                     setUseSourceEnvVars(false);
                 }}
                 title={deployment?.is_active ? 'Redeploy' : 'Rollback to Deployment'}
-            >
-                <ModalSection>
-                    <p className="text-gray-700 dark:text-gray-300">
-                        {deployment?.is_active
-                            ? `Are you sure you want to redeploy ${deploymentId}? This will create a new deployment with the same image.`
-                            : `Are you sure you want to rollback to deployment ${deploymentId}? This will create a new deployment with the same image.`}
-                    </p>
-                    
-                    <div className="bg-gray-50 dark:bg-gray-800 p-4 rounded-lg">
-                        <label className="flex items-start gap-3 cursor-pointer">
-                            <input
-                                type="checkbox"
-                                checked={useSourceEnvVars}
-                                onChange={(e) => setUseSourceEnvVars(e.target.checked)}
-                                className="mt-1 w-4 h-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500"
-                            />
-                            <div className="flex-1">
-                                <div className="text-sm font-medium text-gray-900 dark:text-gray-100">
-                                    Use source deployment's environment variables
-                                </div>
-                                <div className="text-xs text-gray-600 dark:text-gray-400 mt-1">
-                                    {useSourceEnvVars 
-                                        ? "Will copy environment variables from the source deployment" 
-                                        : "Will use the current project's environment variables (default)"}
-                                </div>
-                            </div>
-                        </label>
-                    </div>
-
-                    <ModalActions>
-                        <Button
-                            variant="secondary"
+                footer={
+                    <>
+                        <RButton
                             onClick={() => {
                                 setRollbackDialogOpen(false);
                                 setUseSourceEnvVars(false);
@@ -1784,17 +1753,44 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                             disabled={rolling}
                         >
                             Cancel
-                        </Button>
-                        <Button
+                        </RButton>
+                        <RButton
                             variant="primary"
                             onClick={handleRollback}
                             loading={rolling}
                             disabled={rolling}
                         >
                             {deployment?.is_active ? 'Redeploy' : 'Rollback'}
-                        </Button>
-                    </ModalActions>
-                </ModalSection>
+                        </RButton>
+                    </>
+                }
+            >
+                <p style={{ fontSize: 13, color: 'var(--text-muted)', margin: 0, lineHeight: 1.6 }}>
+                    {deployment?.is_active
+                        ? `Are you sure you want to redeploy ${deploymentId}? This will create a new deployment with the same image.`
+                        : `Are you sure you want to rollback to deployment ${deploymentId}? This will create a new deployment with the same image.`}
+                </p>
+
+                <div style={{ background: 'var(--surface-2)', border: '1px solid var(--border-faint)', borderRadius: 'var(--radius-sm)', padding: 14 }}>
+                    <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer' }}>
+                        <input
+                            type="checkbox"
+                            checked={useSourceEnvVars}
+                            onChange={(e) => setUseSourceEnvVars(e.target.checked)}
+                            style={{ marginTop: 2 }}
+                        />
+                        <div style={{ flex: 1 }}>
+                            <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text)' }}>
+                                Use source deployment's environment variables
+                            </div>
+                            <div style={{ fontSize: 12, color: 'var(--text-soft)', marginTop: 4 }}>
+                                {useSourceEnvVars
+                                    ? 'Will copy environment variables from the source deployment'
+                                    : "Will use the current project's environment variables (default)"}
+                            </div>
+                        </div>
+                    </label>
+                </div>
             </Modal>
 
             <ConfirmDialog

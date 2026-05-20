@@ -5,7 +5,7 @@ import { CONFIG } from '../lib/config';
 import { navigate } from '../lib/navigation';
 import { formatDate, formatRelativeTimeRounded } from '../lib/utils';
 import { useToast } from '../components/toast';
-import { Button, ConfirmDialog, EnvironmentColorDot, EnvironmentColorPicker, FormField, Modal, ModalActions, ModalSection, ModalTabs, MonoTabButton, MonoTag } from '../components/ui';
+import { Button, ConfirmDialog, EnvironmentColorDot, EnvironmentColorPicker, ModalTabs, MonoTabButton, MonoTag } from '../components/ui';
 import {
     Alert as RAlert,
     Button as RButton,
@@ -532,123 +532,110 @@ export function EnvironmentsList({ projectName, platformConstraints = null }) {
                 </div>
             )}
 
-            <Modal
+            <RModal
                 isOpen={isModalOpen}
                 onClose={() => setIsModalOpen(false)}
                 title={editingEnv ? 'Edit Environment' : 'Create Environment'}
+                footer={
+                    <>
+                        <RButton onClick={() => setIsModalOpen(false)} disabled={saving}>Cancel</RButton>
+                        <RButton variant="primary" onClick={handleSave} loading={saving}>
+                            {editingEnv ? 'Update' : 'Create'}
+                        </RButton>
+                    </>
+                }
             >
-                <ModalSection>
-                    <FormField
-                        label="Name"
-                        id="env-name"
+                <RField label={<>Name<span className="text-red-300 ml-1">*</span></>}>
+                    <RInput
                         value={formData.name}
                         onChange={(e) => setFormData({ ...formData, name: e.target.value.toLowerCase() })}
                         placeholder="staging"
                         disabled={editingEnv !== null}
-                        required
                     />
-                    <FormField
-                        label="Primary Deployment Group"
-                        id="env-primary-group"
+                </RField>
+                <RField
+                    label="Primary Deployment Group"
+                    hint="The deployment group that maps to this environment. Leave empty if not applicable."
+                >
+                    <RInput
                         value={formData.primary_deployment_group}
                         onChange={(e) => setFormData({ ...formData, primary_deployment_group: e.target.value })}
                         placeholder="default"
                     />
-                    <p className="text-xs text-gray-500 dark:text-gray-400 -mt-2">
-                        The deployment group that maps to this environment. Leave empty if not applicable.
-                    </p>
-                    <div className="flex gap-6 mt-2">
-                        <label className="flex items-center gap-2 cursor-pointer">
-                            <input
-                                type="checkbox"
-                                checked={formData.is_production}
-                                onChange={(e) => setFormData({ ...formData, is_production: e.target.checked })}
-                                className="w-4 h-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500"
-                            />
-                            <span className="text-sm text-gray-700 dark:text-gray-300">Production</span>
-                        </label>
-                    </div>
-                    <div className="mt-2">
-                        <span className="mono-label">Color</span>
-                        <EnvironmentColorPicker
-                            value={formData.color}
-                            onChange={(c) => setFormData({ ...formData, color: c })}
+                </RField>
+                <div className="flex gap-6">
+                    <label className="flex items-center gap-2 cursor-pointer">
+                        <input
+                            type="checkbox"
+                            checked={formData.is_production}
+                            onChange={(e) => setFormData({ ...formData, is_production: e.target.checked })}
+                            className="w-4 h-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500"
                         />
-                    </div>
+                        <span className="text-sm text-gray-700 dark:text-gray-300">Production</span>
+                    </label>
+                </div>
+                <RField label="Color">
+                    <EnvironmentColorPicker
+                        value={formData.color}
+                        onChange={(c) => setFormData({ ...formData, color: c })}
+                    />
+                </RField>
 
-                    {isAdmin && editingEnv && (
-                        <div className="mt-4 pt-4 border-t border-gray-200 dark:border-gray-700">
-                            <span className="mono-label">Resource Constraints</span>
-                            <p className="text-xs text-gray-500 dark:text-gray-400 mb-3">
-                                Limit the resource range for deployments in this environment. Leave empty to use platform defaults.
-                            </p>
-                            <div className="grid grid-cols-2 gap-3">
-                                <FormField
-                                    label="Min Replicas"
-                                    id="env-min-replicas"
+                {isAdmin && editingEnv && (
+                    <div className="pt-4 border-t border-gray-200 dark:border-gray-700">
+                        <span className="mono-label">Resource Constraints</span>
+                        <p className="text-xs text-gray-500 dark:text-gray-400 mb-3">
+                            Limit the resource range for deployments in this environment. Leave empty to use platform defaults.
+                        </p>
+                        <div className="grid grid-cols-2 gap-3">
+                            <RField label="Min Replicas">
+                                <RInput
                                     type="number"
                                     value={formData.min_replicas}
                                     onChange={(e) => setFormData({ ...formData, min_replicas: e.target.value })}
                                     placeholder={platformConstraints?.min_replicas?.toString() ?? '1'}
                                 />
-                                <FormField
-                                    label="Max Replicas"
-                                    id="env-max-replicas"
+                            </RField>
+                            <RField label="Max Replicas">
+                                <RInput
                                     type="number"
                                     value={formData.max_replicas}
                                     onChange={(e) => setFormData({ ...formData, max_replicas: e.target.value })}
                                     placeholder={platformConstraints?.max_replicas?.toString() ?? '1'}
                                 />
-                                <FormField
-                                    label="Min CPU"
-                                    id="env-min-cpu"
+                            </RField>
+                            <RField label="Min CPU">
+                                <RInput
                                     value={formData.min_cpu}
                                     onChange={(e) => setFormData({ ...formData, min_cpu: e.target.value })}
                                     placeholder={platformConstraints?.min_cpu ?? '100m'}
                                 />
-                                <FormField
-                                    label="Max CPU"
-                                    id="env-max-cpu"
+                            </RField>
+                            <RField label="Max CPU">
+                                <RInput
                                     value={formData.max_cpu}
                                     onChange={(e) => setFormData({ ...formData, max_cpu: e.target.value })}
                                     placeholder={platformConstraints?.max_cpu ?? '2'}
                                 />
-                                <FormField
-                                    label="Min Memory"
-                                    id="env-min-memory"
+                            </RField>
+                            <RField label="Min Memory">
+                                <RInput
                                     value={formData.min_memory}
                                     onChange={(e) => setFormData({ ...formData, min_memory: e.target.value })}
                                     placeholder={platformConstraints?.min_memory ?? '64Mi'}
                                 />
-                                <FormField
-                                    label="Max Memory"
-                                    id="env-max-memory"
+                            </RField>
+                            <RField label="Max Memory">
+                                <RInput
                                     value={formData.max_memory}
                                     onChange={(e) => setFormData({ ...formData, max_memory: e.target.value })}
                                     placeholder={platformConstraints?.max_memory ?? '2Gi'}
                                 />
-                            </div>
+                            </RField>
                         </div>
-                    )}
-
-                    <ModalActions>
-                        <Button
-                            variant="secondary"
-                            onClick={() => setIsModalOpen(false)}
-                            disabled={saving}
-                        >
-                            Cancel
-                        </Button>
-                        <Button
-                            variant="primary"
-                            onClick={handleSave}
-                            loading={saving}
-                        >
-                            {editingEnv ? 'Update' : 'Create'}
-                        </Button>
-                    </ModalActions>
-                </ModalSection>
-            </Modal>
+                    </div>
+                )}
+            </RModal>
 
             <ConfirmDialog
                 isOpen={confirmDialogOpen}
@@ -1153,43 +1140,31 @@ export function DomainsList({ projectName, defaultUrl = null }) {
                 )}
             </RPanel>
 
-            <Modal
+            <RModal
                 isOpen={isModalOpen}
                 onClose={() => setIsModalOpen(false)}
                 title="Add Custom Domain"
+                footer={
+                    <>
+                        <RButton onClick={() => setIsModalOpen(false)} disabled={saving}>Cancel</RButton>
+                        <RButton variant="primary" onClick={handleSave} loading={saving}>
+                            Add Domain
+                        </RButton>
+                    </>
+                }
             >
-                <ModalSection>
-                    <FormField
-                        label="Domain"
-                        id="domain-name"
+                <RField label={<>Domain<span className="text-red-300 ml-1">*</span></>}>
+                    <RInput
                         value={formData.domain}
                         onChange={(e) => setFormData({ ...formData, domain: e.target.value })}
                         placeholder="example.com"
-                        required
                     />
-                    <p className="text-sm text-gray-600 dark:text-gray-500">
-                        <strong>Note:</strong> Make sure to configure your DNS to point this domain to your Rise deployment before adding it.
-                        The domain will be added to the ingress for the default deployment group only.
-                    </p>
-
-                    <ModalActions>
-                        <Button
-                            variant="secondary"
-                            onClick={() => setIsModalOpen(false)}
-                            disabled={saving}
-                        >
-                            Cancel
-                        </Button>
-                        <Button
-                            variant="primary"
-                            onClick={handleSave}
-                            loading={saving}
-                        >
-                            Add Domain
-                        </Button>
-                    </ModalActions>
-                </ModalSection>
-            </Modal>
+                </RField>
+                <p className="text-sm text-gray-600 dark:text-gray-500">
+                    <strong>Note:</strong> Make sure to configure your DNS to point this domain to your Rise deployment before adding it.
+                    The domain will be added to the ingress for the default deployment group only.
+                </p>
+            </RModal>
 
             <ConfirmDialog
                 isOpen={confirmDialogOpen}
@@ -1970,17 +1945,16 @@ export function ExtensionsList({ projectName }) {
             )}
 
             {/* Add extension picker */}
-            <Modal
+            <RModal
                 isOpen={isAddModalOpen}
                 onClose={() => setIsAddModalOpen(false)}
                 title="Add Extension"
             >
-                <ModalSection>
-                    <p className="text-sm text-gray-600 dark:text-gray-500">
-                        Choose an extension type to add to this project.
-                    </p>
-                    <div className="r-stack tight">
-                        {sortedAvailable.map(extType => {
+                <p className="text-sm text-gray-600 dark:text-gray-500">
+                    Choose an extension type to add to this project.
+                </p>
+                <div className="r-stack tight">
+                    {sortedAvailable.map(extType => {
                             const iconUrl = getExtensionIcon(extType.extension_type);
                             const abbr = (extType.extension_type || '').replace(/[^a-zA-Z]/g, '').slice(0, 2).toUpperCase() || '?';
                             return (
@@ -2015,18 +1989,43 @@ export function ExtensionsList({ projectName }) {
                                 </button>
                             );
                         })}
-                    </div>
-                </ModalSection>
-            </Modal>
+                </div>
+            </RModal>
 
             {/* Configuration Modal */}
-            <Modal
+            <RModal
                 isOpen={isConfigModalOpen}
                 onClose={() => setIsConfigModalOpen(false)}
                 title={editMode ? `Extension: ${selectedExtension?.name}` : `Enable Extension: ${selectedExtension?.name}`}
-                maxWidth="max-w-4xl"
+                width="xwide"
+                footer={selectedExtension && (
+                    modalTab === 'delete' && editMode && selectedExtensionData ? (
+                        <>
+                            <RButton
+                                onClick={() => setModalTab(hasExtensionUI(selectedExtension.extension_type) ? 'ui' : 'config')}
+                                disabled={deleting}
+                            >
+                                Cancel
+                            </RButton>
+                            <RButton
+                                variant="danger"
+                                onClick={handleDelete}
+                                loading={deleting}
+                                disabled={deleteConfirmName !== selectedExtensionData.extension}
+                            >
+                                Delete Extension
+                            </RButton>
+                        </>
+                    ) : (
+                        <>
+                            <RButton onClick={() => setIsConfigModalOpen(false)} disabled={saving}>Cancel</RButton>
+                            <RButton variant="primary" onClick={handleSave} loading={saving}>
+                                {editMode ? 'Update' : 'Enable'}
+                            </RButton>
+                        </>
+                    )
+                )}
             >
-                <ModalSection>
                     {selectedExtension && (
                         <>
                             {/* Tab Navigation */}
@@ -2070,16 +2069,14 @@ export function ExtensionsList({ projectName }) {
 
                             {modalTab === 'config' && (
                                 <div className="space-y-4">
-                                    <FormField
-                                        label="Configuration Spec (JSON)"
-                                        id="extension-spec"
-                                        type="textarea"
-                                        value={formData.spec}
-                                        onChange={(e) => handleJsonSpecChange(e.target.value)}
-                                        placeholder="{}"
-                                        required
-                                        rows={15}
-                                    />
+                                    <RField label={<>Configuration Spec (JSON)<span className="text-red-300 ml-1">*</span></>}>
+                                        <RTextarea
+                                            value={formData.spec}
+                                            onChange={(e) => handleJsonSpecChange(e.target.value)}
+                                            placeholder="{}"
+                                            rows={15}
+                                        />
+                                    </RField>
                                     <p className="text-sm text-gray-600 dark:text-gray-500">
                                         Enter the extension configuration as a JSON object. See the Schema tab and Project Extensions docs for valid fields and examples.
                                         {hasExtensionUI(selectedExtension.extension_type) && <span> Use the Configure tab for a form-based interface.</span>}
@@ -2143,58 +2140,18 @@ export function ExtensionsList({ projectName }) {
                                         </p>
                                     </div>
 
-                                    <FormField
-                                        label={`Type "${selectedExtensionData.extension}" to confirm deletion`}
-                                        id="delete-confirm-name"
-                                        value={deleteConfirmName}
-                                        onChange={(e) => setDeleteConfirmName(e.target.value)}
-                                        placeholder={selectedExtensionData.extension}
-                                        required
-                                    />
-
-                                    <div className="flex justify-end gap-3 pt-4">
-                                        <Button
-                                            variant="secondary"
-                                            onClick={() => setModalTab(hasExtensionUI(selectedExtension.extension_type) ? 'ui' : 'config')}
-                                            disabled={deleting}
-                                        >
-                                            Cancel
-                                        </Button>
-                                        <Button
-                                            variant="danger"
-                                            onClick={handleDelete}
-                                            loading={deleting}
-                                            disabled={deleteConfirmName !== selectedExtensionData.extension}
-                                        >
-                                            Delete Extension
-                                        </Button>
-                                    </div>
-                                </div>
-                            )}
-
-                            {/* Action buttons - only shown when not on delete tab */}
-                            {modalTab !== 'delete' && (
-                                <div className="flex justify-end gap-3 pt-4">
-                                    <Button
-                                        variant="secondary"
-                                        onClick={() => setIsConfigModalOpen(false)}
-                                        disabled={saving}
-                                    >
-                                        Cancel
-                                    </Button>
-                                    <Button
-                                        variant="primary"
-                                        onClick={handleSave}
-                                        loading={saving}
-                                    >
-                                        {editMode ? 'Update' : 'Enable'}
-                                    </Button>
+                                    <RField label={<>{`Type "${selectedExtensionData.extension}" to confirm deletion`}<span className="text-red-300 ml-1">*</span></>}>
+                                        <RInput
+                                            value={deleteConfirmName}
+                                            onChange={(e) => setDeleteConfirmName(e.target.value)}
+                                            placeholder={selectedExtensionData.extension}
+                                        />
+                                    </RField>
                                 </div>
                             )}
                         </>
                     )}
-                </ModalSection>
-            </Modal>
+            </RModal>
 
         </div>
     );

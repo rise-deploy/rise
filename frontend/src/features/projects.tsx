@@ -4,8 +4,8 @@ import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
 import { copyToClipboard, formatISO8601, formatRelativeTimeRounded, isSafeUrl } from '../lib/utils';
 import { useToast } from '../components/toast';
-import { AutocompleteInput, Button, ConfirmDialog, FormField, Modal, ModalActions, ModalSection, MonoNotice } from '../components/ui';
-import { Button as RButton, Combobox as RCombobox, Empty, Field as RField, Input as RInput, Panel, Pill, Segmented } from '../components/r-ui';
+import { AutocompleteInput, Button, ConfirmDialog, MonoNotice } from '../components/ui';
+import { Button as RButton, Combobox as RCombobox, Empty, Field as RField, Input as RInput, Modal as RModal, Panel, Pill, Segmented } from '../components/r-ui';
 import { ProjectTable } from '../components/project-table';
 import { ActiveDeploymentsSummary, DeploymentDetail, DeploymentsList } from './deployments';
 import { DomainsList, EnvironmentsList, EnvVarsList, ExtensionDetailPage, ExtensionsList, ServiceAccountsList } from './resources';
@@ -170,76 +170,66 @@ export function ProjectsList({ openCreate = false }) {
                 emptyMessage="No projects."
             />
 
-            <Modal
+            <RModal
                 isOpen={isModalOpen}
                 onClose={() => setIsModalOpen(false)}
                 title="Create Project"
+                footer={
+                    <>
+                        <RButton onClick={() => setIsModalOpen(false)} disabled={saving}>
+                            Cancel
+                        </RButton>
+                        <RButton variant="primary" onClick={handleCreate} loading={saving}>
+                            Create
+                        </RButton>
+                    </>
+                }
             >
-                <ModalSection>
-                    <FormField
-                        label="Project Name"
+                <RField
+                    label="Project Name"
+                    hint="Only lowercase letters, numbers, and hyphens allowed"
+                >
+                    <RInput
                         id="project-name"
                         value={formData.name}
                         onChange={(e) => setFormData({ ...formData, name: e.target.value.toLowerCase() })}
                         placeholder="my-awesome-app"
-                        required
+                        autoFocus
                     />
-                    <p className="text-sm text-gray-600 dark:text-gray-500 -mt-2">
-                        Only lowercase letters, numbers, and hyphens allowed
-                    </p>
+                </RField>
 
-                    <FormField
-                        label="Access Class"
+                <RField
+                    label="Access Class"
+                    hint={accessClasses.find(ac => ac.id === formData.access_class)?.description}
+                >
+                    <select
                         id="project-access-class"
-                        type="select"
+                        className="r-field"
                         value={formData.access_class}
                         onChange={(e) => setFormData({ ...formData, access_class: e.target.value })}
-                        required
                     >
                         {accessClasses.map(ac => (
                             <option key={ac.id} value={ac.id} title={ac.description}>
                                 {ac.display_name}
                             </option>
                         ))}
-                    </FormField>
-                    {accessClasses.find(ac => ac.id === formData.access_class) && (
-                        <p className="text-sm text-gray-600 dark:text-gray-500 -mt-2">
-                            {accessClasses.find(ac => ac.id === formData.access_class).description}
-                        </p>
-                    )}
+                    </select>
+                </RField>
 
-                    <FormField
-                        label="Owner"
+                <RField label="Owner">
+                    <select
                         id="project-owner"
-                        type="select"
+                        className="r-field"
                         value={formData.owner}
                         onChange={(e) => setFormData({ ...formData, owner: e.target.value })}
-                        required
                     >
                         <option value="self">Self</option>
                         {teams.map(team => (
                             <option key={team.id} value={team.id}>team:{team.name}</option>
                         ))}
-                    </FormField>
-
-                    <ModalActions>
-                        <Button
-                            variant="secondary"
-                            onClick={() => setIsModalOpen(false)}
-                            disabled={saving}
-                        >
-                            Cancel
-                        </Button>
-                        <Button
-                            variant="primary"
-                            onClick={handleCreate}
-                            loading={saving}
-                        >
-                            Create
-                        </Button>
-                    </ModalActions>
-                </ModalSection>
-            </Modal>
+                    </select>
+                </RField>
+            </RModal>
         </section>
     );
 }
@@ -760,64 +750,56 @@ export function ProjectDetail({ projectName, initialTab }) {
                 loading={deleting}
             />
 
-            <Modal
+            <RModal
                 isOpen={editingOwner}
                 onClose={handleCancelEditOwner}
                 title="Transfer Project Ownership"
-                maxWidth="max-w-lg"
+                width="wide"
+                footer={
+                    <>
+                        <RButton onClick={handleCancelEditOwner} disabled={updatingOwner}>
+                            Cancel
+                        </RButton>
+                        <RButton variant="primary" onClick={handleSaveOwner} loading={updatingOwner}>
+                            Transfer Ownership
+                        </RButton>
+                    </>
+                }
             >
-                <ModalSection>
-                    <RField label="Owner type">
-                        <Segmented
-                            value={ownerType}
-                            onChange={setOwnerType}
-                            options={[
-                                { value: 'user', label: 'User' },
-                                { value: 'team', label: 'Team' },
-                            ]}
+                <RField label="Owner type">
+                    <Segmented
+                        value={ownerType}
+                        onChange={setOwnerType}
+                        options={[
+                            { value: 'user', label: 'User' },
+                            { value: 'team', label: 'Team' },
+                        ]}
+                    />
+                </RField>
+
+                {ownerType === 'user' ? (
+                    <RField label="Owner User Email">
+                        <AutocompleteInput
+                            type="email"
+                            id="project-owner-user-email"
+                            value={ownerUserEmail}
+                            onChange={setOwnerUserEmail}
+                            options={currentUserEmail ? [currentUserEmail] : []}
+                            placeholder="owner@example.com"
+                            onEnter={handleSaveOwner}
                         />
                     </RField>
-
-                    {ownerType === 'user' ? (
-                        <div className="form-field">
-                            <label htmlFor="project-owner-user-email" className="mono-label">
-                                Owner User Email
-                                <span className="text-red-300 ml-1">*</span>
-                            </label>
-                            <AutocompleteInput
-                                type="email"
-                                id="project-owner-user-email"
-                                value={ownerUserEmail}
-                                onChange={setOwnerUserEmail}
-                                options={currentUserEmail ? [currentUserEmail] : []}
-                                placeholder="owner@example.com"
-                                onEnter={handleSaveOwner}
-                            />
-                        </div>
-                    ) : (
-                        <div>
-                            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                                Owner Team
-                            </label>
-                            <Combobox
-                                value={ownerTeamId}
-                                onChange={setOwnerTeamId}
-                                options={teams.map(t => ({ value: t.id, label: t.name }))}
-                                placeholder="Search teams..."
-                            />
-                        </div>
-                    )}
-
-                    <ModalActions>
-                        <Button variant="secondary" onClick={handleCancelEditOwner} disabled={updatingOwner}>
-                            Cancel
-                        </Button>
-                        <Button variant="primary" onClick={handleSaveOwner} loading={updatingOwner}>
-                            Transfer Ownership
-                        </Button>
-                    </ModalActions>
-                </ModalSection>
-            </Modal>
+                ) : (
+                    <RField label="Owner Team">
+                        <Combobox
+                            value={ownerTeamId}
+                            onChange={setOwnerTeamId}
+                            options={teams.map(t => ({ value: t.id, label: t.name }))}
+                            placeholder="Search teams..."
+                        />
+                    </RField>
+                )}
+            </RModal>
         </section>
     );
 }

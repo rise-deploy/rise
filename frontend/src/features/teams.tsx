@@ -4,12 +4,12 @@ import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
 import { formatDate } from '../lib/utils';
 import { useToast } from '../components/toast';
-import { AutocompleteInput, Button, Modal, FormField, ConfirmDialog, ModalActions, ModalSection } from '../components/ui';
+import { AutocompleteInput, Button, ConfirmDialog } from '../components/ui';
 import { ProjectTable } from '../components/project-table';
 import { MonoSortButton, MonoTable, MonoTableBody, MonoTableEmptyRow, MonoTableFrame, MonoTableHead, MonoTableRow, MonoTd, MonoTh } from '../components/table';
 import { EmptyState, ErrorState, LoadingState } from '../components/states';
 import { useRowKeyboardNavigation, useSortableData } from '../lib/table';
-import { Panel, PanelBody, PanelHead, Button as RButton, Empty, colorFor } from '../components/r-ui';
+import { Panel, PanelBody, PanelHead, Button as RButton, Empty, Field as RField, Input as RInput, Modal as RModal, colorFor } from '../components/r-ui';
 
 
 // Teams List Component
@@ -146,76 +146,61 @@ export function TeamsList({ currentUser, openCreate = false }) {
                 </div>
             )}
 
-            <Modal
+            <RModal
                 isOpen={isModalOpen}
                 onClose={() => setIsModalOpen(false)}
                 title="Create Team"
+                footer={
+                    <>
+                        <RButton onClick={() => setIsModalOpen(false)} disabled={saving}>
+                            Cancel
+                        </RButton>
+                        <RButton variant="primary" onClick={handleCreate} loading={saving}>
+                            Create
+                        </RButton>
+                    </>
+                }
             >
-                <ModalSection>
-                    <FormField
-                        label="Team Name"
+                <RField label="Team Name">
+                    <RInput
                         id="team-name"
                         value={formData.name}
                         onChange={(e) => setFormData({ ...formData, name: e.target.value })}
                         placeholder="engineering"
-                        required
+                        autoFocus
                     />
+                </RField>
 
-                    <div className="form-field">
-                        <label htmlFor="team-owners" className="mono-label">
-                            Owners (emails, comma-separated)
-                            <span className="text-red-300 ml-1">*</span>
-                        </label>
-                        <AutocompleteInput
-                            id="team-owners"
-                            type="email"
-                            value={formData.owners}
-                            onChange={(next) => setFormData({ ...formData, owners: next })}
-                            options={currentUser?.email ? [currentUser.email] : []}
-                            placeholder="alice@example.com, bob@example.com"
-                            multiValue
-                        />
-                    </div>
-                    <p className="text-sm text-gray-600 dark:text-gray-500 -mt-2">
-                        Owners can manage the team. At least one owner is required.
-                    </p>
+                <RField
+                    label="Owners (emails, comma-separated)"
+                    hint="Owners can manage the team. At least one owner is required."
+                >
+                    <AutocompleteInput
+                        id="team-owners"
+                        type="email"
+                        value={formData.owners}
+                        onChange={(next) => setFormData({ ...formData, owners: next })}
+                        options={currentUser?.email ? [currentUser.email] : []}
+                        placeholder="alice@example.com, bob@example.com"
+                        multiValue
+                    />
+                </RField>
 
-                    <div className="form-field">
-                        <label htmlFor="team-members" className="mono-label">
-                            Members (emails, comma-separated)
-                        </label>
-                        <AutocompleteInput
-                            id="team-members"
-                            type="email"
-                            value={formData.members}
-                            onChange={(next) => setFormData({ ...formData, members: next })}
-                            options={currentUser?.email ? [currentUser.email] : []}
-                            placeholder="charlie@example.com, dana@example.com"
-                            multiValue
-                        />
-                    </div>
-                    <p className="text-sm text-gray-600 dark:text-gray-500 -mt-2">
-                        Members can use the team for project ownership.
-                    </p>
-
-                    <ModalActions>
-                        <Button
-                            variant="secondary"
-                            onClick={() => setIsModalOpen(false)}
-                            disabled={saving}
-                        >
-                            Cancel
-                        </Button>
-                        <Button
-                            variant="primary"
-                            onClick={handleCreate}
-                            loading={saving}
-                        >
-                            Create
-                        </Button>
-                    </ModalActions>
-                </ModalSection>
-            </Modal>
+                <RField
+                    label="Members (emails, comma-separated)"
+                    hint="Members can use the team for project ownership."
+                >
+                    <AutocompleteInput
+                        id="team-members"
+                        type="email"
+                        value={formData.members}
+                        onChange={(next) => setFormData({ ...formData, members: next })}
+                        options={currentUser?.email ? [currentUser.email] : []}
+                        placeholder="charlie@example.com, dana@example.com"
+                        multiValue
+                    />
+                </RField>
+            </RModal>
         </section>
     );
 }
