@@ -672,12 +672,15 @@ export function DeploymentsList({ projectName }) {
 
 // Deployment Logs Component with SSE streaming
 function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
+    // Active deployments auto-follow live logs starting from just the most
+    // recent line; terminal deployments load a larger backlog on demand.
+    const isActiveDeployment = ['Deploying', 'Healthy', 'Unhealthy'].includes(deploymentStatus);
     const [logs, setLogs] = useState([]);
     const [streaming, setStreaming] = useState(false);
     const [error, setError] = useState(null);
     const [autoScroll, setAutoScroll] = useState(true);
-    const [tailLines, setTailLines] = useState(1000);
-    const [tailInputValue, setTailInputValue] = useState('1000');
+    const [tailLines, setTailLines] = useState(isActiveDeployment ? 1 : 1000);
+    const [tailInputValue, setTailInputValue] = useState(isActiveDeployment ? '1' : '1000');
     const logsEndRef = useRef(null);
     const abortControllerRef = useRef(null);
 
@@ -973,7 +976,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                         <div style={{ flex: 1 }}>Error: {error}</div>
                     </div>
                 )}
-                <div className="r-logs" style={{ height: 400, flex: 'none' }}>
+                <div className="r-logs" style={{ height: 'calc(100vh - 340px)', minHeight: 360, flex: 'none' }}>
                     {visibleLogs.length === 0 ? (
                         <div style={{ textAlign: 'center', padding: '32px 0', color: 'oklch(0.55 0.005 80)' }}>
                             {logs.length === 0
