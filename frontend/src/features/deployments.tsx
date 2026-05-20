@@ -412,10 +412,18 @@ export function DeploymentsList({ projectName }) {
         ? sortedDeployments.filter(d => d.environment === envFilter)
         : sortedDeployments;
 
-    // "Active" shows deployments that are not in a terminal state.
-    const statusFilteredDeployments = statusFilter === 'active'
-        ? envFilteredDeployments.filter(d => !isTerminal(d.status))
-        : envFilteredDeployments;
+    // Status filter — "Active" = not in a terminal state; the rest match a
+    // specific status; "All" shows everything.
+    const matchesStatus = (d) => {
+        switch (statusFilter) {
+            case 'active': return !isTerminal(d.status);
+            case 'healthy': return d.status === 'Healthy';
+            case 'unhealthy': return d.status === 'Unhealthy';
+            case 'failed': return d.status === 'Failed';
+            default: return true;
+        }
+    };
+    const statusFilteredDeployments = envFilteredDeployments.filter(matchesStatus);
 
     // Client-side text search over the loaded page (deployment id / image / author)
     const q = search.trim().toLowerCase();
@@ -442,7 +450,13 @@ export function DeploymentsList({ projectName }) {
                 />
                 <Segmented<string>
                     value={statusFilter}
-                    options={[{ value: 'active', label: 'Active' }, { value: 'all', label: 'All' }]}
+                    options={[
+                        { value: 'active', label: 'Active' },
+                        { value: 'healthy', label: 'Healthy' },
+                        { value: 'unhealthy', label: 'Unhealthy' },
+                        { value: 'failed', label: 'Failed' },
+                        { value: 'all', label: 'All' },
+                    ]}
                     onChange={setStatusFilter}
                 />
                 {environments.length > 0 && (
