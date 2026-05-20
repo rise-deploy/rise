@@ -229,7 +229,7 @@ function countProjectsForTeam(projects, team) {
 function TeamCard({ team, projectCount, onOpen, isOwner }) {
     const members = team.members || [];
     const owners = team.owners || [];
-    const leadEmail = owners[0]?.email || members[0]?.email;
+    const ownerEmails = owners.map(o => o.email).filter(Boolean);
     const visibleMembers = members.slice(0, 8);
     const overflow = Math.max(0, members.length - visibleMembers.length);
 
@@ -250,11 +250,13 @@ function TeamCard({ team, projectCount, onOpen, isOwner }) {
                 </div>
             </PanelHead>
             <PanelBody>
-                {leadEmail && (
-                    <div className="r-meta-bar" style={{ marginBottom: 14 }}>
-                        <span style={{ color: 'var(--text-soft)' }}>Lead</span>
+                {ownerEmails.length > 0 && (
+                    <div className="r-meta-bar" style={{ marginBottom: 14, flexWrap: 'wrap' }}>
+                        <span style={{ color: 'var(--text-soft)' }}>
+                            {ownerEmails.length === 1 ? 'Owner' : 'Owners'}
+                        </span>
                         <span className="dot-sep" />
-                        <a className="r-link">{leadEmail}</a>
+                        <span>{ownerEmails.join(', ')}</span>
                     </div>
                 )}
                 {visibleMembers.length > 0 ? (
