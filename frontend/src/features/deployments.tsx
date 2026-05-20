@@ -283,6 +283,7 @@ export function DeploymentsList({ projectName }) {
     const [deploymentGroups, setDeploymentGroups] = useState([]);
     const [environments, setEnvironments] = useState([]);
     const [envFilter, setEnvFilter] = useState('');
+    const [statusFilter, setStatusFilter] = useState('active');
     const [search, setSearch] = useState('');
     const [confirmDialogOpen, setConfirmDialogOpen] = useState(false);
     const [deploymentToStop, setDeploymentToStop] = useState(null);
@@ -411,14 +412,19 @@ export function DeploymentsList({ projectName }) {
         ? sortedDeployments.filter(d => d.environment === envFilter)
         : sortedDeployments;
 
+    // "Active" shows deployments that are not in a terminal state.
+    const statusFilteredDeployments = statusFilter === 'active'
+        ? envFilteredDeployments.filter(d => !isTerminal(d.status))
+        : envFilteredDeployments;
+
     // Client-side text search over the loaded page (deployment id / image / author)
     const q = search.trim().toLowerCase();
     const filteredDeployments = q
-        ? envFilteredDeployments.filter(d => {
+        ? statusFilteredDeployments.filter(d => {
             const haystack = `${d.deployment_id || ''} ${d.image || ''} ${d.created_by_email || ''}`.toLowerCase();
             return haystack.includes(q);
         })
-        : envFilteredDeployments;
+        : statusFilteredDeployments;
 
     const envOptions = [
         { value: '', label: 'All envs' },
@@ -433,6 +439,11 @@ export function DeploymentsList({ projectName }) {
                     onChange={setSearch}
                     placeholder="Filter deployments…"
                     style={{ flex: 1, maxWidth: 280 }}
+                />
+                <Segmented<string>
+                    value={statusFilter}
+                    options={[{ value: 'active', label: 'Active' }, { value: 'all', label: 'All' }]}
+                    onChange={setStatusFilter}
                 />
                 {environments.length > 0 && (
                     <Segmented<string>

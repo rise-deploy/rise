@@ -9,7 +9,7 @@ import { Icon } from '../components/icon';
 import { EnvironmentColorDot } from '../components/ui';
 import { LoadingState, ErrorState, EmptyState } from '../components/states';
 
-import { ActiveDeploymentsSummary, DeploymentsList } from './deployments';
+import { DeploymentsList } from './deployments';
 import { DomainsList, EnvironmentsList, EnvVarsList, ExtensionsList, ServiceAccountsList } from './resources';
 import { AppUsersList } from './projects';
 
@@ -276,16 +276,78 @@ function RecentDeploymentsPanel({ projectName }: { projectName: string }) {
     );
 }
 
+// The currently-active deployment in the production environment's default group.
+function CurrentDeploymentPanel({ projectName, environments }: { projectName: string; environments: any[] }) {
+    const [deployments, setDeployments] = useState<any[] | null>(null);
+
+    useEffect(() => {
+        let cancelled = false;
+        api.getProjectDeployments(projectName, { limit: 100 })
+            .then((d: any[]) => { if (!cancelled) setDeployments(Array.isArray(d) ? d : []); })
+            .catch(() => { if (!cancelled) setDeployments([]); });
+        return () => { cancelled = true; };
+    }, [projectName]);
+
+    const prodEnv = environments.find(e => e.is_production)
+        || environments.find(e => e.name === 'production')
+        || environments[0];
+
+    let current: any = null;
+    if (deployments && prodEnv) {
+        const inEnv = deployments.filter(d => d.environment === prodEnv.name && d.is_active);
+        const preferredGroup = prodEnv.primary_deployment_group || 'default';
+        current = inEnv.find(d => d.deployment_group === preferredGroup) || inEnv[0] || null;
+    }
+
+    return (
+        <Panel>
+            <PanelHead
+                title="Current production deployment"
+                sub={current ? `${current.deployment_group || 'default'} group` : undefined}
+                right={current && (
+                    <a className="r-link" style={{ fontSize: 12.5 }} onClick={() => navigate(`/deployment/${projectName}/${current.deployment_id}`)}>
+                        View deployment →
+                    </a>
+                )}
+            />
+            {deployments === null ? (
+                <PanelBody><div style={{ color: 'var(--text-muted)', fontSize: 12.5 }}>Loading…</div></PanelBody>
+            ) : !current ? (
+                <PanelBody><Empty title="No active production deployment" /></PanelBody>
+            ) : (
+                <PanelBody style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 20 }}>
+                    <div>
+                        <div className="r-stat-label">Image</div>
+                        <div className="mono" style={{ marginTop: 8, fontSize: 12.5, wordBreak: 'break-all' }}>
+                            {current.image ? current.image.split('/').pop() : '—'}
+                        </div>
+                    </div>
+                    <div>
+                        <div className="r-stat-label">Status</div>
+                        <div style={{ marginTop: 8 }}><Status status={current.status || 'Unknown'} /></div>
+                    </div>
+                    <div>
+                        <div className="r-stat-label">Deployed</div>
+                        <div style={{ marginTop: 8, fontSize: 13.5 }}>{current.created ? formatRelativeTimeRounded(current.created) : '—'}</div>
+                        {current.created_by_email && (
+                            <div style={{ color: 'var(--text-soft)', fontSize: 12 }}>by {current.created_by_email}</div>
+                        )}
+                    </div>
+                    <div>
+                        <div className="r-stat-label">Replicas</div>
+                        <div style={{ marginTop: 8, fontSize: 13.5 }}>{current.replicas ?? '—'}</div>
+                    </div>
+                </PanelBody>
+            )}
+        </Panel>
+    );
+}
+
 function ProjectOverview({ project, projectName, accessLabel, environments, onCopy }: { project: any; projectName: string; accessLabel: string; environments: any[]; onCopy: (v: string, l: string) => void }) {
     return (
         <div className="r-grid-2-1">
             <div className="r-stack">
-                <Panel>
-                    <PanelHead title="Active deployments" sub="Current healthy deployment per group, per environment" />
-                    <PanelBody>
-                        <ActiveDeploymentsSummary projectName={projectName} />
-                    </PanelBody>
-                </Panel>
+                <CurrentDeploymentPanel projectName={projectName} environments={environments} />
 
                 <RecentDeploymentsPanel projectName={projectName} />
             </div>
