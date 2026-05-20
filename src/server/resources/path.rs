@@ -471,6 +471,50 @@ mod tests {
     }
 
     #[test]
+    fn resource_path_subresource_finalizers_depth_2() {
+        assert_eq!(
+            parse_resource_path("organizations/acme/widgets/w1/sub-things/s1/finalizers").unwrap(),
+            ResourcePath::Subresource {
+                ancestors: vec![
+                    AncestorRef {
+                        collection: "organizations".to_string(),
+                        identifier: "acme".to_string(),
+                    },
+                    AncestorRef {
+                        collection: "widgets".to_string(),
+                        identifier: "w1".to_string(),
+                    },
+                ],
+                collection: "sub-things".to_string(),
+                identifier: "s1".to_string(),
+                subresource: Subresource::Finalizers,
+            }
+        );
+    }
+
+    #[test]
+    fn resource_path_subresource_reparent_depth_2() {
+        assert_eq!(
+            parse_resource_path("organizations/acme/widgets/w1/sub-things/s1/reparent").unwrap(),
+            ResourcePath::Subresource {
+                ancestors: vec![
+                    AncestorRef {
+                        collection: "organizations".to_string(),
+                        identifier: "acme".to_string(),
+                    },
+                    AncestorRef {
+                        collection: "widgets".to_string(),
+                        identifier: "w1".to_string(),
+                    },
+                ],
+                collection: "sub-things".to_string(),
+                identifier: "s1".to_string(),
+                subresource: Subresource::Reparent,
+            }
+        );
+    }
+
+    #[test]
     fn resource_path_orphans_at_non_first_position_is_error() {
         let err = parse_resource_path("things/id/orphans").unwrap_err();
         assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
