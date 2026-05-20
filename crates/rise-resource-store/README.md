@@ -12,8 +12,8 @@ user-defined kind). Hierarchy is encoded by a single FK:
 parent_uid UUID NULL REFERENCES resources(uid)
 ```
 
-Uniqueness of `(kind, name)` within a parent scope is enforced by partial unique indexes —
-one for `parent_uid IS NULL` (root) and one for `parent_uid IS NOT NULL`.
+Uniqueness of `(api_version, kind, name)` within a parent scope is enforced by partial
+unique indexes — one for `parent_uid IS NULL` (root) and one for `parent_uid IS NOT NULL`.
 
 `resource_definitions` is a projection table holding the indexed/queryable identity fields
 (group, kind, plural, scope) of `ResourceDefinition` rows; it stays in sync via
@@ -67,16 +67,17 @@ Two kinds of finalizers live in the `finalizers` array:
 
 ## Path resolution
 
-`resolve_path(&[PathSegment])` walks a path of `(kind, identifier)` pairs in a single
-transaction and returns the full ancestor chain (leaf is the last element). Two segment
+`resolve_path(&[PathSegment])` walks a path of `(api_version, kind, identifier)` pairs in a
+single transaction and returns the full ancestor chain (leaf is the last element). Two segment
 forms:
 
 ```rust
-PathSegment::Name { kind, name }    // "widgets/foo"
-PathSegment::Uid  { kind, uid }     // "widgets/uid:aaaa-bbbb"
+PathSegment::Name { api_version, kind, name }    // "widgets/foo"
+PathSegment::Uid  { api_version, kind, uid }     // "widgets/uid:aaaa-bbbb"
 ```
 
-`kind` is always required, even for UID-addressed segments. This lets the API layer:
+`api_version` and `kind` are always required, even for UID-addressed segments. This lets
+the API layer:
 
 - Determine the response shape from the URL alone (no resolve-before-route round-trip).
 - Surface `KindMismatch` when a UUID was copy-pasted into the wrong slot.
@@ -97,7 +98,8 @@ mode explicitly nulls `parent_uid` instead.
 `reparent(uid, new_parent_uid)` atomically moves a resource. Rejects:
 
 - `ReparentCycle` — self-loop or moving a node under one of its own descendants.
-- `NameConflict` — destination scope already has a row with the same `(kind, name)` or
+- `NameConflict` — destination scope already has a row with the same
+  `(api_version, kind, name)` or
   discriminator.
 
 Use this in preference to delete-then-recreate, which loses the UID and revision history.

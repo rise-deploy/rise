@@ -16,7 +16,8 @@ use axum::{
     Json,
 };
 use rise_resource_api::{
-    CreateResourceRequest, ResourceScope, UpdateResourceRequest, ORGANIZATION_KIND,
+    CreateResourceRequest, ResourceScope, UpdateResourceRequest, API_VERSION_V1ALPHA1,
+    ORGANIZATION_KIND,
 };
 use rise_resource_store::{
     CollectionInfo, CreateResourceParams, DeleteOutcome, PathSegment, PropagationPolicy,
@@ -103,7 +104,7 @@ async fn resolve_organization_parent(
     store: &Arc<dyn ResourceStore>,
     org_token: &str,
 ) -> Result<Uuid, ServerError> {
-    let segment = parse_identifier(ORGANIZATION_KIND, org_token)?;
+    let segment = parse_identifier(API_VERSION_V1ALPHA1, ORGANIZATION_KIND, org_token)?;
     let chain = store
         .resolve_path(&[segment])
         .await
@@ -125,11 +126,12 @@ async fn resolve_leaf(
     let mut segments = Vec::new();
     if let Some(pid) = parent_uid {
         segments.push(PathSegment::Uid {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: ORGANIZATION_KIND.to_string(),
             uid: pid,
         });
     }
-    segments.push(parse_identifier(&info.kind, identifier)?);
+    segments.push(parse_identifier(&info.api_version, &info.kind, identifier)?);
     let chain = store
         .resolve_path(&segments)
         .await
@@ -257,7 +259,7 @@ pub async fn list_root(
     enforce_scope(&resolved.info, ResourceScope::Root, &resolved.collection)?;
     let rows = state
         .resource_store
-        .list(&resolved.info.kind, None)
+        .list(&resolved.info.api_version, &resolved.info.kind, None)
         .await
         .map_err(store_error_to_server_error)?;
     Ok(Json(ResourceList {
@@ -339,7 +341,11 @@ pub async fn list_org(
     )?;
     let rows = state
         .resource_store
-        .list(&resolved.info.kind, Some(org_uid))
+        .list(
+            &resolved.info.api_version,
+            &resolved.info.kind,
+            Some(org_uid),
+        )
         .await
         .map_err(store_error_to_server_error)?;
     Ok(Json(ResourceList {

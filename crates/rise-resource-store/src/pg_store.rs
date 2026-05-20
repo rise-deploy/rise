@@ -112,6 +112,43 @@ impl PgResourceStore {
 
         Err(StoreError::DiscriminatorExhausted)
     }
+
+    async fn ensure_resource_definition_has_no_instances(
+        &self,
+        row: &ResourceRow,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> Result<(), StoreError> {
+        let spec: ResourceDefinitionSpec =
+            serde_json::from_value(row.spec.clone()).map_err(|e| {
+                StoreError::Validation(format!("stored ResourceDefinition spec is invalid: {e}"))
+            })?;
+        let api_versions: Vec<String> = spec
+            .versions
+            .iter()
+            .map(|version| format!("{}/{}", spec.group, version.name))
+            .collect();
+        let instance_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM resource_store.resources
+            WHERE kind = $1
+              AND api_version = ANY($2)
+            "#,
+        )
+        .bind(&spec.kind)
+        .bind(&api_versions)
+        .fetch_one(&mut **tx)
+        .await?;
+
+        if instance_count > 0 {
+            return Err(StoreError::Validation(format!(
+                "cannot delete ResourceDefinition '{}' while {instance_count} instance(s) exist",
+                row.name
+            )));
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -141,6 +178,7 @@ impl ResourceStore for PgResourceStore {
 
     async fn get_by_name(
         &self,
+        api_version: &str,
         kind: &str,
         name: &str,
         parent_uid: Option<Uuid>,
@@ -148,16 +186,18 @@ impl ResourceStore for PgResourceStore {
         let row =
             match parent_uid {
                 None => sqlx::query_as::<_, ResourceRow>(
-                    "SELECT * FROM resource_store.resources WHERE kind = $1 AND name = $2 AND parent_uid IS NULL",
+                    "SELECT * FROM resource_store.resources WHERE api_version = $1 AND kind = $2 AND name = $3 AND parent_uid IS NULL",
                 )
+                .bind(api_version)
                 .bind(kind)
                 .bind(name)
                 .fetch_optional(&self.pool)
                 .await?,
                 Some(pid) => {
                     sqlx::query_as::<_, ResourceRow>(
-                        "SELECT * FROM resource_store.resources WHERE kind = $1 AND name = $2 AND parent_uid = $3",
+                        "SELECT * FROM resource_store.resources WHERE api_version = $1 AND kind = $2 AND name = $3 AND parent_uid = $4",
                     )
+                    .bind(api_version)
                     .bind(kind)
                     .bind(name)
                     .bind(pid)
@@ -170,21 +210,24 @@ impl ResourceStore for PgResourceStore {
 
     async fn list(
         &self,
+        api_version: &str,
         kind: &str,
         parent_uid: Option<Uuid>,
     ) -> Result<Vec<ResourceRow>, StoreError> {
         let rows =
             match parent_uid {
                 None => sqlx::query_as::<_, ResourceRow>(
-                    "SELECT * FROM resource_store.resources WHERE kind = $1 AND parent_uid IS NULL ORDER BY name",
+                    "SELECT * FROM resource_store.resources WHERE api_version = $1 AND kind = $2 AND parent_uid IS NULL ORDER BY name",
                 )
+                .bind(api_version)
                 .bind(kind)
                 .fetch_all(&self.pool)
                 .await?,
                 Some(pid) => {
                     sqlx::query_as::<_, ResourceRow>(
-                        "SELECT * FROM resource_store.resources WHERE kind = $1 AND parent_uid = $2 ORDER BY name",
+                        "SELECT * FROM resource_store.resources WHERE api_version = $1 AND kind = $2 AND parent_uid = $3 ORDER BY name",
                     )
+                    .bind(api_version)
                     .bind(kind)
                     .bind(pid)
                     .fetch_all(&self.pool)
@@ -324,8 +367,9 @@ impl ResourceStore for PgResourceStore {
             }
             PropagationPolicy::Orphan => {
                 if child_count > 0 {
-                    // Detach children. The partial unique index on (kind, name) WHERE
-                    // parent_uid IS NULL may reject this if a name collides at the root scope.
+                    // Detach children. The partial unique index on
+                    // (api_version, kind, name) WHERE parent_uid IS NULL may reject this if a
+                    // name collides at the root scope.
                     // Bump revision so the detach is observable.
                     let result = sqlx::query(
                         r#"
@@ -340,9 +384,9 @@ impl ResourceStore for PgResourceStore {
                     .await;
                     if let Err(e) = result {
                         // A child's name or discriminator may collide at the root scope
-                        // (partial unique indexes on (kind, name) and discriminator when
-                        // parent_uid IS NULL). Surface both as NameConflict for parity
-                        // with reparent() rather than leaking an internal Database error.
+                        // (partial unique indexes on (api_version, kind, name) and discriminator
+                        // when parent_uid IS NULL). Surface both as NameConflict for parity with
+                        // reparent() rather than leaking an internal Database error.
                         if Self::is_name_conflict(&e) || Self::is_discriminator_conflict(&e) {
                             return Err(StoreError::NameConflict);
                         }
@@ -370,10 +414,14 @@ impl ResourceStore for PgResourceStore {
             return Ok(DeleteOutcome::MarkedForDeletion(Box::new(marked)));
         }
 
-        sqlx::query("DELETE FROM resource_store.resource_definitions WHERE uid = $1")
-            .bind(uid)
-            .execute(&mut *tx)
-            .await?;
+        if row.kind == RESOURCE_DEFINITION_KIND {
+            self.ensure_resource_definition_has_no_instances(&row, &mut tx)
+                .await?;
+            sqlx::query("DELETE FROM resource_store.resource_definitions WHERE uid = $1")
+                .bind(uid)
+                .execute(&mut *tx)
+                .await?;
+        }
         sqlx::query("DELETE FROM resource_store.resources WHERE uid = $1")
             .bind(uid)
             .execute(&mut *tx)
@@ -470,10 +518,14 @@ impl ResourceStore for PgResourceStore {
         }
 
         // Clear: hard-delete.
-        sqlx::query("DELETE FROM resource_store.resource_definitions WHERE uid = $1")
-            .bind(uid)
-            .execute(&mut *tx)
-            .await?;
+        if row.kind == RESOURCE_DEFINITION_KIND {
+            self.ensure_resource_definition_has_no_instances(&row, &mut tx)
+                .await?;
+            sqlx::query("DELETE FROM resource_store.resource_definitions WHERE uid = $1")
+                .bind(uid)
+                .execute(&mut *tx)
+                .await?;
+        }
         sqlx::query("DELETE FROM resource_store.resources WHERE uid = $1")
             .bind(uid)
             .execute(&mut *tx)
@@ -509,18 +561,24 @@ impl ResourceStore for PgResourceStore {
 
         for (idx, segment) in segments.iter().enumerate() {
             let row = match segment {
-                PathSegment::Name { kind, name } => {
+                PathSegment::Name {
+                    api_version,
+                    kind,
+                    name,
+                } => {
                     let row: Option<ResourceRow> = match current_parent {
                         None => sqlx::query_as::<_, ResourceRow>(
-                            "SELECT * FROM resource_store.resources WHERE kind = $1 AND name = $2 AND parent_uid IS NULL",
+                            "SELECT * FROM resource_store.resources WHERE api_version = $1 AND kind = $2 AND name = $3 AND parent_uid IS NULL",
                         )
+                        .bind(api_version)
                         .bind(kind)
                         .bind(name)
                         .fetch_optional(&mut *tx)
                         .await?,
                         Some(pid) => sqlx::query_as::<_, ResourceRow>(
-                            "SELECT * FROM resource_store.resources WHERE kind = $1 AND name = $2 AND parent_uid = $3",
+                            "SELECT * FROM resource_store.resources WHERE api_version = $1 AND kind = $2 AND name = $3 AND parent_uid = $4",
                         )
+                        .bind(api_version)
                         .bind(kind)
                         .bind(name)
                         .bind(pid)
@@ -533,7 +591,11 @@ impl ResourceStore for PgResourceStore {
                         None => return Err(StoreError::ParentNotFound),
                     }
                 }
-                PathSegment::Uid { kind, uid } => {
+                PathSegment::Uid {
+                    api_version,
+                    kind,
+                    uid,
+                } => {
                     let row: ResourceRow = match sqlx::query_as::<_, ResourceRow>(
                         "SELECT * FROM resource_store.resources WHERE uid = $1",
                     )
@@ -545,10 +607,10 @@ impl ResourceStore for PgResourceStore {
                         None if idx + 1 == segments.len() => return Err(StoreError::NotFound),
                         None => return Err(StoreError::ParentNotFound),
                     };
-                    if row.kind != *kind {
+                    if row.kind != *kind || row.api_version != *api_version {
                         return Err(StoreError::KindMismatch {
-                            expected: kind.clone(),
-                            got: row.kind,
+                            expected: format!("{api_version}/{kind}"),
+                            got: format!("{}/{}", row.api_version, row.kind),
                         });
                     }
                     if row.parent_uid != current_parent {

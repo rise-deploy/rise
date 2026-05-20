@@ -58,12 +58,64 @@ async fn list_resources(pool: sqlx::PgPool) -> sqlx::Result<()> {
             .unwrap();
     }
 
-    let list = store.list(ORGANIZATION_KIND, None).await.unwrap();
+    let list = store
+        .list(API_VERSION_V1ALPHA1, ORGANIZATION_KIND, None)
+        .await
+        .unwrap();
     assert_eq!(list.len(), 3);
     // Returned in name order
     assert_eq!(list[0].name, "alpha");
     assert_eq!(list[1].name, "beta");
     assert_eq!(list[2].name, "gamma");
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn same_kind_name_is_isolated_by_api_version(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+
+    let first = store
+        .create(CreateResourceParams {
+            api_version: "alpha.example.dev/v1".to_string(),
+            kind: "Widget".to_string(),
+            name: "shared".to_string(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec: json!({}),
+            validator: None,
+        })
+        .await
+        .unwrap();
+
+    let second = store
+        .create(CreateResourceParams {
+            api_version: "beta.example.dev/v1".to_string(),
+            kind: "Widget".to_string(),
+            name: "shared".to_string(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec: json!({}),
+            validator: None,
+        })
+        .await
+        .unwrap();
+
+    let alpha = store
+        .list("alpha.example.dev/v1", "Widget", None)
+        .await
+        .unwrap();
+    assert_eq!(alpha.len(), 1);
+    assert_eq!(alpha[0].uid, first.uid);
+
+    let beta = store
+        .get_by_name("beta.example.dev/v1", "Widget", "shared", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(beta.uid, second.uid);
 
     Ok(())
 }
@@ -427,6 +479,62 @@ async fn register_resource_definition(pool: sqlx::PgPool) -> sqlx::Result<()> {
 }
 
 #[sqlx::test]
+async fn delete_resource_definition_rejects_existing_instances(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+
+    let spec = json!({
+        "group": "example.dev",
+        "kind": "Widget",
+        "plural": "widgets",
+        "scope": "root",
+        "versions": [{"name": "v1", "served": true, "storage": true}],
+        "allowedStatusControllerIds": []
+    });
+
+    let definition = store
+        .register_resource_definition(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: RESOURCE_DEFINITION_KIND.to_string(),
+            name: "widgets.example.dev".to_string(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec,
+            validator: None,
+        })
+        .await
+        .unwrap();
+
+    store
+        .create(CreateResourceParams {
+            api_version: "example.dev/v1".to_string(),
+            kind: "Widget".to_string(),
+            name: "w1".to_string(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec: json!({}),
+            validator: None,
+        })
+        .await
+        .unwrap();
+
+    let err = store
+        .delete(definition.uid, PropagationPolicy::Cascade)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Validation(_)),
+        "expected validation error, got {err:?}"
+    );
+    assert!(store.resolve_collection("widgets").await.unwrap().is_some());
+
+    Ok(())
+}
+
+#[sqlx::test]
 async fn register_resource_definition_rejects_reserved_plural(
     pool: sqlx::PgPool,
 ) -> sqlx::Result<()> {
@@ -479,14 +587,14 @@ async fn get_by_name(pool: sqlx::PgPool) -> sqlx::Result<()> {
         .unwrap();
 
     let found = store
-        .get_by_name(ORGANIZATION_KIND, "lookup-org", None)
+        .get_by_name(API_VERSION_V1ALPHA1, ORGANIZATION_KIND, "lookup-org", None)
         .await
         .unwrap();
     assert!(found.is_some());
     assert_eq!(found.unwrap().name, "lookup-org");
 
     let not_found = store
-        .get_by_name(ORGANIZATION_KIND, "nonexistent", None)
+        .get_by_name(API_VERSION_V1ALPHA1, ORGANIZATION_KIND, "nonexistent", None)
         .await
         .unwrap();
     assert!(not_found.is_none());
@@ -1061,10 +1169,12 @@ async fn resolve_path_walks_named_segments(pool: sqlx::PgPool) -> sqlx::Result<(
     let chain = store
         .resolve_path(&[
             PathSegment::Name {
+                api_version: API_VERSION_V1ALPHA1.to_string(),
                 kind: ORGANIZATION_KIND.to_string(),
                 name: "acme".to_string(),
             },
             PathSegment::Name {
+                api_version: "example.dev/v1".to_string(),
                 kind: "Widget".to_string(),
                 name: "w1".to_string(),
             },
@@ -1087,10 +1197,12 @@ async fn resolve_path_supports_uid_segments(pool: sqlx::PgPool) -> sqlx::Result<
     let chain = store
         .resolve_path(&[
             PathSegment::Uid {
+                api_version: API_VERSION_V1ALPHA1.to_string(),
                 kind: ORGANIZATION_KIND.to_string(),
                 uid: org.uid,
             },
             PathSegment::Name {
+                api_version: "example.dev/v1".to_string(),
                 kind: "Widget".to_string(),
                 name: "w1".to_string(),
             },
@@ -1110,6 +1222,7 @@ async fn resolve_path_rejects_kind_mismatch(pool: sqlx::PgPool) -> sqlx::Result<
 
     let err = store
         .resolve_path(&[PathSegment::Uid {
+            api_version: "example.dev/v1".to_string(),
             kind: "Widget".to_string(),
             uid: org.uid,
         }])
@@ -1133,10 +1246,12 @@ async fn resolve_path_rejects_wrong_subtree(pool: sqlx::PgPool) -> sqlx::Result<
     let err = store
         .resolve_path(&[
             PathSegment::Uid {
+                api_version: API_VERSION_V1ALPHA1.to_string(),
                 kind: ORGANIZATION_KIND.to_string(),
                 uid: org_a.uid,
             },
             PathSegment::Uid {
+                api_version: "example.dev/v1".to_string(),
                 kind: "Widget".to_string(),
                 uid: widget_b.uid,
             },
@@ -1168,10 +1283,12 @@ async fn resolve_path_returns_tombstoned_rows(pool: sqlx::PgPool) -> sqlx::Resul
     let chain = store
         .resolve_path(&[
             PathSegment::Name {
+                api_version: API_VERSION_V1ALPHA1.to_string(),
                 kind: ORGANIZATION_KIND.to_string(),
                 name: "acme".to_string(),
             },
             PathSegment::Name {
+                api_version: "example.dev/v1".to_string(),
                 kind: "Widget".to_string(),
                 name: "w1".to_string(),
             },
@@ -1247,9 +1364,15 @@ async fn reparent_moves_resource(pool: sqlx::PgPool) -> sqlx::Result<()> {
         .unwrap();
     assert_eq!(moved.parent_uid, Some(org_b.uid));
 
-    let under_a = store.list("Widget", Some(org_a.uid)).await.unwrap();
+    let under_a = store
+        .list("example.dev/v1", "Widget", Some(org_a.uid))
+        .await
+        .unwrap();
     assert!(under_a.is_empty());
-    let under_b = store.list("Widget", Some(org_b.uid)).await.unwrap();
+    let under_b = store
+        .list("example.dev/v1", "Widget", Some(org_b.uid))
+        .await
+        .unwrap();
     assert_eq!(under_b.len(), 1);
     assert_eq!(under_b[0].uid, widget.uid);
 

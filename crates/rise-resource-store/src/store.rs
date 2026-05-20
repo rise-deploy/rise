@@ -55,10 +55,18 @@ pub enum PropagationPolicy {
 #[derive(Debug, Clone)]
 pub enum PathSegment {
     /// Address by name within the parent scope (root if first segment).
-    Name { kind: String, name: String },
+    Name {
+        api_version: String,
+        kind: String,
+        name: String,
+    },
     /// Address by UID. The kind is still required and checked against the stored row; mismatches
     /// surface as `StoreError::KindMismatch`.
-    Uid { kind: String, uid: Uuid },
+    Uid {
+        api_version: String,
+        kind: String,
+        uid: Uuid,
+    },
 }
 
 pub enum DeleteOutcome {
@@ -91,6 +99,7 @@ pub trait ResourceStore: Send + Sync {
 
     async fn get_by_name(
         &self,
+        api_version: &str,
         kind: &str,
         name: &str,
         parent_uid: Option<Uuid>,
@@ -98,6 +107,7 @@ pub trait ResourceStore: Send + Sync {
 
     async fn list(
         &self,
+        api_version: &str,
         kind: &str,
         parent_uid: Option<Uuid>,
     ) -> Result<Vec<ResourceRow>, StoreError>;
