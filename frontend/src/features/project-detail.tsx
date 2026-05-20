@@ -10,7 +10,7 @@ import { EnvironmentColorDot } from '../components/ui';
 import { LoadingState, ErrorState, EmptyState } from '../components/states';
 
 import { DeploymentsList } from './deployments';
-import { DomainsList, EnvironmentsList, EnvVarsList, ExtensionsList, ServiceAccountsList } from './resources';
+import { DomainsList, EnvironmentsList, EnvVarsList, ExtensionsList } from './resources';
 import { AppUsersList } from './projects';
 
 const TAB_LABELS: Record<string, string> = {
@@ -19,12 +19,11 @@ const TAB_LABELS: Record<string, string> = {
     deployments: 'Deployments',
     'env-vars': 'Env vars',
     domains: 'Domains',
-    'service-accounts': 'Service accounts',
     extensions: 'Extensions',
     access: 'Access',
 };
 
-const TAB_IDS = ['overview', 'environments', 'deployments', 'env-vars', 'domains', 'service-accounts', 'extensions', 'access'];
+const TAB_IDS = ['overview', 'environments', 'deployments', 'env-vars', 'domains', 'extensions', 'access'];
 
 export function ProjectDetail({ projectName, initialTab }: { projectName: string; initialTab?: string }) {
     const [project, setProject] = useState<any>(null);
@@ -74,9 +73,6 @@ export function ProjectDetail({ projectName, initialTab }: { projectName: string
             .catch(() => {});
         api.getProjectDomains(projectName)
             .then((d: any) => record('domains', Array.isArray(d) ? d.length : (d?.domains?.length ?? 0)))
-            .catch(() => {});
-        api.getProjectServiceAccounts(projectName)
-            .then((d: any) => record('service-accounts', Array.isArray(d) ? d.length : (d?.workload_identities?.length ?? 0)))
             .catch(() => {});
         api.getProjectExtensions(projectName)
             .then((d: any) => record('extensions', Array.isArray(d) ? d.length : (d?.extensions?.length ?? 0)))
@@ -194,7 +190,6 @@ export function ProjectDetail({ projectName, initialTab }: { projectName: string
                 {activeTab === 'environments' && (
                     <EnvironmentsList projectName={projectName} platformConstraints={project?.platform_constraints} />
                 )}
-                {activeTab === 'service-accounts' && <ServiceAccountsList projectName={projectName} />}
                 {activeTab === 'env-vars' && <EnvVarsList projectName={projectName} />}
                 {activeTab === 'domains' && <DomainsList projectName={projectName} defaultUrl={project.default_url} />}
                 {activeTab === 'extensions' && <ExtensionsList projectName={projectName} />}

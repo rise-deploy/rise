@@ -23,7 +23,6 @@ import { ErrorBoundary } from './components/error-boundary';
 const TAB_LABELS = {
     deployments: 'Deployments',
     environments: 'Environments',
-    'service-accounts': 'Service Accounts',
     'env-vars': 'Env Vars',
     domains: 'Domains',
     extensions: 'Extensions',
