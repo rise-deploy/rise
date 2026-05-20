@@ -3,10 +3,21 @@ import { createElement, useCallback, useEffect, useMemo, useState } from 'react'
 import { api } from '../lib/api';
 import { CONFIG } from '../lib/config';
 import { navigate } from '../lib/navigation';
-import { copyToClipboard, formatDate } from '../lib/utils';
+import { formatDate } from '../lib/utils';
 import { useToast } from '../components/toast';
 import { Button, ConfirmDialog, EnvironmentColorDot, EnvironmentColorPicker, EnvironmentCombobox, EnvironmentDropdown, FormField, Modal, ModalActions, ModalSection, ModalTabs, MonoStatusPill, MonoTabButton, MonoTag, SegmentedRadioGroup } from '../components/ui';
-import { MonoTable, MonoTableBody, MonoTableEmptyRow, MonoTableFrame, MonoTableHead, MonoTableRow, MonoTd, MonoTh } from '../components/table';
+import {
+    Alert as RAlert,
+    Button as RButton,
+    Empty as REmpty,
+    GroupBar as RGroupBar,
+    KV as RKV,
+    KVRow as RKVRow,
+    Panel as RPanel,
+    SearchInput as RSearchInput,
+} from '../components/r-ui';
+import { Icon } from '../components/icon';
+import { LoadingState, ErrorState } from '../components/states';
 import {
   AwsRdsDetailView,
   AwsRdsExtensionUI,
@@ -148,6 +159,64 @@ function sortObjectKeys(obj) {
         }, {});
 }
 
+// Single environment card: collapsible GroupBar header + detail body.
+function EnvironmentCard({ env, projectName, constraintSummary, onEdit, onDelete }) {
+    const [open, setOpen] = useState(false);
+    return (
+        <RPanel>
+            <RGroupBar
+                open={open}
+                onToggle={() => setOpen(o => !o)}
+                right={
+                    <>
+                        {constraintSummary && (
+                            <span style={{ fontSize: 11.5, color: 'var(--text-soft)' }}>{constraintSummary}</span>
+                        )}
+                        <RButton
+                            size="sm"
+                            icon="arrow"
+                            onClick={(e) => { e.stopPropagation(); navigate(`/project/${projectName}/environment/${env.name}`); }}
+                        >
+                            Open
+                        </RButton>
+                    </>
+                }
+            >
+                <EnvironmentColorDot color={env.color} />
+                <strong>{env.name}</strong>
+                {env.is_production && <span className="r-pill env-prod">production</span>}
+            </RGroupBar>
+            {open && (
+                <div className="r-panel-body">
+                    <RKV>
+                        <RKVRow k="Primary group">
+                            {env.primary_deployment_group
+                                ? <span className="mono">{env.primary_deployment_group}</span>
+                                : <span style={{ color: 'var(--text-soft)' }}>—</span>}
+                        </RKVRow>
+                        <RKVRow k="Resources">
+                            {constraintSummary || <span style={{ color: 'var(--text-soft)' }}>platform defaults</span>}
+                        </RKVRow>
+                        <RKVRow k="Created">{formatDate(env.created_at)}</RKVRow>
+                    </RKV>
+                    <div style={{ display: 'flex', gap: 8, marginTop: 16 }}>
+                        <RButton size="sm" icon="edit" onClick={(e) => { e.stopPropagation(); onEdit(); }}>Edit</RButton>
+                        <RButton
+                            size="sm"
+                            variant="danger"
+                            icon="trash"
+                            onClick={(e) => { e.stopPropagation(); onDelete(); }}
+                            disabled={env.is_production}
+                        >
+                            Delete
+                        </RButton>
+                    </div>
+                </div>
+            )}
+        </RPanel>
+    );
+}
+
 // Environments Component
 export function EnvironmentsList({ projectName, platformConstraints = null }) {
     const [environments, setEnvironments] = useState([]);
@@ -286,88 +355,53 @@ export function EnvironmentsList({ projectName, platformConstraints = null }) {
         }
     };
 
-    if (loading) return <div className="text-center py-8"><div className="inline-block w-8 h-8 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin"></div></div>;
-    if (error) return <p className="text-red-600 dark:text-red-400">Error loading environments: {error}</p>;
+    if (loading) return <LoadingState label="Loading environments…" />;
+    if (error) return <ErrorState message={`Error loading environments: ${error}`} onRetry={loadEnvironments} />;
+
+    const envConstraintSummary = (env) => {
+        const c = env.deployment_constraints;
+        if (!c) return null;
+        const parts = [];
+        if (c.min_replicas != null && c.max_replicas != null) parts.push(`${c.min_replicas}–${c.max_replicas} replicas`);
+        if (c.min_cpu && c.max_cpu) parts.push(`${c.min_cpu}–${c.max_cpu} cpu`);
+        if (c.min_memory && c.max_memory) parts.push(`${c.min_memory}–${c.max_memory} mem`);
+        return parts.length ? parts.join(' · ') : null;
+    };
 
     return (
         <div>
-            <div className="mb-4 flex justify-end">
-                <Button variant="primary" size="sm" onClick={handleAddClick}>
-                    Create Environment
+            <div className="r-section-head">
+                <div>
+                    <div className="r-section-title">Environments</div>
+                    <div className="r-section-sub">Deployment targets and their resource constraints for this project.</div>
+                </div>
+                <Button variant="primary" icon="plus" onClick={handleAddClick}>
+                    New environment
                 </Button>
             </div>
-            <MonoTableFrame>
-                <MonoTable>
-                    <MonoTableHead>
-                        <tr>
-                            <MonoTh className="px-6 py-3 text-left">Name</MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">Primary Group</MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">Resources</MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">Created</MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">Actions</MonoTh>
-                        </tr>
-                    </MonoTableHead>
-                    <MonoTableBody>
-                        {environments.length === 0 ? (
-                            <MonoTableEmptyRow colSpan={5}>No environments configured.</MonoTableEmptyRow>
-                        ) : (
-                            environments.map(env => (
-                                <MonoTableRow
-                                    key={env.name}
-                                    interactive
-                                    className="transition-colors"
-                                    onClick={() => navigate(`/project/${projectName}/environment/${env.name}`)}
-                                    style={{ cursor: 'pointer' }}
-                                >
-                                    <MonoTd className="px-6 py-4 text-sm">
-                                        <div className="flex items-center gap-2">
-                                            <EnvironmentColorDot color={env.color} />
-                                            <span>{env.name}</span>
-                                            {env.is_production && <MonoTag>production</MonoTag>}
-                                        </div>
-                                    </MonoTd>
-                                    <MonoTd className="px-6 py-4 text-sm text-gray-700 dark:text-gray-300">{env.primary_deployment_group || '-'}</MonoTd>
-                                    <MonoTd className="px-6 py-4 text-sm text-gray-700 dark:text-gray-300">
-                                        {env.deployment_constraints ? (
-                                            <span className="text-xs">
-                                                {env.deployment_constraints.min_replicas != null && env.deployment_constraints.max_replicas != null
-                                                    ? `${env.deployment_constraints.min_replicas}–${env.deployment_constraints.max_replicas} replicas`
-                                                    : null}
-                                                {env.deployment_constraints.min_cpu && env.deployment_constraints.max_cpu
-                                                    ? `${env.deployment_constraints.min_replicas != null ? ' · ' : ''}${env.deployment_constraints.min_cpu}–${env.deployment_constraints.max_cpu} cpu`
-                                                    : null}
-                                                {env.deployment_constraints.min_memory && env.deployment_constraints.max_memory
-                                                    ? `${(env.deployment_constraints.min_cpu || env.deployment_constraints.min_replicas != null) ? ' · ' : ''}${env.deployment_constraints.min_memory}–${env.deployment_constraints.max_memory} mem`
-                                                    : null}
-                                            </span>
-                                        ) : '-'}
-                                    </MonoTd>
-                                    <MonoTd className="px-6 py-4 whitespace-nowrap text-sm text-gray-700 dark:text-gray-300">{formatDate(env.created_at)}</MonoTd>
-                                    <MonoTd className="px-6 py-4 text-sm">
-                                        <div className="flex gap-2">
-                                            <Button
-                                                variant="secondary"
-                                                size="sm"
-                                                onClick={(e) => { e.stopPropagation(); handleEditClick(env); }}
-                                            >
-                                                Edit
-                                            </Button>
-                                            <Button
-                                                variant="danger"
-                                                size="sm"
-                                                onClick={(e) => { e.stopPropagation(); handleDeleteClick(env); }}
-                                                disabled={env.is_production}
-                                            >
-                                                Delete
-                                            </Button>
-                                        </div>
-                                    </MonoTd>
-                                </MonoTableRow>
-                            ))
-                        )}
-                    </MonoTableBody>
-                </MonoTable>
-            </MonoTableFrame>
+
+            {environments.length === 0 ? (
+                <RPanel>
+                    <REmpty title="No environments">
+                        <div style={{ color: 'var(--text-soft)', fontSize: 13 }}>
+                            No environments configured. Create one to define a deployment target.
+                        </div>
+                    </REmpty>
+                </RPanel>
+            ) : (
+                <div className="r-stack tight">
+                    {environments.map(env => (
+                        <EnvironmentCard
+                            key={env.name}
+                            env={env}
+                            projectName={projectName}
+                            constraintSummary={envConstraintSummary(env)}
+                            onEdit={() => handleEditClick(env)}
+                            onDelete={() => handleDeleteClick(env)}
+                        />
+                    ))}
+                </div>
+            )}
 
             <Modal
                 isOpen={isModalOpen}
@@ -1087,6 +1121,78 @@ function EnvVarSourceTag({ source, environments = [] }) {
     return <MonoTag color={ENV_VAR_SOURCE_COLORS[source] || 'gray'}>{source}</MonoTag>;
 }
 
+// One collapsible scope panel (Global, or a single environment) of env vars.
+function EnvVarScopeGroup({ scope, vars, searching, defaultOpen, environments, renderTypeTag, renderValueCell, onAdd, onEdit, onDelete }) {
+    const [open, setOpen] = useState(defaultOpen);
+    const secretCount = vars.filter(v => v.is_secret).length;
+    // When searching, collapse empty scopes entirely.
+    if (searching && vars.length === 0) return null;
+
+    return (
+        <RPanel>
+            <RGroupBar
+                open={open}
+                onToggle={() => setOpen(o => !o)}
+                right={
+                    <>
+                        <span style={{ fontSize: 11.5, color: 'var(--text-soft)' }}>
+                            {vars.length} variable{vars.length !== 1 ? 's' : ''}
+                        </span>
+                        {secretCount > 0 && (
+                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11.5, color: 'var(--text-soft)' }}>
+                                <Icon name="lock" size={11} /> {secretCount} secret{secretCount !== 1 ? 's' : ''}
+                            </span>
+                        )}
+                        <RButton size="sm" icon="plus" onClick={(e) => { e.stopPropagation(); onAdd(); }}>
+                            Add
+                        </RButton>
+                    </>
+                }
+            >
+                <span className={`r-pill ${scope.kind}`}>
+                    {scope.color && <EnvironmentColorDot color={scope.color} />}
+                    {scope.label}
+                </span>
+                <span style={{ fontSize: 11.5, color: 'var(--text-soft)' }}>· {scope.hint}</span>
+            </RGroupBar>
+            {open && (
+                vars.length === 0 ? (
+                    <div style={{ padding: 28, textAlign: 'center', color: 'var(--text-soft)', fontSize: 13 }}>
+                        No variables in this scope.
+                    </div>
+                ) : (
+                    <table className="r-table fixed">
+                        <colgroup>
+                            <col style={{ width: '28%' }} />
+                            <col />
+                            <col style={{ width: 110 }} />
+                            <col style={{ width: 130 }} />
+                        </colgroup>
+                        <thead>
+                            <tr><th>Key</th><th>Value</th><th>Type</th><th></th></tr>
+                        </thead>
+                        <tbody>
+                            {vars.map(v => (
+                                <tr key={`${v.key}-${v.environment || ''}`}>
+                                    <td className="mono" style={{ fontSize: 13, fontWeight: 500 }}>{v.key}</td>
+                                    <td>{renderValueCell(v)}</td>
+                                    <td>{renderTypeTag(v)}</td>
+                                    <td>
+                                        <div className="row-actions" style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
+                                            <RButton size="sm" icon="edit" onClick={() => onEdit(v)}>Edit</RButton>
+                                            <RButton size="sm" variant="danger" icon="trash" onClick={() => onDelete(v)}>Delete</RButton>
+                                        </div>
+                                    </td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                )
+            )}
+        </RPanel>
+    );
+}
+
 // Environment Variables Component
 export function EnvVarsList({ projectName, deploymentId }) {
     const [envVars, setEnvVars] = useState([]);
@@ -1100,7 +1206,8 @@ export function EnvVarsList({ projectName, deploymentId }) {
     const [deleting, setDeleting] = useState(false);
     const [saving, setSaving] = useState(false);
     const [environments, setEnvironments] = useState([]);
-    const [envFilter, setEnvFilter] = useState('');
+    const [search, setSearch] = useState('');
+    const [revealed, setRevealed] = useState({});
     const { showToast } = useToast();
 
     // Convert API representation to UI type
@@ -1115,7 +1222,7 @@ export function EnvVarsList({ projectName, deploymentId }) {
         is_protected: type === 'protected',
     });
 
-    // Load environments for filter dropdown and source color dots
+    // Load environments for source color dots
     useEffect(() => {
         api.getProjectEnvironments(projectName)
             .then(data => setEnvironments(data || []))
@@ -1126,22 +1233,22 @@ export function EnvVarsList({ projectName, deploymentId }) {
         try {
             const response = deploymentId
                 ? await api.getDeploymentEnvVars(projectName, deploymentId)
-                : await api.getProjectEnvVars(projectName, envFilter || null);
+                : await api.getProjectEnvVars(projectName, null);
             setEnvVars(response.env_vars || []);
             setLoading(false);
         } catch (err) {
             setError(err.message);
             setLoading(false);
         }
-    }, [projectName, deploymentId, envFilter]);
+    }, [projectName, deploymentId]);
 
     useEffect(() => {
         loadEnvVars();
     }, [loadEnvVars]);
 
-    const handleAddClick = () => {
+    const handleAddClick = (environment = null) => {
         setEditingEnvVar(null);
-        setFormData({ key: '', value: '', type: 'plain', environment: envFilter || null });
+        setFormData({ key: '', value: '', type: 'plain', environment: environment || null });
         setIsModalOpen(true);
     };
 
@@ -1211,164 +1318,170 @@ export function EnvVarsList({ projectName, deploymentId }) {
         }
     };
 
-    if (loading) return <div className="text-center py-8"><div className="inline-block w-8 h-8 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin"></div></div>;
-    if (error) return <p className="text-red-600 dark:text-red-400">Error loading environment variables: {error}</p>;
+    if (loading) return <LoadingState label="Loading environment variables…" />;
+    if (error) return <ErrorState message={`Error loading environment variables: ${error}`} onRetry={loadEnvVars} />;
 
-    const showEnvColumn = !deploymentId && envFilter === '' && environments.length > 0;
+    const revealSecret = async (envVar) => {
+        const revealKey = `${envVar.environment || ''}:${envVar.key}`;
+        if (revealed[revealKey] !== undefined) {
+            setRevealed(r => { const next = { ...r }; delete next[revealKey]; return next; });
+            return;
+        }
+        try {
+            const response = deploymentId
+                ? await api.getDeploymentEnvVarValue(projectName, deploymentId, envVar.key)
+                : await api.getEnvVarValue(projectName, envVar.key, envVar.environment || null);
+            setRevealed(r => ({ ...r, [revealKey]: response.value }));
+        } catch (err) {
+            showToast(`Failed to reveal secret: ${err.message}`, 'error');
+            console.error('Failed to fetch secret:', err);
+        }
+    };
+
+    const TypeTag = ({ envVar }) => {
+        if (envVar.is_protected) return <MonoTag color="purple">protected</MonoTag>;
+        if (envVar.is_secret) return <MonoTag color="yellow">secret</MonoTag>;
+        return <MonoTag color="gray">plain</MonoTag>;
+    };
+
+    // Renders the masked/revealed value cell with a reveal eye for readable secrets.
+    const ValueCell = ({ envVar }) => {
+        const revealKey = `${envVar.environment || ''}:${envVar.key}`;
+        const isRevealed = revealed[revealKey] !== undefined;
+        const canReveal = envVar.is_secret && !envVar.is_protected;
+        return (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, overflow: 'hidden' }}>
+                <span
+                    className="mono"
+                    style={{
+                        fontSize: 12.5,
+                        color: envVar.is_secret && !isRevealed ? 'var(--text-soft)' : 'var(--text)',
+                        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0,
+                    }}
+                >
+                    {envVar.is_secret && !isRevealed ? '••••••••••••' : (isRevealed ? revealed[revealKey] : envVar.value)}
+                </span>
+                {canReveal && (
+                    <RButton
+                        variant="ghost"
+                        size="sm"
+                        icon={isRevealed ? 'eyeoff' : 'eye'}
+                        onClick={() => revealSecret(envVar)}
+                        title={isRevealed ? 'Hide' : 'Reveal'}
+                        style={{ flex: '0 0 auto', padding: '2px 6px' }}
+                    />
+                )}
+            </div>
+        );
+    };
+
+    // Deployment snapshot mode: a single read-only table.
+    if (deploymentId) {
+        return (
+            <div>
+                <RPanel>
+                    {envVars.length === 0 ? (
+                        <REmpty title="No environment variables">
+                            <div style={{ color: 'var(--text-soft)', fontSize: 13 }}>
+                                This deployment has no environment variables.
+                            </div>
+                        </REmpty>
+                    ) : (
+                        <table className="r-table fixed">
+                            <colgroup>
+                                <col style={{ width: '28%' }} />
+                                <col />
+                                <col style={{ width: 110 }} />
+                                <col style={{ width: 150 }} />
+                            </colgroup>
+                            <thead>
+                                <tr><th>Key</th><th>Value</th><th>Type</th><th>Source</th></tr>
+                            </thead>
+                            <tbody>
+                                {envVars.map(env => (
+                                    <tr key={`${env.key}-${env.environment || ''}`}>
+                                        <td className="mono" style={{ fontSize: 13, fontWeight: 500 }}>{env.key}</td>
+                                        <td><ValueCell envVar={env} /></td>
+                                        <td><TypeTag envVar={env} /></td>
+                                        <td><EnvVarSourceTag source={env.source} environments={environments} /></td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    )}
+                </RPanel>
+                <p style={{ marginTop: 16, fontSize: 12.5, color: 'var(--text-muted)' }}>
+                    Environment variables are read-only snapshots taken at deployment time.
+                    Secret values are always masked unless revealed.
+                </p>
+            </div>
+        );
+    }
+
+    // Project mode: group all vars by scope (Global + one per environment).
+    const search_q = search.trim().toLowerCase();
+    const matchesSearch = (v) =>
+        !search_q || v.key.toLowerCase().includes(search_q) || (v.value || '').toLowerCase().includes(search_q);
+
+    const envOrder = environments.map(e => e.name);
+    const scopeNames = Array.from(new Set(envVars.map(v => v.environment).filter(Boolean)));
+    // Keep declared environment order first, then any extra scopes present in the data.
+    const orderedEnvScopes = [
+        ...envOrder.filter(n => scopeNames.includes(n)),
+        ...scopeNames.filter(n => !envOrder.includes(n)),
+    ];
+
+    const scopes = [
+        { id: null, label: 'Global', hint: 'applies to every environment', kind: 'env-global' },
+        ...orderedEnvScopes.map(name => ({
+            id: name,
+            label: name,
+            hint: `overrides global for ${name}`,
+            kind: 'env-prod',
+            color: environments.find(e => e.name === name)?.color,
+        })),
+    ];
 
     return (
         <div>
-            {!deploymentId && (
-                <div className="mb-4 flex justify-between items-center">
-                    <div className="flex items-center gap-2">
-                        {environments.length > 0 && (
-                            <select
-                                value={envFilter}
-                                onChange={(e) => { setEnvFilter(e.target.value); setLoading(true); }}
-                                className="mono-select text-sm"
-                            >
-                                <option value="">All environments</option>
-                                {environments.map(env => (
-                                    <option key={env.name} value={env.name}>{env.name}</option>
-                                ))}
-                            </select>
-                        )}
-                    </div>
-                    <Button variant="primary" size="sm" onClick={handleAddClick}>
-                        Add Variable
-                    </Button>
-                </div>
-            )}
-            <MonoTableFrame>
-                <MonoTable>
-                    <MonoTableHead>
-                        <tr>
-                            <MonoTh className="px-6 py-3 text-left">Key</MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">Value</MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">Type</MonoTh>
-                            {deploymentId && (
-                                <MonoTh className="px-6 py-3 text-left">Source</MonoTh>
-                            )}
-                            {showEnvColumn && (
-                                <MonoTh className="px-6 py-3 text-left">Environment</MonoTh>
-                            )}
-                            {!deploymentId && (
-                                <MonoTh className="px-6 py-3 text-left">Actions</MonoTh>
-                            )}
-                        </tr>
-                    </MonoTableHead>
-                    <MonoTableBody>
-                        {envVars.length === 0 ? (
-                            <MonoTableEmptyRow colSpan={deploymentId ? 4 : (showEnvColumn ? 5 : 4)}>No environment variables configured.</MonoTableEmptyRow>
-                        ) : (
-                            envVars.map(env => (
-                            <MonoTableRow key={`${env.key}-${env.environment || ''}`} interactive className="transition-colors">
-                                <MonoTd className="px-6 py-4 text-sm font-mono text-gray-900 dark:text-gray-200">{env.key}</MonoTd>
-                                <MonoTd className="px-6 py-4 text-sm font-mono text-gray-900 dark:text-gray-200">
-                                    <div className="flex items-center gap-2">
-                                        <span>{env.value}</span>
-                                        {env.is_secret && !env.is_protected && (
-                                            <button
-                                                onClick={async () => {
-                                                    try {
-                                                        const response = deploymentId
-                                                            ? await api.getDeploymentEnvVarValue(projectName, deploymentId, env.key)
-                                                            : await api.getEnvVarValue(projectName, env.key, env.environment || null);
-                                                        await copyToClipboard(response.value);
-                                                        showToast('Secret copied to clipboard!', 'success');
-                                                    } catch (err) {
-                                                        showToast(`Failed to copy secret: ${err.message}`, 'error');
-                                                        console.error('Failed to fetch secret:', err);
-                                                    }
-                                                }}
-                                                className="p-1 text-gray-500 hover:text-blue-600 dark:text-gray-400 dark:hover:text-blue-400 transition-colors rounded hover:bg-gray-100 dark:hover:bg-gray-700"
-                                                title="Copy secret value to clipboard"
-                                            >
-                                                <svg
-                                                    xmlns="http://www.w3.org/2000/svg"
-                                                    className="h-4 w-4"
-                                                    fill="none"
-                                                    viewBox="0 0 24 24"
-                                                    stroke="currentColor"
-                                                    strokeWidth={2}
-                                                >
-                                                    <path
-                                                        strokeLinecap="round"
-                                                        strokeLinejoin="round"
-                                                        d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"
-                                                    />
-                                                </svg>
-                                            </button>
-                                        )}
-                                    </div>
-                                </MonoTd>
-                                <MonoTd className="px-6 py-4 text-sm">
-                                    {env.is_protected ? (
-                                        <MonoTag color="purple">
-                                            <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3" viewBox="0 0 20 20" fill="currentColor">
-                                                <path fillRule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clipRule="evenodd" />
-                                            </svg>
-                                            protected
-                                        </MonoTag>
-                                    ) : env.is_secret ? (
-                                        <MonoTag color="yellow">secret</MonoTag>
-                                    ) : (
-                                        <MonoTag color="gray">plain</MonoTag>
-                                    )}
-                                </MonoTd>
-                                {deploymentId && (
-                                    <MonoTd className="px-6 py-4 text-sm">
-                                        <EnvVarSourceTag source={env.source} environments={environments} />
-                                    </MonoTd>
-                                )}
-                                {showEnvColumn && (
-                                    <MonoTd className="px-6 py-4 text-sm text-gray-700 dark:text-gray-300">
-                                        {env.environment ? (
-                                            <span className="inline-flex items-center gap-2">
-                                                <EnvironmentColorDot color={environments.find(e => e.name === env.environment)?.color} />
-                                                {env.environment}
-                                            </span>
-                                        ) : '(global)'}
-                                    </MonoTd>
-                                )}
-                                {!deploymentId && (
-                                    <MonoTd className="px-6 py-4 text-sm">
-                                        <div className="flex gap-2">
-                                            <Button
-                                                variant="secondary"
-                                                size="sm"
-                                                onClick={() => handleEditClick(env)}
-                                            >
-                                                Edit
-                                            </Button>
-                                            <Button
-                                                variant="danger"
-                                                size="sm"
-                                                onClick={() => handleDeleteClick(env)}
-                                            >
-                                                Delete
-                                            </Button>
-                                        </div>
-                                    </MonoTd>
-                                )}
-                            </MonoTableRow>
-                        ))
-                        )}
-                    </MonoTableBody>
-                </MonoTable>
-            </MonoTableFrame>
-            {deploymentId ? (
-                <p className="mt-4 text-sm text-gray-600 dark:text-gray-500">
-                    <strong>Note:</strong> Environment variables are read-only snapshots taken at deployment time.
-                    Secret values are always masked for security.
-                </p>
-            ) : (
-                <p className="mt-4 text-sm text-gray-600 dark:text-gray-500">
-                    <strong>Note:</strong> Environment variables are snapshots at deployment time.
-                    Changes to project variables will only apply to new deployments, not existing ones.
-                    Secret values are always masked for security.
-                </p>
-            )}
+            <div className="r-section-head">
+                <RSearchInput
+                    value={search}
+                    onChange={setSearch}
+                    placeholder="Filter keys or values…"
+                    style={{ maxWidth: 320 }}
+                />
+                <Button variant="primary" icon="plus" onClick={() => handleAddClick()}>
+                    Add variable
+                </Button>
+            </div>
+
+            <RAlert tone="info" icon="lock">
+                Global variables apply to all environments. A variable redefined in a specific environment
+                <strong> overrides</strong> the global one for that env. Secrets are encrypted at rest.
+            </RAlert>
+
+            <div className="r-stack tight" style={{ marginTop: 16 }}>
+                {scopes.map((scope, i) => (
+                    <EnvVarScopeGroup
+                        key={scope.id || '__global__'}
+                        scope={scope}
+                        vars={envVars.filter(v => (v.environment || null) === scope.id && matchesSearch(v))}
+                        searching={!!search_q}
+                        defaultOpen={i < 2}
+                        environments={environments}
+                        renderTypeTag={(v) => <TypeTag envVar={v} />}
+                        renderValueCell={(v) => <ValueCell envVar={v} />}
+                        onAdd={() => handleAddClick(scope.id)}
+                        onEdit={handleEditClick}
+                        onDelete={handleDeleteClick}
+                    />
+                ))}
+            </div>
+            <p style={{ marginTop: 16, fontSize: 12.5, color: 'var(--text-muted)' }}>
+                Environment variables are snapshots at deployment time. Changes to project variables only
+                apply to new deployments, not existing ones. Secret values are always masked unless revealed.
+            </p>
 
             <Modal
                 isOpen={isModalOpen}
@@ -1464,6 +1577,7 @@ export function ExtensionsList({ projectName }) {
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
     const [isConfigModalOpen, setIsConfigModalOpen] = useState(false);
+    const [isAddModalOpen, setIsAddModalOpen] = useState(false);
     const [selectedExtension, setSelectedExtension] = useState(null);
     const [selectedExtensionData, setSelectedExtensionData] = useState(null);
     const [formData, setFormData] = useState({ spec: '{}' });
@@ -1592,122 +1706,139 @@ export function ExtensionsList({ projectName }) {
         return enabledExtensions.find(e => e.extension_type === extensionTypeName);
     };
 
-    if (loading) return <div className="text-center py-8"><div className="inline-block w-8 h-8 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin"></div></div>;
-    if (error) return <p className="text-red-600 dark:text-red-400">Error loading extensions: {error}</p>;
+    if (loading) return <LoadingState label="Loading extensions…" />;
+    if (error) return <ErrorState message={`Error loading extensions: ${error}`} onRetry={loadExtensions} />;
+
+    const sortedAvailable = [...availableExtensions].sort((a, b) => a.display_name.localeCompare(b.display_name));
+    const sortedEnabled = [...enabledExtensions].sort((a, b) => a.extension.localeCompare(b.extension));
 
     return (
-        <div className="space-y-6">
-            {/* Enabled Extensions - Table with Add Icons */}
-            <div>
-                <div className="flex items-center justify-between gap-3 mb-3">
-                    {availableExtensions.length > 0 && (
-                        <div className="flex items-center gap-2 ml-auto">
-                            {/* Plus icon indicator (non-clickable) */}
-                            <div className="w-8 h-8 flex items-center justify-center text-gray-600 dark:text-gray-500">
-                                <div className="w-5 h-5 svg-mask" style={{
-                                    maskImage: 'url(/assets/plus.svg)',
-                                    WebkitMaskImage: 'url(/assets/plus.svg)'
-                                }}></div>
-                            </div>
-                            {/* Extension add icons */}
-                            {availableExtensions
-                                .sort((a, b) => a.display_name.localeCompare(b.display_name))
-                                .map(extType => {
-                                    const iconUrl = getExtensionIcon(extType.extension_type);
-
-                                    return (
-                                        <button
-                                            key={extType.extension_type}
-                                            onClick={() => {
-                                                navigate(`/project/${projectName}/extensions/${extType.extension_type}/@new`);
-                                            }}
-                                            className="mono-extension-create-button w-8 h-8 flex items-center justify-center bg-gray-100 dark:bg-gray-800 hover:bg-gray-100 dark:hover:bg-gray-700 border border-gray-300 dark:border-gray-700 hover:border-indigo-500 transition-all"
-                                            title={`Add ${extType.display_name}`}
-                                        >
-                                            {iconUrl ? (
-                                                <img
-                                                    src={iconUrl}
-                                                    alt={extType.display_name}
-                                                    className="w-6 h-6 object-contain"
-                                                />
-                                            ) : (
-                                                <div className="w-6 h-6 flex items-center justify-center text-gray-600 dark:text-gray-400 text-xs font-bold">
-                                                    {extType.display_name.charAt(0).toUpperCase()}
-                                                </div>
-                                            )}
-                                        </button>
-                                    );
-                                })
-                            }
-                        </div>
-                    )}
+        <div>
+            <div className="r-section-head">
+                <div>
+                    <div className="r-section-title">Extensions</div>
+                    <div className="r-section-sub">Datastores and managed services connected to this project.</div>
                 </div>
-                {enabledExtensions.length === 0 ? (
-                    <div className="bg-white dark:bg-gray-900 rounded-lg border border-gray-200 dark:border-gray-800 px-6 py-8 text-center">
-                        <p className="text-gray-600 dark:text-gray-400 text-sm">
-                            No extensions enabled yet. Click an extension icon to add one.
-                        </p>
-                    </div>
-                ) : (
-                    <MonoTableFrame>
-                        <MonoTable>
-                            <MonoTableHead>
-                                <tr>
-                                    <MonoTh className="w-12 px-3 py-3"></MonoTh>
-                                    <MonoTh className="px-6 py-3 text-left">Extension</MonoTh>
-                                    <MonoTh className="px-6 py-3 text-left">Type</MonoTh>
-                                    <MonoTh className="px-6 py-3 text-left">Status</MonoTh>
-                                    <MonoTh className="px-6 py-3 text-left">Updated</MonoTh>
-                                </tr>
-                            </MonoTableHead>
-                            <MonoTableBody>
-                                {enabledExtensions
-                                    .sort((a, b) => a.extension.localeCompare(b.extension))
-                                    .map(ext => {
-                                        const extType = availableExtensions.find(t => t.extension_type === ext.extension_type);
-                                        const iconUrl = getExtensionIcon(ext.extension_type);
-
-                                        return (
-                                            <MonoTableRow
-                                                key={ext.extension}
-                                                interactive
-                                                className="transition-colors cursor-pointer"
-                                                onClick={() => {
-                                                    // Navigate to the specific extension instance
-                                                    navigate(`/project/${projectName}/extensions/${ext.extension_type}/${ext.extension}`);
-                                                }}
-                                            >
-                                                <MonoTd className="px-3 py-4">
-                                                    {iconUrl ? (
-                                                        <img
-                                                            src={iconUrl}
-                                                            alt={ext.extension}
-                                                            className="w-8 h-8 rounded object-contain"
-                                                        />
-                                                    ) : (
-                                                        <div className="w-8 h-8"></div>
-                                                    )}
-                                                </MonoTd>
-                                                <MonoTd className="px-6 py-4 text-sm">
-                                                    <span className="font-mono text-gray-900 dark:text-gray-200">{ext.extension}</span>
-                                                </MonoTd>
-                                                <MonoTd className="px-6 py-4 text-sm text-gray-700 dark:text-gray-300">
-                                                    {extType?.description || ext.extension_type}
-                                                </MonoTd>
-                                                <MonoTd className="px-6 py-4 text-sm">
-                                                    {renderExtensionStatusBadge(ext)}
-                                                </MonoTd>
-                                                <MonoTd className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                                                    {formatDate(ext.updated)}
-                                                </MonoTd>
-                                            </MonoTableRow>
-                                        );
-                                    })}
-                            </MonoTableBody>
-                        </MonoTable>
-                    </MonoTableFrame>
+                {availableExtensions.length > 0 && (
+                    <Button variant="primary" icon="plus" onClick={() => setIsAddModalOpen(true)}>
+                        Add extension
+                    </Button>
                 )}
             </div>
+
+            {enabledExtensions.length === 0 ? (
+                <RPanel>
+                    <REmpty title="No extensions enabled">
+                        <div style={{ color: 'var(--text-soft)', fontSize: 13 }}>
+                            {availableExtensions.length > 0
+                                ? 'Add an extension to connect a datastore or managed service.'
+                                : 'No extension types are available.'}
+                        </div>
+                    </REmpty>
+                </RPanel>
+            ) : (
+                <div className="r-grid-2">
+                    {sortedEnabled.map(ext => {
+                        const extType = availableExtensions.find(t => t.extension_type === ext.extension_type);
+                        const iconUrl = getExtensionIcon(ext.extension_type);
+                        const abbr = (ext.extension_type || '').replace(/[^a-zA-Z]/g, '').slice(0, 2).toUpperCase() || '?';
+
+                        return (
+                            <RPanel key={ext.extension}>
+                                <div
+                                    className="r-panel-head"
+                                    style={{ cursor: 'pointer' }}
+                                    onClick={() => navigate(`/project/${projectName}/extensions/${ext.extension_type}/${ext.extension}`)}
+                                >
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: 12, minWidth: 0 }}>
+                                        {iconUrl ? (
+                                            <img src={iconUrl} alt={ext.extension} style={{ width: 36, height: 36, borderRadius: 8, objectFit: 'contain' }} />
+                                        ) : (
+                                            <div style={{
+                                                width: 36, height: 36, borderRadius: 8, background: 'var(--accent)', color: '#fff',
+                                                display: 'grid', placeItems: 'center', fontWeight: 600, fontSize: 13,
+                                            }}>{abbr}</div>
+                                        )}
+                                        <div style={{ minWidth: 0 }}>
+                                            <div className="r-panel-title">{ext.extension}</div>
+                                            <div className="r-panel-sub mono">{extType?.display_name || ext.extension_type}</div>
+                                        </div>
+                                    </div>
+                                    {renderExtensionStatusBadge(ext)}
+                                </div>
+                                <div className="r-panel-body">
+                                    <RKV>
+                                        <RKVRow k="Type">
+                                            <span className="mono" style={{ fontSize: 12.5 }}>{ext.extension_type}</span>
+                                        </RKVRow>
+                                        <RKVRow k="Status">{ext.status_summary || '—'}</RKVRow>
+                                        <RKVRow k="Updated">{formatDate(ext.updated)}</RKVRow>
+                                    </RKV>
+                                    <div style={{ display: 'flex', gap: 6, marginTop: 14 }}>
+                                        <RButton
+                                            size="sm"
+                                            icon="arrow"
+                                            onClick={() => navigate(`/project/${projectName}/extensions/${ext.extension_type}/${ext.extension}`)}
+                                        >
+                                            Manage
+                                        </RButton>
+                                    </div>
+                                </div>
+                            </RPanel>
+                        );
+                    })}
+                </div>
+            )}
+
+            {/* Add extension picker */}
+            <Modal
+                isOpen={isAddModalOpen}
+                onClose={() => setIsAddModalOpen(false)}
+                title="Add Extension"
+            >
+                <ModalSection>
+                    <p className="text-sm text-gray-600 dark:text-gray-500">
+                        Choose an extension type to add to this project.
+                    </p>
+                    <div className="r-stack tight">
+                        {sortedAvailable.map(extType => {
+                            const iconUrl = getExtensionIcon(extType.extension_type);
+                            const abbr = (extType.extension_type || '').replace(/[^a-zA-Z]/g, '').slice(0, 2).toUpperCase() || '?';
+                            return (
+                                <button
+                                    key={extType.extension_type}
+                                    type="button"
+                                    className="r-panel"
+                                    style={{
+                                        display: 'flex', alignItems: 'center', gap: 12, padding: 12,
+                                        textAlign: 'left', cursor: 'pointer', background: 'var(--surface)',
+                                        font: 'inherit', color: 'inherit', width: '100%',
+                                    }}
+                                    onClick={() => {
+                                        setIsAddModalOpen(false);
+                                        navigate(`/project/${projectName}/extensions/${extType.extension_type}/@new`);
+                                    }}
+                                >
+                                    {iconUrl ? (
+                                        <img src={iconUrl} alt={extType.display_name} style={{ width: 32, height: 32, borderRadius: 6, objectFit: 'contain' }} />
+                                    ) : (
+                                        <div style={{
+                                            width: 32, height: 32, borderRadius: 6, background: 'var(--accent)', color: '#fff',
+                                            display: 'grid', placeItems: 'center', fontWeight: 600, fontSize: 12,
+                                        }}>{abbr}</div>
+                                    )}
+                                    <div style={{ minWidth: 0 }}>
+                                        <div style={{ fontSize: 13.5, fontWeight: 500 }}>{extType.display_name}</div>
+                                        {extType.description && (
+                                            <div style={{ fontSize: 12, color: 'var(--text-soft)' }}>{extType.description}</div>
+                                        )}
+                                    </div>
+                                </button>
+                            );
+                        })}
+                    </div>
+                </ModalSection>
+            </Modal>
 
             {/* Configuration Modal */}
             <Modal
