@@ -4,9 +4,9 @@ import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
 import { copyToClipboard, formatDate, formatISO8601, formatRelativeTimeRounded, formatTimeRemaining } from '../lib/utils';
 import { useToast } from '../components/toast';
-import { Button, ConfirmDialog, ENV_COLOR_STYLES, EnvironmentColorDot, SourceLinkGroup, SourceLinkGroupAction, StatusBadge } from '../components/ui';
+import { Button, ENV_COLOR_STYLES, EnvironmentColorDot, SourceLinkGroup, SourceLinkGroupAction, StatusBadge } from '../components/ui';
 import { MonoSortButton, MonoTable, MonoTableBody, MonoTableEmptyRow, MonoTableFrame, MonoTableHead, MonoTableRow, MonoTd, MonoTh } from '../components/table';
-import { Button as RButton, Combobox, Empty, KV, KVRow, Modal, Panel, PanelBody, PanelHead, Pill, SearchInput, Segmented, Status, Tabs } from '../components/r-ui';
+import { Button as RButton, Combobox, ConfirmDialog, Empty, KV, KVRow, Modal, Panel, PanelBody, PanelHead, Pill, SearchInput, Segmented, Status, Tabs } from '../components/r-ui';
 import { Icon } from '../components/icon';
 import { EnvVarsList } from './resources';
 import { EmptyState, ErrorState, LoadingState } from '../components/states';
@@ -265,7 +265,7 @@ export function ActiveDeploymentsSummary({ projectName }) {
                 title="Stop Deployment"
                 message={`Are you sure you want to stop deployment ${deploymentToStop?.deployment_id}? Impact: traffic for group "${deploymentToStop?.deployment_group || 'default'}" may terminate.`}
                 confirmText="Stop Deployment"
-                variant="danger"
+                confirmTone="danger"
                 loading={stopping}
             />
         </>
@@ -604,7 +604,7 @@ export function DeploymentsList({ projectName }) {
                 title="Stop Deployment"
                 message={`Are you sure you want to stop deployment ${deploymentToStop?.deployment_id}? Impact: traffic for group "${deploymentToStop?.deployment_group || 'default'}" may terminate.`}
                 confirmText="Stop Deployment"
-                variant="danger"
+                confirmTone="danger"
                 loading={stopping}
             />
 
@@ -1817,7 +1817,7 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                 title="Stop Deployment"
                 message={`Are you sure you want to stop deployment ${deploymentId}? Impact: traffic for group "${deployment?.deployment_group || 'default'}" may terminate.`}
                 confirmText="Stop Deployment"
-                variant="danger"
+                confirmTone="danger"
                 loading={stopping}
             />
         </section>

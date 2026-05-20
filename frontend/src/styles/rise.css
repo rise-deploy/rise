@@ -413,6 +413,7 @@ a { color: inherit; }
 .r-btn.danger { background: var(--err); color: #fff; border-color: transparent; }
 .r-btn.danger:hover { background: var(--err); filter: brightness(1.07); }
 .r-btn:disabled, .r-btn[aria-disabled="true"] { opacity: 0.5; cursor: not-allowed; }
+.r-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 /* ---------- Inputs ---------- *
    All form fields share a single visual style: same border, padding, focus

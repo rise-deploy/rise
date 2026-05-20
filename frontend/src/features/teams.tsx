@@ -4,11 +4,11 @@ import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
 import { formatDate } from '../lib/utils';
 import { useToast } from '../components/toast';
-import { AutocompleteInput, Button, ConfirmDialog } from '../components/ui';
+import { AutocompleteInput, Button } from '../components/ui';
 import { ProjectTable } from '../components/project-table';
 import { EmptyState, ErrorState, LoadingState } from '../components/states';
 import { useRowKeyboardNavigation, useSortableData } from '../lib/table';
-import { Alert, Panel, PanelBody, PanelHead, Button as RButton, Empty, Field as RField, Input as RInput, Modal as RModal, Pill, colorFor } from '../components/r-ui';
+import { Alert, ConfirmDialog as RConfirmDialog, Panel, PanelBody, PanelHead, Button as RButton, Empty, Field as RField, Input as RInput, Modal as RModal, Pill, colorFor } from '../components/r-ui';
 import { AddMenu, RosterTable } from '../components/roster-table';
 
 
@@ -595,16 +595,15 @@ export function TeamDetail({ teamName, currentUser }) {
                 </RField>
             </RModal>
 
-            <ConfirmDialog
+            <RConfirmDialog
                 isOpen={deleteDialogOpen}
                 onClose={() => setDeleteDialogOpen(false)}
                 onConfirm={handleDeleteTeam}
                 title="Delete Team"
                 message={`Delete team "${team.name}"? Impact: projects owned by this team may lose expected ownership workflows.`}
                 confirmText="Delete Team"
-                variant="danger"
-                requireConfirmation={true}
-                confirmationText={team.name}
+                confirmTone="danger"
+                requireText={team.name}
                 loading={deleting}
             />
         </section>

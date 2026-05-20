@@ -5,7 +5,7 @@ import { CONFIG } from '../lib/config';
 import { navigate } from '../lib/navigation';
 import { formatDate, formatRelativeTimeRounded } from '../lib/utils';
 import { useToast } from '../components/toast';
-import { Button, ConfirmDialog, EnvironmentColorDot, EnvironmentColorPicker, ModalTabs, MonoTabButton, MonoTag } from '../components/ui';
+import { Button, EnvironmentColorDot, EnvironmentColorPicker, ModalTabs, MonoTabButton, MonoTag } from '../components/ui';
 import {
     Alert as RAlert,
     Button as RButton,
@@ -678,7 +678,7 @@ export function EnvironmentsList({ projectName, platformConstraints = null }) {
                 )}
             </RModal>
 
-            <ConfirmDialog
+            <RConfirmDialog
                 isOpen={confirmDialogOpen}
                 onClose={() => {
                     setConfirmDialogOpen(false);
@@ -688,7 +688,7 @@ export function EnvironmentsList({ projectName, platformConstraints = null }) {
                 title="Delete Environment"
                 message={`Are you sure you want to delete the environment "${envToDelete?.name}"? This action cannot be undone.`}
                 confirmText="Delete Environment"
-                variant="danger"
+                confirmTone="danger"
                 loading={deleting}
             />
         </div>
@@ -932,7 +932,7 @@ export function DomainsList({ projectName, defaultUrl = null }) {
                 </p>
             </RModal>
 
-            <ConfirmDialog
+            <RConfirmDialog
                 isOpen={confirmDialogOpen}
                 onClose={() => {
                     setConfirmDialogOpen(false);
@@ -942,7 +942,7 @@ export function DomainsList({ projectName, defaultUrl = null }) {
                 title="Delete Custom Domain"
                 message={`Are you sure you want to delete the custom domain "${domainToDelete?.domain}"? This action cannot be undone.`}
                 confirmText="Delete Domain"
-                variant="danger"
+                confirmTone="danger"
                 loading={deleting}
             />
         </div>
@@ -1473,7 +1473,7 @@ export function EnvVarsList({ projectName, deploymentId }) {
                 </RField>
             </RModal>
 
-            <ConfirmDialog
+            <RConfirmDialog
                 isOpen={confirmDialogOpen}
                 onClose={() => {
                     setConfirmDialogOpen(false);
@@ -1483,7 +1483,7 @@ export function EnvVarsList({ projectName, deploymentId }) {
                 title="Delete Environment Variable"
                 message={`Are you sure you want to delete the environment variable "${envVarToDelete?.key}"? This action cannot be undone.`}
                 confirmText="Delete Variable"
-                variant="danger"
+                confirmTone="danger"
                 loading={deleting}
             />
         </div>
