@@ -5,6 +5,7 @@ import { navigate } from '../lib/navigation';
 import { copyToClipboard, formatISO8601, formatRelativeTimeRounded, isSafeUrl } from '../lib/utils';
 import { useToast } from '../components/toast';
 import { AutocompleteInput, Button, ConfirmDialog, FormField, Modal, ModalActions, ModalSection, MonoNotice, SegmentedRadioGroup } from '../components/ui';
+import { Button as RButton, Combobox as RCombobox, Empty, Input as RInput, Panel, Pill, Segmented } from '../components/r-ui';
 import { ProjectTable } from '../components/project-table';
 import { ActiveDeploymentsSummary, DeploymentDetail, DeploymentsList } from './deployments';
 import { DomainsList, EnvironmentsList, EnvVarsList, ExtensionDetailPage, ExtensionsList, ServiceAccountsList } from './resources';
@@ -1018,166 +1019,136 @@ export function AppUsersList({ projectName, project, accessClasses, currentUserE
         }
     };
 
+    const accessClassDescription = accessClasses.find(ac => ac.id === project?.access_class)?.description;
+
     return (
-        <div>
-            <div className="mb-6 flex items-center gap-3">
-                <SegmentedRadioGroup
-                    label="Access Class"
-                    name="access-class"
-                    value={project?.access_class}
-                    onChange={handleChangeAccessClass}
-                    options={accessClasses.map(ac => ({ value: ac.id, label: ac.display_name }))}
-                />
-                {accessClasses.find(ac => ac.id === project?.access_class)?.description && (
-                    <span className="text-sm text-gray-400 self-end mb-1">
-                        {accessClasses.find(ac => ac.id === project?.access_class).description}
-                    </span>
+        <div className="r-stack">
+            <div className="r-section-head">
+                <div>
+                    <div className="r-section-title">Access class</div>
+                    <div className="r-section-sub">
+                        {accessClassDescription || 'Controls who can reach this project.'}
+                    </div>
+                </div>
+                {accessClasses.length > 0 && project?.access_class && (
+                    <Segmented
+                        value={project.access_class}
+                        options={accessClasses.map(ac => ({ value: ac.id, label: ac.display_name }))}
+                        onChange={handleChangeAccessClass}
+                    />
                 )}
             </div>
-            <p className="text-sm text-gray-500 mb-4">
+
+            <p style={{ fontSize: 12.5, color: 'var(--text-muted)', margin: 0 }}>
                 The project owner always has access and is shown as a fixed entry.
             </p>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                <div>
-                    <div className="flex justify-between items-center mb-4">
-                        <h4 className="text-lg font-bold">Users ({displayedUsers.length})</h4>
+            <div className="r-grid-2-1" style={{ gridTemplateColumns: 'repeat(2, 1fr)' }}>
+                <Panel>
+                    <div className="r-panel-head">
+                        <div className="r-section-head" style={{ marginBottom: 0, flex: 1 }}>
+                            <div className="r-section-title">Users</div>
+                            <Pill>{displayedUsers.length}</Pill>
+                        </div>
                     </div>
                     {displayedUsers.length > 0 ? (
-                        <MonoTableFrame className="mb-4">
-                            <MonoTable>
-                                <MonoTableHead>
-                                    <tr>
-                                        <MonoTh className="px-6 py-3 text-left">Email</MonoTh>
-                                        <MonoTh className="px-6 py-3 text-right">Actions</MonoTh>
+                        <table className="r-table">
+                            <thead>
+                                <tr>
+                                    <th>Email</th>
+                                    <th style={{ textAlign: 'right' }}>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {displayedUsers.map(user => (
+                                    <tr key={user.id}>
+                                        <td>
+                                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                                                <span>{user.email}</span>
+                                                {user.isOwnerFixed && <Pill>Owner</Pill>}
+                                            </span>
+                                        </td>
+                                        <td style={{ textAlign: 'right' }}>
+                                            {user.isOwnerFixed ? (
+                                                <span style={{ fontSize: 12, color: 'var(--text-soft)' }}>Always has access</span>
+                                            ) : (
+                                                <RButton variant="danger" size="sm" onClick={() => handleRemoveUser(user.email)}>
+                                                    Remove
+                                                </RButton>
+                                            )}
+                                        </td>
                                     </tr>
-                                </MonoTableHead>
-                                <MonoTableBody>
-                                    {displayedUsers.map(user => (
-                                        <MonoTableRow key={user.id} interactive className="transition-colors">
-                                            <MonoTd className="px-6 py-4 text-sm text-gray-900 dark:text-gray-200">
-                                                <span className="inline-flex items-center gap-2">
-                                                    <span>{user.email}</span>
-                                                    {user.isOwnerFixed && (
-                                                        <span className="px-2 py-0.5 rounded text-xs border border-gray-300 dark:border-gray-700 text-gray-600 dark:text-gray-300">
-                                                            Owner
-                                                        </span>
-                                                    )}
-                                                </span>
-                                            </MonoTd>
-                                            <MonoTd className="px-6 py-4">
-                                                <div className="flex justify-end">
-                                                    {user.isOwnerFixed ? (
-                                                        <span className="text-xs text-gray-500">Always has access</span>
-                                                    ) : (
-                                                        <Button
-                                                            variant="danger"
-                                                            size="sm"
-                                                            onClick={() => handleRemoveUser(user.email)}
-                                                        >
-                                                            Remove
-                                                        </Button>
-                                                    )}
-                                                </div>
-                                            </MonoTd>
-                                        </MonoTableRow>
-                                    ))}
-                                </MonoTableBody>
-                            </MonoTable>
-                        </MonoTableFrame>
+                                ))}
+                            </tbody>
+                        </table>
                     ) : (
-                        <p className="text-gray-600 dark:text-gray-400 mb-4">No users</p>
+                        <div className="r-panel-body"><Empty title="No users" /></div>
                     )}
-                    <div className="flex justify-end">
-                        <div className="flex gap-2">
-                            <AutocompleteInput
-                                type="email"
-                                value={newUserEmail}
-                                onChange={setNewUserEmail}
-                                options={currentUserEmail ? [currentUserEmail] : []}
-                                placeholder="user@example.com"
-                                className="w-64"
-                                onEnter={handleAddUser}
-                            />
-                            <Button variant="primary" size="sm" onClick={handleAddUser}>
-                                Add
-                            </Button>
-                        </div>
+                    <div className="r-panel-body" style={{ display: 'flex', gap: 8 }}>
+                        <RInput
+                            type="email"
+                            value={newUserEmail}
+                            onChange={(e) => setNewUserEmail(e.target.value)}
+                            onKeyDown={(e) => { if (e.key === 'Enter') handleAddUser(); }}
+                            placeholder="user@example.com"
+                            style={{ flex: 1 }}
+                        />
+                        <RButton variant="primary" onClick={handleAddUser}>Add</RButton>
                     </div>
-                </div>
+                </Panel>
 
-                <div>
-                    <div className="flex justify-between items-center mb-4">
-                        <h4 className="text-lg font-bold">Teams ({displayedTeams.length})</h4>
+                <Panel>
+                    <div className="r-panel-head">
+                        <div className="r-section-head" style={{ marginBottom: 0, flex: 1 }}>
+                            <div className="r-section-title">Teams</div>
+                            <Pill>{displayedTeams.length}</Pill>
+                        </div>
                     </div>
                     {displayedTeams.length > 0 ? (
-                        <MonoTableFrame className="mb-4">
-                            <MonoTable>
-                                <MonoTableHead>
-                                    <tr>
-                                        <MonoTh className="px-6 py-3 text-left">Name</MonoTh>
-                                        <MonoTh className="px-6 py-3 text-right">Actions</MonoTh>
+                        <table className="r-table">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th style={{ textAlign: 'right' }}>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {displayedTeams.map(team => (
+                                    <tr key={team.id}>
+                                        <td>
+                                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                                                <a className="r-link" onClick={() => navigate(`/team/${team.name}`)}>{team.name}</a>
+                                                {team.isOwnerFixed && <Pill>Owner</Pill>}
+                                            </span>
+                                        </td>
+                                        <td style={{ textAlign: 'right' }}>
+                                            {team.isOwnerFixed ? (
+                                                <span style={{ fontSize: 12, color: 'var(--text-soft)' }}>Always has access</span>
+                                            ) : (
+                                                <RButton variant="danger" size="sm" onClick={() => handleRemoveTeam(team.id, team.name)}>
+                                                    Remove
+                                                </RButton>
+                                            )}
+                                        </td>
                                     </tr>
-                                </MonoTableHead>
-                                <MonoTableBody>
-                                    {displayedTeams.map(team => (
-                                        <MonoTableRow key={team.id} interactive className="transition-colors">
-                                            <MonoTd className="px-6 py-4 text-sm">
-                                                <span className="inline-flex items-center gap-2">
-                                                    <button
-                                                        type="button"
-                                                        className="text-gray-900 dark:text-gray-200 underline"
-                                                        onClick={() => navigate(`/team/${team.name}`)}
-                                                    >
-                                                        {team.name}
-                                                    </button>
-                                                    {team.isOwnerFixed && (
-                                                        <span className="px-2 py-0.5 rounded text-xs border border-gray-300 dark:border-gray-700 text-gray-600 dark:text-gray-300">
-                                                            Owner
-                                                        </span>
-                                                    )}
-                                                </span>
-                                            </MonoTd>
-                                            <MonoTd className="px-6 py-4">
-                                                <div className="flex justify-end">
-                                                    {team.isOwnerFixed ? (
-                                                        <span className="text-xs text-gray-500">Always has access</span>
-                                                    ) : (
-                                                        <Button
-                                                            variant="danger"
-                                                            size="sm"
-                                                            onClick={() => handleRemoveTeam(team.id, team.name)}
-                                                        >
-                                                            Remove
-                                                        </Button>
-                                                    )}
-                                                </div>
-                                            </MonoTd>
-                                        </MonoTableRow>
-                                    ))}
-                                </MonoTableBody>
-                            </MonoTable>
-                        </MonoTableFrame>
+                                ))}
+                            </tbody>
+                        </table>
                     ) : (
-                        <p className="text-gray-600 dark:text-gray-400 mb-4">No teams</p>
+                        <div className="r-panel-body"><Empty title="No teams" /></div>
                     )}
-                    <div className="flex justify-end">
-                        <div className="flex gap-2 items-center">
-                            <div className="w-64">
-                                <Combobox
-                                    value={selectedTeamId}
-                                    onChange={setSelectedTeamId}
-                                    options={teams.map(t => ({ value: t.id, label: t.name }))}
-                                    placeholder="Search teams..."
-                                    loading={teams.length === 0}
-                                />
-                            </div>
-                            <Button variant="primary" size="sm" onClick={handleAddTeam} disabled={teams.length === 0}>
-                                Add
-                            </Button>
+                    <div className="r-panel-body" style={{ display: 'flex', gap: 8 }}>
+                        <div style={{ flex: 1 }}>
+                            <RCombobox
+                                value={selectedTeamId}
+                                onChange={setSelectedTeamId}
+                                options={teams.map(t => ({ value: t.id, label: t.name }))}
+                                placeholder="Search teams…"
+                            />
                         </div>
+                        <RButton variant="primary" onClick={handleAddTeam} disabled={teams.length === 0}>Add</RButton>
                     </div>
-                </div>
+                </Panel>
             </div>
         </div>
     );

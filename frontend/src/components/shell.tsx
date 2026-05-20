@@ -3,6 +3,7 @@ import { Icon } from './icon';
 import { Avatar, cx, colorFor } from './r-ui';
 import { navigate } from '../lib/navigation';
 import { usePrefs } from '../lib/prefs';
+import { api } from '../lib/api';
 
 interface NavItem { id: string; label: string; icon: string; href: string; matches: (route: string) => boolean }
 
@@ -40,24 +41,58 @@ export function Shell({ route, breadcrumbs, user, onLogout, onOpenPalette, child
 function Sidebar({ route, user, onLogout, onToggleTheme, theme }: { route: string; user: ShellProps['user']; onLogout: () => void; onToggleTheme: () => void; theme: 'light' | 'dark' }) {
     const userEmail = user?.email || '';
     const userColor = colorFor(userEmail || 'user');
+    const [navCounts, setNavCounts] = useState<{ projects?: number; teams?: number }>({});
+
+    // Fetch nav badge counts (projects / teams). Best-effort; failures are ignored.
+    useEffect(() => {
+        let cancelled = false;
+        api.getProjects()
+            .then((p: any[]) => { if (!cancelled) setNavCounts(c => ({ ...c, projects: Array.isArray(p) ? p.length : undefined })); })
+            .catch(() => {});
+        api.getTeams()
+            .then((t: any[]) => { if (!cancelled) setNavCounts(c => ({ ...c, teams: Array.isArray(t) ? t.length : undefined })); })
+            .catch(() => {});
+        return () => { cancelled = true; };
+    }, []);
+
+    const countFor = (id: string): number | undefined => {
+        if (id === 'projects') return navCounts.projects;
+        if (id === 'teams') return navCounts.teams;
+        return undefined;
+    };
+
     return (
         <aside className="r-side">
             <div className="r-brand" onClick={() => navigate('/home')} style={{ cursor: 'pointer' }}>
                 <div className="r-brand-mark">R</div>
                 <div className="r-brand-name">Rise</div>
             </div>
+            {/*
+              Non-functional placeholder for future multi-tenancy / workspace
+              switching. Renders a static workspace label only — there is no
+              dropdown or menu behaviour yet.
+            */}
+            <div className="r-org" role="presentation">
+                <span className="r-org-avatar">W</span>
+                <span className="r-org-name">Workspace</span>
+                <Icon name="chevd" size={14} />
+            </div>
             <nav className="r-nav">
-                {PRIMARY.map(item => (
-                    <button
-                        key={item.id}
-                        className={cx(item.matches(route) && 'active')}
-                        onClick={() => navigate(item.href)}
-                        type="button"
-                    >
-                        <Icon name={item.icon} className="ico" />
-                        {item.label}
-                    </button>
-                ))}
+                {PRIMARY.map(item => {
+                    const count = countFor(item.id);
+                    return (
+                        <button
+                            key={item.id}
+                            className={cx(item.matches(route) && 'active')}
+                            onClick={() => navigate(item.href)}
+                            type="button"
+                        >
+                            <Icon name={item.icon} className="ico" />
+                            {item.label}
+                            {count !== undefined && <span className="badge">{count}</span>}
+                        </button>
+                    );
+                })}
             </nav>
             <div className="r-side-footer">
                 <a className="r-theme-btn" href="/docs/" style={{ textDecoration: 'none' }}>

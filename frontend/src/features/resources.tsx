@@ -3,7 +3,7 @@ import { createElement, lazy, Suspense, useCallback, useEffect, useMemo, useRef,
 import { api } from '../lib/api';
 import { CONFIG } from '../lib/config';
 import { navigate } from '../lib/navigation';
-import { formatDate } from '../lib/utils';
+import { formatDate, formatRelativeTimeRounded } from '../lib/utils';
 import { useToast } from '../components/toast';
 import { Button, ConfirmDialog, EnvironmentColorDot, EnvironmentColorPicker, EnvironmentCombobox, EnvironmentDropdown, FormField, Modal, ModalActions, ModalSection, ModalTabs, MonoTabButton, MonoTag, SegmentedRadioGroup } from '../components/ui';
 import {
@@ -21,6 +21,7 @@ import {
     PanelHead as RPanelHead,
     Pill as RPill,
     SearchInput as RSearchInput,
+    Segmented as RSegmented,
     Status as RStatus,
     Tabs as RTabs,
 } from '../components/r-ui';
@@ -177,9 +178,26 @@ function sortObjectKeys(obj) {
         }, {});
 }
 
-// Single environment card: collapsible GroupBar header + detail body.
-function EnvironmentCard({ env, projectName, constraintSummary, onEdit, onDelete }) {
-    const [open, setOpen] = useState(false);
+// Format an elapsed duration between two ISO timestamps as a compact string.
+function formatDuration(start, end) {
+    if (!start || !end) return null;
+    const ms = new Date(end).getTime() - new Date(start).getTime();
+    if (!isFinite(ms) || ms < 0) return null;
+    const secs = Math.round(ms / 1000);
+    if (secs < 60) return `${secs}s`;
+    const mins = Math.floor(secs / 60);
+    const remSecs = secs % 60;
+    if (mins < 60) return remSecs ? `${mins}m ${remSecs}s` : `${mins}m`;
+    const hrs = Math.floor(mins / 60);
+    const remMins = mins % 60;
+    return remMins ? `${hrs}h ${remMins}m` : `${hrs}h`;
+}
+
+// Collapsible deployment-group card: GroupBar header + deployment history table.
+function DeploymentGroupCard({ groupName, deployments, projectName, defaultOpen }) {
+    const [open, setOpen] = useState(defaultOpen);
+    const active = deployments.find(d => d.is_active);
+    const replicas = active?.replicas;
     return (
         <RPanel>
             <RGroupBar
@@ -187,49 +205,73 @@ function EnvironmentCard({ env, projectName, constraintSummary, onEdit, onDelete
                 onToggle={() => setOpen(o => !o)}
                 right={
                     <>
-                        {constraintSummary && (
-                            <span style={{ fontSize: 11.5, color: 'var(--text-soft)' }}>{constraintSummary}</span>
+                        {active && <RStatus status={active.status || 'Unknown'} />}
+                        {replicas != null && (
+                            <span style={{ fontSize: 11.5, color: 'var(--text-soft)' }}>
+                                {replicas} replica{replicas === 1 ? '' : 's'}
+                            </span>
                         )}
-                        <RButton
-                            size="sm"
-                            icon="arrow"
-                            onClick={(e) => { e.stopPropagation(); navigate(`/project/${projectName}/environment/${env.name}`); }}
-                        >
-                            Open
-                        </RButton>
                     </>
                 }
             >
-                <EnvironmentColorDot color={env.color} />
-                <strong>{env.name}</strong>
-                {env.is_production && <span className="r-pill env-prod">production</span>}
+                <strong>{groupName}</strong>
+                <span style={{ fontSize: 11.5, color: 'var(--text-soft)' }}>
+                    · {deployments.length} deployment{deployments.length === 1 ? '' : 's'}
+                </span>
             </RGroupBar>
             {open && (
-                <div className="r-panel-body">
-                    <RKV>
-                        <RKVRow k="Primary group">
-                            {env.primary_deployment_group
-                                ? <span className="mono">{env.primary_deployment_group}</span>
-                                : <span style={{ color: 'var(--text-soft)' }}>—</span>}
-                        </RKVRow>
-                        <RKVRow k="Resources">
-                            {constraintSummary || <span style={{ color: 'var(--text-soft)' }}>platform defaults</span>}
-                        </RKVRow>
-                        <RKVRow k="Created">{formatDate(env.created_at)}</RKVRow>
-                    </RKV>
-                    <div style={{ display: 'flex', gap: 8, marginTop: 16 }}>
-                        <RButton size="sm" icon="edit" onClick={(e) => { e.stopPropagation(); onEdit(); }}>Edit</RButton>
-                        <RButton
-                            size="sm"
-                            variant="danger"
-                            icon="trash"
-                            onClick={(e) => { e.stopPropagation(); onDelete(); }}
-                            disabled={env.is_production}
-                        >
-                            Delete
-                        </RButton>
+                deployments.length === 0 ? (
+                    <div style={{ padding: 28, textAlign: 'center', color: 'var(--text-soft)', fontSize: 13 }}>
+                        No deployments in this group.
                     </div>
-                </div>
+                ) : (
+                    <table className="r-table r-table-fixed">
+                        <colgroup>
+                            <col style={{ width: 220 }} />
+                            <col style={{ width: 130 }} />
+                            <col />
+                            <col style={{ width: 120 }} />
+                            <col style={{ width: 110 }} />
+                        </colgroup>
+                        <thead>
+                            <tr>
+                                <th>ID</th><th>Status</th><th>Author</th><th>Duration</th>
+                                <th style={{ textAlign: 'right' }}>Age</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {deployments.map(d => {
+                                const duration = formatDuration(d.created, d.completed_at);
+                                return (
+                                    <tr
+                                        key={d.deployment_id}
+                                        className="click"
+                                        onClick={() => navigate(`/deployment/${projectName}/${d.deployment_id}`)}
+                                    >
+                                        <td className="mono" style={{ fontSize: 12.25 }}>
+                                            {d.deployment_id}
+                                            {d.is_active && (
+                                                <span style={{
+                                                    marginLeft: 8, fontSize: 10.5, padding: '1px 6px',
+                                                    background: 'var(--accent-soft)', color: 'var(--accent)',
+                                                    borderRadius: 4, fontFamily: 'Inter',
+                                                }}>CURRENT</span>
+                                            )}
+                                        </td>
+                                        <td><RStatus status={d.status || 'Unknown'} /></td>
+                                        <td>{d.created_by_email || <span style={{ color: 'var(--text-soft)' }}>—</span>}</td>
+                                        <td className="mono" style={{ fontSize: 12.25 }}>
+                                            {duration || <span style={{ color: 'var(--text-soft)' }}>—</span>}
+                                        </td>
+                                        <td style={{ textAlign: 'right', color: 'var(--text-muted)' }}>
+                                            {d.created ? formatRelativeTimeRounded(d.created) : '—'}
+                                        </td>
+                                    </tr>
+                                );
+                            })}
+                        </tbody>
+                    </table>
+                )
             )}
         </RPanel>
     );
@@ -251,12 +293,18 @@ export function EnvironmentsList({ projectName, platformConstraints = null }) {
     const [deleting, setDeleting] = useState(false);
     const [saving, setSaving] = useState(false);
     const [currentUser, setCurrentUser] = useState(null);
+    const [deployments, setDeployments] = useState([]);
+    const [envFilter, setEnvFilter] = useState('all');
     const { showToast } = useToast();
 
     const loadEnvironments = useCallback(async () => {
         try {
-            const data = await api.getProjectEnvironments(projectName);
-            setEnvironments(data || []);
+            const [envData, deployData] = await Promise.all([
+                api.getProjectEnvironments(projectName),
+                api.getProjectDeployments(projectName, { limit: 100 }).catch(() => []),
+            ]);
+            setEnvironments(envData || []);
+            setDeployments(deployData || []);
             setLoading(false);
         } catch (err) {
             setError(err.message);
@@ -376,22 +424,29 @@ export function EnvironmentsList({ projectName, platformConstraints = null }) {
     if (loading) return <LoadingState label="Loading environments…" />;
     if (error) return <ErrorState message={`Error loading environments: ${error}`} onRetry={loadEnvironments} />;
 
-    const envConstraintSummary = (env) => {
-        const c = env.deployment_constraints;
-        if (!c) return null;
-        const parts = [];
-        if (c.min_replicas != null && c.max_replicas != null) parts.push(`${c.min_replicas}–${c.max_replicas} replicas`);
-        if (c.min_cpu && c.max_cpu) parts.push(`${c.min_cpu}–${c.max_cpu} cpu`);
-        if (c.min_memory && c.max_memory) parts.push(`${c.min_memory}–${c.max_memory} mem`);
-        return parts.length ? parts.join(' · ') : null;
+    // Build the env → deployment-group → deployments hierarchy client-side.
+    const deploymentsForEnv = (envName) => deployments.filter(d => d.environment === envName);
+    const groupsForEnv = (env) => {
+        const envDeployments = deploymentsForEnv(env.name);
+        const groupNames = Array.from(new Set(envDeployments.map(d => d.deployment_group || 'default')));
+        // Surface the env's primary group even if it has no deployments yet.
+        if (env.primary_deployment_group && !groupNames.includes(env.primary_deployment_group)) {
+            groupNames.unshift(env.primary_deployment_group);
+        }
+        return groupNames.map(name => ({
+            name,
+            deployments: envDeployments.filter(d => (d.deployment_group || 'default') === name),
+        }));
     };
+
+    const visibleEnvs = environments.filter(env => envFilter === 'all' || env.name === envFilter);
 
     return (
         <div>
             <div className="r-section-head">
                 <div>
                     <div className="r-section-title">Environments</div>
-                    <div className="r-section-sub">Deployment targets and their resource constraints for this project.</div>
+                    <div className="r-section-sub">Deployment targets and their deployment groups for this project.</div>
                 </div>
                 <Button variant="primary" icon="plus" onClick={handleAddClick}>
                     New environment
@@ -407,17 +462,70 @@ export function EnvironmentsList({ projectName, platformConstraints = null }) {
                     </REmpty>
                 </RPanel>
             ) : (
-                <div className="r-stack tight">
-                    {environments.map(env => (
-                        <EnvironmentCard
-                            key={env.name}
-                            env={env}
-                            projectName={projectName}
-                            constraintSummary={envConstraintSummary(env)}
-                            onEdit={() => handleEditClick(env)}
-                            onDelete={() => handleDeleteClick(env)}
+                <div className="r-stack">
+                    {environments.length > 1 && (
+                        <RSegmented
+                            value={envFilter}
+                            options={[
+                                { value: 'all', label: 'All' },
+                                ...environments.map(env => ({ value: env.name, label: env.name })),
+                            ]}
+                            onChange={setEnvFilter}
                         />
-                    ))}
+                    )}
+                    {visibleEnvs.map(env => {
+                        const groups = groupsForEnv(env);
+                        const deployCount = deploymentsForEnv(env.name).length;
+                        return (
+                            <div key={env.name} className="r-stack tight">
+                                <div className="r-section-head" style={{ marginBottom: 0 }}>
+                                    <div>
+                                        <div className="r-section-title" style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                                            <span className={`r-pill ${env.is_production ? 'env-prod' : 'env-staging'}`}>
+                                                <EnvironmentColorDot color={env.color} />
+                                                {env.name}
+                                            </span>
+                                            {env.is_production && (
+                                                <span style={{ fontSize: 11.5, color: 'var(--text-soft)' }}>production</span>
+                                            )}
+                                        </div>
+                                        <div className="r-section-sub">
+                                            {groups.length} group{groups.length === 1 ? '' : 's'} · {deployCount} deployment{deployCount === 1 ? '' : 's'}
+                                        </div>
+                                    </div>
+                                    <div style={{ display: 'flex', gap: 6 }}>
+                                        <RButton size="sm" icon="edit" onClick={() => handleEditClick(env)}>Edit</RButton>
+                                        <RButton
+                                            size="sm"
+                                            variant="danger"
+                                            icon="trash"
+                                            onClick={() => handleDeleteClick(env)}
+                                            disabled={env.is_production}
+                                        >
+                                            Delete
+                                        </RButton>
+                                    </div>
+                                </div>
+                                {groups.length === 0 ? (
+                                    <RPanel>
+                                        <div style={{ padding: 24, textAlign: 'center', color: 'var(--text-soft)', fontSize: 13 }}>
+                                            No deployment groups in this environment.
+                                        </div>
+                                    </RPanel>
+                                ) : (
+                                    groups.map((g, i) => (
+                                        <DeploymentGroupCard
+                                            key={g.name}
+                                            groupName={g.name}
+                                            deployments={g.deployments}
+                                            projectName={projectName}
+                                            defaultOpen={i === 0 || g.name === env.primary_deployment_group}
+                                        />
+                                    ))
+                                )}
+                            </div>
+                        );
+                    })}
                 </div>
             )}
 
@@ -689,70 +797,77 @@ export function ServiceAccountsList({ projectName }) {
 
     return (
         <div>
-            <div className="mb-4 flex justify-end">
-                <Button variant="primary" size="sm" onClick={handleAddClick}>
-                    Create Service Account
+            <div className="r-section-head">
+                <div>
+                    <div className="r-section-title">Service accounts</div>
+                    <div className="r-section-sub">Use these in CI/CD or external systems to deploy and read state.</div>
+                </div>
+                <Button variant="primary" icon="plus" onClick={handleAddClick}>
+                    Create service account
                 </Button>
             </div>
-            <MonoTableFrame>
-                <MonoTable>
-                    <MonoTableHead>
-                        <tr>
-                            <MonoTh className="px-6 py-3 text-left">Email</MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">Issuer URL</MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">Claims</MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">Environments</MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">Created</MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">Actions</MonoTh>
-                        </tr>
-                    </MonoTableHead>
-                    <MonoTableBody>
-                        {serviceAccounts.length === 0 ? (
-                            <MonoTableEmptyRow colSpan={6}>No service accounts found.</MonoTableEmptyRow>
-                        ) : (
-                            serviceAccounts.map(sa => (
-                            <MonoTableRow key={sa.id} interactive className="transition-colors">
-                                <MonoTd className="px-6 py-4 text-sm text-gray-900 dark:text-gray-200">{sa.email}</MonoTd>
-                                <MonoTd className="px-6 py-4 text-sm text-gray-700 dark:text-gray-300 break-all max-w-xs">{sa.issuer_url}</MonoTd>
-                                <MonoTd className="px-6 py-4 text-xs font-mono text-gray-700 dark:text-gray-300">
-                                    {Object.entries(sa.claims || {})
-                                        .map(([key, value]) => `${key}=${value}`)
-                                        .join(', ')}
-                                </MonoTd>
-                                <MonoTd className="px-6 py-4 text-sm text-gray-700 dark:text-gray-300">
-                                    {sa.allowed_environments ? sa.allowed_environments.map((envName, i) => (
-                                        <span key={envName} className="inline-flex items-center gap-1.5">
-                                            {i > 0 && ', '}
-                                            <EnvironmentColorDot color={environments.find(e => e.name === envName)?.color} />
-                                            {envName}
+
+            <RPanel>
+                {serviceAccounts.length === 0 ? (
+                    <REmpty title="No service accounts">
+                        <div style={{ color: 'var(--text-soft)', fontSize: 13 }}>
+                            No service accounts configured. Create one to grant workload identity access.
+                        </div>
+                    </REmpty>
+                ) : (
+                    <table className="r-table">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Issuer URL</th>
+                                <th>Claims</th>
+                                <th>Environments</th>
+                                <th>Created</th>
+                                <th style={{ textAlign: 'right' }}>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {serviceAccounts.map(sa => (
+                                <tr key={sa.id}>
+                                    <td>
+                                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                                            <Icon name="key" size={14} />
+                                            <span style={{ fontWeight: 500 }}>{sa.email}</span>
                                         </span>
-                                    )) : 'All'}
-                                </MonoTd>
-                                <MonoTd className="px-6 py-4 whitespace-nowrap text-sm text-gray-700 dark:text-gray-300">{formatDate(sa.created_at)}</MonoTd>
-                                <MonoTd className="px-6 py-4 text-sm">
-                                    <div className="flex gap-2">
-                                        <Button
-                                            variant="secondary"
-                                            size="sm"
-                                            onClick={() => handleEditClick(sa)}
-                                        >
-                                            Edit
-                                        </Button>
-                                        <Button
-                                            variant="danger"
-                                            size="sm"
-                                            onClick={() => handleDeleteClick(sa)}
-                                        >
-                                            Delete
-                                        </Button>
-                                    </div>
-                                </MonoTd>
-                            </MonoTableRow>
-                        ))
-                        )}
-                    </MonoTableBody>
-                </MonoTable>
-            </MonoTableFrame>
+                                    </td>
+                                    <td className="mono" style={{ fontSize: 12.25, color: 'var(--text-muted)' }}>{sa.issuer_url}</td>
+                                    <td>
+                                        <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
+                                            {Object.entries(sa.claims || {}).map(([key, value]) => (
+                                                <RPill key={key} className="mono">{key}={String(value)}</RPill>
+                                            ))}
+                                        </div>
+                                    </td>
+                                    <td>
+                                        {sa.allowed_environments ? (
+                                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                                                {sa.allowed_environments.map(envName => (
+                                                    <span key={envName} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                                                        <EnvironmentColorDot color={environments.find(e => e.name === envName)?.color} />
+                                                        {envName}
+                                                    </span>
+                                                ))}
+                                            </span>
+                                        ) : <span style={{ color: 'var(--text-soft)' }}>All</span>}
+                                    </td>
+                                    <td style={{ color: 'var(--text-muted)' }}>{formatDate(sa.created_at)}</td>
+                                    <td>
+                                        <div className="row-actions" style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
+                                            <RButton size="sm" icon="edit" onClick={() => handleEditClick(sa)}>Edit</RButton>
+                                            <RButton size="sm" variant="danger" icon="trash" onClick={() => handleDeleteClick(sa)}>Delete</RButton>
+                                        </div>
+                                    </td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                )}
+            </RPanel>
 
             <Modal
                 isOpen={isModalOpen}
@@ -951,114 +1066,102 @@ export function DomainsList({ projectName, defaultUrl = null }) {
         }
     };
 
-    if (loading) return <div className="text-center py-8"><div className="inline-block w-8 h-8 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin"></div></div>;
-    if (error) return <p className="text-red-600 dark:text-red-400">Error loading custom domains: {error}</p>;
+    if (loading) return <LoadingState label="Loading custom domains…" />;
+    if (error) return <ErrorState message={`Error loading custom domains: ${error}`} onRetry={loadDomains} />;
+
+    const defaultHost = (() => {
+        if (!defaultUrl) return null;
+        try { return new URL(defaultUrl).hostname; } catch { return defaultUrl; }
+    })();
 
     return (
         <div>
-            <div className="mb-4 flex justify-end">
-                <Button variant="primary" size="sm" onClick={handleAddClick}>
-                    Add Domain
+            <div className="r-section-head">
+                <div>
+                    <div className="r-section-title">Custom domains</div>
+                    <div className="r-section-sub">Point your own domains at this project. The primary domain is used as the default URL.</div>
+                </div>
+                <Button variant="primary" icon="plus" onClick={handleAddClick}>
+                    Add domain
                 </Button>
             </div>
-            <MonoTableFrame>
-                <MonoTable>
-                    <MonoTableHead>
-                        <tr>
-                            <MonoTh className="px-6 py-3 text-left">Domain</MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">Primary</MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">Created</MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">Actions</MonoTh>
-                        </tr>
-                    </MonoTableHead>
-                    <MonoTableBody>
-                        {defaultUrl && (
-                            <MonoTableRow interactive className="transition-colors">
-                                <MonoTd className="px-6 py-4 text-sm font-mono text-gray-900 dark:text-gray-200">
-                                    <a href={defaultUrl} target="_blank" rel="noopener noreferrer" className="underline">
-                                        {(() => { try { return new URL(defaultUrl).hostname; } catch { return defaultUrl; } })()}
-                                    </a>
-                                    <MonoTag className="ml-2">default</MonoTag>
-                                    {isDefaultPrimary && (
-                                        <MonoTag color="yellow" className="ml-1">primary</MonoTag>
-                                    )}
-                                </MonoTd>
-                                <MonoTd className="px-6 py-4 text-sm">
-                                    <button
-                                        onClick={handleStarDefault}
-                                        disabled={isDefaultPrimary || updatingPrimaryDomain === '__default__'}
-                                        className="text-gray-400 hover:text-yellow-500 dark:text-gray-500 dark:hover:text-yellow-400 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                                        title={isDefaultPrimary ? "Default URL is primary" : "Set default URL as primary"}
-                                    >
-                                        {updatingPrimaryDomain === '__default__' ? (
-                                            <svg className="w-5 h-5 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                                            </svg>
-                                        ) : isDefaultPrimary ? (
-                                            <svg className="w-5 h-5 fill-current text-yellow-500 dark:text-yellow-400" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-                                                <path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/>
-                                            </svg>
-                                        ) : (
-                                            <svg className="w-5 h-5 stroke-current" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth="2">
-                                                <path strokeLinecap="round" strokeLinejoin="round" d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/>
-                                            </svg>
-                                        )}
-                                    </button>
-                                </MonoTd>
-                                <MonoTd className="px-6 py-4 text-sm text-gray-700 dark:text-gray-300">-</MonoTd>
-                                <MonoTd className="px-6 py-4 text-sm"></MonoTd>
-                            </MonoTableRow>
-                        )}
-                        {domains.map(domain => (
-                            <MonoTableRow key={domain.id} interactive className="transition-colors">
-                                <MonoTd className="px-6 py-4 text-sm font-mono text-gray-900 dark:text-gray-200">
-                                    {domain.domain}
-                                    {domain.is_primary && (
-                                        <MonoTag color="yellow" className="ml-2">primary</MonoTag>
-                                    )}
-                                </MonoTd>
-                                <MonoTd className="px-6 py-4 text-sm">
-                                    <button
-                                        onClick={() => handleTogglePrimary(domain)}
-                                        disabled={updatingPrimaryDomain === domain.domain}
-                                        className="text-gray-400 hover:text-yellow-500 dark:text-gray-500 dark:hover:text-yellow-400 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                                        title={domain.is_primary ? "Remove as primary" : "Set as primary"}
-                                    >
-                                        {updatingPrimaryDomain === domain.domain ? (
-                                            <svg className="w-5 h-5 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                                            </svg>
-                                        ) : domain.is_primary ? (
-                                            <svg className="w-5 h-5 fill-current text-yellow-500 dark:text-yellow-400" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-                                                <path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/>
-                                            </svg>
-                                        ) : (
-                                            <svg className="w-5 h-5 stroke-current" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth="2">
-                                                <path strokeLinecap="round" strokeLinejoin="round" d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/>
-                                            </svg>
-                                        )}
-                                    </button>
-                                </MonoTd>
-                                <MonoTd className="px-6 py-4 text-sm text-gray-700 dark:text-gray-300">{formatDate(domain.created_at)}</MonoTd>
-                                <MonoTd className="px-6 py-4 text-sm">
-                                    <Button
-                                        variant="danger"
-                                        size="sm"
-                                        onClick={() => handleDeleteClick(domain)}
-                                    >
-                                        Delete
-                                    </Button>
-                                </MonoTd>
-                            </MonoTableRow>
-                        ))}
-                        {!defaultUrl && domains.length === 0 && (
-                            <MonoTableEmptyRow colSpan={4}>No domains configured.</MonoTableEmptyRow>
-                        )}
-                    </MonoTableBody>
-                </MonoTable>
-            </MonoTableFrame>
+
+            <RPanel>
+                {!defaultUrl && domains.length === 0 ? (
+                    <REmpty title="No custom domains">
+                        <div style={{ color: 'var(--text-soft)', fontSize: 13 }}>
+                            No custom domains configured. Add one to serve this project from your own domain.
+                        </div>
+                    </REmpty>
+                ) : (
+                    <table className="r-table">
+                        <thead>
+                            <tr>
+                                <th>Domain</th>
+                                <th>Created</th>
+                                <th style={{ textAlign: 'right' }}>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {defaultUrl && (
+                                <tr>
+                                    <td>
+                                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                                            <Icon name="globe" size={14} />
+                                            <a className="r-link mono" style={{ fontSize: 13 }} href={defaultUrl} target="_blank" rel="noopener noreferrer">
+                                                {defaultHost}
+                                            </a>
+                                            <RPill>default</RPill>
+                                            {isDefaultPrimary && <RPill kind="accent">primary</RPill>}
+                                        </span>
+                                    </td>
+                                    <td style={{ color: 'var(--text-soft)' }}>—</td>
+                                    <td>
+                                        <div className="row-actions" style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
+                                            <RButton
+                                                size="sm"
+                                                icon="check"
+                                                onClick={handleStarDefault}
+                                                loading={updatingPrimaryDomain === '__default__'}
+                                                disabled={isDefaultPrimary}
+                                            >
+                                                {isDefaultPrimary ? 'Primary' : 'Set primary'}
+                                            </RButton>
+                                        </div>
+                                    </td>
+                                </tr>
+                            )}
+                            {domains.map(domain => (
+                                <tr key={domain.id}>
+                                    <td>
+                                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                                            <Icon name="globe" size={14} />
+                                            <span className="mono" style={{ fontSize: 13 }}>{domain.domain}</span>
+                                            {domain.is_primary && <RPill kind="accent">primary</RPill>}
+                                        </span>
+                                    </td>
+                                    <td style={{ color: 'var(--text-muted)' }}>{formatDate(domain.created_at)}</td>
+                                    <td>
+                                        <div className="row-actions" style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
+                                            <RButton
+                                                size="sm"
+                                                icon="check"
+                                                onClick={() => handleTogglePrimary(domain)}
+                                                loading={updatingPrimaryDomain === domain.domain}
+                                            >
+                                                {domain.is_primary ? 'Unset primary' : 'Set primary'}
+                                            </RButton>
+                                            <RButton size="sm" variant="danger" icon="trash" onClick={() => handleDeleteClick(domain)}>
+                                                Delete
+                                            </RButton>
+                                        </div>
+                                    </td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                )}
+            </RPanel>
 
             <Modal
                 isOpen={isModalOpen}

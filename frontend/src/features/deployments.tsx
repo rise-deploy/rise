@@ -6,7 +6,7 @@ import { copyToClipboard, formatDate, formatISO8601, formatRelativeTimeRounded, 
 import { useToast } from '../components/toast';
 import { Button, ConfirmDialog, ENV_COLOR_STYLES, EnvironmentColorDot, Modal, ModalActions, ModalSection, SourceLinkGroup, SourceLinkGroupAction, StatusBadge } from '../components/ui';
 import { MonoSortButton, MonoTable, MonoTableBody, MonoTableEmptyRow, MonoTableFrame, MonoTableHead, MonoTableRow, MonoTd, MonoTh } from '../components/table';
-import { Button as RButton, Empty, KV, KVRow, Panel, PanelBody, PanelHead, Pill, Segmented, Status, Tabs } from '../components/r-ui';
+import { Button as RButton, Combobox, Empty, KV, KVRow, Panel, PanelBody, PanelHead, Pill, SearchInput, Segmented, Status, Tabs } from '../components/r-ui';
 import { Icon } from '../components/icon';
 import { EnvVarsList } from './resources';
 import { EmptyState, ErrorState, LoadingState } from '../components/states';
@@ -283,6 +283,7 @@ export function DeploymentsList({ projectName }) {
     const [deploymentGroups, setDeploymentGroups] = useState([]);
     const [environments, setEnvironments] = useState([]);
     const [envFilter, setEnvFilter] = useState('');
+    const [search, setSearch] = useState('');
     const [confirmDialogOpen, setConfirmDialogOpen] = useState(false);
     const [deploymentToStop, setDeploymentToStop] = useState(null);
     const [stopping, setStopping] = useState(false);
@@ -340,16 +341,6 @@ export function DeploymentsList({ projectName }) {
         const interval = setInterval(loadDeployments, 5000);
         return () => clearInterval(interval);
     }, [loadDeployments]);
-
-    const handleGroupChange = (e) => {
-        setGroupFilter(e.target.value);
-        setPage(0);
-    };
-
-    const handleEnvFilterChange = (e) => {
-        setEnvFilter(e.target.value);
-        setPage(0);
-    };
 
     const isTerminal = (status) => {
         return ['Cancelled', 'Stopped', 'Superseded', 'Failed', 'Expired'].includes(status);
@@ -416,176 +407,166 @@ export function DeploymentsList({ projectName }) {
     if (error) return <ErrorState message={`Error loading deployments: ${error}`} onRetry={loadDeployments} />;
 
     // Client-side environment filter
-    const filteredDeployments = envFilter
+    const envFilteredDeployments = envFilter
         ? sortedDeployments.filter(d => d.environment === envFilter)
         : sortedDeployments;
 
-    // Find the most recent deployment in the default group (only non-terminal)
-    const mostRecentDefault = filteredDeployments.find(d => d.deployment_group === 'default' && !isTerminal(d.status));
+    // Client-side text search over the loaded page (deployment id / image / author)
+    const q = search.trim().toLowerCase();
+    const filteredDeployments = q
+        ? envFilteredDeployments.filter(d => {
+            const haystack = `${d.deployment_id || ''} ${d.image || ''} ${d.created_by_email || ''}`.toLowerCase();
+            return haystack.includes(q);
+        })
+        : envFilteredDeployments;
+
+    const envOptions = [
+        { value: '', label: 'All envs' },
+        ...environments.map(env => ({ value: env.name, label: env.name })),
+    ];
 
     return (
         <div>
-            <div className="mb-4 flex items-center gap-4">
-                <label htmlFor="deployment-group-filter" className="flex items-center gap-2">
-                    <span className="text-sm text-gray-600 dark:text-gray-400 whitespace-nowrap">Group:</span>
-                    <select
-                        id="deployment-group-filter"
-                        value={groupFilter}
-                        onChange={handleGroupChange}
-                        className="mono-select text-sm"
-                    >
-                        <option value="">All groups</option>
-                        {deploymentGroups.map(group => (
-                            <option key={group} value={group}>{group}</option>
-                        ))}
-                    </select>
-                </label>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 14 }}>
+                <SearchInput
+                    value={search}
+                    onChange={setSearch}
+                    placeholder="Filter deployments…"
+                    style={{ flex: 1, maxWidth: 280 }}
+                />
                 {environments.length > 0 && (
-                    <label htmlFor="deployment-env-filter" className="flex items-center gap-2">
-                        <span className="text-sm text-gray-600 dark:text-gray-400 whitespace-nowrap">Environment:</span>
-                        <select
-                            id="deployment-env-filter"
-                            value={envFilter}
-                            onChange={handleEnvFilterChange}
-                            className="mono-select text-sm"
-                        >
-                            <option value="">All environments</option>
-                            {environments.map(env => (
-                                <option key={env.name} value={env.name}>{env.name}</option>
-                            ))}
-                        </select>
-                    </label>
+                    <Segmented<string>
+                        value={envFilter}
+                        options={envOptions}
+                        onChange={(v) => { setEnvFilter(v); setPage(0); }}
+                        capitalize
+                    />
                 )}
+                {deploymentGroups.length > 0 && (
+                    <div style={{ width: 200 }}>
+                        <Combobox
+                            value={groupFilter}
+                            onChange={(v) => { setGroupFilter(v); setPage(0); }}
+                            options={[
+                                { value: '', label: 'All groups' },
+                                ...deploymentGroups.map(group => ({ value: group, label: group })),
+                            ]}
+                            placeholder="All groups"
+                        />
+                    </div>
+                )}
+                <div style={{ marginLeft: 'auto', fontSize: 12.5, color: 'var(--text-soft)' }}>
+                    {filteredDeployments.length} of {deployments.length}
+                </div>
             </div>
-            {actionStatus && <p className="mono-inline-status mb-3">{actionStatus}</p>}
+            {actionStatus && (
+                <div className="r-alert info" style={{ marginBottom: 14, fontSize: 12.5 }}>
+                    <Icon name="info" size={14} />
+                    <div style={{ flex: 1 }}>{actionStatus}</div>
+                </div>
+            )}
 
-            <MonoTableFrame>
-                <MonoTable className="mono-sticky-table mono-table--sticky" onKeyDown={onKeyDown}>
-                    <MonoTableHead>
-                        <tr>
-                            <MonoTh stickyCol className="px-6 py-3 text-left">
-                                <MonoSortButton label="ID" active={sortKey === 'deployment_id'} direction={sortDirection} onClick={() => requestSort('deployment_id')} />
-                            </MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">
-                                <MonoSortButton label="Status" active={sortKey === 'status'} direction={sortDirection} onClick={() => requestSort('status')} />
-                            </MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">Created by</MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">Image</MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">Group</MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">Environment</MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">URL</MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">Expires</MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">
-                                <MonoSortButton label="Created" active={sortKey === 'created'} direction={sortDirection} onClick={() => requestSort('created')} />
-                            </MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">Actions</MonoTh>
-                        </tr>
-                    </MonoTableHead>
-                    <MonoTableBody>
-                        {filteredDeployments.length === 0 ? (
-                            <MonoTableEmptyRow colSpan={10}>
-                                <EmptyState message="No deployments found." />
-                            </MonoTableEmptyRow>
-                        ) : (
-                            filteredDeployments.map((d, idx) => {
-                                    const isHighlighted = mostRecentDefault && d.id === mostRecentDefault.id;
-                                    return (
-                                    <MonoTableRow
-                                        key={d.id}
-                                        onClick={() => navigate(`/deployment/${projectName}/${d.deployment_id}`)}
-                                        onFocus={() => setActiveIndex(idx)}
-                                        tabIndex={0}
-                                        aria-label={`Deployment ${d.deployment_id}`}
-                                        interactive
-                                        active={activeIndex === idx}
-                                        highlight={Boolean(isHighlighted)}
-                                        className="transition-colors"
-                                    >
-                                        <MonoTd stickyCol mono className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-gray-200">{d.deployment_id}</MonoTd>
-                                        <MonoTd className="px-6 py-4 whitespace-nowrap text-sm"><StatusBadge status={d.status} /></MonoTd>
-                                        <MonoTd className="px-6 py-4 whitespace-nowrap text-sm text-gray-700 dark:text-gray-300">{d.created_by_email || '-'}</MonoTd>
-                                        <MonoTd mono className="px-6 py-4 whitespace-nowrap text-xs text-gray-700 dark:text-gray-300">{d.image ? d.image.split('/').pop() : '-'}</MonoTd>
-                                        <MonoTd className="px-6 py-4 whitespace-nowrap text-sm text-gray-700 dark:text-gray-300">{d.deployment_group}</MonoTd>
-                                        <MonoTd className="px-6 py-4 whitespace-nowrap text-sm text-gray-700 dark:text-gray-300">{d.environment ? <span className="inline-flex items-center gap-2"><EnvironmentColorDot color={d.environment_color} />{d.environment}</span> : '-'}</MonoTd>
-                                        <MonoTd className="px-6 py-4 whitespace-nowrap text-sm">
-                                            {d.primary_url ? (
-                                                <a
-                                                    href={d.primary_url}
-                                                    target="_blank"
-                                                    rel="noopener noreferrer"
-                                                    className="text-indigo-600 dark:text-indigo-400 hover:text-indigo-700 dark:hover:text-indigo-300"
-                                                    onClick={(e) => e.stopPropagation()}
+            <Panel>
+                {filteredDeployments.length === 0 ? (
+                    <div style={{ padding: 36, textAlign: 'center', color: 'var(--text-muted)' }}>
+                        No deployments found.
+                    </div>
+                ) : (
+                    <table className="r-table">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Status</th>
+                                <th>Env</th>
+                                <th>Group</th>
+                                <th>Image</th>
+                                <th>Created by</th>
+                                <th>Duration</th>
+                                <th>Age</th>
+                                <th style={{ textAlign: 'right' }}>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {filteredDeployments.map(d => (
+                                <tr
+                                    key={d.id}
+                                    className="click"
+                                    onClick={() => navigate(`/deployment/${projectName}/${d.deployment_id}`)}
+                                >
+                                    <td className="mono" style={{ fontSize: 12.25 }}>{d.deployment_id}</td>
+                                    <td><Status status={d.status} /></td>
+                                    <td>
+                                        {d.environment ? (
+                                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                                                <EnvironmentColorDot color={d.environment_color} />
+                                                {d.environment}
+                                            </span>
+                                        ) : <span style={{ color: 'var(--text-soft)' }}>—</span>}
+                                    </td>
+                                    <td className="mono" style={{ fontSize: 12.5 }}>{d.deployment_group}</td>
+                                    <td className="mono" style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                                        {d.image ? d.image.split('/').pop() : '—'}
+                                    </td>
+                                    <td>{d.created_by_email || <span style={{ color: 'var(--text-soft)' }}>—</span>}</td>
+                                    <td className="mono" style={{ fontSize: 12.25, color: 'var(--text-muted)' }}>
+                                        {d.completed_at ? formatDurationDelta(d.created, d.completed_at) : '—'}
+                                    </td>
+                                    <td style={{ color: 'var(--text-muted)' }} title={formatISO8601(d.created)}>
+                                        {formatRelativeTimeRounded(d.created)}
+                                    </td>
+                                    <td style={{ textAlign: 'right' }}>
+                                        <div className="row-actions" style={{ display: 'inline-flex', gap: 6, justifyContent: 'flex-end' }}>
+                                            {isRollbackable(d) && (
+                                                <RButton
+                                                    size="sm"
+                                                    onClick={(e) => {
+                                                        e.stopPropagation();
+                                                        handleRollbackClick(d);
+                                                    }}
                                                 >
-                                                    Link
-                                                </a>
-                                            ) : '-'}
-                                        </MonoTd>
-                                        <MonoTd className="px-6 py-4 whitespace-nowrap text-sm text-gray-700 dark:text-gray-300">
-                                            {d.expires_at ? (
-                                                <span>
-                                                    {formatTimeRemaining(d.expires_at)}
-                                                    <br />
-                                                    <span className="text-gray-600 dark:text-gray-500 text-xs">({formatDate(d.expires_at)})</span>
-                                                </span>
-                                            ) : '-'}
-                                        </MonoTd>
-                                        <MonoTd className="px-6 py-4 whitespace-nowrap text-sm text-gray-700 dark:text-gray-300" title={formatISO8601(d.created)}>
-                                            {formatRelativeTimeRounded(d.created)}
-                                        </MonoTd>
-                                        <MonoTd className="px-6 py-4 whitespace-nowrap text-sm">
-                                            <div className="mono-table-action-slot">
-                                                {isRollbackable(d) && (
-                                                    <Button
-                                                        variant="primary"
-                                                        size="sm"
-                                                        onClick={(e) => {
-                                                            e.stopPropagation();
-                                                            handleRollbackClick(d);
-                                                        }}
-                                                    >
-                                                        {d.is_active ? 'Redeploy' : 'Rollback'}
-                                                    </Button>
-                                                )}
-                                                {!isTerminal(d.status) && (
-                                                    <Button
-                                                        variant="danger"
-                                                        size="sm"
-                                                        onClick={(e) => {
-                                                            e.stopPropagation();
-                                                            handleStopClick(d);
-                                                        }}
-                                                    >
-                                                        Stop
-                                                    </Button>
-                                                )}
-                                            </div>
-                                        </MonoTd>
-                                    </MonoTableRow>
-                                    );
-                                })
-                        )}
-                    </MonoTableBody>
-                </MonoTable>
-            </MonoTableFrame>
+                                                    {d.is_active ? 'Redeploy' : 'Rollback'}
+                                                </RButton>
+                                            )}
+                                            {!isTerminal(d.status) && (
+                                                <RButton
+                                                    size="sm"
+                                                    variant="danger"
+                                                    onClick={(e) => {
+                                                        e.stopPropagation();
+                                                        handleStopClick(d);
+                                                    }}
+                                                >
+                                                    Stop
+                                                </RButton>
+                                            )}
+                                        </div>
+                                    </td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                )}
+            </Panel>
 
-            <div className="mt-4 flex justify-between items-center">
-                <button
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 14 }}>
+                <RButton
+                    size="sm"
                     onClick={() => setPage(p => p - 1)}
                     disabled={page === 0}
-                    className="bg-gray-700 hover:bg-gray-600 disabled:bg-gray-100 dark:bg-gray-800 disabled:text-gray-600 text-white px-4 py-2 rounded text-sm transition-colors"
+                    icon="chevl"
                 >
                     Previous
-                </button>
-                <span className="text-sm text-gray-600 dark:text-gray-400">
-                    Page {page + 1} (showing {deployments.length} deployments)
+                </RButton>
+                <span style={{ fontSize: 12.5, color: 'var(--text-muted)' }}>
+                    Page {page + 1} · showing {deployments.length} deployment{deployments.length === 1 ? '' : 's'}
                 </span>
-                <button
+                <RButton
+                    size="sm"
                     onClick={() => setPage(p => p + 1)}
                     disabled={!hasMore}
-                    className="bg-gray-700 hover:bg-gray-600 disabled:bg-gray-100 dark:bg-gray-800 disabled:text-gray-600 text-white px-4 py-2 rounded text-sm transition-colors"
                 >
                     Next
-                </button>
+                </RButton>
             </div>
 
             <ConfirmDialog
