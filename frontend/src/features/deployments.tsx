@@ -1510,7 +1510,7 @@ export function DeploymentDetail({ projectName, deploymentId }) {
 
     const buildKv = (
         <Panel>
-            <PanelHead title="Build" />
+            <PanelHead title="Deploy" />
             <PanelBody>
                 <KV>
                     <KVRow k="Image">
@@ -1541,7 +1541,7 @@ export function DeploymentDetail({ projectName, deploymentId }) {
 
     const runtimeKv = (
         <Panel>
-            <PanelHead title="Runtime" />
+            <PanelHead title="Resources" />
             <PanelBody>
                 <KV>
                     <KVRow k="Replicas">{deployment.replicas}</KVRow>
