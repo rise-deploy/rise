@@ -2,8 +2,10 @@
 //!
 //! The API is operator-only in v1 (`auth.operator_users`), except for the
 //! controller-specific status/finalizer endpoints, which authenticate via the
-//! `ControllerAuthContext` extractor. `Orphan` deletion and reparent are
-//! additionally gated to operators who are also listed in `auth.admin_users`.
+//! `ControllerAuthContext` extractor and are further gated to controllers
+//! listed in the collection's `allowed_status_controller_ids` (default-deny on
+//! an empty list). `Orphan` deletion and reparent are additionally gated to
+//! operators who are also listed in `auth.admin_users`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -153,6 +155,34 @@ fn enforce_scope(
         )));
     }
     Ok(())
+}
+
+/// Authorize a controller token for status/finalizer writes against a
+/// collection. The collection's `allowed_status_controller_ids` is the gate;
+/// an empty list is default-deny. Built-in collections currently carry an
+/// empty list, so controllers cannot write their status until a future phase
+/// wires controller ownership for built-ins.
+fn enforce_controller_allowed(
+    info: &CollectionInfo,
+    collection: &str,
+    controller_id: &str,
+) -> Result<(), ServerError> {
+    if info
+        .allowed_status_controller_ids
+        .iter()
+        .any(|id| id == controller_id)
+    {
+        return Ok(());
+    }
+    tracing::warn!(
+        controller_id = %controller_id,
+        kind = %info.kind,
+        "Controller status/finalizer write denied — controller not in collection's allowed_status_controller_ids"
+    );
+    Err(ServerError::forbidden(format!(
+        "controller '{controller_id}' is not authorized to write status or finalizers \
+         for collection '{collection}'"
+    )))
 }
 
 fn assert_body_matches(
@@ -404,6 +434,11 @@ pub async fn update_status_root(
 ) -> Result<Json<rise_resource_api::Resource>, ServerError> {
     let resolved = resolve_collection(&state.resource_store, &collection).await?;
     enforce_scope(&resolved.info, ResourceScope::Root, &resolved.collection)?;
+    enforce_controller_allowed(
+        &resolved.info,
+        &resolved.collection,
+        &controller.0.identity_id,
+    )?;
     let row = resolve_leaf(&state.resource_store, &resolved.info, None, &name).await?;
     apply_controller_status(&state, &controller, &row, body).await
 }
@@ -421,6 +456,11 @@ pub async fn update_status_org(
         ResourceScope::Organization,
         &resolved.collection,
     )?;
+    enforce_controller_allowed(
+        &resolved.info,
+        &resolved.collection,
+        &controller.0.identity_id,
+    )?;
     let row = resolve_leaf(&state.resource_store, &resolved.info, Some(org_uid), &name).await?;
     apply_controller_status(&state, &controller, &row, body).await
 }
@@ -433,6 +473,11 @@ pub async fn update_finalizers_root(
 ) -> Result<Json<rise_resource_api::Resource>, ServerError> {
     let resolved = resolve_collection(&state.resource_store, &collection).await?;
     enforce_scope(&resolved.info, ResourceScope::Root, &resolved.collection)?;
+    enforce_controller_allowed(
+        &resolved.info,
+        &resolved.collection,
+        &controller.0.identity_id,
+    )?;
     let row = resolve_leaf(&state.resource_store, &resolved.info, None, &name).await?;
     apply_controller_finalizers(&state, &controller, &row, body).await
 }
@@ -449,6 +494,11 @@ pub async fn update_finalizers_org(
         &resolved.info,
         ResourceScope::Organization,
         &resolved.collection,
+    )?;
+    enforce_controller_allowed(
+        &resolved.info,
+        &resolved.collection,
+        &controller.0.identity_id,
     )?;
     let row = resolve_leaf(&state.resource_store, &resolved.info, Some(org_uid), &name).await?;
     apply_controller_finalizers(&state, &controller, &row, body).await
@@ -488,6 +538,7 @@ pub async fn reparent_root(
 ) -> Result<Json<rise_resource_api::Resource>, ServerError> {
     let user = require_admin_operator(&state, &auth)?;
     let resolved = resolve_collection(&state.resource_store, &collection).await?;
+    enforce_scope(&resolved.info, ResourceScope::Root, &resolved.collection)?;
     let row = resolve_leaf(&state.resource_store, &resolved.info, None, &name).await?;
     apply_reparent(&state, &row, body, &user).await
 }
@@ -501,6 +552,11 @@ pub async fn reparent_org(
     let user = require_admin_operator(&state, &auth)?;
     let org_uid = resolve_organization_parent(&state.resource_store, &org).await?;
     let resolved = resolve_collection(&state.resource_store, &collection).await?;
+    enforce_scope(
+        &resolved.info,
+        ResourceScope::Organization,
+        &resolved.collection,
+    )?;
     let row = resolve_leaf(&state.resource_store, &resolved.info, Some(org_uid), &name).await?;
     apply_reparent(&state, &row, body, &user).await
 }
@@ -767,5 +823,38 @@ mod tests {
         assert!(
             assert_body_matches(&info, "rise.dev/v1alpha1", "Widget", "acme", "acme",).is_err()
         );
+    }
+
+    fn collection_info(allowed: Vec<String>) -> CollectionInfo {
+        CollectionInfo {
+            api_version: "example.dev/v1".into(),
+            kind: "Widget".into(),
+            scope: ResourceScope::Root,
+            spec_validator: std::sync::Arc::new(rise_resource_store::NoOpValidator),
+            allowed_status_controller_ids: allowed,
+        }
+    }
+
+    #[test]
+    fn enforce_controller_allowed_permits_listed_controller() {
+        let info = collection_info(vec!["controller.example.com".into()]);
+        assert!(enforce_controller_allowed(&info, "widgets", "controller.example.com").is_ok());
+    }
+
+    #[test]
+    fn enforce_controller_allowed_rejects_unlisted_controller() {
+        let info = collection_info(vec!["controller.example.com".into()]);
+        let err = enforce_controller_allowed(&info, "widgets", "other.example.com").unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        assert!(err.message.contains("not authorized"));
+    }
+
+    #[test]
+    fn enforce_controller_allowed_default_denies_empty_allowlist() {
+        // Built-in collections carry an empty allowlist — default-deny.
+        let info = collection_info(vec![]);
+        let err =
+            enforce_controller_allowed(&info, "widgets", "controller.example.com").unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
     }
 }
