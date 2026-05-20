@@ -79,4 +79,3 @@ mod tests {
         let _router: Router<crate::server::state::AppState> = routes();
     }
 }
-
