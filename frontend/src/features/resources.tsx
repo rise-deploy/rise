@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { createElement, useCallback, useEffect, useMemo, useState } from 'react';
+import { createElement, lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from '../lib/api';
 import { CONFIG } from '../lib/config';
 import { navigate } from '../lib/navigation';
@@ -18,11 +18,21 @@ import {
     Panel as RPanel,
     PanelBody as RPanelBody,
     PanelHead as RPanelHead,
+    Pill as RPill,
     SearchInput as RSearchInput,
     Status as RStatus,
     Tabs as RTabs,
 } from '../components/r-ui';
+import { validateJson } from '../lib/json-validate';
 import { Icon } from '../components/icon';
+
+// CodeMirror is heavy; load it only when an extension's Spec tab is opened.
+const JsonEditor = lazy(() => import('../components/json-editor'));
+const JsonEditorFallback = () => (
+    <div style={{ padding: 20, fontSize: 12.5, color: 'var(--text-soft)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
+        Loading editor…
+    </div>
+);
 import { LoadingState, ErrorState } from '../components/states';
 import {
   AwsRdsDetailView,
@@ -2369,9 +2379,18 @@ export function ExtensionDetailPage({ projectName, extensionType: extensionTypeP
     if (isEnabled) tabs.push({ id: 'overview', label: 'Overview' });
     if (hasUI) tabs.push({ id: 'configure', label: `Configure${unsavedMark}` });
     tabs.push({ id: 'config', label: `Spec${unsavedMark}` });
-    if (isEnabled) tabs.push({ id: 'status', label: 'Status' });
-    tabs.push({ id: 'schema', label: 'Schema' });
     if (isEnabled) tabs.push({ id: 'delete', label: 'Delete' });
+
+    // Validity of the current spec JSON against the extension schema.
+    const specValidation = validateJson(formData.spec, extensionType.spec_schema);
+
+    const openRawSchema = () => {
+        const blob = new Blob([JSON.stringify(extensionType.spec_schema, null, 2)], {
+            type: 'application/json',
+        });
+        const url = URL.createObjectURL(blob);
+        window.open(url, '_blank', 'noopener,noreferrer');
+    };
 
     const instanceNameField = (id) => (
         <RField
@@ -2393,7 +2412,7 @@ export function ExtensionDetailPage({ projectName, extensionType: extensionTypeP
             variant="primary"
             onClick={handleSave}
             loading={saving}
-            disabled={isPreviewOnly}
+            disabled={isPreviewOnly || !specValidation.jsonValid}
             className={!isEnabled ? 'mono-btn-cta' : ''}
         >
             {isPreviewOnly ? 'Preview Only' : (isEnabled ? 'Update' : 'Enable')}
@@ -2473,6 +2492,7 @@ export function ExtensionDetailPage({ projectName, extensionType: extensionTypeP
                 )}
 
                 {activeTab === 'config' && (
+                    <Suspense fallback={<JsonEditorFallback />}>
                     <div className="r-stack">
                         {!isEnabled && (
                             <RPanel>
@@ -2482,17 +2502,57 @@ export function ExtensionDetailPage({ projectName, extensionType: extensionTypeP
                         <RPanel>
                             <RPanelHead
                                 title="Configuration Spec (JSON)"
-                                sub="Enter the extension configuration as a JSON object. See the Schema tab and Project Extensions docs for valid fields and examples."
+                                sub="Enter the extension configuration as a JSON object. See the raw schema and Project Extensions docs for valid fields and examples."
                             />
                             <RPanelBody>
-                                <FormField
-                                    id="extension-spec"
-                                    type="textarea"
+                                <div
+                                    style={{
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        justifyContent: 'space-between',
+                                        gap: 12,
+                                        flexWrap: 'wrap',
+                                        marginBottom: 8,
+                                    }}
+                                >
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                                        <strong style={{ fontSize: 13 }}>Spec</strong>
+                                        {specValidation.jsonValid && specValidation.schemaValid ? (
+                                            <RPill kind="accent">Schema valid</RPill>
+                                        ) : !specValidation.jsonValid ? (
+                                            <RPill>Invalid JSON</RPill>
+                                        ) : (
+                                            <RPill>
+                                                {specValidation.errors.length} issue
+                                                {specValidation.errors.length === 1 ? '' : 's'}
+                                            </RPill>
+                                        )}
+                                    </div>
+                                    <RButton size="sm" icon="ext" onClick={openRawSchema}>
+                                        View raw schema
+                                    </RButton>
+                                </div>
+                                <JsonEditor
                                     value={formData.spec}
-                                    onChange={(e) => handleJsonSpecChange(e.target.value)}
-                                    placeholder="{}"
-                                    rows={15}
+                                    onChange={handleJsonSpecChange}
+                                    ariaLabel="Extension configuration spec"
                                 />
+                                {specValidation.errors.length > 0 && (
+                                    <div style={{ marginTop: 8 }}>
+                                        <RAlert tone="err">
+                                            <strong>
+                                                {specValidation.jsonValid
+                                                    ? 'Schema validation issues'
+                                                    : 'Invalid JSON'}
+                                            </strong>
+                                            <ul style={{ margin: '4px 0 0', paddingLeft: 18 }}>
+                                                {specValidation.errors.map((err, i) => (
+                                                    <li key={i}>{err}</li>
+                                                ))}
+                                            </ul>
+                                        </RAlert>
+                                    </div>
+                                )}
                                 <p style={{ fontSize: 12.5, color: 'var(--text-soft)', marginTop: 8 }}>
                                     {hasUI && 'Use the Configure tab for a form-based interface. '}
                                     Extension docs:{' '}
@@ -2509,40 +2569,25 @@ export function ExtensionDetailPage({ projectName, extensionType: extensionTypeP
                                 </p>
                             </RPanelBody>
                         </RPanel>
+
+                        {isEnabled && enabledExtension.status && (
+                            <RPanel>
+                                <RPanelHead title="Status (read-only)" />
+                                <RPanelBody>
+                                    <JsonEditor
+                                        value={JSON.stringify(enabledExtension.status, null, 2)}
+                                        readOnly
+                                        ariaLabel="Extension status"
+                                    />
+                                </RPanelBody>
+                            </RPanel>
+                        )}
+
                         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12 }}>
                             {saveButton}
                         </div>
                     </div>
-                )}
-
-                {activeTab === 'status' && isEnabled && (
-                    <div className="r-stack">
-                        <RPanel>
-                            <RPanelHead title="Status Summary" />
-                            <RPanelBody>
-                                <p style={{ margin: 0, color: 'var(--text)' }}>{enabledExtension.status_summary}</p>
-                            </RPanelBody>
-                        </RPanel>
-                        <ExtensionJsonPanel title="Current Spec" value={enabledExtension.spec} />
-                        <ExtensionJsonPanel title="Full Status" value={enabledExtension.status} />
-                        <RPanel>
-                            <RPanelHead title="Metadata" />
-                            <RPanelBody>
-                                <RKV>
-                                    <RKVRow k="Created">{formatDate(enabledExtension.created)}</RKVRow>
-                                    <RKVRow k="Updated">{formatDate(enabledExtension.updated)}</RKVRow>
-                                </RKV>
-                            </RPanelBody>
-                        </RPanel>
-                    </div>
-                )}
-
-                {activeTab === 'schema' && (
-                    <ExtensionJsonPanel
-                        title="Schema"
-                        sub="This JSON schema defines the valid structure for the extension configuration."
-                        value={extensionType.spec_schema}
-                    />
+                    </Suspense>
                 )}
 
                 {activeTab === 'delete' && isEnabled && (

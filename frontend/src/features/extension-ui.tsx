@@ -1235,44 +1235,39 @@ export function SnowflakeOAuthDetailView({ extension, projectName }) {
                     </PanelBody>
                 </Panel>
 
-                {/* Configuration Summary */}
-                <Panel style={{ gridColumn: '1 / -1' }}>
-                    <PanelHead title="Configuration" />
-                    <PanelBody>
-                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 16 }}>
-                            <div>
-                                <div className="r-field-label">Blocked Roles</div>
-                                {spec.blocked_roles && spec.blocked_roles.length > 0 ? (
-                                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                                        {spec.blocked_roles.map((role, idx) => (
-                                            <Pill key={idx}>{role}</Pill>
-                                        ))}
-                                    </div>
-                                ) : (
-                                    <p style={{ fontSize: 12, color: 'var(--text-soft)', margin: 0 }}>Using backend defaults only</p>
-                                )}
-                            </div>
-                            <div>
-                                <div className="r-field-label">OAuth Scopes</div>
-                                {spec.scopes && spec.scopes.length > 0 ? (
-                                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                                        {spec.scopes.map((scope, idx) => (
-                                            <Pill key={idx} kind="accent">{scope}</Pill>
-                                        ))}
-                                    </div>
-                                ) : (
-                                    <p style={{ fontSize: 12, color: 'var(--text-soft)', margin: 0 }}>Using backend defaults only</p>
-                                )}
-                            </div>
-                        </div>
-                        <div style={{ marginTop: 16 }}>
-                            <Alert tone="warn" icon="info">
-                                <strong>Note:</strong> Additional roles and scopes are combined with backend defaults
-                                (not replaced). ACCOUNTADMIN, ORGADMIN, and SECURITYADMIN are always blocked.
-                            </Alert>
-                        </div>
-                    </PanelBody>
-                </Panel>
+                {/* Injected Environment Variables */}
+                {status.oauth_extension_name && (
+                    <Panel style={{ gridColumn: '1 / -1' }}>
+                        <PanelHead
+                            title="Injected Environment Variables"
+                            sub="The linked OAuth extension injects these environment variables into your deployed application."
+                        />
+                        <PanelBody>
+                            <table className="r-table" style={{ width: '100%' }}>
+                                <thead>
+                                    <tr>
+                                        <th style={{ textAlign: 'left' }}>Variable</th>
+                                        <th style={{ textAlign: 'left' }}>Source</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr>
+                                        <td><span className="mono" style={{ whiteSpace: 'nowrap' }}>{status.oauth_extension_name.toUpperCase().replace(/-/g, '_')}_CLIENT_ID</span></td>
+                                        <td><span style={{ color: 'var(--text-muted)' }}>OAuth client ID</span></td>
+                                    </tr>
+                                    <tr>
+                                        <td><span className="mono" style={{ whiteSpace: 'nowrap' }}>{status.oauth_extension_name.toUpperCase().replace(/-/g, '_')}_CLIENT_SECRET</span></td>
+                                        <td><Pill>protected</Pill></td>
+                                    </tr>
+                                    <tr>
+                                        <td><span className="mono" style={{ whiteSpace: 'nowrap' }}>{status.oauth_extension_name.toUpperCase().replace(/-/g, '_')}_ISSUER</span></td>
+                                        <td><span style={{ color: 'var(--text-muted)' }}>OIDC issuer URL</span></td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </PanelBody>
+                    </Panel>
+                )}
             </div>
         </div>
     );
@@ -1526,33 +1521,48 @@ export function AwsRdsDetailView({ extension, projectName }) {
                 )}
             </section>
 
-            {/* Configuration */}
+            {/* Injected Environment Variables */}
             <Panel>
-                <PanelHead title="Environment Variables" />
+                <PanelHead title="Injected Environment Variables" sub="These environment variables are injected into your deployed application." />
                 <PanelBody>
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--text-muted)' }}>
-                            <span>Database URL Variable:</span>
-                            <code
-                                className="mono"
-                                style={{
-                                    padding: '2px 8px',
-                                    background: 'var(--surface-2)',
-                                    border: '1px solid var(--border)',
-                                    borderRadius: 'var(--radius-sm)',
-                                    color: 'var(--text)',
-                                }}
-                            >
-                                {spec.database_url_env_var || 'DATABASE_URL'}
-                            </code>
-                        </div>
-                        <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--text)' }}>
-                            <input type="checkbox" checked={spec.inject_pg_vars !== false} disabled />
-                            <span>
-                                Inject <code className="mono" style={{ color: 'var(--accent)' }}>PG*</code> variables
-                            </span>
-                        </label>
-                    </div>
+                    <table className="r-table" style={{ width: '100%' }}>
+                        <thead>
+                            <tr>
+                                <th style={{ textAlign: 'left' }}>Variable</th>
+                                <th style={{ textAlign: 'left' }}>Source</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><span className="mono" style={{ whiteSpace: 'nowrap' }}>{spec.database_url_env_var || 'DATABASE_URL'}</span></td>
+                                <td><span style={{ color: 'var(--text-muted)' }}>Full PostgreSQL connection string</span></td>
+                            </tr>
+                            {spec.inject_pg_vars !== false && (
+                                <>
+                                    <tr>
+                                        <td><span className="mono">PGHOST</span></td>
+                                        <td><span className="mono" style={{ color: 'var(--text-muted)' }}>{status.endpoint || '(pending)'}</span></td>
+                                    </tr>
+                                    <tr>
+                                        <td><span className="mono">PGPORT</span></td>
+                                        <td><span style={{ color: 'var(--text-muted)' }}>Database port</span></td>
+                                    </tr>
+                                    <tr>
+                                        <td><span className="mono">PGUSER</span></td>
+                                        <td><span style={{ color: 'var(--text-muted)' }}>Database user</span></td>
+                                    </tr>
+                                    <tr>
+                                        <td><span className="mono">PGPASSWORD</span></td>
+                                        <td><Pill>protected</Pill></td>
+                                    </tr>
+                                    <tr>
+                                        <td><span className="mono">PGDATABASE</span></td>
+                                        <td><span style={{ color: 'var(--text-muted)' }}>Database name</span></td>
+                                    </tr>
+                                </>
+                            )}
+                        </tbody>
+                    </table>
                 </PanelBody>
             </Panel>
         </div>
