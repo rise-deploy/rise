@@ -160,6 +160,17 @@ export function ProjectDetail({ projectName, initialTab }: { projectName: string
                         {project.created && (
                             <span title={formatISO8601(project.created)}>created {formatRelativeTimeRounded(project.created)}</span>
                         )}
+                        {project.deployment_groups?.length > 0 && (
+                            <>
+                                <span className="dot-sep" />
+                                <span>
+                                    {project.deployment_groups.length} group{project.deployment_groups.length === 1 ? '' : 's'}
+                                    {tabCounts.deployments != null && (
+                                        ` · ${tabCounts.deployments} deployment${tabCounts.deployments === 1 ? '' : 's'}`
+                                    )}
+                                </span>
+                            </>
+                        )}
                     </div>
                 </div>
                 {project.primary_url && (
@@ -398,7 +409,11 @@ function ProjectOverview({ project, projectName, accessLabel, environments, onCo
                                             {env.name}
                                             {env.is_production && <Pill kind="env-prod">production</Pill>}
                                         </span>
-                                        <Status status={env.is_production ? 'Production' : 'Active'} bare />
+                                        {env.primary_deployment_group && (
+                                            <span style={{ fontSize: 12, color: 'var(--text-soft)' }}>
+                                                <span className="mono">{env.primary_deployment_group}</span> group
+                                            </span>
+                                        )}
                                     </div>
                                 ))}
                             </div>
