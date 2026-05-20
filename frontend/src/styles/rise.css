@@ -226,6 +226,15 @@ a { color: inherit; }
     color: var(--accent);
     font-weight: 600;
 }
+.r-nav button.active::before {
+    content: '';
+    width: 3px;
+    height: 14px;
+    background: var(--accent);
+    border-radius: 2px;
+    margin-left: -10px;
+    margin-right: 7px;
+}
 .dark .r-nav button.active { color: var(--text); }
 .r-nav .ico { width: 16px; height: 16px; opacity: 0.82; flex: 0 0 16px; }
 .r-nav .badge {
