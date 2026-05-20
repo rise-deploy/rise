@@ -518,3 +518,14 @@ export function ConfirmDialog({ isOpen, onClose, onConfirm, title, message, conf
         </Modal>
     );
 }
+
+// ---------- Tooltip ----------
+// Custom hover/focus tooltip, replaces native `title` attributes.
+export function Tooltip({ content, children }: { content: React.ReactNode; children: React.ReactNode }) {
+    return (
+        <span className="r-tip" tabIndex={0}>
+            {children}
+            <span className="r-tip-pop" role="tooltip">{content}</span>
+        </span>
+    );
+}

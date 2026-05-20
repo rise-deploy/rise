@@ -6,7 +6,7 @@ import { copyToClipboard, formatDate, formatISO8601, formatRelativeTimeRounded, 
 import { useToast } from '../components/toast';
 import { Button, ENV_COLOR_STYLES, EnvironmentColorDot, SourceLinkGroup, SourceLinkGroupAction, StatusBadge } from '../components/ui';
 import { MonoSortButton, MonoTable, MonoTableBody, MonoTableEmptyRow, MonoTableFrame, MonoTableHead, MonoTableRow, MonoTd, MonoTh } from '../components/table';
-import { Button as RButton, Combobox, ConfirmDialog, Empty, KV, KVRow, Modal, Panel, PanelBody, PanelHead, Pill, SearchInput, Segmented, Status, Tabs } from '../components/r-ui';
+import { Button as RButton, Combobox, ConfirmDialog, Empty, KV, KVRow, Modal, Panel, PanelBody, PanelHead, Pill, SearchInput, Segmented, Status, Tabs, Tooltip } from '../components/r-ui';
 import { Icon } from '../components/icon';
 import { EnvVarsList } from './resources';
 import { EmptyState, ErrorState, LoadingState } from '../components/states';
@@ -681,7 +681,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
     const [autoScroll, setAutoScroll] = useState(true);
     const [tailLines, setTailLines] = useState(isActiveDeployment ? 1 : 1000);
     const [tailInputValue, setTailInputValue] = useState(isActiveDeployment ? '1' : '1000');
-    const logsEndRef = useRef(null);
+    const logBoxRef = useRef(null);
     const abortControllerRef = useRef(null);
 
     const isLoggable = (status) => {
@@ -689,9 +689,11 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
         return ['Deploying', 'Healthy', 'Unhealthy', 'Stopped', 'Failed', 'Superseded'].includes(status);
     };
 
+    // Scroll the log container itself (not scrollIntoView, which would also
+    // scroll the whole page window).
     const scrollToBottom = () => {
-        if (autoScroll && logsEndRef.current) {
-            logsEndRef.current.scrollIntoView({ behavior: 'smooth' });
+        if (autoScroll && logBoxRef.current) {
+            logBoxRef.current.scrollTop = logBoxRef.current.scrollHeight;
         }
     };
 
@@ -835,21 +837,21 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
     }, [projectName, deploymentId, tailLines]);
 
     // On open, automatically show logs: live-follow active deployments (from
-    // the most recent line), or load the backlog for terminal ones. The
-    // one-shot guard is only armed once the deployment can actually serve
-    // logs, so a deployment that becomes streamable later still auto-follows.
-    const autoLoadedRef = useRef(false);
+    // the most recent line) or load the backlog for terminal ones. Runs once
+    // per deployment; the cleanup stops the stream on unmount. Written so it
+    // survives React StrictMode's mount/unmount/remount cycle.
     useEffect(() => {
-        if (autoLoadedRef.current) return;
-        if (!isLoggable(deploymentStatus)) return;
-        autoLoadedRef.current = true;
-        const terminal = ['Cancelled', 'Stopped', 'Superseded', 'Failed', 'Expired'].includes(deploymentStatus);
-        if (terminal) {
-            loadInitialLogs();
-        } else {
-            startStreaming();
+        if (isLoggable(deploymentStatus)) {
+            const terminal = ['Cancelled', 'Stopped', 'Superseded', 'Failed', 'Expired'].includes(deploymentStatus);
+            if (terminal) {
+                loadInitialLogs();
+            } else {
+                startStreaming();
+            }
         }
-    }, [deploymentStatus, startStreaming, loadInitialLogs]);
+        return () => stopStreaming();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [deploymentId]);
 
     const clearLogs = () => {
         setLogs([]);
@@ -883,12 +885,6 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
         }
     }, [tailLines]); // Only depend on tailLines, not streaming or startStreaming to avoid loops
 
-    useEffect(() => {
-        return () => {
-            stopStreaming();
-        };
-    }, [stopStreaming]);
-
     const [levelFilter, setLevelFilter] = useState('all');
 
     // Heuristic log-level detection for styling + filtering. Raw log lines have
@@ -921,6 +917,12 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
             <div className="r-panel-head">
                 <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
                     <div className="r-panel-title">Runtime logs</div>
+                    {streaming && (
+                        <span className="r-status running" style={{ padding: '2px 9px' }}>
+                            <span className="dot" />
+                            <span>Live streaming</span>
+                        </span>
+                    )}
                     <Segmented
                         value={levelFilter}
                         options={['all', 'info', 'warn', 'error']}
@@ -982,7 +984,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                         <div style={{ flex: 1 }}>Error: {error}</div>
                     </div>
                 )}
-                <div className="r-logs" style={{ height: 'calc(100vh - 340px)', minHeight: 360, flex: 'none' }}>
+                <div ref={logBoxRef} className="r-logs" style={{ height: 'calc(100vh - 340px)', minHeight: 360, flex: 'none' }}>
                     {visibleLogs.length === 0 ? (
                         <div style={{ textAlign: 'center', padding: '32px 0', color: 'oklch(0.55 0.005 80)' }}>
                             {logs.length === 0
@@ -990,28 +992,17 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                                 : 'No log lines match this filter.'}
                         </div>
                     ) : (
-                        <>
-                            {visibleLogs.map((entry) => (
-                                <div
-                                    key={entry.idx}
-                                    className={`lv-${entry.level}`}
-                                    style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}
-                                >
-                                    {entry.log}
-                                </div>
-                            ))}
-                            <div ref={logsEndRef} />
-                        </>
+                        visibleLogs.map((entry) => (
+                            <div
+                                key={entry.idx}
+                                className={`lv-${entry.level}`}
+                                style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}
+                            >
+                                {entry.log}
+                            </div>
+                        ))
                     )}
                 </div>
-                {streaming && (
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--text-muted)' }}>
-                        <span className="r-status running" style={{ padding: '2px 9px' }}>
-                            <span className="dot" />
-                            <span>Live streaming</span>
-                        </span>
-                    </div>
-                )}
             </PanelBody>
         </Panel>
     );
@@ -1624,13 +1615,29 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                     <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
                         <h1 className="r-page-title mono" style={{ fontSize: 20 }}>{deployment.deployment_id}</h1>
                         <Status status={deployment.status} />
-                        {deployment.environment && (
-                            <Pill className="r-row" style={{ gap: 6 }}>
-                                <EnvironmentColorDot color={deployment.environment_color} />
-                                {deployment.environment}
-                            </Pill>
+                        {deployment.environment ? (
+                            <Tooltip
+                                content={
+                                    <>
+                                        <div>Environment: <span className="mono">{deployment.environment}</span></div>
+                                        <div>
+                                            Deployment Group: <span className="mono">{deployment.deployment_group}</span>
+                                            {deployment.deployment_group === 'default' && ' (primary group)'}
+                                        </div>
+                                    </>
+                                }
+                            >
+                                <Pill className="r-row" style={{ gap: 6 }}>
+                                    <EnvironmentColorDot color={deployment.environment_color} />
+                                    <span className="mono">{deployment.environment}</span>
+                                    <span className="mono" style={{ color: 'var(--text-soft)' }}>
+                                        ({deployment.deployment_group})
+                                    </span>
+                                </Pill>
+                            </Tooltip>
+                        ) : (
+                            <Pill className="mono">{deployment.deployment_group}</Pill>
                         )}
-                        <Pill className="mono">{deployment.deployment_group}</Pill>
                     </div>
                     <div className="r-meta-bar" style={{ marginTop: 8 }}>
                         <span>{projectName}</span>

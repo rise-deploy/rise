@@ -906,6 +906,29 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
 .r-logs .lv-warn { color: oklch(0.82 0.12 75); }
 .r-logs .lv-error { color: oklch(0.72 0.16 25); }
 
+/* ---------- Tooltip ---------- */
+.r-tip { position: relative; display: inline-flex; }
+.r-tip-pop {
+    position: absolute;
+    top: calc(100% + 6px);
+    left: 0;
+    z-index: 60;
+    width: max-content;
+    max-width: 320px;
+    padding: 7px 10px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    box-shadow: var(--shadow-md);
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.12s;
+}
+.r-tip:hover .r-tip-pop, .r-tip:focus-within .r-tip-pop { opacity: 1; }
+
 /* ---------- Misc ---------- */
 .r-progress { height: 6px; background: var(--surface-2); border-radius: 2px; overflow: hidden; }
 .r-progress > div { height: 100%; background: var(--accent); border-radius: 2px; }
