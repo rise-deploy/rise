@@ -276,7 +276,7 @@ export function App() {
         id: `team-${t.id || t.name}`,
         group: 'Teams',
         label: t.name,
-        hint: `${t.member_count || 0} members`,
+        hint: `${t.members?.length || 0} members`,
         keywords: ['team', t.name],
         run: () => navigate(`/team/${t.name}`),
     }));

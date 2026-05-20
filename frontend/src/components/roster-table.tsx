@@ -118,7 +118,13 @@ export function RosterTable({ title, sub, addControl, filter, rows, extraColumnL
                                                 : <span style={{ color: 'var(--text-soft)' }}>—</span>}
                                         </td>
                                     )}
-                                    <td style={{ textAlign: 'right' }}>{row.actions}</td>
+                                    <td style={{ textAlign: 'right' }}>
+                                        {row.actions && (
+                                            <div className="row-actions" style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
+                                                {row.actions}
+                                            </div>
+                                        )}
+                                    </td>
                                 </tr>
                             ))}
                         </tbody>

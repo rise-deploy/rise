@@ -73,7 +73,7 @@ export function Home({ user }: HomeProps) {
                 <Stat
                     label="Teams"
                     value={teams.length}
-                    delta={`${teams.reduce((n, t) => n + (t.member_count || 0), 0)} members total`}
+                    delta={`${teams.reduce((n, t) => n + (t.members?.length || 0), 0)} members total`}
                 />
             </StatGrid>
 
@@ -137,7 +137,7 @@ export function Home({ user }: HomeProps) {
                                     <div style={{ flex: 1, minWidth: 0 }}>
                                         <div style={{ fontWeight: 500, fontSize: 13 }}>{t.name}</div>
                                         <div style={{ color: 'var(--text-soft)', fontSize: 11.5 }}>
-                                            {t.member_count || 0} member{(t.member_count || 0) === 1 ? '' : 's'}
+                                            {t.members?.length || 0} member{(t.members?.length || 0) === 1 ? '' : 's'}
                                         </div>
                                     </div>
                                 </div>

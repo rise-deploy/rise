@@ -524,18 +524,11 @@ export function TeamDetail({ teamName, currentUser }) {
                     <div className="r-section-title" style={{ marginBottom: 14 }}>
                         Projects ({teamProjects.length})
                     </div>
-                    {teamProjects.length > 0 ? (
-                        <ProjectTable
-                            projects={teamProjects.slice().sort((a, b) => a.name.localeCompare(b.name))}
-                            onRowClick={(project) => navigate(`/project/${project.name}`)}
-                        />
-                    ) : (
-                        <Panel>
-                            <div className="r-panel-body">
-                                <Empty title="No projects owned by or shared with this team" />
-                            </div>
-                        </Panel>
-                    )}
+                    <ProjectTable
+                        projects={teamProjects.slice().sort((a, b) => a.name.localeCompare(b.name))}
+                        onRowClick={(project) => navigate(`/project/${project.name}`)}
+                        emptyText="No projects owned by or shared with this team"
+                    />
                 </div>
             </div>
 

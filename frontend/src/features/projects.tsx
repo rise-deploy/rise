@@ -53,8 +53,9 @@ export function AppUsersList({ projectName, project, accessClasses, currentUserE
     const [selectedTeamId, setSelectedTeamId] = useState('');
     const [addingTeam, setAddingTeam] = useState(false);
 
-    // Add-service-account modal
+    // Add / edit service-account modal
     const [addSaOpen, setAddSaOpen] = useState(false);
+    const [editingSa, setEditingSa] = useState(null);
     const [saIssuerUrl, setSaIssuerUrl] = useState('');
     const [saAud, setSaAud] = useState('');
     const [saClaimsText, setSaClaimsText] = useState('{}');
@@ -168,11 +169,26 @@ export function AppUsersList({ projectName, project, accessClasses, currentUserE
     const openAddUser = () => { setNewUserEmail(''); setAddUserOpen(true); };
     const openAddTeam = () => { setSelectedTeamId(''); setAddTeamOpen(true); };
     const openAddSa = () => {
+        setEditingSa(null);
         setSaIssuerUrl('');
         setSaAud(CONFIG.backendUrl);
         setSaClaimsText('{}');
         setSaSelectedEnvs([]);
         setAddSaOpen(true);
+    };
+    const openEditSa = (sa) => {
+        setEditingSa(sa);
+        setSaIssuerUrl(sa.issuer_url || '');
+        const claims = { ...(sa.claims || {}) };
+        setSaAud(claims.aud || CONFIG.backendUrl);
+        delete claims.aud;
+        setSaClaimsText(Object.keys(claims).length ? JSON.stringify(claims, null, 2) : '{}');
+        setSaSelectedEnvs(sa.allowed_environments || []);
+        setAddSaOpen(true);
+    };
+    const closeSaModal = () => {
+        setAddSaOpen(false);
+        setEditingSa(null);
     };
 
     const handleAddUser = async () => {
@@ -218,7 +234,7 @@ export function AppUsersList({ projectName, project, accessClasses, currentUserE
         }
     };
 
-    const handleAddServiceAccount = async () => {
+    const handleSaveServiceAccount = async () => {
         if (!saIssuerUrl.trim()) {
             showToast('Issuer URL is required', 'error');
             return;
@@ -239,13 +255,18 @@ export function AppUsersList({ projectName, project, accessClasses, currentUserE
 
         setAddingSa(true);
         try {
-            await api.createServiceAccount(projectName, saIssuerUrl.trim(), claims, allowedEnvs);
-            showToast('Service account created successfully', 'success');
-            setAddSaOpen(false);
+            if (editingSa) {
+                await api.updateServiceAccount(projectName, editingSa.id, saIssuerUrl.trim(), claims, allowedEnvs);
+                showToast('Service account updated successfully', 'success');
+            } else {
+                await api.createServiceAccount(projectName, saIssuerUrl.trim(), claims, allowedEnvs);
+                showToast('Service account created successfully', 'success');
+            }
+            closeSaModal();
             await loadServiceAccounts();
             onProjectUpdated();
         } catch (err) {
-            showToast(`Failed to create service account: ${err.message}`, 'error');
+            showToast(`Failed to ${editingSa ? 'update' : 'create'} service account: ${err.message}`, 'error');
         } finally {
             setAddingSa(false);
         }
@@ -315,7 +336,7 @@ export function AppUsersList({ projectName, project, accessClasses, currentUserE
         })),
         ...displayedTeams.map(t => {
             const matched = teams.find(team => team.id === t.id || team.name === t.name);
-            const memberCount = matched?.member_count;
+            const memberCount = matched?.members?.length;
             return {
                 key: `team-${t.id || t.name}`,
                 kind: 'team',
@@ -336,7 +357,12 @@ export function AppUsersList({ projectName, project, accessClasses, currentUserE
             name: <span style={{ fontWeight: 500 }}>{sa.email}</span>,
             kindLabel: KIND_META.sa.label,
             extra: null,
-            actions: removeAction(() => setConfirmRemove({ kind: 'sa', sa, name: sa.email })),
+            actions: (
+                <>
+                    <RButton size="sm" icon="edit" onClick={() => openEditSa(sa)}>Edit</RButton>
+                    {removeAction(() => setConfirmRemove({ kind: 'sa', sa, name: sa.email }))}
+                </>
+            ),
         })),
     ];
 
@@ -492,14 +518,14 @@ export function AppUsersList({ projectName, project, accessClasses, currentUserE
 
             <RModal
                 isOpen={addSaOpen}
-                onClose={() => setAddSaOpen(false)}
-                title="Add Service Account"
+                onClose={closeSaModal}
+                title={editingSa ? 'Edit Service Account' : 'Add Service Account'}
                 sub="Service accounts grant workload identity access for CI/CD or external systems."
                 footer={
                     <>
-                        <RButton onClick={() => setAddSaOpen(false)} disabled={addingSa}>Cancel</RButton>
-                        <RButton variant="primary" onClick={handleAddServiceAccount} loading={addingSa}>
-                            Create Service Account
+                        <RButton onClick={closeSaModal} disabled={addingSa}>Cancel</RButton>
+                        <RButton variant="primary" onClick={handleSaveServiceAccount} loading={addingSa}>
+                            {editingSa ? 'Save changes' : 'Create Service Account'}
                         </RButton>
                     </>
                 }
