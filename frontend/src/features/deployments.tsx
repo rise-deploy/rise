@@ -1521,9 +1521,6 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                             <span className="mono" style={{ fontSize: 12, wordBreak: 'break-all' }}>{deployment.image_digest}</span>
                         </KVRow>
                     )}
-                    <KVRow k="Replicas">{deployment.replicas}</KVRow>
-                    <KVRow k="CPU">{deployment.cpu}</KVRow>
-                    <KVRow k="Memory">{deployment.memory}</KVRow>
                     <KVRow k="Created by">{deployment.created_by_email || '-'}</KVRow>
                     <KVRow k="Started">
                         <span title={formatISO8601(deployment.created)}>{formatRelativeTimeRounded(deployment.created)}</span>
@@ -1537,6 +1534,19 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                             <SourceLinkGroup jobUrl={deployment.job_url} prUrl={deployment.pull_request_url} />
                         </KVRow>
                     )}
+                </KV>
+            </PanelBody>
+        </Panel>
+    );
+
+    const runtimeKv = (
+        <Panel>
+            <PanelHead title="Runtime" />
+            <PanelBody>
+                <KV>
+                    <KVRow k="Replicas">{deployment.replicas}</KVRow>
+                    <KVRow k="CPU">{deployment.cpu}</KVRow>
+                    <KVRow k="Memory">{deployment.memory}</KVRow>
                 </KV>
             </PanelBody>
         </Panel>
@@ -1631,6 +1641,7 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                     <DeploymentLogs projectName={projectName} deploymentId={deploymentId} deploymentStatus={deployment.status} />
                     <div className="r-stack">
                         {buildKv}
+                        {runtimeKv}
                         {routingPanel}
                     </div>
                 </div>

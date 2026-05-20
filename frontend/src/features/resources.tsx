@@ -10,11 +10,17 @@ import {
     Alert as RAlert,
     Button as RButton,
     Empty as REmpty,
+    Field as RField,
     GroupBar as RGroupBar,
+    Input as RInput,
     KV as RKV,
     KVRow as RKVRow,
     Panel as RPanel,
+    PanelBody as RPanelBody,
+    PanelHead as RPanelHead,
     SearchInput as RSearchInput,
+    Status as RStatus,
+    Tabs as RTabs,
 } from '../components/r-ui';
 import { Icon } from '../components/icon';
 import { LoadingState, ErrorState } from '../components/states';
@@ -2074,54 +2080,60 @@ function renderExtensionStatusBadge(extension) {
     return <MonoStatusPill tone={badgeTone}>{statusText}</MonoStatusPill>;
 }
 
+// Mono JSON block used across extension detail tabs.
+const extJsonPreStyle = {
+    margin: 0,
+    fontSize: 12,
+    lineHeight: 1.5,
+    overflow: 'auto',
+    maxHeight: 420,
+    whiteSpace: 'pre',
+};
+
+function ExtensionJsonPanel({ title, sub, value, maxHeight }: any) {
+    return (
+        <RPanel>
+            <RPanelHead title={title} sub={sub} />
+            <RPanelBody>
+                <pre className="mono" style={{ ...extJsonPreStyle, maxHeight: maxHeight ?? extJsonPreStyle.maxHeight }}>
+                    {JSON.stringify(value, null, 2)}
+                </pre>
+            </RPanelBody>
+        </RPanel>
+    );
+}
+
 // Generic Extension Detail View (fallback for extensions without custom UI)
 function GenericExtensionDetailView({ extension }) {
     return (
-        <div className="space-y-6">
-            <section>
-                <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-200 mb-3">Status</h2>
-                <div className="bg-white dark:bg-gray-900 rounded p-4">
-                    <p className="text-gray-700 dark:text-gray-300">{extension.status_summary}</p>
-
+        <div className="r-stack">
+            <RPanel>
+                <RPanelHead title="Status" />
+                <RPanelBody>
+                    <p style={{ margin: 0, color: 'var(--text)' }}>{extension.status_summary}</p>
                     {extension.status && extension.status.error && (
-                        <div className="mt-3 p-3 bg-red-900/20 border border-red-700 rounded">
-                            <p className="text-sm text-red-300">
+                        <div style={{ marginTop: 12 }}>
+                            <RAlert tone="err">
                                 <strong>Error:</strong> {extension.status.error}
-                            </p>
+                            </RAlert>
                         </div>
                     )}
-                </div>
-            </section>
+                </RPanelBody>
+            </RPanel>
 
-            <section>
-                <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-200 mb-3">Configuration</h2>
-                <pre className="bg-white dark:bg-gray-900 rounded p-4 overflow-x-auto">
-                    <code className="text-sm text-gray-700 dark:text-gray-300">
-                        {JSON.stringify(extension.spec, null, 2)}
-                    </code>
-                </pre>
-            </section>
+            <ExtensionJsonPanel title="Configuration" value={extension.spec} />
 
-            <section>
-                <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-200 mb-3">Full Status</h2>
-                <pre className="bg-white dark:bg-gray-900 rounded p-4 overflow-x-auto">
-                    <code className="text-sm text-gray-700 dark:text-gray-300">
-                        {JSON.stringify(extension.status, null, 2)}
-                    </code>
-                </pre>
-            </section>
+            <ExtensionJsonPanel title="Full Status" value={extension.status} />
 
-            <section>
-                <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-200 mb-3">Metadata</h2>
-                <div className="bg-white dark:bg-gray-900 rounded p-4 space-y-2">
-                    <p className="text-sm text-gray-700 dark:text-gray-300">
-                        <span className="text-gray-600 dark:text-gray-500">Created:</span> {formatDate(extension.created)}
-                    </p>
-                    <p className="text-sm text-gray-700 dark:text-gray-300">
-                        <span className="text-gray-600 dark:text-gray-500">Updated:</span> {formatDate(extension.updated)}
-                    </p>
-                </div>
-            </section>
+            <RPanel>
+                <RPanelHead title="Metadata" />
+                <RPanelBody>
+                    <RKV>
+                        <RKVRow k="Created">{formatDate(extension.created)}</RKVRow>
+                        <RKVRow k="Updated">{formatDate(extension.updated)}</RKVRow>
+                    </RKV>
+                </RPanelBody>
+            </RPanel>
         </div>
     );
 }
@@ -2340,64 +2352,88 @@ export function ExtensionDetailPage({ projectName, extensionType: extensionTypeP
     };
 
     if (loading) {
-        return (
-            <div className="flex items-center justify-center min-h-[400px]">
-                <div className="w-12 h-12 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin"></div>
-            </div>
-        );
+        return <LoadingState label="Loading extension…" />;
     }
 
     if (error || !extensionType) {
-        return (
-            <div className="max-w-7xl mx-auto">
-                <div className="bg-red-900/20 border border-red-700 rounded-lg p-6">
-                    <h2 className="text-lg font-semibold text-red-300 mb-2">Error</h2>
-                    <p className="text-red-200">{error || 'Extension type not found'}</p>
-                </div>
-            </div>
-        );
+        return <ErrorState message={error || 'Extension type not found'} />;
     }
 
     const CustomDetailView = getExtensionDetailView(extensionType.extension_type);
+    const hasUI = hasExtensionUI(extensionType.extension_type);
+    const iconUrl = getExtensionIcon(extensionType.extension_type);
+    const unsavedMark = hasUnsavedChanges ? ' *' : '';
+
+    // Build the tab set, keeping the original conditionals.
+    const tabs = [];
+    if (isEnabled) tabs.push({ id: 'overview', label: 'Overview' });
+    if (hasUI) tabs.push({ id: 'configure', label: `Configure${unsavedMark}` });
+    tabs.push({ id: 'config', label: `Spec${unsavedMark}` });
+    if (isEnabled) tabs.push({ id: 'status', label: 'Status' });
+    tabs.push({ id: 'schema', label: 'Schema' });
+    if (isEnabled) tabs.push({ id: 'delete', label: 'Delete' });
+
+    const instanceNameField = (id) => (
+        <RField
+            label="Extension Name"
+            hint="Give this extension instance a unique name. You can create multiple instances of the same extension type with different names."
+        >
+            <RInput
+                id={id}
+                value={instanceName}
+                onChange={(e) => setInstanceName(e.target.value)}
+                placeholder={getDefaultExtensionName(extensionTypeProp)}
+                required
+            />
+        </RField>
+    );
+
+    const saveButton = (
+        <Button
+            variant="primary"
+            onClick={handleSave}
+            loading={saving}
+            disabled={isPreviewOnly}
+            className={!isEnabled ? 'mono-btn-cta' : ''}
+        >
+            {isPreviewOnly ? 'Preview Only' : (isEnabled ? 'Update' : 'Enable')}
+        </Button>
+    );
 
     return (
-        <div className="max-w-7xl mx-auto">
-            <div className="bg-gray-100 dark:bg-gray-800 rounded-lg shadow-xl p-6">
-                <div className="flex items-center justify-between mb-6">
-                    <div className="flex items-center space-x-4">
-                        {getExtensionIcon(extensionType.extension_type) && (
-                            <img
-                                src={getExtensionIcon(extensionType.extension_type)}
-                                alt={extensionType.display_name}
-                                className="w-12 h-12 rounded object-contain"
-                            />
-                        )}
-                        <div>
-                            <h1 className="text-2xl font-bold text-gray-900 dark:text-white">
-                                {extensionType.display_name}
-                            </h1>
-                            <p className="text-gray-600 dark:text-gray-400">{extensionType.description}</p>
-                        </div>
-                    </div>
-                    <div className="flex items-center gap-3">
-                        <Button
-                            variant="secondary"
-                            size="sm"
-                            onClick={() => navigate(extensionDocsHref(extensionType.extension_type))}
-                        >
-                            Extension Docs
-                        </Button>
-                        {isEnabled ? (
-                            renderExtensionStatusBadge(enabledExtension)
-                        ) : (
-                            <MonoStatusPill tone="muted">Not Enabled</MonoStatusPill>
-                        )}
-                    </div>
+        <section>
+            <div className="r-page-head">
+                {iconUrl && (
+                    <img
+                        src={iconUrl}
+                        alt={extensionType.display_name}
+                        style={{ width: 44, height: 44, borderRadius: 6, objectFit: 'contain' }}
+                    />
+                )}
+                <div className="title-stack">
+                    <h1 className="r-page-title">{extensionType.display_name}</h1>
+                    {extensionType.description && (
+                        <div className="r-page-sub">{extensionType.description}</div>
+                    )}
                 </div>
+                <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => navigate(extensionDocsHref(extensionType.extension_type))}
+                >
+                    Extension Docs
+                </Button>
+                {isEnabled ? (
+                    renderExtensionStatusBadge(enabledExtension)
+                ) : (
+                    <RStatus status="Not Enabled" />
+                )}
+            </div>
 
-                {isPreviewOnly && (
-                    <div className="mb-6 rounded-lg border border-amber-400/40 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-500/40 dark:bg-amber-900/20 dark:text-amber-100">
-                        <div className="flex items-center justify-between gap-3">
+            {isPreviewOnly && (
+                <div style={{ marginBottom: 20 }}>
+                    <RAlert tone="warn">
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
                             <span>Preview mode: this extension UI is available for configuration testing only. Install the backend provider to enable create and update actions.</span>
                             <Button
                                 variant="secondary"
@@ -2407,48 +2443,13 @@ export function ExtensionDetailPage({ projectName, extensionType: extensionTypeP
                                 Disable Preview Mode
                             </Button>
                         </div>
-                    </div>
-                )}
-
-                {/* Tab Navigation */}
-                <div className="border-b border-gray-300 dark:border-gray-700 mb-6">
-                    <div className="flex gap-6">
-                        {/* Left-aligned: Extension-specific tabs */}
-                        {isEnabled && (
-                            <MonoTabButton active={activeTab === 'overview'} onClick={() => setActiveTab('overview')}>
-                                Overview
-                            </MonoTabButton>
-                        )}
-                        {hasExtensionUI(extensionType.extension_type) && (
-                            <MonoTabButton active={activeTab === 'configure'} onClick={() => setActiveTab('configure')}>
-                                Configure{hasUnsavedChanges && ' *'}
-                            </MonoTabButton>
-                        )}
-
-                        {/* Spacer to push common tabs to the right */}
-                        <div className="flex-1"></div>
-
-                        {/* Right-aligned: Common tabs */}
-                        <MonoTabButton active={activeTab === 'config'} onClick={() => setActiveTab('config')}>
-                            Spec{hasUnsavedChanges && ' *'}
-                        </MonoTabButton>
-                        {isEnabled && (
-                            <MonoTabButton active={activeTab === 'status'} onClick={() => setActiveTab('status')}>
-                                Status
-                            </MonoTabButton>
-                        )}
-                        <MonoTabButton active={activeTab === 'schema'} onClick={() => setActiveTab('schema')}>
-                            Schema
-                        </MonoTabButton>
-                        {isEnabled && (
-                            <MonoTabButton tone="danger" active={activeTab === 'delete'} onClick={() => setActiveTab('delete')}>
-                                Delete
-                            </MonoTabButton>
-                        )}
-                    </div>
+                    </RAlert>
                 </div>
+            )}
 
-                {/* Tab Content */}
+            <RTabs tabs={tabs} active={activeTab} onChange={setActiveTab} />
+
+            <div>
                 {activeTab === 'overview' && isEnabled && CustomDetailView && (
                     <CustomDetailView extension={enabledExtension} projectName={projectName} />
                 )}
@@ -2458,148 +2459,117 @@ export function ExtensionDetailPage({ projectName, extensionType: extensionTypeP
                 )}
 
                 {activeTab === 'configure' && extensionAPI?.renderConfigureTab && (
-                    <div className="space-y-4">
+                    <div className="r-stack">
                         {!isEnabled && (
-                            <div className="pb-4 border-b border-gray-300 dark:border-gray-700">
-                                <FormField
-                                    label="Extension Name"
-                                    id="extension-instance-name"
-                                    value={instanceName}
-                                    onChange={(e) => setInstanceName(e.target.value)}
-                                    placeholder={getDefaultExtensionName(extensionTypeProp)}
-                                    required
-                                />
-                                <p className="text-xs text-gray-600 dark:text-gray-500 mt-2">
-                                    Give this extension instance a unique name. You can create multiple instances of the same extension type with different names.
-                                </p>
-                            </div>
+                            <RPanel>
+                                <RPanelBody>{instanceNameField('extension-instance-name')}</RPanelBody>
+                            </RPanel>
                         )}
                         {extensionAPI.renderConfigureTab(uiSpec, extensionType.spec_schema, handleUiSpecChange, projectName, instanceName, isEnabled)}
-                        <div className="flex justify-end gap-3 pt-4 border-t border-gray-300 dark:border-gray-700">
-                            <Button
-                                variant="primary"
-                                onClick={handleSave}
-                                loading={saving}
-                                disabled={isPreviewOnly}
-                                className={!isEnabled ? 'mono-btn-cta' : ''}
-                            >
-                                {isPreviewOnly ? 'Preview Only' : (isEnabled ? 'Update' : 'Enable')}
-                            </Button>
+                        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12 }}>
+                            {saveButton}
                         </div>
                     </div>
                 )}
 
                 {activeTab === 'config' && (
-                    <div className="space-y-4">
+                    <div className="r-stack">
                         {!isEnabled && (
-                            <div className="pb-4 border-b border-gray-300 dark:border-gray-700">
-                                <FormField
-                                    label="Extension Name"
-                                    id="extension-instance-name-config"
-                                    value={instanceName}
-                                    onChange={(e) => setInstanceName(e.target.value)}
-                                    placeholder={getDefaultExtensionName(extensionTypeProp)}
-                                    required
-                                />
-                                <p className="text-xs text-gray-600 dark:text-gray-500 mt-2">
-                                    Give this extension instance a unique name. You can create multiple instances of the same extension type with different names.
-                                </p>
-                            </div>
+                            <RPanel>
+                                <RPanelBody>{instanceNameField('extension-instance-name-config')}</RPanelBody>
+                            </RPanel>
                         )}
-                        <FormField
-                            label="Configuration Spec (JSON)"
-                            id="extension-spec"
-                            type="textarea"
-                            value={formData.spec}
-                            onChange={(e) => handleJsonSpecChange(e.target.value)}
-                            placeholder="{}"
-                            required
-                            rows={15}
-                        />
-                        <p className="text-sm text-gray-600 dark:text-gray-500">
-                            Enter the extension configuration as a JSON object. See the Schema tab and Project Extensions docs for valid fields and examples.
-                            {hasExtensionUI(extensionType.extension_type) && <span> Use the Configure tab for a form-based interface.</span>}
-                        </p>
-                        <p className="text-sm text-gray-600 dark:text-gray-500">
-                            Extension docs: <a href={extensionDocsHref(extensionType.extension_type)} onClick={(e) => {
-                                e.preventDefault();
-                                navigate(extensionDocsHref(extensionType.extension_type));
-                            }} className="underline">Open {extensionType.extension_type} documentation</a>
-                        </p>
-                        <div className="flex justify-end gap-3 pt-4 border-t border-gray-300 dark:border-gray-700">
-                            <Button
-                                variant="primary"
-                                onClick={handleSave}
-                                loading={saving}
-                                disabled={isPreviewOnly}
-                                className={!isEnabled ? 'mono-btn-cta' : ''}
-                            >
-                                {isPreviewOnly ? 'Preview Only' : (isEnabled ? 'Update' : 'Enable')}
-                            </Button>
+                        <RPanel>
+                            <RPanelHead
+                                title="Configuration Spec (JSON)"
+                                sub="Enter the extension configuration as a JSON object. See the Schema tab and Project Extensions docs for valid fields and examples."
+                            />
+                            <RPanelBody>
+                                <FormField
+                                    id="extension-spec"
+                                    type="textarea"
+                                    value={formData.spec}
+                                    onChange={(e) => handleJsonSpecChange(e.target.value)}
+                                    placeholder="{}"
+                                    rows={15}
+                                />
+                                <p style={{ fontSize: 12.5, color: 'var(--text-soft)', marginTop: 8 }}>
+                                    {hasUI && 'Use the Configure tab for a form-based interface. '}
+                                    Extension docs:{' '}
+                                    <a
+                                        href={extensionDocsHref(extensionType.extension_type)}
+                                        onClick={(e) => {
+                                            e.preventDefault();
+                                            navigate(extensionDocsHref(extensionType.extension_type));
+                                        }}
+                                        className="r-link"
+                                    >
+                                        Open {extensionType.extension_type} documentation
+                                    </a>
+                                </p>
+                            </RPanelBody>
+                        </RPanel>
+                        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12 }}>
+                            {saveButton}
                         </div>
                     </div>
                 )}
 
                 {activeTab === 'status' && isEnabled && (
-                    <div className="space-y-4">
-                        <div>
-                            <h4 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">Status Summary</h4>
-                            <p className="text-gray-900 dark:text-gray-200">{enabledExtension.status_summary}</p>
-                        </div>
-
-                        <div>
-                            <h4 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">Current Spec</h4>
-                            <pre className="text-xs font-mono text-gray-700 dark:text-gray-300 bg-white dark:bg-gray-900 p-3 rounded overflow-x-auto">
-                                {JSON.stringify(enabledExtension.spec, null, 2)}
-                            </pre>
-                        </div>
-
-                        <div>
-                            <h4 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">Full Status</h4>
-                            <pre className="text-xs font-mono text-gray-700 dark:text-gray-300 bg-white dark:bg-gray-900 p-3 rounded overflow-x-auto max-h-96">
-                                {JSON.stringify(enabledExtension.status, null, 2)}
-                            </pre>
-                        </div>
-
-                        <div className="text-xs text-gray-600 dark:text-gray-500">
-                            <p>Created: {formatDate(enabledExtension.created)}</p>
-                            <p>Updated: {formatDate(enabledExtension.updated)}</p>
-                        </div>
+                    <div className="r-stack">
+                        <RPanel>
+                            <RPanelHead title="Status Summary" />
+                            <RPanelBody>
+                                <p style={{ margin: 0, color: 'var(--text)' }}>{enabledExtension.status_summary}</p>
+                            </RPanelBody>
+                        </RPanel>
+                        <ExtensionJsonPanel title="Current Spec" value={enabledExtension.spec} />
+                        <ExtensionJsonPanel title="Full Status" value={enabledExtension.status} />
+                        <RPanel>
+                            <RPanelHead title="Metadata" />
+                            <RPanelBody>
+                                <RKV>
+                                    <RKVRow k="Created">{formatDate(enabledExtension.created)}</RKVRow>
+                                    <RKVRow k="Updated">{formatDate(enabledExtension.updated)}</RKVRow>
+                                </RKV>
+                            </RPanelBody>
+                        </RPanel>
                     </div>
                 )}
 
                 {activeTab === 'schema' && (
-                    <div className="space-y-4">
-                        <h4 className="text-sm font-semibold text-gray-700 dark:text-gray-300">Schema</h4>
-                        <pre className="text-xs font-mono text-gray-700 dark:text-gray-300 bg-white dark:bg-gray-900 p-4 rounded overflow-x-auto max-h-96">
-                            {JSON.stringify(extensionType.spec_schema, null, 2)}
-                        </pre>
-                        <p className="text-sm text-gray-600 dark:text-gray-500">
-                            This JSON schema defines the valid structure for the extension configuration.
-                        </p>
-                    </div>
+                    <ExtensionJsonPanel
+                        title="Schema"
+                        sub="This JSON schema defines the valid structure for the extension configuration."
+                        value={extensionType.spec_schema}
+                    />
                 )}
 
                 {activeTab === 'delete' && isEnabled && (
-                    <div className="space-y-4">
-                        <div className="bg-red-900/20 border border-red-700 rounded-lg p-4">
-                            <h4 className="text-sm font-semibold text-red-300 mb-2">Warning: Permanent Deletion</h4>
-                            <p className="text-sm text-red-200">
+                    <div className="r-stack">
+                        <RAlert tone="err">
+                            <strong>Warning: Permanent Deletion</strong>
+                            <p style={{ margin: '4px 0 0' }}>
                                 Deleting this extension will deprovision all resources created by this extension.
                                 This action cannot be undone.
                             </p>
-                        </div>
+                        </RAlert>
 
-                        <FormField
-                            label={`Type the extension instance name "${enabledExtension.extension}" to confirm deletion`}
-                            id="delete-confirm-name"
-                            value={deleteConfirmName}
-                            onChange={(e) => setDeleteConfirmName(e.target.value)}
-                            placeholder={enabledExtension.extension}
-                            required
-                        />
+                        <RPanel>
+                            <RPanelBody>
+                                <RField label={`Type the extension instance name "${enabledExtension.extension}" to confirm deletion`}>
+                                    <RInput
+                                        id="delete-confirm-name"
+                                        value={deleteConfirmName}
+                                        onChange={(e) => setDeleteConfirmName(e.target.value)}
+                                        placeholder={enabledExtension.extension}
+                                        required
+                                    />
+                                </RField>
+                            </RPanelBody>
+                        </RPanel>
 
-                        <div className="flex justify-end gap-3 pt-4 border-t border-gray-300 dark:border-gray-700">
+                        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12 }}>
                             <Button
                                 variant="secondary"
                                 onClick={() => setActiveTab('overview')}
@@ -2619,6 +2589,6 @@ export function ExtensionDetailPage({ projectName, extensionType: extensionTypeP
                     </div>
                 )}
             </div>
-        </div>
+        </section>
     );
 }
