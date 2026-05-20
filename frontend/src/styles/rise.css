@@ -624,11 +624,11 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
 }
 .r-status .dot { width: 6px; height: 6px; border-radius: 50%; flex: 0 0 6px; }
 
-.r-status.healthy, .r-status.running, .r-status.ok {
+.r-status.healthy, .r-status.running, .r-status.ok, .r-status.available, .r-status.active {
     color: var(--ok);
     background: var(--ok-bg);
 }
-.r-status.healthy .dot, .r-status.running .dot, .r-status.ok .dot {
+.r-status.healthy .dot, .r-status.running .dot, .r-status.ok .dot, .r-status.available .dot, .r-status.active .dot {
     background: var(--ok);
     box-shadow: 0 0 0 3px color-mix(in oklch, var(--ok) 30%, transparent);
 }
@@ -645,22 +645,26 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
 .r-status.unhealthy .dot { animation: r-pulse-soft 1.6s infinite; }
 
 .r-status.building, .r-status.deploying, .r-status.queued, .r-status.pending,
-.r-status.pushing, .r-status.pushed, .r-status.warn {
+.r-status.pushing, .r-status.pushed, .r-status.warn,
+.r-status.creating, .r-status.provisioning, .r-status.updating, .r-status.deletion_blocked {
     color: var(--warn);
     background: var(--warn-bg);
 }
 .r-status.building .dot, .r-status.deploying .dot, .r-status.queued .dot, .r-status.pending .dot,
-.r-status.pushing .dot, .r-status.pushed .dot, .r-status.warn .dot { background: var(--warn); }
+.r-status.pushing .dot, .r-status.pushed .dot, .r-status.warn .dot,
+.r-status.creating .dot, .r-status.provisioning .dot, .r-status.updating .dot, .r-status.deletion_blocked .dot { background: var(--warn); }
 .r-status.building .dot, .r-status.deploying .dot { animation: r-pulse 1.4s infinite; }
 
 .r-status.superseded, .r-status.stopped, .r-status.cancelled, .r-status.expired,
-.r-status.terminating, .r-status.inactive, .r-status.muted {
+.r-status.terminating, .r-status.inactive, .r-status.muted,
+.r-status.deleting, .r-status.deleted, .r-status.unknown {
     color: var(--text-soft);
     background: var(--surface-2);
     border: 1px solid var(--border-faint);
 }
 .r-status.superseded .dot, .r-status.stopped .dot, .r-status.cancelled .dot, .r-status.expired .dot,
-.r-status.terminating .dot, .r-status.inactive .dot, .r-status.muted .dot { background: var(--text-soft); }
+.r-status.terminating .dot, .r-status.inactive .dot, .r-status.muted .dot,
+.r-status.deleting .dot, .r-status.deleted .dot, .r-status.unknown .dot { background: var(--text-soft); }
 
 .r-status.bare { padding: 0; background: transparent; border: none; }
 
