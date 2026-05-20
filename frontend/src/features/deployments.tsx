@@ -583,7 +583,10 @@ export function DeploymentsList({ projectName }) {
                     Previous
                 </RButton>
                 <span style={{ fontSize: 12.5, color: 'var(--text-muted)' }}>
-                    Page {page + 1} · showing {deployments.length} deployment{deployments.length === 1 ? '' : 's'}
+                    Page {page + 1} · showing{' '}
+                    {filteredDeployments.length === deployments.length
+                        ? `${deployments.length} deployment${deployments.length === 1 ? '' : 's'}`
+                        : `${filteredDeployments.length} of ${deployments.length} deployment${deployments.length === 1 ? '' : 's'}`}
                 </span>
                 <RButton
                     size="sm"
