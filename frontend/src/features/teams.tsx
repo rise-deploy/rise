@@ -470,6 +470,13 @@ export function TeamDetail({ teamName, currentUser }) {
         ) : null,
     }));
 
+    const isTeamOwnedProject = (project) => {
+        const owner = project.owner;
+        if (!owner) return false;
+        if (team.id && owner.id) return owner.id === team.id;
+        return !owner.email && owner.name === team.name;
+    };
+
     return (
         <section>
             <div className="r-page-head">
@@ -521,13 +528,19 @@ export function TeamDetail({ teamName, currentUser }) {
                 />
 
                 <div>
-                    <div className="r-section-title" style={{ marginBottom: 14 }}>
-                        Projects ({teamProjects.length})
+                    <div style={{ marginBottom: 14 }}>
+                        <div className="r-section-title">Projects ({teamProjects.length})</div>
+                        {teamProjects.length > 0 && (
+                            <div className="r-section-sub">
+                                Highlighted rows are owned by this team. The rest are shared with it via project access.
+                            </div>
+                        )}
                     </div>
                     <ProjectTable
                         projects={teamProjects.slice().sort((a, b) => a.name.localeCompare(b.name))}
                         onRowClick={(project) => navigate(`/project/${project.name}`)}
                         emptyText="No projects owned by or shared with this team"
+                        isOwnRow={isTeamOwnedProject}
                     />
                 </div>
             </div>

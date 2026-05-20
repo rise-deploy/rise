@@ -797,6 +797,10 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
 .r-table tr.click:hover td { background: var(--hover); }
 .r-table .row-actions { opacity: 0; transition: opacity 0.14s; }
 .r-table tr:hover .row-actions { opacity: 1; }
+/* Accent-highlighted row (e.g. projects a team owns vs. has access to). */
+.r-table tr.r-row-own td { background: var(--accent-soft); }
+.r-table tr.r-row-own.click:hover td { background: var(--accent-soft); filter: brightness(0.97); }
+.r-table tr.r-row-own td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
 
 /* ---------- Stat group ---------- */
 .r-stat-grid {

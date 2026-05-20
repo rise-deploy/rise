@@ -3,10 +3,9 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
 import { useToast } from '../components/toast';
-import { Button, Combobox, Field, Input, Modal, Panel, SearchInput, Segmented, Status, Stat, StatGrid, cx } from '../components/r-ui';
-import { Icon } from '../components/icon';
-import { LoadingState, ErrorState, EmptyState } from '../components/states';
-import { formatRelativeTimeRounded, stripUrlScheme } from '../lib/utils';
+import { Button, Combobox, Field, Input, Modal, SearchInput, Segmented, Stat, StatGrid } from '../components/r-ui';
+import { ProjectTable } from '../components/project-table';
+import { LoadingState, ErrorState } from '../components/states';
 
 interface Project {
     id?: string;
@@ -108,12 +107,6 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
         deploying: projects.filter(p => ['deploying', 'building', 'pushing', 'pending'].includes((p.status || '').toLowerCase())).length,
     };
 
-    const ownerInfo = (p: Project) => {
-        if (p.owner?.email) return { type: 'user' as const, label: p.owner.email };
-        if (p.owner?.name) return { type: 'team' as const, label: p.owner.name };
-        return null;
-    };
-
     return (
         <section>
             <div className="r-page-head">
@@ -158,69 +151,12 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
                 )}
             </div>
 
-            <Panel>
-                {filtered.length === 0 ? (
-                    <div style={{ padding: 36, textAlign: 'center', color: 'var(--text-muted)' }}>
-                        No projects match your filters.
-                    </div>
-                ) : (
-                    <table className="r-table">
-                        <thead>
-                            <tr>
-                                <th>Project</th>
-                                <th>Status</th>
-                                <th>Primary URL</th>
-                                <th>Owner</th>
-                                <th>Access</th>
-                                <th style={{ textAlign: 'right' }}>Updated</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {filtered.map(p => {
-                                const owner = ownerInfo(p);
-                                return (
-                                    <tr key={p.id || p.name} className="click" onClick={() => navigate(`/project/${p.name}`)}>
-                                        <td style={{ maxWidth: 280 }}>
-                                            <div style={{ fontWeight: 500, fontSize: 13.5 }}>{p.name}</div>
-                                        </td>
-                                        <td><Status status={p.status || 'Unknown'} /></td>
-                                        <td style={{ maxWidth: 300 }}>
-                                            {p.primary_url ? (
-                                                <a
-                                                    className="r-link mono"
-                                                    style={{ fontSize: 12.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'inline-block', maxWidth: '100%' }}
-                                                    href={p.primary_url}
-                                                    target="_blank"
-                                                    rel="noopener noreferrer"
-                                                    onClick={e => e.stopPropagation()}
-                                                >
-                                                    {stripUrlScheme(p.primary_url)}
-                                                </a>
-                                            ) : <span style={{ color: 'var(--text-soft)' }}>—</span>}
-                                        </td>
-                                        <td>
-                                            {owner ? (
-                                                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                                                    <Icon name={owner.type === 'team' ? 'users' : 'user'} size={13} />
-                                                    {owner.label}
-                                                </span>
-                                            ) : <span style={{ color: 'var(--text-soft)' }}>—</span>}
-                                        </td>
-                                        <td>
-                                            <span className="r-pill">
-                                                {accessClasses.find(a => a.id === p.access_class)?.display_name || p.access_class || '—'}
-                                            </span>
-                                        </td>
-                                        <td style={{ textAlign: 'right', color: 'var(--text-muted)' }}>
-                                            {p.updated_at || p.created ? formatRelativeTimeRounded(p.updated_at || p.created) : '—'}
-                                        </td>
-                                    </tr>
-                                );
-                            })}
-                        </tbody>
-                    </table>
-                )}
-            </Panel>
+            <ProjectTable
+                projects={filtered}
+                accessClasses={accessClasses}
+                onRowClick={(p) => navigate(`/project/${p.name}`)}
+                emptyText="No projects match your filters."
+            />
 
             <Modal
                 isOpen={modalOpen}

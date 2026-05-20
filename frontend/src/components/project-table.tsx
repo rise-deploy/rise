@@ -1,6 +1,7 @@
 // @ts-nocheck
 import { Icon } from './icon';
-import { Empty, Panel, Status } from './r-ui';
+import { Panel, Status } from './r-ui';
+import { formatRelativeTimeRounded, stripUrlScheme } from '../lib/utils';
 
 function OwnerCell({ owner }) {
     if (!owner || (!owner.email && !owner.name)) {
@@ -8,66 +9,85 @@ function OwnerCell({ owner }) {
     }
     const isTeam = !owner.email && !!owner.name;
     return (
-        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-            <Icon name={isTeam ? 'users' : 'user'} size={14} />
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+            <Icon name={isTeam ? 'users' : 'user'} size={13} />
             <span>{owner.email || owner.name}</span>
         </span>
     );
 }
 
-// Project listing table styled with the r-* design system. Renders inside a
-// Panel and handles its own empty state.
-export function ProjectTable({ projects, onRowClick, emptyText = 'No projects found.' }) {
+// Shared project listing table (r-* design system). Renders inside a Panel and
+// owns its empty state. Used by the Projects page and the team detail page.
+//
+// isOwnRow: optional predicate; matching rows get an accent highlight.
+export function ProjectTable({
+    projects,
+    accessClasses = [],
+    onRowClick,
+    emptyText = 'No projects found.',
+    isOwnRow,
+}) {
     return (
         <Panel>
             {projects.length === 0 ? (
-                <div className="r-panel-body">
-                    <Empty title={emptyText} />
+                <div style={{ padding: 36, textAlign: 'center', color: 'var(--text-muted)' }}>
+                    {emptyText}
                 </div>
             ) : (
                 <table className="r-table">
                     <thead>
                         <tr>
-                            <th>Name</th>
+                            <th>Project</th>
                             <th>Status</th>
+                            <th>Primary URL</th>
                             <th>Owner</th>
                             <th>Access</th>
-                            <th>URL</th>
+                            <th style={{ textAlign: 'right' }}>Updated</th>
                         </tr>
                     </thead>
                     <tbody>
-                        {projects.map(project => (
-                            <tr
-                                key={project.id || project.name}
-                                className="click"
-                                onClick={() => onRowClick(project)}
-                            >
-                                <td><span style={{ fontWeight: 500 }}>{project.name}</span></td>
-                                <td><Status status={project.status || 'Unknown'} /></td>
-                                <td style={{ color: 'var(--text-muted)' }}>
-                                    <OwnerCell owner={project.owner} />
-                                </td>
-                                <td style={{ color: 'var(--text-muted)' }}>
-                                    {project.access_class || '—'}
-                                </td>
-                                <td>
-                                    {project.primary_url ? (
-                                        <a
-                                            className="r-link mono"
-                                            style={{ fontSize: 12.5 }}
-                                            href={project.primary_url}
-                                            target="_blank"
-                                            rel="noopener noreferrer"
-                                            onClick={(e) => e.stopPropagation()}
-                                        >
-                                            {project.primary_url}
-                                        </a>
-                                    ) : (
-                                        <span style={{ color: 'var(--text-soft)' }}>—</span>
-                                    )}
-                                </td>
-                            </tr>
-                        ))}
+                        {projects.map(project => {
+                            const own = isOwnRow ? isOwnRow(project) : false;
+                            const updated = project.updated || project.updated_at || project.created;
+                            return (
+                                <tr
+                                    key={project.id || project.name}
+                                    className={own ? 'click r-row-own' : 'click'}
+                                    onClick={() => onRowClick(project)}
+                                >
+                                    <td style={{ maxWidth: 280 }}>
+                                        <div style={{ fontWeight: 500, fontSize: 13.5 }}>{project.name}</div>
+                                    </td>
+                                    <td><Status status={project.status || 'Unknown'} /></td>
+                                    <td style={{ maxWidth: 300 }}>
+                                        {project.primary_url ? (
+                                            <a
+                                                className="r-link mono"
+                                                style={{ fontSize: 12.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'inline-block', maxWidth: '100%' }}
+                                                href={project.primary_url}
+                                                target="_blank"
+                                                rel="noopener noreferrer"
+                                                onClick={(e) => e.stopPropagation()}
+                                            >
+                                                {stripUrlScheme(project.primary_url)}
+                                            </a>
+                                        ) : (
+                                            <span style={{ color: 'var(--text-soft)' }}>—</span>
+                                        )}
+                                    </td>
+                                    <td><OwnerCell owner={project.owner} /></td>
+                                    <td>
+                                        <span className="r-pill">
+                                            {accessClasses.find(a => a.id === project.access_class)?.display_name
+                                                || project.access_class || '—'}
+                                        </span>
+                                    </td>
+                                    <td style={{ textAlign: 'right', color: 'var(--text-muted)' }}>
+                                        {updated ? formatRelativeTimeRounded(updated) : '—'}
+                                    </td>
+                                </tr>
+                            );
+                        })}
                     </tbody>
                 </table>
             )}
