@@ -1,3 +1,8 @@
+/** Drop a leading http:// or https:// for display; other schemes are kept. */
+export function stripUrlScheme(url: string | null | undefined): string {
+  return (url || '').replace(/^https?:\/\//i, '');
+}
+
 /** Returns true if the URL uses http: or https: scheme (safe to render as a clickable link). */
 export function isSafeUrl(url: string): boolean {
   try {

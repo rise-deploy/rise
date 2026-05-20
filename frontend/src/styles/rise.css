@@ -70,11 +70,15 @@
     --shadow-lg: 0 24px 60px rgba(0, 0, 0, 0.5);
 }
 
-/* Palette: ONLY changes accent color. Background tinting in light mode
-   stays subtle, dark mode keeps neutral borders/surfaces. */
+/* Palette: shifts the accent plus a subtle tint of the light-mode
+   surfaces toward the accent hue. Dark mode keeps neutral surfaces. */
 [data-palette="mint"] {
     --accent: oklch(0.55 0.10 165);
     --accent-soft: oklch(0.95 0.04 165);
+    --bg: oklch(0.985 0.008 165);
+    --surface-2: oklch(0.96 0.011 165);
+    --hover: oklch(0.945 0.012 165);
+    --border-faint: oklch(0.89 0.009 165);
 }
 [data-palette="mint"].dark, .dark[data-palette="mint"] {
     --accent: oklch(0.78 0.13 165);
@@ -85,6 +89,10 @@
 [data-palette="indigo"] {
     --accent: oklch(0.55 0.17 270);
     --accent-soft: oklch(0.95 0.04 270);
+    --bg: oklch(0.985 0.009 270);
+    --surface-2: oklch(0.96 0.012 270);
+    --hover: oklch(0.945 0.013 270);
+    --border-faint: oklch(0.89 0.01 270);
 }
 [data-palette="indigo"].dark, .dark[data-palette="indigo"] {
     --accent: oklch(0.78 0.14 270);
@@ -95,6 +103,10 @@
 [data-palette="ember"] {
     --accent: oklch(0.62 0.16 40);
     --accent-soft: oklch(0.95 0.05 40);
+    --bg: oklch(0.987 0.01 55);
+    --surface-2: oklch(0.965 0.013 55);
+    --hover: oklch(0.95 0.014 55);
+    --border-faint: oklch(0.89 0.011 55);
 }
 [data-palette="ember"].dark, .dark[data-palette="ember"] {
     --accent: oklch(0.78 0.15 40);
@@ -106,6 +118,10 @@
     --accent: oklch(0.32 0.012 250);
     --accent-fg: #ffffff;
     --accent-soft: oklch(0.92 0.006 250);
+    --bg: oklch(0.985 0.004 250);
+    --surface-2: oklch(0.96 0.005 250);
+    --hover: oklch(0.945 0.006 250);
+    --border-faint: oklch(0.89 0.005 250);
 }
 [data-palette="slate"].dark, .dark[data-palette="slate"] {
     --accent: oklch(0.88 0.005 250);
@@ -376,8 +392,8 @@ a { color: inherit; }
 .r-btn.ghost { border: none; background: transparent; padding: 6px 9px; }
 .r-btn.ghost:hover { background: var(--hover); }
 .r-btn.small { padding: 4px 9px; font-size: 12px; }
-.r-btn.danger { color: var(--err); }
-.r-btn.danger:hover { background: var(--err-bg); }
+.r-btn.danger { background: var(--err); color: #fff; border-color: transparent; }
+.r-btn.danger:hover { background: var(--err); filter: brightness(1.07); }
 .r-btn:disabled, .r-btn[aria-disabled="true"] { opacity: 0.5; cursor: not-allowed; }
 
 /* ---------- Inputs ---------- *

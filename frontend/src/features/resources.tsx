@@ -1,11 +1,11 @@
 // @ts-nocheck
-import { createElement, lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react';
+import { createElement, lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../lib/api';
 import { CONFIG } from '../lib/config';
 import { navigate } from '../lib/navigation';
 import { formatDate } from '../lib/utils';
 import { useToast } from '../components/toast';
-import { Button, ConfirmDialog, EnvironmentColorDot, EnvironmentColorPicker, EnvironmentCombobox, EnvironmentDropdown, FormField, Modal, ModalActions, ModalSection, ModalTabs, MonoStatusPill, MonoTabButton, MonoTag, SegmentedRadioGroup } from '../components/ui';
+import { Button, ConfirmDialog, EnvironmentColorDot, EnvironmentColorPicker, EnvironmentCombobox, EnvironmentDropdown, FormField, Modal, ModalActions, ModalSection, ModalTabs, MonoTabButton, MonoTag, SegmentedRadioGroup } from '../components/ui';
 import {
     Alert as RAlert,
     Button as RButton,
@@ -1225,6 +1225,7 @@ export function EnvVarsList({ projectName, deploymentId }) {
     const [environments, setEnvironments] = useState([]);
     const [search, setSearch] = useState('');
     const [revealed, setRevealed] = useState({});
+    const importInputRef = useRef(null);
     const { showToast } = useToast();
 
     // Convert API representation to UI type
@@ -1335,6 +1336,65 @@ export function EnvVarsList({ projectName, deploymentId }) {
         }
     };
 
+    // Export currently-loaded variables as a .env file. Secret values are not
+    // available client-side, so secret keys are written without a value.
+    const handleExport = () => {
+        const lines = envVars.map(v => {
+            if (v.is_secret) return `# ${v.key} is a secret; value not exported\n${v.key}=`;
+            return `${v.key}=${v.value ?? ''}`;
+        });
+        const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/plain' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${projectName}.env`;
+        a.click();
+        URL.revokeObjectURL(url);
+    };
+
+    // Parse an uploaded .env file and create each variable as a plain global var.
+    const handleImportFile = async (e) => {
+        const file = e.target.files?.[0];
+        e.target.value = '';
+        if (!file) return;
+        let text = '';
+        try {
+            text = await file.text();
+        } catch (err) {
+            showToast(`Failed to read file: ${err.message}`, 'error');
+            return;
+        }
+        const entries = [];
+        for (const raw of text.split('\n')) {
+            const line = raw.trim();
+            if (!line || line.startsWith('#')) continue;
+            const eq = line.indexOf('=');
+            if (eq <= 0) continue;
+            let key = line.slice(0, eq).trim();
+            if (key.startsWith('export ')) key = key.slice(7).trim();
+            let value = line.slice(eq + 1).trim();
+            if (value.length >= 2 && ((value[0] === '"' && value.endsWith('"')) || (value[0] === "'" && value.endsWith("'")))) {
+                value = value.slice(1, -1);
+            }
+            if (key) entries.push([key, value]);
+        }
+        if (entries.length === 0) {
+            showToast('No variables found in file', 'error');
+            return;
+        }
+        let ok = 0;
+        for (const [key, value] of entries) {
+            try {
+                await api.setEnvVar(projectName, key, value, false, false, null);
+                ok++;
+            } catch (err) {
+                showToast(`Failed to import ${key}: ${err.message}`, 'error');
+            }
+        }
+        if (ok > 0) showToast(`Imported ${ok} variable${ok === 1 ? '' : 's'} into Global`, 'success');
+        loadEnvVars();
+    };
+
     if (loading) return <LoadingState label="Loading environment variables…" />;
     if (error) return <ErrorState message={`Error loading environment variables: ${error}`} onRetry={loadEnvVars} />;
 
@@ -1356,9 +1416,13 @@ export function EnvVarsList({ projectName, deploymentId }) {
     };
 
     const TypeTag = ({ envVar }) => {
-        if (envVar.is_protected) return <MonoTag color="purple">protected</MonoTag>;
-        if (envVar.is_secret) return <MonoTag color="yellow">secret</MonoTag>;
-        return <MonoTag color="gray">plain</MonoTag>;
+        if (envVar.is_protected) {
+            return <span className="r-pill" style={{ color: 'var(--info)', background: 'var(--info-bg)', borderColor: 'transparent' }}>protected</span>;
+        }
+        if (envVar.is_secret) {
+            return <span className="r-pill" style={{ color: 'var(--warn)', background: 'var(--warn-bg)', borderColor: 'transparent' }}>secret</span>;
+        }
+        return <span className="r-pill">plain</span>;
     };
 
     // Renders the masked/revealed value cell with a reveal eye for readable secrets.
@@ -1468,12 +1532,27 @@ export function EnvVarsList({ projectName, deploymentId }) {
                     placeholder="Filter keys or values…"
                     style={{ maxWidth: 320 }}
                 />
-                <Button variant="primary" icon="plus" onClick={() => handleAddClick()}>
-                    Add variable
-                </Button>
+                <div style={{ display: 'flex', gap: 8 }}>
+                    <input
+                        ref={importInputRef}
+                        type="file"
+                        accept=".env,text/plain"
+                        style={{ display: 'none' }}
+                        onChange={handleImportFile}
+                    />
+                    <RButton icon="copy" onClick={() => importInputRef.current?.click()}>
+                        Import .env
+                    </RButton>
+                    <RButton icon="ext" onClick={handleExport}>
+                        Export
+                    </RButton>
+                    <RButton variant="primary" icon="plus" onClick={() => handleAddClick()}>
+                        Add variable
+                    </RButton>
+                </div>
             </div>
 
-            <RAlert tone="info" icon="lock">
+            <RAlert icon="lock">
                 Global variables apply to all environments. A variable redefined in a specific environment
                 <strong> overrides</strong> the global one for that env. Secrets are encrypted at rest.
             </RAlert>
@@ -1737,9 +1816,9 @@ export function ExtensionsList({ projectName }) {
                     <div className="r-section-sub">Datastores and managed services connected to this project.</div>
                 </div>
                 {availableExtensions.length > 0 && (
-                    <Button variant="primary" icon="plus" onClick={() => setIsAddModalOpen(true)}>
+                    <RButton variant="primary" icon="plus" onClick={() => setIsAddModalOpen(true)}>
                         Add extension
-                    </Button>
+                    </RButton>
                 )}
             </div>
 
@@ -2043,10 +2122,8 @@ function renderExtensionStatusBadge(extension) {
     // Show pending deletion badge when extension is marked for deletion
     if (extension.deleted) {
         const state = (extension.status?.state || '').toLowerCase();
-        if (state === 'deletion_blocked') {
-            return <MonoStatusPill tone="warn">deletion blocked</MonoStatusPill>;
-        }
-        return <MonoStatusPill tone="muted">{state === 'deleting' ? 'deleting' : 'pending deletion'}</MonoStatusPill>;
+        if (state === 'deletion_blocked') return <RStatus status="deletion_blocked" />;
+        return <RStatus status={state === 'deleting' ? 'deleting' : 'pending'} />;
     }
 
     // Check if extension has custom status badge renderer
@@ -2056,39 +2133,9 @@ function renderExtensionStatusBadge(extension) {
         if (customBadge) return customBadge;
     }
 
-    // Fallback to generic status badge using status_summary
-    let badgeTone = 'muted';
-    let statusText = extension.status_summary || 'Unknown';
-
-    // Parse status JSON to determine color and text
-    if (extension.status && extension.status.state) {
-        const state = extension.status.state.toLowerCase();
-        statusText = extension.status.state; // Use the original state value as the text
-
-        switch (state) {
-            case 'available':
-                badgeTone = 'ok';
-                break;
-            case 'creating':
-            case 'pending':
-                badgeTone = 'warn';
-                break;
-            case 'failed':
-                badgeTone = 'bad';
-                break;
-            case 'deleting':
-            case 'deleted':
-                badgeTone = 'muted';
-                break;
-            case 'deletion_blocked':
-                badgeTone = 'warn';
-                break;
-            default:
-                badgeTone = 'muted';
-        }
-    }
-
-    return <MonoStatusPill tone={badgeTone}>{statusText}</MonoStatusPill>;
+    // Fallback: render the lifecycle state (or summary) as a design status pill.
+    const statusText = extension.status?.state || extension.status_summary || 'Unknown';
+    return <RStatus status={statusText} />;
 }
 
 // Mono JSON block used across extension detail tabs.

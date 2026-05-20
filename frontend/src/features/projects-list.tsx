@@ -6,7 +6,7 @@ import { useToast } from '../components/toast';
 import { Button, Combobox, Field, Input, Modal, Panel, SearchInput, Segmented, Status, Stat, StatGrid, cx } from '../components/r-ui';
 import { Icon } from '../components/icon';
 import { LoadingState, ErrorState, EmptyState } from '../components/states';
-import { formatRelativeTimeRounded } from '../lib/utils';
+import { formatRelativeTimeRounded, stripUrlScheme } from '../lib/utils';
 
 interface Project {
     id?: string;
@@ -195,7 +195,7 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
                                                     rel="noopener noreferrer"
                                                     onClick={e => e.stopPropagation()}
                                                 >
-                                                    {p.primary_url}
+                                                    {stripUrlScheme(p.primary_url)}
                                                 </a>
                                             ) : <span style={{ color: 'var(--text-soft)' }}>—</span>}
                                         </td>

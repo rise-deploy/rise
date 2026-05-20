@@ -2,7 +2,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
-import { copyToClipboard, formatISO8601, formatRelativeTimeRounded, isSafeUrl } from '../lib/utils';
+import { copyToClipboard, formatISO8601, formatRelativeTimeRounded, isSafeUrl, stripUrlScheme } from '../lib/utils';
 import { useToast } from '../components/toast';
 import { Button, ConfirmDialog, KV, KVRow, Modal, Panel, PanelBody, PanelHead, Pill, Status, Tabs, cx } from '../components/r-ui';
 import { Icon } from '../components/icon';
@@ -114,7 +114,7 @@ export function ProjectDetail({ projectName, initialTab }: { projectName: string
                         {project.primary_url ? (
                             <>
                                 <a className="r-link mono" style={{ fontSize: 12.5 }} href={project.primary_url} target="_blank" rel="noopener noreferrer">
-                                    {project.primary_url}
+                                    {stripUrlScheme(project.primary_url)}
                                 </a>
                                 <span className="dot-sep" />
                             </>
@@ -205,14 +205,14 @@ function ProjectOverview({ project, projectName, accessLabel, onCopy }: { projec
                             {project.primary_url && (
                                 <KVRow k="Primary URL">
                                     <a className="r-link mono" style={{ fontSize: 12.5 }} href={project.primary_url} target="_blank" rel="noopener noreferrer">
-                                        {project.primary_url}
+                                        {stripUrlScheme(project.primary_url)}
                                     </a>
                                 </KVRow>
                             )}
                             {project.source_url && isSafeUrl(project.source_url) && (
                                 <KVRow k="Source">
                                     <a className="r-link mono" style={{ fontSize: 12.5 }} href={project.source_url} target="_blank" rel="noopener noreferrer">
-                                        {project.source_url}
+                                        {stripUrlScheme(project.source_url)}
                                     </a>
                                 </KVRow>
                             )}
