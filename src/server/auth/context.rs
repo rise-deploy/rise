@@ -219,8 +219,6 @@ impl FromRequestParts<AppState> for AuthContext {
 /// Controller auth is tried first (it is more specific — requires both a
 /// `VerifiedExternalToken` extension *and* matching `ControllerIdentity` claims).
 /// If that fails, regular user/SA auth is attempted.
-// TODO: remove #[allow(dead_code)] once dispatch_put handler consumes AnyAuth
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum AnyAuth {
     User(AuthContext),

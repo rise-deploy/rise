@@ -1411,9 +1411,12 @@ async fn reparent_rejects_cycle(pool: sqlx::PgPool) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
     let org = create_org(&store, "root").await;
 
-    // Self-loop: moving an org under itself is rejected as a cycle.
-    // The org is root-level so it passes the api_version/parent_uid guards,
-    // letting the cycle detector fire.
+    // Self-loop is the reachable cycle with the current two-scope model.
+    // An ancestor→descendant cycle (moving A under one of its own descendants)
+    // would require the new parent to pass the Organization scope check, which
+    // requires a root-level rise.dev/v1alpha1/Organization — a descendant always
+    // has parent_uid set, so it can never satisfy that check. The cycle detector
+    // is still present to guard hypothetical future scope variants.
     let err = store
         .reparent(org.uid, Some(org.uid), ResourceScope::Organization)
         .await

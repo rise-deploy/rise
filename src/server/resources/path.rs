@@ -45,7 +45,6 @@ pub fn parse_identifier(
 
 /// A single ancestor segment in a hierarchical resource path, e.g. `organizations/acme`.
 #[derive(Debug, PartialEq)]
-#[allow(dead_code)]
 pub struct AncestorRef {
     pub collection: String,
     pub identifier: String,
@@ -53,7 +52,6 @@ pub struct AncestorRef {
 
 /// The well-known sub-resource suffixes that can appear at the end of a path.
 #[derive(Debug, PartialEq)]
-#[allow(dead_code)]
 pub enum Subresource {
     Status,
     Finalizers,
@@ -62,7 +60,6 @@ pub enum Subresource {
 
 /// A parsed representation of a hierarchical resource URL path.
 #[derive(Debug, PartialEq)]
-#[allow(dead_code)]
 pub enum ResourcePath {
     /// The literal path `orphans`.
     Orphans,
@@ -86,11 +83,6 @@ pub enum ResourcePath {
     },
 }
 
-/// Keywords that are reserved and may not be used as collection names or identifiers
-/// (except in their designated positions).
-#[allow(dead_code)]
-const RESERVED: &[&str] = &["orphans", "status", "finalizers", "reparent"];
-
 /// Parse a URL resource path into a [`ResourcePath`].
 ///
 /// The path is a `/`-separated sequence of segments. Empty paths and empty
@@ -99,15 +91,18 @@ const RESERVED: &[&str] = &["orphans", "status", "finalizers", "reparent"];
 /// # Grammar
 ///
 /// ```text
-/// path      ::= "orphans"
-///             | segment+
-/// segment   ::= collection "/" identifier
-/// tail      ::= collection              -- List
-///             | collection "/" name     -- Item
-///             | collection "/" name "/" subresource
-/// subresource ::= "status" | "finalizers" | "reparent"
+/// path        ::= "orphans"
+///               | segment+
+/// segment     ::= collection "/" identifier
+/// tail        ::= collection                        -- List
+///               | collection "/" identifier          -- Item
+///               | collection "/" identifier "/" sub  -- Subresource
+/// sub         ::= "status" | "finalizers" | "reparent"
 /// ```
-#[allow(dead_code)]
+///
+/// The keywords `orphans`, `status`, `finalizers`, and `reparent` are reserved:
+/// `orphans` is only valid as the sole path segment; `status`, `finalizers`, and
+/// `reparent` are only valid as the final segment of an item path.
 pub fn parse_resource_path(raw: &str) -> Result<ResourcePath, ServerError> {
     let segments: Vec<&str> = raw.split('/').collect();
 
