@@ -54,8 +54,17 @@ pub struct ResourceList {
 /// typed spec/status. The generic API returns the raw JSON values verbatim, so
 /// callers can round-trip arbitrary external resources.
 pub fn row_to_resource(row: &ResourceRow) -> Resource {
-    let annotations: BTreeMap<String, String> =
-        serde_json::from_value(row.metadata.clone()).unwrap_or_default();
+    let annotations: BTreeMap<String, String> = serde_json::from_value(row.metadata.clone())
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                uid = %row.uid,
+                kind = %row.kind,
+                name = %row.name,
+                error = %e,
+                "resource metadata is not a string map — annotations will be empty"
+            );
+            BTreeMap::new()
+        });
 
     let spec: BTreeMap<String, serde_json::Value> = match &row.spec {
         serde_json::Value::Object(map) => map.clone().into_iter().collect(),

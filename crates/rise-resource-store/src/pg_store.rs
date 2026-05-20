@@ -127,6 +127,20 @@ impl PgResourceStore {
             .iter()
             .map(|version| format!("{}/{}", spec.group, version.name))
             .collect();
+
+        // Lock the resource_definitions row for the duration of this transaction so
+        // two concurrent deletes of the same definition cannot both pass the instance
+        // check. Note: a concurrent create() that inserts a new instance after this
+        // count check but before the DELETE can still slip through, because create()
+        // does not read resource_definitions. Closing that window would require
+        // create() to also acquire a FOR SHARE lock here.
+        sqlx::query(
+            "SELECT uid FROM resource_store.resource_definitions WHERE uid = $1 FOR UPDATE",
+        )
+        .bind(row.uid)
+        .execute(&mut **tx)
+        .await?;
+
         let instance_count: i64 = sqlx::query_scalar(
             r#"
             SELECT COUNT(*)

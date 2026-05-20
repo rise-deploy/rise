@@ -1410,6 +1410,13 @@ async fn reparent_to_root(pool: sqlx::PgPool) -> sqlx::Result<()> {
 async fn reparent_rejects_cycle(pool: sqlx::PgPool) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
     let org = create_org(&store, "root").await;
+    // Create a child org in the store so we have a two-level hierarchy to
+    // attempt cyclic reparenting on. In the live API organizations are
+    // root-scoped, but the store does not enforce that — scope is the caller's
+    // responsibility. We pass ResourceScope::Organization here precisely
+    // because it allows a parent UID, which lets us reach the cycle check.
+    // Using ResourceScope::Root would short-circuit with a Validation error
+    // before the cycle detector fires.
     let child_org = store
         .create(CreateResourceParams {
             api_version: API_VERSION_V1ALPHA1.to_string(),
