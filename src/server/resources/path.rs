@@ -1,8 +1,13 @@
-//! URL path identifier parsing for the generic resource API.
+//! URL path parsing for the generic resource API.
 //!
-//! Path segments follow the `<kind>/<identifier>` grammar. The identifier is
-//! either a name or a UID-prefixed token (`uid:<uuid>`). This module turns the
-//! raw path component into a `PathSegment` the store can resolve.
+//! This module provides two parsing functions:
+//!
+//! * [`parse_identifier`] — turns a single `<identifier>` segment into a
+//!   `PathSegment` (name or `uid:<uuid>` form) for the resource store.
+//! * [`parse_resource_path`] — parses a full resource URL path like
+//!   `organizations/acme/widgets/w1/status` into a typed [`ResourcePath`],
+//!   expressing the collection hierarchy, the leaf resource, and any
+//!   subresource keyword.
 
 use rise_resource_store::PathSegment;
 use uuid::Uuid;
@@ -140,28 +145,24 @@ pub fn parse_resource_path(raw: &str) -> Result<ResourcePath, ServerError> {
             _ => {
                 // remaining.len() >= 3
                 match remaining[2] {
-                    "status" => {
+                    kw @ ("status" | "finalizers" | "reparent") => {
+                        if remaining.len() > 3 {
+                            return Err(ServerError::bad_request(format!(
+                                "unexpected segments after subresource '{}': path must end after \
+                                 the keyword",
+                                kw
+                            )));
+                        }
+                        let subresource = match kw {
+                            "status" => Subresource::Status,
+                            "finalizers" => Subresource::Finalizers,
+                            _ => Subresource::Reparent,
+                        };
                         return Ok(ResourcePath::Subresource {
                             ancestors,
                             collection: remaining[0].to_string(),
                             identifier: remaining[1].to_string(),
-                            subresource: Subresource::Status,
-                        });
-                    }
-                    "finalizers" => {
-                        return Ok(ResourcePath::Subresource {
-                            ancestors,
-                            collection: remaining[0].to_string(),
-                            identifier: remaining[1].to_string(),
-                            subresource: Subresource::Finalizers,
-                        });
-                    }
-                    "reparent" => {
-                        return Ok(ResourcePath::Subresource {
-                            ancestors,
-                            collection: remaining[0].to_string(),
-                            identifier: remaining[1].to_string(),
-                            subresource: Subresource::Reparent,
+                            subresource,
                         });
                     }
                     "orphans" => {
@@ -519,5 +520,26 @@ mod tests {
         let err = parse_resource_path("things/id/orphans").unwrap_err();
         assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
         assert!(err.message.contains("orphans"));
+    }
+
+    #[test]
+    fn resource_path_trailing_segment_after_subresource_is_error() {
+        for path in &[
+            "things/id/reparent/extra",
+            "things/id/status/extra",
+            "things/id/finalizers/extra",
+        ] {
+            let err = parse_resource_path(path).unwrap_err();
+            assert_eq!(
+                err.status,
+                axum::http::StatusCode::BAD_REQUEST,
+                "expected 400 for path '{path}'"
+            );
+            assert!(
+                err.message.contains("unexpected"),
+                "expected 'unexpected' in error for path '{path}', got: {}",
+                err.message
+            );
+        }
     }
 }
