@@ -534,12 +534,39 @@ export function ConfirmDialog({ isOpen, onClose, onConfirm, title, message, conf
 }
 
 // ---------- Tooltip ----------
-// Custom hover/focus tooltip, replaces native `title` attributes.
+// Custom hover/focus tooltip, replaces native `title` attributes. The bubble is
+// portaled so it is never clipped by a surrounding overflow container.
 export function Tooltip({ content, children }: { content: React.ReactNode; children: React.ReactNode }) {
+    const [pos, setPos] = React.useState<{ top: number; left: number } | null>(null);
+    const ref = React.useRef<HTMLSpanElement | null>(null);
+    const show = () => {
+        const el = ref.current;
+        if (!el) return;
+        const r = el.getBoundingClientRect();
+        setPos({ top: r.bottom + 6, left: r.left + r.width / 2 });
+    };
+    const hide = () => setPos(null);
     return (
-        <span className="r-tip" tabIndex={0}>
+        <span
+            ref={ref}
+            className="r-tip"
+            tabIndex={0}
+            onMouseEnter={show}
+            onMouseLeave={hide}
+            onFocus={show}
+            onBlur={hide}
+        >
             {children}
-            <span className="r-tip-pop" role="tooltip">{content}</span>
+            {pos && createPortal(
+                <span
+                    className="r-tip-pop"
+                    role="tooltip"
+                    style={{ position: 'fixed', top: pos.top, left: pos.left, transform: 'translateX(-50%)' }}
+                >
+                    {content}
+                </span>,
+                document.body
+            )}
         </span>
     );
 }

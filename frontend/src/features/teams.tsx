@@ -8,7 +8,7 @@ import { AutocompleteInput, Button } from '../components/ui';
 import { ProjectTable } from '../components/project-table';
 import { EmptyState, ErrorState, LoadingState } from '../components/states';
 import { useRowKeyboardNavigation, useSortableData } from '../lib/table';
-import { Alert, ConfirmDialog as RConfirmDialog, Panel, PanelBody, PanelHead, Button as RButton, Empty, Field as RField, Input as RInput, Modal as RModal, Pill, colorFor } from '../components/r-ui';
+import { Alert, ConfirmDialog as RConfirmDialog, Panel, PanelBody, PanelHead, Button as RButton, Empty, Field as RField, Input as RInput, Modal as RModal, Pill, Tooltip, colorFor } from '../components/r-ui';
 import { AddMenu, Menu, RosterTable } from '../components/roster-table';
 import { Icon } from '../components/icon';
 
@@ -226,12 +226,49 @@ function countProjectsForTeam(projects, team) {
     }).length;
 }
 
+// A labelled, overlapping stack of user avatars; each avatar shows the user's
+// email on hover.
+function AvatarGroup({ label, users }) {
+    const visible = users.slice(0, 8);
+    const overflow = Math.max(0, users.length - visible.length);
+    return (
+        <div className="r-meta-bar" style={{ marginBottom: 0 }}>
+            <span style={{ color: 'var(--text-soft)' }}>{label}</span>
+            <span className="dot-sep" />
+            {users.length === 0 ? (
+                <span style={{ color: 'var(--text-soft)' }}>None</span>
+            ) : (
+                <div className="r-member-stack">
+                    {visible.map(u => {
+                        const email = u.email || u.name || '?';
+                        return (
+                            <Tooltip key={u.id || email} content={email}>
+                                <span
+                                    className="r-ava-sm"
+                                    style={{ background: colorFor(email), width: 22, height: 22, fontSize: 10 }}
+                                >
+                                    {email.trim()[0]?.toUpperCase() || '?'}
+                                </span>
+                            </Tooltip>
+                        );
+                    })}
+                    {overflow > 0 && (
+                        <span
+                            className="r-ava-sm"
+                            style={{ background: 'var(--surface-2)', color: 'var(--text-muted)', width: 22, height: 22, fontSize: 10 }}
+                        >
+                            +{overflow}
+                        </span>
+                    )}
+                </div>
+            )}
+        </div>
+    );
+}
+
 function TeamCard({ team, projectCount, onOpen, isOwner }) {
     const members = team.members || [];
     const owners = team.owners || [];
-    const ownerEmails = owners.map(o => o.email).filter(Boolean);
-    const visibleMembers = members.slice(0, 8);
-    const overflow = Math.max(0, members.length - visibleMembers.length);
 
     return (
         <Panel onClick={onOpen} className={isOwner ? 'r-panel-own' : undefined}>
@@ -250,43 +287,10 @@ function TeamCard({ team, projectCount, onOpen, isOwner }) {
                 </div>
             </PanelHead>
             <PanelBody>
-                {ownerEmails.length > 0 && (
-                    <div className="r-meta-bar" style={{ marginBottom: 14, flexWrap: 'wrap' }}>
-                        <span style={{ color: 'var(--text-soft)' }}>
-                            {ownerEmails.length === 1 ? 'Owner' : 'Owners'}
-                        </span>
-                        <span className="dot-sep" />
-                        <span>{ownerEmails.join(', ')}</span>
-                    </div>
-                )}
-                {visibleMembers.length > 0 ? (
-                    <div className="r-member-stack">
-                        {visibleMembers.map(m => {
-                            const label = m.email || m.name || '?';
-                            return (
-                                <span
-                                    key={m.id || label}
-                                    className="r-ava-sm"
-                                    style={{ background: colorFor(label), width: 22, height: 22, fontSize: 10 }}
-                                    title={label}
-                                >
-                                    {label.trim()[0]?.toUpperCase() || '?'}
-                                </span>
-                            );
-                        })}
-                        {overflow > 0 && (
-                            <span
-                                className="r-ava-sm"
-                                style={{ background: 'var(--surface-2)', color: 'var(--text-muted)', width: 22, height: 22, fontSize: 10 }}
-                                title={`${overflow} more`}
-                            >
-                                +{overflow}
-                            </span>
-                        )}
-                    </div>
-                ) : (
-                    <div style={{ color: 'var(--text-soft)', fontSize: 12.5 }}>No members yet</div>
-                )}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                    <AvatarGroup label="Owners" users={owners} />
+                    <AvatarGroup label="Members" users={members} />
+                </div>
             </PanelBody>
         </Panel>
     );

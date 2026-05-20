@@ -928,12 +928,9 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
 .r-logs .lv-error { color: oklch(0.72 0.16 25); }
 
 /* ---------- Tooltip ---------- */
-.r-tip { position: relative; display: inline-flex; }
+.r-tip { display: inline-flex; }
 .r-tip-pop {
-    position: absolute;
-    top: calc(100% + 6px);
-    left: 0;
-    z-index: 60;
+    z-index: 100;
     width: max-content;
     max-width: 320px;
     padding: 7px 10px;
@@ -944,11 +941,8 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
     font-size: 12px;
     line-height: 1.5;
     color: var(--text);
-    opacity: 0;
     pointer-events: none;
-    transition: opacity 0.12s;
 }
-.r-tip:hover .r-tip-pop, .r-tip:focus-within .r-tip-pop { opacity: 1; }
 
 /* ---------- Misc ---------- */
 .r-progress { height: 6px; background: var(--surface-2); border-radius: 2px; overflow: hidden; }
@@ -1146,8 +1140,9 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
 
 /* ---------- Avatar / member stack ---------- */
 .r-member-stack { display: inline-flex; }
-.r-member-stack .r-ava-sm { margin-left: -6px; border: 2px solid var(--surface); }
-.r-member-stack .r-ava-sm:first-child { margin-left: 0; }
+.r-member-stack > * { margin-left: -6px; }
+.r-member-stack > *:first-child { margin-left: 0; }
+.r-member-stack .r-ava-sm { border: 2px solid var(--surface); }
 .r-ava-sm {
     width: 24px; height: 24px;
     border-radius: 4px;
