@@ -1,32 +1,57 @@
 // @ts-nocheck
 import { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { Icon } from './icon';
 import { Button as RButton, Empty, Panel, Pill, Segmented } from './r-ui';
 
-// Small inline dropdown menu (button + absolutely-positioned list, close on click-away).
-export function AddMenu({ items }) {
+// Generic dropdown menu. `trigger` is a render prop receiving { toggle, open };
+// the item list is portaled and fixed-positioned so it is never clipped by a
+// surrounding panel/overflow container.
+export function Menu({ trigger, items }) {
     const [open, setOpen] = useState(false);
-    const ref = useRef(null);
+    const [rect, setRect] = useState(null);
+    const wrapRef = useRef(null);
+    const popRef = useRef(null);
+
+    useEffect(() => {
+        if (!open) { setRect(null); return; }
+        const update = () => {
+            const el = wrapRef.current;
+            if (!el) return;
+            const r = el.getBoundingClientRect();
+            setRect({ top: r.bottom + 4, right: window.innerWidth - r.right });
+        };
+        update();
+        window.addEventListener('scroll', update, true);
+        window.addEventListener('resize', update);
+        return () => {
+            window.removeEventListener('scroll', update, true);
+            window.removeEventListener('resize', update);
+        };
+    }, [open]);
 
     useEffect(() => {
         if (!open) return;
         const onClick = (e) => {
-            if (ref.current && !ref.current.contains(e.target)) setOpen(false);
+            if (wrapRef.current && wrapRef.current.contains(e.target)) return;
+            if (popRef.current && popRef.current.contains(e.target)) return;
+            setOpen(false);
         };
         document.addEventListener('mousedown', onClick);
         return () => document.removeEventListener('mousedown', onClick);
     }, [open]);
 
     return (
-        <div ref={ref} style={{ position: 'relative', display: 'inline-block' }}>
-            <RButton variant="primary" icon="plus" onClick={() => setOpen(o => !o)}>Add</RButton>
-            {open && (
+        <div ref={wrapRef} style={{ position: 'relative', display: 'inline-block' }}>
+            {trigger({ toggle: () => setOpen(o => !o), open })}
+            {open && rect && createPortal(
                 <div
+                    ref={popRef}
                     style={{
-                        position: 'absolute',
-                        top: 'calc(100% + 4px)',
-                        right: 0,
-                        zIndex: 30,
+                        position: 'fixed',
+                        top: rect.top,
+                        right: rect.right,
+                        zIndex: 100,
                         minWidth: 180,
                         background: 'var(--surface)',
                         border: '1px solid var(--border)',
@@ -62,9 +87,22 @@ export function AddMenu({ items }) {
                             {item.label}
                         </button>
                     ))}
-                </div>
+                </div>,
+                document.body
             )}
         </div>
+    );
+}
+
+// "Add" split button — a primary button that opens a dropdown of choices.
+export function AddMenu({ items }) {
+    return (
+        <Menu
+            items={items}
+            trigger={({ toggle }) => (
+                <RButton variant="primary" icon="plus" onClick={toggle}>Add</RButton>
+            )}
+        />
     );
 }
 
@@ -72,6 +110,7 @@ export function AddMenu({ items }) {
 // type filter, followed by a panel with a unified subject/kind/actions table.
 //
 // rows: { key, icon, name, kindLabel, badge?, extra?, actions? }[]
+// kindLabel may be a string or an array of strings (rendered as multiple pills).
 export function RosterTable({ title, sub, addControl, filter, rows, extraColumnLabel, emptyText }) {
     return (
         <>
@@ -111,7 +150,13 @@ export function RosterTable({ title, sub, addControl, filter, rows, extraColumnL
                                             {row.badge && <Pill>{row.badge}</Pill>}
                                         </span>
                                     </td>
-                                    <td><Pill>{row.kindLabel}</Pill></td>
+                                    <td>
+                                        <span style={{ display: 'inline-flex', gap: 6, flexWrap: 'wrap' }}>
+                                            {(Array.isArray(row.kindLabel) ? row.kindLabel : [row.kindLabel])
+                                                .filter(Boolean)
+                                                .map(k => <Pill key={k}>{k}</Pill>)}
+                                        </span>
+                                    </td>
                                     {extraColumnLabel && (
                                         <td>
                                             {row.extra != null && row.extra !== ''

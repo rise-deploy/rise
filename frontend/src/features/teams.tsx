@@ -9,7 +9,8 @@ import { ProjectTable } from '../components/project-table';
 import { EmptyState, ErrorState, LoadingState } from '../components/states';
 import { useRowKeyboardNavigation, useSortableData } from '../lib/table';
 import { Alert, ConfirmDialog as RConfirmDialog, Panel, PanelBody, PanelHead, Button as RButton, Empty, Field as RField, Input as RInput, Modal as RModal, Pill, colorFor } from '../components/r-ui';
-import { AddMenu, RosterTable } from '../components/roster-table';
+import { AddMenu, Menu, RosterTable } from '../components/roster-table';
+import { Icon } from '../components/icon';
 
 
 // Teams List Component
@@ -445,35 +446,70 @@ export function TeamDetail({ teamName, currentUser }) {
     if (!team) return <EmptyState message="Team not found." />;
 
     // --- Unified members roster ---
+    // A user can be both an owner and a member; collapse those into one row.
     const owners = team.owners || [];
     const members = team.members || [];
-    const allRows = [
-        ...owners.map(o => ({ ...o, role: 'owner' })),
-        ...members.map(m => ({ ...m, role: 'member' })),
-    ];
-    const visiblePeople = allRows.filter(p => {
-        if (roleFilter === 'owners') return p.role === 'owner';
-        if (roleFilter === 'members') return p.role === 'member';
+    const peopleMap = new Map();
+    const keyOf = (u) => u.id || u.email;
+    for (const o of owners) {
+        const k = keyOf(o);
+        if (!peopleMap.has(k)) peopleMap.set(k, { ...o, isOwner: false, isMember: false });
+        peopleMap.get(k).isOwner = true;
+    }
+    for (const m of members) {
+        const k = keyOf(m);
+        if (!peopleMap.has(k)) peopleMap.set(k, { ...m, isOwner: false, isMember: false });
+        peopleMap.get(k).isMember = true;
+    }
+    const visiblePeople = [...peopleMap.values()].filter(p => {
+        if (roleFilter === 'owners') return p.isOwner;
+        if (roleFilter === 'members') return p.isMember;
         return true;
     });
-    const rosterRows = visiblePeople.map(p => ({
-        key: `${p.role}-${p.id || p.email}`,
-        icon: 'user',
-        name: <span style={{ fontWeight: 500 }}>{p.email}</span>,
-        kindLabel: p.role === 'owner' ? 'Owner' : 'Member',
-        actions: canEdit ? (
-            <RButton
-                variant="danger"
-                size="sm"
-                icon="trash"
-                onClick={() => p.role === 'owner'
-                    ? handleRemoveOwner(p.id, p.email)
-                    : handleRemoveMember(p.id, p.email)}
-            >
-                Remove
-            </RButton>
-        ) : null,
-    }));
+    const rosterRows = visiblePeople.map(p => {
+        const kinds = [];
+        if (p.isOwner) kinds.push('Owner');
+        if (p.isMember) kinds.push('Member');
+        let actions = null;
+        if (canEdit) {
+            if (p.isOwner && p.isMember) {
+                actions = (
+                    <Menu
+                        items={[
+                            { label: 'Remove as owner', icon: 'trash', onClick: () => handleRemoveOwner(p.id, p.email) },
+                            { label: 'Remove as member', icon: 'trash', onClick: () => handleRemoveMember(p.id, p.email) },
+                        ]}
+                        trigger={({ toggle }) => (
+                            <RButton variant="danger" size="sm" icon="trash" onClick={toggle}>
+                                Remove<Icon name="chevd" size={12} />
+                            </RButton>
+                        )}
+                    />
+                );
+            } else {
+                const removeRole = p.isOwner ? 'owner' : 'member';
+                actions = (
+                    <RButton
+                        variant="danger"
+                        size="sm"
+                        icon="trash"
+                        onClick={() => removeRole === 'owner'
+                            ? handleRemoveOwner(p.id, p.email)
+                            : handleRemoveMember(p.id, p.email)}
+                    >
+                        Remove
+                    </RButton>
+                );
+            }
+        }
+        return {
+            key: `person-${keyOf(p)}`,
+            icon: 'user',
+            name: <span style={{ fontWeight: 500 }}>{p.email}</span>,
+            kindLabel: kinds,
+            actions,
+        };
+    });
 
     const isTeamOwnedProject = (project) => {
         const owner = project.owner;
