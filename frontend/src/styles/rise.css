@@ -72,7 +72,7 @@
 
 /* Palette: shifts the accent plus a subtle tint of the light-mode
    surfaces toward the accent hue. Dark mode keeps neutral surfaces. */
-[data-palette="mint"] {
+[data-palette="mint"]:not(.dark) {
     --accent: oklch(0.55 0.10 165);
     --accent-soft: oklch(0.95 0.04 165);
     --bg: oklch(0.985 0.008 165);
@@ -86,7 +86,7 @@
     --accent-soft: oklch(0.30 0.08 165);
 }
 
-[data-palette="indigo"] {
+[data-palette="indigo"]:not(.dark) {
     --accent: oklch(0.55 0.17 270);
     --accent-soft: oklch(0.95 0.04 270);
     --bg: oklch(0.985 0.009 270);
@@ -100,7 +100,7 @@
     --accent-soft: oklch(0.30 0.10 270);
 }
 
-[data-palette="ember"] {
+[data-palette="ember"]:not(.dark) {
     --accent: oklch(0.62 0.16 40);
     --accent-soft: oklch(0.95 0.05 40);
     --bg: oklch(0.987 0.01 55);
@@ -114,7 +114,7 @@
     --accent-soft: oklch(0.32 0.10 40);
 }
 
-[data-palette="slate"] {
+[data-palette="slate"]:not(.dark) {
     --accent: oklch(0.32 0.012 250);
     --accent-fg: #ffffff;
     --accent-soft: oklch(0.92 0.006 250);
