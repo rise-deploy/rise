@@ -130,9 +130,18 @@ pub struct ResourceDefinitionSpec {
     pub kind: String,
     pub plural: String,
     pub scope: ResourceScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<ResourceParentRef>,
     pub versions: Vec<ResourceDefinitionVersion>,
     #[serde(default)]
     pub allowed_status_controller_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceParentRef {
+    pub api_version: String,
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]

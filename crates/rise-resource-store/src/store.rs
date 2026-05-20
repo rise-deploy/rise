@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use rise_resource_api::ResourceScope;
+use rise_resource_api::{ResourceParentRef, ResourceScope};
 
 use crate::error::StoreError;
 use crate::models::ResourceRow;
@@ -28,6 +28,7 @@ pub struct CreateResourceParams {
 }
 
 pub struct UpdateResourceParams {
+    pub api_version: Option<String>,
     pub revision: i64,
     pub annotations: BTreeMap<String, String>,
     pub finalizers: Vec<String>,
@@ -56,14 +57,14 @@ pub enum PropagationPolicy {
 pub enum PathSegment {
     /// Address by name within the parent scope (root if first segment).
     Name {
-        api_version: String,
+        api_versions: Vec<String>,
         kind: String,
         name: String,
     },
     /// Address by UID. The kind is still required and checked against the stored row; mismatches
     /// surface as `StoreError::KindMismatch`.
     Uid {
-        api_version: String,
+        api_versions: Vec<String>,
         kind: String,
         uid: Uuid,
     },
@@ -85,8 +86,11 @@ impl std::fmt::Debug for DeleteOutcome {
 
 pub struct CollectionInfo {
     pub api_version: String,
+    pub storage_api_version: String,
+    pub served_api_versions: Vec<String>,
     pub kind: String,
     pub scope: ResourceScope,
+    pub parent: Option<ResourceParentRef>,
     pub spec_validator: Arc<dyn SpecValidator>,
     pub allowed_status_controller_ids: Vec<String>,
 }
@@ -108,6 +112,13 @@ pub trait ResourceStore: Send + Sync {
     async fn list(
         &self,
         api_version: &str,
+        kind: &str,
+        parent_uid: Option<Uuid>,
+    ) -> Result<Vec<ResourceRow>, StoreError>;
+
+    async fn list_versions(
+        &self,
+        api_versions: &[String],
         kind: &str,
         parent_uid: Option<Uuid>,
     ) -> Result<Vec<ResourceRow>, StoreError>;
@@ -185,6 +196,13 @@ pub trait ResourceStore: Send + Sync {
 
     async fn resolve_collection(
         &self,
+        collection: &str,
+    ) -> Result<Option<CollectionInfo>, StoreError>;
+
+    async fn resolve_collection_version(
+        &self,
+        group: &str,
+        version: &str,
         collection: &str,
     ) -> Result<Option<CollectionInfo>, StoreError>;
 

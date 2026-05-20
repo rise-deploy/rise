@@ -58,15 +58,21 @@ impl PgResourceStore {
         match collection {
             ORGANIZATION_COLLECTION => Some(CollectionInfo {
                 api_version: API_VERSION_V1ALPHA1.to_string(),
+                storage_api_version: API_VERSION_V1ALPHA1.to_string(),
+                served_api_versions: vec![API_VERSION_V1ALPHA1.to_string()],
                 kind: ORGANIZATION_KIND.to_string(),
                 scope: ResourceScope::Root,
+                parent: None,
                 spec_validator: Arc::new(OrganizationValidator),
                 allowed_status_controller_ids: vec![],
             }),
             RESOURCE_DEFINITION_COLLECTION => Some(CollectionInfo {
                 api_version: API_VERSION_V1ALPHA1.to_string(),
+                storage_api_version: API_VERSION_V1ALPHA1.to_string(),
+                served_api_versions: vec![API_VERSION_V1ALPHA1.to_string()],
                 kind: RESOURCE_DEFINITION_KIND.to_string(),
                 scope: ResourceScope::Root,
+                parent: None,
                 spec_validator: Arc::new(ResourceDefinitionValidator),
                 allowed_status_controller_ids: vec![],
             }),
@@ -128,12 +134,9 @@ impl PgResourceStore {
             .map(|version| format!("{}/{}", spec.group, version.name))
             .collect();
 
-        // Lock the resource_definitions row for the duration of this transaction so
-        // two concurrent deletes of the same definition cannot both pass the instance
-        // check. Note: a concurrent create() that inserts a new instance after this
-        // count check but before the DELETE can still slip through, because create()
-        // does not read resource_definitions. Closing that window would require
-        // create() to also acquire a FOR SHARE lock here.
+        // Lock the resource_definitions row for the duration of this transaction.
+        // Instance writes acquire a FOR SHARE lock on the same row before inserting,
+        // so they cannot slip in after this count check and before deletion commits.
         sqlx::query(
             "SELECT uid FROM resource_store.resource_definitions WHERE uid = $1 FOR UPDATE",
         )
@@ -163,6 +166,45 @@ impl PgResourceStore {
 
         Ok(())
     }
+
+    async fn lock_matching_definition_for_write(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        api_version: &str,
+        kind: &str,
+        required: bool,
+    ) -> Result<(), StoreError> {
+        let Some((group, version)) = api_version.split_once('/') else {
+            return Ok(());
+        };
+
+        let row = sqlx::query(
+            r#"
+            SELECT rd.uid
+            FROM resource_store.resource_definitions rd
+            WHERE rd.group_name = $1
+              AND rd.kind = $2
+              AND rd.versions @> $3::jsonb
+            FOR SHARE
+            "#,
+        )
+        .bind(group)
+        .bind(kind)
+        .bind(serde_json::json!([{ "name": version }]))
+        .fetch_optional(&mut **tx)
+        .await?;
+
+        if required && row.is_none() {
+            return Err(StoreError::Validation(format!(
+                "no ResourceDefinition serves '{api_version}/{kind}'"
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn api_version(group: &str, version: &str) -> String {
+        format!("{group}/{version}")
+    }
 }
 
 #[async_trait::async_trait]
@@ -176,8 +218,21 @@ impl ResourceStore for PgResourceStore {
 
         let metadata = serde_json::to_value(&params.annotations).unwrap_or_default();
 
-        let mut conn = self.pool.acquire().await.map_err(StoreError::Database)?;
-        Self::insert_resource_row_with_retry(&mut conn, &params, metadata).await
+        let mut tx = self.pool.begin().await?;
+        if params.kind != RESOURCE_DEFINITION_KIND {
+            let is_builtin =
+                params.api_version == API_VERSION_V1ALPHA1 && params.kind == ORGANIZATION_KIND;
+            Self::lock_matching_definition_for_write(
+                &mut tx,
+                &params.api_version,
+                &params.kind,
+                params.validator.is_some() && !is_builtin,
+            )
+            .await?;
+        }
+        let row = Self::insert_resource_row_with_retry(&mut tx, &params, metadata).await?;
+        tx.commit().await?;
+        Ok(row)
     }
 
     async fn get(&self, uid: Uuid) -> Result<Option<ResourceRow>, StoreError> {
@@ -251,6 +306,35 @@ impl ResourceStore for PgResourceStore {
         Ok(rows)
     }
 
+    async fn list_versions(
+        &self,
+        api_versions: &[String],
+        kind: &str,
+        parent_uid: Option<Uuid>,
+    ) -> Result<Vec<ResourceRow>, StoreError> {
+        let rows =
+            match parent_uid {
+                None => sqlx::query_as::<_, ResourceRow>(
+                    "SELECT * FROM resource_store.resources WHERE api_version = ANY($1) AND kind = $2 AND parent_uid IS NULL ORDER BY name",
+                )
+                .bind(api_versions)
+                .bind(kind)
+                .fetch_all(&self.pool)
+                .await?,
+                Some(pid) => {
+                    sqlx::query_as::<_, ResourceRow>(
+                        "SELECT * FROM resource_store.resources WHERE api_version = ANY($1) AND kind = $2 AND parent_uid = $3 ORDER BY name",
+                    )
+                    .bind(api_versions)
+                    .bind(kind)
+                    .bind(pid)
+                    .fetch_all(&self.pool)
+                    .await?
+                }
+            };
+        Ok(rows)
+    }
+
     async fn update(
         &self,
         uid: Uuid,
@@ -258,14 +342,16 @@ impl ResourceStore for PgResourceStore {
     ) -> Result<ResourceRow, StoreError> {
         // ResourceDefinitions must go through update_resource_definition to keep the
         // resource_definitions projection table in sync.
-        let kind: Option<String> =
-            sqlx::query_scalar("SELECT kind FROM resource_store.resources WHERE uid = $1")
+        let current_identity: Option<(String, String)> =
+            sqlx::query_as("SELECT api_version, kind FROM resource_store.resources WHERE uid = $1")
                 .bind(uid)
                 .fetch_optional(&self.pool)
                 .await?;
-        match kind.as_deref() {
-            None => return Err(StoreError::NotFound),
-            Some(RESOURCE_DEFINITION_KIND) => {
+        let Some((current_api_version, kind)) = current_identity else {
+            return Err(StoreError::NotFound);
+        };
+        match kind.as_str() {
+            RESOURCE_DEFINITION_KIND => {
                 return Err(StoreError::Validation(
                     "ResourceDefinitions must be updated through update_resource_definition"
                         .to_string(),
@@ -283,27 +369,47 @@ impl ResourceStore for PgResourceStore {
         // Include the expected revision in the WHERE clause so the update is atomic:
         // a concurrent write that already incremented the revision will cause zero rows
         // to be affected, which we detect and map to RevisionConflict.
+        let mut tx = self.pool.begin().await?;
+        if params.validator.is_some() {
+            let target_api_version = params
+                .api_version
+                .as_deref()
+                .unwrap_or(&current_api_version);
+            let is_builtin =
+                target_api_version == API_VERSION_V1ALPHA1 && kind == ORGANIZATION_KIND;
+            Self::lock_matching_definition_for_write(
+                &mut tx,
+                target_api_version,
+                &kind,
+                !is_builtin,
+            )
+            .await?;
+        }
+
         let updated = sqlx::query_as::<_, ResourceRow>(
             r#"
             UPDATE resource_store.resources
-            SET metadata   = $1,
-                spec       = $2,
-                finalizers = $3,
+            SET api_version = COALESCE($1, api_version),
+                metadata   = $2,
+                spec       = $3,
+                finalizers = $4,
                 revision   = revision + 1,
                 updated_at = NOW()
-            WHERE uid = $4 AND revision = $5
+            WHERE uid = $5 AND revision = $6
             RETURNING *
             "#,
         )
+        .bind(params.api_version.as_deref())
         .bind(metadata)
         .bind(&params.spec)
         .bind(&params.finalizers)
         .bind(uid)
         .bind(params.revision)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
 
         if let Some(row) = updated {
+            tx.commit().await?;
             return Ok(row);
         }
 
@@ -576,23 +682,23 @@ impl ResourceStore for PgResourceStore {
         for (idx, segment) in segments.iter().enumerate() {
             let row = match segment {
                 PathSegment::Name {
-                    api_version,
+                    api_versions,
                     kind,
                     name,
                 } => {
                     let row: Option<ResourceRow> = match current_parent {
                         None => sqlx::query_as::<_, ResourceRow>(
-                            "SELECT * FROM resource_store.resources WHERE api_version = $1 AND kind = $2 AND name = $3 AND parent_uid IS NULL",
+                            "SELECT * FROM resource_store.resources WHERE api_version = ANY($1) AND kind = $2 AND name = $3 AND parent_uid IS NULL",
                         )
-                        .bind(api_version)
+                        .bind(api_versions)
                         .bind(kind)
                         .bind(name)
                         .fetch_optional(&mut *tx)
                         .await?,
                         Some(pid) => sqlx::query_as::<_, ResourceRow>(
-                            "SELECT * FROM resource_store.resources WHERE api_version = $1 AND kind = $2 AND name = $3 AND parent_uid = $4",
+                            "SELECT * FROM resource_store.resources WHERE api_version = ANY($1) AND kind = $2 AND name = $3 AND parent_uid = $4",
                         )
-                        .bind(api_version)
+                        .bind(api_versions)
                         .bind(kind)
                         .bind(name)
                         .bind(pid)
@@ -606,7 +712,7 @@ impl ResourceStore for PgResourceStore {
                     }
                 }
                 PathSegment::Uid {
-                    api_version,
+                    api_versions,
                     kind,
                     uid,
                 } => {
@@ -621,9 +727,9 @@ impl ResourceStore for PgResourceStore {
                         None if idx + 1 == segments.len() => return Err(StoreError::NotFound),
                         None => return Err(StoreError::ParentNotFound),
                     };
-                    if row.kind != *kind || row.api_version != *api_version {
+                    if row.kind != *kind || !api_versions.iter().any(|v| v == &row.api_version) {
                         return Err(StoreError::KindMismatch {
-                            expected: format!("{api_version}/{kind}"),
+                            expected: format!("one of {:?}/{kind}", api_versions),
                             got: format!("{}/{}", row.api_version, row.kind),
                         });
                     }
@@ -898,18 +1004,12 @@ impl ResourceStore for PgResourceStore {
             return Ok(Some(info));
         }
 
-        // Check for a pre-compiled validator to avoid re-compiling JSON schema on every call
-        let cached_validator = self
-            .schema_cache
-            .read()
-            .ok()
-            .and_then(|c| c.get(collection).cloned());
-
         let row = sqlx::query(
             r#"
             SELECT rd.uid, rd.group_name, rd.kind, rd.scope, rd.versions,
-                   rd.allowed_status_controller_ids
+                   rd.allowed_status_controller_ids, r.spec
             FROM resource_store.resource_definitions rd
+            JOIN resource_store.resources r ON r.uid = rd.uid
             WHERE rd.plural = $1
             "#,
         )
@@ -921,31 +1021,96 @@ impl ResourceStore for PgResourceStore {
             return Ok(None);
         };
 
-        let scope: ResourceScope = serde_json::from_value(
-            row.try_get("scope").map_err(StoreError::Database)?,
-        )
-        .map_err(|e| StoreError::Validation(format!("invalid scope in ResourceDefinition: {e}")))?;
-
         let versions: Vec<rise_resource_api::ResourceDefinitionVersion> =
             serde_json::from_value(row.try_get("versions").map_err(StoreError::Database)?)
                 .map_err(|e| {
                     StoreError::Validation(format!("invalid versions in ResourceDefinition: {e}"))
                 })?;
 
-        let allowed: Vec<String> = row
-            .try_get("allowed_status_controller_ids")
-            .map_err(StoreError::Database)?;
-
         let group_name: String = row.try_get("group_name").map_err(StoreError::Database)?;
-        let kind: String = row.try_get("kind").map_err(StoreError::Database)?;
-
         let storage_version = versions
             .iter()
             .find(|v| v.storage)
             .map(|v| v.name.clone())
             .unwrap_or_else(|| "v1".to_string());
 
-        let api_version = format!("{group_name}/{storage_version}");
+        self.resolve_collection_version(&group_name, &storage_version, collection)
+            .await
+    }
+
+    async fn resolve_collection_version(
+        &self,
+        group: &str,
+        version: &str,
+        collection: &str,
+    ) -> Result<Option<CollectionInfo>, StoreError> {
+        if group == "rise.dev" && version == "v1alpha1" {
+            return Ok(Self::builtin_collection_info(collection));
+        }
+
+        let cache_key = format!("{group}/{version}/{collection}");
+        let cached_validator = self
+            .schema_cache
+            .read()
+            .ok()
+            .and_then(|c| c.get(&cache_key).cloned());
+
+        let row = sqlx::query(
+            r#"
+            SELECT rd.uid, rd.group_name, rd.kind, rd.scope, rd.versions,
+                   rd.allowed_status_controller_ids, r.spec
+            FROM resource_store.resource_definitions rd
+            JOIN resource_store.resources r ON r.uid = rd.uid
+            WHERE rd.group_name = $1 AND rd.plural = $2
+            "#,
+        )
+        .bind(group)
+        .bind(collection)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let spec: ResourceDefinitionSpec = serde_json::from_value(
+            row.try_get("spec").map_err(StoreError::Database)?,
+        )
+        .map_err(|e| StoreError::Validation(format!("invalid ResourceDefinition spec: {e}")))?;
+
+        let versions = spec.versions.clone();
+        let requested = versions
+            .iter()
+            .find(|v| v.name == version)
+            .ok_or_else(|| StoreError::Validation(format!("version '{version}' is not defined")))?;
+        if !requested.served {
+            return Err(StoreError::Validation(format!(
+                "version '{version}' is not served"
+            )));
+        }
+
+        let storage_version = versions
+            .iter()
+            .find(|v| v.storage)
+            .map(|v| v.name.clone())
+            .unwrap_or_else(|| "v1".to_string());
+        let storage_api_version = Self::api_version(group, &storage_version);
+        let served_api_versions: Vec<String> = versions
+            .iter()
+            .filter(|v| v.served)
+            .map(|v| Self::api_version(group, &v.name))
+            .collect();
+        let api_version = Self::api_version(group, version);
+
+        let allowed: Vec<String> = row
+            .try_get("allowed_status_controller_ids")
+            .map_err(StoreError::Database)?;
+
+        let scope: ResourceScope = serde_json::from_value(
+            row.try_get("scope").map_err(StoreError::Database)?,
+        )
+        .map_err(|e| StoreError::Validation(format!("invalid scope in ResourceDefinition: {e}")))?;
+        let kind: String = row.try_get("kind").map_err(StoreError::Database)?;
 
         // Use the cached validator, or compile one and store it in the cache. A schema that
         // fails to compile is a hard error: silently falling back to NoOpValidator would let
@@ -954,18 +1119,16 @@ impl ResourceStore for PgResourceStore {
         let schema_validator: Arc<dyn SpecValidator> = match cached_validator {
             Some(v) => v,
             None => {
-                let storage_version = versions.iter().find(|v| v.storage);
-                let v: Arc<dyn SpecValidator> = match storage_version.and_then(|v| v.schema.clone())
-                {
+                let v: Arc<dyn SpecValidator> = match requested.schema.clone() {
                     Some(schema) => Arc::new(JsonSchemaValidator::new(schema).map_err(|e| {
                         StoreError::Validation(format!(
-                            "ResourceDefinition '{collection}' has an invalid JSON schema: {e}"
+                            "ResourceDefinition '{collection}' version '{version}' has an invalid JSON schema: {e}"
                         ))
                     })?) as Arc<dyn SpecValidator>,
                     None => Arc::new(NoOpValidator),
                 };
                 if let Ok(mut cache) = self.schema_cache.write() {
-                    cache.insert(collection.to_string(), v.clone());
+                    cache.insert(cache_key, v.clone());
                 }
                 v
             }
@@ -973,8 +1136,11 @@ impl ResourceStore for PgResourceStore {
 
         Ok(Some(CollectionInfo {
             api_version,
+            storage_api_version,
+            served_api_versions,
             kind,
             scope,
+            parent: spec.parent,
             spec_validator: schema_validator,
             allowed_status_controller_ids: allowed,
         }))
@@ -1132,15 +1298,17 @@ impl ResourceStore for PgResourceStore {
         let updated = sqlx::query_as::<_, ResourceRow>(
             r#"
             UPDATE resource_store.resources
-            SET metadata   = $1,
-                spec       = $2,
-                finalizers = $3,
+            SET api_version = COALESCE($1, api_version),
+                metadata   = $2,
+                spec       = $3,
+                finalizers = $4,
                 revision   = revision + 1,
                 updated_at = NOW()
-            WHERE uid = $4 AND revision = $5
+            WHERE uid = $5 AND revision = $6
             RETURNING *
             "#,
         )
+        .bind(params.api_version.as_deref())
         .bind(metadata)
         .bind(&params.spec)
         .bind(&params.finalizers)

@@ -1,7 +1,7 @@
 use rise_resource_api::{
     is_reserved_collection_name, validate_collection_name, validate_controller_id,
     validate_resource_group, validate_resource_kind, validate_resource_version, OrganizationSpec,
-    OrganizationStatus, ResourceDefinitionSpec, ResourceDefinitionStatus,
+    OrganizationStatus, ResourceDefinitionSpec, ResourceDefinitionStatus, ResourceScope,
 };
 
 use crate::error::StoreError;
@@ -50,6 +50,35 @@ impl SpecValidator for ResourceDefinitionValidator {
                 "plural '{}' is a reserved collection name",
                 parsed.plural
             )));
+        }
+
+        match parsed.scope {
+            ResourceScope::Root => {
+                if parsed.parent.is_some() {
+                    return Err(StoreError::Validation(
+                        "root-scoped ResourceDefinitions must not declare a parent".into(),
+                    ));
+                }
+            }
+            ResourceScope::Organization => {
+                let Some(parent) = &parsed.parent else {
+                    return Err(StoreError::Validation(
+                        "non-root ResourceDefinitions must declare parent.apiVersion and parent.kind"
+                            .into(),
+                    ));
+                };
+                let Some((group, version)) = parent.api_version.split_once('/') else {
+                    return Err(StoreError::Validation(
+                        "parent.apiVersion must be '<group>/<version>'".into(),
+                    ));
+                };
+                validate_resource_group(group)
+                    .map_err(|e| StoreError::Validation(e.to_string()))?;
+                validate_resource_version(version)
+                    .map_err(|e| StoreError::Validation(e.to_string()))?;
+                validate_resource_kind(&parent.kind)
+                    .map_err(|e| StoreError::Validation(e.to_string()))?;
+            }
         }
 
         if parsed.versions.is_empty() {

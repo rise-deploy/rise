@@ -144,6 +144,7 @@ async fn update_resource_increments_revision(pool: sqlx::PgPool) -> sqlx::Result
         .update(
             row.uid,
             UpdateResourceParams {
+                api_version: None,
                 revision: 1,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
@@ -182,6 +183,7 @@ async fn update_rejects_wrong_revision(pool: sqlx::PgPool) -> sqlx::Result<()> {
         .update(
             row.uid,
             UpdateResourceParams {
+                api_version: None,
                 revision: 99, // wrong
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
@@ -535,6 +537,61 @@ async fn delete_resource_definition_rejects_existing_instances(
 }
 
 #[sqlx::test]
+async fn delete_resource_definition_rejects_instances_in_any_served_version(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+
+    let spec = json!({
+        "group": "example.dev",
+        "kind": "Widget",
+        "plural": "widgets",
+        "scope": "root",
+        "versions": [
+            {"name": "v1", "served": true, "storage": false},
+            {"name": "v2", "served": true, "storage": true}
+        ],
+        "allowedStatusControllerIds": []
+    });
+
+    let definition = store
+        .register_resource_definition(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: RESOURCE_DEFINITION_KIND.to_string(),
+            name: "widgets.example.dev".to_string(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec,
+            validator: None,
+        })
+        .await
+        .unwrap();
+
+    store
+        .create(CreateResourceParams {
+            api_version: "example.dev/v1".to_string(),
+            kind: "Widget".to_string(),
+            name: "w1".to_string(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec: json!({}),
+            validator: None,
+        })
+        .await
+        .unwrap();
+
+    let err = store
+        .delete(definition.uid, PropagationPolicy::Cascade)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Validation(_)));
+
+    Ok(())
+}
+
+#[sqlx::test]
 async fn register_resource_definition_rejects_reserved_plural(
     pool: sqlx::PgPool,
 ) -> sqlx::Result<()> {
@@ -564,6 +621,63 @@ async fn register_resource_definition_rejects_reserved_plural(
         .unwrap_err();
 
     assert!(matches!(err, StoreError::Validation(_)));
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn register_resource_definition_requires_parent_for_non_root_scope(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+
+    let missing_parent = json!({
+        "group": "example.dev",
+        "kind": "Widget",
+        "plural": "widgets",
+        "scope": "organization",
+        "versions": [{"name": "v1", "served": true, "storage": true}],
+        "allowedStatusControllerIds": []
+    });
+
+    let err = store
+        .register_resource_definition(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: RESOURCE_DEFINITION_KIND.to_string(),
+            name: "widgets.example.dev".to_string(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec: missing_parent,
+            validator: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Validation(_)));
+
+    let with_parent = json!({
+        "group": "example.dev",
+        "kind": "Widget",
+        "plural": "widgets",
+        "scope": "organization",
+        "parent": {"apiVersion": API_VERSION_V1ALPHA1, "kind": ORGANIZATION_KIND},
+        "versions": [{"name": "v1", "served": true, "storage": true}],
+        "allowedStatusControllerIds": []
+    });
+
+    store
+        .register_resource_definition(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: RESOURCE_DEFINITION_KIND.to_string(),
+            name: "widgets.example.dev".to_string(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec: with_parent,
+            validator: None,
+        })
+        .await
+        .unwrap();
 
     Ok(())
 }
@@ -755,6 +869,7 @@ async fn update_resource_definition_updates_projection(pool: sqlx::PgPool) -> sq
         .update_resource_definition(
             row.uid,
             UpdateResourceParams {
+                api_version: None,
                 revision: row.revision,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
@@ -770,6 +885,95 @@ async fn update_resource_definition_updates_projection(pool: sqlx::PgPool) -> sq
     // resolve_collection should reflect the new storage version
     let info = store.resolve_collection("widgets").await.unwrap().unwrap();
     assert_eq!(info.api_version, "example.dev/v2");
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn added_version_serves_existing_instances_without_rewriting(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+
+    let spec_v1 = json!({
+        "group": "example.dev",
+        "kind": "Widget",
+        "plural": "widgets",
+        "scope": "root",
+        "versions": [{"name": "v1", "served": true, "storage": true}],
+        "allowedStatusControllerIds": []
+    });
+
+    let rd = store
+        .register_resource_definition(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: RESOURCE_DEFINITION_KIND.to_string(),
+            name: "widgets.example.dev".to_string(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec: spec_v1,
+            validator: None,
+        })
+        .await
+        .unwrap();
+
+    let widget = store
+        .create(CreateResourceParams {
+            api_version: "example.dev/v1".to_string(),
+            kind: "Widget".to_string(),
+            name: "w1".to_string(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec: json!({}),
+            validator: None,
+        })
+        .await
+        .unwrap();
+
+    let spec_v2 = json!({
+        "group": "example.dev",
+        "kind": "Widget",
+        "plural": "widgets",
+        "scope": "root",
+        "versions": [
+            {"name": "v1", "served": true, "storage": false},
+            {"name": "v2", "served": true, "storage": true}
+        ],
+        "allowedStatusControllerIds": []
+    });
+
+    store
+        .update_resource_definition(
+            rd.uid,
+            UpdateResourceParams {
+                api_version: None,
+                revision: rd.revision,
+                annotations: BTreeMap::new(),
+                finalizers: vec![],
+                spec: spec_v2,
+                validator: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let info = store
+        .resolve_collection_version("example.dev", "v2", "widgets")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(info.api_version, "example.dev/v2");
+    assert_eq!(info.storage_api_version, "example.dev/v2");
+
+    let rows = store
+        .list_versions(&info.served_api_versions, &info.kind, None)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].uid, widget.uid);
+    assert_eq!(rows[0].api_version, "example.dev/v1");
 
     Ok(())
 }
@@ -817,6 +1021,7 @@ async fn update_resource_definition_rejects_identity_change(
         .update_resource_definition(
             row.uid,
             UpdateResourceParams {
+                api_version: None,
                 revision: row.revision,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
@@ -867,6 +1072,7 @@ async fn update_rejects_resource_definition(pool: sqlx::PgPool) -> sqlx::Result<
         .update(
             row.uid,
             UpdateResourceParams {
+                api_version: None,
                 revision: row.revision,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
@@ -1169,12 +1375,12 @@ async fn resolve_path_walks_named_segments(pool: sqlx::PgPool) -> sqlx::Result<(
     let chain = store
         .resolve_path(&[
             PathSegment::Name {
-                api_version: API_VERSION_V1ALPHA1.to_string(),
+                api_versions: vec![API_VERSION_V1ALPHA1.to_string()],
                 kind: ORGANIZATION_KIND.to_string(),
                 name: "acme".to_string(),
             },
             PathSegment::Name {
-                api_version: "example.dev/v1".to_string(),
+                api_versions: vec!["example.dev/v1".to_string()],
                 kind: "Widget".to_string(),
                 name: "w1".to_string(),
             },
@@ -1197,12 +1403,12 @@ async fn resolve_path_supports_uid_segments(pool: sqlx::PgPool) -> sqlx::Result<
     let chain = store
         .resolve_path(&[
             PathSegment::Uid {
-                api_version: API_VERSION_V1ALPHA1.to_string(),
+                api_versions: vec![API_VERSION_V1ALPHA1.to_string()],
                 kind: ORGANIZATION_KIND.to_string(),
                 uid: org.uid,
             },
             PathSegment::Name {
-                api_version: "example.dev/v1".to_string(),
+                api_versions: vec!["example.dev/v1".to_string()],
                 kind: "Widget".to_string(),
                 name: "w1".to_string(),
             },
@@ -1222,7 +1428,7 @@ async fn resolve_path_rejects_kind_mismatch(pool: sqlx::PgPool) -> sqlx::Result<
 
     let err = store
         .resolve_path(&[PathSegment::Uid {
-            api_version: "example.dev/v1".to_string(),
+            api_versions: vec!["example.dev/v1".to_string()],
             kind: "Widget".to_string(),
             uid: org.uid,
         }])
@@ -1246,12 +1452,12 @@ async fn resolve_path_rejects_wrong_subtree(pool: sqlx::PgPool) -> sqlx::Result<
     let err = store
         .resolve_path(&[
             PathSegment::Uid {
-                api_version: API_VERSION_V1ALPHA1.to_string(),
+                api_versions: vec![API_VERSION_V1ALPHA1.to_string()],
                 kind: ORGANIZATION_KIND.to_string(),
                 uid: org_a.uid,
             },
             PathSegment::Uid {
-                api_version: "example.dev/v1".to_string(),
+                api_versions: vec!["example.dev/v1".to_string()],
                 kind: "Widget".to_string(),
                 uid: widget_b.uid,
             },
@@ -1283,12 +1489,12 @@ async fn resolve_path_returns_tombstoned_rows(pool: sqlx::PgPool) -> sqlx::Resul
     let chain = store
         .resolve_path(&[
             PathSegment::Name {
-                api_version: API_VERSION_V1ALPHA1.to_string(),
+                api_versions: vec![API_VERSION_V1ALPHA1.to_string()],
                 kind: ORGANIZATION_KIND.to_string(),
                 name: "acme".to_string(),
             },
             PathSegment::Name {
-                api_version: "example.dev/v1".to_string(),
+                api_versions: vec!["example.dev/v1".to_string()],
                 kind: "Widget".to_string(),
                 name: "w1".to_string(),
             },

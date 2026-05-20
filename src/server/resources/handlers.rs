@@ -26,10 +26,12 @@ use uuid::Uuid;
 
 use super::error_map::store_error_to_server_error;
 use super::models::{
-    row_to_resource, ControllerFinalizerUpdate, ControllerStatusUpdate, ReparentRequest,
-    ResourceList,
+    row_to_resource, row_to_resource_with_api_version, ControllerFinalizerUpdate,
+    ControllerStatusUpdate, ReparentRequest, ResourceList,
 };
-use super::path::{parse_identifier, parse_resource_path, AncestorRef, ResourcePath, Subresource};
+use super::path::{
+    parse_identifier, parse_resource_path, AncestorRef, CollectionRef, ResourcePath, Subresource,
+};
 use crate::db::models::User;
 use crate::server::auth::context::{AnyAuth, AuthContext};
 use crate::server::auth::controller::ControllerAuthContext;
@@ -83,15 +85,20 @@ struct ResolvedCollection {
 
 async fn resolve_collection(
     store: &Arc<dyn ResourceStore>,
-    collection: &str,
+    collection: &CollectionRef,
 ) -> Result<ResolvedCollection, ServerError> {
     let info = store
-        .resolve_collection(collection)
+        .resolve_collection_version(&collection.group, &collection.version, &collection.plural)
         .await
         .map_err(store_error_to_server_error)?
-        .ok_or_else(|| ServerError::not_found(format!("unknown collection '{collection}'")))?;
+        .ok_or_else(|| {
+            ServerError::not_found(format!(
+                "unknown collection '{}/{}/{}'",
+                collection.group, collection.version, collection.plural
+            ))
+        })?;
     Ok(ResolvedCollection {
-        collection: collection.to_string(),
+        collection: collection.plural.clone(),
         info,
     })
 }
@@ -110,7 +117,11 @@ async fn resolve_item(
     identifier: &str,
 ) -> Result<ResourceRow, ServerError> {
     let mut segs = ancestor_segs;
-    segs.push(parse_identifier(&info.api_version, &info.kind, identifier)?);
+    segs.push(path_segment(
+        &info.served_api_versions,
+        &info.kind,
+        identifier,
+    )?);
     let chain = store
         .resolve_path(&segs)
         .await
@@ -121,22 +132,27 @@ async fn resolve_item(
         .ok_or_else(|| ServerError::not_found(format!("resource '{identifier}' not found")))
 }
 
-/// Resolve the parent UID from a list of already-resolved ancestor segments.
-///
-/// Returns `None` for root-scoped resources (no ancestors). Calls the store's
-/// `resolve_path` to obtain the last row's UID for org-scoped resources.
-async fn resolve_parent_uid_from_segs(
-    store: &Arc<dyn ResourceStore>,
-    ancestor_segs: &[PathSegment],
-) -> Result<Option<Uuid>, ServerError> {
-    if ancestor_segs.is_empty() {
-        return Ok(None);
+fn path_segment(
+    api_versions: &[String],
+    kind: &str,
+    raw: &str,
+) -> Result<PathSegment, ServerError> {
+    match parse_identifier(
+        api_versions.first().map(String::as_str).unwrap_or_default(),
+        kind,
+        raw,
+    )? {
+        PathSegment::Name { name, .. } => Ok(PathSegment::Name {
+            api_versions: api_versions.to_vec(),
+            kind: kind.to_string(),
+            name,
+        }),
+        PathSegment::Uid { uid, .. } => Ok(PathSegment::Uid {
+            api_versions: api_versions.to_vec(),
+            kind: kind.to_string(),
+            uid,
+        }),
     }
-    let rows = store
-        .resolve_path(ancestor_segs)
-        .await
-        .map_err(store_error_to_server_error)?;
-    Ok(rows.into_iter().last().map(|r| r.uid))
 }
 
 /// Check that a collection's declared scope is consistent with its depth in the URL path.
@@ -161,6 +177,32 @@ fn enforce_collection_depth(
         )));
     }
     Ok(())
+}
+
+fn enforce_parent_type(
+    info: &CollectionInfo,
+    parent: Option<&ResourceRow>,
+    collection: &str,
+) -> Result<(), ServerError> {
+    match (&info.parent, parent) {
+        (None, None) => Ok(()),
+        (None, Some(_)) => Err(ServerError::bad_request(format!(
+            "collection '{collection}' is root-scoped and cannot appear under a parent resource"
+        ))),
+        (Some(_), None) => Err(ServerError::bad_request(format!(
+            "collection '{collection}' requires a parent resource"
+        ))),
+        (Some(expected), Some(parent)) => {
+            if parent.api_version == expected.api_version && parent.kind == expected.kind {
+                Ok(())
+            } else {
+                Err(ServerError::bad_request(format!(
+                    "collection '{collection}' requires parent '{}/{}', got '{}/{}'",
+                    expected.api_version, expected.kind, parent.api_version, parent.kind
+                )))
+            }
+        }
+    }
 }
 
 /// Authorize a controller token for status/finalizer writes against a
@@ -261,18 +303,39 @@ fn parse_propagation(value: Option<String>) -> Result<PropagationPolicy, ServerE
 async fn resolve_ancestors(
     store: &Arc<dyn ResourceStore>,
     ancestors: &[AncestorRef],
-) -> Result<Vec<PathSegment>, ServerError> {
+) -> Result<(Vec<PathSegment>, Option<ResourceRow>), ServerError> {
     let mut segs = Vec::with_capacity(ancestors.len());
     for (i, anc) in ancestors.iter().enumerate() {
         let resolved = resolve_collection(store, &anc.collection).await?;
         enforce_collection_depth(&resolved.info, i > 0, &resolved.collection)?;
-        segs.push(parse_identifier(
-            &resolved.info.api_version,
+        let parent = if segs.is_empty() {
+            None
+        } else {
+            store
+                .resolve_path(&segs)
+                .await
+                .map_err(store_error_to_server_error)?
+                .into_iter()
+                .last()
+        };
+        enforce_parent_type(&resolved.info, parent.as_ref(), &resolved.collection)?;
+        segs.push(path_segment(
+            &resolved.info.served_api_versions,
             &resolved.info.kind,
             &anc.identifier,
         )?);
     }
-    Ok(segs)
+    let parent = if segs.is_empty() {
+        None
+    } else {
+        store
+            .resolve_path(&segs)
+            .await
+            .map_err(store_error_to_server_error)?
+            .into_iter()
+            .last()
+    };
+    Ok((segs, parent))
 }
 
 // -----------------------------------------------------------------------------
@@ -310,20 +373,28 @@ pub async fn dispatch_get(
             collection,
         } => {
             let _user = require_operator(&state, &auth)?;
-            let ancestor_segs = resolve_ancestors(&state.resource_store, &ancestors).await?;
-            let parent_uid =
-                resolve_parent_uid_from_segs(&state.resource_store, &ancestor_segs).await?;
+            let (_ancestor_segs, parent) =
+                resolve_ancestors(&state.resource_store, &ancestors).await?;
+            let parent_uid = parent.as_ref().map(|r| r.uid);
             let resolved = resolve_collection(&state.resource_store, &collection).await?;
             enforce_collection_depth(&resolved.info, !ancestors.is_empty(), &resolved.collection)?;
+            enforce_parent_type(&resolved.info, parent.as_ref(), &resolved.collection)?;
             let rows = state
                 .resource_store
-                .list(&resolved.info.api_version, &resolved.info.kind, parent_uid)
+                .list_versions(
+                    &resolved.info.served_api_versions,
+                    &resolved.info.kind,
+                    parent_uid,
+                )
                 .await
                 .map_err(store_error_to_server_error)?;
             Ok(Json(ResourceList {
-                api_version: resolved.info.api_version,
+                api_version: resolved.info.api_version.clone(),
                 kind: resolved.info.kind,
-                items: rows.iter().map(row_to_resource).collect(),
+                items: rows
+                    .iter()
+                    .map(|row| row_to_resource_with_api_version(row, &resolved.info.api_version))
+                    .collect(),
             })
             .into_response())
         }
@@ -333,9 +404,11 @@ pub async fn dispatch_get(
             identifier,
         } => {
             let _user = require_operator(&state, &auth)?;
-            let ancestor_segs = resolve_ancestors(&state.resource_store, &ancestors).await?;
+            let (ancestor_segs, parent) =
+                resolve_ancestors(&state.resource_store, &ancestors).await?;
             let resolved = resolve_collection(&state.resource_store, &collection).await?;
             enforce_collection_depth(&resolved.info, !ancestors.is_empty(), &resolved.collection)?;
+            enforce_parent_type(&resolved.info, parent.as_ref(), &resolved.collection)?;
             let row = resolve_item(
                 &state.resource_store,
                 ancestor_segs,
@@ -343,7 +416,11 @@ pub async fn dispatch_get(
                 &identifier,
             )
             .await?;
-            Ok(Json(row_to_resource(&row)).into_response())
+            Ok(Json(row_to_resource_with_api_version(
+                &row,
+                &resolved.info.api_version,
+            ))
+            .into_response())
         }
         ResourcePath::Subresource { .. } => Err(ServerError::new(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -367,11 +444,12 @@ pub async fn dispatch_post(
             let user = require_operator(&state, &auth)?;
             let body: CreateResourceRequest = serde_json::from_value(body)
                 .map_err(|e| ServerError::bad_request(format!("invalid request body: {e}")))?;
-            let ancestor_segs = resolve_ancestors(&state.resource_store, &ancestors).await?;
-            let parent_uid =
-                resolve_parent_uid_from_segs(&state.resource_store, &ancestor_segs).await?;
+            let (_ancestor_segs, parent) =
+                resolve_ancestors(&state.resource_store, &ancestors).await?;
+            let parent_uid = parent.as_ref().map(|r| r.uid);
             let resolved = resolve_collection(&state.resource_store, &collection).await?;
             enforce_collection_depth(&resolved.info, !ancestors.is_empty(), &resolved.collection)?;
+            enforce_parent_type(&resolved.info, parent.as_ref(), &resolved.collection)?;
             let (status, resource) =
                 create_resource(&state, &resolved, parent_uid, body, &user).await?;
             Ok((status, resource).into_response())
@@ -385,9 +463,11 @@ pub async fn dispatch_post(
             let user = require_admin_operator(&state, &auth)?;
             let body: ReparentRequest = serde_json::from_value(body)
                 .map_err(|e| ServerError::bad_request(format!("invalid request body: {e}")))?;
-            let ancestor_segs = resolve_ancestors(&state.resource_store, &ancestors).await?;
+            let (ancestor_segs, parent) =
+                resolve_ancestors(&state.resource_store, &ancestors).await?;
             let resolved = resolve_collection(&state.resource_store, &collection).await?;
             enforce_collection_depth(&resolved.info, !ancestors.is_empty(), &resolved.collection)?;
+            enforce_parent_type(&resolved.info, parent.as_ref(), &resolved.collection)?;
             let row = resolve_item(
                 &state.resource_store,
                 ancestor_segs,
@@ -430,9 +510,11 @@ pub async fn dispatch_put(
             let user = require_operator(&state, auth_ctx)?;
             let body: UpdateResourceRequest = serde_json::from_value(body)
                 .map_err(|e| ServerError::bad_request(format!("invalid request body: {e}")))?;
-            let ancestor_segs = resolve_ancestors(&state.resource_store, &ancestors).await?;
+            let (ancestor_segs, parent) =
+                resolve_ancestors(&state.resource_store, &ancestors).await?;
             let resolved = resolve_collection(&state.resource_store, &collection).await?;
             enforce_collection_depth(&resolved.info, !ancestors.is_empty(), &resolved.collection)?;
+            enforce_parent_type(&resolved.info, parent.as_ref(), &resolved.collection)?;
             let row = resolve_item(
                 &state.resource_store,
                 ancestor_segs,
@@ -458,9 +540,11 @@ pub async fn dispatch_put(
                     ));
                 }
             };
-            let ancestor_segs = resolve_ancestors(&state.resource_store, &ancestors).await?;
+            let (ancestor_segs, parent) =
+                resolve_ancestors(&state.resource_store, &ancestors).await?;
             let resolved = resolve_collection(&state.resource_store, &collection).await?;
             enforce_collection_depth(&resolved.info, !ancestors.is_empty(), &resolved.collection)?;
+            enforce_parent_type(&resolved.info, parent.as_ref(), &resolved.collection)?;
             enforce_controller_allowed(
                 &resolved.info,
                 &resolved.collection,
@@ -479,7 +563,14 @@ pub async fn dispatch_put(
                         serde_json::from_value(body).map_err(|e| {
                             ServerError::bad_request(format!("invalid request body: {e}"))
                         })?;
-                    let resp = apply_controller_status(&state, controller, &row, body).await?;
+                    let resp = apply_controller_status(
+                        &state,
+                        controller,
+                        &row,
+                        body,
+                        &resolved.info.api_version,
+                    )
+                    .await?;
                     Ok(resp.into_response())
                 }
                 Subresource::Finalizers => {
@@ -487,7 +578,14 @@ pub async fn dispatch_put(
                         serde_json::from_value(body).map_err(|e| {
                             ServerError::bad_request(format!("invalid request body: {e}"))
                         })?;
-                    let resp = apply_controller_finalizers(&state, controller, &row, body).await?;
+                    let resp = apply_controller_finalizers(
+                        &state,
+                        controller,
+                        &row,
+                        body,
+                        &resolved.info.api_version,
+                    )
+                    .await?;
                     Ok(resp.into_response())
                 }
                 Subresource::Reparent => Err(ServerError::new(
@@ -522,9 +620,11 @@ pub async fn dispatch_delete(
             } else {
                 require_operator(&state, &auth)?
             };
-            let ancestor_segs = resolve_ancestors(&state.resource_store, &ancestors).await?;
+            let (ancestor_segs, parent) =
+                resolve_ancestors(&state.resource_store, &ancestors).await?;
             let resolved = resolve_collection(&state.resource_store, &collection).await?;
             enforce_collection_depth(&resolved.info, !ancestors.is_empty(), &resolved.collection)?;
+            enforce_parent_type(&resolved.info, parent.as_ref(), &resolved.collection)?;
             let row = resolve_item(
                 &state.resource_store,
                 ancestor_segs,
@@ -532,7 +632,8 @@ pub async fn dispatch_delete(
                 &identifier,
             )
             .await?;
-            let resp = delete_resource(&state, &row, policy, &user).await?;
+            let resp =
+                delete_resource(&state, &row, policy, &user, &resolved.info.api_version).await?;
             Ok(resp.into_response())
         }
         _ => Err(ServerError::new(
@@ -572,7 +673,7 @@ async fn create_resource(
         .map_err(|e| ServerError::bad_request(format!("invalid spec: {e}")))?;
 
     let params = CreateResourceParams {
-        api_version: body.api_version,
+        api_version: resolved.info.storage_api_version.clone(),
         kind: body.kind,
         name: body.metadata.name,
         parent_uid,
@@ -609,7 +710,13 @@ async fn create_resource(
         parent_uid = ?row.parent_uid,
         "resource.created"
     );
-    Ok((StatusCode::CREATED, Json(row_to_resource(&row))))
+    Ok((
+        StatusCode::CREATED,
+        Json(row_to_resource_with_api_version(
+            &row,
+            &resolved.info.api_version,
+        )),
+    ))
 }
 
 async fn update_resource(
@@ -640,6 +747,7 @@ async fn update_resource(
         .map_err(|e| ServerError::bad_request(format!("invalid spec: {e}")))?;
 
     let params = UpdateResourceParams {
+        api_version: Some(resolved.info.storage_api_version.clone()),
         revision: body.metadata.revision,
         annotations,
         finalizers: body.metadata.finalizers,
@@ -671,7 +779,10 @@ async fn update_resource(
         revision = updated.revision,
         "resource.updated"
     );
-    Ok(Json(row_to_resource(&updated)))
+    Ok(Json(row_to_resource_with_api_version(
+        &updated,
+        &resolved.info.api_version,
+    )))
 }
 
 async fn delete_resource(
@@ -679,6 +790,7 @@ async fn delete_resource(
     row: &ResourceRow,
     policy: PropagationPolicy,
     user: &User,
+    response_api_version: &str,
 ) -> Result<Json<serde_json::Value>, ServerError> {
     let outcome = state
         .resource_store
@@ -706,7 +818,7 @@ async fn delete_resource(
         DeleteOutcome::MarkedForDeletion(marked) => serde_json::json!({
             "deleted": false,
             "markedForDeletion": true,
-            "resource": row_to_resource(&marked),
+            "resource": row_to_resource_with_api_version(&marked, response_api_version),
         }),
     };
     Ok(Json(body))
@@ -717,13 +829,17 @@ async fn apply_controller_status(
     controller: &ControllerAuthContext,
     row: &ResourceRow,
     body: ControllerStatusUpdate,
+    response_api_version: &str,
 ) -> Result<Json<rise_resource_api::Resource>, ServerError> {
     let updated = state
         .resource_store
         .update_controller_status(row.uid, &controller.0.identity_id, body.status)
         .await
         .map_err(store_error_to_server_error)?;
-    Ok(Json(row_to_resource(&updated)))
+    Ok(Json(row_to_resource_with_api_version(
+        &updated,
+        response_api_version,
+    )))
 }
 
 async fn apply_controller_finalizers(
@@ -731,13 +847,17 @@ async fn apply_controller_finalizers(
     controller: &ControllerAuthContext,
     row: &ResourceRow,
     body: ControllerFinalizerUpdate,
+    response_api_version: &str,
 ) -> Result<Json<rise_resource_api::Resource>, ServerError> {
     let updated = state
         .resource_store
         .update_controller_finalizers(row.uid, &controller.0.identity_id, &body.add, &body.remove)
         .await
         .map_err(store_error_to_server_error)?;
-    Ok(Json(row_to_resource(&updated)))
+    Ok(Json(row_to_resource_with_api_version(
+        &updated,
+        response_api_version,
+    )))
 }
 
 async fn apply_reparent(
@@ -762,7 +882,10 @@ async fn apply_reparent(
         new_parent_uid = ?body.new_parent_uid,
         "resource.reparent"
     );
-    Ok(Json(row_to_resource(&updated)))
+    Ok(Json(row_to_resource_with_api_version(
+        &updated,
+        &info.api_version,
+    )))
 }
 
 #[cfg(test)]
@@ -804,8 +927,11 @@ mod tests {
     fn assert_body_matches_uid_url_does_not_enforce_name() {
         let info = CollectionInfo {
             api_version: "rise.dev/v1alpha1".into(),
+            storage_api_version: "rise.dev/v1alpha1".into(),
+            served_api_versions: vec!["rise.dev/v1alpha1".into()],
             kind: "Organization".into(),
             scope: ResourceScope::Root,
+            parent: None,
             spec_validator: std::sync::Arc::new(rise_resource_store::NoOpValidator),
             allowed_status_controller_ids: vec![],
         };
@@ -838,8 +964,11 @@ mod tests {
     fn collection_info(allowed: Vec<String>) -> CollectionInfo {
         CollectionInfo {
             api_version: "example.dev/v1".into(),
+            storage_api_version: "example.dev/v1".into(),
+            served_api_versions: vec!["example.dev/v1".into()],
             kind: "Widget".into(),
             scope: ResourceScope::Root,
+            parent: None,
             spec_validator: std::sync::Arc::new(rise_resource_store::NoOpValidator),
             allowed_status_controller_ids: allowed,
         }

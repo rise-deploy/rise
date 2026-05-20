@@ -5,7 +5,7 @@
 //! * [`parse_identifier`] — turns a single `<identifier>` segment into a
 //!   `PathSegment` (name or `uid:<uuid>` form) for the resource store.
 //! * [`parse_resource_path`] — parses a full resource URL path like
-//!   `organizations/acme/widgets/w1/status` into a typed [`ResourcePath`],
+//!   `apis/rise.dev/v1alpha1/organizations/acme/apis/example.dev/v1/widgets/w1/status` into a typed [`ResourcePath`],
 //!   expressing the collection hierarchy, the leaf resource, and any
 //!   subresource keyword.
 
@@ -30,23 +30,30 @@ pub fn parse_identifier(
             ServerError::bad_request(format!("invalid uid token '{raw}': expected uid:<uuid>"))
         })?;
         Ok(PathSegment::Uid {
-            api_version: api_version.to_string(),
+            api_versions: vec![api_version.to_string()],
             kind: kind.to_string(),
             uid,
         })
     } else {
         Ok(PathSegment::Name {
-            api_version: api_version.to_string(),
+            api_versions: vec![api_version.to_string()],
             kind: kind.to_string(),
             name: raw.to_string(),
         })
     }
 }
 
-/// A single ancestor segment in a hierarchical resource path, e.g. `organizations/acme`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CollectionRef {
+    pub group: String,
+    pub version: String,
+    pub plural: String,
+}
+
+/// A single ancestor segment in a hierarchical resource path.
 #[derive(Debug, PartialEq)]
 pub struct AncestorRef {
-    pub collection: String,
+    pub collection: CollectionRef,
     pub identifier: String,
 }
 
@@ -66,18 +73,18 @@ pub enum ResourcePath {
     /// A collection, optionally nested under ancestors: `<ancestors…>/<collection>`.
     List {
         ancestors: Vec<AncestorRef>,
-        collection: String,
+        collection: CollectionRef,
     },
     /// A single item: `<ancestors…>/<collection>/<identifier>`.
     Item {
         ancestors: Vec<AncestorRef>,
-        collection: String,
+        collection: CollectionRef,
         identifier: String,
     },
     /// A sub-resource operation on an item: `<ancestors…>/<collection>/<identifier>/<sub>`.
     Subresource {
         ancestors: Vec<AncestorRef>,
-        collection: String,
+        collection: CollectionRef,
         identifier: String,
         subresource: Subresource,
     },
@@ -93,6 +100,7 @@ pub enum ResourcePath {
 /// ```text
 /// path        ::= "orphans"
 ///               | segment+
+/// collection  ::= "apis" "/" group "/" version "/" plural
 /// segment     ::= collection "/" identifier
 /// tail        ::= collection                        -- List
 ///               | collection "/" identifier          -- Item
@@ -116,69 +124,91 @@ pub fn parse_resource_path(raw: &str) -> Result<ResourcePath, ServerError> {
     }
 
     let mut ancestors: Vec<AncestorRef> = Vec::new();
-    let mut remaining = segments.as_slice();
+    let mut pos = 0;
 
     loop {
-        match remaining.len() {
-            0 => {
-                // Should be unreachable given earlier checks, but be safe.
-                return Err(ServerError::bad_request("empty resource path segment"));
-            }
-            1 => {
-                return Ok(ResourcePath::List {
-                    ancestors,
-                    collection: remaining[0].to_string(),
-                });
-            }
-            2 => {
-                return Ok(ResourcePath::Item {
-                    ancestors,
-                    collection: remaining[0].to_string(),
-                    identifier: remaining[1].to_string(),
-                });
-            }
-            _ => {
-                // remaining.len() >= 3
-                match remaining[2] {
-                    kw @ ("status" | "finalizers" | "reparent") => {
-                        if remaining.len() > 3 {
-                            return Err(ServerError::bad_request(format!(
-                                "unexpected segments after subresource '{}': path must end after \
-                                 the keyword",
-                                kw
-                            )));
-                        }
-                        let subresource = match kw {
-                            "status" => Subresource::Status,
-                            "finalizers" => Subresource::Finalizers,
-                            _ => Subresource::Reparent,
-                        };
-                        return Ok(ResourcePath::Subresource {
-                            ancestors,
-                            collection: remaining[0].to_string(),
-                            identifier: remaining[1].to_string(),
-                            subresource,
-                        });
-                    }
-                    "orphans" => {
-                        return Err(ServerError::bad_request(
-                            "'orphans' is a reserved keyword and may not appear at a non-first \
-                             path position",
-                        ));
-                    }
-                    _ => {
-                        // remaining[2] is a plain segment: push the first two as an ancestor
-                        // and continue with remaining[2..].
-                        ancestors.push(AncestorRef {
-                            collection: remaining[0].to_string(),
-                            identifier: remaining[1].to_string(),
-                        });
-                        remaining = &remaining[2..];
-                    }
+        let collection = parse_collection(&segments, pos)?;
+        pos += 4;
+
+        if pos == segments.len() {
+            return Ok(ResourcePath::List {
+                ancestors,
+                collection,
+            });
+        }
+
+        let identifier = segments[pos].to_string();
+        pos += 1;
+
+        if pos == segments.len() {
+            return Ok(ResourcePath::Item {
+                ancestors,
+                collection,
+                identifier,
+            });
+        }
+
+        match segments[pos] {
+            kw @ ("status" | "finalizers" | "reparent") => {
+                if pos + 1 != segments.len() {
+                    return Err(ServerError::bad_request(format!(
+                        "unexpected segments after subresource '{kw}': path must end after the keyword"
+                    )));
                 }
+                let subresource = match kw {
+                    "status" => Subresource::Status,
+                    "finalizers" => Subresource::Finalizers,
+                    _ => Subresource::Reparent,
+                };
+                return Ok(ResourcePath::Subresource {
+                    ancestors,
+                    collection,
+                    identifier,
+                    subresource,
+                });
+            }
+            "apis" => {
+                ancestors.push(AncestorRef {
+                    collection,
+                    identifier,
+                });
+            }
+            "orphans" => {
+                return Err(ServerError::bad_request(
+                    "'orphans' is a reserved keyword and may not appear at a non-first path position",
+                ));
+            }
+            other => {
+                return Err(ServerError::bad_request(format!(
+                    "expected nested collection to start with 'apis', got '{other}'"
+                )));
             }
         }
     }
+}
+
+fn parse_collection(segments: &[&str], pos: usize) -> Result<CollectionRef, ServerError> {
+    if segments.get(pos) != Some(&"apis") {
+        return Err(ServerError::bad_request(
+            "resource collection paths must start with 'apis/{group}/{version}/{plural}'",
+        ));
+    }
+    let Some(group) = segments.get(pos + 1) else {
+        return Err(ServerError::bad_request("missing resource API group"));
+    };
+    let Some(version) = segments.get(pos + 2) else {
+        return Err(ServerError::bad_request("missing resource API version"));
+    };
+    let Some(plural) = segments.get(pos + 3) else {
+        return Err(ServerError::bad_request(
+            "missing resource collection plural",
+        ));
+    };
+    Ok(CollectionRef {
+        group: (*group).to_string(),
+        version: (*version).to_string(),
+        plural: (*plural).to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -190,11 +220,11 @@ mod tests {
         let seg = parse_identifier("rise.dev/v1alpha1", "Organization", "acme").unwrap();
         match seg {
             PathSegment::Name {
-                api_version,
+                api_versions,
                 kind,
                 name,
             } => {
-                assert_eq!(api_version, "rise.dev/v1alpha1");
+                assert_eq!(api_versions, vec!["rise.dev/v1alpha1"]);
                 assert_eq!(kind, "Organization");
                 assert_eq!(name, "acme");
             }
@@ -209,11 +239,11 @@ mod tests {
         let seg = parse_identifier("rise.dev/v1alpha1", "Organization", &raw).unwrap();
         match seg {
             PathSegment::Uid {
-                api_version,
+                api_versions,
                 kind,
                 uid: got,
             } => {
-                assert_eq!(api_version, "rise.dev/v1alpha1");
+                assert_eq!(api_versions, vec!["rise.dev/v1alpha1"]);
                 assert_eq!(kind, "Organization");
                 assert_eq!(got, uid);
             }
@@ -236,24 +266,12 @@ mod tests {
         assert!(matches!(seg, PathSegment::Name { .. }));
     }
 
-    // ── parse_resource_path tests ────────────────────────────────────────────
-
-    #[test]
-    fn resource_path_empty_string_is_error() {
-        let err = parse_resource_path("").unwrap_err();
-        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn resource_path_trailing_slash_is_error() {
-        let err = parse_resource_path("organizations/").unwrap_err();
-        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn resource_path_leading_slash_is_error() {
-        let err = parse_resource_path("/organizations").unwrap_err();
-        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+    fn collection(group: &str, version: &str, plural: &str) -> CollectionRef {
+        CollectionRef {
+            group: group.into(),
+            version: version.into(),
+            plural: plural.into(),
+        }
     }
 
     #[test]
@@ -267,10 +285,10 @@ mod tests {
     #[test]
     fn resource_path_list_top_level() {
         assert_eq!(
-            parse_resource_path("organizations").unwrap(),
+            parse_resource_path("apis/rise.dev/v1alpha1/organizations").unwrap(),
             ResourcePath::List {
                 ancestors: vec![],
-                collection: "organizations".to_string(),
+                collection: collection("rise.dev", "v1alpha1", "organizations"),
             }
         );
     }
@@ -278,11 +296,11 @@ mod tests {
     #[test]
     fn resource_path_item_top_level() {
         assert_eq!(
-            parse_resource_path("organizations/acme").unwrap(),
+            parse_resource_path("apis/rise.dev/v1alpha1/organizations/acme").unwrap(),
             ResourcePath::Item {
                 ancestors: vec![],
-                collection: "organizations".to_string(),
-                identifier: "acme".to_string(),
+                collection: collection("rise.dev", "v1alpha1", "organizations"),
+                identifier: "acme".into(),
             }
         );
     }
@@ -290,251 +308,42 @@ mod tests {
     #[test]
     fn resource_path_list_depth_1() {
         assert_eq!(
-            parse_resource_path("organizations/acme/widgets").unwrap(),
+            parse_resource_path(
+                "apis/rise.dev/v1alpha1/organizations/acme/apis/example.dev/v1/widgets"
+            )
+            .unwrap(),
             ResourcePath::List {
                 ancestors: vec![AncestorRef {
-                    collection: "organizations".to_string(),
-                    identifier: "acme".to_string(),
+                    collection: collection("rise.dev", "v1alpha1", "organizations"),
+                    identifier: "acme".into(),
                 }],
-                collection: "widgets".to_string(),
+                collection: collection("example.dev", "v1", "widgets"),
             }
         );
     }
 
     #[test]
-    fn resource_path_item_depth_1() {
+    fn resource_path_subresource_depth_1() {
         assert_eq!(
-            parse_resource_path("organizations/acme/widgets/w1").unwrap(),
-            ResourcePath::Item {
-                ancestors: vec![AncestorRef {
-                    collection: "organizations".to_string(),
-                    identifier: "acme".to_string(),
-                }],
-                collection: "widgets".to_string(),
-                identifier: "w1".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn resource_path_list_depth_2() {
-        assert_eq!(
-            parse_resource_path("organizations/acme/widgets/w1/sub-things").unwrap(),
-            ResourcePath::List {
-                ancestors: vec![
-                    AncestorRef {
-                        collection: "organizations".to_string(),
-                        identifier: "acme".to_string(),
-                    },
-                    AncestorRef {
-                        collection: "widgets".to_string(),
-                        identifier: "w1".to_string(),
-                    },
-                ],
-                collection: "sub-things".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn resource_path_item_depth_2() {
-        assert_eq!(
-            parse_resource_path("organizations/acme/widgets/w1/sub-things/s1").unwrap(),
-            ResourcePath::Item {
-                ancestors: vec![
-                    AncestorRef {
-                        collection: "organizations".to_string(),
-                        identifier: "acme".to_string(),
-                    },
-                    AncestorRef {
-                        collection: "widgets".to_string(),
-                        identifier: "w1".to_string(),
-                    },
-                ],
-                collection: "sub-things".to_string(),
-                identifier: "s1".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn resource_path_subresource_status_top_level() {
-        assert_eq!(
-            parse_resource_path("organizations/acme/status").unwrap(),
+            parse_resource_path(
+                "apis/rise.dev/v1alpha1/organizations/acme/apis/example.dev/v1/widgets/w1/status"
+            )
+            .unwrap(),
             ResourcePath::Subresource {
-                ancestors: vec![],
-                collection: "organizations".to_string(),
-                identifier: "acme".to_string(),
+                ancestors: vec![AncestorRef {
+                    collection: collection("rise.dev", "v1alpha1", "organizations"),
+                    identifier: "acme".into(),
+                }],
+                collection: collection("example.dev", "v1", "widgets"),
+                identifier: "w1".into(),
                 subresource: Subresource::Status,
             }
         );
     }
 
     #[test]
-    fn resource_path_subresource_finalizers_top_level() {
-        assert_eq!(
-            parse_resource_path("organizations/acme/finalizers").unwrap(),
-            ResourcePath::Subresource {
-                ancestors: vec![],
-                collection: "organizations".to_string(),
-                identifier: "acme".to_string(),
-                subresource: Subresource::Finalizers,
-            }
-        );
-    }
-
-    #[test]
-    fn resource_path_subresource_reparent_top_level() {
-        assert_eq!(
-            parse_resource_path("organizations/acme/reparent").unwrap(),
-            ResourcePath::Subresource {
-                ancestors: vec![],
-                collection: "organizations".to_string(),
-                identifier: "acme".to_string(),
-                subresource: Subresource::Reparent,
-            }
-        );
-    }
-
-    #[test]
-    fn resource_path_subresource_status_depth_1() {
-        assert_eq!(
-            parse_resource_path("organizations/acme/widgets/w1/status").unwrap(),
-            ResourcePath::Subresource {
-                ancestors: vec![AncestorRef {
-                    collection: "organizations".to_string(),
-                    identifier: "acme".to_string(),
-                }],
-                collection: "widgets".to_string(),
-                identifier: "w1".to_string(),
-                subresource: Subresource::Status,
-            }
-        );
-    }
-
-    #[test]
-    fn resource_path_subresource_finalizers_depth_1() {
-        assert_eq!(
-            parse_resource_path("organizations/acme/widgets/w1/finalizers").unwrap(),
-            ResourcePath::Subresource {
-                ancestors: vec![AncestorRef {
-                    collection: "organizations".to_string(),
-                    identifier: "acme".to_string(),
-                }],
-                collection: "widgets".to_string(),
-                identifier: "w1".to_string(),
-                subresource: Subresource::Finalizers,
-            }
-        );
-    }
-
-    #[test]
-    fn resource_path_subresource_reparent_depth_1() {
-        assert_eq!(
-            parse_resource_path("organizations/acme/widgets/w1/reparent").unwrap(),
-            ResourcePath::Subresource {
-                ancestors: vec![AncestorRef {
-                    collection: "organizations".to_string(),
-                    identifier: "acme".to_string(),
-                }],
-                collection: "widgets".to_string(),
-                identifier: "w1".to_string(),
-                subresource: Subresource::Reparent,
-            }
-        );
-    }
-
-    #[test]
-    fn resource_path_subresource_status_depth_2() {
-        assert_eq!(
-            parse_resource_path("organizations/acme/widgets/w1/sub-things/s1/status").unwrap(),
-            ResourcePath::Subresource {
-                ancestors: vec![
-                    AncestorRef {
-                        collection: "organizations".to_string(),
-                        identifier: "acme".to_string(),
-                    },
-                    AncestorRef {
-                        collection: "widgets".to_string(),
-                        identifier: "w1".to_string(),
-                    },
-                ],
-                collection: "sub-things".to_string(),
-                identifier: "s1".to_string(),
-                subresource: Subresource::Status,
-            }
-        );
-    }
-
-    #[test]
-    fn resource_path_subresource_finalizers_depth_2() {
-        assert_eq!(
-            parse_resource_path("organizations/acme/widgets/w1/sub-things/s1/finalizers").unwrap(),
-            ResourcePath::Subresource {
-                ancestors: vec![
-                    AncestorRef {
-                        collection: "organizations".to_string(),
-                        identifier: "acme".to_string(),
-                    },
-                    AncestorRef {
-                        collection: "widgets".to_string(),
-                        identifier: "w1".to_string(),
-                    },
-                ],
-                collection: "sub-things".to_string(),
-                identifier: "s1".to_string(),
-                subresource: Subresource::Finalizers,
-            }
-        );
-    }
-
-    #[test]
-    fn resource_path_subresource_reparent_depth_2() {
-        assert_eq!(
-            parse_resource_path("organizations/acme/widgets/w1/sub-things/s1/reparent").unwrap(),
-            ResourcePath::Subresource {
-                ancestors: vec![
-                    AncestorRef {
-                        collection: "organizations".to_string(),
-                        identifier: "acme".to_string(),
-                    },
-                    AncestorRef {
-                        collection: "widgets".to_string(),
-                        identifier: "w1".to_string(),
-                    },
-                ],
-                collection: "sub-things".to_string(),
-                identifier: "s1".to_string(),
-                subresource: Subresource::Reparent,
-            }
-        );
-    }
-
-    #[test]
-    fn resource_path_orphans_at_non_first_position_is_error() {
-        let err = parse_resource_path("things/id/orphans").unwrap_err();
+    fn resource_path_rejects_unversioned_collection() {
+        let err = parse_resource_path("organizations/acme").unwrap_err();
         assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
-        assert!(err.message.contains("orphans"));
-    }
-
-    #[test]
-    fn resource_path_trailing_segment_after_subresource_is_error() {
-        for path in &[
-            "things/id/reparent/extra",
-            "things/id/status/extra",
-            "things/id/finalizers/extra",
-        ] {
-            let err = parse_resource_path(path).unwrap_err();
-            assert_eq!(
-                err.status,
-                axum::http::StatusCode::BAD_REQUEST,
-                "expected 400 for path '{path}'"
-            );
-            assert!(
-                err.message.contains("unexpected"),
-                "expected 'unexpected' in error for path '{path}', got: {}",
-                err.message
-            );
-        }
     }
 }

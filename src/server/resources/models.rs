@@ -54,6 +54,10 @@ pub struct ResourceList {
 /// typed spec/status. The generic API returns the raw JSON values verbatim, so
 /// callers can round-trip arbitrary external resources.
 pub fn row_to_resource(row: &ResourceRow) -> Resource {
+    row_to_resource_with_api_version(row, &row.api_version)
+}
+
+pub fn row_to_resource_with_api_version(row: &ResourceRow, api_version: &str) -> Resource {
     let annotations: BTreeMap<String, String> =
         match serde_json::from_value::<BTreeMap<String, serde_json::Value>>(row.metadata.clone()) {
             Ok(map) => map
@@ -95,7 +99,7 @@ pub fn row_to_resource(row: &ResourceRow) -> Resource {
     };
 
     Resource {
-        api_version: row.api_version.clone(),
+        api_version: api_version.to_string(),
         kind: row.kind.clone(),
         metadata: ResourceMetadata {
             name: row.name.clone(),
