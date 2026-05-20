@@ -12,8 +12,8 @@ use crate::validation::SpecValidator;
 /// finalizers in this namespace via `update_controller_finalizers`.
 pub const SYSTEM_FINALIZER_PREFIX: &str = "system.rise.dev/";
 
-/// Finalizer added to a parent resource when it is deleted with `PropagationPolicy::Cascade`
-/// and still has children. Removed by the store once the subtree has drained.
+/// Finalizer added to a parent resource when it is deleted while it still has children.
+/// Removed by the store once the subtree has drained.
 pub const CASCADE_DELETION_FINALIZER: &str = "system.rise.dev/cascade-deletion";
 
 pub struct CreateResourceParams {
@@ -34,21 +34,6 @@ pub struct UpdateResourceParams {
     pub finalizers: Vec<String>,
     pub spec: serde_json::Value,
     pub validator: Option<Arc<dyn SpecValidator>>,
-}
-
-/// Controls how child resources are handled when a parent is deleted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PropagationPolicy {
-    /// Default. Stamp `deletion_timestamp` on the parent and its immediate children, and attach a
-    /// `system.rise.dev/cascade-deletion` finalizer to the parent. A background GC sweep (via
-    /// `try_collect`) drives the rest of the subtree to completion bottom-up.
-    #[default]
-    Cascade,
-
-    /// Detach all immediate children (`parent_uid = NULL`) and then delete the parent normally.
-    /// Children continue to exist as root-level resources. This is an admin/break-glass operation;
-    /// it should be gated at the API layer.
-    Orphan,
 }
 
 /// One segment of a resource path. Always carries the kind so the response shape and ancestor
@@ -123,36 +108,19 @@ pub trait ResourceStore: Send + Sync {
         parent_uid: Option<Uuid>,
     ) -> Result<Vec<ResourceRow>, StoreError>;
 
-    /// List parentless resources for a non-root-scoped collection. These are
-    /// not root-scoped resources; they are scoped resources whose parent was
-    /// intentionally detached by an administrative break-glass operation.
-    async fn list_unparented_versions(
-        &self,
-        api_versions: &[String],
-        kind: &str,
-    ) -> Result<Vec<ResourceRow>, StoreError>;
-
     async fn update(
         &self,
         uid: Uuid,
         params: UpdateResourceParams,
     ) -> Result<ResourceRow, StoreError>;
 
-    /// Delete (or mark for deletion) a resource. `policy` controls child handling.
+    /// Delete (or mark for deletion) a resource, cascading to its subtree.
     ///
-    /// - `Cascade`: stamps `deletion_timestamp` on the parent and its immediate children, and
-    ///   attaches `system.rise.dev/cascade-deletion` to the parent if children exist. The actual
-    ///   removal of the parent row happens when the subtree has drained and all finalizers are
-    ///   gone, via `try_collect`.
-    /// - `Orphan`: clears `parent_uid` on immediate children, then deletes the parent normally
-    ///   (marked if it carries finalizers, hard-deleted otherwise). Non-root-scoped children
-    ///   remain parentless scoped resources and must be discovered through orphan-aware APIs.
-    ///   Admin gate is the caller's responsibility.
-    async fn delete(
-        &self,
-        uid: Uuid,
-        policy: PropagationPolicy,
-    ) -> Result<DeleteOutcome, StoreError>;
+    /// Stamps `deletion_timestamp` on the resource and its immediate children, and attaches
+    /// `system.rise.dev/cascade-deletion` to the resource if children exist. The row is removed
+    /// once the subtree has drained and all finalizers are gone, via `try_collect`; a childless
+    /// resource with no finalizers is hard-deleted immediately.
+    async fn delete(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError>;
 
     /// GC sweep entry point. Idempotent.
     ///
@@ -174,11 +142,6 @@ pub trait ResourceStore: Send + Sync {
     /// Resolve a path of segments to the full ancestor chain. The leaf is the last element.
     /// Tombstoned rows are returned (callers decide how to handle them).
     async fn resolve_path(&self, segments: &[PathSegment]) -> Result<Vec<ResourceRow>, StoreError>;
-
-    /// List children whose parent is currently tombstoned (`deletion_timestamp IS NOT NULL`).
-    /// Optionally scoped to a single parent. Useful for break-glass discovery of in-progress
-    /// teardowns.
-    async fn list_orphans(&self, parent_uid: Option<Uuid>) -> Result<Vec<ResourceRow>, StoreError>;
 
     /// Atomically move a resource. The destination is validated against the resource's own
     /// declared parent type: a root-scoped resource (built-in `Organization`/`ResourceDefinition`,

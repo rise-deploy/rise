@@ -16,12 +16,9 @@ Resource collection paths are versioned, following the same group/version shape 
 | `apis/{group}/{version}/{plural}/{id}/finalizers` | PUT | Controller finalizer update |
 | `apis/{group}/{version}/{plural}/{id}/reparent` | POST | Break-glass reparent |
 | `apis/{groupA}/{versionA}/{pluralA}/{idA}/apis/{groupB}/{versionB}/{pluralB}` | GET, POST | List / create children under a typed parent |
-| `orphans` | GET | Break-glass orphan listing |
-| `orphans/apis/{group}/{version}/{plural}` | GET | List parentless resources of a non-root-scoped type |
-| `orphans/apis/{group}/{version}/{plural}/{id}` | GET, DELETE | Get / delete a parentless resource of a non-root-scoped type |
-| `orphans/apis/{group}/{version}/{plural}/{id}/reparent` | POST | Reparent a parentless resource of a non-root-scoped type |
+| `pending-deletion` | GET | List resources tombstoned and awaiting garbage collection |
 
-`orphans` is only valid as the first path segment, so a resource may be named `orphans`.
+`pending-deletion` is only valid as the sole path segment, so a resource may be named `pending-deletion`.
 
 Unversioned resource paths are not supported.
 
@@ -42,7 +39,7 @@ When a UID-prefixed identifier is used in a PUT URL, the body's `metadata.name` 
 |---|---|---|
 | Operator | Listed in `auth.operator_users` | GET, POST, item PUT, DELETE |
 | Controller | Configured `ControllerIdentity` token | PUT `status` and `finalizers`, gated by `allowed_status_controller_ids` |
-| Admin + operator | Listed in both `auth.admin_users` and `auth.operator_users` | `reparent`, orphan listing, DELETE with `?propagationPolicy=Orphan` |
+| Admin + operator | Listed in both `auth.admin_users` and `auth.operator_users` | `reparent` |
 
 Controller tokens cannot perform item-level PUT or other operator operations.
 
@@ -53,7 +50,6 @@ Controller tokens cannot perform item-level PUT or other operator operations.
 - Root-scoped resources set `scope: "root"` and do not declare `parent`.
 - Non-root resources must declare `parent: { "apiVersion": "...", "kind": "..." }`.
 - Children may only exist directly under a parent whose stored `apiVersion` and `kind` exactly match the declared parent.
-- The type decides scope. A non-root-scoped resource with no current `parent_uid` is a parentless scoped resource, not a root-scoped resource.
 - A `ResourceDefinition` cannot be deleted while any related resources exist in any declared version.
 
 Version behavior follows Kubernetes-style semantics:
@@ -64,19 +60,16 @@ Version behavior follows Kubernetes-style semantics:
 - Reads and lists can return rows stored in any served version of the same group/kind; the response `apiVersion` is projected to the requested version.
 - Conversion is currently no-op only: the API projects `apiVersion` but does not transform `spec`.
 
-## Propagation Policy
+## Deletion
 
-DELETE accepts `propagationPolicy`:
+`DELETE` always cascades: the resource and its entire subtree are removed. The resource is tombstoned, its subtree drains as finalizers clear, and rows are collected bottom-up. To delete a parent while keeping its children, `reparent` the children to another valid parent first, then delete the now-childless parent.
 
-| Value | Behaviour | Requirement |
-|---|---|---|
-| `Cascade` (default) | Deletes the resource and descendants | Operator |
-| `Orphan` | Deletes only the resource; children are detached and become discoverable through type orphan paths | Admin + operator |
+`GET /api/v1/resources/pending-deletion` lists resources that are tombstoned and still draining — useful for spotting a deletion stuck on a finalizer.
 
 ```bash
 curl -X DELETE \
   -H "Authorization: Bearer $TOKEN" \
-  "https://rise.example.com/api/v1/resources/apis/rise.dev/v1alpha1/organizations/acme?propagationPolicy=Orphan"
+  "https://rise.example.com/api/v1/resources/apis/rise.dev/v1alpha1/organizations/acme"
 ```
 
 ## Examples

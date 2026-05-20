@@ -13,8 +13,8 @@ use crate::discriminator;
 use crate::error::StoreError;
 use crate::models::ResourceRow;
 use crate::store::{
-    CollectionInfo, CreateResourceParams, DeleteOutcome, PathSegment, PropagationPolicy,
-    ResourceStore, UpdateResourceParams, CASCADE_DELETION_FINALIZER, SYSTEM_FINALIZER_PREFIX,
+    CollectionInfo, CreateResourceParams, DeleteOutcome, PathSegment, ResourceStore,
+    UpdateResourceParams, CASCADE_DELETION_FINALIZER, SYSTEM_FINALIZER_PREFIX,
 };
 use crate::validation::{
     JsonSchemaValidator, NoOpValidator, OrganizationValidator, ResourceDefinitionValidator,
@@ -520,11 +520,7 @@ impl ResourceStore for PgResourceStore {
         })
     }
 
-    async fn delete(
-        &self,
-        uid: Uuid,
-        policy: PropagationPolicy,
-    ) -> Result<DeleteOutcome, StoreError> {
+    async fn delete(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError> {
         let mut tx = self.pool.begin().await?;
 
         // Lock the row inside the transaction so a concurrent update_controller_finalizers()
@@ -544,75 +540,42 @@ impl ResourceStore for PgResourceStore {
         .fetch_one(&mut *tx)
         .await?;
 
-        match policy {
-            PropagationPolicy::Cascade => {
-                if child_count > 0 {
-                    // Stamp immediate children that aren't already marked. A future GC sweep
-                    // (try_collect) drives the fan-out down the remaining levels. Bump
-                    // revision on each affected child so concurrent updates see the change.
-                    sqlx::query(
-                        r#"
-                        UPDATE resource_store.resources
-                        SET deletion_timestamp = NOW(),
-                            revision = revision + 1
-                        WHERE parent_uid = $1 AND deletion_timestamp IS NULL
-                        "#,
-                    )
-                    .bind(uid)
-                    .execute(&mut *tx)
-                    .await?;
+        if child_count > 0 {
+            // Stamp immediate children that aren't already marked. A future GC sweep
+            // (try_collect) drives the fan-out down the remaining levels. Bump
+            // revision on each affected child so concurrent updates see the change.
+            sqlx::query(
+                r#"
+                UPDATE resource_store.resources
+                SET deletion_timestamp = NOW(),
+                    revision = revision + 1
+                WHERE parent_uid = $1 AND deletion_timestamp IS NULL
+                "#,
+            )
+            .bind(uid)
+            .execute(&mut *tx)
+            .await?;
 
-                    // Stamp the parent and attach the cascade finalizer (idempotent).
-                    let marked = sqlx::query_as::<_, ResourceRow>(
-                        r#"
-                        UPDATE resource_store.resources
-                        SET deletion_timestamp = COALESCE(deletion_timestamp, NOW()),
-                            finalizers = CASE
-                                WHEN $2 = ANY(finalizers) THEN finalizers
-                                ELSE array_append(finalizers, $2)
-                            END,
-                            revision = revision + 1
-                        WHERE uid = $1
-                        RETURNING *
-                        "#,
-                    )
-                    .bind(uid)
-                    .bind(CASCADE_DELETION_FINALIZER)
-                    .fetch_one(&mut *tx)
-                    .await?;
-                    tx.commit().await?;
-                    return Ok(DeleteOutcome::MarkedForDeletion(Box::new(marked)));
-                }
-            }
-            PropagationPolicy::Orphan => {
-                if child_count > 0 {
-                    // Detach children. The partial unique index on
-                    // (group, kind, name) WHERE parent_uid IS NULL may reject this if a
-                    // name collides at the root scope.
-                    // Bump revision so the detach is observable.
-                    let result = sqlx::query(
-                        r#"
-                        UPDATE resource_store.resources
-                        SET parent_uid = NULL,
-                            revision = revision + 1
-                        WHERE parent_uid = $1
-                        "#,
-                    )
-                    .bind(uid)
-                    .execute(&mut *tx)
-                    .await;
-                    if let Err(e) = result {
-                        // A child's name or discriminator may collide at the root scope
-                        // (partial unique indexes on (group, kind, name) and discriminator
-                        // when parent_uid IS NULL). Surface both as NameConflict for parity with
-                        // reparent() rather than leaking an internal Database error.
-                        if Self::is_name_conflict(&e) || Self::is_discriminator_conflict(&e) {
-                            return Err(StoreError::NameConflict);
-                        }
-                        return Err(StoreError::Database(e));
-                    }
-                }
-            }
+            // Stamp the parent and attach the cascade finalizer (idempotent).
+            let marked = sqlx::query_as::<_, ResourceRow>(
+                r#"
+                UPDATE resource_store.resources
+                SET deletion_timestamp = COALESCE(deletion_timestamp, NOW()),
+                    finalizers = CASE
+                        WHEN $2 = ANY(finalizers) THEN finalizers
+                        ELSE array_append(finalizers, $2)
+                    END,
+                    revision = revision + 1
+                WHERE uid = $1
+                RETURNING *
+                "#,
+            )
+            .bind(uid)
+            .bind(CASCADE_DELETION_FINALIZER)
+            .fetch_one(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(DeleteOutcome::MarkedForDeletion(Box::new(marked)));
         }
 
         // No (remaining) children. Mark if finalizers, else hard-delete.
@@ -846,60 +809,6 @@ impl ResourceStore for PgResourceStore {
 
         tx.commit().await?;
         Ok(chain)
-    }
-
-    async fn list_orphans(&self, parent_uid: Option<Uuid>) -> Result<Vec<ResourceRow>, StoreError> {
-        let rows = match parent_uid {
-            None => {
-                sqlx::query_as::<_, ResourceRow>(
-                    r#"
-                SELECT c.*
-                FROM resource_store.resources c
-                JOIN resource_store.resources p ON c.parent_uid = p.uid
-                WHERE p.deletion_timestamp IS NOT NULL
-                ORDER BY c.kind, c.name
-                "#,
-                )
-                .fetch_all(&self.pool)
-                .await?
-            }
-            Some(pid) => {
-                sqlx::query_as::<_, ResourceRow>(
-                    r#"
-                SELECT c.*
-                FROM resource_store.resources c
-                JOIN resource_store.resources p ON c.parent_uid = p.uid
-                WHERE p.deletion_timestamp IS NOT NULL AND p.uid = $1
-                ORDER BY c.kind, c.name
-                "#,
-                )
-                .bind(pid)
-                .fetch_all(&self.pool)
-                .await?
-            }
-        };
-        Ok(rows)
-    }
-
-    async fn list_unparented_versions(
-        &self,
-        api_versions: &[String],
-        kind: &str,
-    ) -> Result<Vec<ResourceRow>, StoreError> {
-        let rows = sqlx::query_as::<_, ResourceRow>(
-            r#"
-            SELECT * FROM resource_store.resources
-            WHERE api_version = ANY($1)
-              AND kind = $2
-              AND parent_uid IS NULL
-            ORDER BY name
-            "#,
-        )
-        .bind(api_versions)
-        .bind(kind)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
     }
 
     async fn reparent(

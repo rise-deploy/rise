@@ -4,8 +4,8 @@
 //! controller-specific status/finalizer endpoints, which authenticate via the
 //! `AnyAuth` extractor and are further gated to controllers listed in the
 //! collection's `allowed_status_controller_ids` (default-deny on an empty
-//! list). `Orphan` deletion and reparent are additionally gated to operators
-//! who are also listed in `auth.admin_users`.
+//! list). `reparent` is additionally gated to operators who are also listed in
+//! `auth.admin_users`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -16,10 +16,10 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use rise_resource_api::{CreateResourceRequest, ResourceScope, UpdateResourceRequest};
+use rise_resource_api::{CreateResourceRequest, UpdateResourceRequest};
 use rise_resource_store::{
-    CollectionInfo, CreateResourceParams, DeleteOutcome, PathSegment, PropagationPolicy,
-    ResourceRow, ResourceStore, UpdateResourceParams,
+    CollectionInfo, CreateResourceParams, DeleteOutcome, PathSegment, ResourceRow, ResourceStore,
+    UpdateResourceParams,
 };
 use serde::Deserialize;
 use uuid::Uuid;
@@ -94,8 +94,8 @@ fn require_operator(ctx: &ResourceApiCtx, auth: &AuthContext) -> Result<User, Se
     Ok(user)
 }
 
-/// Require an operator who is also an admin. Used for break-glass operations
-/// (`Orphan` deletion and reparent) per the PR 4 plan.
+/// Require an operator who is also an admin. Used for the break-glass `reparent`
+/// operation.
 fn require_admin_operator(ctx: &ResourceApiCtx, auth: &AuthContext) -> Result<User, ServerError> {
     let user = require_operator(ctx, auth)?;
     if !ctx.is_admin(&user.email) {
@@ -237,20 +237,6 @@ fn enforce_parent_type(
     }
 }
 
-fn enforce_orphan_collection(info: &CollectionInfo, collection: &str) -> Result<(), ServerError> {
-    if info.scope == ResourceScope::Root {
-        return Err(ServerError::bad_request(format!(
-            "collection '{collection}' is root-scoped and does not use orphan type paths"
-        )));
-    }
-    if info.parent.is_none() {
-        return Err(ServerError::bad_request(format!(
-            "collection '{collection}' does not declare a parent and cannot have scoped orphans"
-        )));
-    }
-    Ok(())
-}
-
 /// Authorize a controller token for status/finalizer writes against a
 /// collection. The collection's `allowed_status_controller_ids` is the gate;
 /// an empty list is default-deny. Built-in collections currently carry an
@@ -312,29 +298,13 @@ fn assert_body_matches(
 // Query types
 // -----------------------------------------------------------------------------
 
+/// Query parameters for `GET .../pending-deletion`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DeleteQuery {
+pub struct PendingDeletionQuery {
+    /// Maximum number of tombstoned resources to return (default 100).
     #[serde(default)]
-    pub propagation_policy: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OrphansQuery {
-    /// Optional parent UID to scope the list to a single subtree.
-    #[serde(default)]
-    pub parent: Option<Uuid>,
-}
-
-fn parse_propagation(value: Option<String>) -> Result<PropagationPolicy, ServerError> {
-    match value.as_deref().map(str::trim) {
-        None | Some("") | Some("Cascade") => Ok(PropagationPolicy::Cascade),
-        Some("Orphan") => Ok(PropagationPolicy::Orphan),
-        Some(other) => Err(ServerError::bad_request(format!(
-            "invalid propagationPolicy '{other}' (expected 'Cascade' or 'Orphan')"
-        ))),
-    }
+    pub limit: Option<i64>,
 }
 
 // -----------------------------------------------------------------------------
@@ -392,22 +362,6 @@ async fn resolve_ancestors(
     Ok((segs, parent))
 }
 
-async fn resolve_orphan_item(
-    store: &Arc<dyn ResourceStore>,
-    info: &CollectionInfo,
-    identifier: &str,
-) -> Result<ResourceRow, ServerError> {
-    let seg = path_segment(&info.served_api_versions, &info.kind, identifier)?;
-    let chain = store
-        .resolve_path(&[seg])
-        .await
-        .map_err(store_error_to_server_error)?;
-    chain
-        .into_iter()
-        .last()
-        .ok_or_else(|| ServerError::not_found(format!("orphan resource '{identifier}' not found")))
-}
-
 // -----------------------------------------------------------------------------
 // Dispatch handlers
 // -----------------------------------------------------------------------------
@@ -416,7 +370,7 @@ pub async fn dispatch_get(
     State(state): State<AppState>,
     Path(raw): Path<String>,
     auth: AuthContext,
-    Query(q): Query<OrphansQuery>,
+    Query(q): Query<PendingDeletionQuery>,
 ) -> Result<Response, ServerError> {
     dispatch_get_inner(&ResourceApiCtx::from_state(&state), raw, auth, q).await
 }
@@ -425,23 +379,23 @@ async fn dispatch_get_inner(
     ctx: &ResourceApiCtx,
     raw: String,
     auth: AuthContext,
-    q: OrphansQuery,
+    q: PendingDeletionQuery,
 ) -> Result<Response, ServerError> {
     let path = parse_resource_path(&raw)?;
     match path {
-        ResourcePath::Orphans => {
-            let user = require_admin_operator(ctx, &auth)?;
+        ResourcePath::PendingDeletion => {
+            let user = require_operator(ctx, &auth)?;
+            let limit = q.limit.unwrap_or(100).clamp(1, 1000);
             let rows = ctx
                 .store
-                .list_orphans(q.parent)
+                .list_pending_collection(limit)
                 .await
                 .map_err(store_error_to_server_error)?;
             tracing::info!(
                 target: "rise::audit",
                 actor = %user.email,
-                parent = ?q.parent,
                 count = rows.len(),
-                "resource.orphans_listed"
+                "resource.pending_deletion_listed"
             );
             let items: Vec<rise_resource_api::Resource> =
                 rows.iter().map(row_to_resource).collect();
@@ -475,50 +429,6 @@ async fn dispatch_get_inner(
             })
             .into_response())
         }
-        ResourcePath::TypeOrphanList { collection } => {
-            let user = require_admin_operator(ctx, &auth)?;
-            let resolved = resolve_collection(&ctx.store, &collection).await?;
-            enforce_orphan_collection(&resolved.info, &resolved.collection)?;
-            let rows = ctx
-                .store
-                .list_unparented_versions(&resolved.info.served_api_versions, &resolved.info.kind)
-                .await
-                .map_err(store_error_to_server_error)?;
-            tracing::info!(
-                target: "rise::audit",
-                actor = %user.email,
-                collection = %resolved.collection,
-                count = rows.len(),
-                "resource.type_orphans_listed"
-            );
-            Ok(Json(ResourceList {
-                api_version: resolved.info.api_version.clone(),
-                kind: resolved.info.kind,
-                items: rows
-                    .iter()
-                    .map(|row| row_to_resource_with_api_version(row, &resolved.info.api_version))
-                    .collect(),
-            })
-            .into_response())
-        }
-        ResourcePath::TypeOrphanItem {
-            collection,
-            identifier,
-        } => {
-            let _user = require_admin_operator(ctx, &auth)?;
-            let resolved = resolve_collection(&ctx.store, &collection).await?;
-            enforce_orphan_collection(&resolved.info, &resolved.collection)?;
-            let row = resolve_orphan_item(&ctx.store, &resolved.info, &identifier).await?;
-            Ok(Json(row_to_resource_with_api_version(
-                &row,
-                &resolved.info.api_version,
-            ))
-            .into_response())
-        }
-        ResourcePath::TypeOrphanSubresource { .. } => Err(ServerError::new(
-            StatusCode::METHOD_NOT_ALLOWED,
-            "GET is not supported for orphan subresource paths",
-        )),
         ResourcePath::Item {
             ancestors,
             collection,
@@ -587,20 +497,6 @@ async fn dispatch_post_inner(
             let resolved = resolve_collection(&ctx.store, &collection).await?;
             enforce_parent_type(&resolved.info, parent.as_ref(), &resolved.collection)?;
             let row = resolve_item(&ctx.store, ancestor_segs, &resolved.info, &identifier).await?;
-            let resp = apply_reparent(ctx, &resolved.info, &row, body, &user).await?;
-            Ok(resp.into_response())
-        }
-        ResourcePath::TypeOrphanSubresource {
-            collection,
-            identifier,
-            subresource: Subresource::Reparent,
-        } => {
-            let user = require_admin_operator(ctx, &auth)?;
-            let body: ReparentRequest = serde_json::from_value(body)
-                .map_err(|e| ServerError::bad_request(format!("invalid request body: {e}")))?;
-            let resolved = resolve_collection(&ctx.store, &collection).await?;
-            enforce_orphan_collection(&resolved.info, &resolved.collection)?;
-            let row = resolve_orphan_item(&ctx.store, &resolved.info, &identifier).await?;
             let resp = apply_reparent(ctx, &resolved.info, &row, body, &user).await?;
             Ok(resp.into_response())
         }
@@ -715,12 +611,6 @@ async fn dispatch_put_inner(
                 )),
             }
         }
-        ResourcePath::TypeOrphanList { .. }
-        | ResourcePath::TypeOrphanItem { .. }
-        | ResourcePath::TypeOrphanSubresource { .. } => Err(ServerError::new(
-            StatusCode::METHOD_NOT_ALLOWED,
-            "PUT is not valid for orphan type paths",
-        )),
         _ => Err(ServerError::new(
             StatusCode::METHOD_NOT_ALLOWED,
             "PUT is only valid for item and subresource paths",
@@ -732,16 +622,14 @@ pub async fn dispatch_delete(
     State(state): State<AppState>,
     Path(raw): Path<String>,
     auth: AuthContext,
-    Query(q): Query<DeleteQuery>,
 ) -> Result<Response, ServerError> {
-    dispatch_delete_inner(&ResourceApiCtx::from_state(&state), raw, auth, q).await
+    dispatch_delete_inner(&ResourceApiCtx::from_state(&state), raw, auth).await
 }
 
 async fn dispatch_delete_inner(
     ctx: &ResourceApiCtx,
     raw: String,
     auth: AuthContext,
-    q: DeleteQuery,
 ) -> Result<Response, ServerError> {
     let path = parse_resource_path(&raw)?;
     match path {
@@ -750,31 +638,12 @@ async fn dispatch_delete_inner(
             collection,
             identifier,
         } => {
-            let policy = parse_propagation(q.propagation_policy)?;
-            let user = if matches!(policy, PropagationPolicy::Orphan) {
-                require_admin_operator(ctx, &auth)?
-            } else {
-                require_operator(ctx, &auth)?
-            };
+            let user = require_operator(ctx, &auth)?;
             let (ancestor_segs, parent) = resolve_ancestors(&ctx.store, &ancestors).await?;
             let resolved = resolve_collection(&ctx.store, &collection).await?;
             enforce_parent_type(&resolved.info, parent.as_ref(), &resolved.collection)?;
             let row = resolve_item(&ctx.store, ancestor_segs, &resolved.info, &identifier).await?;
-            let resp =
-                delete_resource(ctx, &row, policy, &user, &resolved.info.api_version).await?;
-            Ok(resp.into_response())
-        }
-        ResourcePath::TypeOrphanItem {
-            collection,
-            identifier,
-        } => {
-            let policy = parse_propagation(q.propagation_policy)?;
-            let user = require_admin_operator(ctx, &auth)?;
-            let resolved = resolve_collection(&ctx.store, &collection).await?;
-            enforce_orphan_collection(&resolved.info, &resolved.collection)?;
-            let row = resolve_orphan_item(&ctx.store, &resolved.info, &identifier).await?;
-            let resp =
-                delete_resource(ctx, &row, policy, &user, &resolved.info.api_version).await?;
+            let resp = delete_resource(ctx, &row, &user, &resolved.info.api_version).await?;
             Ok(resp.into_response())
         }
         _ => Err(ServerError::new(
@@ -925,19 +794,17 @@ async fn update_resource(
 async fn delete_resource(
     ctx: &ResourceApiCtx,
     row: &ResourceRow,
-    policy: PropagationPolicy,
     user: &User,
     response_api_version: &str,
 ) -> Result<Json<serde_json::Value>, ServerError> {
     let outcome = ctx
         .store
-        .delete(row.uid, policy)
+        .delete(row.uid)
         .await
         .map_err(store_error_to_server_error)?;
 
     // A single static event message keeps this audit log consistent with
-    // `resource.created` / `resource.updated`. The `propagation_policy` field
-    // already distinguishes a cascade delete from an orphan delete.
+    // `resource.created` / `resource.updated`.
     tracing::info!(
         target: "rise::audit",
         actor = %user.email,
@@ -945,7 +812,6 @@ async fn delete_resource(
         api_version = %row.api_version,
         kind = %row.kind,
         name = %row.name,
-        propagation_policy = ?policy,
         "resource.deleted"
     );
 
@@ -1027,38 +893,7 @@ async fn apply_reparent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rise_resource_api::ResourceParentRef;
-
-    #[test]
-    fn parses_propagation_defaults_to_cascade() {
-        assert!(matches!(
-            parse_propagation(None).unwrap(),
-            PropagationPolicy::Cascade
-        ));
-        assert!(matches!(
-            parse_propagation(Some("".into())).unwrap(),
-            PropagationPolicy::Cascade
-        ));
-        assert!(matches!(
-            parse_propagation(Some("Cascade".into())).unwrap(),
-            PropagationPolicy::Cascade
-        ));
-    }
-
-    #[test]
-    fn parses_propagation_orphan() {
-        assert!(matches!(
-            parse_propagation(Some("Orphan".into())).unwrap(),
-            PropagationPolicy::Orphan
-        ));
-    }
-
-    #[test]
-    fn rejects_unknown_propagation() {
-        let err = parse_propagation(Some("Foreground".into())).unwrap_err();
-        assert_eq!(err.status, StatusCode::BAD_REQUEST);
-        assert!(err.message.contains("invalid propagationPolicy"));
-    }
+    use rise_resource_api::{ResourceParentRef, ResourceScope};
 
     #[test]
     fn assert_body_matches_uid_url_does_not_enforce_name() {
@@ -1431,7 +1266,7 @@ mod dispatch_tests {
             &ctx,
             "apis/example.dev/v1/widgets".to_string(),
             auth(PLAIN_USER),
-            OrphansQuery::default(),
+            PendingDeletionQuery::default(),
         )
         .await
         .expect_err("non-operator must be rejected");
@@ -1447,7 +1282,7 @@ mod dispatch_tests {
             &ctx,
             "apis/example.dev/v1/widgets".to_string(),
             auth(OPERATOR),
-            OrphansQuery::default(),
+            PendingDeletionQuery::default(),
         )
         .await
         .expect("operator list");
@@ -1460,67 +1295,6 @@ mod dispatch_tests {
     // -------------------------------------------------------------------------
     // Auth tier: break-glass paths require admin + operator
     // -------------------------------------------------------------------------
-
-    #[sqlx::test]
-    async fn global_orphans_rejects_operator_only(pool: sqlx::PgPool) {
-        let ctx = ctx(pool).await;
-        let err = dispatch_get_inner(
-            &ctx,
-            "orphans".to_string(),
-            auth(OPERATOR),
-            OrphansQuery::default(),
-        )
-        .await
-        .expect_err("operator-only must be rejected for break-glass orphans");
-        assert_eq!(err.status, StatusCode::FORBIDDEN);
-    }
-
-    #[sqlx::test]
-    async fn global_orphans_allows_admin_operator(pool: sqlx::PgPool) {
-        let ctx = ctx(pool).await;
-        let resp = dispatch_get_inner(
-            &ctx,
-            "orphans".to_string(),
-            auth(ADMIN_OPERATOR),
-            OrphansQuery::default(),
-        )
-        .await
-        .expect("admin-operator orphans list");
-        let (status, body) = read(resp).await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(body["items"].is_array());
-    }
-
-    #[sqlx::test]
-    async fn delete_orphan_policy_requires_admin_operator(pool: sqlx::PgPool) {
-        let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
-        create_widget(&ctx, "example.dev/v1", "w1").await;
-
-        // ?propagationPolicy=Orphan is a break-glass operation: operator-only is rejected.
-        let err = dispatch_delete_inner(
-            &ctx,
-            "apis/example.dev/v1/widgets/w1".to_string(),
-            auth(OPERATOR),
-            DeleteQuery {
-                propagation_policy: Some("Orphan".into()),
-            },
-        )
-        .await
-        .expect_err("orphan delete must require admin + operator");
-        assert_eq!(err.status, StatusCode::FORBIDDEN);
-
-        // A plain Cascade delete is allowed for an operator.
-        let resp = dispatch_delete_inner(
-            &ctx,
-            "apis/example.dev/v1/widgets/w1".to_string(),
-            auth(OPERATOR),
-            DeleteQuery::default(),
-        )
-        .await
-        .expect("cascade delete for operator");
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
 
     #[sqlx::test]
     async fn reparent_requires_admin_operator(pool: sqlx::PgPool) {
@@ -1537,33 +1311,6 @@ mod dispatch_tests {
         .await
         .expect_err("reparent must require admin + operator");
         assert_eq!(err.status, StatusCode::FORBIDDEN);
-    }
-
-    #[sqlx::test]
-    async fn type_orphan_list_requires_admin_operator(pool: sqlx::PgPool) {
-        let ctx = ctx(pool).await;
-        register_gadget_rd(&ctx).await;
-
-        // gadgets is Organization-scoped, so it has a type-orphan path.
-        let err = dispatch_get_inner(
-            &ctx,
-            "orphans/apis/example.dev/v1/gadgets".to_string(),
-            auth(OPERATOR),
-            OrphansQuery::default(),
-        )
-        .await
-        .expect_err("type-orphan list must require admin + operator");
-        assert_eq!(err.status, StatusCode::FORBIDDEN);
-
-        let resp = dispatch_get_inner(
-            &ctx,
-            "orphans/apis/example.dev/v1/gadgets".to_string(),
-            auth(ADMIN_OPERATOR),
-            OrphansQuery::default(),
-        )
-        .await
-        .expect("admin-operator type-orphan list");
-        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     // -------------------------------------------------------------------------
@@ -1683,7 +1430,6 @@ mod dispatch_tests {
             &ctx,
             "apis/example.dev/v1/widgets".to_string(),
             auth(OPERATOR),
-            DeleteQuery::default(),
         )
         .await
         .expect_err("DELETE on a collection must be 405");
@@ -1700,7 +1446,7 @@ mod dispatch_tests {
             &ctx,
             "apis/example.dev/v1/widgets/w1/status".to_string(),
             auth(OPERATOR),
-            OrphansQuery::default(),
+            PendingDeletionQuery::default(),
         )
         .await
         .expect_err("GET on a subresource must be 405");
@@ -1733,7 +1479,7 @@ mod dispatch_tests {
             &ctx,
             "apis/example.dev/v1/nonexistents".to_string(),
             auth(OPERATOR),
-            OrphansQuery::default(),
+            PendingDeletionQuery::default(),
         )
         .await
         .expect_err("unknown collection must be 404");
@@ -1748,7 +1494,7 @@ mod dispatch_tests {
             &ctx,
             "widgets/w1".to_string(),
             auth(OPERATOR),
-            OrphansQuery::default(),
+            PendingDeletionQuery::default(),
         )
         .await
         .expect_err("malformed path must be 400");
@@ -1759,7 +1505,7 @@ mod dispatch_tests {
             &ctx,
             "apis/example.dev/v1/widgets/".to_string(),
             auth(OPERATOR),
-            OrphansQuery::default(),
+            PendingDeletionQuery::default(),
         )
         .await
         .expect_err("empty path segment must be 400");
@@ -1775,7 +1521,7 @@ mod dispatch_tests {
             &ctx,
             "apis/example.dev/v1/widgets/missing".to_string(),
             auth(OPERATOR),
-            OrphansQuery::default(),
+            PendingDeletionQuery::default(),
         )
         .await
         .expect_err("missing item must be 404");
@@ -1800,7 +1546,7 @@ mod dispatch_tests {
             &ctx,
             "apis/example.dev/v2/widgets/w1".to_string(),
             auth(OPERATOR),
-            OrphansQuery::default(),
+            PendingDeletionQuery::default(),
         )
         .await
         .expect("get widget via v2");
@@ -1817,7 +1563,7 @@ mod dispatch_tests {
             &ctx,
             "apis/example.dev/v2/widgets".to_string(),
             auth(OPERATOR),
-            OrphansQuery::default(),
+            PendingDeletionQuery::default(),
         )
         .await
         .expect("list widgets via v2");
@@ -1927,7 +1673,7 @@ mod dispatch_tests {
             &ctx,
             "apis/example.dev/v1/widgets/w1/apis/example.dev/v1/gadgets".to_string(),
             auth(OPERATOR),
-            OrphansQuery::default(),
+            PendingDeletionQuery::default(),
         )
         .await
         .expect_err("gadgets under a Widget parent must be a 400");
@@ -1945,7 +1691,7 @@ mod dispatch_tests {
             &ctx,
             "apis/example.dev/v1/widgets/parent/apis/example.dev/v1/widgets".to_string(),
             auth(OPERATOR),
-            OrphansQuery::default(),
+            PendingDeletionQuery::default(),
         )
         .await
         .expect_err("root-scoped collection under a parent must be a 400");
@@ -1971,7 +1717,7 @@ mod dispatch_tests {
             &ctx,
             "apis/example.dev/v1/widgets/lifecycle".to_string(),
             auth(OPERATOR),
-            OrphansQuery::default(),
+            PendingDeletionQuery::default(),
         )
         .await
         .expect("get");
@@ -2002,7 +1748,6 @@ mod dispatch_tests {
             &ctx,
             "apis/example.dev/v1/widgets/lifecycle".to_string(),
             auth(OPERATOR),
-            DeleteQuery::default(),
         )
         .await
         .expect("delete");
@@ -2013,7 +1758,7 @@ mod dispatch_tests {
             &ctx,
             "apis/example.dev/v1/widgets/lifecycle".to_string(),
             auth(OPERATOR),
-            OrphansQuery::default(),
+            PendingDeletionQuery::default(),
         )
         .await
         .expect_err("deleted resource must be gone");
@@ -2043,5 +1788,61 @@ mod dispatch_tests {
         .await
         .expect_err("body kind mismatch must be 400");
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    // -------------------------------------------------------------------------
+    // Pending-deletion listing
+    // -------------------------------------------------------------------------
+
+    #[sqlx::test]
+    async fn pending_deletion_lists_tombstoned_resources(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx, &[]).await;
+
+        let created = create_widget(&ctx, "example.dev/v1", "w1").await;
+        let uid: Uuid = created["metadata"]["uid"]
+            .as_str()
+            .expect("uid")
+            .parse()
+            .expect("parse uid");
+
+        // A finalizer makes delete tombstone the row rather than hard-delete it.
+        ctx.store
+            .update_controller_finalizers(
+                uid,
+                "controller.example.com",
+                &["controller.example.com/cleanup".to_string()],
+                &[],
+            )
+            .await
+            .expect("add finalizer");
+        ctx.store.delete(uid).await.expect("delete");
+
+        // The tombstoned widget shows up in the pending-deletion listing.
+        let resp = dispatch_get_inner(
+            &ctx,
+            "pending-deletion".to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("pending-deletion list");
+        let (status, body) = read(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        let items = body["items"].as_array().expect("items array");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["metadata"]["name"], "w1");
+        assert!(items[0]["metadata"]["deletionTimestamp"].is_string());
+
+        // A non-operator is rejected.
+        let err = dispatch_get_inner(
+            &ctx,
+            "pending-deletion".to_string(),
+            auth(PLAIN_USER),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect_err("non-operator must be rejected");
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
     }
 }

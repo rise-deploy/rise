@@ -68,23 +68,8 @@ pub enum Subresource {
 /// A parsed representation of a hierarchical resource URL path.
 #[derive(Debug, PartialEq)]
 pub enum ResourcePath {
-    /// The literal path `orphans`.
-    Orphans,
-    /// Parentless resources of a specific non-root-scoped collection:
-    /// `<collection>/orphans`.
-    TypeOrphanList { collection: CollectionRef },
-    /// A single parentless resource: `<collection>/orphans/<identifier>`.
-    TypeOrphanItem {
-        collection: CollectionRef,
-        identifier: String,
-    },
-    /// A sub-resource operation on a parentless item:
-    /// `<collection>/orphans/<identifier>/<sub>`.
-    TypeOrphanSubresource {
-        collection: CollectionRef,
-        identifier: String,
-        subresource: Subresource,
-    },
+    /// The literal path `pending-deletion`: resources tombstoned and awaiting GC.
+    PendingDeletion,
     /// A collection, optionally nested under ancestors: `<ancestors…>/<collection>`.
     List {
         ancestors: Vec<AncestorRef>,
@@ -113,10 +98,7 @@ pub enum ResourcePath {
 /// # Grammar
 ///
 /// ```text
-/// path        ::= "orphans"
-///               | "orphans" "/" collection
-///               | "orphans" "/" collection "/" identifier
-///               | "orphans" "/" collection "/" identifier "/" "reparent"
+/// path        ::= "pending-deletion"
 ///               | segment+
 /// collection  ::= "apis" "/" group "/" version "/" plural
 /// segment     ::= collection "/" identifier
@@ -126,11 +108,9 @@ pub enum ResourcePath {
 /// sub         ::= "status" | "finalizers" | "reparent"
 /// ```
 ///
-/// The keywords `orphans`, `status`, `finalizers`, and `reparent` are reserved.
-/// `orphans` is valid only as the first path segment — bare for the global orphan
-/// list, or as a prefix for the type-scoped orphan paths — so a resource may still
-/// be named `orphans`. `status`, `finalizers`, and `reparent` are valid only as
-/// the final segment of an item path.
+/// The keywords `status`, `finalizers`, and `reparent` are reserved, valid only as
+/// the final segment of an item path. `pending-deletion` is valid only as the sole
+/// path segment.
 pub fn parse_resource_path(raw: &str) -> Result<ResourcePath, ServerError> {
     let segments: Vec<&str> = raw.split('/').collect();
 
@@ -138,11 +118,10 @@ pub fn parse_resource_path(raw: &str) -> Result<ResourcePath, ServerError> {
         return Err(ServerError::bad_request("empty resource path segment"));
     }
 
-    // `orphans` is only ever the first segment — bare for the global orphan
-    // listing, or a prefix for the type-scoped orphan paths. It is never an
-    // identifier, so a resource may legitimately be named `orphans`.
-    if segments[0] == "orphans" {
-        return parse_orphan_path(&segments);
+    // `pending-deletion` is the sole-segment diagnostics path. It is never an
+    // identifier, so a resource may legitimately be named `pending-deletion`.
+    if segments.len() == 1 && segments[0] == "pending-deletion" {
+        return Ok(ResourcePath::PendingDeletion);
     }
 
     let mut ancestors: Vec<AncestorRef> = Vec::new();
@@ -195,65 +174,12 @@ pub fn parse_resource_path(raw: &str) -> Result<ResourcePath, ServerError> {
                     identifier,
                 });
             }
-            "orphans" => {
-                return Err(ServerError::bad_request(
-                    "'orphans' is a reserved keyword and may only appear as the first path segment",
-                ));
-            }
             other => {
                 return Err(ServerError::bad_request(format!(
                     "expected nested collection to start with 'apis', got '{other}'"
                 )));
             }
         }
-    }
-}
-
-/// Parse an `orphans`-prefixed path. `segments[0]` is already known to be `orphans`.
-fn parse_orphan_path(segments: &[&str]) -> Result<ResourcePath, ServerError> {
-    // Bare `orphans` — the global listing of resources detached by an
-    // in-progress teardown.
-    if segments.len() == 1 {
-        return Ok(ResourcePath::Orphans);
-    }
-
-    // `orphans/<collection>[/<identifier>[/reparent]]`
-    let collection = parse_collection(segments, 1)?;
-    let mut pos = 5; // "orphans" (1) + collection (4)
-
-    if pos == segments.len() {
-        return Ok(ResourcePath::TypeOrphanList { collection });
-    }
-
-    let identifier = segments[pos].to_string();
-    pos += 1;
-
-    if pos == segments.len() {
-        return Ok(ResourcePath::TypeOrphanItem {
-            collection,
-            identifier,
-        });
-    }
-
-    match segments[pos] {
-        "reparent" => {
-            if pos + 1 != segments.len() {
-                return Err(ServerError::bad_request(
-                    "unexpected segments after orphan reparent: path must end after the keyword",
-                ));
-            }
-            Ok(ResourcePath::TypeOrphanSubresource {
-                collection,
-                identifier,
-                subresource: Subresource::Reparent,
-            })
-        }
-        kw @ ("status" | "finalizers") => Err(ServerError::bad_request(format!(
-            "orphan subresource '{kw}' is not supported"
-        ))),
-        other => Err(ServerError::bad_request(format!(
-            "expected orphan subresource 'reparent', got '{other}'"
-        ))),
     }
 }
 
@@ -345,66 +271,25 @@ mod tests {
     }
 
     #[test]
-    fn resource_path_orphans() {
+    fn resource_path_pending_deletion() {
         assert_eq!(
-            parse_resource_path("orphans").unwrap(),
-            ResourcePath::Orphans
+            parse_resource_path("pending-deletion").unwrap(),
+            ResourcePath::PendingDeletion
         );
     }
 
     #[test]
-    fn resource_path_type_orphan_list() {
+    fn resource_path_item_named_pending_deletion_is_addressable() {
+        // `pending-deletion` is only special as the sole path segment, so a
+        // resource may be named `pending-deletion` and stays reachable.
         assert_eq!(
-            parse_resource_path("orphans/apis/example.dev/v1/widgets").unwrap(),
-            ResourcePath::TypeOrphanList {
-                collection: collection("example.dev", "v1", "widgets"),
-            }
-        );
-    }
-
-    #[test]
-    fn resource_path_type_orphan_item() {
-        assert_eq!(
-            parse_resource_path("orphans/apis/example.dev/v1/widgets/w1").unwrap(),
-            ResourcePath::TypeOrphanItem {
-                collection: collection("example.dev", "v1", "widgets"),
-                identifier: "w1".into(),
-            }
-        );
-    }
-
-    #[test]
-    fn resource_path_type_orphan_reparent() {
-        assert_eq!(
-            parse_resource_path("orphans/apis/example.dev/v1/widgets/w1/reparent").unwrap(),
-            ResourcePath::TypeOrphanSubresource {
-                collection: collection("example.dev", "v1", "widgets"),
-                identifier: "w1".into(),
-                subresource: Subresource::Reparent,
-            }
-        );
-    }
-
-    #[test]
-    fn resource_path_item_named_orphans_is_addressable() {
-        // `orphans` is only special as the first segment, so a resource may be
-        // named `orphans` and is still reachable as a normal item.
-        assert_eq!(
-            parse_resource_path("apis/example.dev/v1/widgets/orphans").unwrap(),
+            parse_resource_path("apis/example.dev/v1/widgets/pending-deletion").unwrap(),
             ResourcePath::Item {
                 ancestors: vec![],
                 collection: collection("example.dev", "v1", "widgets"),
-                identifier: "orphans".into(),
+                identifier: "pending-deletion".into(),
             }
         );
-    }
-
-    #[test]
-    fn resource_path_orphans_rejected_after_identifier() {
-        let err =
-            parse_resource_path("apis/rise.dev/v1alpha1/organizations/acme/orphans").unwrap_err();
-        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
-        assert!(err.message.contains("orphans"));
     }
 
     #[test]

@@ -10,8 +10,8 @@ pub use error::StoreError;
 pub use models::ResourceRow;
 pub use pg_store::PgResourceStore;
 pub use store::{
-    CollectionInfo, CreateResourceParams, DeleteOutcome, PathSegment, PropagationPolicy,
-    ResourceStore, UpdateResourceParams, CASCADE_DELETION_FINALIZER, SYSTEM_FINALIZER_PREFIX,
+    CollectionInfo, CreateResourceParams, DeleteOutcome, PathSegment, ResourceStore,
+    UpdateResourceParams, CASCADE_DELETION_FINALIZER, SYSTEM_FINALIZER_PREFIX,
 };
 pub use validation::{
     JsonSchemaValidator, NoOpValidator, OrganizationValidator, ResourceDefinitionValidator,

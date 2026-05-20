@@ -1,7 +1,7 @@
 use rise_resource_api::{API_VERSION_V1ALPHA1, ORGANIZATION_KIND, RESOURCE_DEFINITION_KIND};
 use rise_resource_store::{
-    CreateResourceParams, DeleteOutcome, PathSegment, PgResourceStore, PropagationPolicy,
-    ResourceStore, StoreError, UpdateResourceParams, CASCADE_DELETION_FINALIZER,
+    CreateResourceParams, DeleteOutcome, PathSegment, PgResourceStore, ResourceStore, StoreError,
+    UpdateResourceParams, CASCADE_DELETION_FINALIZER,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -386,10 +386,7 @@ async fn delete_without_finalizers_removes_row(pool: sqlx::PgPool) -> sqlx::Resu
         .await
         .unwrap();
 
-    let outcome = store
-        .delete(row.uid, PropagationPolicy::Cascade)
-        .await
-        .unwrap();
+    let outcome = store.delete(row.uid).await.unwrap();
     assert!(matches!(outcome, DeleteOutcome::Deleted));
     assert!(store.get(row.uid).await.unwrap().is_none());
 
@@ -414,10 +411,7 @@ async fn delete_with_finalizers_marks_deletion_timestamp(pool: sqlx::PgPool) -> 
         .await
         .unwrap();
 
-    let outcome = store
-        .delete(row.uid, PropagationPolicy::Cascade)
-        .await
-        .unwrap();
+    let outcome = store.delete(row.uid).await.unwrap();
     let marked = match outcome {
         DeleteOutcome::MarkedForDeletion(r) => *r,
         DeleteOutcome::Deleted => panic!("expected MarkedForDeletion"),
@@ -449,10 +443,7 @@ async fn finalizer_flow_completes_deletion(pool: sqlx::PgPool) -> sqlx::Result<(
         .unwrap();
 
     // Delete marks timestamp but doesn't remove
-    let outcome = store
-        .delete(row.uid, PropagationPolicy::Cascade)
-        .await
-        .unwrap();
+    let outcome = store.delete(row.uid).await.unwrap();
     assert!(matches!(outcome, DeleteOutcome::MarkedForDeletion(_)));
 
     // Controller removes its finalizer
@@ -664,10 +655,7 @@ async fn delete_resource_definition_rejects_existing_instances(
         .await
         .unwrap();
 
-    let err = store
-        .delete(definition.uid, PropagationPolicy::Cascade)
-        .await
-        .unwrap_err();
+    let err = store.delete(definition.uid).await.unwrap_err();
     assert!(
         matches!(err, StoreError::Validation(_)),
         "expected validation error, got {err:?}"
@@ -723,10 +711,7 @@ async fn delete_resource_definition_rejects_instances_in_any_served_version(
         .await
         .unwrap();
 
-    let err = store
-        .delete(definition.uid, PropagationPolicy::Cascade)
-        .await
-        .unwrap_err();
+    let err = store.delete(definition.uid).await.unwrap_err();
     assert!(matches!(err, StoreError::Validation(_)));
 
     Ok(())
@@ -941,10 +926,7 @@ async fn delete_already_marked_resource_is_idempotent(pool: sqlx::PgPool) -> sql
         .unwrap();
 
     // First delete: marks for deletion
-    let outcome1 = store
-        .delete(row.uid, PropagationPolicy::Cascade)
-        .await
-        .unwrap();
+    let outcome1 = store.delete(row.uid).await.unwrap();
     let first_ts = match outcome1 {
         DeleteOutcome::MarkedForDeletion(r) => r.deletion_timestamp,
         DeleteOutcome::Deleted => panic!("expected MarkedForDeletion"),
@@ -953,10 +935,7 @@ async fn delete_already_marked_resource_is_idempotent(pool: sqlx::PgPool) -> sql
 
     // Second delete while finalizers are still present: re-marks (idempotent) and preserves
     // the original deletion_timestamp.
-    let outcome2 = store
-        .delete(row.uid, PropagationPolicy::Cascade)
-        .await
-        .unwrap();
+    let outcome2 = store.delete(row.uid).await.unwrap();
     let second = match outcome2 {
         DeleteOutcome::MarkedForDeletion(r) => *r,
         DeleteOutcome::Deleted => panic!("expected MarkedForDeletion"),
@@ -1437,7 +1416,7 @@ async fn update_rejects_resource_definition(pool: sqlx::PgPool) -> sqlx::Result<
 }
 
 // ---------------------------------------------------------------------------------------------
-// Cascade / orphan deletion
+// Cascade deletion
 // ---------------------------------------------------------------------------------------------
 
 async fn create_org(store: &PgResourceStore, name: &str) -> rise_resource_store::ResourceRow {
@@ -1553,10 +1532,7 @@ async fn cascade_delete_stamps_immediate_children(pool: sqlx::PgPool) -> sqlx::R
     let c1 = create_child(&store, parent.uid, "Widget", "w1", vec![]).await;
     let c2 = create_child(&store, parent.uid, "Widget", "w2", vec![]).await;
 
-    let outcome = store
-        .delete(parent.uid, PropagationPolicy::Cascade)
-        .await
-        .unwrap();
+    let outcome = store.delete(parent.uid).await.unwrap();
     let marked = match outcome {
         DeleteOutcome::MarkedForDeletion(r) => *r,
         DeleteOutcome::Deleted => panic!("parent still has children, should be MarkedForDeletion"),
@@ -1584,19 +1560,11 @@ async fn cascade_delete_idempotent(pool: sqlx::PgPool) -> sqlx::Result<()> {
     let parent = create_org(&store, "cascade-org").await;
     create_child(&store, parent.uid, "Widget", "w1", vec![]).await;
 
-    let first = match store
-        .delete(parent.uid, PropagationPolicy::Cascade)
-        .await
-        .unwrap()
-    {
+    let first = match store.delete(parent.uid).await.unwrap() {
         DeleteOutcome::MarkedForDeletion(r) => r.deletion_timestamp,
         _ => panic!("expected MarkedForDeletion"),
     };
-    let second = match store
-        .delete(parent.uid, PropagationPolicy::Cascade)
-        .await
-        .unwrap()
-    {
+    let second = match store.delete(parent.uid).await.unwrap() {
         DeleteOutcome::MarkedForDeletion(r) => {
             let count = r
                 .finalizers
@@ -1630,10 +1598,7 @@ async fn cascade_collection_drains_bottom_up(pool: sqlx::PgPool) -> sqlx::Result
     .await;
 
     // Delete the parent. Child gets stamped, parent gets cascade finalizer.
-    store
-        .delete(parent.uid, PropagationPolicy::Cascade)
-        .await
-        .unwrap();
+    store.delete(parent.uid).await.unwrap();
 
     // try_collect on parent while child still exists: stays marked, cascade finalizer persists.
     let outcome = store.try_collect(parent.uid).await.unwrap();
@@ -1706,81 +1671,12 @@ async fn list_pending_collection_returns_tombstoned_only(pool: sqlx::PgPool) -> 
         )
         .await
         .unwrap();
-    store
-        .delete(dying.uid, PropagationPolicy::Cascade)
-        .await
-        .unwrap();
+    store.delete(dying.uid).await.unwrap();
 
     let pending = store.list_pending_collection(100).await.unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].uid, dying.uid);
     assert!(pending.iter().all(|r| r.uid != alive.uid));
-
-    Ok(())
-}
-
-#[sqlx::test]
-async fn orphan_delete_detaches_children(pool: sqlx::PgPool) -> sqlx::Result<()> {
-    let store = PgResourceStore::new(pool);
-    let parent = create_org(&store, "orphan-org").await;
-    let c1 = create_child(&store, parent.uid, "Widget", "w1", vec![]).await;
-    let c2 = create_child(&store, parent.uid, "Widget", "w2", vec![]).await;
-
-    let outcome = store
-        .delete(parent.uid, PropagationPolicy::Orphan)
-        .await
-        .unwrap();
-    assert!(matches!(outcome, DeleteOutcome::Deleted));
-    assert!(store.get(parent.uid).await.unwrap().is_none());
-
-    let c1_after = store.get(c1.uid).await.unwrap().unwrap();
-    let c2_after = store.get(c2.uid).await.unwrap().unwrap();
-    assert_eq!(c1_after.parent_uid, None);
-    assert_eq!(c2_after.parent_uid, None);
-    assert!(c1_after.deletion_timestamp.is_none());
-
-    Ok(())
-}
-
-#[sqlx::test]
-async fn orphan_delete_children_are_discoverable_by_type_and_reparentable(
-    pool: sqlx::PgPool,
-) -> sqlx::Result<()> {
-    let store = PgResourceStore::new(pool);
-    register_rd(
-        &store,
-        "example.dev",
-        "Widget",
-        "widgets",
-        Some((API_VERSION_V1ALPHA1, ORGANIZATION_KIND)),
-        &[("v1", true, true)],
-    )
-    .await;
-    let org_a = create_org(&store, "orphan-source").await;
-    let org_b = create_org(&store, "orphan-destination").await;
-    let child = create_child(&store, org_a.uid, "Widget", "w1", vec![]).await;
-
-    store
-        .delete(org_a.uid, PropagationPolicy::Orphan)
-        .await
-        .unwrap();
-
-    let unparented = store
-        .list_unparented_versions(&["example.dev/v1".to_string()], "Widget")
-        .await
-        .unwrap();
-    assert_eq!(unparented.len(), 1);
-    assert_eq!(unparented[0].uid, child.uid);
-    assert_eq!(unparented[0].parent_uid, None);
-
-    let moved = store.reparent(child.uid, Some(org_b.uid)).await.unwrap();
-    assert_eq!(moved.parent_uid, Some(org_b.uid));
-
-    let remaining = store
-        .list_unparented_versions(&["example.dev/v1".to_string()], "Widget")
-        .await
-        .unwrap();
-    assert!(remaining.is_empty());
 
     Ok(())
 }
@@ -1937,10 +1833,7 @@ async fn resolve_path_returns_tombstoned_rows(pool: sqlx::PgPool) -> sqlx::Resul
         vec!["controller.example.com/cleanup".to_string()],
     )
     .await;
-    store
-        .delete(widget.uid, PropagationPolicy::Cascade)
-        .await
-        .unwrap();
+    store.delete(widget.uid).await.unwrap();
 
     let chain = store
         .resolve_path(&[
@@ -1972,46 +1865,8 @@ async fn resolve_path_empty_returns_error(pool: sqlx::PgPool) -> sqlx::Result<()
 }
 
 // ---------------------------------------------------------------------------------------------
-// Orphan discovery / reparent
+// Reparent
 // ---------------------------------------------------------------------------------------------
-
-#[sqlx::test]
-async fn list_orphans_returns_children_of_tombstoned_parent(
-    pool: sqlx::PgPool,
-) -> sqlx::Result<()> {
-    let store = PgResourceStore::new(pool);
-    let dying_parent = create_org(&store, "dying").await;
-    store
-        .update_controller_finalizers(
-            dying_parent.uid,
-            "controller.example.com",
-            &["controller.example.com/cleanup".to_string()],
-            &[],
-        )
-        .await
-        .unwrap();
-    let child_dying = create_child(&store, dying_parent.uid, "Widget", "w1", vec![]).await;
-
-    let alive_parent = create_org(&store, "alive").await;
-    let _child_alive = create_child(&store, alive_parent.uid, "Widget", "w2", vec![]).await;
-
-    store
-        .delete(dying_parent.uid, PropagationPolicy::Cascade)
-        .await
-        .unwrap();
-
-    let orphans = store.list_orphans(None).await.unwrap();
-    assert_eq!(orphans.len(), 1);
-    assert_eq!(orphans[0].uid, child_dying.uid);
-
-    let scoped = store.list_orphans(Some(dying_parent.uid)).await.unwrap();
-    assert_eq!(scoped.len(), 1);
-
-    let none_scoped = store.list_orphans(Some(alive_parent.uid)).await.unwrap();
-    assert!(none_scoped.is_empty());
-
-    Ok(())
-}
 
 #[sqlx::test]
 async fn reparent_moves_resource(pool: sqlx::PgPool) -> sqlx::Result<()> {
