@@ -1,7 +1,7 @@
 use crate::db::models::User;
 use crate::db::service_accounts;
 use crate::server::auth::controller::{
-    match_controller_identity, ControllerIdentity, ControllerMatch,
+    match_controller_identity, ControllerAuthContext, ControllerIdentity, ControllerMatch,
 };
 use crate::server::auth::jwt::JwtValidator;
 use crate::server::error::{ServerError, ServerErrorExt};
@@ -210,6 +210,38 @@ impl FromRequestParts<AppState> for AuthContext {
 
         // Neither was set — middleware should have rejected the request
         Err(ServerError::unauthorized("Not authenticated"))
+    }
+}
+
+/// Authentication context that accepts either a user/SA token or a controller token.
+///
+/// Used by endpoints that must handle both kinds of callers (e.g. `dispatch_put`).
+/// Controller auth is tried first (it is more specific — requires both a
+/// `VerifiedExternalToken` extension *and* matching `ControllerIdentity` claims).
+/// If that fails, regular user/SA auth is attempted.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub enum AnyAuth {
+    User(AuthContext),
+    Controller(ControllerAuthContext),
+}
+
+impl FromRequestParts<AppState> for AnyAuth {
+    type Rejection = ServerError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        // Try controller first (more specific — requires VerifiedExternalToken
+        // AND matching ControllerIdentity claims)
+        if let Ok(ctrl) = ControllerAuthContext::from_request_parts(parts, state).await {
+            return Ok(AnyAuth::Controller(ctrl));
+        }
+        // Fall back to user/SA auth
+        Ok(AnyAuth::User(
+            AuthContext::from_request_parts(parts, state).await?,
+        ))
     }
 }
 
