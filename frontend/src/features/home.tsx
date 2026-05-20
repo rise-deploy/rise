@@ -77,7 +77,7 @@ export function Home({ user }: HomeProps) {
                 />
             </StatGrid>
 
-            <div className="r-grid-2-1">
+            <div className="r-grid-2-1" style={{ alignItems: 'start' }}>
                 <Panel>
                     <PanelHead title="Recent projects" sub="Most recently updated across the workspace" />
                     {recent.length === 0 ? (
@@ -123,7 +123,7 @@ export function Home({ user }: HomeProps) {
 
                 <div className="r-stack">
                     <Panel>
-                        <PanelHead title="Teams" />
+                        <PanelHead title="Your teams" />
                         <div style={{ padding: 6 }}>
                             {teams.slice(0, 5).map(t => (
                                 <div
