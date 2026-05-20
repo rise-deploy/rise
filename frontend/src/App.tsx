@@ -18,6 +18,7 @@ import { DeploymentDetail, EnvironmentDeploymentView } from './features/deployme
 import { ExtensionDetailPage } from './features/resources';
 import { TeamDetail, TeamsList } from './features/teams';
 import { usePrefs } from './lib/prefs';
+import { ErrorBoundary } from './components/error-boundary';
 
 const TAB_LABELS = {
     deployments: 'Deployments',
@@ -285,15 +286,17 @@ export function App() {
     return (
         <>
             <Shell route={pathname} breadcrumbs={breadcrumbs} user={user} onLogout={logout} onOpenPalette={() => setCommandPaletteOpen(true)}>
-                {view === 'home' && <Home user={user} />}
-                {view === 'profile' && <Profile user={user} />}
-                {view === 'projects' && <ProjectsList openCreate={createIntent === 'project'} />}
-                {view === 'teams' && <TeamsList currentUser={user} openCreate={createIntent === 'team'} />}
-                {view === 'project-detail' && <ProjectDetail projectName={params.projectName} initialTab={params.tab} />}
-                {view === 'team-detail' && <TeamDetail teamName={params.teamName} currentUser={user} />}
-                {view === 'environment-deployment' && <EnvironmentDeploymentView projectName={params.projectName} environmentName={params.environmentName} />}
-                {view === 'deployment-detail' && <DeploymentDetail projectName={params.projectName} deploymentId={params.deploymentId} />}
-                {view === 'extension-detail' && <ExtensionDetailPage projectName={params.projectName} extensionType={params.extensionType} extensionInstance={params.extensionInstance} />}
+                <ErrorBoundary key={pathname}>
+                    {view === 'home' && <Home user={user} />}
+                    {view === 'profile' && <Profile user={user} />}
+                    {view === 'projects' && <ProjectsList openCreate={createIntent === 'project'} />}
+                    {view === 'teams' && <TeamsList currentUser={user} openCreate={createIntent === 'team'} />}
+                    {view === 'project-detail' && <ProjectDetail projectName={params.projectName} initialTab={params.tab} />}
+                    {view === 'team-detail' && <TeamDetail teamName={params.teamName} currentUser={user} />}
+                    {view === 'environment-deployment' && <EnvironmentDeploymentView projectName={params.projectName} environmentName={params.environmentName} />}
+                    {view === 'deployment-detail' && <DeploymentDetail projectName={params.projectName} deploymentId={params.deploymentId} />}
+                    {view === 'extension-detail' && <ExtensionDetailPage projectName={params.projectName} extensionType={params.extensionType} extensionInstance={params.extensionInstance} />}
+                </ErrorBoundary>
             </Shell>
             <CommandPalette
                 isOpen={commandPaletteOpen}
