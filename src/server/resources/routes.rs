@@ -3,9 +3,12 @@
 //! All routes are mounted under `/api/v1` (the rise API namespace). The routes
 //! themselves use `/resources` as the next segment to distinguish the generic
 //! resource API from the existing typed APIs.
+//!
+//! All resource paths are dispatched through four handler functions that parse
+//! the wildcard `{*path}` capture and route based on the parsed [`ResourcePath`].
 
 use axum::{
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
     Router,
 };
 
@@ -14,56 +17,10 @@ use crate::server::state::AppState;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        // Break-glass: orphan discovery (must come before /{collection}).
-        .route("/resources/orphans", get(handlers::list_orphans))
-        // Root-scoped subresource endpoints (3 path segments after /resources/).
-        .route(
-            "/resources/{collection}/{name}/reparent",
-            post(handlers::reparent_root),
-        )
-        .route(
-            "/resources/{collection}/{name}/status",
-            put(handlers::update_status_root),
-        )
-        .route(
-            "/resources/{collection}/{name}/finalizers",
-            put(handlers::update_finalizers_root),
-        )
-        // Root-scoped CRUD.
-        .route(
-            "/resources/{collection}",
-            get(handlers::list_root).post(handlers::create_root),
-        )
-        .route(
-            "/resources/{collection}/{name}",
-            get(handlers::get_root)
-                .put(handlers::update_root)
-                .delete(handlers::delete_root),
-        )
-        // Organization-scoped subresource endpoints.
-        .route(
-            "/resources/organizations/{org}/{collection}/{name}/reparent",
-            post(handlers::reparent_org),
-        )
-        .route(
-            "/resources/organizations/{org}/{collection}/{name}/status",
-            put(handlers::update_status_org),
-        )
-        .route(
-            "/resources/organizations/{org}/{collection}/{name}/finalizers",
-            put(handlers::update_finalizers_org),
-        )
-        // Organization-scoped CRUD.
-        .route(
-            "/resources/organizations/{org}/{collection}",
-            get(handlers::list_org).post(handlers::create_org),
-        )
-        .route(
-            "/resources/organizations/{org}/{collection}/{name}",
-            get(handlers::get_org)
-                .put(handlers::update_org)
-                .delete(handlers::delete_org),
-        )
+        .route("/resources/{*path}", get(handlers::dispatch_get))
+        .route("/resources/{*path}", post(handlers::dispatch_post))
+        .route("/resources/{*path}", put(handlers::dispatch_put))
+        .route("/resources/{*path}", delete(handlers::dispatch_delete))
 }
 
 #[cfg(test)]
