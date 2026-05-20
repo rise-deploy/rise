@@ -12,8 +12,10 @@ import {
     Field as RField,
     Input as RInput,
     Modal as RModal,
+    Pill,
     Segmented,
 } from '../components/r-ui';
+import { Icon } from '../components/icon';
 import { AddMenu, RosterTable } from '../components/roster-table';
 
 // CodeMirror is heavy; load it only when the service-account modal is opened.
@@ -36,6 +38,7 @@ export function AppUsersList({ projectName, project, accessClasses, currentUserE
     const [serviceAccounts, setServiceAccounts] = useState([]);
     const [environments, setEnvironments] = useState([]);
     const [typeFilter, setTypeFilter] = useState('all');
+    const [accessInfoOpen, setAccessInfoOpen] = useState(false);
 
     const [editingOwner, setEditingOwner] = useState(false);
     const [newOwnerType, setNewOwnerType] = useState('user');
@@ -378,7 +381,24 @@ export function AppUsersList({ projectName, project, accessClasses, currentUserE
         <div className="r-stack">
             <div className="r-section-head">
                 <div>
-                    <div className="r-section-title">Access class</div>
+                    <div className="r-section-title" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                        Access class
+                        {accessClasses.length > 0 && (
+                            <button
+                                type="button"
+                                onClick={() => setAccessInfoOpen(true)}
+                                title="About access classes"
+                                aria-label="About access classes"
+                                style={{
+                                    display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                                    padding: 2, background: 'transparent', border: 'none', cursor: 'pointer',
+                                    color: 'var(--text-soft)', borderRadius: 4,
+                                }}
+                            >
+                                <Icon name="info" size={15} />
+                            </button>
+                        )}
+                    </div>
                     <div className="r-section-sub">
                         {accessClassDescription || 'Controls who can reach this project.'}
                     </div>
@@ -586,6 +606,28 @@ export function AppUsersList({ projectName, project, accessClasses, currentUserE
                 confirmTone="danger"
                 loading={removing}
             />
+
+            <RModal
+                isOpen={accessInfoOpen}
+                onClose={() => setAccessInfoOpen(false)}
+                title="Access classes"
+                sub="How each access class controls who can reach this project."
+                footer={<RButton onClick={() => setAccessInfoOpen(false)}>Close</RButton>}
+            >
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+                    {accessClasses.map(ac => (
+                        <div key={ac.id}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                                <span style={{ fontWeight: 600, fontSize: 13 }}>{ac.display_name}</span>
+                                {project?.access_class === ac.id && <Pill kind="accent">Current</Pill>}
+                            </div>
+                            <div style={{ fontSize: 12.5, color: 'var(--text-muted)', marginTop: 3 }}>
+                                {ac.description || 'No description provided.'}
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            </RModal>
         </div>
     );
 }
