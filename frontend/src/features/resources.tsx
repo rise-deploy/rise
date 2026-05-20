@@ -223,7 +223,28 @@ function DeploymentGroupCard({ groupName, deployments, projectName, defaultOpen 
                 </span>
             </RGroupBar>
             {open && (
-                deployments.length === 0 ? (
+                <>
+                {active && (
+                    <div style={{ display: 'flex', gap: 32, padding: '12px 18px', borderBottom: '1px solid var(--border-faint)' }}>
+                        <div>
+                            <div className="r-stat-label">Current</div>
+                            <a
+                                className="r-link mono"
+                                style={{ fontSize: 12.5, marginTop: 4, display: 'inline-block' }}
+                                onClick={(e) => { e.stopPropagation(); navigate(`/deployment/${projectName}/${active.deployment_id}`); }}
+                            >
+                                {active.deployment_id}
+                            </a>
+                        </div>
+                        {replicas != null && (
+                            <div>
+                                <div className="r-stat-label">Replicas</div>
+                                <div style={{ fontSize: 13, marginTop: 4 }}>{replicas}</div>
+                            </div>
+                        )}
+                    </div>
+                )}
+                {deployments.length === 0 ? (
                     <div style={{ padding: 28, textAlign: 'center', color: 'var(--text-soft)', fontSize: 13 }}>
                         No deployments in this group.
                     </div>
@@ -274,7 +295,8 @@ function DeploymentGroupCard({ groupName, deployments, projectName, defaultOpen 
                             })}
                         </tbody>
                     </table>
-                )
+                )}
+                </>
             )}
         </RPanel>
     );
@@ -481,18 +503,21 @@ export function EnvironmentsList({ projectName, platformConstraints = null }) {
                         const deployCount = deploymentsForEnv(env.name).length;
                         return (
                             <div key={env.name} className="r-stack tight">
-                                <div className="r-section-head" style={{ marginBottom: 0 }}>
+                                <div
+                                    className="r-section-head"
+                                    style={{ marginBottom: 0, padding: '12px 16px', background: 'var(--surface-2)', border: '1px solid var(--border-faint)', borderRadius: 'var(--radius)' }}
+                                >
                                     <div>
-                                        <div className="r-section-title" style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                                            <span className={`r-pill ${env.is_production ? 'env-prod' : 'env-staging'}`}>
-                                                <EnvironmentColorDot color={env.color} />
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
+                                            <EnvironmentColorDot color={env.color} size="0.7rem" />
+                                            <span style={{ fontSize: 15, fontWeight: 600, letterSpacing: '-0.01em', textTransform: 'capitalize' }}>
                                                 {env.name}
                                             </span>
-                                            {env.is_production && (
-                                                <span style={{ fontSize: 11.5, color: 'var(--text-soft)' }}>production</span>
+                                            {env.is_production && env.name.toLowerCase() !== 'production' && (
+                                                <span className="r-pill env-prod">production</span>
                                             )}
                                         </div>
-                                        <div className="r-section-sub">
+                                        <div className="r-section-sub" style={{ marginTop: 3 }}>
                                             {groups.length} group{groups.length === 1 ? '' : 's'} · {deployCount} deployment{deployCount === 1 ? '' : 's'}
                                         </div>
                                     </div>
