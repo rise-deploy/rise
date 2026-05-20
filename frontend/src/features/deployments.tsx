@@ -834,16 +834,22 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
         }
     }, [projectName, deploymentId, tailLines]);
 
-    // Auto-follow logs on open when the deployment is still active.
-    const autoFollowedRef = useRef(false);
+    // On open, automatically show logs: live-follow active deployments (from
+    // the most recent line), or load the backlog for terminal ones. The
+    // one-shot guard is only armed once the deployment can actually serve
+    // logs, so a deployment that becomes streamable later still auto-follows.
+    const autoLoadedRef = useRef(false);
     useEffect(() => {
-        if (autoFollowedRef.current) return;
-        autoFollowedRef.current = true;
+        if (autoLoadedRef.current) return;
+        if (!isLoggable(deploymentStatus)) return;
+        autoLoadedRef.current = true;
         const terminal = ['Cancelled', 'Stopped', 'Superseded', 'Failed', 'Expired'].includes(deploymentStatus);
-        if (!terminal && isLoggable(deploymentStatus)) {
+        if (terminal) {
+            loadInitialLogs();
+        } else {
             startStreaming();
         }
-    }, [deploymentStatus, startStreaming]);
+    }, [deploymentStatus, startStreaming, loadInitialLogs]);
 
     const clearLogs = () => {
         setLogs([]);
