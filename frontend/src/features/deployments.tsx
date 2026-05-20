@@ -1566,7 +1566,7 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                             className="r-link mono"
                             style={{ fontSize: 12.5, wordBreak: 'break-all' }}
                         >
-                            {url}
+                            {url.replace(/^https?:\/\//, '')}
                         </a>
                     ))
                 ) : (
