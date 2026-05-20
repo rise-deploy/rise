@@ -104,7 +104,7 @@ function Sidebar({ route, user, onLogout, onToggleTheme, theme }: { route: strin
                     {theme === 'dark' ? 'Light mode' : 'Dark mode'}
                 </button>
                 <div
-                    className="r-user"
+                    className={cx('r-user', route === '/profile' && 'active')}
                     role="button"
                     tabIndex={0}
                     onClick={() => navigate('/profile')}

@@ -275,6 +275,12 @@ a { color: inherit; }
     transition: background 0.14s;
 }
 .r-user:hover { background: var(--hover); }
+.r-user.active {
+    background: var(--accent-soft);
+    border-color: transparent;
+}
+.r-user.active .r-user-name { color: var(--accent); font-weight: 600; }
+.dark .r-user.active .r-user-name { color: var(--text); }
 .r-ava {
     width: 26px; height: 26px;
     border-radius: 4px;
