@@ -96,35 +96,47 @@ async fn resolve_collection(
     })
 }
 
-/// Resolve a leaf resource within a scope by name-or-uid identifier.
+/// Resolve a leaf resource by building the full ancestor + leaf segment chain
+/// and calling `store.resolve_path` once.
 ///
-/// `parent_row` is the already-resolved parent resource, if any. Its
-/// `api_version` and `kind` are used to build the leading path segment so
-/// the store can validate the full ancestry chain — no hardcoding of parent
-/// kind is required here.
-async fn resolve_leaf(
+/// `ancestor_segs` must be the already-resolved ancestor segments (from
+/// `resolve_ancestors`). Appends the leaf segment for `identifier` and passes
+/// the complete chain to the store so ancestry validation is correct even for
+/// depth-2+ paths.
+async fn resolve_item(
     store: &Arc<dyn ResourceStore>,
+    ancestor_segs: Vec<PathSegment>,
     info: &CollectionInfo,
-    parent_row: Option<&ResourceRow>,
     identifier: &str,
 ) -> Result<ResourceRow, ServerError> {
-    let mut segments = Vec::new();
-    if let Some(parent) = parent_row {
-        segments.push(PathSegment::Uid {
-            api_version: parent.api_version.clone(),
-            kind: parent.kind.clone(),
-            uid: parent.uid,
-        });
-    }
-    segments.push(parse_identifier(&info.api_version, &info.kind, identifier)?);
+    let mut segs = ancestor_segs;
+    segs.push(parse_identifier(&info.api_version, &info.kind, identifier)?);
     let chain = store
-        .resolve_path(&segments)
+        .resolve_path(&segs)
         .await
         .map_err(store_error_to_server_error)?;
     chain
         .into_iter()
         .last()
         .ok_or_else(|| ServerError::not_found(format!("resource '{identifier}' not found")))
+}
+
+/// Resolve the parent UID from a list of already-resolved ancestor segments.
+///
+/// Returns `None` for root-scoped resources (no ancestors). Calls the store's
+/// `resolve_path` to obtain the last row's UID for org-scoped resources.
+async fn resolve_parent_uid_from_segs(
+    store: &Arc<dyn ResourceStore>,
+    ancestor_segs: &[PathSegment],
+) -> Result<Option<Uuid>, ServerError> {
+    if ancestor_segs.is_empty() {
+        return Ok(None);
+    }
+    let rows = store
+        .resolve_path(ancestor_segs)
+        .await
+        .map_err(store_error_to_server_error)?;
+    Ok(rows.into_iter().last().map(|r| r.uid))
 }
 
 fn enforce_scope(
@@ -298,20 +310,13 @@ pub async fn dispatch_get(
         } => {
             let _user = require_operator(&state, &auth)?;
             let ancestor_segs = resolve_ancestors(&state.resource_store, &ancestors).await?;
-            let (parent_uid, expected_scope) = if ancestors.is_empty() {
-                (None, ResourceScope::Root)
+            let expected_scope = if ancestors.is_empty() {
+                ResourceScope::Root
             } else {
-                let parent_rows = state
-                    .resource_store
-                    .resolve_path(&ancestor_segs)
-                    .await
-                    .map_err(store_error_to_server_error)?;
-                let parent = parent_rows
-                    .into_iter()
-                    .last()
-                    .ok_or_else(|| ServerError::not_found("ancestor not found"))?;
-                (Some(parent.uid), ResourceScope::Organization)
+                ResourceScope::Organization
             };
+            let parent_uid =
+                resolve_parent_uid_from_segs(&state.resource_store, &ancestor_segs).await?;
             let resolved = resolve_collection(&state.resource_store, &collection).await?;
             enforce_scope(&resolved.info, expected_scope, &resolved.collection)?;
             let rows = state
@@ -333,26 +338,17 @@ pub async fn dispatch_get(
         } => {
             let _user = require_operator(&state, &auth)?;
             let ancestor_segs = resolve_ancestors(&state.resource_store, &ancestors).await?;
-            let (parent_row_opt, expected_scope) = if ancestors.is_empty() {
-                (None, ResourceScope::Root)
+            let expected_scope = if ancestors.is_empty() {
+                ResourceScope::Root
             } else {
-                let parent_rows = state
-                    .resource_store
-                    .resolve_path(&ancestor_segs)
-                    .await
-                    .map_err(store_error_to_server_error)?;
-                let parent = parent_rows
-                    .into_iter()
-                    .last()
-                    .ok_or_else(|| ServerError::not_found("ancestor not found"))?;
-                (Some(parent), ResourceScope::Organization)
+                ResourceScope::Organization
             };
             let resolved = resolve_collection(&state.resource_store, &collection).await?;
             enforce_scope(&resolved.info, expected_scope, &resolved.collection)?;
-            let row = resolve_leaf(
+            let row = resolve_item(
                 &state.resource_store,
+                ancestor_segs,
                 &resolved.info,
-                parent_row_opt.as_ref(),
                 &identifier,
             )
             .await?;
@@ -381,20 +377,13 @@ pub async fn dispatch_post(
             let body: CreateResourceRequest = serde_json::from_value(body)
                 .map_err(|e| ServerError::bad_request(format!("invalid request body: {e}")))?;
             let ancestor_segs = resolve_ancestors(&state.resource_store, &ancestors).await?;
-            let (parent_uid, expected_scope) = if ancestors.is_empty() {
-                (None, ResourceScope::Root)
+            let expected_scope = if ancestors.is_empty() {
+                ResourceScope::Root
             } else {
-                let parent_rows = state
-                    .resource_store
-                    .resolve_path(&ancestor_segs)
-                    .await
-                    .map_err(store_error_to_server_error)?;
-                let parent = parent_rows
-                    .into_iter()
-                    .last()
-                    .ok_or_else(|| ServerError::not_found("ancestor not found"))?;
-                (Some(parent.uid), ResourceScope::Organization)
+                ResourceScope::Organization
             };
+            let parent_uid =
+                resolve_parent_uid_from_segs(&state.resource_store, &ancestor_segs).await?;
             let resolved = resolve_collection(&state.resource_store, &collection).await?;
             enforce_scope(&resolved.info, expected_scope, &resolved.collection)?;
             let (status, resource) = create_resource(&state, &resolved, parent_uid, body).await?;
@@ -410,26 +399,17 @@ pub async fn dispatch_post(
             let body: ReparentRequest = serde_json::from_value(body)
                 .map_err(|e| ServerError::bad_request(format!("invalid request body: {e}")))?;
             let ancestor_segs = resolve_ancestors(&state.resource_store, &ancestors).await?;
-            let (parent_row_opt, expected_scope) = if ancestors.is_empty() {
-                (None, ResourceScope::Root)
+            let expected_scope = if ancestors.is_empty() {
+                ResourceScope::Root
             } else {
-                let parent_rows = state
-                    .resource_store
-                    .resolve_path(&ancestor_segs)
-                    .await
-                    .map_err(store_error_to_server_error)?;
-                let parent = parent_rows
-                    .into_iter()
-                    .last()
-                    .ok_or_else(|| ServerError::not_found("ancestor not found"))?;
-                (Some(parent), ResourceScope::Organization)
+                ResourceScope::Organization
             };
             let resolved = resolve_collection(&state.resource_store, &collection).await?;
             enforce_scope(&resolved.info, expected_scope, &resolved.collection)?;
-            let row = resolve_leaf(
+            let row = resolve_item(
                 &state.resource_store,
+                ancestor_segs,
                 &resolved.info,
-                parent_row_opt.as_ref(),
                 &identifier,
             )
             .await?;
@@ -469,31 +449,21 @@ pub async fn dispatch_put(
             let body: UpdateResourceRequest = serde_json::from_value(body)
                 .map_err(|e| ServerError::bad_request(format!("invalid request body: {e}")))?;
             let ancestor_segs = resolve_ancestors(&state.resource_store, &ancestors).await?;
-            let (parent_row_opt, expected_scope) = if ancestors.is_empty() {
-                (None, ResourceScope::Root)
+            let expected_scope = if ancestors.is_empty() {
+                ResourceScope::Root
             } else {
-                let parent_rows = state
-                    .resource_store
-                    .resolve_path(&ancestor_segs)
-                    .await
-                    .map_err(store_error_to_server_error)?;
-                let parent = parent_rows
-                    .into_iter()
-                    .last()
-                    .ok_or_else(|| ServerError::not_found("ancestor not found"))?;
-                (Some(parent), ResourceScope::Organization)
+                ResourceScope::Organization
             };
             let resolved = resolve_collection(&state.resource_store, &collection).await?;
             enforce_scope(&resolved.info, expected_scope, &resolved.collection)?;
-            // update_resource resolves the leaf internally
-            let resp = update_resource(
-                &state,
-                &resolved,
-                parent_row_opt.as_ref(),
+            let row = resolve_item(
+                &state.resource_store,
+                ancestor_segs,
+                &resolved.info,
                 &identifier,
-                body,
             )
             .await?;
+            let resp = update_resource(&state, &resolved, &row, &identifier, body).await?;
             Ok(resp.into_response())
         }
         ResourcePath::Subresource {
@@ -512,19 +482,10 @@ pub async fn dispatch_put(
                 }
             };
             let ancestor_segs = resolve_ancestors(&state.resource_store, &ancestors).await?;
-            let (parent_row_opt, expected_scope) = if ancestors.is_empty() {
-                (None, ResourceScope::Root)
+            let expected_scope = if ancestors.is_empty() {
+                ResourceScope::Root
             } else {
-                let parent_rows = state
-                    .resource_store
-                    .resolve_path(&ancestor_segs)
-                    .await
-                    .map_err(store_error_to_server_error)?;
-                let parent = parent_rows
-                    .into_iter()
-                    .last()
-                    .ok_or_else(|| ServerError::not_found("ancestor not found"))?;
-                (Some(parent), ResourceScope::Organization)
+                ResourceScope::Organization
             };
             let resolved = resolve_collection(&state.resource_store, &collection).await?;
             enforce_scope(&resolved.info, expected_scope, &resolved.collection)?;
@@ -533,10 +494,10 @@ pub async fn dispatch_put(
                 &resolved.collection,
                 &controller.0.identity_id,
             )?;
-            let row = resolve_leaf(
+            let row = resolve_item(
                 &state.resource_store,
+                ancestor_segs,
                 &resolved.info,
-                parent_row_opt.as_ref(),
                 &identifier,
             )
             .await?;
@@ -590,32 +551,21 @@ pub async fn dispatch_delete(
                 require_operator(&state, &auth)?
             };
             let ancestor_segs = resolve_ancestors(&state.resource_store, &ancestors).await?;
-            let (parent_row_opt, expected_scope) = if ancestors.is_empty() {
-                (None, ResourceScope::Root)
+            let expected_scope = if ancestors.is_empty() {
+                ResourceScope::Root
             } else {
-                let parent_rows = state
-                    .resource_store
-                    .resolve_path(&ancestor_segs)
-                    .await
-                    .map_err(store_error_to_server_error)?;
-                let parent = parent_rows
-                    .into_iter()
-                    .last()
-                    .ok_or_else(|| ServerError::not_found("ancestor not found"))?;
-                (Some(parent), ResourceScope::Organization)
+                ResourceScope::Organization
             };
             let resolved = resolve_collection(&state.resource_store, &collection).await?;
             enforce_scope(&resolved.info, expected_scope, &resolved.collection)?;
-            // delete_resource resolves the leaf internally
-            let resp = delete_resource(
-                &state,
-                &resolved,
-                parent_row_opt.as_ref(),
+            let row = resolve_item(
+                &state.resource_store,
+                ancestor_segs,
+                &resolved.info,
                 &identifier,
-                policy,
-                &user,
             )
             .await?;
+            let resp = delete_resource(&state, &row, policy, &user).await?;
             Ok(resp.into_response())
         }
         _ => Err(ServerError::new(
@@ -687,7 +637,7 @@ async fn create_resource(
 async fn update_resource(
     state: &AppState,
     resolved: &ResolvedCollection,
-    parent_row: Option<&ResourceRow>,
+    row: &ResourceRow,
     url_name: &str,
     body: UpdateResourceRequest,
 ) -> Result<Json<rise_resource_api::Resource>, ServerError> {
@@ -699,7 +649,6 @@ async fn update_resource(
         url_name,
     )?;
 
-    let row = resolve_leaf(&state.resource_store, &resolved.info, parent_row, url_name).await?;
     if body.metadata.name != row.name {
         return Err(ServerError::bad_request(format!(
             "renaming a resource via PUT is not supported (stored name '{}', body '{}')",
@@ -738,13 +687,10 @@ async fn update_resource(
 
 async fn delete_resource(
     state: &AppState,
-    resolved: &ResolvedCollection,
-    parent_row: Option<&ResourceRow>,
-    url_name: &str,
+    row: &ResourceRow,
     policy: PropagationPolicy,
     user: &User,
 ) -> Result<Json<serde_json::Value>, ServerError> {
-    let row = resolve_leaf(&state.resource_store, &resolved.info, parent_row, url_name).await?;
     let outcome = state
         .resource_store
         .delete(row.uid, policy)
