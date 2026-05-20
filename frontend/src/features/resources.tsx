@@ -25,6 +25,7 @@ import {
     Tabs as RTabs,
 } from '../components/r-ui';
 import { validateJson } from '../lib/json-validate';
+import { MonoTable, MonoTableBody, MonoTableEmptyRow, MonoTableFrame, MonoTableHead, MonoTableRow, MonoTd, MonoTh } from '../components/table';
 import { Icon } from '../components/icon';
 
 // CodeMirror is heavy; load it only when an extension's Spec tab is opened.
