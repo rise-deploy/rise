@@ -47,12 +47,16 @@ export function ProjectTable({
                     </thead>
                     <tbody>
                         {projects.map(project => {
-                            const own = isOwnRow ? isOwnRow(project) : false;
                             const updated = project.updated || project.updated_at || project.created;
+                            // When isOwnRow is provided, mark every row: an accent
+                            // bar for owned projects, a gray bar for shared ones.
+                            const ownClass = isOwnRow
+                                ? (isOwnRow(project) ? ' r-row-own' : ' r-row-shared')
+                                : '';
                             return (
                                 <tr
                                     key={project.id || project.name}
-                                    className={own ? 'click r-row-own' : 'click'}
+                                    className={`click${ownClass}`}
                                     onClick={() => onRowClick(project)}
                                 >
                                     <td style={{ maxWidth: 280 }}>
