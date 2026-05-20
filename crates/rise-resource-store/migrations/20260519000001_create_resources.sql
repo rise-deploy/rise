@@ -44,11 +44,11 @@ ALTER TABLE resource_store.resources
 
 -- Same-level name uniqueness
 CREATE UNIQUE INDEX resources_child_kind_name_unique
-    ON resource_store.resources (parent_uid, api_version, kind, name)
+    ON resource_store.resources (parent_uid, kind, name)
     WHERE parent_uid IS NOT NULL;
 
 CREATE UNIQUE INDEX resources_root_kind_name_unique
-    ON resource_store.resources (api_version, kind, name)
+    ON resource_store.resources (kind, name)
     WHERE parent_uid IS NULL;
 
 -- Same-level discriminator uniqueness

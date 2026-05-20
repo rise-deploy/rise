@@ -1410,38 +1410,93 @@ async fn reparent_to_root(pool: sqlx::PgPool) -> sqlx::Result<()> {
 async fn reparent_rejects_cycle(pool: sqlx::PgPool) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
     let org = create_org(&store, "root").await;
-    // Create a child org in the store so we have a two-level hierarchy to
-    // attempt cyclic reparenting on. In the live API organizations are
-    // root-scoped, but the store does not enforce that — scope is the caller's
-    // responsibility. We pass ResourceScope::Organization here precisely
-    // because it allows a parent UID, which lets us reach the cycle check.
-    // Using ResourceScope::Root would short-circuit with a Validation error
-    // before the cycle detector fires.
-    let child_org = store
-        .create(CreateResourceParams {
-            api_version: API_VERSION_V1ALPHA1.to_string(),
-            kind: ORGANIZATION_KIND.to_string(),
-            name: "child".to_string(),
-            parent_uid: Some(org.uid),
-            annotations: BTreeMap::new(),
-            finalizers: vec![],
-            spec: json!({"displayName": "Child"}),
-            validator: None,
-        })
-        .await
-        .unwrap();
 
+    // Self-loop: moving an org under itself is rejected as a cycle.
+    // The org is root-level so it passes the api_version/parent_uid guards,
+    // letting the cycle detector fire.
     let err = store
         .reparent(org.uid, Some(org.uid), ResourceScope::Organization)
         .await
         .unwrap_err();
     assert!(matches!(err, StoreError::ReparentCycle));
 
+    Ok(())
+}
+
+#[sqlx::test]
+async fn reparent_rejects_org_scoped_resource_under_non_root_org(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let org = create_org(&store, "root").await;
+    let widget = create_child(&store, org.uid, "Widget", "w1", vec![]).await;
+
+    // Fabricate a non-root Organization in the store to use as the new parent.
+    let nested_org = store
+        .create(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: ORGANIZATION_KIND.to_string(),
+            name: "nested".to_string(),
+            parent_uid: Some(org.uid),
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec: json!({"displayName": "Nested"}),
+            validator: None,
+        })
+        .await
+        .unwrap();
+
     let err = store
-        .reparent(org.uid, Some(child_org.uid), ResourceScope::Organization)
+        .reparent(
+            widget.uid,
+            Some(nested_org.uid),
+            ResourceScope::Organization,
+        )
         .await
         .unwrap_err();
-    assert!(matches!(err, StoreError::ReparentCycle));
+    assert!(
+        matches!(err, StoreError::Validation(_)),
+        "expected validation error for non-root org parent, got {err:?}"
+    );
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn reparent_rejects_org_scoped_resource_under_wrong_api_version(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let org = create_org(&store, "root").await;
+    let widget = create_child(&store, org.uid, "Widget", "w1", vec![]).await;
+
+    // Fabricate an "Organization" from a different API group at root scope.
+    let foreign_org = store
+        .create(CreateResourceParams {
+            api_version: "external.example.dev/v1".to_string(),
+            kind: ORGANIZATION_KIND.to_string(),
+            name: "foreign-org".to_string(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec: json!({}),
+            validator: None,
+        })
+        .await
+        .unwrap();
+
+    let err = store
+        .reparent(
+            widget.uid,
+            Some(foreign_org.uid),
+            ResourceScope::Organization,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Validation(_)),
+        "expected validation error for wrong api_version parent, got {err:?}"
+    );
 
     Ok(())
 }

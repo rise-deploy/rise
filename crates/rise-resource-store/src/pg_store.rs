@@ -717,11 +717,19 @@ impl ResourceStore for PgResourceStore {
                 .await?
                 .ok_or(StoreError::ParentNotFound)?;
 
-                if parent.kind != ORGANIZATION_KIND {
+                if parent.kind != ORGANIZATION_KIND || parent.api_version != API_VERSION_V1ALPHA1 {
                     return Err(StoreError::Validation(format!(
-                        "organization-scoped resources can only be reparented under an Organization, got '{}'",
-                        parent.kind
+                        "organization-scoped resources can only be reparented under a built-in \
+                         Organization (rise.dev/v1alpha1/Organization), got '{}/{}'",
+                        parent.api_version, parent.kind
                     )));
+                }
+                if parent.parent_uid.is_some() {
+                    return Err(StoreError::Validation(
+                        "organization-scoped resources can only be reparented under a root-level \
+                         Organization"
+                            .to_string(),
+                    ));
                 }
             }
         }
