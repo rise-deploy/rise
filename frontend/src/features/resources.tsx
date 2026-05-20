@@ -9,6 +9,7 @@ import { Button, ConfirmDialog, EnvironmentColorDot, EnvironmentColorPicker, Env
 import {
     Alert as RAlert,
     Button as RButton,
+    ConfirmDialog as RConfirmDialog,
     Empty as REmpty,
     Field as RField,
     GroupBar as RGroupBar,
@@ -2173,7 +2174,7 @@ export function ExtensionDetailPage({ projectName, extensionType: extensionTypeP
     const [uiSpec, setUiSpec] = useState({});
     const [saving, setSaving] = useState(false);
     const [deleting, setDeleting] = useState(false);
-    const [deleteConfirmName, setDeleteConfirmName] = useState('');
+    const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
     const [originalSpec, setOriginalSpec] = useState('{}');
     const [instanceName, setInstanceName] = useState(getDefaultExtensionName(extensionTypeProp)); // Instance name for new extensions
     const { showToast } = useToast();
@@ -2344,10 +2345,7 @@ export function ExtensionDetailPage({ projectName, extensionType: extensionTypeP
     };
 
     const handleDelete = async () => {
-        if (!enabledExtension || deleteConfirmName !== enabledExtension.extension) {
-            showToast('Please enter the extension instance name to confirm deletion', 'error');
-            return;
-        }
+        if (!enabledExtension) return;
 
         setDeleting(true);
         try {
@@ -2356,7 +2354,6 @@ export function ExtensionDetailPage({ projectName, extensionType: extensionTypeP
             navigate(`/project/${projectName}/extensions`);
         } catch (err) {
             showToast(`Failed to delete extension: ${err.message}`, 'error');
-        } finally {
             setDeleting(false);
         }
     };
@@ -2379,7 +2376,6 @@ export function ExtensionDetailPage({ projectName, extensionType: extensionTypeP
     if (isEnabled) tabs.push({ id: 'overview', label: 'Overview' });
     if (hasUI) tabs.push({ id: 'configure', label: `Configure${unsavedMark}` });
     tabs.push({ id: 'config', label: `Spec${unsavedMark}` });
-    if (isEnabled) tabs.push({ id: 'delete', label: 'Delete' });
 
     // Validity of the current spec JSON against the extension schema.
     const specValidation = validateJson(formData.spec, extensionType.spec_schema);
@@ -2442,6 +2438,11 @@ export function ExtensionDetailPage({ projectName, extensionType: extensionTypeP
                 >
                     Extension Docs
                 </Button>
+                {isEnabled && (
+                    <RButton variant="danger" size="sm" icon="trash" onClick={() => setConfirmDeleteOpen(true)}>
+                        Delete
+                    </RButton>
+                )}
                 {isEnabled ? (
                     renderExtensionStatusBadge(enabledExtension)
                 ) : (
@@ -2572,7 +2573,14 @@ export function ExtensionDetailPage({ projectName, extensionType: extensionTypeP
 
                         {isEnabled && enabledExtension.status && (
                             <RPanel>
-                                <RPanelHead title="Status (read-only)" />
+                                <RPanelHead
+                                    title="Status"
+                                    right={
+                                        <span style={{ display: 'inline-flex', color: 'var(--text-soft)' }} title="Read-only">
+                                            <Icon name="lock" size={13} />
+                                        </span>
+                                    }
+                                />
                                 <RPanelBody>
                                     <JsonEditor
                                         value={JSON.stringify(enabledExtension.status, null, 2)}
@@ -2590,50 +2598,25 @@ export function ExtensionDetailPage({ projectName, extensionType: extensionTypeP
                     </Suspense>
                 )}
 
-                {activeTab === 'delete' && isEnabled && (
-                    <div className="r-stack">
-                        <RAlert tone="err">
-                            <strong>Warning: Permanent Deletion</strong>
-                            <p style={{ margin: '4px 0 0' }}>
-                                Deleting this extension will deprovision all resources created by this extension.
-                                This action cannot be undone.
-                            </p>
-                        </RAlert>
-
-                        <RPanel>
-                            <RPanelBody>
-                                <RField label={`Type the extension instance name "${enabledExtension.extension}" to confirm deletion`}>
-                                    <RInput
-                                        id="delete-confirm-name"
-                                        value={deleteConfirmName}
-                                        onChange={(e) => setDeleteConfirmName(e.target.value)}
-                                        placeholder={enabledExtension.extension}
-                                        required
-                                    />
-                                </RField>
-                            </RPanelBody>
-                        </RPanel>
-
-                        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12 }}>
-                            <Button
-                                variant="secondary"
-                                onClick={() => setActiveTab('overview')}
-                                disabled={deleting}
-                            >
-                                Cancel
-                            </Button>
-                            <Button
-                                variant="danger"
-                                onClick={handleDelete}
-                                loading={deleting}
-                                disabled={deleteConfirmName !== enabledExtension.extension}
-                            >
-                                Delete Extension
-                            </Button>
-                        </div>
-                    </div>
-                )}
             </div>
+
+            {isEnabled && (
+                <RConfirmDialog
+                    isOpen={confirmDeleteOpen}
+                    onClose={() => setConfirmDeleteOpen(false)}
+                    onConfirm={handleDelete}
+                    title={`Delete extension ${enabledExtension.extension}?`}
+                    message={
+                        <p style={{ marginTop: 0 }}>
+                            Deleting this extension will deprovision all resources it created.
+                            This cannot be undone.
+                        </p>
+                    }
+                    confirmText="Delete extension"
+                    requireText={enabledExtension.extension}
+                    loading={deleting}
+                />
+            )}
         </section>
     );
 }
