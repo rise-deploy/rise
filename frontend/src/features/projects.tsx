@@ -4,8 +4,8 @@ import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
 import { copyToClipboard, formatISO8601, formatRelativeTimeRounded, isSafeUrl } from '../lib/utils';
 import { useToast } from '../components/toast';
-import { AutocompleteInput, Button, ConfirmDialog, FormField, Modal, ModalActions, ModalSection, MonoNotice, SegmentedRadioGroup } from '../components/ui';
-import { Button as RButton, Combobox as RCombobox, Empty, Input as RInput, Panel, Pill, Segmented } from '../components/r-ui';
+import { AutocompleteInput, Button, ConfirmDialog, FormField, Modal, ModalActions, ModalSection, MonoNotice } from '../components/ui';
+import { Button as RButton, Combobox as RCombobox, Empty, Field as RField, Input as RInput, Panel, Pill, Segmented } from '../components/r-ui';
 import { ProjectTable } from '../components/project-table';
 import { ActiveDeploymentsSummary, DeploymentDetail, DeploymentsList } from './deployments';
 import { DomainsList, EnvironmentsList, EnvVarsList, ExtensionDetailPage, ExtensionsList, ServiceAccountsList } from './resources';
@@ -767,16 +767,16 @@ export function ProjectDetail({ projectName, initialTab }) {
                 maxWidth="max-w-lg"
             >
                 <ModalSection>
-                    <SegmentedRadioGroup
-                        label="Owner Type"
-                        name="owner-type"
-                        value={ownerType}
-                        onChange={setOwnerType}
-                        options={[
-                            { value: 'user', label: 'USER' },
-                            { value: 'team', label: 'TEAM' },
-                        ]}
-                    />
+                    <RField label="Owner type">
+                        <Segmented
+                            value={ownerType}
+                            onChange={setOwnerType}
+                            options={[
+                                { value: 'user', label: 'User' },
+                                { value: 'team', label: 'Team' },
+                            ]}
+                        />
+                    </RField>
 
                     {ownerType === 'user' ? (
                         <div className="form-field">

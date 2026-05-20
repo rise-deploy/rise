@@ -569,37 +569,6 @@ export function MonoCodeBlock({ as = 'pre', className = '', children }) {
     );
 }
 
-export function SegmentedRadioGroup({
-    label,
-    name,
-    value,
-    onChange,
-    options = [],
-    ariaLabel,
-    className = '',
-}) {
-    return (
-        <div className={cx('form-field', className)}>
-            {label && <p className="mono-label">{label}</p>}
-            <div className="mono-segmented mt-1" role="radiogroup" aria-label={ariaLabel || label || name}>
-                {options.map((option) => (
-                    <label key={option.value} className={`mono-segmented-option ${value === option.value ? 'active' : ''}`}>
-                        <input
-                            type="radio"
-                            name={name}
-                            value={option.value}
-                            checked={value === option.value}
-                            onChange={() => onChange(option.value)}
-                            className="mono-segmented-input"
-                        />
-                        <span>{option.label}</span>
-                    </label>
-                ))}
-            </div>
-        </div>
-    );
-}
-
 export function FormField({
     label,
     id,

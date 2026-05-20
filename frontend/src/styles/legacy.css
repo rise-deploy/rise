@@ -282,30 +282,6 @@
 .form-field textarea { font-family: 'JetBrains Mono', monospace; font-size: 12.5px; min-height: 80px; }
 .form-field { margin-bottom: 12px; }
 
-.mono-segmented-group {
-    display: inline-flex;
-    padding: 2px;
-    background: var(--surface-2);
-    border-radius: 5px;
-    border: 1px solid var(--border-faint);
-}
-.mono-segmented-group label, .mono-segmented-group button {
-    cursor: pointer;
-    padding: 4px 10px;
-    font-size: 12px;
-    color: var(--text-muted);
-    border-radius: 3px;
-    transition: background 0.14s, color 0.14s;
-}
-.mono-segmented-group label:has(input:checked),
-.mono-segmented-group label.active,
-.mono-segmented-group button.active {
-    background: var(--surface);
-    color: var(--text);
-    box-shadow: var(--shadow-sm);
-}
-.mono-segmented-group input { display: none; }
-
 /* Tabs */
 .mono-tabbar {
     display: flex;
