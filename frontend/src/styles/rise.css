@@ -464,6 +464,11 @@ a { color: inherit; }
     border-color: var(--accent);
     box-shadow: 0 0 0 3px color-mix(in oklch, var(--accent) 16%, transparent);
 }
+.r-field:disabled {
+    background: var(--surface-2);
+    color: var(--text-muted);
+    cursor: not-allowed;
+}
 textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains Mono', monospace; font-size: 12.5px; }
 
 /* ---------- Combobox ----------
