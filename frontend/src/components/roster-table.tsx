@@ -80,14 +80,15 @@ export function RosterTable({ title, sub, addControl, filter, rows, extraColumnL
                     <div className="r-section-title">{title}</div>
                     {sub && <div className="r-section-sub">{sub}</div>}
                 </div>
-                {addControl && <div>{addControl}</div>}
+                {(filter || addControl) && (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                        {filter && (
+                            <Segmented value={filter.value} options={filter.options} onChange={filter.onChange} />
+                        )}
+                        {addControl}
+                    </div>
+                )}
             </div>
-
-            {filter && (
-                <div style={{ marginBottom: 14 }}>
-                    <Segmented value={filter.value} options={filter.options} onChange={filter.onChange} />
-                </div>
-            )}
 
             <Panel>
                 {rows.length > 0 ? (
