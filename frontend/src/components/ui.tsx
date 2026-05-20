@@ -655,17 +655,40 @@ export function AutocompleteInput({
     onEnter,
 }) {
     const [isOpen, setIsOpen] = useState(false);
-    const ref = useRef<HTMLDivElement | null>(null);
+    const [popRect, setPopRect] = useState<{ top: number; left: number; width: number } | null>(null);
+    const wrapRef = useRef<HTMLDivElement | null>(null);
+    const inputRef = useRef<HTMLInputElement | null>(null);
+    const popRef = useRef<HTMLDivElement | null>(null);
 
     useEffect(() => {
         function handleClickOutside(e: MouseEvent) {
-            if (ref.current && !ref.current.contains(e.target as Node)) {
-                setIsOpen(false);
-            }
+            const t = e.target as Node;
+            if (wrapRef.current && wrapRef.current.contains(t)) return;
+            if (popRef.current && popRef.current.contains(t)) return;
+            setIsOpen(false);
         }
         document.addEventListener('mousedown', handleClickOutside);
         return () => document.removeEventListener('mousedown', handleClickOutside);
     }, []);
+
+    // Position the suggestion list as a fixed-position portal so it is not
+    // clipped by a surrounding modal/overflow container.
+    useEffect(() => {
+        if (!isOpen) { setPopRect(null); return; }
+        const update = () => {
+            const el = inputRef.current;
+            if (!el) return;
+            const r = el.getBoundingClientRect();
+            setPopRect({ top: r.bottom + 4, left: r.left, width: r.width });
+        };
+        update();
+        window.addEventListener('scroll', update, true);
+        window.addEventListener('resize', update);
+        return () => {
+            window.removeEventListener('scroll', update, true);
+            window.removeEventListener('resize', update);
+        };
+    }, [isOpen]);
 
     const rawQuery = multiValue ? (value || '').split(',').pop() || '' : (value || '');
     const query = rawQuery.trim().toLowerCase();
@@ -684,8 +707,9 @@ export function AutocompleteInput({
     };
 
     return (
-        <div ref={ref} className={cx('relative', className)}>
+        <div ref={wrapRef} className={cx('relative', className)}>
             <input
+                ref={inputRef}
                 type={type}
                 id={id}
                 className="mono-input w-full"
@@ -702,8 +726,12 @@ export function AutocompleteInput({
                 onClick={() => setIsOpen(true)}
                 disabled={disabled || loading}
             />
-            {isOpen && (
-                <div className="absolute z-10 w-full mt-1 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded shadow-lg max-h-48 overflow-y-auto">
+            {isOpen && popRect && createPortal(
+                <div
+                    ref={popRef}
+                    className="bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded shadow-lg max-h-48 overflow-y-auto"
+                    style={{ position: 'fixed', top: popRect.top, left: popRect.left, width: popRect.width, zIndex: 100 }}
+                >
                     {loading ? (
                         <div className="px-3 py-2 text-sm text-gray-500">Loading...</div>
                     ) : filteredOptions.length === 0 ? (
@@ -720,7 +748,8 @@ export function AutocompleteInput({
                             </button>
                         ))
                     )}
-                </div>
+                </div>,
+                document.body
             )}
         </div>
     );
