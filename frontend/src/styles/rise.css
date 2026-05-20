@@ -779,8 +779,19 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
 .r-panel-clickable { cursor: pointer; transition: border-color 0.14s; }
 .r-panel-clickable:hover { border-color: var(--text-soft); }
 .r-panel-clickable:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-/* Accent left border, e.g. cards for teams the current user owns. */
-.r-panel-own { box-shadow: inset 3px 0 0 var(--accent); }
+/* Accent left border, e.g. cards for teams the current user owns. Drawn as an
+   overlay so it stays continuous over the panel head's bottom divider. */
+.r-panel-own { position: relative; }
+.r-panel-own::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 3px;
+    background: var(--accent);
+    z-index: 1;
+}
 
 /* ---------- Tables ---------- */
 .r-table { width: 100%; border-collapse: collapse; font-size: 13px; }
