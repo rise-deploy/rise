@@ -5,7 +5,7 @@ import { CONFIG } from '../lib/config';
 import { navigate } from '../lib/navigation';
 import { formatDate, formatRelativeTimeRounded } from '../lib/utils';
 import { useToast } from '../components/toast';
-import { Button, ConfirmDialog, EnvironmentColorDot, EnvironmentColorPicker, EnvironmentCombobox, EnvironmentDropdown, FormField, Modal, ModalActions, ModalSection, ModalTabs, MonoTabButton, MonoTag } from '../components/ui';
+import { Button, ConfirmDialog, EnvironmentColorDot, EnvironmentColorPicker, FormField, Modal, ModalActions, ModalSection, ModalTabs, MonoTabButton, MonoTag } from '../components/ui';
 import {
     Alert as RAlert,
     Button as RButton,
@@ -872,71 +872,58 @@ export function ServiceAccountsList({ projectName }) {
                 )}
             </RPanel>
 
-            <Modal
+            <RModal
                 isOpen={isModalOpen}
                 onClose={() => setIsModalOpen(false)}
-                title={editingSA ? 'Edit Service Account' : 'Create Service Account'}
+                title={editingSA ? 'Edit service account' : 'Create service account'}
+                footer={
+                    <>
+                        <RButton onClick={() => setIsModalOpen(false)} disabled={saving}>Cancel</RButton>
+                        <RButton variant="primary" onClick={handleSave} loading={saving}>
+                            {editingSA ? 'Update' : 'Create'}
+                        </RButton>
+                    </>
+                }
             >
-                <ModalSection>
-                    {environments.length > 0 && (
-                        <div>
-                            <span className="mono-label">Allowed Environments</span>
-                            <EnvironmentCombobox
-                                environments={environments}
-                                selected={selectedEnvs}
-                                onChange={setSelectedEnvs}
-                                placeholder="All environments"
-                            />
-                        </div>
-                    )}
-                    <FormField
-                        label="Issuer URL"
-                        id="sa-issuer-url"
+                {environments.length > 0 && (
+                    <RField label="Allowed environments" hint="Leave empty to allow all environments.">
+                        <RCombobox
+                            multi
+                            value={selectedEnvs}
+                            onChange={setSelectedEnvs}
+                            options={environments.map(env => ({ value: env.name, label: env.name }))}
+                            placeholder="All environments"
+                            searchPlaceholder="Search environments…"
+                        />
+                    </RField>
+                )}
+                <RField label="Issuer URL">
+                    <RInput
                         value={formData.issuer_url}
                         onChange={(e) => setFormData({ ...formData, issuer_url: e.target.value })}
                         placeholder="https://token.actions.githubusercontent.com"
-                        required
                         autoFocus
                     />
-                    <FormField
-                        label="Audience (aud)"
-                        id="sa-aud"
+                </RField>
+                <RField label="Audience (aud)">
+                    <RInput
                         value={formData.aud}
                         onChange={(e) => setFormData({ ...formData, aud: e.target.value })}
                         placeholder={CONFIG.backendUrl}
-                        required
                     />
-                    <FormField
-                        label="Additional Claims (JSON)"
-                        id="sa-claims"
-                        type="textarea"
+                </RField>
+                <RField
+                    label="Additional claims (JSON)"
+                    hint={<>Provide a JSON object. The <span className="mono">aud</span> claim is configured separately above.</>}
+                >
+                    <RTextarea
                         value={claimsText}
                         onChange={(e) => setClaimsText(e.target.value)}
-                        placeholder={`{\n  "sub": "repo:myorg/myrepo:*"\n}`}
+                        placeholder={'{\n  "sub": "repo:myorg/myrepo:*"\n}'}
                         rows={5}
                     />
-                    <p className="text-sm text-gray-600 dark:text-gray-500">
-                        <strong>Note:</strong> Additional claims should be provided as a JSON object. The <code className="bg-gray-100 dark:bg-gray-800 px-1 rounded">aud</code> claim is configured separately above.
-                    </p>
-
-                    <ModalActions>
-                        <Button
-                            variant="secondary"
-                            onClick={() => setIsModalOpen(false)}
-                            disabled={saving}
-                        >
-                            Cancel
-                        </Button>
-                        <Button
-                            variant="primary"
-                            onClick={handleSave}
-                            loading={saving}
-                        >
-                            {editingSA ? 'Update' : 'Create'}
-                        </Button>
-                    </ModalActions>
-                </ModalSection>
-            </Modal>
+                </RField>
+            </RModal>
 
             <ConfirmDialog
                 isOpen={confirmDialogOpen}
