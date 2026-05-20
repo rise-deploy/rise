@@ -12,10 +12,14 @@ user-defined kind). Hierarchy is encoded by a single FK:
 parent_uid UUID NULL REFERENCES resources(uid)
 ```
 
-Uniqueness of `(api_version, kind, name)` within a parent scope is enforced by partial
-unique indexes — one for `parent_uid IS NULL` (root) and one for `parent_uid IS NOT NULL`.
-For non-root-scoped types, `parent_uid IS NULL` means the resource is parentless/orphaned;
-scope still comes from the `ResourceDefinition`.
+Resource identity is unique per `(group, kind, name)` within a parent scope, enforced by
+partial unique indexes — one for `parent_uid IS NULL` (root) and one for
+`parent_uid IS NOT NULL`. The group is the substring of `api_version` before `/`, so the
+same logical resource cannot be created twice under two different versions of the same
+group; resources from *different* groups may still share `(kind, name)`. For non-root-scoped
+types, `parent_uid IS NULL` means the resource is parentless/orphaned; scope still comes from
+the `ResourceDefinition`. A name-uniqueness violation surfaces as `StoreError::NameConflict`,
+never a raw database error.
 
 `resource_definitions` is a projection table holding the indexed/queryable identity fields
 (group, kind, plural, scope) of `ResourceDefinition` rows; it stays in sync via
@@ -99,11 +103,25 @@ orphan deletion and should be repaired with `reparent`.
 
 ## Reparenting
 
-`reparent(uid, new_parent_uid)` atomically moves a resource. Rejects:
+`reparent(uid, new_parent_uid)` atomically moves a resource. The destination is validated
+against the resource's *own* declared parent type — `reparent` self-determines this from the
+resource's definition, so the caller passes no scope:
 
+- Built-in kinds (`Organization`, `ResourceDefinition`) and any `ResourceDefinition` with
+  `scope = Root` are root-scoped: they have no declared parent and must move to root
+  (`new_parent_uid = None`).
+- A resource whose `ResourceDefinition` declares a `parent` must move under a row matching
+  the declared parent's API **group** and **kind**. The version is ignored, so a parent
+  stored at an older served version of the same group is still accepted. Arbitrary nesting
+  depth is allowed — the parent need not be root-level.
+
+Rejects:
+
+- `Validation` — destination does not match the resource's declared parent type (e.g. a
+  root-scoped resource given a parent, a non-root resource sent to root, or a wrongly-typed
+  new parent).
 - `ReparentCycle` — self-loop or moving a node under one of its own descendants.
-- `NameConflict` — destination scope already has a row with the same
-  `(api_version, kind, name)` or
-  discriminator.
+- `NameConflict` — destination scope already has a row with the same `(group, kind, name)`
+  or discriminator.
 
 Use this in preference to delete-then-recreate, which loses the UID and revision history.

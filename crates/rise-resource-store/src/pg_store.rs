@@ -3,8 +3,8 @@ use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
 use rise_resource_api::{
-    validate_controller_id, validate_resource_name, ResourceDefinitionSpec, ResourceScope,
-    API_VERSION_V1ALPHA1, ORGANIZATION_COLLECTION, ORGANIZATION_KIND,
+    validate_controller_id, validate_resource_name, ResourceDefinitionSpec, ResourceParentRef,
+    ResourceScope, API_VERSION_V1ALPHA1, ORGANIZATION_COLLECTION, ORGANIZATION_KIND,
     RESOURCE_DEFINITION_COLLECTION, RESOURCE_DEFINITION_KIND,
 };
 use sqlx::{PgPool, Row};
@@ -206,6 +206,68 @@ impl PgResourceStore {
         format!("{group}/{version}")
     }
 
+    /// The API group of an `api_version` string (`"group/version"` → `"group"`). Falls back to
+    /// the whole string if there is no `/`, which keeps malformed rows comparable rather than
+    /// silently matching everything.
+    fn group_of(api_version: &str) -> &str {
+        api_version.split_once('/').map_or(api_version, |(g, _)| g)
+    }
+
+    /// Resolve the declared parent of a resource from its own definition, used by `reparent` to
+    /// decide where the resource is allowed to move.
+    ///
+    /// - Built-in kinds (`Organization`, `ResourceDefinition`) are root-scoped with no declared
+    ///   parent.
+    /// - User-defined kinds resolve their `ResourceDefinition` by `(group, kind)`; the RD's
+    ///   stored `resources.spec` carries `scope` and the optional `spec.parent`.
+    ///
+    /// Returns `None` for a root-scoped resource (must reparent to root) and `Some(parent_ref)`
+    /// for a resource that must live under a row of the referenced group + kind.
+    async fn declared_parent_ref(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        api_version: &str,
+        kind: &str,
+    ) -> Result<Option<ResourceParentRef>, StoreError> {
+        // Built-in root-scoped kinds carry no ResourceDefinition.
+        if kind == ORGANIZATION_KIND || kind == RESOURCE_DEFINITION_KIND {
+            return Ok(None);
+        }
+
+        let group = Self::group_of(api_version);
+        let row = sqlx::query(
+            r#"
+            SELECT r.spec
+            FROM resource_store.resource_definitions rd
+            JOIN resource_store.resources r ON r.uid = rd.uid
+            WHERE rd.group_name = $1 AND rd.kind = $2
+            "#,
+        )
+        .bind(group)
+        .bind(kind)
+        .fetch_optional(&mut **tx)
+        .await?;
+
+        let Some(row) = row else {
+            return Err(StoreError::Validation(format!(
+                "no ResourceDefinition serves '{group}/{kind}'"
+            )));
+        };
+
+        let spec: ResourceDefinitionSpec = serde_json::from_value(
+            row.try_get("spec").map_err(StoreError::Database)?,
+        )
+        .map_err(|e| StoreError::Validation(format!("invalid ResourceDefinition spec: {e}")))?;
+
+        match spec.scope {
+            ResourceScope::Root => Ok(None),
+            ResourceScope::Organization => spec.parent.map(Some).ok_or_else(|| {
+                StoreError::Validation(format!(
+                    "ResourceDefinition for '{group}/{kind}' is non-root but declares no parent"
+                ))
+            }),
+        }
+    }
+
     fn invalidate_schema_cache(&self, group: &str, plural: &str) {
         if let Ok(mut cache) = self.schema_cache.write() {
             cache.retain(|key, _| {
@@ -381,14 +443,11 @@ impl ResourceStore for PgResourceStore {
         let Some((current_api_version, kind)) = current_identity else {
             return Err(StoreError::NotFound);
         };
-        match kind.as_str() {
-            RESOURCE_DEFINITION_KIND => {
-                return Err(StoreError::Validation(
-                    "ResourceDefinitions must be updated through update_resource_definition"
-                        .to_string(),
-                ))
-            }
-            _ => {}
+        if kind == RESOURCE_DEFINITION_KIND {
+            return Err(StoreError::Validation(
+                "ResourceDefinitions must be updated through update_resource_definition"
+                    .to_string(),
+            ));
         }
 
         if let Some(v) = &params.validator {
@@ -437,7 +496,16 @@ impl ResourceStore for PgResourceStore {
         .bind(uid)
         .bind(params.revision)
         .fetch_optional(&mut *tx)
-        .await?;
+        .await;
+
+        let updated = match updated {
+            Ok(row) => row,
+            // Changing api_version can move the row into a group where its (group, kind, name)
+            // already exists. Surface the partial unique-index violation as NameConflict (409)
+            // instead of leaking an internal Database error (500).
+            Err(ref e) if Self::is_name_conflict(e) => return Err(StoreError::NameConflict),
+            Err(e) => return Err(StoreError::Database(e)),
+        };
 
         if let Some(row) = updated {
             tx.commit().await?;
@@ -519,7 +587,7 @@ impl ResourceStore for PgResourceStore {
             PropagationPolicy::Orphan => {
                 if child_count > 0 {
                     // Detach children. The partial unique index on
-                    // (api_version, kind, name) WHERE parent_uid IS NULL may reject this if a
+                    // (group, kind, name) WHERE parent_uid IS NULL may reject this if a
                     // name collides at the root scope.
                     // Bump revision so the detach is observable.
                     let result = sqlx::query(
@@ -535,7 +603,7 @@ impl ResourceStore for PgResourceStore {
                     .await;
                     if let Err(e) = result {
                         // A child's name or discriminator may collide at the root scope
-                        // (partial unique indexes on (api_version, kind, name) and discriminator
+                        // (partial unique indexes on (group, kind, name) and discriminator
                         // when parent_uid IS NULL). Surface both as NameConflict for parity with
                         // reparent() rather than leaking an internal Database error.
                         if Self::is_name_conflict(&e) || Self::is_discriminator_conflict(&e) {
@@ -838,7 +906,6 @@ impl ResourceStore for PgResourceStore {
         &self,
         uid: Uuid,
         new_parent_uid: Option<Uuid>,
-        scope: ResourceScope,
     ) -> Result<ResourceRow, StoreError> {
         let mut tx = self.pool.begin().await?;
 
@@ -851,22 +918,27 @@ impl ResourceStore for PgResourceStore {
         .await?
         .ok_or(StoreError::NotFound)?;
 
-        match scope {
-            ResourceScope::Root => {
-                if new_parent_uid.is_some() {
-                    return Err(StoreError::Validation(
-                        "root-scoped resources cannot be reparented under another resource"
-                            .to_string(),
-                    ));
-                }
-            }
-            ResourceScope::Organization => {
-                let Some(new_pid) = new_parent_uid else {
-                    return Err(StoreError::Validation(
-                        "organization-scoped resources must stay under an Organization".to_string(),
-                    ));
-                };
+        // Determine the resource's declared parent type from its own definition. The target may
+        // be parented at any depth, so the destination is validated by parent *type* (group +
+        // kind), not by a fixed "must be a root-level Organization" rule.
+        let declared_parent =
+            Self::declared_parent_ref(&mut tx, &target.api_version, &target.kind).await?;
 
+        match (&declared_parent, new_parent_uid) {
+            // Root-scoped resource: it has no declared parent, so it can only live at root.
+            (None, Some(_)) => {
+                return Err(StoreError::Validation(
+                    "root-scoped resources cannot be reparented under another resource".to_string(),
+                ));
+            }
+            (None, None) => {}
+            // Non-root resource: it must move under a row of the declared parent type.
+            (Some(_), None) => {
+                return Err(StoreError::Validation(
+                    "non-root resources must be reparented under a parent resource".to_string(),
+                ));
+            }
+            (Some(parent_ref), Some(new_pid)) => {
                 let parent = sqlx::query_as::<_, ResourceRow>(
                     "SELECT * FROM resource_store.resources WHERE uid = $1",
                 )
@@ -875,19 +947,16 @@ impl ResourceStore for PgResourceStore {
                 .await?
                 .ok_or(StoreError::ParentNotFound)?;
 
-                if parent.kind != ORGANIZATION_KIND || parent.api_version != API_VERSION_V1ALPHA1 {
+                // Match the new parent on group + kind only. The declared parent ref pins a
+                // specific version, but a valid parent may legitimately be stored at an older
+                // served version of the same group, so the version is intentionally ignored.
+                let expected_group = Self::group_of(&parent_ref.api_version);
+                let actual_group = Self::group_of(&parent.api_version);
+                if parent.kind != parent_ref.kind || actual_group != expected_group {
                     return Err(StoreError::Validation(format!(
-                        "organization-scoped resources can only be reparented under a built-in \
-                         Organization (rise.dev/v1alpha1/Organization), got '{}/{}'",
-                        parent.api_version, parent.kind
+                        "resource declares parent '{}/{}' but the new parent is '{}/{}'",
+                        expected_group, parent_ref.kind, actual_group, parent.kind
                     )));
-                }
-                if parent.parent_uid.is_some() {
-                    return Err(StoreError::Validation(
-                        "organization-scoped resources can only be reparented under a root-level \
-                         Organization"
-                            .to_string(),
-                    ));
                 }
             }
         }
@@ -1096,8 +1165,16 @@ impl ResourceStore for PgResourceStore {
         version: &str,
         collection: &str,
     ) -> Result<Option<CollectionInfo>, StoreError> {
-        if group == "rise.dev" && version == "v1alpha1" {
-            return Ok(Self::builtin_collection_info(collection));
+        // Built-in collections have no row in the resource_definitions projection and
+        // use native validators, so they can't be resolved from the table. The built-in
+        // registry and its api_version live in builtin_collection_info; resolve against
+        // it rather than re-encoding the group/version as string literals here.
+        if let Some(info) = Self::builtin_collection_info(collection) {
+            if format!("{group}/{version}") == info.api_version {
+                return Ok(Some(info));
+            }
+            // A built-in collection requested at a version it does not serve.
+            return Ok(None);
         }
 
         let cache_key = format!("{group}/{version}/{collection}");
@@ -1349,7 +1426,15 @@ impl ResourceStore for PgResourceStore {
         .bind(uid)
         .bind(params.revision)
         .fetch_optional(&mut *tx)
-        .await?;
+        .await;
+
+        let updated = match updated {
+            Ok(row) => row,
+            // Defensively map a name-uniqueness violation (e.g. an api_version change that
+            // collides on (group, kind, name)) to NameConflict rather than a raw DB error.
+            Err(ref e) if Self::is_name_conflict(e) => return Err(StoreError::NameConflict),
+            Err(e) => return Err(StoreError::Database(e)),
+        };
 
         let row = match updated {
             Some(r) => r,

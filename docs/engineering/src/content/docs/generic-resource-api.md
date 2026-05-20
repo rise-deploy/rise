@@ -17,9 +17,11 @@ Resource collection paths are versioned, following the same group/version shape 
 | `apis/{group}/{version}/{plural}/{id}/reparent` | POST | Break-glass reparent |
 | `apis/{groupA}/{versionA}/{pluralA}/{idA}/apis/{groupB}/{versionB}/{pluralB}` | GET, POST | List / create children under a typed parent |
 | `orphans` | GET | Break-glass orphan listing |
-| `apis/{group}/{version}/{plural}/orphans` | GET | List parentless resources of a non-root-scoped type |
-| `apis/{group}/{version}/{plural}/orphans/{id}` | GET, DELETE | Get / delete a parentless resource of a non-root-scoped type |
-| `apis/{group}/{version}/{plural}/orphans/{id}/reparent` | POST | Reparent a parentless resource of a non-root-scoped type |
+| `orphans/apis/{group}/{version}/{plural}` | GET | List parentless resources of a non-root-scoped type |
+| `orphans/apis/{group}/{version}/{plural}/{id}` | GET, DELETE | Get / delete a parentless resource of a non-root-scoped type |
+| `orphans/apis/{group}/{version}/{plural}/{id}/reparent` | POST | Reparent a parentless resource of a non-root-scoped type |
+
+`orphans` is only valid as the first path segment, so a resource may be named `orphans`.
 
 Unversioned resource paths are not supported.
 

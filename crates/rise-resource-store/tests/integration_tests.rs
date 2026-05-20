@@ -1,6 +1,4 @@
-use rise_resource_api::{
-    ResourceScope, API_VERSION_V1ALPHA1, ORGANIZATION_KIND, RESOURCE_DEFINITION_KIND,
-};
+use rise_resource_api::{API_VERSION_V1ALPHA1, ORGANIZATION_KIND, RESOURCE_DEFINITION_KIND};
 use rise_resource_store::{
     CreateResourceParams, DeleteOutcome, PathSegment, PgResourceStore, PropagationPolicy,
     ResourceStore, StoreError, UpdateResourceParams, CASCADE_DELETION_FINALIZER,
@@ -223,6 +221,149 @@ async fn duplicate_name_returns_conflict(pool: sqlx::PgPool) -> sqlx::Result<()>
     store.create(params()).await.unwrap();
     let err = store.create(params()).await.unwrap_err();
     assert!(matches!(err, StoreError::NameConflict));
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn same_group_kind_name_conflicts_across_versions_at_root(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+
+    store
+        .create(CreateResourceParams {
+            api_version: "example.dev/v1".to_string(),
+            kind: "Widget".to_string(),
+            name: "shared".to_string(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec: json!({}),
+            validator: None,
+        })
+        .await
+        .unwrap();
+
+    // Same group + kind + name, different version: identity is per (group, kind, name), so the
+    // second create must conflict rather than create a duplicate logical resource.
+    let err = store
+        .create(CreateResourceParams {
+            api_version: "example.dev/v2".to_string(),
+            kind: "Widget".to_string(),
+            name: "shared".to_string(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec: json!({}),
+            validator: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::NameConflict),
+        "expected NameConflict, got {err:?}"
+    );
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn same_group_kind_name_conflicts_across_versions_in_child_scope(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let parent = create_org(&store, "parent-org").await;
+
+    store
+        .create(CreateResourceParams {
+            api_version: "example.dev/v1".to_string(),
+            kind: "Widget".to_string(),
+            name: "shared".to_string(),
+            parent_uid: Some(parent.uid),
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec: json!({}),
+            validator: None,
+        })
+        .await
+        .unwrap();
+
+    let err = store
+        .create(CreateResourceParams {
+            api_version: "example.dev/v2".to_string(),
+            kind: "Widget".to_string(),
+            name: "shared".to_string(),
+            parent_uid: Some(parent.uid),
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec: json!({}),
+            validator: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::NameConflict),
+        "expected NameConflict, got {err:?}"
+    );
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn update_api_version_collision_returns_name_conflict(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+
+    // Two resources with the same kind + name but in different groups — allowed at root.
+    let moving = store
+        .create(CreateResourceParams {
+            api_version: "alpha.example.dev/v1".to_string(),
+            kind: "Widget".to_string(),
+            name: "shared".to_string(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec: json!({}),
+            validator: None,
+        })
+        .await
+        .unwrap();
+    store
+        .create(CreateResourceParams {
+            api_version: "beta.example.dev/v1".to_string(),
+            kind: "Widget".to_string(),
+            name: "shared".to_string(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec: json!({}),
+            validator: None,
+        })
+        .await
+        .unwrap();
+
+    // Updating `moving` into the beta group collides on (group, kind, name). The partial unique
+    // index violation must surface as NameConflict (409), not a raw Database error (500).
+    let err = store
+        .update(
+            moving.uid,
+            UpdateResourceParams {
+                api_version: Some("beta.example.dev/v1".to_string()),
+                revision: moving.revision,
+                annotations: BTreeMap::new(),
+                finalizers: vec![],
+                spec: json!({}),
+                validator: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::NameConflict),
+        "expected NameConflict, got {err:?}"
+    );
 
     Ok(())
 }
@@ -1337,6 +1478,74 @@ async fn create_child(
         .unwrap()
 }
 
+/// Register a ResourceDefinition. `parent` is `Some((apiVersion, kind))` for non-root scopes.
+/// `versions` are `(name, served, storage)` triples.
+async fn register_rd(
+    store: &PgResourceStore,
+    group: &str,
+    kind: &str,
+    plural: &str,
+    parent: Option<(&str, &str)>,
+    versions: &[(&str, bool, bool)],
+) -> rise_resource_store::ResourceRow {
+    let scope = if parent.is_some() {
+        "organization"
+    } else {
+        "root"
+    };
+    let versions_json: Vec<_> = versions
+        .iter()
+        .map(|(name, served, storage)| json!({"name": name, "served": served, "storage": storage}))
+        .collect();
+    let mut spec = json!({
+        "group": group,
+        "kind": kind,
+        "plural": plural,
+        "scope": scope,
+        "versions": versions_json,
+        "allowedStatusControllerIds": []
+    });
+    if let Some((parent_api_version, parent_kind)) = parent {
+        spec["parent"] = json!({"apiVersion": parent_api_version, "kind": parent_kind});
+    }
+    store
+        .register_resource_definition(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: RESOURCE_DEFINITION_KIND.to_string(),
+            name: format!("{plural}.{group}"),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec,
+            validator: None,
+        })
+        .await
+        .unwrap()
+}
+
+/// Create a resource of an arbitrary kind/version under an optional parent.
+async fn create_resource(
+    store: &PgResourceStore,
+    api_version: &str,
+    kind: &str,
+    name: &str,
+    parent_uid: Option<Uuid>,
+) -> rise_resource_store::ResourceRow {
+    store
+        .create(CreateResourceParams {
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+            name: name.to_string(),
+            parent_uid,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec: json!({}),
+            validator: None,
+        })
+        .await
+        .unwrap()
+}
+
 #[sqlx::test]
 async fn cascade_delete_stamps_immediate_children(pool: sqlx::PgPool) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
@@ -1538,6 +1747,15 @@ async fn orphan_delete_children_are_discoverable_by_type_and_reparentable(
     pool: sqlx::PgPool,
 ) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
+    register_rd(
+        &store,
+        "example.dev",
+        "Widget",
+        "widgets",
+        Some((API_VERSION_V1ALPHA1, ORGANIZATION_KIND)),
+        &[("v1", true, true)],
+    )
+    .await;
     let org_a = create_org(&store, "orphan-source").await;
     let org_b = create_org(&store, "orphan-destination").await;
     let child = create_child(&store, org_a.uid, "Widget", "w1", vec![]).await;
@@ -1555,10 +1773,7 @@ async fn orphan_delete_children_are_discoverable_by_type_and_reparentable(
     assert_eq!(unparented[0].uid, child.uid);
     assert_eq!(unparented[0].parent_uid, None);
 
-    let moved = store
-        .reparent(child.uid, Some(org_b.uid), ResourceScope::Organization)
-        .await
-        .unwrap();
+    let moved = store.reparent(child.uid, Some(org_b.uid)).await.unwrap();
     assert_eq!(moved.parent_uid, Some(org_b.uid));
 
     let remaining = store
@@ -1801,14 +2016,20 @@ async fn list_orphans_returns_children_of_tombstoned_parent(
 #[sqlx::test]
 async fn reparent_moves_resource(pool: sqlx::PgPool) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
+    register_rd(
+        &store,
+        "example.dev",
+        "Widget",
+        "widgets",
+        Some((API_VERSION_V1ALPHA1, ORGANIZATION_KIND)),
+        &[("v1", true, true)],
+    )
+    .await;
     let org_a = create_org(&store, "org-a").await;
     let org_b = create_org(&store, "org-b").await;
     let widget = create_child(&store, org_a.uid, "Widget", "w1", vec![]).await;
 
-    let moved = store
-        .reparent(widget.uid, Some(org_b.uid), ResourceScope::Organization)
-        .await
-        .unwrap();
+    let moved = store.reparent(widget.uid, Some(org_b.uid)).await.unwrap();
     assert_eq!(moved.parent_uid, Some(org_b.uid));
 
     let under_a = store
@@ -1827,126 +2048,140 @@ async fn reparent_moves_resource(pool: sqlx::PgPool) -> sqlx::Result<()> {
 }
 
 #[sqlx::test]
-async fn reparent_to_root(pool: sqlx::PgPool) -> sqlx::Result<()> {
+async fn reparent_succeeds_under_typed_parent_at_depth(pool: sqlx::PgPool) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
-    let org_a = create_org(&store, "org-a").await;
-    let child_org = store
-        .create(CreateResourceParams {
-            api_version: API_VERSION_V1ALPHA1.to_string(),
-            kind: ORGANIZATION_KIND.to_string(),
-            name: "child".to_string(),
-            parent_uid: Some(org_a.uid),
-            annotations: BTreeMap::new(),
-            finalizers: vec![],
-            spec: json!({"displayName": "Child"}),
-            validator: None,
-        })
-        .await
-        .unwrap();
+    // Hierarchy: Organization -> Gadget (org-scoped) -> Widget (Gadget-scoped).
+    register_rd(
+        &store,
+        "example.dev",
+        "Gadget",
+        "gadgets",
+        Some((API_VERSION_V1ALPHA1, ORGANIZATION_KIND)),
+        &[("v1", true, true)],
+    )
+    .await;
+    register_rd(
+        &store,
+        "example.dev",
+        "Widget",
+        "widgets",
+        Some(("example.dev/v1", "Gadget")),
+        &[("v1", true, true)],
+    )
+    .await;
 
+    let org = create_org(&store, "org").await;
+    let gadget_a = create_resource(
+        &store,
+        "example.dev/v1",
+        "Gadget",
+        "gadget-a",
+        Some(org.uid),
+    )
+    .await;
+    let gadget_b = create_resource(
+        &store,
+        "example.dev/v1",
+        "Gadget",
+        "gadget-b",
+        Some(org.uid),
+    )
+    .await;
+    // Widget lives at depth 3 (Organization -> Gadget -> Widget).
+    let widget =
+        create_resource(&store, "example.dev/v1", "Widget", "w1", Some(gadget_a.uid)).await;
+
+    // Reparent the Widget under a different Gadget — a correctly-typed parent at depth 2.
     let moved = store
-        .reparent(child_org.uid, None, ResourceScope::Root)
+        .reparent(widget.uid, Some(gadget_b.uid))
         .await
         .unwrap();
-    assert_eq!(moved.parent_uid, None);
+    assert_eq!(moved.parent_uid, Some(gadget_b.uid));
 
-    Ok(())
-}
-
-#[sqlx::test]
-async fn reparent_rejects_cycle(pool: sqlx::PgPool) -> sqlx::Result<()> {
-    let store = PgResourceStore::new(pool);
-    let org = create_org(&store, "root").await;
-
-    // Self-loop is the reachable cycle with the current two-scope model.
-    // An ancestor→descendant cycle (moving A under one of its own descendants)
-    // would require the new parent to pass the Organization scope check, which
-    // requires a root-level rise.dev/v1alpha1/Organization — a descendant always
-    // has parent_uid set, so it can never satisfy that check. The cycle detector
-    // is still present to guard hypothetical future scope variants.
-    let err = store
-        .reparent(org.uid, Some(org.uid), ResourceScope::Organization)
+    let under_b = store
+        .list("example.dev/v1", "Widget", Some(gadget_b.uid))
         .await
-        .unwrap_err();
-    assert!(matches!(err, StoreError::ReparentCycle));
+        .unwrap();
+    assert_eq!(under_b.len(), 1);
+    assert_eq!(under_b[0].uid, widget.uid);
 
     Ok(())
 }
 
 #[sqlx::test]
-async fn reparent_rejects_org_scoped_resource_under_non_root_org(
+async fn reparent_matches_parent_type_by_group_kind_ignoring_version(
     pool: sqlx::PgPool,
 ) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
-    let org = create_org(&store, "root").await;
-    let widget = create_child(&store, org.uid, "Widget", "w1", vec![]).await;
+    // Gadget is served at v1 and v2; v2 is the storage version.
+    register_rd(
+        &store,
+        "example.dev",
+        "Gadget",
+        "gadgets",
+        Some((API_VERSION_V1ALPHA1, ORGANIZATION_KIND)),
+        &[("v1", true, false), ("v2", true, true)],
+    )
+    .await;
+    // The Widget's declared parent ref pins example.dev/v2/Gadget.
+    register_rd(
+        &store,
+        "example.dev",
+        "Widget",
+        "widgets",
+        Some(("example.dev/v2", "Gadget")),
+        &[("v1", true, true)],
+    )
+    .await;
 
-    // Fabricate a non-root Organization in the store to use as the new parent.
-    let nested_org = store
-        .create(CreateResourceParams {
-            api_version: API_VERSION_V1ALPHA1.to_string(),
-            kind: ORGANIZATION_KIND.to_string(),
-            name: "nested".to_string(),
-            parent_uid: Some(org.uid),
-            annotations: BTreeMap::new(),
-            finalizers: vec![],
-            spec: json!({"displayName": "Nested"}),
-            validator: None,
-        })
-        .await
-        .unwrap();
+    let org = create_org(&store, "org").await;
+    // The Gadget parent is stored at the OLDER served version (v1), not the declared v2.
+    let gadget = create_resource(&store, "example.dev/v1", "Gadget", "gadget", Some(org.uid)).await;
+    let widget = create_resource(&store, "example.dev/v1", "Widget", "w1", Some(org.uid)).await;
 
-    let err = store
-        .reparent(
-            widget.uid,
-            Some(nested_org.uid),
-            ResourceScope::Organization,
-        )
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(err, StoreError::Validation(_)),
-        "expected validation error for non-root org parent, got {err:?}"
-    );
+    // Reparent succeeds: parent type is matched on group + kind only, the version is ignored.
+    let moved = store.reparent(widget.uid, Some(gadget.uid)).await.unwrap();
+    assert_eq!(moved.parent_uid, Some(gadget.uid));
 
     Ok(())
 }
 
 #[sqlx::test]
-async fn reparent_rejects_org_scoped_resource_under_wrong_api_version(
-    pool: sqlx::PgPool,
-) -> sqlx::Result<()> {
+async fn reparent_rejects_wrongly_typed_parent(pool: sqlx::PgPool) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
-    let org = create_org(&store, "root").await;
-    let widget = create_child(&store, org.uid, "Widget", "w1", vec![]).await;
+    // Gadget is org-scoped; Widget is Gadget-scoped.
+    register_rd(
+        &store,
+        "example.dev",
+        "Gadget",
+        "gadgets",
+        Some((API_VERSION_V1ALPHA1, ORGANIZATION_KIND)),
+        &[("v1", true, true)],
+    )
+    .await;
+    register_rd(
+        &store,
+        "example.dev",
+        "Widget",
+        "widgets",
+        Some(("example.dev/v1", "Gadget")),
+        &[("v1", true, true)],
+    )
+    .await;
 
-    // Fabricate an "Organization" from a different API group at root scope.
-    let foreign_org = store
-        .create(CreateResourceParams {
-            api_version: "external.example.dev/v1".to_string(),
-            kind: ORGANIZATION_KIND.to_string(),
-            name: "foreign-org".to_string(),
-            parent_uid: None,
-            annotations: BTreeMap::new(),
-            finalizers: vec![],
-            spec: json!({}),
-            validator: None,
-        })
-        .await
-        .unwrap();
+    let org = create_org(&store, "org").await;
+    let gadget = create_resource(&store, "example.dev/v1", "Gadget", "gadget", Some(org.uid)).await;
+    let widget = create_resource(&store, "example.dev/v1", "Widget", "w1", Some(gadget.uid)).await;
 
-    let err = store
-        .reparent(
-            widget.uid,
-            Some(foreign_org.uid),
-            ResourceScope::Organization,
-        )
-        .await
-        .unwrap_err();
+    // The Widget declares parent Gadget, so an Organization is the wrong type.
+    let err = store.reparent(widget.uid, Some(org.uid)).await.unwrap_err();
     assert!(
         matches!(err, StoreError::Validation(_)),
-        "expected validation error for wrong api_version parent, got {err:?}"
+        "expected validation error for wrongly-typed parent, got {err:?}"
     );
+
+    let unchanged = store.get(widget.uid).await.unwrap().unwrap();
+    assert_eq!(unchanged.parent_uid, Some(gadget.uid));
 
     Ok(())
 }
@@ -1956,16 +2191,17 @@ async fn reparent_rejects_root_scoped_resource_under_parent(
     pool: sqlx::PgPool,
 ) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
+    // Organization is a built-in root-scoped kind: it has no declared parent.
     let org_a = create_org(&store, "org-a").await;
     let org_b = create_org(&store, "org-b").await;
 
     let err = store
-        .reparent(org_a.uid, Some(org_b.uid), ResourceScope::Root)
+        .reparent(org_a.uid, Some(org_b.uid))
         .await
         .unwrap_err();
     assert!(
         matches!(err, StoreError::Validation(_)),
-        "expected scope validation error, got {err:?}"
+        "expected validation error for root-scoped resource under a parent, got {err:?}"
     );
 
     let unchanged = store.get(org_a.uid).await.unwrap().unwrap();
@@ -1975,18 +2211,52 @@ async fn reparent_rejects_root_scoped_resource_under_parent(
 }
 
 #[sqlx::test]
-async fn reparent_rejects_org_scoped_resource_to_root(pool: sqlx::PgPool) -> sqlx::Result<()> {
+async fn reparent_rejects_custom_root_scoped_resource_under_parent(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
+    // A user-defined root-scoped kind (no parent declared) also cannot be reparented.
+    register_rd(
+        &store,
+        "example.dev",
+        "Gizmo",
+        "gizmos",
+        None,
+        &[("v1", true, true)],
+    )
+    .await;
+    let org = create_org(&store, "org").await;
+    let gizmo = create_resource(&store, "example.dev/v1", "Gizmo", "g1", None).await;
+
+    let err = store.reparent(gizmo.uid, Some(org.uid)).await.unwrap_err();
+    assert!(
+        matches!(err, StoreError::Validation(_)),
+        "expected validation error for custom root-scoped resource under a parent, got {err:?}"
+    );
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn reparent_rejects_non_root_resource_to_root(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    register_rd(
+        &store,
+        "example.dev",
+        "Widget",
+        "widgets",
+        Some((API_VERSION_V1ALPHA1, ORGANIZATION_KIND)),
+        &[("v1", true, true)],
+    )
+    .await;
     let org = create_org(&store, "org").await;
     let widget = create_child(&store, org.uid, "Widget", "w1", vec![]).await;
 
-    let err = store
-        .reparent(widget.uid, None, ResourceScope::Organization)
-        .await
-        .unwrap_err();
+    // The Widget declares a parent, so it cannot move to root (new_parent_uid = None).
+    let err = store.reparent(widget.uid, None).await.unwrap_err();
     assert!(
         matches!(err, StoreError::Validation(_)),
-        "expected scope validation error, got {err:?}"
+        "expected validation error moving a non-root resource to root, got {err:?}"
     );
 
     let unchanged = store.get(widget.uid).await.unwrap().unwrap();
@@ -1996,29 +2266,66 @@ async fn reparent_rejects_org_scoped_resource_to_root(pool: sqlx::PgPool) -> sql
 }
 
 #[sqlx::test]
-async fn reparent_rejects_org_scoped_resource_under_non_org(
-    pool: sqlx::PgPool,
-) -> sqlx::Result<()> {
+async fn reparent_rejects_cycle(pool: sqlx::PgPool) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
+    // A self-referential kind: a Folder's declared parent is another Folder. This lets us
+    // build a same-typed ancestor chain and exercise the ancestor->descendant cycle check.
+    register_rd(
+        &store,
+        "example.dev",
+        "Folder",
+        "folders",
+        Some(("example.dev/v1", "Folder")),
+        &[("v1", true, true)],
+    )
+    .await;
     let org = create_org(&store, "org").await;
-    let widget = create_child(&store, org.uid, "Widget", "w1", vec![]).await;
-    let other_widget = create_child(&store, org.uid, "Widget", "w2", vec![]).await;
+    // `create` does not enforce parent type, so the top folder can be seeded under the org.
+    let root_folder =
+        create_resource(&store, "example.dev/v1", "Folder", "root", Some(org.uid)).await;
+    let child_folder = create_resource(
+        &store,
+        "example.dev/v1",
+        "Folder",
+        "child",
+        Some(root_folder.uid),
+    )
+    .await;
 
+    // Moving `root_folder` under its own descendant `child_folder` would form a cycle.
+    // The parent type (Folder) matches, so this reaches the cycle detector.
     let err = store
-        .reparent(
-            widget.uid,
-            Some(other_widget.uid),
-            ResourceScope::Organization,
-        )
+        .reparent(root_folder.uid, Some(child_folder.uid))
         .await
         .unwrap_err();
     assert!(
-        matches!(err, StoreError::Validation(_)),
-        "expected scope validation error, got {err:?}"
+        matches!(err, StoreError::ReparentCycle),
+        "expected ReparentCycle, got {err:?}"
     );
 
-    let unchanged = store.get(widget.uid).await.unwrap().unwrap();
-    assert_eq!(unchanged.parent_uid, Some(org.uid));
+    Ok(())
+}
+
+#[sqlx::test]
+async fn reparent_rejects_self_loop(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    register_rd(
+        &store,
+        "example.dev",
+        "Folder",
+        "folders",
+        Some(("example.dev/v1", "Folder")),
+        &[("v1", true, true)],
+    )
+    .await;
+    let org = create_org(&store, "org").await;
+    let folder = create_resource(&store, "example.dev/v1", "Folder", "f1", Some(org.uid)).await;
+
+    let err = store
+        .reparent(folder.uid, Some(folder.uid))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ReparentCycle));
 
     Ok(())
 }
@@ -2026,16 +2333,48 @@ async fn reparent_rejects_org_scoped_resource_under_non_org(
 #[sqlx::test]
 async fn reparent_respects_uniqueness(pool: sqlx::PgPool) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
+    register_rd(
+        &store,
+        "example.dev",
+        "Widget",
+        "widgets",
+        Some((API_VERSION_V1ALPHA1, ORGANIZATION_KIND)),
+        &[("v1", true, true)],
+    )
+    .await;
     let org_a = create_org(&store, "org-a").await;
     let org_b = create_org(&store, "org-b").await;
     let _existing = create_child(&store, org_b.uid, "Widget", "shared", vec![]).await;
     let moving = create_child(&store, org_a.uid, "Widget", "shared", vec![]).await;
 
+    // The destination scope already has a Widget named "shared" — surface NameConflict.
     let err = store
-        .reparent(moving.uid, Some(org_b.uid), ResourceScope::Organization)
+        .reparent(moving.uid, Some(org_b.uid))
         .await
         .unwrap_err();
     assert!(matches!(err, StoreError::NameConflict));
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn reparent_to_root_succeeds_for_root_scoped_resource(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    // A built-in root-scoped Organization seeded under a parent can be moved back to root.
+    let org_a = create_org(&store, "org-a").await;
+    let child_org = create_resource(
+        &store,
+        API_VERSION_V1ALPHA1,
+        ORGANIZATION_KIND,
+        "child",
+        Some(org_a.uid),
+    )
+    .await;
+
+    let moved = store.reparent(child_org.uid, None).await.unwrap();
+    assert_eq!(moved.parent_uid, None);
 
     Ok(())
 }

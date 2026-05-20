@@ -114,9 +114,9 @@ pub enum ResourcePath {
 ///
 /// ```text
 /// path        ::= "orphans"
-///               | collection "/" "orphans"
-///               | collection "/" "orphans" "/" identifier
-///               | collection "/" "orphans" "/" identifier "/" "reparent"
+///               | "orphans" "/" collection
+///               | "orphans" "/" collection "/" identifier
+///               | "orphans" "/" collection "/" identifier "/" "reparent"
 ///               | segment+
 /// collection  ::= "apis" "/" group "/" version "/" plural
 /// segment     ::= collection "/" identifier
@@ -126,10 +126,11 @@ pub enum ResourcePath {
 /// sub         ::= "status" | "finalizers" | "reparent"
 /// ```
 ///
-/// The keywords `orphans`, `status`, `finalizers`, and `reparent` are reserved:
-/// `orphans` is valid as the sole path segment or immediately after a collection
-/// as the orphan-aware type path; `status`, `finalizers`, and `reparent` are
-/// only valid as the final segment of an item path.
+/// The keywords `orphans`, `status`, `finalizers`, and `reparent` are reserved.
+/// `orphans` is valid only as the first path segment — bare for the global orphan
+/// list, or as a prefix for the type-scoped orphan paths — so a resource may still
+/// be named `orphans`. `status`, `finalizers`, and `reparent` are valid only as
+/// the final segment of an item path.
 pub fn parse_resource_path(raw: &str) -> Result<ResourcePath, ServerError> {
     let segments: Vec<&str> = raw.split('/').collect();
 
@@ -137,9 +138,11 @@ pub fn parse_resource_path(raw: &str) -> Result<ResourcePath, ServerError> {
         return Err(ServerError::bad_request("empty resource path segment"));
     }
 
-    // Special-case: bare `orphans`
-    if segments.len() == 1 && segments[0] == "orphans" {
-        return Ok(ResourcePath::Orphans);
+    // `orphans` is only ever the first segment — bare for the global orphan
+    // listing, or a prefix for the type-scoped orphan paths. It is never an
+    // identifier, so a resource may legitimately be named `orphans`.
+    if segments[0] == "orphans" {
+        return parse_orphan_path(&segments);
     }
 
     let mut ancestors: Vec<AncestorRef> = Vec::new();
@@ -158,47 +161,6 @@ pub fn parse_resource_path(raw: &str) -> Result<ResourcePath, ServerError> {
 
         let identifier = segments[pos].to_string();
         pos += 1;
-
-        if identifier == "orphans" && ancestors.is_empty() {
-            if pos == segments.len() {
-                return Ok(ResourcePath::TypeOrphanList { collection });
-            }
-
-            let orphan_identifier = segments[pos].to_string();
-            pos += 1;
-
-            if pos == segments.len() {
-                return Ok(ResourcePath::TypeOrphanItem {
-                    collection,
-                    identifier: orphan_identifier,
-                });
-            }
-
-            match segments[pos] {
-                "reparent" => {
-                    if pos + 1 != segments.len() {
-                        return Err(ServerError::bad_request(
-                            "unexpected segments after orphan reparent: path must end after the keyword",
-                        ));
-                    }
-                    return Ok(ResourcePath::TypeOrphanSubresource {
-                        collection,
-                        identifier: orphan_identifier,
-                        subresource: Subresource::Reparent,
-                    });
-                }
-                kw @ ("status" | "finalizers") => {
-                    return Err(ServerError::bad_request(format!(
-                        "orphan subresource '{kw}' is not supported"
-                    )));
-                }
-                other => {
-                    return Err(ServerError::bad_request(format!(
-                        "expected orphan subresource 'reparent', got '{other}'"
-                    )));
-                }
-            }
-        }
 
         if pos == segments.len() {
             return Ok(ResourcePath::Item {
@@ -235,7 +197,7 @@ pub fn parse_resource_path(raw: &str) -> Result<ResourcePath, ServerError> {
             }
             "orphans" => {
                 return Err(ServerError::bad_request(
-                    "'orphans' is a reserved keyword and may only appear as the sole path segment or immediately after a top-level collection",
+                    "'orphans' is a reserved keyword and may only appear as the first path segment",
                 ));
             }
             other => {
@@ -244,6 +206,54 @@ pub fn parse_resource_path(raw: &str) -> Result<ResourcePath, ServerError> {
                 )));
             }
         }
+    }
+}
+
+/// Parse an `orphans`-prefixed path. `segments[0]` is already known to be `orphans`.
+fn parse_orphan_path(segments: &[&str]) -> Result<ResourcePath, ServerError> {
+    // Bare `orphans` — the global listing of resources detached by an
+    // in-progress teardown.
+    if segments.len() == 1 {
+        return Ok(ResourcePath::Orphans);
+    }
+
+    // `orphans/<collection>[/<identifier>[/reparent]]`
+    let collection = parse_collection(segments, 1)?;
+    let mut pos = 5; // "orphans" (1) + collection (4)
+
+    if pos == segments.len() {
+        return Ok(ResourcePath::TypeOrphanList { collection });
+    }
+
+    let identifier = segments[pos].to_string();
+    pos += 1;
+
+    if pos == segments.len() {
+        return Ok(ResourcePath::TypeOrphanItem {
+            collection,
+            identifier,
+        });
+    }
+
+    match segments[pos] {
+        "reparent" => {
+            if pos + 1 != segments.len() {
+                return Err(ServerError::bad_request(
+                    "unexpected segments after orphan reparent: path must end after the keyword",
+                ));
+            }
+            Ok(ResourcePath::TypeOrphanSubresource {
+                collection,
+                identifier,
+                subresource: Subresource::Reparent,
+            })
+        }
+        kw @ ("status" | "finalizers") => Err(ServerError::bad_request(format!(
+            "orphan subresource '{kw}' is not supported"
+        ))),
+        other => Err(ServerError::bad_request(format!(
+            "expected orphan subresource 'reparent', got '{other}'"
+        ))),
     }
 }
 
@@ -345,7 +355,7 @@ mod tests {
     #[test]
     fn resource_path_type_orphan_list() {
         assert_eq!(
-            parse_resource_path("apis/example.dev/v1/widgets/orphans").unwrap(),
+            parse_resource_path("orphans/apis/example.dev/v1/widgets").unwrap(),
             ResourcePath::TypeOrphanList {
                 collection: collection("example.dev", "v1", "widgets"),
             }
@@ -355,7 +365,7 @@ mod tests {
     #[test]
     fn resource_path_type_orphan_item() {
         assert_eq!(
-            parse_resource_path("apis/example.dev/v1/widgets/orphans/w1").unwrap(),
+            parse_resource_path("orphans/apis/example.dev/v1/widgets/w1").unwrap(),
             ResourcePath::TypeOrphanItem {
                 collection: collection("example.dev", "v1", "widgets"),
                 identifier: "w1".into(),
@@ -366,13 +376,35 @@ mod tests {
     #[test]
     fn resource_path_type_orphan_reparent() {
         assert_eq!(
-            parse_resource_path("apis/example.dev/v1/widgets/orphans/w1/reparent").unwrap(),
+            parse_resource_path("orphans/apis/example.dev/v1/widgets/w1/reparent").unwrap(),
             ResourcePath::TypeOrphanSubresource {
                 collection: collection("example.dev", "v1", "widgets"),
                 identifier: "w1".into(),
                 subresource: Subresource::Reparent,
             }
         );
+    }
+
+    #[test]
+    fn resource_path_item_named_orphans_is_addressable() {
+        // `orphans` is only special as the first segment, so a resource may be
+        // named `orphans` and is still reachable as a normal item.
+        assert_eq!(
+            parse_resource_path("apis/example.dev/v1/widgets/orphans").unwrap(),
+            ResourcePath::Item {
+                ancestors: vec![],
+                collection: collection("example.dev", "v1", "widgets"),
+                identifier: "orphans".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn resource_path_orphans_rejected_after_identifier() {
+        let err =
+            parse_resource_path("apis/rise.dev/v1alpha1/organizations/acme/orphans").unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("orphans"));
     }
 
     #[test]
