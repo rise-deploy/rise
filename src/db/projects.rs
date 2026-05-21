@@ -86,6 +86,40 @@ pub async fn list_accessible_by_user(pool: &PgPool, user_id: Uuid) -> Result<Vec
     Ok(projects)
 }
 
+/// List all projects a user owns directly or via team membership.
+///
+/// Unlike [`list_accessible_by_user`], this excludes service-account access:
+/// it reflects project ownership only.
+pub async fn list_owned_by_user(pool: &PgPool, user_id: Uuid) -> Result<Vec<Project>> {
+    let projects = sqlx::query_as!(
+        Project,
+        r#"
+        SELECT DISTINCT
+            p.id, p.name,
+            p.status as "status: ProjectStatus",
+            p.access_class,
+            p.owner_user_id, p.owner_team_id,
+            p.finalizers, p.source_url,
+            p.created_at, p.updated_at
+        FROM projects p
+        WHERE
+            p.owner_user_id = $1
+            OR EXISTS(
+                SELECT 1 FROM team_members tm
+                WHERE tm.team_id = p.owner_team_id
+                AND tm.user_id = $1
+            )
+        ORDER BY p.created_at DESC
+        "#,
+        user_id
+    )
+    .fetch_all(pool)
+    .await
+    .context("Failed to list projects owned by user")?;
+
+    Ok(projects)
+}
+
 /// List all projects a team can access (owned by the team, or granted view access)
 pub async fn list_accessible_by_team(pool: &PgPool, team_id: Uuid) -> Result<Vec<Project>> {
     let projects = sqlx::query_as!(

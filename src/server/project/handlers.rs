@@ -400,15 +400,19 @@ pub async fn list_team_projects(
         .await
         .internal_err("Failed to list team projects")?;
 
+    // Admins can see every project, so the ownership filter does not apply to
+    // them. Everyone else only sees the team's projects they own themselves
+    // (directly or via team membership) — service-account access does not
+    // count, so this stays narrower than `list_accessible_by_user`.
     if !state.is_admin(&user.email) {
-        let user_project_ids: std::collections::HashSet<_> =
-            projects::list_accessible_by_user(&state.db_pool, user.id)
+        let owned_project_ids: std::collections::HashSet<_> =
+            projects::list_owned_by_user(&state.db_pool, user.id)
                 .await
                 .internal_err("Failed to list user projects")?
                 .into_iter()
                 .map(|p| p.id)
                 .collect();
-        projects.retain(|project| user_project_ids.contains(&project.id));
+        projects.retain(|project| owned_project_ids.contains(&project.id));
     }
 
     let api_projects = projects_to_api(&state, projects).await?;
