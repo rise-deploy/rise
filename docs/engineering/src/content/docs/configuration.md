@@ -88,7 +88,7 @@ database:
 # (omit the database.url key entirely)
 ```
 
-**Note**: DATABASE_URL is only required at compile time for SQLX query verification. At runtime, you can set it via either method above.
+**Note**: `DATABASE_URL` is also required at **compile time** for SQLX query verification. See the [Developer Guide](./developer-guide.md#database_url-at-compile-time) for details.
 
 ## Examples
 
