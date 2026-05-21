@@ -58,6 +58,15 @@ export function ProjectTable({
                                     key={project.id || project.name}
                                     className={`click${ownClass}`}
                                     onClick={() => onRowClick(project)}
+                                    tabIndex={0}
+                                    role="button"
+                                    aria-label={`Open project ${project.name}`}
+                                    onKeyDown={(e) => {
+                                        if (e.key === 'Enter' || e.key === ' ') {
+                                            e.preventDefault();
+                                            onRowClick(project);
+                                        }
+                                    }}
                                 >
                                     <td style={{ maxWidth: 280 }}>
                                         <div style={{ fontWeight: 500, fontSize: 13.5 }}>{project.name}</div>

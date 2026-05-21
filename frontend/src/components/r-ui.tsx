@@ -172,10 +172,10 @@ export function Field({ label, children, hint }: { label: React.ReactNode; child
 }
 
 export function Input(props: React.InputHTMLAttributes<HTMLInputElement>) {
-    return <input className={cx('r-field', props.className)} {...props} />;
+    return <input {...props} className={cx('r-field', props.className)} />;
 }
 export function Textarea(props: React.TextareaHTMLAttributes<HTMLTextAreaElement>) {
-    return <textarea className={cx('r-field', props.className)} {...props} />;
+    return <textarea {...props} className={cx('r-field', props.className)} />;
 }
 
 // ---------- Combobox ----------
@@ -221,7 +221,7 @@ export function Combobox(props: ComboboxProps) {
     const [activeIndex, setActiveIndex] = useState(0);
     const [popRect, setPopRect] = useState<{ top: number; left: number; width: number } | null>(null);
     const wrapRef = useRef<HTMLDivElement>(null);
-    const triggerRef = useRef<HTMLButtonElement>(null);
+    const triggerRef = useRef<HTMLDivElement>(null);
     const popRef = useRef<HTMLDivElement>(null);
     const inputRef = useRef<HTMLInputElement>(null);
 
@@ -322,13 +322,19 @@ export function Combobox(props: ComboboxProps) {
 
     return (
         <div ref={wrapRef} className={cx('r-cbox', open && 'open', className)}>
-            <button
+            <div
                 ref={triggerRef}
                 id={id}
-                type="button"
+                role="button"
+                tabIndex={disabled ? -1 : 0}
+                aria-disabled={disabled || undefined}
                 className={cx('r-cbox-trigger', isEmpty && 'placeholder')}
-                disabled={disabled}
-                onClick={() => setOpen(o => !o)}
+                onClick={() => { if (!disabled) setOpen(o => !o); }}
+                onKeyDown={(e) => {
+                    if (disabled) return;
+                    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setOpen(o => !o); }
+                    else if (e.key === 'ArrowDown') { e.preventDefault(); setOpen(true); }
+                }}
                 aria-haspopup="listbox"
                 aria-expanded={open}
             >
@@ -348,7 +354,7 @@ export function Combobox(props: ComboboxProps) {
                     </button>
                 )}
                 <Icon name="chevd" size={14} className="chev" />
-            </button>
+            </div>
             {open && popRect && createPortal(
                 <div
                     ref={popRef}

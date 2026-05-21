@@ -142,7 +142,16 @@ function Topbar({ breadcrumbs, onOpenPalette }: { breadcrumbs: { label: string; 
                         <React.Fragment key={`${c.label}-${i}`}>
                             {i > 0 && <span className="sep">/</span>}
                             {c.href && !isLast ? (
-                                <a onClick={() => navigate(c.href!)}>{c.label}</a>
+                                <a
+                                    href={c.href}
+                                    onClick={(e) => {
+                                        if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
+                                        e.preventDefault();
+                                        navigate(c.href!);
+                                    }}
+                                >
+                                    {c.label}
+                                </a>
                             ) : (
                                 <strong>{c.label}</strong>
                             )}
