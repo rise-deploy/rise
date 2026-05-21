@@ -14,7 +14,7 @@ Resource collection paths are versioned, following the same group/version shape 
 | `apis/{group}/{version}/{plural}/{id}` | GET, PUT, DELETE | Get / update / delete an item |
 | `apis/{group}/{version}/{plural}/{id}/status` | PUT | Controller status update |
 | `apis/{group}/{version}/{plural}/{id}/finalizers` | PUT | Controller finalizer update |
-| `apis/{group}/{version}/{plural}/{id}/reparent` | POST | Break-glass reparent |
+| `apis/{group}/{version}/{plural}/{id}/reparent` | POST | Move an item under a new parent |
 | `apis/{groupA}/{versionA}/{pluralA}/{idA}/apis/{groupB}/{versionB}/{pluralB}` | GET, POST | List / create children under a typed parent |
 | `pending-deletion` | GET | List resources tombstoned and awaiting garbage collection |
 
@@ -37,9 +37,8 @@ When a UID-prefixed identifier is used in a PUT URL, the body's `metadata.name` 
 
 | Tier | Credentials | Permitted operations |
 |---|---|---|
-| Operator | Listed in `auth.operator_users` | GET, POST, item PUT, DELETE |
+| Operator | Listed in `auth.operator_users` | GET, POST, item PUT, DELETE, `reparent` |
 | Controller | Configured `ControllerIdentity` token | PUT `status` and `finalizers`, gated by `allowed_status_controller_ids` |
-| Admin + operator | Listed in both `auth.admin_users` and `auth.operator_users` | `reparent` |
 
 Controller tokens cannot perform item-level PUT or other operator operations.
 

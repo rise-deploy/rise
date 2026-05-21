@@ -183,9 +183,9 @@ Backend startup migration order:
   - `DELETE /api/v1/resources/organizations/{org}/{collection}/{name}`
 - Path grammar is uniform `<kind>/<identifier>` per segment. The identifier is either a name or a UID-prefixed token (`uid:<uuid>`), e.g. `/api/v1/resources/organizations/acme/projects/uid:a1b2c3d4-...`. The kind is always present, so response shape is statically determinable from the URL and the store can verify that the UID's row actually has the expected kind (mismatches return 404). The HTTP layer resolves the path through the store's `resolve_path(&[PathSegment])` in a single round-trip.
 - `DELETE` always cascades to the subtree.
-- Break-glass / discovery endpoints:
+- Maintenance / discovery endpoints:
   - `GET /api/v1/resources/pending-deletion` — resources tombstoned and awaiting GC (`list_pending_collection`)
-  - `POST /api/v1/resources/{collection}/{name}/reparent` — atomic move to a new parent, admin-only; rejects cycles and uniqueness conflicts at the destination
+  - `POST /api/v1/resources/{collection}/{name}/reparent` — atomic move to a new parent (operator); rejects cycles and uniqueness conflicts at the destination
 - Route `{collection}` through the resource registry:
   - built-in registrations first
   - external ResourceDefinitions second
@@ -439,7 +439,7 @@ Deliver in the following order. PRs 1–4 avoid existing data model changes, but
 - Resource registry: built-in resolution first, external ResourceDefinitions second
 - Request body validation, operator-only enforcement, controller status/finalizer endpoints
 - `DELETE` always cascades to the subtree
-- Break-glass `POST .../{name}/reparent` (admin-only) and a `GET /api/v1/resources/pending-deletion` diagnostics listing
+- `POST .../{name}/reparent` (operator) and a `GET /api/v1/resources/pending-deletion` diagnostics listing
 - Audit logging for delete and reparent operations
 - Purely additive — no existing routes change
 - Depends on: PR 2, PR 3

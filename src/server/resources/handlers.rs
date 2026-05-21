@@ -4,8 +4,7 @@
 //! controller-specific status/finalizer endpoints, which authenticate via the
 //! `AnyAuth` extractor and are further gated to controllers listed in the
 //! collection's `allowed_status_controller_ids` (default-deny on an empty
-//! list). `reparent` is additionally gated to operators who are also listed in
-//! `auth.admin_users`.
+//! list).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -53,7 +52,6 @@ use crate::server::state::AppState;
 pub(crate) struct ResourceApiCtx {
     store: Arc<dyn ResourceStore>,
     operator_users: Arc<Vec<String>>,
-    admin_users: Arc<Vec<String>>,
 }
 
 impl ResourceApiCtx {
@@ -61,16 +59,11 @@ impl ResourceApiCtx {
         Self {
             store: state.resource_store.clone(),
             operator_users: state.operator_users.clone(),
-            admin_users: state.admin_users.clone(),
         }
     }
 
     fn is_operator(&self, email: &str) -> bool {
         crate::server::auth::admin::is_operator_user(&self.operator_users, email)
-    }
-
-    fn is_admin(&self, email: &str) -> bool {
-        crate::server::auth::admin::is_admin_user(&self.admin_users, email)
     }
 }
 
@@ -89,22 +82,6 @@ fn require_operator(ctx: &ResourceApiCtx, auth: &AuthContext) -> Result<User, Se
         );
         return Err(ServerError::forbidden(
             "Operator role required for the generic resource API",
-        ));
-    }
-    Ok(user)
-}
-
-/// Require an operator who is also an admin. Used for the break-glass `reparent`
-/// operation.
-fn require_admin_operator(ctx: &ResourceApiCtx, auth: &AuthContext) -> Result<User, ServerError> {
-    let user = require_operator(ctx, auth)?;
-    if !ctx.is_admin(&user.email) {
-        tracing::warn!(
-            user_email = %user.email,
-            "Break-glass resource operation denied — Operator is not also listed as an admin"
-        );
-        return Err(ServerError::forbidden(
-            "This operation requires Operator + admin privileges",
         ));
     }
     Ok(user)
@@ -490,7 +467,7 @@ async fn dispatch_post_inner(
             identifier,
             subresource: Subresource::Reparent,
         } => {
-            let user = require_admin_operator(ctx, &auth)?;
+            let user = require_operator(ctx, &auth)?;
             let body: ReparentRequest = serde_json::from_value(body)
                 .map_err(|e| ServerError::bad_request(format!("invalid request body: {e}")))?;
             let (ancestor_segs, parent) = resolve_ancestors(&ctx.store, &ancestors).await?;
@@ -1119,7 +1096,6 @@ mod dispatch_tests {
     use serde_json::{json, Value};
 
     const OPERATOR: &str = "operator@example.com";
-    const ADMIN_OPERATOR: &str = "admin-operator@example.com";
     const PLAIN_USER: &str = "plain-user@example.com";
 
     /// Build a `ResourceApiCtx` over a real `PgResourceStore`. The resource
@@ -1131,9 +1107,7 @@ mod dispatch_tests {
             .expect("resource store migrations");
         ResourceApiCtx {
             store: Arc::new(PgResourceStore::new(pool)),
-            // OPERATOR is operator-only; ADMIN_OPERATOR is operator + admin.
-            operator_users: Arc::new(vec![OPERATOR.into(), ADMIN_OPERATOR.into()]),
-            admin_users: Arc::new(vec![ADMIN_OPERATOR.into()]),
+            operator_users: Arc::new(vec![OPERATOR.into()]),
         }
     }
 
@@ -1301,11 +1275,30 @@ mod dispatch_tests {
     }
 
     // -------------------------------------------------------------------------
-    // Auth tier: break-glass paths require admin + operator
+    // Auth tier: reparent is a normal operator operation
     // -------------------------------------------------------------------------
 
     #[sqlx::test]
-    async fn reparent_requires_admin_operator(pool: sqlx::PgPool) {
+    async fn reparent_allowed_for_operator(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx, &[]).await;
+        create_widget(&ctx, "example.dev/v1", "w1").await;
+
+        // Any operator may reparent — there is no separate admin tier.
+        let resp = dispatch_post_inner(
+            &ctx,
+            "apis/example.dev/v1/widgets/w1/reparent".to_string(),
+            auth(OPERATOR),
+            json!({"newParentUid": null}),
+        )
+        .await
+        .expect("operator may reparent");
+        let (status, _) = read(resp).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[sqlx::test]
+    async fn reparent_rejects_non_operator(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
         register_widget_rd(&ctx, &[]).await;
         create_widget(&ctx, "example.dev/v1", "w1").await;
@@ -1313,11 +1306,11 @@ mod dispatch_tests {
         let err = dispatch_post_inner(
             &ctx,
             "apis/example.dev/v1/widgets/w1/reparent".to_string(),
-            auth(OPERATOR),
+            auth(PLAIN_USER),
             json!({"newParentUid": null}),
         )
         .await
-        .expect_err("reparent must require admin + operator");
+        .expect_err("a non-operator must not reparent");
         assert_eq!(err.status, StatusCode::FORBIDDEN);
     }
 
@@ -1947,7 +1940,7 @@ mod dispatch_tests {
         let err = dispatch_put_inner(
             &ctx,
             "apis/example.dev/v1/widgets/w1/reparent".to_string(),
-            any_user(ADMIN_OPERATOR),
+            any_user(OPERATOR),
             json!({"newParentUid": null}),
         )
         .await
