@@ -17,6 +17,18 @@ use axum::{
 };
 use uuid::Uuid;
 
+async fn trigger_project_resync(
+    kube_client: Option<&kube::Client>,
+    project_name: &str,
+) -> anyhow::Result<bool> {
+    let Some(kube_client) = kube_client else {
+        return Ok(false);
+    };
+
+    crate::server::deployment::crd::trigger_resync(kube_client, project_name).await?;
+    Ok(true)
+}
+
 /// Validate that a URL uses only http or https schemes.
 /// Returns the trimmed URL on success, or an error message if the URL is invalid or uses a disallowed scheme.
 pub fn validate_http_url(url: &str) -> Result<String, String> {
@@ -502,6 +514,7 @@ pub async fn update_project(
 
     // Update project fields
     let mut updated_project = project;
+    let mut should_trigger_resync = false;
 
     // Update owner if provided
     if let Some(owner) = payload.owner {
@@ -589,6 +602,7 @@ pub async fn update_project(
             )));
         }
 
+        should_trigger_resync = updated_project.access_class != access_class;
         updated_project =
             projects::update_access_class(&state.db_pool, updated_project.id, access_class)
                 .await
@@ -685,6 +699,17 @@ pub async fn update_project(
             projects::update_source_url(&state.db_pool, updated_project.id, normalized)
                 .await
                 .internal_err("Failed to update project source URL")?;
+    }
+
+    if should_trigger_resync {
+        if let Err(e) =
+            trigger_project_resync(state.kube_client.as_ref(), &updated_project.name).await
+        {
+            tracing::warn!(
+                project = %updated_project.name,
+                "Failed to trigger CRD resync after access class update: {:?}", e
+            );
+        }
     }
 
     let owner_info = resolve_owner_info(&state, &updated_project)
@@ -1038,4 +1063,94 @@ pub async fn check_write_permission(
     projects::user_can_access(&state.db_pool, project.id, user.id)
         .await
         .map_err(|e| format!("Failed to check access: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trigger_project_resync;
+    use axum::http::Uri;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn spawn_kube_api_stub() -> (kube::Client, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = Vec::new();
+            let mut temp = [0u8; 1024];
+            let mut header_end = None;
+            let mut content_length = 0usize;
+
+            loop {
+                let read = stream.read(&mut temp).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&temp[..read]);
+
+                if header_end.is_none() {
+                    if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                        header_end = Some(pos + 4);
+                        let headers = String::from_utf8_lossy(&buffer[..pos + 4]);
+                        for line in headers.lines() {
+                            let line = line.trim();
+                            if let Some(value) = line.strip_prefix("Content-Length:") {
+                                content_length = value.trim().parse().unwrap();
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if let Some(header_end) = header_end {
+                    if buffer.len() >= header_end + content_length {
+                        break;
+                    }
+                }
+            }
+
+            let request = String::from_utf8(buffer).unwrap();
+            let body = r#"{"apiVersion":"rise.dev/v1alpha1","kind":"RiseProject","metadata":{"name":"demo"},"spec":{}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+
+            request
+        });
+
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let config = kube::Config::new(format!("http://{addr}").parse::<Uri>().unwrap());
+        let client = kube::Client::try_from(config).unwrap();
+
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn trigger_project_resync_patches_rise_project() {
+        let (client, server) = spawn_kube_api_stub().await;
+
+        let triggered = trigger_project_resync(Some(&client), "demo").await.unwrap();
+
+        assert!(triggered);
+
+        let request = server.await.unwrap();
+        assert!(
+            request.contains("PATCH /apis/rise.dev/v1alpha1/riseprojects/demo"),
+            "unexpected request: {request}"
+        );
+        assert!(request.contains("\"rise.dev/trigger\""));
+    }
+
+    #[tokio::test]
+    async fn trigger_project_resync_skips_without_kube_client() {
+        let triggered = trigger_project_resync(None, "demo").await.unwrap();
+
+        assert!(!triggered);
+    }
 }
