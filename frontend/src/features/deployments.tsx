@@ -4,7 +4,7 @@ import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
 import { copyToClipboard, formatDate, formatISO8601, formatRelativeTimeRounded, formatTimeRemaining } from '../lib/utils';
 import { useToast } from '../components/toast';
-import { Button, ConfirmDialog, ENV_COLOR_STYLES, EnvironmentColorDot, Modal, ModalActions, ModalSection, SourceLinkGroup, SourceLinkGroupAction, StatusBadge } from '../components/ui';
+import { Button, ConfirmDialog, ENV_COLOR_STYLES, EnvironmentColorDot, Modal, ModalActions, ModalSection, MonoStatusPill, SourceLinkGroup, SourceLinkGroupAction, StatusBadge } from '../components/ui';
 import { MonoSortButton, MonoTable, MonoTableBody, MonoTableEmptyRow, MonoTableFrame, MonoTableHead, MonoTableRow, MonoTd, MonoTh } from '../components/table';
 import { EnvVarsList } from './resources';
 import { EmptyState, ErrorState, LoadingState } from '../components/states';
@@ -1057,6 +1057,7 @@ interface ContainerStatusInfo {
     ready: boolean;
     restart_count: number;
     state?: ContainerState;
+    last_state?: ContainerState;
 }
 
 interface PodCondition {
@@ -1084,16 +1085,39 @@ interface PodStatus {
     last_checked: string;
 }
 
+/** Returns the notable reason from a container's last_state (e.g. "OOMKilled"), or undefined. */
+function getLastStateReason(container: ContainerStatusInfo): string | undefined {
+    if (container.last_state?.state_type === 'terminated') {
+        return container.last_state.reason ?? undefined;
+    }
+    return undefined;
+}
+
 function PodInfoRow({ pod }: { pod: PodInfo }) {
     const [expanded, setExpanded] = useState(false);
     const detailsId = `pod-details-${pod.name.replace(/[^a-zA-Z0-9_-]/g, '-')}`;
 
     const isGone = pod.terminating || pod.terminated;
 
+    // Collect unique notable last_state reasons across all containers (e.g. OOMKilled)
+    const lastStateReasons: string[] = [];
+    if (!isGone && pod.containers) {
+        for (const c of pod.containers) {
+            const reason = getLastStateReason(c);
+            if (reason && !lastStateReasons.includes(reason)) {
+                lastStateReasons.push(reason);
+            }
+        }
+    }
+
     // Terminating/terminated pods: suppress issue indicators (not-ready is expected)
     const hasIssues = !isGone && (
                       pod.events?.length > 0 ||
-                      pod.containers?.some(c => !c.ready || c.restart_count > 0) ||
+                      pod.containers?.some(c =>
+                          !c.ready ||
+                          c.restart_count > 0 ||
+                          (c.last_state?.state_type === 'terminated' && (c.last_state.reason || (c.last_state.exit_code !== undefined && c.last_state.exit_code !== 0)))
+                      ) ||
                       pod.conditions?.some(c => c.status === 'False'));
 
     const phaseTone = {
@@ -1137,6 +1161,11 @@ function PodInfoRow({ pod }: { pod: PodInfo }) {
                                     ⚠
                                 </span>
                             )}
+                            {lastStateReasons.map((reason) => (
+                                <MonoStatusPill key={reason} tone="bad" uppercase={false}>
+                                    {reason}
+                                </MonoStatusPill>
+                            ))}
                         </div>
                         <div className="text-xs" style={{ color: 'var(--mono-muted)' }}>
                             {pod.containers?.length || 0} container(s) •{' '}
@@ -1158,37 +1187,74 @@ function PodInfoRow({ pod }: { pod: PodInfo }) {
                                 Containers
                             </h6>
                             <div className="space-y-2">
-                                {pod.containers.map((container, idx) => (
-                                    <div key={idx} className="text-xs p-2" style={{ background: '#0f0f0f', border: '1px solid var(--mono-line)' }}>
-                                        <div className="flex items-center justify-between mb-1">
-                                            <span className="font-mono" style={{ color: '#e8e8e8' }}>{container.name}</span>
-                                            <span style={{ color: container.ready ? '#b7ffce' : '#ffc0c0' }}>
-                                                {container.ready ? '✓ Ready' : '✗ Not ready'}
-                                            </span>
+                                {pod.containers.map((container, idx) => {
+                                    const lastStateReason = getLastStateReason(container);
+                                    const hasLastStateIssue = lastStateReason != null || (
+                                        container.last_state?.state_type === 'terminated' &&
+                                        container.last_state.exit_code !== undefined &&
+                                        container.last_state.exit_code !== 0
+                                    );
+                                    const containerBorderColor = hasLastStateIssue ? '#7d4b4b' : 'var(--mono-line)';
+                                    return (
+                                        <div key={idx} className="text-xs p-2" style={{ background: '#0f0f0f', border: `1px solid ${containerBorderColor}` }}>
+                                            <div className="flex items-center justify-between mb-1">
+                                                <div className="flex items-center gap-2 flex-wrap">
+                                                    <span className="font-mono" style={{ color: '#e8e8e8' }}>{container.name}</span>
+                                                    {lastStateReason && (
+                                                        <MonoStatusPill tone="bad" uppercase={false}>
+                                                            {lastStateReason}
+                                                        </MonoStatusPill>
+                                                    )}
+                                                </div>
+                                                <span style={{ color: container.ready ? '#b7ffce' : '#ffc0c0' }}>
+                                                    {container.ready ? '✓ Ready' : '✗ Not ready'}
+                                                </span>
+                                            </div>
+                                            {container.restart_count > 0 && (
+                                                <div style={{ color: 'var(--mono-warn)' }}>
+                                                    Restarts: {container.restart_count}
+                                                </div>
+                                            )}
+                                            {container.state && (
+                                                <div style={{ color: 'var(--mono-muted)' }}>
+                                                    State: {container.state.state_type}
+                                                    {container.state.reason && ` (${container.state.reason})`}
+                                                </div>
+                                            )}
+                                            {container.state?.message && (
+                                                <div className="mt-1 font-mono" style={{ color: '#ffc0c0' }}>
+                                                    {container.state.message}
+                                                </div>
+                                            )}
+                                            {container.state?.exit_code !== undefined && (
+                                                <div style={{ color: 'var(--mono-muted)' }}>
+                                                    Exit code: {container.state.exit_code}
+                                                </div>
+                                            )}
+                                            {container.last_state && (
+                                                <div className="mt-2 pt-2" style={{ borderTop: '1px solid var(--mono-line)' }}>
+                                                    <div className="font-semibold mb-1" style={{ color: 'var(--mono-muted)' }}>
+                                                        Last state
+                                                    </div>
+                                                    <div style={{ color: hasLastStateIssue ? '#ffc0c0' : 'var(--mono-muted)' }}>
+                                                        {container.last_state.state_type}
+                                                        {container.last_state.reason && ` (${container.last_state.reason})`}
+                                                    </div>
+                                                    {container.last_state.exit_code !== undefined && (
+                                                        <div style={{ color: 'var(--mono-muted)' }}>
+                                                            Exit code: {container.last_state.exit_code}
+                                                        </div>
+                                                    )}
+                                                    {container.last_state.message && (
+                                                        <div className="font-mono" style={{ color: '#ffc0c0' }}>
+                                                            {container.last_state.message}
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            )}
                                         </div>
-                                        {container.restart_count > 0 && (
-                                            <div style={{ color: 'var(--mono-warn)' }}>
-                                                Restarts: {container.restart_count}
-                                            </div>
-                                        )}
-                                        {container.state && (
-                                            <div style={{ color: 'var(--mono-muted)' }}>
-                                                State: {container.state.state_type}
-                                                {container.state.reason && ` (${container.state.reason})`}
-                                            </div>
-                                        )}
-                                        {container.state?.message && (
-                                            <div className="mt-1 font-mono" style={{ color: '#ffc0c0' }}>
-                                                {container.state.message}
-                                            </div>
-                                        )}
-                                        {container.state?.exit_code !== undefined && (
-                                            <div style={{ color: 'var(--mono-muted)' }}>
-                                                Exit code: {container.state.exit_code}
-                                            </div>
-                                        )}
-                                    </div>
-                                ))}
+                                    );
+                                })}
                             </div>
                         </div>
                     )}
