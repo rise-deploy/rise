@@ -5,7 +5,7 @@
 //! resource API from the existing typed APIs.
 //!
 //! All resource paths are dispatched through four handler functions that parse
-//! the wildcard `{*path}` capture and route based on the parsed [`ResourcePath`].
+//! the wildcard `{*path}` capture and classify it against the resource store.
 
 use axum::{
     routing::{delete, get, post, put},

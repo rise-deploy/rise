@@ -168,20 +168,22 @@ Backend startup migration order:
 
 ## Generic API
 
-- Add generic API routes under `/api/v1/resources`.
-- Initial root routes:
-  - `GET /api/v1/resources/{collection}`
-  - `POST /api/v1/resources/{collection}`
-  - `GET /api/v1/resources/{collection}/{name}`
-  - `PUT /api/v1/resources/{collection}/{name}`
-  - `DELETE /api/v1/resources/{collection}/{name}`
-- Initial organization child routes for future external resources:
-  - `GET /api/v1/resources/organizations/{org}/{collection}`
-  - `POST /api/v1/resources/organizations/{org}/{collection}`
-  - `GET /api/v1/resources/organizations/{org}/{collection}/{name}`
-  - `PUT /api/v1/resources/organizations/{org}/{collection}/{name}`
-  - `DELETE /api/v1/resources/organizations/{org}/{collection}/{name}`
-- Path grammar is uniform `<kind>/<identifier>` per segment. The identifier is either a name or a UID-prefixed token (`uid:<uuid>`), e.g. `/api/v1/resources/organizations/acme/projects/uid:a1b2c3d4-...`. The kind is always present, so response shape is statically determinable from the URL and the store can verify that the UID's row actually has the expected kind (mismatches return 404). The HTTP layer resolves the path through the store's `resolve_path(&[PathSegment])` in a single round-trip.
+- Add generic API routes under `/api/v1/resources`, dispatched from a single
+  `GET|POST|PUT|DELETE /resources/{*path}` wildcard.
+- Path grammar names the **leaf** collection as `{group}/{version}/{plural}`,
+  followed by the resource hierarchy as bare ancestor names:
+  - `{group}/{version}/{plural}/{ancestor}…` — list / create (`D` ancestor names)
+  - `{group}/{version}/{plural}/{ancestor}…/{name}` — get / update / delete an item
+  - `{group}/{version}/{plural}/{ancestor}…/{name}/{status|finalizers|reparent}` — subresource
+  - `{group}/{version}/{plural}/uid:{uuid}[/{sub}]` — address an item by UID
+- `D` is the leaf kind's parent-chain depth. Each `ResourceDefinition` declares
+  exactly one `parent`, so the ancestor *kinds* are derived from the leaf kind by
+  walking the parent chain; the URL supplies only the ancestor *names*. The HTTP
+  layer resolves the named chain through the store's `resolve_path(&[PathSegment])`
+  in a single round-trip.
+- A `uid:` token is a globally-unique identifier, so it is valid only as the sole
+  identifier segment (no ancestor names) and the store verifies the row has the
+  expected kind (mismatches return 404).
 - `DELETE` always cascades to the subtree.
 - Maintenance / discovery endpoints:
   - `GET /api/v1/resources/pending-deletion` — resources tombstoned and awaiting GC (`list_pending_collection`)

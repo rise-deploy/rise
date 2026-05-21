@@ -1191,6 +1191,68 @@ impl ResourceStore for PgResourceStore {
         }))
     }
 
+    async fn resolve_collection_by_kind(
+        &self,
+        group: &str,
+        kind: &str,
+    ) -> Result<Option<CollectionInfo>, StoreError> {
+        // Built-in kinds are root-scoped and live in the `rise.dev` group; they
+        // have no `resource_definitions` row, so map `(group, kind)` to the
+        // plural and resolve against the built-in registry.
+        if group == Self::group_of(API_VERSION_V1ALPHA1) {
+            let builtin_plural = match kind {
+                ORGANIZATION_KIND => Some(ORGANIZATION_COLLECTION),
+                RESOURCE_DEFINITION_KIND => Some(RESOURCE_DEFINITION_COLLECTION),
+                _ => None,
+            };
+            if let Some(plural) = builtin_plural {
+                return Ok(Self::builtin_collection_info(plural));
+            }
+        }
+
+        // `(group_name, kind)` is unique (resource_definitions_group_kind_unique).
+        let row = sqlx::query(
+            r#"
+            SELECT plural, versions
+            FROM resource_store.resource_definitions
+            WHERE group_name = $1 AND kind = $2
+            "#,
+        )
+        .bind(group)
+        .bind(kind)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let plural: String = row.try_get("plural").map_err(StoreError::Database)?;
+        let versions: Vec<rise_resource_api::ResourceDefinitionVersion> =
+            serde_json::from_value(row.try_get("versions").map_err(StoreError::Database)?)
+                .map_err(|e| {
+                    StoreError::Validation(format!("invalid versions in ResourceDefinition: {e}"))
+                })?;
+
+        // Ancestors are not version-addressed: resolve at the storage version,
+        // falling back to any served version when the storage version is not
+        // served (`resolve_collection_version` rejects non-served versions).
+        let storage = versions.iter().find(|v| v.storage);
+        let version = storage
+            .filter(|v| v.served)
+            .or_else(|| versions.iter().find(|v| v.served))
+            .or(storage)
+            .map(|v| v.name.clone())
+            .ok_or_else(|| {
+                StoreError::Validation(format!(
+                    "ResourceDefinition '{plural}' declares no versions"
+                ))
+            })?;
+
+        self.resolve_collection_version(group, &version, &plural)
+            .await
+    }
+
     async fn register_resource_definition(
         &self,
         params: CreateResourceParams,

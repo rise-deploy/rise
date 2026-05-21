@@ -6,29 +6,30 @@ The generic resource API (`/api/v1/resources/...`) is an operator-only HTTP surf
 
 ## URL Grammar
 
-Resource collection paths are versioned, following the same group/version shape as the Kubernetes API:
+A resource path names the **leaf** collection as `{group}/{version}/{plural}`, followed by the resource hierarchy as bare names. Each `ResourceDefinition` declares exactly one `parent`, so the whole ancestor chain of *kinds* is derived from the leaf kind — the URL only names *which instances*. `D` is the leaf kind's parent-chain depth (`0` for a root-scoped collection).
 
 | Path | HTTP Methods | Operation |
 |---|---|---|
-| `apis/{group}/{version}/{plural}` | GET, POST | List / create in a root-scoped collection |
-| `apis/{group}/{version}/{plural}/{id}` | GET, PUT, DELETE | Get / update / delete an item |
-| `apis/{group}/{version}/{plural}/{id}/status` | PUT | Controller status update |
-| `apis/{group}/{version}/{plural}/{id}/finalizers` | PUT | Controller finalizer update |
-| `apis/{group}/{version}/{plural}/{id}/reparent` | POST | Move an item under a new parent |
-| `apis/{groupA}/{versionA}/{pluralA}/{idA}/apis/{groupB}/{versionB}/{pluralB}` | GET, POST | List / create children under a typed parent |
+| `{group}/{version}/{plural}/{ancestor}…` (`D` names) | GET, POST | List / create in the collection |
+| `{group}/{version}/{plural}/{ancestor}…/{name}` (`D+1`) | GET, PUT, DELETE | Get / update / delete an item |
+| `{group}/{version}/{plural}/{ancestor}…/{name}/status` (`D+2`) | PUT | Controller status update |
+| `{group}/{version}/{plural}/{ancestor}…/{name}/finalizers` (`D+2`) | PUT | Controller finalizer update |
+| `{group}/{version}/{plural}/{ancestor}…/{name}/reparent` (`D+2`) | POST | Move an item under a new parent |
+| `{group}/{version}/{plural}/uid:{uuid}` | GET, PUT, DELETE | Get / update / delete an item by UID |
+| `{group}/{version}/{plural}/uid:{uuid}/{sub}` | PUT, POST | `status` / `finalizers` / `reparent` on an item by UID |
 | `pending-deletion` | GET | List resources tombstoned and awaiting garbage collection |
 
-`pending-deletion` is only valid as the sole path segment, so a resource may be named `pending-deletion`.
+The `{ancestor}` segments are bare resource *names*, ordered root-most first; the ancestor *types* are derived from the leaf's `ResourceDefinition` parent chain, never supplied in the URL. `pending-deletion` is only valid as the sole path segment, so a resource may be named `pending-deletion`.
 
-Unversioned resource paths are not supported.
+Unversioned resource paths are not supported — `{group}/{version}` always names the leaf collection.
 
 ## UID Addressing
 
-Any identifier segment can be prefixed with `uid:` to address by UUID instead of name:
+The leaf identifier may be given as `uid:{uuid}` instead of a name. A UID is globally unique, so the ancestor names are redundant: the `uid:` form is valid **only** as the sole identifier segment, immediately after `{group}/{version}/{plural}`, with no ancestor names.
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" \
-  https://rise.example.com/api/v1/resources/apis/rise.dev/v1alpha1/organizations/uid:123e4567-e89b-12d3-a456-426614174000
+  https://rise.example.com/api/v1/resources/rise.dev/v1alpha1/organizations/uid:123e4567-e89b-12d3-a456-426614174000
 ```
 
 When a UID-prefixed identifier is used in a PUT URL, the body's `metadata.name` is not validated against the URL. It still must match the stored resource name.
@@ -48,7 +49,8 @@ Controller tokens cannot perform item-level PUT or other operator operations.
 
 - Root-scoped resources set `scope: "root"` and do not declare `parent`.
 - Non-root resources must declare `parent: { "apiVersion": "...", "kind": "..." }`.
-- Children may only exist directly under a parent whose stored `apiVersion` and `kind` exactly match the declared parent.
+- The ancestor *types* in a URL are derived from this parent chain — the URL carries only ancestor *names*, so a child can never be addressed under a parent of the wrong type.
+- A child may only exist directly under a parent of the declared parent kind.
 - A `ResourceDefinition` cannot be deleted while any related resources exist in any declared version.
 
 Version behavior follows Kubernetes-style semantics:
@@ -69,30 +71,32 @@ Version behavior follows Kubernetes-style semantics:
 ```bash
 curl -X DELETE \
   -H "Authorization: Bearer $TOKEN" \
-  "https://rise.example.com/api/v1/resources/apis/rise.dev/v1alpha1/organizations/acme"
+  "https://rise.example.com/api/v1/resources/rise.dev/v1alpha1/organizations/acme"
 ```
 
 ## Examples
+
+These examples assume a `widgets` collection (group `example.dev`) whose declared parent is the built-in `Organization` — a parent-chain depth of `1`, so a widget path carries one ancestor name (the organization).
 
 ### List Organizations
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" \
-  https://rise.example.com/api/v1/resources/apis/rise.dev/v1alpha1/organizations
+  https://rise.example.com/api/v1/resources/rise.dev/v1alpha1/organizations
 ```
 
 ### Get An Organization
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" \
-  https://rise.example.com/api/v1/resources/apis/rise.dev/v1alpha1/organizations/acme
+  https://rise.example.com/api/v1/resources/rise.dev/v1alpha1/organizations/acme
 ```
 
 ### List Widgets Under An Organization
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" \
-  https://rise.example.com/api/v1/resources/apis/rise.dev/v1alpha1/organizations/acme/apis/example.dev/v1/widgets
+  https://rise.example.com/api/v1/resources/example.dev/v1/widgets/acme
 ```
 
 ### Create A Widget
@@ -107,7 +111,7 @@ curl -X POST \
     "metadata": { "name": "my-widget", "annotations": {} },
     "spec": { "color": "blue" }
   }' \
-  https://rise.example.com/api/v1/resources/apis/rise.dev/v1alpha1/organizations/acme/apis/example.dev/v1/widgets
+  https://rise.example.com/api/v1/resources/example.dev/v1/widgets/acme
 ```
 
 ### Update Controller Status
@@ -117,7 +121,7 @@ curl -X PUT \
   -H "Authorization: Bearer $CONTROLLER_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{ "status": { "phase": "Ready", "message": "all good" } }' \
-  https://rise.example.com/api/v1/resources/apis/rise.dev/v1alpha1/organizations/acme/apis/example.dev/v1/widgets/my-widget/status
+  https://rise.example.com/api/v1/resources/example.dev/v1/widgets/acme/my-widget/status
 ```
 
 The status payload is stored under `status.controllers[<controller-id>]`. Other controller slots are unaffected.

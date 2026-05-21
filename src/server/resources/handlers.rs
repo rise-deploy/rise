@@ -29,7 +29,8 @@ use super::models::{
     ControllerStatusUpdate, ReparentRequest, ResourceList,
 };
 use super::path::{
-    parse_identifier, parse_resource_path, AncestorRef, CollectionRef, ResourcePath, Subresource,
+    parse_identifier, parse_resource_path, parse_uid_token, CollectionRef, RawResourcePath,
+    Subresource, UID_PREFIX,
 };
 use crate::db::models::User;
 use crate::server::auth::context::{AnyAuth, AuthContext};
@@ -119,9 +120,9 @@ async fn resolve_collection(
 /// Resolve a leaf resource by building the full ancestor + leaf segment chain
 /// and calling `store.resolve_path` once.
 ///
-/// `ancestor_segs` must be the already-resolved ancestor segments (from
-/// `resolve_ancestors`). Appends the leaf segment for `identifier` and passes
-/// the complete chain to the store so ancestry validation is correct even for
+/// `ancestor_segs` must be the already-built ancestor segments (from
+/// `classify_path`). Appends the leaf segment for `identifier` and passes the
+/// complete chain to the store so ancestry validation is correct even for
 /// depth-2+ paths.
 async fn resolve_item(
     store: &Arc<dyn ResourceStore>,
@@ -176,42 +177,79 @@ fn api_group(api_version: &str) -> &str {
     api_version.split('/').next().unwrap_or(api_version)
 }
 
-/// Check that a collection's declared parent type is consistent with the parent
-/// resolved from the URL path.
+/// Maximum `ResourceDefinition` parent-chain depth. The chain is walked per
+/// request to derive ancestor types; there is no cycle check at registration,
+/// so a cyclic `parent` graph would otherwise loop forever. Hitting this cap is
+/// treated as a server misconfiguration (500).
+const MAX_PARENT_CHAIN_DEPTH: usize = 32;
+
+/// Resolve a leaf resource addressed by `uid:` form.
 ///
-/// This single check covers every case: a root-scoped collection (no declared
-/// parent) must have no parent in the path, and a collection that declares a
-/// parent must appear under a resource of that parent's API **group** and
-/// **kind**. The parent's version is intentionally ignored — a parent resource
-/// may be stored at an older served version than the one the child's
-/// `ResourceDefinition` declares, so an exact `api_version` match would wrongly
-/// reject otherwise-valid children.
-fn enforce_parent_type(
-    info: &CollectionInfo,
-    parent: Option<&ResourceRow>,
-    collection: &str,
-) -> Result<(), ServerError> {
-    match (&info.parent, parent) {
-        (None, None) => Ok(()),
-        (None, Some(_)) => Err(ServerError::bad_request(format!(
-            "collection '{collection}' is root-scoped and cannot appear under a parent resource"
-        ))),
-        (Some(_), None) => Err(ServerError::bad_request(format!(
-            "collection '{collection}' requires a parent resource"
-        ))),
-        (Some(expected), Some(parent)) => {
-            let expected_group = api_group(&expected.api_version);
-            let parent_group = api_group(&parent.api_version);
-            if parent_group == expected_group && parent.kind == expected.kind {
-                Ok(())
-            } else {
-                Err(ServerError::bad_request(format!(
-                    "collection '{collection}' requires parent '{}/{}', got '{}/{}'",
-                    expected.api_version, expected.kind, parent.api_version, parent.kind
-                )))
-            }
-        }
+/// A UID is globally unique, so the ancestor chain is redundant and is not
+/// consulted — this resolves the row directly and verifies it belongs to the
+/// addressed collection (matching kind and a declared `api_version`). A missing
+/// UID, or a row of the wrong kind, is a 404.
+async fn resolve_item_by_uid(
+    store: &Arc<dyn ResourceStore>,
+    resolved: &ResolvedCollection,
+    uid: Uuid,
+) -> Result<ResourceRow, ServerError> {
+    let row = store
+        .get(uid)
+        .await
+        .map_err(store_error_to_server_error)?
+        .ok_or_else(|| ServerError::not_found(format!("resource 'uid:{uid}' not found")))?;
+    if row.kind != resolved.info.kind
+        || !resolved
+            .info
+            .declared_api_versions
+            .contains(&row.api_version)
+    {
+        return Err(ServerError::not_found(format!(
+            "resource 'uid:{uid}' is not a member of collection '{}'",
+            resolved.collection
+        )));
     }
+    Ok(row)
+}
+
+/// Walk the `ResourceDefinition` parent chain of `leaf`, returning the ancestor
+/// collections root-most first. `chain.len()` is the leaf kind's parent-chain
+/// depth `D`.
+///
+/// Each ancestor is resolved by `(group, kind)` via `resolve_collection_by_kind`.
+/// An ancestor kind with no registered collection is a 404. The walk is capped
+/// at `MAX_PARENT_CHAIN_DEPTH` to guard against a cyclic RD `parent` graph.
+async fn resolve_parent_chain(
+    store: &Arc<dyn ResourceStore>,
+    leaf: &CollectionInfo,
+) -> Result<Vec<CollectionInfo>, ServerError> {
+    let mut chain: Vec<CollectionInfo> = Vec::new();
+    let mut current = leaf.parent.clone();
+    while let Some(parent_ref) = current {
+        if chain.len() >= MAX_PARENT_CHAIN_DEPTH {
+            return Err(ServerError::internal(format!(
+                "ResourceDefinition parent chain for kind '{}' exceeds the maximum depth \
+                 of {MAX_PARENT_CHAIN_DEPTH}; the parent graph may contain a cycle",
+                leaf.kind
+            )));
+        }
+        let group = api_group(&parent_ref.api_version);
+        let info = store
+            .resolve_collection_by_kind(group, &parent_ref.kind)
+            .await
+            .map_err(store_error_to_server_error)?
+            .ok_or_else(|| {
+                ServerError::not_found(format!(
+                    "parent collection '{}/{}' declared by kind '{}' is not registered",
+                    group, parent_ref.kind, leaf.kind
+                ))
+            })?;
+        current = info.parent.clone();
+        chain.push(info);
+    }
+    chain.reverse();
+    Ok(chain)
 }
 
 /// Authorize a controller token for status/finalizer writes against a
@@ -285,58 +323,201 @@ pub struct PendingDeletionQuery {
 }
 
 // -----------------------------------------------------------------------------
-// Ancestor resolution helper
+// Store-aware path classification
 // -----------------------------------------------------------------------------
 
-/// Resolve a sequence of ancestor `AncestorRef` values to `PathSegment`s.
+/// How to resolve the leaf resource row of an item/subresource path.
+enum LeafRef {
+    /// Named form: `D` ancestor name segments plus the leaf name.
+    Named {
+        ancestor_segs: Vec<PathSegment>,
+        name: String,
+    },
+    /// `uid:` form: a globally-unique UID, no ancestor segments.
+    Uid(Uuid),
+}
+
+impl LeafRef {
+    /// The identifier as it appeared in the URL — a bare name, or `uid:<uuid>`.
+    fn url_name(&self) -> String {
+        match self {
+            LeafRef::Named { name, .. } => name.clone(),
+            LeafRef::Uid(uid) => format!("{UID_PREFIX}{uid}"),
+        }
+    }
+}
+
+/// A resource path classified against the leaf kind's parent-chain depth.
+enum ResolvedPath {
+    /// `pending-deletion`: resources tombstoned and awaiting GC.
+    PendingDeletion,
+    /// A collection listing — `D` ancestor name segments, no leaf.
+    List {
+        resolved: ResolvedCollection,
+        ancestor_segs: Vec<PathSegment>,
+    },
+    /// A single item.
+    Item {
+        resolved: ResolvedCollection,
+        leaf: LeafRef,
+    },
+    /// A subresource operation on an item.
+    Subresource {
+        resolved: ResolvedCollection,
+        leaf: LeafRef,
+        subresource: Subresource,
+    },
+}
+
+/// Build the "wrong number of segments" 400 for a named path.
+fn segment_count_error(resolved: &ResolvedCollection, depth: usize, got: usize) -> ServerError {
+    ServerError::bad_request(format!(
+        "collection '{}' has parent-chain depth {depth}: a list expects {depth} ancestor \
+         name segment(s), an item {}, a subresource {} (the item name plus a subresource \
+         keyword); got {got}",
+        resolved.collection,
+        depth + 1,
+        depth + 2,
+    ))
+}
+
+/// Classify a parsed resource path against the resource store.
 ///
-/// Each ancestor's declared parent type is checked against its position in the
-/// path: the first ancestor must be root-scoped; any further ancestor must sit
-/// under a parent of its declared parent type. The returned segments can be
-/// passed directly to `ResourceStore::resolve_path`.
-///
-/// The full ancestor path is resolved with a single `store.resolve_path` call
-/// (rather than once per ancestor prefix), so the cost is O(n) row lookups
-/// across one transaction instead of O(n^2) across n transactions.
-async fn resolve_ancestors(
+/// `parse_resource_path` cannot decide list-vs-item-vs-subresource: that needs
+/// the leaf kind's parent-chain depth `D`. This resolves the leaf collection,
+/// then either short-circuits the `uid:` form (a UID is globally unique, so the
+/// ancestor chain is irrelevant — no parent-chain walk) or walks the parent
+/// chain to learn `D` and classifies the named segments against it.
+async fn classify_path(
     store: &Arc<dyn ResourceStore>,
-    ancestors: &[AncestorRef],
-) -> Result<(Vec<PathSegment>, Option<ResourceRow>), ServerError> {
-    // Step 1: resolve every ancestor collection and build the full segment
-    // chain. No `resolve_path` calls happen in this loop.
-    let mut segs = Vec::with_capacity(ancestors.len());
-    let mut infos = Vec::with_capacity(ancestors.len());
-    for anc in ancestors {
-        let resolved = resolve_collection(store, &anc.collection).await?;
-        segs.push(path_segment(
-            &resolved.info.declared_api_versions,
-            &resolved.info.kind,
-            &anc.identifier,
+    raw: RawResourcePath,
+) -> Result<ResolvedPath, ServerError> {
+    let (collection, segments) = match raw {
+        RawResourcePath::PendingDeletion => return Ok(ResolvedPath::PendingDeletion),
+        RawResourcePath::Collection {
+            collection,
+            segments,
+        } => (collection, segments),
+    };
+    let resolved = resolve_collection(store, &collection).await?;
+
+    // `uid:` form: a `uid:` token as the sole identifier segment. A UID is
+    // globally unique, so the ancestor chain is redundant — the parent-chain
+    // walk is skipped entirely and the form resolves even when an ancestor's
+    // ResourceDefinition is absent.
+    if segments.first().is_some_and(|s| s.starts_with(UID_PREFIX)) {
+        let uid = parse_uid_token(&segments[0])?;
+        return match segments.len() {
+            1 => Ok(ResolvedPath::Item {
+                resolved,
+                leaf: LeafRef::Uid(uid),
+            }),
+            2 => {
+                let subresource = Subresource::from_keyword(&segments[1]).ok_or_else(|| {
+                    ServerError::bad_request(format!(
+                        "expected a subresource keyword after a uid: identifier, got '{}'",
+                        segments[1]
+                    ))
+                })?;
+                Ok(ResolvedPath::Subresource {
+                    resolved,
+                    leaf: LeafRef::Uid(uid),
+                    subresource,
+                })
+            }
+            _ => Err(ServerError::bad_request(
+                "a uid: identifier may be followed only by an optional subresource keyword",
+            )),
+        };
+    }
+
+    // Named form: a `uid:` token is valid only as the sole identifier segment.
+    if let Some(pos) = segments.iter().position(|s| s.starts_with(UID_PREFIX)) {
+        return Err(ServerError::bad_request(format!(
+            "uid: token at segment {pos} is invalid; a uid: identifier may only appear as \
+             the sole identifier segment, with no ancestor names"
+        )));
+    }
+
+    // Derive the parent-chain depth `D` and classify the segment count.
+    let ancestors = resolve_parent_chain(store, &resolved.info).await?;
+    let depth = ancestors.len();
+    let n = segments.len();
+    if n < depth {
+        return Err(segment_count_error(&resolved, depth, n));
+    }
+
+    let mut ancestor_segs = Vec::with_capacity(depth);
+    for (ancestor, name) in ancestors.iter().zip(&segments) {
+        ancestor_segs.push(path_segment(
+            &ancestor.declared_api_versions,
+            &ancestor.kind,
+            name,
         )?);
-        infos.push(resolved);
     }
 
-    if segs.is_empty() {
-        return Ok((segs, None));
+    match n - depth {
+        0 => Ok(ResolvedPath::List {
+            resolved,
+            ancestor_segs,
+        }),
+        1 => Ok(ResolvedPath::Item {
+            resolved,
+            leaf: LeafRef::Named {
+                ancestor_segs,
+                name: segments[depth].clone(),
+            },
+        }),
+        2 => {
+            let subresource = Subresource::from_keyword(&segments[depth + 1]).ok_or_else(|| {
+                ServerError::bad_request(format!(
+                    "expected a subresource keyword (status, finalizers, reparent) after \
+                     the item name, got '{}'",
+                    segments[depth + 1]
+                ))
+            })?;
+            Ok(ResolvedPath::Subresource {
+                resolved,
+                leaf: LeafRef::Named {
+                    ancestor_segs,
+                    name: segments[depth].clone(),
+                },
+                subresource,
+            })
+        }
+        _ => Err(segment_count_error(&resolved, depth, n)),
     }
+}
 
-    // Step 2: resolve the complete ancestor chain in one call. On success the
-    // chain has exactly one row per segment; a missing ancestor surfaces as a
-    // 404 from the store.
+/// Resolve the parent row for a list: the last ancestor in the chain. Returns
+/// `None` when there are no ancestor segments (a root-scoped leaf collection).
+async fn resolve_parent_row(
+    store: &Arc<dyn ResourceStore>,
+    ancestor_segs: &[PathSegment],
+) -> Result<Option<ResourceRow>, ServerError> {
+    if ancestor_segs.is_empty() {
+        return Ok(None);
+    }
     let chain = store
-        .resolve_path(&segs)
+        .resolve_path(ancestor_segs)
         .await
         .map_err(store_error_to_server_error)?;
+    Ok(chain.into_iter().last())
+}
 
-    // Step 3: walk the chain to validate parent typing at each level. Ancestor
-    // `i`'s parent is `chain[i - 1]`; ancestor 0 has no parent.
-    for (i, resolved) in infos.iter().enumerate() {
-        let parent = i.checked_sub(1).and_then(|p| chain.get(p));
-        enforce_parent_type(&resolved.info, parent, &resolved.collection)?;
+/// Resolve the leaf resource row for an item/subresource path.
+async fn resolve_leaf(
+    store: &Arc<dyn ResourceStore>,
+    resolved: &ResolvedCollection,
+    leaf: LeafRef,
+) -> Result<ResourceRow, ServerError> {
+    match leaf {
+        LeafRef::Named {
+            ancestor_segs,
+            name,
+        } => resolve_item(store, ancestor_segs, &resolved.info, &name).await,
+        LeafRef::Uid(uid) => resolve_item_by_uid(store, resolved, uid).await,
     }
-
-    let parent = chain.into_iter().last();
-    Ok((segs, parent))
 }
 
 // -----------------------------------------------------------------------------
@@ -358,10 +539,12 @@ async fn dispatch_get_inner(
     auth: AuthContext,
     q: PendingDeletionQuery,
 ) -> Result<Response, ServerError> {
-    let path = parse_resource_path(&raw)?;
-    match path {
-        ResourcePath::PendingDeletion => {
-            let user = require_operator(ctx, &auth)?;
+    let raw_path = parse_resource_path(&raw)?;
+    // Every GET path on the generic resource API is operator-only; authorize
+    // before any store I/O so collection existence is not probeable.
+    let user = require_operator(ctx, &auth)?;
+    match classify_path(&ctx.store, raw_path).await? {
+        ResolvedPath::PendingDeletion => {
             let limit = q.limit.unwrap_or(100).clamp(1, 1000);
             let rows = ctx
                 .store
@@ -378,15 +561,13 @@ async fn dispatch_get_inner(
                 rows.iter().map(row_to_resource).collect();
             Ok(Json(serde_json::json!({ "items": items })).into_response())
         }
-        ResourcePath::List {
-            ancestors,
-            collection,
+        ResolvedPath::List {
+            resolved,
+            ancestor_segs,
         } => {
-            let _user = require_operator(ctx, &auth)?;
-            let (_ancestor_segs, parent) = resolve_ancestors(&ctx.store, &ancestors).await?;
-            let parent_uid = parent.as_ref().map(|r| r.uid);
-            let resolved = resolve_collection(&ctx.store, &collection).await?;
-            enforce_parent_type(&resolved.info, parent.as_ref(), &resolved.collection)?;
+            let parent_uid = resolve_parent_row(&ctx.store, &ancestor_segs)
+                .await?
+                .map(|r| r.uid);
             let rows = ctx
                 .store
                 .list_versions(
@@ -406,23 +587,15 @@ async fn dispatch_get_inner(
             })
             .into_response())
         }
-        ResourcePath::Item {
-            ancestors,
-            collection,
-            identifier,
-        } => {
-            let _user = require_operator(ctx, &auth)?;
-            let (ancestor_segs, parent) = resolve_ancestors(&ctx.store, &ancestors).await?;
-            let resolved = resolve_collection(&ctx.store, &collection).await?;
-            enforce_parent_type(&resolved.info, parent.as_ref(), &resolved.collection)?;
-            let row = resolve_item(&ctx.store, ancestor_segs, &resolved.info, &identifier).await?;
+        ResolvedPath::Item { resolved, leaf } => {
+            let row = resolve_leaf(&ctx.store, &resolved, leaf).await?;
             Ok(Json(row_to_resource_with_api_version(
                 &row,
                 &resolved.info.api_version,
             ))
             .into_response())
         }
-        ResourcePath::Subresource { .. } => Err(ServerError::new(
+        ResolvedPath::Subresource { .. } => Err(ServerError::new(
             StatusCode::METHOD_NOT_ALLOWED,
             "GET is not supported for subresource paths",
         )),
@@ -444,36 +617,31 @@ async fn dispatch_post_inner(
     auth: AuthContext,
     body: serde_json::Value,
 ) -> Result<Response, ServerError> {
-    let path = parse_resource_path(&raw)?;
-    match path {
-        ResourcePath::List {
-            ancestors,
-            collection,
+    let raw_path = parse_resource_path(&raw)?;
+    // Every POST path on the generic resource API is operator-only.
+    let user = require_operator(ctx, &auth)?;
+    match classify_path(&ctx.store, raw_path).await? {
+        ResolvedPath::List {
+            resolved,
+            ancestor_segs,
         } => {
-            let user = require_operator(ctx, &auth)?;
             let body: CreateResourceRequest = serde_json::from_value(body)
                 .map_err(|e| ServerError::bad_request(format!("invalid request body: {e}")))?;
-            let (_ancestor_segs, parent) = resolve_ancestors(&ctx.store, &ancestors).await?;
-            let parent_uid = parent.as_ref().map(|r| r.uid);
-            let resolved = resolve_collection(&ctx.store, &collection).await?;
-            enforce_parent_type(&resolved.info, parent.as_ref(), &resolved.collection)?;
+            let parent_uid = resolve_parent_row(&ctx.store, &ancestor_segs)
+                .await?
+                .map(|r| r.uid);
             let (status, resource) =
                 create_resource(ctx, &resolved, parent_uid, body, &user).await?;
             Ok((status, resource).into_response())
         }
-        ResourcePath::Subresource {
-            ancestors,
-            collection,
-            identifier,
+        ResolvedPath::Subresource {
+            resolved,
+            leaf,
             subresource: Subresource::Reparent,
         } => {
-            let user = require_operator(ctx, &auth)?;
             let body: ReparentRequest = serde_json::from_value(body)
                 .map_err(|e| ServerError::bad_request(format!("invalid request body: {e}")))?;
-            let (ancestor_segs, parent) = resolve_ancestors(&ctx.store, &ancestors).await?;
-            let resolved = resolve_collection(&ctx.store, &collection).await?;
-            enforce_parent_type(&resolved.info, parent.as_ref(), &resolved.collection)?;
-            let row = resolve_item(&ctx.store, ancestor_segs, &resolved.info, &identifier).await?;
+            let row = resolve_leaf(&ctx.store, &resolved, leaf).await?;
             let resp = apply_reparent(ctx, &resolved.info, &row, body, &user).await?;
             Ok(resp.into_response())
         }
@@ -499,13 +667,9 @@ async fn dispatch_put_inner(
     auth: AnyAuth,
     body: serde_json::Value,
 ) -> Result<Response, ServerError> {
-    let path = parse_resource_path(&raw)?;
-    match path {
-        ResourcePath::Item {
-            ancestors,
-            collection,
-            identifier,
-        } => {
+    let raw_path = parse_resource_path(&raw)?;
+    match classify_path(&ctx.store, raw_path).await? {
+        ResolvedPath::Item { resolved, leaf } => {
             // Controller tokens must not update items
             let auth_ctx = match &auth {
                 AnyAuth::User(c) => c,
@@ -518,17 +682,14 @@ async fn dispatch_put_inner(
             let user = require_operator(ctx, auth_ctx)?;
             let body: UpdateResourceRequest = serde_json::from_value(body)
                 .map_err(|e| ServerError::bad_request(format!("invalid request body: {e}")))?;
-            let (ancestor_segs, parent) = resolve_ancestors(&ctx.store, &ancestors).await?;
-            let resolved = resolve_collection(&ctx.store, &collection).await?;
-            enforce_parent_type(&resolved.info, parent.as_ref(), &resolved.collection)?;
-            let row = resolve_item(&ctx.store, ancestor_segs, &resolved.info, &identifier).await?;
-            let resp = update_resource(ctx, &resolved, &row, &identifier, body, &user).await?;
+            let url_name = leaf.url_name();
+            let row = resolve_leaf(&ctx.store, &resolved, leaf).await?;
+            let resp = update_resource(ctx, &resolved, &row, &url_name, body, &user).await?;
             Ok(resp.into_response())
         }
-        ResourcePath::Subresource {
-            ancestors,
-            collection,
-            identifier,
+        ResolvedPath::Subresource {
+            resolved,
+            leaf,
             subresource,
         } => {
             // `reparent` is POST-only; reject PUT before auth discrimination so
@@ -550,15 +711,12 @@ async fn dispatch_put_inner(
                     ));
                 }
             };
-            let (ancestor_segs, parent) = resolve_ancestors(&ctx.store, &ancestors).await?;
-            let resolved = resolve_collection(&ctx.store, &collection).await?;
-            enforce_parent_type(&resolved.info, parent.as_ref(), &resolved.collection)?;
             enforce_controller_allowed(
                 &resolved.info,
                 &resolved.collection,
                 &controller.0.identity_id,
             )?;
-            let row = resolve_item(&ctx.store, ancestor_segs, &resolved.info, &identifier).await?;
+            let row = resolve_leaf(&ctx.store, &resolved, leaf).await?;
             match subresource {
                 Subresource::Status => {
                     let body: ControllerStatusUpdate =
@@ -613,18 +771,12 @@ async fn dispatch_delete_inner(
     raw: String,
     auth: AuthContext,
 ) -> Result<Response, ServerError> {
-    let path = parse_resource_path(&raw)?;
-    match path {
-        ResourcePath::Item {
-            ancestors,
-            collection,
-            identifier,
-        } => {
-            let user = require_operator(ctx, &auth)?;
-            let (ancestor_segs, parent) = resolve_ancestors(&ctx.store, &ancestors).await?;
-            let resolved = resolve_collection(&ctx.store, &collection).await?;
-            enforce_parent_type(&resolved.info, parent.as_ref(), &resolved.collection)?;
-            let row = resolve_item(&ctx.store, ancestor_segs, &resolved.info, &identifier).await?;
+    let raw_path = parse_resource_path(&raw)?;
+    // Every DELETE path on the generic resource API is operator-only.
+    let user = require_operator(ctx, &auth)?;
+    match classify_path(&ctx.store, raw_path).await? {
+        ResolvedPath::Item { resolved, leaf } => {
+            let row = resolve_leaf(&ctx.store, &resolved, leaf).await?;
             let resp = delete_resource(ctx, &row, &user, &resolved.info.api_version).await?;
             Ok(resp.into_response())
         }
@@ -875,7 +1027,7 @@ async fn apply_reparent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rise_resource_api::{ResourceParentRef, ResourceScope};
+    use rise_resource_api::ResourceScope;
 
     #[test]
     fn assert_body_matches_uid_url_does_not_enforce_name() {
@@ -960,121 +1112,6 @@ mod tests {
         // No slash — the whole string is the group.
         assert_eq!(api_group("plaingroup"), "plaingroup");
         assert_eq!(api_group(""), "");
-    }
-
-    /// `CollectionInfo` for a child collection that declares `parent`.
-    fn child_collection_info(parent: Option<ResourceParentRef>) -> CollectionInfo {
-        CollectionInfo {
-            api_version: "example.dev/v2".into(),
-            storage_api_version: "example.dev/v2".into(),
-            served_api_versions: vec!["example.dev/v2".into()],
-            declared_api_versions: vec!["example.dev/v2".into()],
-            kind: "Gadget".into(),
-            scope: if parent.is_some() {
-                ResourceScope::Organization
-            } else {
-                ResourceScope::Root
-            },
-            parent,
-            spec_validator: std::sync::Arc::new(rise_resource_store::NoOpValidator),
-            allowed_status_controller_ids: vec![],
-        }
-    }
-
-    fn parent_row(api_version: &str, kind: &str) -> ResourceRow {
-        ResourceRow {
-            uid: Uuid::new_v4(),
-            api_version: api_version.to_string(),
-            kind: kind.to_string(),
-            parent_uid: None,
-            name: "p".into(),
-            discriminator: "abcd1234".into(),
-            metadata: serde_json::json!({}),
-            spec: serde_json::json!({}),
-            status: serde_json::json!({}),
-            revision: 1,
-            finalizers: vec![],
-            deletion_timestamp: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        }
-    }
-
-    #[test]
-    fn enforce_parent_type_root_scoped_accepts_no_parent() {
-        let info = child_collection_info(None);
-        assert!(enforce_parent_type(&info, None, "gadgets").is_ok());
-    }
-
-    #[test]
-    fn enforce_parent_type_root_scoped_rejects_a_parent() {
-        let info = child_collection_info(None);
-        let parent = parent_row("rise.dev/v1alpha1", "Organization");
-        let err = enforce_parent_type(&info, Some(&parent), "gadgets").unwrap_err();
-        assert_eq!(err.status, StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn enforce_parent_type_scoped_requires_a_parent() {
-        let info = child_collection_info(Some(ResourceParentRef {
-            api_version: "rise.dev/v1alpha1".into(),
-            kind: "Organization".into(),
-        }));
-        let err = enforce_parent_type(&info, None, "gadgets").unwrap_err();
-        assert_eq!(err.status, StatusCode::BAD_REQUEST);
-        assert!(err.message.contains("requires a parent"));
-    }
-
-    #[test]
-    fn enforce_parent_type_matches_on_group_and_kind() {
-        let info = child_collection_info(Some(ResourceParentRef {
-            api_version: "rise.dev/v1alpha1".into(),
-            kind: "Organization".into(),
-        }));
-        // Exact group + kind match.
-        let parent = parent_row("rise.dev/v1alpha1", "Organization");
-        assert!(enforce_parent_type(&info, Some(&parent), "gadgets").is_ok());
-    }
-
-    #[test]
-    fn enforce_parent_type_ignores_parent_version() {
-        // Fix B: a parent stored at an older served version than the one the
-        // child's ResourceDefinition declares must still be accepted — only the
-        // group + kind matter.
-        let info = child_collection_info(Some(ResourceParentRef {
-            api_version: "example.dev/v2".into(),
-            kind: "Folder".into(),
-        }));
-        let parent = parent_row("example.dev/v1", "Folder");
-        assert!(
-            enforce_parent_type(&info, Some(&parent), "gadgets").is_ok(),
-            "parent at older version example.dev/v1 should satisfy declared example.dev/v2"
-        );
-    }
-
-    #[test]
-    fn enforce_parent_type_rejects_wrong_group() {
-        let info = child_collection_info(Some(ResourceParentRef {
-            api_version: "rise.dev/v1alpha1".into(),
-            kind: "Organization".into(),
-        }));
-        // Same kind, different group — must be rejected.
-        let parent = parent_row("other.dev/v1alpha1", "Organization");
-        let err = enforce_parent_type(&info, Some(&parent), "gadgets").unwrap_err();
-        assert_eq!(err.status, StatusCode::BAD_REQUEST);
-        assert!(err.message.contains("requires parent"));
-    }
-
-    #[test]
-    fn enforce_parent_type_rejects_wrong_kind() {
-        let info = child_collection_info(Some(ResourceParentRef {
-            api_version: "rise.dev/v1alpha1".into(),
-            kind: "Organization".into(),
-        }));
-        // Same group, different kind — must be rejected.
-        let parent = parent_row("rise.dev/v1alpha1", "Project");
-        let err = enforce_parent_type(&info, Some(&parent), "gadgets").unwrap_err();
-        assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 }
 
@@ -1184,8 +1221,10 @@ mod dispatch_tests {
     }
 
     /// Register an Organization-scoped `gadgets` collection whose declared
-    /// parent is the built-in `rise.dev/v1alpha1` `Organization`.
-    async fn register_gadget_rd(ctx: &ResourceApiCtx) {
+    /// parent is the built-in `rise.dev/v1alpha1` `Organization` (depth 1).
+    /// `allowed` becomes the collection's `allowedStatusControllerIds`.
+    async fn register_gadget_rd(ctx: &ResourceApiCtx, allowed: &[&str]) {
+        let allowed: Vec<String> = allowed.iter().map(|s| s.to_string()).collect();
         let spec = json!({
             "group": "example.dev",
             "kind": "Gadget",
@@ -1193,7 +1232,7 @@ mod dispatch_tests {
             "scope": "organization",
             "parent": {"apiVersion": "rise.dev/v1alpha1", "kind": "Organization"},
             "versions": [{"name": "v1", "served": true, "storage": true}],
-            "allowedStatusControllerIds": [],
+            "allowedStatusControllerIds": allowed,
         });
         ctx.store
             .register_resource_definition(CreateResourceParams {
@@ -1210,6 +1249,67 @@ mod dispatch_tests {
             .expect("register gadgets RD");
     }
 
+    /// Register a `gizmos` collection whose declared parent is the `Gadget`
+    /// collection — a depth-2 chain (`Gizmo` → `Gadget` → `Organization`).
+    async fn register_gizmo_rd(ctx: &ResourceApiCtx) {
+        let spec = json!({
+            "group": "example.dev",
+            "kind": "Gizmo",
+            "plural": "gizmos",
+            "scope": "organization",
+            "parent": {"apiVersion": "example.dev/v1", "kind": "Gadget"},
+            "versions": [{"name": "v1", "served": true, "storage": true}],
+            "allowedStatusControllerIds": [],
+        });
+        ctx.store
+            .register_resource_definition(CreateResourceParams {
+                api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
+                kind: RESOURCE_DEFINITION_KIND.to_string(),
+                name: "gizmos.example.dev".to_string(),
+                parent_uid: None,
+                annotations: BTreeMap::new(),
+                finalizers: vec![],
+                spec,
+                validator: None,
+            })
+            .await
+            .expect("register gizmos RD");
+    }
+
+    /// POST `body` to `path`, asserting a 201, and return the created JSON.
+    async fn create_at(ctx: &ResourceApiCtx, path: &str, body: Value) -> Value {
+        let resp = dispatch_post_inner(ctx, path.to_string(), auth(OPERATOR), body)
+            .await
+            .expect("create resource");
+        let (status, created) = read(resp).await;
+        assert_eq!(status, StatusCode::CREATED, "unexpected create status");
+        created
+    }
+
+    /// Parse `metadata.uid` from a resource JSON body.
+    fn uid_of(resource: &Value) -> Uuid {
+        resource["metadata"]["uid"]
+            .as_str()
+            .expect("uid")
+            .parse()
+            .expect("parse uid")
+    }
+
+    /// Create an Organization through the generic API.
+    async fn create_org(ctx: &ResourceApiCtx, name: &str) {
+        create_at(
+            ctx,
+            "rise.dev/v1alpha1/organizations",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "Organization",
+                "metadata": {"name": name},
+                "spec": {"displayName": name},
+            }),
+        )
+        .await;
+    }
+
     /// JSON body for creating a widget at the given served apiVersion.
     fn widget_body(api_version: &str, name: &str) -> Value {
         json!({
@@ -1224,7 +1324,7 @@ mod dispatch_tests {
     async fn create_widget(ctx: &ResourceApiCtx, api_version: &str, name: &str) -> Value {
         let resp = dispatch_post_inner(
             ctx,
-            "apis/example.dev/v1/widgets".to_string(),
+            "example.dev/v1/widgets".to_string(),
             auth(OPERATOR),
             widget_body(api_version, name),
         )
@@ -1246,7 +1346,7 @@ mod dispatch_tests {
 
         let err = dispatch_get_inner(
             &ctx,
-            "apis/example.dev/v1/widgets".to_string(),
+            "example.dev/v1/widgets".to_string(),
             auth(PLAIN_USER),
             PendingDeletionQuery::default(),
         )
@@ -1262,7 +1362,7 @@ mod dispatch_tests {
 
         let resp = dispatch_get_inner(
             &ctx,
-            "apis/example.dev/v1/widgets".to_string(),
+            "example.dev/v1/widgets".to_string(),
             auth(OPERATOR),
             PendingDeletionQuery::default(),
         )
@@ -1287,7 +1387,7 @@ mod dispatch_tests {
         // Any operator may reparent — there is no separate admin tier.
         let resp = dispatch_post_inner(
             &ctx,
-            "apis/example.dev/v1/widgets/w1/reparent".to_string(),
+            "example.dev/v1/widgets/w1/reparent".to_string(),
             auth(OPERATOR),
             json!({"newParentUid": null}),
         )
@@ -1305,7 +1405,7 @@ mod dispatch_tests {
 
         let err = dispatch_post_inner(
             &ctx,
-            "apis/example.dev/v1/widgets/w1/reparent".to_string(),
+            "example.dev/v1/widgets/w1/reparent".to_string(),
             auth(PLAIN_USER),
             json!({"newParentUid": null}),
         )
@@ -1328,7 +1428,7 @@ mod dispatch_tests {
         // authorization failure (403), not an authentication failure (401).
         let err = dispatch_put_inner(
             &ctx,
-            "apis/example.dev/v1/widgets/w1/status".to_string(),
+            "example.dev/v1/widgets/w1/status".to_string(),
             any_user(OPERATOR),
             json!({"status": {"phase": "Ready"}}),
         )
@@ -1339,7 +1439,7 @@ mod dispatch_tests {
         // Same for finalizers.
         let err = dispatch_put_inner(
             &ctx,
-            "apis/example.dev/v1/widgets/w1/finalizers".to_string(),
+            "example.dev/v1/widgets/w1/finalizers".to_string(),
             any_user(OPERATOR),
             json!({"add": ["x/y"], "remove": []}),
         )
@@ -1356,7 +1456,7 @@ mod dispatch_tests {
 
         let resp = dispatch_put_inner(
             &ctx,
-            "apis/example.dev/v1/widgets/w1/status".to_string(),
+            "example.dev/v1/widgets/w1/status".to_string(),
             any_controller("controller.example.com"),
             json!({"status": {"phase": "Ready"}}),
         )
@@ -1374,7 +1474,7 @@ mod dispatch_tests {
 
         let err = dispatch_put_inner(
             &ctx,
-            "apis/example.dev/v1/widgets/w1/status".to_string(),
+            "example.dev/v1/widgets/w1/status".to_string(),
             any_controller("other.example.com"),
             json!({"status": {"phase": "Ready"}}),
         )
@@ -1392,7 +1492,7 @@ mod dispatch_tests {
         // A controller token must not be able to PUT a full item.
         let err = dispatch_put_inner(
             &ctx,
-            "apis/example.dev/v1/widgets/w1".to_string(),
+            "example.dev/v1/widgets/w1".to_string(),
             any_controller("controller.example.com"),
             json!({
                 "apiVersion": "example.dev/v1",
@@ -1418,7 +1518,7 @@ mod dispatch_tests {
         // PUT is not valid for a collection path.
         let err = dispatch_put_inner(
             &ctx,
-            "apis/example.dev/v1/widgets".to_string(),
+            "example.dev/v1/widgets".to_string(),
             any_user(OPERATOR),
             json!({}),
         )
@@ -1427,13 +1527,9 @@ mod dispatch_tests {
         assert_eq!(err.status, StatusCode::METHOD_NOT_ALLOWED);
 
         // DELETE is not valid for a collection path.
-        let err = dispatch_delete_inner(
-            &ctx,
-            "apis/example.dev/v1/widgets".to_string(),
-            auth(OPERATOR),
-        )
-        .await
-        .expect_err("DELETE on a collection must be 405");
+        let err = dispatch_delete_inner(&ctx, "example.dev/v1/widgets".to_string(), auth(OPERATOR))
+            .await
+            .expect_err("DELETE on a collection must be 405");
         assert_eq!(err.status, StatusCode::METHOD_NOT_ALLOWED);
     }
 
@@ -1445,7 +1541,7 @@ mod dispatch_tests {
 
         let err = dispatch_get_inner(
             &ctx,
-            "apis/example.dev/v1/widgets/w1/status".to_string(),
+            "example.dev/v1/widgets/w1/status".to_string(),
             auth(OPERATOR),
             PendingDeletionQuery::default(),
         )
@@ -1463,7 +1559,7 @@ mod dispatch_tests {
         // POST is only valid for collection paths and reparent.
         let err = dispatch_post_inner(
             &ctx,
-            "apis/example.dev/v1/widgets/w1".to_string(),
+            "example.dev/v1/widgets/w1".to_string(),
             auth(OPERATOR),
             json!({}),
         )
@@ -1478,7 +1574,7 @@ mod dispatch_tests {
         // No RD registered for `nonexistents`.
         let err = dispatch_get_inner(
             &ctx,
-            "apis/example.dev/v1/nonexistents".to_string(),
+            "example.dev/v1/nonexistents".to_string(),
             auth(OPERATOR),
             PendingDeletionQuery::default(),
         )
@@ -1490,7 +1586,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn malformed_path_yields_400(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        // An unversioned collection path (no `apis/` prefix) is malformed.
+        // Fewer than three leading segments cannot name a {group}/{version}/{plural}.
         let err = dispatch_get_inner(
             &ctx,
             "widgets/w1".to_string(),
@@ -1504,7 +1600,7 @@ mod dispatch_tests {
         // A trailing-slash empty segment is also malformed.
         let err = dispatch_get_inner(
             &ctx,
-            "apis/example.dev/v1/widgets/".to_string(),
+            "example.dev/v1/widgets/".to_string(),
             auth(OPERATOR),
             PendingDeletionQuery::default(),
         )
@@ -1520,7 +1616,7 @@ mod dispatch_tests {
         // Collection exists, item does not.
         let err = dispatch_get_inner(
             &ctx,
-            "apis/example.dev/v1/widgets/missing".to_string(),
+            "example.dev/v1/widgets/missing".to_string(),
             auth(OPERATOR),
             PendingDeletionQuery::default(),
         )
@@ -1545,7 +1641,7 @@ mod dispatch_tests {
         // GET the same resource through the v2 served version.
         let resp = dispatch_get_inner(
             &ctx,
-            "apis/example.dev/v2/widgets/w1".to_string(),
+            "example.dev/v2/widgets/w1".to_string(),
             auth(OPERATOR),
             PendingDeletionQuery::default(),
         )
@@ -1562,7 +1658,7 @@ mod dispatch_tests {
         // LIST through v2 must also report v2 on the envelope and items.
         let resp = dispatch_get_inner(
             &ctx,
-            "apis/example.dev/v2/widgets".to_string(),
+            "example.dev/v2/widgets".to_string(),
             auth(OPERATOR),
             PendingDeletionQuery::default(),
         )
@@ -1584,7 +1680,7 @@ mod dispatch_tests {
         // names a version the ResourceDefinition does not expose).
         let err = dispatch_post_inner(
             &ctx,
-            "apis/example.dev/v3/widgets".to_string(),
+            "example.dev/v3/widgets".to_string(),
             auth(OPERATOR),
             widget_body("example.dev/v3", "w1"),
         )
@@ -1606,7 +1702,7 @@ mod dispatch_tests {
         // Creating a second widget with the same name in the same scope.
         let err = dispatch_post_inner(
             &ctx,
-            "apis/example.dev/v1/widgets".to_string(),
+            "example.dev/v1/widgets".to_string(),
             auth(OPERATOR),
             widget_body("example.dev/v1", "dup"),
         )
@@ -1637,7 +1733,7 @@ mod dispatch_tests {
         };
         let resp = dispatch_put_inner(
             &ctx,
-            "apis/example.dev/v1/widgets/w1".to_string(),
+            "example.dev/v1/widgets/w1".to_string(),
             any_user(OPERATOR),
             update(revision),
         )
@@ -1648,7 +1744,7 @@ mod dispatch_tests {
         // Re-using the now-stale revision must conflict (409), not 500.
         let err = dispatch_put_inner(
             &ctx,
-            "apis/example.dev/v1/widgets/w1".to_string(),
+            "example.dev/v1/widgets/w1".to_string(),
             any_user(OPERATOR),
             update(revision),
         )
@@ -1658,44 +1754,44 @@ mod dispatch_tests {
     }
 
     // -------------------------------------------------------------------------
-    // Parent typing through the dispatch layer (Fix B / Fix C)
+    // Parent-chain classification through the dispatch layer
     // -------------------------------------------------------------------------
 
     #[sqlx::test]
-    async fn nested_collection_requires_correct_parent_type(pool: sqlx::PgPool) {
+    async fn nested_ancestor_name_not_found_yields_404(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
-        register_gadget_rd(&ctx).await;
+        register_gadget_rd(&ctx, &[]).await;
 
-        // A root-scoped `widgets` resource cannot be a parent for the
-        // Organization-scoped `gadgets` collection — wrong parent kind => 400.
-        create_widget(&ctx, "example.dev/v1", "w1").await;
+        // `gadgets` is Organization-scoped (depth 1). The ancestor *type* is now
+        // derived from the ResourceDefinition graph and cannot be mistyped in
+        // the URL, so the only failure mode is an ancestor *name* with no row.
         let err = dispatch_get_inner(
             &ctx,
-            "apis/example.dev/v1/widgets/w1/apis/example.dev/v1/gadgets".to_string(),
+            "example.dev/v1/gadgets/no-such-org".to_string(),
             auth(OPERATOR),
             PendingDeletionQuery::default(),
         )
         .await
-        .expect_err("gadgets under a Widget parent must be a 400");
-        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        .expect_err("a missing ancestor organization must be a 404");
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
     }
 
     #[sqlx::test]
-    async fn root_scoped_collection_rejects_a_parent(pool: sqlx::PgPool) {
+    async fn excess_segments_for_root_collection_yields_400(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
         register_widget_rd(&ctx, &[]).await;
-        create_widget(&ctx, "example.dev/v1", "parent").await;
 
-        // `widgets` is root-scoped; nesting it under another resource is a 400.
+        // `widgets` is root-scoped (depth 0): a path may carry at most an item
+        // name plus a subresource keyword. More name segments than that is a
+        // segment-count 400.
         let err = dispatch_get_inner(
             &ctx,
-            "apis/example.dev/v1/widgets/parent/apis/example.dev/v1/widgets".to_string(),
+            "example.dev/v1/widgets/w1/extra/segments".to_string(),
             auth(OPERATOR),
             PendingDeletionQuery::default(),
         )
         .await
-        .expect_err("root-scoped collection under a parent must be a 400");
+        .expect_err("too many segments for a depth-0 collection must be a 400");
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
@@ -1716,7 +1812,7 @@ mod dispatch_tests {
         // Get.
         let resp = dispatch_get_inner(
             &ctx,
-            "apis/example.dev/v1/widgets/lifecycle".to_string(),
+            "example.dev/v1/widgets/lifecycle".to_string(),
             auth(OPERATOR),
             PendingDeletionQuery::default(),
         )
@@ -1729,7 +1825,7 @@ mod dispatch_tests {
         // Update.
         let resp = dispatch_put_inner(
             &ctx,
-            "apis/example.dev/v1/widgets/lifecycle".to_string(),
+            "example.dev/v1/widgets/lifecycle".to_string(),
             any_user(OPERATOR),
             json!({
                 "apiVersion": "example.dev/v1",
@@ -1747,7 +1843,7 @@ mod dispatch_tests {
         // Delete (cascade).
         let resp = dispatch_delete_inner(
             &ctx,
-            "apis/example.dev/v1/widgets/lifecycle".to_string(),
+            "example.dev/v1/widgets/lifecycle".to_string(),
             auth(OPERATOR),
         )
         .await
@@ -1757,7 +1853,7 @@ mod dispatch_tests {
         // Gone.
         let err = dispatch_get_inner(
             &ctx,
-            "apis/example.dev/v1/widgets/lifecycle".to_string(),
+            "example.dev/v1/widgets/lifecycle".to_string(),
             auth(OPERATOR),
             PendingDeletionQuery::default(),
         )
@@ -1777,7 +1873,7 @@ mod dispatch_tests {
 
         let err = dispatch_post_inner(
             &ctx,
-            "apis/example.dev/v1/widgets".to_string(),
+            "example.dev/v1/widgets".to_string(),
             auth(OPERATOR),
             json!({
                 "apiVersion": "example.dev/v1",
@@ -1886,7 +1982,7 @@ mod dispatch_tests {
         // Create through the served v2 endpoint — the row lands at storage v1.
         let resp = dispatch_post_inner(
             &ctx,
-            "apis/example.dev/v2/widgets".to_string(),
+            "example.dev/v2/widgets".to_string(),
             auth(OPERATOR),
             widget_body("example.dev/v2", "w1"),
         )
@@ -1899,7 +1995,7 @@ mod dispatch_tests {
         // GET via v2 must find the row stored at the non-served v1.
         let resp = dispatch_get_inner(
             &ctx,
-            "apis/example.dev/v2/widgets/w1".to_string(),
+            "example.dev/v2/widgets/w1".to_string(),
             auth(OPERATOR),
             PendingDeletionQuery::default(),
         )
@@ -1913,7 +2009,7 @@ mod dispatch_tests {
         // LIST via v2 must include it too.
         let resp = dispatch_get_inner(
             &ctx,
-            "apis/example.dev/v2/widgets".to_string(),
+            "example.dev/v2/widgets".to_string(),
             auth(OPERATOR),
             PendingDeletionQuery::default(),
         )
@@ -1939,12 +2035,248 @@ mod dispatch_tests {
         // about controller authentication.
         let err = dispatch_put_inner(
             &ctx,
-            "apis/example.dev/v1/widgets/w1/reparent".to_string(),
+            "example.dev/v1/widgets/w1/reparent".to_string(),
             any_user(OPERATOR),
             json!({"newParentUid": null}),
         )
         .await
         .expect_err("PUT on reparent must be 405");
         assert_eq!(err.status, StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    // -------------------------------------------------------------------------
+    // Parent-chain depth: list / item / subresource at depth 1 and 2
+    // -------------------------------------------------------------------------
+
+    #[sqlx::test]
+    async fn depth_1_chain_classifies_list_item_subresource(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_gadget_rd(&ctx, &["controller.example.com"]).await;
+        create_org(&ctx, "acme").await;
+
+        // Create a gadget under acme — POST to the depth-1 list path.
+        let gadget = create_at(
+            &ctx,
+            "example.dev/v1/gadgets/acme",
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Gadget",
+                "metadata": {"name": "g1"},
+                "spec": {},
+            }),
+        )
+        .await;
+        assert_eq!(gadget["metadata"]["name"], "g1");
+
+        // List — exactly D (= 1) ancestor name segments, no leaf.
+        let resp = dispatch_get_inner(
+            &ctx,
+            "example.dev/v1/gadgets/acme".to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("list gadgets under acme");
+        let (status, body) = read(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["items"].as_array().expect("items").len(), 1);
+
+        // Item — D + 1 segments.
+        let resp = dispatch_get_inner(
+            &ctx,
+            "example.dev/v1/gadgets/acme/g1".to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("get gadget");
+        let (status, body) = read(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["metadata"]["name"], "g1");
+
+        // Subresource — D + 2 segments, controller-authenticated status write.
+        let resp = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/gadgets/acme/g1/status".to_string(),
+            any_controller("controller.example.com"),
+            json!({"status": {"phase": "Ready"}}),
+        )
+        .await
+        .expect("controller status write on a depth-1 subresource");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[sqlx::test]
+    async fn depth_2_chain_resolves_list_and_item(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_gadget_rd(&ctx, &[]).await;
+        register_gizmo_rd(&ctx).await;
+        create_org(&ctx, "acme").await;
+        create_at(
+            &ctx,
+            "example.dev/v1/gadgets/acme",
+            json!({"apiVersion": "example.dev/v1", "kind": "Gadget", "metadata": {"name": "g1"}, "spec": {}}),
+        )
+        .await;
+        create_at(
+            &ctx,
+            "example.dev/v1/gizmos/acme/g1",
+            json!({"apiVersion": "example.dev/v1", "kind": "Gizmo", "metadata": {"name": "z1"}, "spec": {}}),
+        )
+        .await;
+
+        // Item — 2 ancestor names (org, gadget) + the leaf name.
+        let resp = dispatch_get_inner(
+            &ctx,
+            "example.dev/v1/gizmos/acme/g1/z1".to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("get gizmo at depth 2");
+        let (status, body) = read(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["metadata"]["name"], "z1");
+
+        // List — exactly 2 ancestor names, no leaf.
+        let resp = dispatch_get_inner(
+            &ctx,
+            "example.dev/v1/gizmos/acme/g1".to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("list gizmos at depth 2");
+        let (status, body) = read(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["items"].as_array().expect("items").len(), 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // UID addressing and segment-count edge cases
+    // -------------------------------------------------------------------------
+
+    #[sqlx::test]
+    async fn uid_form_resolves_nested_resource_without_ancestors(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx, &[]).await;
+        register_gadget_rd(&ctx, &[]).await;
+        create_org(&ctx, "acme").await;
+        let gadget = create_at(
+            &ctx,
+            "example.dev/v1/gadgets/acme",
+            json!({"apiVersion": "example.dev/v1", "kind": "Gadget", "metadata": {"name": "g1"}, "spec": {}}),
+        )
+        .await;
+        let uid = uid_of(&gadget);
+
+        // The `uid:` form addresses the gadget globally: no `acme` ancestor name
+        // and no parent-chain walk, even though the gadget is nested.
+        let resp = dispatch_get_inner(
+            &ctx,
+            format!("example.dev/v1/gadgets/uid:{uid}"),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("get nested gadget by uid alone");
+        let (status, body) = read(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["metadata"]["name"], "g1");
+
+        // A UID resolved under the wrong collection is a 404 (kind mismatch).
+        let err = dispatch_get_inner(
+            &ctx,
+            format!("example.dev/v1/widgets/uid:{uid}"),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect_err("a Gadget uid under the widgets collection must be 404");
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    async fn uid_token_mid_chain_yields_400(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_gadget_rd(&ctx, &[]).await;
+
+        // A `uid:` token is valid only as the sole identifier segment; following
+        // an ancestor name it is a 400 — and the parent-chain walk is not even
+        // reached.
+        let err = dispatch_get_inner(
+            &ctx,
+            format!("example.dev/v1/gadgets/acme/uid:{}", Uuid::new_v4()),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect_err("uid: after an ancestor name must be 400");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test]
+    async fn leaf_resource_named_status_resolves_as_item(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx, &[]).await;
+        create_widget(&ctx, "example.dev/v1", "status").await;
+
+        // `widgets` is depth 0, so `widgets/status` is D + 1 segments: the
+        // trailing `status` is the item name, not a subresource keyword.
+        let resp = dispatch_get_inner(
+            &ctx,
+            "example.dev/v1/widgets/status".to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("get widget literally named 'status'");
+        let (status, body) = read(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["metadata"]["name"], "status");
+    }
+
+    #[sqlx::test]
+    async fn cyclic_parent_chain_yields_500(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+
+        // Two ResourceDefinitions whose `parent` refs point at each other. There
+        // is no cycle check at registration, so the parent-chain walk must
+        // terminate on the depth cap rather than loop forever.
+        for (kind, plural, parent_kind) in [("Alpha", "alphas", "Beta"), ("Beta", "betas", "Alpha")]
+        {
+            let spec = json!({
+                "group": "cycle.dev",
+                "kind": kind,
+                "plural": plural,
+                "scope": "organization",
+                "parent": {"apiVersion": "cycle.dev/v1", "kind": parent_kind},
+                "versions": [{"name": "v1", "served": true, "storage": true}],
+                "allowedStatusControllerIds": [],
+            });
+            ctx.store
+                .register_resource_definition(CreateResourceParams {
+                    api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
+                    kind: RESOURCE_DEFINITION_KIND.to_string(),
+                    name: format!("{plural}.cycle.dev"),
+                    parent_uid: None,
+                    annotations: BTreeMap::new(),
+                    finalizers: vec![],
+                    spec,
+                    validator: None,
+                })
+                .await
+                .expect("register cyclic RD");
+        }
+
+        let err = dispatch_get_inner(
+            &ctx,
+            "cycle.dev/v1/alphas".to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect_err("a cyclic parent chain must error, not hang");
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

@@ -187,6 +187,21 @@ pub trait ResourceStore: Send + Sync {
         collection: &str,
     ) -> Result<Option<CollectionInfo>, StoreError>;
 
+    /// Resolve a collection by its API group and kind, rather than by plural.
+    ///
+    /// Used to walk the parent chain of a `ResourceDefinition`: the `parent`
+    /// ref carries `{api_version, kind}`, not the plural. The collection is
+    /// resolved at its storage version (ancestors are never version-addressed);
+    /// when the storage version is not served, any served version is used
+    /// instead — the resolved `kind`, `declared_api_versions`, and `parent` are
+    /// version-independent. Returns `None` when no built-in or
+    /// `ResourceDefinition` declares that `(group, kind)`.
+    async fn resolve_collection_by_kind(
+        &self,
+        group: &str,
+        kind: &str,
+    ) -> Result<Option<CollectionInfo>, StoreError>;
+
     async fn register_resource_definition(
         &self,
         params: CreateResourceParams,

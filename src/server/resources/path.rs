@@ -1,20 +1,39 @@
 //! URL path parsing for the generic resource API.
 //!
-//! This module provides two parsing functions:
+//! This module provides the *pure-syntax* half of resource-path handling:
 //!
 //! * [`parse_identifier`] — turns a single `<identifier>` segment into a
 //!   `PathSegment` (name or `uid:<uuid>` form) for the resource store.
-//! * [`parse_resource_path`] — parses a full resource URL path like
-//!   `apis/rise.dev/v1alpha1/organizations/acme/apis/example.dev/v1/widgets/w1/status` into a typed [`ResourcePath`],
-//!   expressing the collection hierarchy, the leaf resource, and any
-//!   subresource keyword.
+//! * [`parse_uid_token`] — parses a `uid:<uuid>` token into its `Uuid`.
+//! * [`parse_resource_path`] — splits a full resource URL path into a
+//!   [`RawResourcePath`]: the leaf collection (`{group}/{version}/{plural}`)
+//!   plus the trailing identifier segments, verbatim.
+//!
+//! `parse_resource_path` deliberately does *not* decide whether a path is a
+//! list, an item, or a subresource: a flat chain of names is ambiguous without
+//! knowing the leaf kind's parent-chain depth, which only the resource store
+//! knows. Store-aware classification lives in [`super::handlers`].
 
 use rise_resource_store::PathSegment;
 use uuid::Uuid;
 
 use crate::server::error::ServerError;
 
-const UID_PREFIX: &str = "uid:";
+/// Prefix marking an identifier segment as a UID rather than a name.
+pub const UID_PREFIX: &str = "uid:";
+
+/// Parse a `uid:<uuid>` token into its `Uuid`.
+///
+/// Returns a 400 if `raw` is not `uid:`-prefixed or the remainder is not a
+/// well-formed UUID — the caller does not need to distinguish.
+pub fn parse_uid_token(raw: &str) -> Result<Uuid, ServerError> {
+    let rest = raw
+        .strip_prefix(UID_PREFIX)
+        .ok_or_else(|| ServerError::bad_request(format!("expected a uid: token, got '{raw}'")))?;
+    rest.parse().map_err(|_| {
+        ServerError::bad_request(format!("invalid uid token '{raw}': expected uid:<uuid>"))
+    })
+}
 
 /// Parse a URL path identifier into a `PathSegment`.
 ///
@@ -25,14 +44,11 @@ pub fn parse_identifier(
     kind: &str,
     raw: &str,
 ) -> Result<PathSegment, ServerError> {
-    if let Some(rest) = raw.strip_prefix(UID_PREFIX) {
-        let uid: Uuid = rest.parse().map_err(|_| {
-            ServerError::bad_request(format!("invalid uid token '{raw}': expected uid:<uuid>"))
-        })?;
+    if raw.starts_with(UID_PREFIX) {
         Ok(PathSegment::Uid {
             api_versions: vec![api_version.to_string()],
             kind: kind.to_string(),
-            uid,
+            uid: parse_uid_token(raw)?,
         })
     } else {
         Ok(PathSegment::Name {
@@ -50,47 +66,44 @@ pub struct CollectionRef {
     pub plural: String,
 }
 
-/// A single ancestor segment in a hierarchical resource path.
-#[derive(Debug, PartialEq)]
-pub struct AncestorRef {
-    pub collection: CollectionRef,
-    pub identifier: String,
-}
-
 /// The well-known sub-resource suffixes that can appear at the end of a path.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Subresource {
     Status,
     Finalizers,
     Reparent,
 }
 
-/// A parsed representation of a hierarchical resource URL path.
+impl Subresource {
+    /// Parse a reserved subresource keyword. Returns `None` for any other value.
+    pub fn from_keyword(value: &str) -> Option<Self> {
+        match value {
+            "status" => Some(Self::Status),
+            "finalizers" => Some(Self::Finalizers),
+            "reparent" => Some(Self::Reparent),
+            _ => None,
+        }
+    }
+}
+
+/// A resource URL path split into its leaf collection and the trailing
+/// identifier segments.
+///
+/// No list/item/subresource classification is applied — that requires the leaf
+/// kind's parent-chain depth (see [`super::handlers`]).
 #[derive(Debug, PartialEq)]
-pub enum ResourcePath {
+pub enum RawResourcePath {
     /// The literal path `pending-deletion`: resources tombstoned and awaiting GC.
     PendingDeletion,
-    /// A collection, optionally nested under ancestors: `<ancestors…>/<collection>`.
-    List {
-        ancestors: Vec<AncestorRef>,
+    /// A `{group}/{version}/{plural}` collection followed by zero or more
+    /// ancestor-name / leaf-name / subresource segments, taken verbatim.
+    Collection {
         collection: CollectionRef,
-    },
-    /// A single item: `<ancestors…>/<collection>/<identifier>`.
-    Item {
-        ancestors: Vec<AncestorRef>,
-        collection: CollectionRef,
-        identifier: String,
-    },
-    /// A sub-resource operation on an item: `<ancestors…>/<collection>/<identifier>/<sub>`.
-    Subresource {
-        ancestors: Vec<AncestorRef>,
-        collection: CollectionRef,
-        identifier: String,
-        subresource: Subresource,
+        segments: Vec<String>,
     },
 }
 
-/// Parse a URL resource path into a [`ResourcePath`].
+/// Parse a URL resource path into a [`RawResourcePath`].
 ///
 /// The path is a `/`-separated sequence of segments. Empty paths and empty
 /// segments (e.g. a trailing `/`) are rejected with a 400 error.
@@ -99,19 +112,15 @@ pub enum ResourcePath {
 ///
 /// ```text
 /// path        ::= "pending-deletion"
-///               | segment+
-/// collection  ::= "apis" "/" group "/" version "/" plural
-/// segment     ::= collection "/" identifier
-/// tail        ::= collection                        -- List
-///               | collection "/" identifier          -- Item
-///               | collection "/" identifier "/" sub  -- Subresource
-/// sub         ::= "status" | "finalizers" | "reparent"
+///               | group "/" version "/" plural ( "/" segment )*
 /// ```
 ///
-/// The keywords `status`, `finalizers`, and `reparent` are reserved, valid only as
-/// the final segment of an item path. `pending-deletion` is valid only as the sole
-/// path segment.
-pub fn parse_resource_path(raw: &str) -> Result<ResourcePath, ServerError> {
+/// The leading `{group}/{version}/{plural}` names the *leaf* collection. The
+/// trailing `segment`s are ancestor names, the leaf identifier, and an optional
+/// subresource keyword — but distinguishing them requires the leaf kind's
+/// parent-chain depth, so that is left to store-aware classification.
+/// `pending-deletion` is valid only as the sole path segment.
+pub fn parse_resource_path(raw: &str) -> Result<RawResourcePath, ServerError> {
     let segments: Vec<&str> = raw.split('/').collect();
 
     if segments.is_empty() || segments.iter().any(|s| s.is_empty()) {
@@ -121,89 +130,22 @@ pub fn parse_resource_path(raw: &str) -> Result<ResourcePath, ServerError> {
     // `pending-deletion` is the sole-segment diagnostics path. It is never an
     // identifier, so a resource may legitimately be named `pending-deletion`.
     if segments.len() == 1 && segments[0] == "pending-deletion" {
-        return Ok(ResourcePath::PendingDeletion);
+        return Ok(RawResourcePath::PendingDeletion);
     }
 
-    let mut ancestors: Vec<AncestorRef> = Vec::new();
-    let mut pos = 0;
-
-    loop {
-        let collection = parse_collection(&segments, pos)?;
-        pos += 4;
-
-        if pos == segments.len() {
-            return Ok(ResourcePath::List {
-                ancestors,
-                collection,
-            });
-        }
-
-        let identifier = segments[pos].to_string();
-        pos += 1;
-
-        if pos == segments.len() {
-            return Ok(ResourcePath::Item {
-                ancestors,
-                collection,
-                identifier,
-            });
-        }
-
-        match segments[pos] {
-            kw @ ("status" | "finalizers" | "reparent") => {
-                if pos + 1 != segments.len() {
-                    return Err(ServerError::bad_request(format!(
-                        "unexpected segments after subresource '{kw}': path must end after the keyword"
-                    )));
-                }
-                let subresource = match kw {
-                    "status" => Subresource::Status,
-                    "finalizers" => Subresource::Finalizers,
-                    _ => Subresource::Reparent,
-                };
-                return Ok(ResourcePath::Subresource {
-                    ancestors,
-                    collection,
-                    identifier,
-                    subresource,
-                });
-            }
-            "apis" => {
-                ancestors.push(AncestorRef {
-                    collection,
-                    identifier,
-                });
-            }
-            other => {
-                return Err(ServerError::bad_request(format!(
-                    "expected nested collection to start with 'apis', got '{other}'"
-                )));
-            }
-        }
-    }
-}
-
-fn parse_collection(segments: &[&str], pos: usize) -> Result<CollectionRef, ServerError> {
-    if segments.get(pos) != Some(&"apis") {
+    let [group, version, plural, rest @ ..] = segments.as_slice() else {
         return Err(ServerError::bad_request(
-            "resource collection paths must start with 'apis/{group}/{version}/{plural}'",
-        ));
-    }
-    let Some(group) = segments.get(pos + 1) else {
-        return Err(ServerError::bad_request("missing resource API group"));
-    };
-    let Some(version) = segments.get(pos + 2) else {
-        return Err(ServerError::bad_request("missing resource API version"));
-    };
-    let Some(plural) = segments.get(pos + 3) else {
-        return Err(ServerError::bad_request(
-            "missing resource collection plural",
+            "resource collection paths must start with '{group}/{version}/{plural}'",
         ));
     };
-    Ok(CollectionRef {
-        group: (*group).to_string(),
-        version: (*version).to_string(),
-        plural: (*plural).to_string(),
+
+    Ok(RawResourcePath::Collection {
+        collection: CollectionRef {
+            group: (*group).to_string(),
+            version: (*version).to_string(),
+            plural: (*plural).to_string(),
+        },
+        segments: rest.iter().map(|s| (*s).to_string()).collect(),
     })
 }
 
@@ -262,6 +204,29 @@ mod tests {
         assert!(matches!(seg, PathSegment::Name { .. }));
     }
 
+    #[test]
+    fn parse_uid_token_rejects_non_uid() {
+        let err = parse_uid_token("acme").unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn subresource_from_keyword() {
+        assert_eq!(
+            Subresource::from_keyword("status"),
+            Some(Subresource::Status)
+        );
+        assert_eq!(
+            Subresource::from_keyword("finalizers"),
+            Some(Subresource::Finalizers)
+        );
+        assert_eq!(
+            Subresource::from_keyword("reparent"),
+            Some(Subresource::Reparent)
+        );
+        assert_eq!(Subresource::from_keyword("widgets"), None);
+    }
+
     fn collection(group: &str, version: &str, plural: &str) -> CollectionRef {
         CollectionRef {
             group: group.into(),
@@ -274,86 +239,44 @@ mod tests {
     fn resource_path_pending_deletion() {
         assert_eq!(
             parse_resource_path("pending-deletion").unwrap(),
-            ResourcePath::PendingDeletion
+            RawResourcePath::PendingDeletion
         );
     }
 
     #[test]
-    fn resource_path_item_named_pending_deletion_is_addressable() {
-        // `pending-deletion` is only special as the sole path segment, so a
-        // resource may be named `pending-deletion` and stays reachable.
+    fn resource_path_collection_only() {
         assert_eq!(
-            parse_resource_path("apis/example.dev/v1/widgets/pending-deletion").unwrap(),
-            ResourcePath::Item {
-                ancestors: vec![],
-                collection: collection("example.dev", "v1", "widgets"),
-                identifier: "pending-deletion".into(),
-            }
-        );
-    }
-
-    #[test]
-    fn resource_path_list_top_level() {
-        assert_eq!(
-            parse_resource_path("apis/rise.dev/v1alpha1/organizations").unwrap(),
-            ResourcePath::List {
-                ancestors: vec![],
+            parse_resource_path("rise.dev/v1alpha1/organizations").unwrap(),
+            RawResourcePath::Collection {
                 collection: collection("rise.dev", "v1alpha1", "organizations"),
+                segments: vec![],
             }
         );
     }
 
     #[test]
-    fn resource_path_item_top_level() {
+    fn resource_path_collection_with_trailing_segments() {
+        // The trailing segments are returned verbatim — no name/uid/subresource
+        // interpretation happens here.
         assert_eq!(
-            parse_resource_path("apis/rise.dev/v1alpha1/organizations/acme").unwrap(),
-            ResourcePath::Item {
-                ancestors: vec![],
-                collection: collection("rise.dev", "v1alpha1", "organizations"),
-                identifier: "acme".into(),
-            }
-        );
-    }
-
-    #[test]
-    fn resource_path_list_depth_1() {
-        assert_eq!(
-            parse_resource_path(
-                "apis/rise.dev/v1alpha1/organizations/acme/apis/example.dev/v1/widgets"
-            )
-            .unwrap(),
-            ResourcePath::List {
-                ancestors: vec![AncestorRef {
-                    collection: collection("rise.dev", "v1alpha1", "organizations"),
-                    identifier: "acme".into(),
-                }],
+            parse_resource_path("example.dev/v1/widgets/acme/w1/status").unwrap(),
+            RawResourcePath::Collection {
                 collection: collection("example.dev", "v1", "widgets"),
-            }
-        );
-    }
-
-    #[test]
-    fn resource_path_subresource_depth_1() {
-        assert_eq!(
-            parse_resource_path(
-                "apis/rise.dev/v1alpha1/organizations/acme/apis/example.dev/v1/widgets/w1/status"
-            )
-            .unwrap(),
-            ResourcePath::Subresource {
-                ancestors: vec![AncestorRef {
-                    collection: collection("rise.dev", "v1alpha1", "organizations"),
-                    identifier: "acme".into(),
-                }],
-                collection: collection("example.dev", "v1", "widgets"),
-                identifier: "w1".into(),
-                subresource: Subresource::Status,
+                segments: vec!["acme".into(), "w1".into(), "status".into()],
             }
         );
     }
 
     #[test]
     fn resource_path_rejects_unversioned_collection() {
+        // Fewer than three leading segments cannot name a `{group}/{version}/{plural}`.
         let err = parse_resource_path("organizations/acme").unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn resource_path_rejects_empty_segment() {
+        let err = parse_resource_path("example.dev/v1/widgets/").unwrap_err();
         assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
     }
 }

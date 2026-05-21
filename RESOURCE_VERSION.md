@@ -80,6 +80,3 @@ These — not schema evolution — are the only things our versioning supports t
   schema? Current lean: **keep it** — maturing an API's shape is considered
   likely.
 - If kept: build conversion via webhook, or via in-process conversion functions?
-- The route redesign (compact `/resources/{group}/{version}/{plural}/...`,
-  dropping the repeated `apis` segment) is entangled with this and is also
-  parked until the versioning direction settles.

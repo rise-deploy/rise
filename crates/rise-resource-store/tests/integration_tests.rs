@@ -576,6 +576,108 @@ async fn resolve_builtin_collection(pool: sqlx::PgPool) -> sqlx::Result<()> {
 }
 
 #[sqlx::test]
+async fn resolve_collection_by_kind_resolves_builtins_and_rds(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+
+    // Built-in kinds resolve without a `resource_definitions` row.
+    let org = store
+        .resolve_collection_by_kind("rise.dev", ORGANIZATION_KIND)
+        .await
+        .unwrap()
+        .expect("Organization resolves by kind");
+    assert_eq!(org.kind, ORGANIZATION_KIND);
+
+    let rd = store
+        .resolve_collection_by_kind("rise.dev", RESOURCE_DEFINITION_KIND)
+        .await
+        .unwrap()
+        .expect("ResourceDefinition resolves by kind");
+    assert_eq!(rd.kind, RESOURCE_DEFINITION_KIND);
+
+    // An unknown kind resolves to `None`.
+    assert!(store
+        .resolve_collection_by_kind("rise.dev", "Nonexistent")
+        .await
+        .unwrap()
+        .is_none());
+
+    // A registered ResourceDefinition resolves by `(group, kind)`.
+    store
+        .register_resource_definition(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: RESOURCE_DEFINITION_KIND.to_string(),
+            name: "widgets.example.dev".to_string(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec: json!({
+                "group": "example.dev",
+                "kind": "Widget",
+                "plural": "widgets",
+                "scope": "root",
+                "versions": [{"name": "v1", "served": true, "storage": true}],
+                "allowedStatusControllerIds": []
+            }),
+            validator: None,
+        })
+        .await
+        .unwrap();
+
+    let widget = store
+        .resolve_collection_by_kind("example.dev", "Widget")
+        .await
+        .unwrap()
+        .expect("Widget RD resolves by kind");
+    assert_eq!(widget.kind, "Widget");
+    assert_eq!(widget.api_version, "example.dev/v1");
+
+    // The same kind under a different group does not resolve.
+    assert!(store
+        .resolve_collection_by_kind("other.dev", "Widget")
+        .await
+        .unwrap()
+        .is_none());
+
+    // A collection whose storage version is not served still resolves by kind:
+    // the fallback picks a served version since ancestors are not
+    // version-addressed.
+    store
+        .register_resource_definition(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: RESOURCE_DEFINITION_KIND.to_string(),
+            name: "gauges.example.dev".to_string(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec: json!({
+                "group": "example.dev",
+                "kind": "Gauge",
+                "plural": "gauges",
+                "scope": "root",
+                "versions": [
+                    {"name": "v1", "served": false, "storage": true},
+                    {"name": "v2", "served": true, "storage": false}
+                ],
+                "allowedStatusControllerIds": []
+            }),
+            validator: None,
+        })
+        .await
+        .unwrap();
+
+    let gauge = store
+        .resolve_collection_by_kind("example.dev", "Gauge")
+        .await
+        .unwrap()
+        .expect("Gauge RD with a non-served storage version resolves by kind");
+    assert_eq!(gauge.kind, "Gauge");
+
+    Ok(())
+}
+
+#[sqlx::test]
 async fn register_resource_definition(pool: sqlx::PgPool) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
 
