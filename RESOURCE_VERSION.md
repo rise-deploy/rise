@@ -12,8 +12,10 @@ The generic resource store supports versioned collections:
   and exactly one is the `storage` version.
 - Every `resources` row stores its own `api_version` (`group/version`) — the
   version it was last *written* at.
-- **Reads** (`get`, `list`) span *all served versions* of a `group`+`kind`.
-  The response `apiVersion` is projected to the version the caller requested.
+- **Reads** (`get`, `list`) span *all declared versions* of a `group`+`kind`
+  — including a non-served storage version, so a row is never orphaned by
+  the version it happens to be stored at. The response `apiVersion` is
+  projected to the version the caller requested.
 - **Writes** (`create`, `update`) persist at the current `storage` version. A
   row therefore migrates lazily: it keeps its old `api_version` until its next
   `update`, which rewrites it to the storage version (the `COALESCE` in the
