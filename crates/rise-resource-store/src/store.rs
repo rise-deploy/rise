@@ -73,6 +73,10 @@ pub struct CollectionInfo {
     pub api_version: String,
     pub storage_api_version: String,
     pub served_api_versions: Vec<String>,
+    /// Every api_version the collection declares (served and non-served).
+    /// Used for row lookups so a resource stored at a non-served version is
+    /// still found; `served_api_versions` only gates URL accessibility.
+    pub declared_api_versions: Vec<String>,
     pub kind: String,
     pub scope: ResourceScope,
     pub parent: Option<ResourceParentRef>,

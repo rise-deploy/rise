@@ -752,6 +752,45 @@ async fn register_resource_definition_rejects_reserved_plural(
 }
 
 #[sqlx::test]
+async fn register_resource_definition_rejects_zero_served_versions(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+
+    // A storage version that is not served, with no other served version,
+    // leaves the collection unaddressable via any URL.
+    let spec = json!({
+        "group": "example.dev",
+        "kind": "Widget",
+        "plural": "widgets",
+        "scope": "root",
+        "versions": [{"name": "v1", "served": false, "storage": true}],
+        "allowedStatusControllerIds": []
+    });
+
+    let err = store
+        .register_resource_definition(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: RESOURCE_DEFINITION_KIND.to_string(),
+            name: "widgets.example.dev".to_string(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec,
+            validator: None,
+        })
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, StoreError::Validation(_)),
+        "expected Validation error for zero served versions, got {err:?}"
+    );
+
+    Ok(())
+}
+
+#[sqlx::test]
 async fn register_resource_definition_requires_parent_for_non_root_scope(
     pool: sqlx::PgPool,
 ) -> sqlx::Result<()> {
@@ -1156,6 +1195,110 @@ async fn update_resource_definition_rejects_identity_change(
         matches!(err, StoreError::Validation(_)),
         "expected Validation error for identity change, got {err:?}"
     );
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn update_resource_definition_rejects_removing_version_with_instances(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+
+    let spec = json!({
+        "group": "example.dev",
+        "kind": "Widget",
+        "plural": "widgets",
+        "scope": "root",
+        "versions": [
+            {"name": "v1", "served": true, "storage": true},
+            {"name": "v2", "served": true, "storage": false}
+        ],
+        "allowedStatusControllerIds": []
+    });
+
+    let rd = store
+        .register_resource_definition(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: RESOURCE_DEFINITION_KIND.to_string(),
+            name: "widgets.example.dev".to_string(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec,
+            validator: None,
+        })
+        .await
+        .unwrap();
+
+    // Instances are created at the storage version (v1).
+    store
+        .create(CreateResourceParams {
+            api_version: "example.dev/v1".to_string(),
+            kind: "Widget".to_string(),
+            name: "w1".to_string(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec: json!({}),
+            validator: None,
+        })
+        .await
+        .unwrap();
+
+    // Dropping v1 (where the instance lives) must be rejected, even though
+    // promoting v2 to the storage version is itself valid.
+    let drop_v1 = json!({
+        "group": "example.dev",
+        "kind": "Widget",
+        "plural": "widgets",
+        "scope": "root",
+        "versions": [{"name": "v2", "served": true, "storage": true}],
+        "allowedStatusControllerIds": []
+    });
+    let err = store
+        .update_resource_definition(
+            rd.uid,
+            UpdateResourceParams {
+                api_version: None,
+                revision: rd.revision,
+                annotations: BTreeMap::new(),
+                finalizers: vec![],
+                spec: drop_v1,
+                validator: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Validation(_)),
+        "expected Validation error for removing a version with instances, got {err:?}"
+    );
+
+    // Dropping v2, which has no instances, is allowed. The failed update above
+    // rolled back, so the revision is unchanged.
+    let drop_v2 = json!({
+        "group": "example.dev",
+        "kind": "Widget",
+        "plural": "widgets",
+        "scope": "root",
+        "versions": [{"name": "v1", "served": true, "storage": true}],
+        "allowedStatusControllerIds": []
+    });
+    store
+        .update_resource_definition(
+            rd.uid,
+            UpdateResourceParams {
+                api_version: None,
+                revision: rd.revision,
+                annotations: BTreeMap::new(),
+                finalizers: vec![],
+                spec: drop_v2,
+                validator: None,
+            },
+        )
+        .await
+        .expect("dropping a version with no instances should succeed");
 
     Ok(())
 }

@@ -60,6 +60,7 @@ impl PgResourceStore {
                 api_version: API_VERSION_V1ALPHA1.to_string(),
                 storage_api_version: API_VERSION_V1ALPHA1.to_string(),
                 served_api_versions: vec![API_VERSION_V1ALPHA1.to_string()],
+                declared_api_versions: vec![API_VERSION_V1ALPHA1.to_string()],
                 kind: ORGANIZATION_KIND.to_string(),
                 scope: ResourceScope::Root,
                 parent: None,
@@ -70,6 +71,7 @@ impl PgResourceStore {
                 api_version: API_VERSION_V1ALPHA1.to_string(),
                 storage_api_version: API_VERSION_V1ALPHA1.to_string(),
                 served_api_versions: vec![API_VERSION_V1ALPHA1.to_string()],
+                declared_api_versions: vec![API_VERSION_V1ALPHA1.to_string()],
                 kind: RESOURCE_DEFINITION_KIND.to_string(),
                 scope: ResourceScope::Root,
                 parent: None,
@@ -1138,6 +1140,10 @@ impl ResourceStore for PgResourceStore {
             .filter(|v| v.served)
             .map(|v| Self::api_version(group, &v.name))
             .collect();
+        let declared_api_versions: Vec<String> = versions
+            .iter()
+            .map(|v| Self::api_version(group, &v.name))
+            .collect();
         let api_version = Self::api_version(group, version);
 
         let allowed: Vec<String> = row
@@ -1176,6 +1182,7 @@ impl ResourceStore for PgResourceStore {
             api_version,
             storage_api_version,
             served_api_versions,
+            declared_api_versions,
             kind,
             scope,
             parent: spec.parent,
@@ -1310,6 +1317,50 @@ impl ResourceStore for PgResourceStore {
                 "ResourceDefinition identity fields (group, kind, plural, scope, parent) are immutable"
                     .to_string(),
             ));
+        }
+
+        // A row can be stored at any declared version (instances are created at the
+        // storage version, and `update` migrates rows to the current storage version).
+        // Removing a version that still has stored instances would orphan those rows
+        // from path resolution, so reject such an update. `group` is immutable, so
+        // old and new group are equal.
+        let removed_api_versions: Vec<String> = old_spec
+            .versions
+            .iter()
+            .filter(|ov| !new_spec.versions.iter().any(|nv| nv.name == ov.name))
+            .map(|ov| Self::api_version(&new_spec.group, &ov.name))
+            .collect();
+        if !removed_api_versions.is_empty() {
+            // Lock the projection row so concurrent instance creates (which take a
+            // FOR SHARE lock on the same row via lock_matching_definition_for_write)
+            // cannot slip in between this count and the commit.
+            sqlx::query(
+                "SELECT uid FROM resource_store.resource_definitions WHERE uid = $1 FOR UPDATE",
+            )
+            .bind(uid)
+            .execute(&mut *tx)
+            .await?;
+
+            let instance_count: i64 = sqlx::query_scalar(
+                r#"
+                SELECT COUNT(*)
+                FROM resource_store.resources
+                WHERE kind = $1
+                  AND api_version = ANY($2)
+                "#,
+            )
+            .bind(&new_spec.kind)
+            .bind(&removed_api_versions)
+            .fetch_one(&mut *tx)
+            .await?;
+
+            if instance_count > 0 {
+                return Err(StoreError::Validation(format!(
+                    "cannot remove version(s) from ResourceDefinition '{}' while \
+                     {instance_count} instance(s) still use them",
+                    current.name
+                )));
+            }
         }
 
         let metadata = serde_json::to_value(&params.annotations).unwrap_or_default();

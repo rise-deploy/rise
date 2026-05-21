@@ -92,6 +92,11 @@ impl SpecValidator for ResourceDefinitionValidator {
                 "ResourceDefinition must have exactly one storage version".into(),
             ));
         }
+        if !parsed.versions.iter().any(|v| v.served) {
+            return Err(StoreError::Validation(
+                "ResourceDefinition must have at least one served version".into(),
+            ));
+        }
         for v in &parsed.versions {
             validate_resource_version(&v.name)
                 .map_err(|e| StoreError::Validation(e.to_string()))?;

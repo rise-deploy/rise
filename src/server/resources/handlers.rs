@@ -154,7 +154,7 @@ async fn resolve_item(
 ) -> Result<ResourceRow, ServerError> {
     let mut segs = ancestor_segs;
     segs.push(path_segment(
-        &info.served_api_versions,
+        &info.declared_api_versions,
         &info.kind,
         identifier,
     )?);
@@ -332,7 +332,7 @@ async fn resolve_ancestors(
     for anc in ancestors {
         let resolved = resolve_collection(store, &anc.collection).await?;
         segs.push(path_segment(
-            &resolved.info.served_api_versions,
+            &resolved.info.declared_api_versions,
             &resolved.info.kind,
             &anc.identifier,
         )?);
@@ -413,7 +413,7 @@ async fn dispatch_get_inner(
             let rows = ctx
                 .store
                 .list_versions(
-                    &resolved.info.served_api_versions,
+                    &resolved.info.declared_api_versions,
                     &resolved.info.kind,
                     parent_uid,
                 )
@@ -554,6 +554,14 @@ async fn dispatch_put_inner(
             identifier,
             subresource,
         } => {
+            // `reparent` is POST-only; reject PUT before auth discrimination so
+            // every caller gets a consistent 405 (not a 403 about controllers).
+            if matches!(subresource, Subresource::Reparent) {
+                return Err(ServerError::new(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "PUT is not valid for reparent; use POST",
+                ));
+            }
             // User tokens cannot update status/finalizers. The caller is
             // authenticated (a user/SA token), so this is an authorization
             // failure (403), not an authentication failure (401).
@@ -605,10 +613,7 @@ async fn dispatch_put_inner(
                     .await?;
                     Ok(resp.into_response())
                 }
-                Subresource::Reparent => Err(ServerError::new(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "PUT is not valid for reparent",
-                )),
+                Subresource::Reparent => unreachable!("handled above"),
             }
         }
         _ => Err(ServerError::new(
@@ -901,6 +906,7 @@ mod tests {
             api_version: "rise.dev/v1alpha1".into(),
             storage_api_version: "rise.dev/v1alpha1".into(),
             served_api_versions: vec!["rise.dev/v1alpha1".into()],
+            declared_api_versions: vec!["rise.dev/v1alpha1".into()],
             kind: "Organization".into(),
             scope: ResourceScope::Root,
             parent: None,
@@ -938,6 +944,7 @@ mod tests {
             api_version: "example.dev/v1".into(),
             storage_api_version: "example.dev/v1".into(),
             served_api_versions: vec!["example.dev/v1".into()],
+            declared_api_versions: vec!["example.dev/v1".into()],
             kind: "Widget".into(),
             scope: ResourceScope::Root,
             parent: None,
@@ -984,6 +991,7 @@ mod tests {
             api_version: "example.dev/v2".into(),
             storage_api_version: "example.dev/v2".into(),
             served_api_versions: vec!["example.dev/v2".into()],
+            declared_api_versions: vec!["example.dev/v2".into()],
             kind: "Gadget".into(),
             scope: if parent.is_some() {
                 ResourceScope::Organization
@@ -1844,5 +1852,106 @@ mod dispatch_tests {
         .await
         .expect_err("non-operator must be rejected");
         assert_eq!(err.status, StatusCode::FORBIDDEN);
+    }
+
+    // -------------------------------------------------------------------------
+    // Version-independent lookup
+    // -------------------------------------------------------------------------
+
+    #[sqlx::test]
+    async fn resource_reachable_when_storage_version_not_served(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+
+        // v1 is the storage version but is NOT served; v2 is served. Rows are
+        // stored at v1, so lookups must search declared (not just served)
+        // versions or the resource becomes unreachable.
+        let spec = json!({
+            "group": "example.dev",
+            "kind": "Widget",
+            "plural": "widgets",
+            "scope": "root",
+            "versions": [
+                {"name": "v1", "served": false, "storage": true},
+                {"name": "v2", "served": true, "storage": false},
+            ],
+            "allowedStatusControllerIds": [],
+        });
+        ctx.store
+            .register_resource_definition(CreateResourceParams {
+                api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
+                kind: RESOURCE_DEFINITION_KIND.to_string(),
+                name: "widgets.example.dev".to_string(),
+                parent_uid: None,
+                annotations: BTreeMap::new(),
+                finalizers: vec![],
+                spec,
+                validator: None,
+            })
+            .await
+            .expect("register widgets RD");
+
+        // Create through the served v2 endpoint — the row lands at storage v1.
+        let resp = dispatch_post_inner(
+            &ctx,
+            "apis/example.dev/v2/widgets".to_string(),
+            auth(OPERATOR),
+            widget_body("example.dev/v2", "w1"),
+        )
+        .await
+        .expect("create widget via v2");
+        let (status, created) = read(resp).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(created["apiVersion"], "example.dev/v2");
+
+        // GET via v2 must find the row stored at the non-served v1.
+        let resp = dispatch_get_inner(
+            &ctx,
+            "apis/example.dev/v2/widgets/w1".to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("get widget via v2");
+        let (status, body) = read(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["apiVersion"], "example.dev/v2");
+        assert_eq!(body["metadata"]["name"], "w1");
+
+        // LIST via v2 must include it too.
+        let resp = dispatch_get_inner(
+            &ctx,
+            "apis/example.dev/v2/widgets".to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("list widgets via v2");
+        let (status, body) = read(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["items"].as_array().expect("items array").len(), 1);
+        assert_eq!(body["items"][0]["apiVersion"], "example.dev/v2");
+    }
+
+    // -------------------------------------------------------------------------
+    // Method correctness: reparent is POST-only
+    // -------------------------------------------------------------------------
+
+    #[sqlx::test]
+    async fn put_on_reparent_yields_405(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx, &[]).await;
+        create_widget(&ctx, "example.dev/v1", "w1").await;
+
+        // reparent is POST-only; a PUT must be 405 for every caller, not a 403
+        // about controller authentication.
+        let err = dispatch_put_inner(
+            &ctx,
+            "apis/example.dev/v1/widgets/w1/reparent".to_string(),
+            any_user(ADMIN_OPERATOR),
+            json!({"newParentUid": null}),
+        )
+        .await
+        .expect_err("PUT on reparent must be 405");
+        assert_eq!(err.status, StatusCode::METHOD_NOT_ALLOWED);
     }
 }

@@ -54,10 +54,11 @@ Controller tokens cannot perform item-level PUT or other operator operations.
 
 Version behavior follows Kubernetes-style semantics:
 
-- Only versions with `served: true` can be addressed by the HTTP API.
+- Only versions with `served: true` can be addressed by the HTTP API; at least one version must be served.
 - Exactly one version must have `storage: true`.
 - Creates and updates through any served version are stored at the current storage version.
-- Reads and lists can return rows stored in any served version of the same group/kind; the response `apiVersion` is projected to the requested version.
+- Reads and lists return rows stored at any declared version of the same group/kind — including a non-served storage version; the response `apiVersion` is projected to the requested version.
+- A version cannot be removed from a `ResourceDefinition` while resources are still stored at it.
 - Conversion is currently no-op only: the API projects `apiVersion` but does not transform `spec`.
 
 ## Deletion
