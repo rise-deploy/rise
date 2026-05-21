@@ -1069,25 +1069,40 @@ pub async fn check_write_permission(
 mod tests {
     use super::trigger_project_resync;
     use axum::http::Uri;
+    use std::sync::OnceLock;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    async fn spawn_kube_api_stub() -> (kube::Client, tokio::task::JoinHandle<String>) {
+    const MAX_REQUEST_SIZE: usize = 16 * 1024;
+    static RUSTLS_PROVIDER: OnceLock<()> = OnceLock::new();
+
+    async fn spawn_mock_kube_api_server(
+        expected_project_name: &'static str,
+    ) -> (kube::Client, tokio::task::JoinHandle<String>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut buffer = Vec::new();
-            let mut temp = [0u8; 1024];
+            let mut read_buffer = [0u8; 1024];
             let mut header_end = None;
             let mut content_length = 0usize;
 
             loop {
-                let read = stream.read(&mut temp).await.unwrap();
+                let read =
+                    tokio::time::timeout(Duration::from_secs(5), stream.read(&mut read_buffer))
+                        .await
+                        .unwrap()
+                        .unwrap();
                 if read == 0 {
                     break;
                 }
-                buffer.extend_from_slice(&temp[..read]);
+                buffer.extend_from_slice(&read_buffer[..read]);
+                assert!(
+                    buffer.len() <= MAX_REQUEST_SIZE,
+                    "mock kube request exceeded {MAX_REQUEST_SIZE} bytes"
+                );
 
                 if header_end.is_none() {
                     if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -1111,7 +1126,15 @@ mod tests {
             }
 
             let request = String::from_utf8(buffer).unwrap();
-            let body = r#"{"apiVersion":"rise.dev/v1alpha1","kind":"RiseProject","metadata":{"name":"demo"},"spec":{}}"#;
+            assert!(
+                request.contains(&format!(
+                    "PATCH /apis/rise.dev/v1alpha1/riseprojects/{expected_project_name}"
+                )),
+                "unexpected request: {request}"
+            );
+            let body = format!(
+                r#"{{"apiVersion":"rise.dev/v1alpha1","kind":"RiseProject","metadata":{{"name":"{expected_project_name}"}},"spec":{{}}}}"#
+            );
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
                 body.len(),
@@ -1122,9 +1145,11 @@ mod tests {
             request
         });
 
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .ok();
+        RUSTLS_PROVIDER.get_or_init(|| {
+            rustls::crypto::ring::default_provider()
+                .install_default()
+                .expect("failed to install rustls crypto provider");
+        });
         let config = kube::Config::new(format!("http://{addr}").parse::<Uri>().unwrap());
         let client = kube::Client::try_from(config).unwrap();
 
@@ -1133,17 +1158,13 @@ mod tests {
 
     #[tokio::test]
     async fn trigger_project_resync_patches_rise_project() {
-        let (client, server) = spawn_kube_api_stub().await;
+        let (client, server) = spawn_mock_kube_api_server("demo").await;
 
         let triggered = trigger_project_resync(Some(&client), "demo").await.unwrap();
 
         assert!(triggered);
 
         let request = server.await.unwrap();
-        assert!(
-            request.contains("PATCH /apis/rise.dev/v1alpha1/riseprojects/demo"),
-            "unexpected request: {request}"
-        );
         assert!(request.contains("\"rise.dev/trigger\""));
     }
 
