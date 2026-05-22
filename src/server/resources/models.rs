@@ -52,18 +52,22 @@ pub fn row_to_resource_with_api_version(row: &ResourceRow, api_version: &str) ->
         match serde_json::from_value::<BTreeMap<String, serde_json::Value>>(row.metadata.clone()) {
             Ok(map) => map
                 .into_iter()
-                .filter_map(|(k, v)| match v {
-                    serde_json::Value::String(s) => Some((k, s)),
+                .map(|(k, v)| match v {
+                    serde_json::Value::String(s) => (k, s),
+                    // Non-string annotation values are preserved as their JSON
+                    // representation so that round-trip GET → PUT does not silently
+                    // erase them.  The conversion is lossless: `42` → `"42"`,
+                    // `{"x":1}` → `"{\"x\":1}"`.
                     other => {
-                        tracing::warn!(
+                        tracing::debug!(
                             uid = %row.uid,
                             kind = %row.kind,
                             name = %row.name,
                             key = %k,
                             value = %other,
-                            "annotation value is not a string — key will be omitted"
+                            "annotation value is not a string — serialising to JSON string"
                         );
-                        None
+                        (k, other.to_string())
                     }
                 })
                 .collect(),
@@ -151,6 +155,26 @@ mod tests {
         );
         assert_eq!(resource.spec.get("displayName"), Some(&json!("Acme")));
         assert!(resource.status.contains_key("controllers"));
+    }
+
+    #[test]
+    fn row_to_resource_preserves_non_string_annotations_as_json_strings() {
+        // Annotations written by external tools may store numbers, booleans, or
+        // objects.  They must survive a GET → PUT round-trip rather than being
+        // silently dropped.
+        let mut r = row(json!({}), json!({}));
+        r.metadata = json!({
+            "count": 42,
+            "flag": true,
+            "nested": {"x": 1},
+            "normal": "hello"
+        });
+        let resource = row_to_resource(&r);
+        let ann = &resource.metadata.annotations;
+        assert_eq!(ann.get("count").map(String::as_str), Some("42"));
+        assert_eq!(ann.get("flag").map(String::as_str), Some("true"));
+        assert_eq!(ann.get("nested").map(String::as_str), Some("{\"x\":1}"));
+        assert_eq!(ann.get("normal").map(String::as_str), Some("hello"));
     }
 
     #[test]
