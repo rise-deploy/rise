@@ -50,3 +50,46 @@ The controller supports two authentication modes:
 - Set `kubeconfig` path explicitly
 - Useful for development or external cluster access
 - Falls back to `~/.kube/config` if path not specified
+
+## Extra Projected Service Account Tokens
+
+The `extra_service_token_audiences` deployment controller option mounts
+additional **Kubernetes-issued** ServiceAccount tokens into every deployed app
+pod. This is useful for systems like Vault that expect a Kubernetes service
+account token minted for a custom audience.
+
+```yaml
+deployment_controller:
+  type: kubernetes
+  # ... other settings ...
+  extra_service_token_audiences:
+    vault: "https://vault.example.com"
+    metrics: "metrics-service"
+```
+
+With this configuration:
+- Rise adds a single projected volume to each app pod
+- The volume is mounted at `/var/run/secrets/rise/tokens`
+- Each map key becomes a filename in that directory (validated as a safe path
+  segment — letters, numbers, `.`, `_`, `-`)
+- Each file contains a Kubernetes service account token minted for the
+  configured audience
+
+Examples:
+- `/var/run/secrets/rise/tokens/vault`
+- `/var/run/secrets/rise/tokens/metrics`
+
+The kubelet mints and rotates these tokens; lifetime uses Kubernetes defaults
+(Rise does not set `expirationSeconds`). Because they are issued by the
+cluster, their `iss` and claims are Kubernetes-shaped.
+
+This is platform-wide configuration — it applies to **every** deployment and
+is not controllable per project.
+
+:::note[Not the same as workload identity tokens]
+These are *Kubernetes-issued* SA tokens. They are distinct from **Rise workload
+identity tokens** (`/var/run/secrets/rise/identity/`), which are issued and
+signed by Rise itself, describe the Rise project/environment, and are
+configured per project in `.rise.toml`. See the
+[Workload Identity Tokens](../../user-guide/workload-identity-tokens) user guide.
+:::

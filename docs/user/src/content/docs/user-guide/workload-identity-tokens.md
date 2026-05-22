@@ -45,6 +45,18 @@ injected:
 
 There are two ways to obtain a token.
 
+:::note[Not to be confused with `/var/run/secrets/rise/tokens/`]
+Your pod may also contain files under `/var/run/secrets/rise/tokens/` — a
+**separate** feature. Those are *Kubernetes-issued* ServiceAccount tokens,
+configured platform-wide by the Rise operator (not in `.rise.toml`). They carry
+Kubernetes-shaped claims and a cluster issuer.
+
+Workload identity tokens, described on this page, live under
+`/var/run/secrets/rise/identity/`, are issued and signed by **Rise**, and carry
+the Rise `project`/`environment` identity. Use these when you want trust policies
+keyed on the Rise identity rather than on Kubernetes.
+:::
+
 ### 1. Auto-mounted token files (Kubernetes)
 
 List the audiences you need in `.rise.toml`:
