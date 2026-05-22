@@ -1219,6 +1219,7 @@ pub(crate) fn should_have_infrastructure(deployment: &Deployment) -> bool {
             | DeploymentStatus::Deploying
             | DeploymentStatus::Healthy
             | DeploymentStatus::Unhealthy
+            | DeploymentStatus::Terminating
     )
 }
 
@@ -1808,6 +1809,7 @@ mod tests {
             DeploymentStatus::Deploying,
             DeploymentStatus::Healthy,
             DeploymentStatus::Unhealthy,
+            DeploymentStatus::Terminating,
         ];
         for status in &statuses_with_infra {
             let d = test_deployment(status.clone());
@@ -1827,7 +1829,6 @@ mod tests {
             DeploymentStatus::Pushing,
             DeploymentStatus::Cancelling,
             DeploymentStatus::Cancelled,
-            DeploymentStatus::Terminating,
             DeploymentStatus::Stopped,
             DeploymentStatus::Superseded,
             DeploymentStatus::Failed,
