@@ -1631,8 +1631,7 @@
   },
   "required": [
     "server",
-    "auth",
-    "database"
+    "auth"
   ],
   "title": "Settings",
   "type": "object"
