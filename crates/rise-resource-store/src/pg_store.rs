@@ -176,6 +176,11 @@ impl PgResourceStore {
         required: bool,
     ) -> Result<(), StoreError> {
         let Some((group, version)) = api_version.split_once('/') else {
+            if required {
+                return Err(StoreError::Validation(format!(
+                    "api_version '{api_version}' is not in '<group>/<version>' form"
+                )));
+            }
             return Ok(());
         };
 
@@ -1060,13 +1065,21 @@ impl ResourceStore for PgResourceStore {
                 })?;
 
         let group_name: String = row.try_get("group_name").map_err(StoreError::Database)?;
-        let storage_version = versions
-            .iter()
-            .find(|v| v.storage)
+        // Mirror resolve_collection_by_kind's fallback: if the storage version is not served,
+        // pick any served version (resolve_collection_version rejects non-served versions).
+        let storage = versions.iter().find(|v| v.storage);
+        let version = storage
+            .filter(|v| v.served)
+            .or_else(|| versions.iter().find(|v| v.served))
+            .or(storage)
             .map(|v| v.name.clone())
-            .unwrap_or_else(|| "v1".to_string());
+            .ok_or_else(|| {
+                StoreError::Validation(format!(
+                    "ResourceDefinition '{collection}' declares no versions"
+                ))
+            })?;
 
-        self.resolve_collection_version(&group_name, &storage_version, collection)
+        self.resolve_collection_version(&group_name, &version, collection)
             .await
     }
 

@@ -48,7 +48,7 @@ use crate::server::state::AppState;
 /// and delegates to a `dispatch_*_inner` function. Keeping the dispatch logic
 /// behind this small context (rather than the 30-plus-field `AppState`) lets
 /// the router/auth behaviour be exercised in tests with only a resource store
-/// and the two role allowlists.
+/// and the operator allowlist.
 #[derive(Clone)]
 pub(crate) struct ResourceApiCtx {
     store: Arc<dyn ResourceStore>,
@@ -667,6 +667,10 @@ async fn dispatch_put_inner(
     auth: AnyAuth,
     body: serde_json::Value,
 ) -> Result<Response, ServerError> {
+    // Reject non-operator users before any store I/O so path existence is not probeable.
+    if let AnyAuth::User(auth_ctx) = &auth {
+        require_operator(ctx, auth_ctx)?;
+    }
     let raw_path = parse_resource_path(&raw)?;
     match classify_path(&ctx.store, raw_path).await? {
         ResolvedPath::Item { resolved, leaf } => {

@@ -71,17 +71,18 @@ Two kinds of finalizers live in the `finalizers` array:
 
 ## Path resolution
 
-`resolve_path(&[PathSegment])` walks a path of `(api_version, kind, identifier)` pairs in a
+`resolve_path(&[PathSegment])` walks a path of `(api_versions, kind, identifier)` pairs in a
 single transaction and returns the full ancestor chain (leaf is the last element). Two segment
 forms:
 
 ```rust
-PathSegment::Name { api_version, kind, name }    // "widgets/foo"
-PathSegment::Uid  { api_version, kind, uid }     // "widgets/uid:aaaa-bbbb"
+PathSegment::Name { api_versions: vec!["widgets.example.com/v1".into()], kind: "Widget".into(), name: "foo".into() }
+PathSegment::Uid  { api_versions: vec!["widgets.example.com/v1".into()], kind: "Widget".into(), uid }
 ```
 
-`api_version` and `kind` are always required, even for UID-addressed segments. This lets
-the API layer:
+`api_versions` is the set of API versions the caller accepts for that segment (typically the
+served versions of a collection). The stored row must match one of them. `kind` is always
+required, even for UID-addressed segments. Together they let the API layer:
 
 - Determine the response shape from the URL alone (no resolve-before-route round-trip).
 - Surface `KindMismatch` when a UUID was copy-pasted into the wrong slot.
