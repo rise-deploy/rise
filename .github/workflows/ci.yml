@@ -351,6 +351,8 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'push'
     needs: prepare
+    environment:
+      name: github-pages
     permissions:
       contents: read
       id-token: write
@@ -491,6 +493,8 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request' && needs.prepare.outputs.is_trusted_pr == 'true'
     needs: prepare
+    environment:
+      name: github-pages
     permissions:
       contents: read
       id-token: write
