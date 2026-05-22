@@ -288,10 +288,15 @@ fn assert_body_matches(
     body_name: &str,
     url_name: &str,
 ) -> Result<(), ServerError> {
-    if body_api_version != info.api_version {
+    if !info
+        .served_api_versions
+        .contains(&body_api_version.to_string())
+    {
         return Err(ServerError::bad_request(format!(
-            "body apiVersion '{body_api_version}' does not match collection ({})",
-            info.api_version
+            "body apiVersion '{body_api_version}' is not a served version of collection \
+             '{}' (served: {})",
+            info.kind,
+            info.served_api_versions.join(", ")
         )));
     }
     if body_kind != info.kind {
@@ -503,6 +508,9 @@ async fn resolve_parent_row(
         .resolve_path(ancestor_segs)
         .await
         .map_err(store_error_to_server_error)?;
+    if chain.is_empty() {
+        return Err(ServerError::not_found("parent resource not found"));
+    }
     Ok(chain.into_iter().last())
 }
 
@@ -658,22 +666,27 @@ async fn dispatch_put_inner(
     body: serde_json::Value,
 ) -> Result<Response, ServerError> {
     // Reject non-operator users before any store I/O so path existence is not probeable.
-    if let AnyAuth::User(auth_ctx) = &auth {
-        require_operator(ctx, auth_ctx)?;
-    }
+    // Store the result so it can be reused inside the Item branch without a second call.
+    let operator_user = if let AnyAuth::User(auth_ctx) = &auth {
+        Some(require_operator(ctx, auth_ctx)?)
+    } else {
+        None
+    };
     let raw_path = parse_resource_path(&raw)?;
     match classify_path(&ctx.store, raw_path).await? {
         ResolvedPath::Item { resolved, leaf } => {
             // Controller tokens must not update items
-            let auth_ctx = match &auth {
-                AnyAuth::User(c) => c,
+            let user = match &auth {
+                AnyAuth::User(_) => {
+                    // Already validated by the early gate above; reuse the result.
+                    operator_user.expect("operator_user must be Some for AnyAuth::User")
+                }
                 AnyAuth::Controller(_) => {
                     return Err(ServerError::forbidden(
                         "controller tokens cannot update resource items",
                     ));
                 }
             };
-            let user = require_operator(ctx, auth_ctx)?;
             let body: UpdateResourceRequest = serde_json::from_value(body)
                 .map_err(|e| ServerError::bad_request(format!("invalid request body: {e}")))?;
             let url_name = leaf.url_name();
@@ -784,10 +797,16 @@ async fn create_resource(
     user: &User,
 ) -> Result<(StatusCode, Json<rise_resource_api::Resource>), ServerError> {
     // POST creates have no URL name segment — only validate type identity.
-    if body.api_version != resolved.info.api_version {
+    if !resolved
+        .info
+        .served_api_versions
+        .contains(&body.api_version)
+    {
         return Err(ServerError::bad_request(format!(
-            "body apiVersion '{}' does not match collection ({})",
-            body.api_version, resolved.info.api_version
+            "body apiVersion '{}' is not a served version of collection '{}' (served: {})",
+            body.api_version,
+            resolved.info.kind,
+            resolved.info.served_api_versions.join(", ")
         )));
     }
     if body.kind != resolved.info.kind {

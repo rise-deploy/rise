@@ -102,6 +102,11 @@ impl PgResourceStore {
 
     /// Retry an INSERT into `resources` up to 10 times, generating a fresh discriminator on each
     /// discriminator collision. Returns the inserted row or a `StoreError`.
+    ///
+    /// Each attempt is wrapped in a SAVEPOINT so that a discriminator-conflict error does not abort
+    /// the surrounding Postgres transaction — without this, the first conflict would put the
+    /// connection into an aborted-transaction state, making all subsequent retry attempts fail with
+    /// "current transaction is aborted" rather than a discriminator conflict.
     async fn insert_resource_row_with_retry(
         conn: &mut sqlx::PgConnection,
         params: &CreateResourceParams,
@@ -109,6 +114,11 @@ impl PgResourceStore {
     ) -> Result<ResourceRow, StoreError> {
         for _ in 0..10 {
             let discriminator = discriminator::generate();
+
+            sqlx::query("SAVEPOINT sp_discriminator_retry")
+                .execute(&mut *conn)
+                .await?;
+
             let result = sqlx::query_as::<_, ResourceRow>(
                 r#"
                 INSERT INTO resource_store.resources
@@ -129,11 +139,29 @@ impl PgResourceStore {
             .await;
 
             match result {
-                Ok(row) => return Ok(row),
-                Err(ref e) if Self::is_name_conflict(e) => return Err(StoreError::NameConflict),
-                Err(ref e) if Self::is_discriminator_conflict(e) => continue,
+                Ok(row) => {
+                    sqlx::query("RELEASE SAVEPOINT sp_discriminator_retry")
+                        .execute(&mut *conn)
+                        .await?;
+                    return Ok(row);
+                }
+                Err(ref e) if Self::is_name_conflict(e) => {
+                    sqlx::query("ROLLBACK TO SAVEPOINT sp_discriminator_retry")
+                        .execute(&mut *conn)
+                        .await?;
+                    return Err(StoreError::NameConflict);
+                }
+                Err(ref e) if Self::is_discriminator_conflict(e) => {
+                    sqlx::query("ROLLBACK TO SAVEPOINT sp_discriminator_retry")
+                        .execute(&mut *conn)
+                        .await?;
+                    continue;
+                }
                 Err(e) => {
-                    return Err(Self::rd_uniqueness_conflict(&e).unwrap_or(StoreError::Database(e)))
+                    sqlx::query("ROLLBACK TO SAVEPOINT sp_discriminator_retry")
+                        .execute(&mut *conn)
+                        .await?;
+                    return Err(Self::rd_uniqueness_conflict(&e).unwrap_or(StoreError::Database(e)));
                 }
             }
         }
@@ -205,6 +233,10 @@ impl PgResourceStore {
 
         // Lock the matching ResourceDefinition's `resources` row directly — the
         // `resource_definitions` projection is a view and cannot be locked.
+        // The JSONB containment check includes `served: true` so that a version
+        // declared with `served=false` is not treated as a valid write target;
+        // non-served versions must be rejected at the store level, not just at
+        // the HTTP layer.
         let row = sqlx::query(
             r#"
             SELECT uid
@@ -219,7 +251,7 @@ impl PgResourceStore {
         .bind(RESOURCE_DEFINITION_KIND)
         .bind(group)
         .bind(kind)
-        .bind(serde_json::json!([{ "name": version }]))
+        .bind(serde_json::json!([{ "name": version, "served": true }]))
         .fetch_optional(&mut **tx)
         .await?;
 
@@ -246,12 +278,18 @@ impl PgResourceStore {
     fn invalidate_schema_cache(&self, group: &str, plural: &str) {
         if let Ok(mut cache) = self.schema_cache.write() {
             cache.retain(|key, _| {
-                let Some((key_group, rest)) = key.split_once('/') else {
+                // Cache keys are formatted as "{group}/{version}/{plural}" by
+                // resolve_collection_version. Split into exactly three parts so that
+                // a malformed key (e.g. a version string containing '/') doesn't cause
+                // split_once/rsplit_once to extract the wrong component.
+                let mut parts = key.splitn(3, '/');
+                let key_group = parts.next().unwrap_or("");
+                let _key_version = parts.next();
+                let key_plural = parts.next().unwrap_or("");
+                // If there are fewer than 3 parts the key is malformed; retain it.
+                if _key_version.is_none() {
                     return true;
-                };
-                let Some((_, key_plural)) = rest.rsplit_once('/') else {
-                    return true;
-                };
+                }
                 key_group != group || key_plural != plural
             });
         }
@@ -281,9 +319,10 @@ impl PgResourceStore {
     /// registered before this ancestor (the walk reaches that descendant, whose
     /// parent ref points back at the kind being registered).
     ///
-    /// The walk reads outside any transaction, so it is best-effort against a
-    /// concurrent RD registration; the runtime `MAX_PARENT_CHAIN_DEPTH` cap in
-    /// the resource API's path resolution is the hard backstop.
+    /// The caller must hold the `resource_definitions_parent_cycle` advisory lock
+    /// (via `SELECT pg_advisory_xact_lock`) for the duration of the enclosing
+    /// transaction so that two concurrent registrations cannot both pass the cycle
+    /// check before either commits.
     async fn ensure_no_parent_cycle(
         &self,
         spec: &ResourceDefinitionSpec,
@@ -334,11 +373,14 @@ impl ResourceStore for PgResourceStore {
         if params.kind != RESOURCE_DEFINITION_KIND {
             let is_builtin =
                 params.api_version == API_VERSION_V1ALPHA1 && params.kind == ORGANIZATION_KIND;
+            // Always require the lock (and therefore verify the RD exists) unless this is a
+            // builtin kind. Without a lock, a concurrent RD hard-deletion could race with the
+            // insert, and callers with validator=None would bypass the RD existence check.
             Self::lock_matching_definition_for_write(
                 &mut tx,
                 &params.api_version,
                 &params.kind,
-                params.validator.is_some() && !is_builtin,
+                !is_builtin,
             )
             .await?;
         }
@@ -603,7 +645,15 @@ impl ResourceStore for PgResourceStore {
             return Ok(DeleteOutcome::MarkedForDeletion(Box::new(marked)));
         }
 
-        // No (remaining) children. Mark if finalizers, else hard-delete.
+        // No (remaining) children. For ResourceDefinitions, reject deletion when live instances
+        // exist — check before tombstoning (finalizer path) or hard-deleting so the caller gets
+        // an immediate error rather than a silent tombstone that try_collect would later reject.
+        if row.kind == RESOURCE_DEFINITION_KIND {
+            self.ensure_resource_definition_has_no_instances(&row, &mut tx)
+                .await?;
+        }
+
+        // Mark if finalizers, else hard-delete.
         if !row.finalizers.is_empty() {
             let marked = sqlx::query_as::<_, ResourceRow>(
                 r#"
@@ -619,11 +669,6 @@ impl ResourceStore for PgResourceStore {
             .await?;
             tx.commit().await?;
             return Ok(DeleteOutcome::MarkedForDeletion(Box::new(marked)));
-        }
-
-        if row.kind == RESOURCE_DEFINITION_KIND {
-            self.ensure_resource_definition_has_no_instances(&row, &mut tx)
-                .await?;
         }
         // Deleting the `resources` row also removes it from the
         // `resource_definitions` view.
@@ -1192,10 +1237,20 @@ impl ResourceStore for PgResourceStore {
         // fail only when that version is first used.
         Self::validate_version_schemas(&spec, &format!("'{}'", params.name))?;
 
-        // Reject a parent chain that would cycle back to this kind.
-        self.ensure_no_parent_cycle(&spec).await?;
-
         let mut tx = self.pool.begin().await?;
+
+        // Acquire a transaction-scoped advisory lock before the cycle check so that two
+        // concurrent registrations cannot both pass the check before either commits.
+        // The lock is automatically released when the transaction commits or rolls back.
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtext('resource_definitions_parent_cycle')::bigint)",
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        // Reject a parent chain that would cycle back to this kind. The advisory lock above
+        // ensures the committed state read here is stable for the duration of this transaction.
+        self.ensure_no_parent_cycle(&spec).await?;
 
         let metadata = serde_json::to_value(&params.annotations).unwrap_or_default();
 
