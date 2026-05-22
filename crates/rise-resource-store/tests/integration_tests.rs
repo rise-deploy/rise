@@ -252,41 +252,25 @@ async fn duplicate_name_returns_conflict(pool: sqlx::PgPool) -> sqlx::Result<()>
 }
 
 #[sqlx::test]
-async fn same_group_kind_name_conflicts_across_versions_at_root(
+async fn duplicate_name_returns_conflict_for_rd_backed_kind(
     pool: sqlx::PgPool,
 ) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
     register_example_widget_rd(&store).await;
 
-    store
-        .create(CreateResourceParams {
-            api_version: "example.dev/v1".to_string(),
-            kind: "Widget".to_string(),
-            name: "shared".to_string(),
-            parent_uid: None,
-            annotations: BTreeMap::new(),
-            finalizers: vec![],
-            spec: json!({}),
-            validator: None,
-        })
-        .await
-        .unwrap();
+    let params = || CreateResourceParams {
+        api_version: "example.dev/v1".to_string(),
+        kind: "Widget".to_string(),
+        name: "same-name".to_string(),
+        parent_uid: None,
+        annotations: BTreeMap::new(),
+        finalizers: vec![],
+        spec: json!({}),
+        validator: None,
+    };
 
-    // Same group + kind + name, different version: identity is per (group, kind, name), so the
-    // second create must conflict rather than create a duplicate logical resource.
-    let err = store
-        .create(CreateResourceParams {
-            api_version: "example.dev/v2".to_string(),
-            kind: "Widget".to_string(),
-            name: "shared".to_string(),
-            parent_uid: None,
-            annotations: BTreeMap::new(),
-            finalizers: vec![],
-            spec: json!({}),
-            validator: None,
-        })
-        .await
-        .unwrap_err();
+    store.create(params()).await.unwrap();
+    let err = store.create(params()).await.unwrap_err();
     assert!(
         matches!(err, StoreError::NameConflict),
         "expected NameConflict, got {err:?}"
@@ -296,32 +280,42 @@ async fn same_group_kind_name_conflicts_across_versions_at_root(
 }
 
 #[sqlx::test]
-async fn same_group_kind_name_conflicts_across_versions_in_child_scope(
-    pool: sqlx::PgPool,
-) -> sqlx::Result<()> {
+async fn create_rejects_non_storage_version_at_root(pool: sqlx::PgPool) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
     register_example_widget_rd(&store).await;
-    let parent = create_org(&store, "parent-org").await;
 
-    store
+    let err = store
         .create(CreateResourceParams {
-            api_version: "example.dev/v1".to_string(),
+            api_version: "example.dev/v2".to_string(),
             kind: "Widget".to_string(),
-            name: "shared".to_string(),
-            parent_uid: Some(parent.uid),
+            name: "non-storage".to_string(),
+            parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
             spec: json!({}),
             validator: None,
         })
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Validation(_)),
+        "expected Validation for non-storage create, got {err:?}"
+    );
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn create_rejects_non_storage_version_in_child_scope(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    register_example_widget_rd(&store).await;
+    let parent = create_org(&store, "parent-org").await;
 
     let err = store
         .create(CreateResourceParams {
             api_version: "example.dev/v2".to_string(),
             kind: "Widget".to_string(),
-            name: "shared".to_string(),
+            name: "non-storage".to_string(),
             parent_uid: Some(parent.uid),
             annotations: BTreeMap::new(),
             finalizers: vec![],
@@ -331,8 +325,8 @@ async fn same_group_kind_name_conflicts_across_versions_in_child_scope(
         .await
         .unwrap_err();
     assert!(
-        matches!(err, StoreError::NameConflict),
-        "expected NameConflict, got {err:?}"
+        matches!(err, StoreError::Validation(_)),
+        "expected Validation for non-storage create, got {err:?}"
     );
 
     Ok(())
@@ -417,6 +411,49 @@ async fn update_api_version_collision_returns_name_conflict(
     assert!(
         matches!(err, StoreError::NameConflict),
         "expected NameConflict, got {err:?}"
+    );
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn update_rejects_non_storage_version(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    register_example_widget_rd(&store).await;
+
+    let widget = store
+        .create(CreateResourceParams {
+            api_version: "example.dev/v1".to_string(),
+            kind: "Widget".to_string(),
+            name: "w1".to_string(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec: json!({}),
+            validator: None,
+        })
+        .await
+        .unwrap();
+
+    // v2 is served-only (storage: false) — migrating a row to a non-storage
+    // version must be rejected.
+    let err = store
+        .update(
+            widget.uid,
+            UpdateResourceParams {
+                api_version: Some("example.dev/v2".to_string()),
+                revision: widget.revision,
+                annotations: BTreeMap::new(),
+                finalizers: vec![],
+                spec: json!({}),
+                validator: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Validation(_)),
+        "expected Validation for non-storage update target, got {err:?}"
     );
 
     Ok(())
@@ -823,13 +860,13 @@ async fn delete_resource_definition_rejects_instances_in_any_served_version(
 ) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
 
-    let spec = json!({
+    let spec_v1_storage = json!({
         "group": "example.dev",
         "kind": "Widget",
         "plural": "widgets",
         "versions": [
-            {"name": "v1", "served": true, "storage": false},
-            {"name": "v2", "served": true, "storage": true}
+            {"name": "v1", "served": true, "storage": true},
+            {"name": "v2", "served": true, "storage": false}
         ],
         "allowedStatusControllerIds": []
     });
@@ -842,7 +879,7 @@ async fn delete_resource_definition_rejects_instances_in_any_served_version(
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
-            spec,
+            spec: spec_v1_storage,
             validator: None,
         })
         .await
@@ -859,6 +896,34 @@ async fn delete_resource_definition_rejects_instances_in_any_served_version(
             spec: json!({}),
             validator: None,
         })
+        .await
+        .unwrap();
+
+    // Kubernetes-style storage semantics: rows are written at the storage
+    // version. After the RD promotes v2 to storage, the existing v1 row still
+    // counts as an instance in a declared version and must block RD deletion.
+    let spec_v2_storage = json!({
+        "group": "example.dev",
+        "kind": "Widget",
+        "plural": "widgets",
+        "versions": [
+            {"name": "v1", "served": true, "storage": false},
+            {"name": "v2", "served": true, "storage": true}
+        ],
+        "allowedStatusControllerIds": []
+    });
+    let definition = store
+        .update_resource_definition(
+            definition.uid,
+            UpdateResourceParams {
+                api_version: None,
+                revision: definition.revision,
+                annotations: BTreeMap::new(),
+                finalizers: vec![],
+                spec: spec_v2_storage,
+                validator: None,
+            },
+        )
         .await
         .unwrap();
 

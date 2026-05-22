@@ -573,11 +573,16 @@ impl ResourceStore for PgResourceStore {
                 &mut tx,
                 target_api_version,
                 &kind,
-                // The instance already exists, so the RD may have been deleted between
-                // creation and this update. Don't require the lock to find a row; if
-                // the RD is already gone the instance is already orphaned — just lock
-                // it when it's there to block a racing deletion.
-                false,
+                // Require the RD row to exist (and declare target_api_version as its
+                // storage version) only when the caller is explicitly migrating the
+                // row to a new api_version. A migration target must be a declared
+                // storage version, so required=true catches non-storage targets.
+                //
+                // When not migrating (api_version = None), the instance may be at a
+                // formerly-storage version whose RD was since deleted — still lock it
+                // when present to block racing deletions, but don't error if the RD
+                // is gone.
+                params.api_version.is_some(),
             )
             .await?;
         }

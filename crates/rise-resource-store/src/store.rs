@@ -22,6 +22,12 @@ pub const CASCADE_DELETION_FINALIZER: &str = "system.rise.dev/cascade-deletion";
 pub const MAX_PARENT_CHAIN_DEPTH: usize = 32;
 
 pub struct CreateResourceParams {
+    /// Canonical storage API version for the row.
+    ///
+    /// Callers that accept a served API version from clients must resolve the
+    /// collection first and pass its `storage_api_version` here. This mirrors
+    /// Kubernetes CRD behavior: served versions are an API boundary concern,
+    /// while persisted rows use the current storage version.
     pub api_version: String,
     pub kind: String,
     pub name: String,
@@ -33,6 +39,10 @@ pub struct CreateResourceParams {
 }
 
 pub struct UpdateResourceParams {
+    /// New canonical storage API version for the row, when migrating it.
+    ///
+    /// HTTP/API callers should translate any served request version to the
+    /// collection's `storage_api_version` before calling the store.
     pub api_version: Option<String>,
     pub revision: i64,
     pub annotations: BTreeMap<String, String>,
