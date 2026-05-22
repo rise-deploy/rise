@@ -291,7 +291,7 @@ enum ProjectCommands {
     Show {
         /// Project name (optional if rise.toml contains [project] section)
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
     },
@@ -313,7 +313,7 @@ enum ProjectCommands {
         /// URL to where the project code lives (e.g. a GitHub/GitLab repository). Use empty string to clear.
         #[arg(long)]
         source_url: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
     },
@@ -323,7 +323,7 @@ enum ProjectCommands {
     Delete {
         /// Project name (optional if rise.toml contains [project] section)
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
     },
@@ -341,7 +341,7 @@ enum AppUserCommands {
         project: Option<String>,
         /// User or team identifier (format: "user:email" or "team:name")
         identifier: String,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
     },
@@ -353,7 +353,7 @@ enum AppUserCommands {
         project: Option<String>,
         /// User or team identifier (format: "user:email" or "team:name")
         identifier: String,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
     },
@@ -363,7 +363,7 @@ enum AppUserCommands {
     List {
         /// Project name (optional if rise.toml contains [project] section)
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
     },
@@ -442,7 +442,7 @@ enum DeploymentCommands {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
         /// Filter by deployment group
@@ -458,7 +458,7 @@ enum DeploymentCommands {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
         /// Deployment ID
@@ -475,7 +475,7 @@ enum DeploymentCommands {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
         /// Deployment group to stop
@@ -487,7 +487,7 @@ enum DeploymentCommands {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
         /// Deployment ID (YYYYMMDD-HHMMSS format)
@@ -516,7 +516,7 @@ enum ServiceAccountCommands {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
         /// OIDC issuer URL (e.g., https://gitlab.com)
@@ -533,7 +533,7 @@ enum ServiceAccountCommands {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
     },
@@ -544,7 +544,7 @@ enum ServiceAccountCommands {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
         /// Service account ID
@@ -557,7 +557,7 @@ enum ServiceAccountCommands {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
         /// Service account ID
@@ -573,7 +573,7 @@ enum EnvCommands {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
         /// Variable name (e.g., DATABASE_URL)
@@ -597,7 +597,7 @@ enum EnvCommands {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
         /// Filter by environment (shows global + environment-scoped vars merged)
@@ -610,7 +610,7 @@ enum EnvCommands {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
         /// Variable name
@@ -627,7 +627,7 @@ enum EnvCommands {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
         /// Variable name
@@ -642,7 +642,7 @@ enum EnvCommands {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
         /// Path to file containing environment variables
@@ -659,7 +659,7 @@ enum EnvCommands {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
         /// Target environment (e.g., 'staging'). Resolved from rise.toml if not specified.
@@ -671,7 +671,7 @@ enum EnvCommands {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
         /// Deployment ID
@@ -690,7 +690,7 @@ enum EnvironmentCommands {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
         /// Primary deployment group for this environment
@@ -710,7 +710,7 @@ enum EnvironmentCommands {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
     },
@@ -722,7 +722,7 @@ enum EnvironmentCommands {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
     },
@@ -735,7 +735,7 @@ enum EnvironmentCommands {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
         /// New environment name
@@ -760,7 +760,7 @@ enum EnvironmentCommands {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
     },
@@ -774,7 +774,7 @@ enum DomainCommands {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
         /// Domain name (e.g., example.com)
@@ -787,7 +787,7 @@ enum DomainCommands {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
     },
@@ -798,7 +798,7 @@ enum DomainCommands {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
         /// Domain name
@@ -815,7 +815,7 @@ enum ExtensionCommands {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
         /// Extension name
@@ -833,7 +833,7 @@ enum ExtensionCommands {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
         /// Extension name
@@ -848,7 +848,7 @@ enum ExtensionCommands {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
         /// Extension name
@@ -864,7 +864,7 @@ enum ExtensionCommands {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
     },
@@ -874,7 +874,7 @@ enum ExtensionCommands {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
         /// Extension name
@@ -887,7 +887,7 @@ enum ExtensionCommands {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
         project: Option<String>,
-        /// Path to rise.toml (defaults to current directory)
+        /// Directory containing rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
         /// Extension name

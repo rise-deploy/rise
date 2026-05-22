@@ -112,6 +112,16 @@ rise project create
 
 If a `rise.toml` already exists, it is never overwritten — the project is created on the backend using the name from the file.
 
+## Managing a Project
+
+`rise project show`, `update`, and `delete` take an optional project name. When omitted, the name is read from the `[project]` section of `rise.toml` (or `.rise.toml`) in the directory given by `--path` (defaults to the current directory):
+
+```bash
+# Both work when rise.toml has [project] name = "my-app"
+rise project show my-app
+rise project show
+```
+
 ## Configuration Precedence
 
 Settings are resolved in this order (highest to lowest priority):
