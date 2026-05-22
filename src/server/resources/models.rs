@@ -59,7 +59,7 @@ pub fn row_to_resource_with_api_version(row: &ResourceRow, api_version: &str) ->
                     // erase them.  The conversion is lossless: `42` → `"42"`,
                     // `{"x":1}` → `"{\"x\":1}"`.
                     other => {
-                        tracing::debug!(
+                        tracing::warn!(
                             uid = %row.uid,
                             kind = %row.kind,
                             name = %row.name,

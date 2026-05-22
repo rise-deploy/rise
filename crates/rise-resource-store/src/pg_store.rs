@@ -1073,7 +1073,11 @@ impl ResourceStore for PgResourceStore {
         // registry and its api_version live in builtin_collection_info; resolve against
         // it rather than re-encoding the group/version as string literals here.
         if let Some(info) = Self::builtin_collection_info(collection) {
-            if format!("{group}/{version}") == info.api_version {
+            let matches = info
+                .api_version
+                .split_once('/')
+                .is_some_and(|(g, v)| g == group && v == version);
+            if matches {
                 return Ok(Some(info));
             }
             // A built-in collection requested at a version it does not serve.

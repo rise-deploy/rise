@@ -75,6 +75,16 @@ CREATE UNIQUE INDEX resources_root_discriminator_unique
     ON resource_store.resources (discriminator)
     WHERE parent_uid IS NULL;
 
+-- Backs group-scoped list and get_by_name queries that match on the API group
+-- (split_part(api_version, '/', 1)) rather than the full api_version.
+CREATE INDEX resources_child_group_kind
+    ON resource_store.resources (parent_uid, split_part(api_version, '/', 1), kind)
+    WHERE parent_uid IS NOT NULL;
+
+CREATE INDEX resources_root_group_kind
+    ON resource_store.resources (split_part(api_version, '/', 1), kind)
+    WHERE parent_uid IS NULL;
+
 -- Backs `list_pending_collection` and the GC sweep that calls `try_collect` on
 -- tombstoned rows. Partial so the index stays small relative to total resource count.
 CREATE INDEX resources_pending_collection

@@ -305,8 +305,9 @@ fn assert_body_matches(
             info.kind
         )));
     }
-    // The URL identifier may be `uid:<uuid>`, in which case it does not
-    // constrain the name. For plain-name URLs, the body's name must match.
+    // For plain-name URLs the body's name must match the URL segment. For
+    // `uid:<uuid>` URLs the URL segment doesn't constrain the name, but
+    // `update_resource` still requires the body name to match the stored row.
     if !url_name.starts_with("uid:") && body_name != url_name {
         return Err(ServerError::bad_request(format!(
             "body metadata.name '{body_name}' does not match URL name '{url_name}'"
@@ -677,9 +678,13 @@ async fn dispatch_put_inner(
         ResolvedPath::Item { resolved, leaf } => {
             // Controller tokens must not update items
             let user = match &auth {
-                AnyAuth::User(_) => {
+                AnyAuth::User(_auth_ctx) => {
                     // Already validated by the early gate above; reuse the result.
-                    operator_user.expect("operator_user must be Some for AnyAuth::User")
+                    operator_user.unwrap_or_else(|| {
+                        // Safety: the early gate at the top of this function sets
+                        // operator_user = Some(...) for every AnyAuth::User variant.
+                        unreachable!("operator_user is always Some when auth is User")
+                    })
                 }
                 AnyAuth::Controller(_) => {
                     return Err(ServerError::forbidden(
