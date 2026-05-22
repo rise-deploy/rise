@@ -26,13 +26,6 @@ pub async fn exchange_token(
     Json(req): Json<ExchangeTokenRequest>,
 ) -> Result<impl IntoResponse, ServerError> {
     let ip = extract_client_ip(&headers);
-    if let Err(retry_after) = state
-        .oauth_rate_limiter
-        .increment_and_check(&ip, None, "identity")
-        .await
-    {
-        return Ok(rate_limit_response(retry_after).into_response());
-    }
 
     let credential = extract_bearer_token(&headers)
         .map(|c| c.trim().to_string())
@@ -43,13 +36,30 @@ pub async fn exchange_token(
     if audience.is_empty() {
         return Err(ServerError::bad_request("audience must not be empty"));
     }
+    if audience.len() > 1024 {
+        return Err(ServerError::bad_request("audience value too long"));
+    }
 
     let hash = sha256_hex(credential.as_bytes());
-    let deployment = db_deployments::get_by_identity_credential_hash(&state.db_pool, &hash)
+    let deployment_opt = db_deployments::get_by_identity_credential_hash(&state.db_pool, &hash)
         .await
         .internal_err("Failed to look up deployment")?
-        .filter(should_have_infrastructure)
-        .ok_or_else(|| ServerError::unauthorized("Invalid bootstrap credential"))?;
+        .filter(should_have_infrastructure);
+
+    let rate_limit_key = deployment_opt
+        .as_ref()
+        .map(|d| d.id.to_string())
+        .unwrap_or_else(|| "invalid-credential".to_string());
+    if let Err(retry_after) = state
+        .oauth_rate_limiter
+        .increment_and_check(&ip, None, &rate_limit_key)
+        .await
+    {
+        return Ok(rate_limit_response(retry_after).into_response());
+    }
+
+    let deployment =
+        deployment_opt.ok_or_else(|| ServerError::unauthorized("Invalid bootstrap credential"))?;
 
     let project = db_projects::find_by_id(&state.db_pool, deployment.project_id)
         .await
@@ -89,6 +99,14 @@ pub async fn exchange_token(
             WORKLOAD_TOKEN_TTL_SECS,
         )
         .map_err(|e| ServerError::internal(format!("Failed to sign workload token: {:?}", e)))?;
+
+    tracing::info!(
+        project = %project.name,
+        deployment_group = %deployment.deployment_group,
+        deployment_id = %deployment.deployment_id,
+        audience = %audience,
+        "Issued workload identity token"
+    );
 
     Ok(Json(ExchangeTokenResponse {
         token,
