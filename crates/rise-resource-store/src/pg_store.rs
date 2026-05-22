@@ -3,9 +3,9 @@ use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
 use rise_resource_api::{
-    validate_controller_id, validate_resource_name, ResourceDefinitionSpec, ResourceParentRef,
-    API_VERSION_V1ALPHA1, ORGANIZATION_COLLECTION, ORGANIZATION_KIND,
-    RESOURCE_DEFINITION_COLLECTION, RESOURCE_DEFINITION_KIND,
+    validate_controller_id, validate_resource_name, ResourceDefinitionSpec, API_VERSION_V1ALPHA1,
+    ORGANIZATION_COLLECTION, ORGANIZATION_KIND, RESOURCE_DEFINITION_COLLECTION,
+    RESOURCE_DEFINITION_KIND,
 };
 use sqlx::{PgPool, Row};
 
@@ -241,55 +241,6 @@ impl PgResourceStore {
     /// silently matching everything.
     fn group_of(api_version: &str) -> &str {
         api_version.split_once('/').map_or(api_version, |(g, _)| g)
-    }
-
-    /// Resolve the declared parent of a resource from its own definition, used by `reparent` to
-    /// decide where the resource is allowed to move.
-    ///
-    /// - Built-in kinds (`Organization`, `ResourceDefinition`) are root-scoped with no declared
-    ///   parent.
-    /// - User-defined kinds resolve their `ResourceDefinition` by `(group, kind)`; the RD's
-    ///   stored `resources.spec` carries the optional `spec.parent` (absent ⇒ root-scoped).
-    ///
-    /// Returns `None` for a root-scoped resource (must reparent to root) and `Some(parent_ref)`
-    /// for a resource that must live under a row of the referenced group + kind.
-    async fn declared_parent_ref(
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        api_version: &str,
-        kind: &str,
-    ) -> Result<Option<ResourceParentRef>, StoreError> {
-        // Built-in root-scoped kinds carry no ResourceDefinition.
-        if kind == ORGANIZATION_KIND || kind == RESOURCE_DEFINITION_KIND {
-            return Ok(None);
-        }
-
-        let group = Self::group_of(api_version);
-        let row = sqlx::query(
-            r#"
-            SELECT r.spec
-            FROM resource_store.resource_definitions rd
-            JOIN resource_store.resources r ON r.uid = rd.uid
-            WHERE rd.group_name = $1 AND rd.kind = $2
-            "#,
-        )
-        .bind(group)
-        .bind(kind)
-        .fetch_optional(&mut **tx)
-        .await?;
-
-        let Some(row) = row else {
-            return Err(StoreError::Validation(format!(
-                "no ResourceDefinition serves '{group}/{kind}'"
-            )));
-        };
-
-        let spec: ResourceDefinitionSpec = serde_json::from_value(
-            row.try_get("spec").map_err(StoreError::Database)?,
-        )
-        .map_err(|e| StoreError::Validation(format!("invalid ResourceDefinition spec: {e}")))?;
-
-        // A ResourceDefinition with no declared `parent` is root-scoped.
-        Ok(spec.parent)
     }
 
     fn invalidate_schema_cache(&self, group: &str, plural: &str) {
@@ -873,124 +824,6 @@ impl ResourceStore for PgResourceStore {
 
         tx.commit().await?;
         Ok(chain)
-    }
-
-    async fn reparent(
-        &self,
-        uid: Uuid,
-        new_parent_uid: Option<Uuid>,
-    ) -> Result<ResourceRow, StoreError> {
-        let mut tx = self.pool.begin().await?;
-
-        // Lock the target row.
-        let target = sqlx::query_as::<_, ResourceRow>(
-            "SELECT * FROM resource_store.resources WHERE uid = $1 FOR UPDATE",
-        )
-        .bind(uid)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(StoreError::NotFound)?;
-
-        // Determine the resource's declared parent type from its own definition. The target may
-        // be parented at any depth, so the destination is validated by parent *type* (group +
-        // kind), not by a fixed "must be a root-level Organization" rule.
-        let declared_parent =
-            Self::declared_parent_ref(&mut tx, &target.api_version, &target.kind).await?;
-
-        match (&declared_parent, new_parent_uid) {
-            // Root-scoped resource: it has no declared parent, so it can only live at root.
-            (None, Some(_)) => {
-                return Err(StoreError::Validation(
-                    "root-scoped resources cannot be reparented under another resource".to_string(),
-                ));
-            }
-            (None, None) => {}
-            // Non-root resource: it must move under a row of the declared parent type.
-            (Some(_), None) => {
-                return Err(StoreError::Validation(
-                    "non-root resources must be reparented under a parent resource".to_string(),
-                ));
-            }
-            (Some(parent_ref), Some(new_pid)) => {
-                let parent = sqlx::query_as::<_, ResourceRow>(
-                    "SELECT * FROM resource_store.resources WHERE uid = $1",
-                )
-                .bind(new_pid)
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or(StoreError::ParentNotFound)?;
-
-                // Match the new parent on group + kind only. The declared parent ref pins a
-                // specific version, but a valid parent may legitimately be stored at an older
-                // served version of the same group, so the version is intentionally ignored.
-                let expected_group = Self::group_of(&parent_ref.api_version);
-                let actual_group = Self::group_of(&parent.api_version);
-                if parent.kind != parent_ref.kind || actual_group != expected_group {
-                    return Err(StoreError::Validation(format!(
-                        "resource declares parent '{}/{}' but the new parent is '{}/{}'",
-                        expected_group, parent_ref.kind, actual_group, parent.kind
-                    )));
-                }
-            }
-        }
-
-        if target.parent_uid == new_parent_uid {
-            tx.commit().await?;
-            return Ok(target);
-        }
-
-        if let Some(new_pid) = new_parent_uid {
-            if new_pid == uid {
-                return Err(StoreError::ReparentCycle);
-            }
-
-            // Verify the new parent exists and isn't an ancestor in our own subtree.
-            // Walk up from the new parent; if we hit `uid`, it would be a cycle.
-            let is_descendant: bool = sqlx::query_scalar(
-                r#"
-                WITH RECURSIVE ancestors AS (
-                    SELECT uid, parent_uid FROM resource_store.resources WHERE uid = $1
-                    UNION ALL
-                    SELECT r.uid, r.parent_uid
-                    FROM resource_store.resources r
-                    JOIN ancestors a ON r.uid = a.parent_uid
-                )
-                SELECT EXISTS (SELECT 1 FROM ancestors WHERE uid = $2)
-                "#,
-            )
-            .bind(new_pid)
-            .bind(uid)
-            .fetch_one(&mut *tx)
-            .await?;
-
-            if is_descendant {
-                return Err(StoreError::ReparentCycle);
-            }
-        }
-
-        let result = sqlx::query_as::<_, ResourceRow>(
-            r#"
-            UPDATE resource_store.resources
-            SET parent_uid = $2,
-                revision = revision + 1
-            WHERE uid = $1
-            RETURNING *
-            "#,
-        )
-        .bind(uid)
-        .bind(new_parent_uid)
-        .fetch_one(&mut *tx)
-        .await;
-
-        let row = match result {
-            Ok(r) => r,
-            Err(e) if Self::is_name_conflict(&e) => return Err(StoreError::NameConflict),
-            Err(e) if Self::is_discriminator_conflict(&e) => return Err(StoreError::NameConflict),
-            Err(e) => return Err(StoreError::Database(e)),
-        };
-
-        tx.commit().await?;
-        Ok(row)
     }
 
     async fn update_controller_status(

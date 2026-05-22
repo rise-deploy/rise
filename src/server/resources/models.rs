@@ -2,15 +2,14 @@
 //!
 //! Request bodies (`CreateResourceRequest`, `UpdateResourceRequest`) come from
 //! `rise_resource_api`; this module holds the response envelope, the small
-//! per-endpoint payloads (status, finalizers, reparent), and the conversion
-//! from a stored `ResourceRow` to the wire `Resource` envelope.
+//! per-endpoint payloads (status, finalizers), and the conversion from a
+//! stored `ResourceRow` to the wire `Resource` envelope.
 
 use std::collections::BTreeMap;
 
 use rise_resource_api::{Resource, ResourceMetadata};
 use rise_resource_store::ResourceRow;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 /// Outcome of a controller status update — what was previously
 /// `status.controllers[<id>]` is replaced with the request body.
@@ -28,15 +27,6 @@ pub struct ControllerFinalizerUpdate {
     pub add: Vec<String>,
     #[serde(default)]
     pub remove: Vec<String>,
-}
-
-/// Body of a reparent request. `new_parent_uid = None` reparents to root.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReparentRequest {
-    /// New parent UID, or null to move to root scope.
-    #[serde(default)]
-    pub new_parent_uid: Option<Uuid>,
 }
 
 /// Wrapper for the generic-resource list endpoint response.
@@ -120,6 +110,7 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use serde_json::json;
+    use uuid::Uuid;
 
     fn row(spec: serde_json::Value, status: serde_json::Value) -> ResourceRow {
         ResourceRow {

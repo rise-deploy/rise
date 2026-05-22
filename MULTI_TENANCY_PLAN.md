@@ -174,7 +174,7 @@ Backend startup migration order:
   followed by the resource hierarchy as bare ancestor names:
   - `{group}/{version}/{plural}/{ancestor}…` — list / create (`D` ancestor names)
   - `{group}/{version}/{plural}/{ancestor}…/{name}` — get / update / delete an item
-  - `{group}/{version}/{plural}/{ancestor}…/{name}/{status|finalizers|reparent}` — subresource
+  - `{group}/{version}/{plural}/{ancestor}…/{name}/{status|finalizers}` — subresource
   - `{group}/{version}/{plural}/uid:{uuid}[/{sub}]` — address an item by UID
 - `D` is the leaf kind's parent-chain depth. Each `ResourceDefinition` declares
   exactly one `parent`, so the ancestor *kinds* are derived from the leaf kind by
@@ -187,7 +187,6 @@ Backend startup migration order:
 - `DELETE` always cascades to the subtree.
 - Maintenance / discovery endpoints:
   - `GET /api/v1/resources/pending-deletion` — resources tombstoned and awaiting GC (`list_pending_collection`)
-  - `POST /api/v1/resources/{collection}/{name}/reparent` — atomic move to a new parent (operator); rejects cycles and uniqueness conflicts at the destination
 - Route `{collection}` through the resource registry:
   - built-in registrations first
   - external ResourceDefinitions second
@@ -380,7 +379,6 @@ high-cardinality or end-user-owned kinds onto the resource store:
   - controllers cannot add or remove `system.rise.dev/*` finalizers via `update_controller_finalizers`
   - `resolve_path` walks `Name` and `Uid` segments, returns the full ancestor chain (including tombstoned rows), and rejects kind mismatches on UID segments
   - `list_pending_collection` enumerates tombstoned rows for the GC worker
-  - `reparent` moves a resource, rejects cycles, and surfaces destination uniqueness conflicts as `NameConflict`
   - Organization with linked teams or projects (via `organization_resource_uid`) is blocked from deletion at the application layer
 - Built-ins:
   - Organization validation via Rust structs
@@ -461,8 +459,8 @@ Deliver in the following order. PRs 1–4 avoid existing data model changes, but
 - Resource registry: built-in resolution first, external ResourceDefinitions second
 - Request body validation, operator-only enforcement, controller status/finalizer endpoints
 - `DELETE` always cascades to the subtree
-- `POST .../{name}/reparent` (operator) and a `GET /api/v1/resources/pending-deletion` diagnostics listing
-- Audit logging for delete and reparent operations
+- `GET /api/v1/resources/pending-deletion` diagnostics listing
+- Audit logging for delete operations
 - Purely additive — no existing routes change
 - Depends on: PR 2, PR 3
 
@@ -498,7 +496,6 @@ Deliver in the following order. PRs 1–4 avoid existing data model changes, but
 - Normal generic resource CRUD is operator-only in v1; controller JWTs may use controller-specific status/finalizer operations.
 - `auth.admin_users` are org-level admins within the default Organization only; they do not receive Operator access and cannot manage Organization resources.
 - Organization-level admins/users will be modeled later and will eventually replace current platform-level access concepts.
-- Delete always cascades to the subtree. Reparent is the supported way to relocate a resource; to delete a parent but keep its children, reparent them elsewhere first.
+- Delete always cascades to the subtree.
 - Tombstoned rows are always visible to the API; controllers and operators rely on observing in-progress teardown to do their work. An `exclude_deleted` filter can be added later when there is a concrete need.
-- Reparent permission model (owner-of-source, owner-of-destination, both, admin-only) is deferred to the API layer and will be decided when reparent is exposed.
 - Recursive-CTE optimization for `resolve_path` is deferred; the initial implementation is a per-segment loop in a single transaction, which is fine for typical hierarchy depths.

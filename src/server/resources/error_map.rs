@@ -23,9 +23,6 @@ pub fn store_error_to_server_error(err: StoreError) -> ServerError {
             "path segment kind mismatch: expected '{expected}', got '{got}'"
         )),
         StoreError::ParentNotFound => ServerError::not_found("parent path segment not found"),
-        StoreError::ReparentCycle => {
-            ServerError::bad_request("reparent would create a cycle in the resource hierarchy")
-        }
         StoreError::ReservedFinalizer(f) => ServerError::bad_request(format!(
             "finalizer '{f}' is in the reserved system.rise.dev/* namespace"
         )),
@@ -78,12 +75,6 @@ mod tests {
         let err = store_error_to_server_error(StoreError::Validation("bad spec".into()));
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert_eq!(err.message, "bad spec");
-    }
-
-    #[test]
-    fn maps_reparent_cycle() {
-        let err = store_error_to_server_error(StoreError::ReparentCycle);
-        assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
     #[test]

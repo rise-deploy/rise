@@ -55,9 +55,7 @@ via `try_collect` fan out down the tree as each level drains. The parent stays o
 until the entire subtree has been collected; because the `parent_uid` FK forbids deleting a
 referenced row, collection is necessarily bottom-up.
 
-To delete a parent but keep its children, `reparent` the children elsewhere first, then
-delete the now-childless parent. There is no detach/orphan operation — a non-root resource
-can never become parentless.
+There is no detach/orphan operation — a non-root resource can never become parentless.
 
 ### Finalizer ownership
 
@@ -95,28 +93,3 @@ required, even for UID-addressed segments. Together they let the API layer:
 `list_pending_collection(limit)` returns tombstoned rows (`deletion_timestamp IS NOT NULL`),
 oldest first. The GC worker iterates it to drive `try_collect`; it also backs operator
 tooling that needs to spot resources stuck mid-deletion.
-
-## Reparenting
-
-`reparent(uid, new_parent_uid)` atomically moves a resource. The destination is validated
-against the resource's *own* declared parent type — `reparent` self-determines this from the
-resource's definition, so the caller passes no scope:
-
-- Built-in kinds (`Organization`, `ResourceDefinition`) and any `ResourceDefinition` that
-  declares no `parent` are root-scoped: they have no declared parent and must move to root
-  (`new_parent_uid = None`).
-- A resource whose `ResourceDefinition` declares a `parent` must move under a row matching
-  the declared parent's API **group** and **kind**. The version is ignored, so a parent
-  stored at an older served version of the same group is still accepted. Arbitrary nesting
-  depth is allowed — the parent need not be root-level.
-
-Rejects:
-
-- `Validation` — destination does not match the resource's declared parent type (e.g. a
-  root-scoped resource given a parent, a non-root resource sent to root, or a wrongly-typed
-  new parent).
-- `ReparentCycle` — self-loop or moving a node under one of its own descendants.
-- `NameConflict` — destination scope already has a row with the same `(group, kind, name)`
-  or discriminator.
-
-Use this in preference to delete-then-recreate, which loses the UID and revision history.

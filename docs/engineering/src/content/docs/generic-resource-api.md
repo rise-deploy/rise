@@ -14,9 +14,8 @@ A resource path names the **leaf** collection as `{group}/{version}/{plural}`, f
 | `{group}/{version}/{plural}/{ancestor}…/{name}` (`D+1`) | GET, PUT, DELETE | Get / update / delete an item |
 | `{group}/{version}/{plural}/{ancestor}…/{name}/status` (`D+2`) | PUT | Controller status update |
 | `{group}/{version}/{plural}/{ancestor}…/{name}/finalizers` (`D+2`) | PUT | Controller finalizer update |
-| `{group}/{version}/{plural}/{ancestor}…/{name}/reparent` (`D+2`) | POST | Move an item under a new parent |
 | `{group}/{version}/{plural}/uid:{uuid}` | GET, PUT, DELETE | Get / update / delete an item by UID |
-| `{group}/{version}/{plural}/uid:{uuid}/{sub}` | PUT, POST | `status` / `finalizers` / `reparent` on an item by UID |
+| `{group}/{version}/{plural}/uid:{uuid}/{sub}` | PUT | `status` / `finalizers` on an item by UID |
 | `pending-deletion` | GET | List resources tombstoned and awaiting garbage collection |
 
 The `{ancestor}` segments are bare resource *names*, ordered root-most first; the ancestor *types* are derived from the leaf's `ResourceDefinition` parent chain, never supplied in the URL. `pending-deletion` is only valid as the sole path segment, so a resource may be named `pending-deletion`.
@@ -44,7 +43,7 @@ Like `name`, the discriminator identifies a resource within its sibling scope. U
 
 | Tier | Credentials | Permitted operations |
 |---|---|---|
-| Operator | Listed in `auth.operator_users` | GET, POST, item PUT, DELETE, `reparent` |
+| Operator | Listed in `auth.operator_users` | GET, POST, item PUT, DELETE |
 | Controller | Configured `ControllerIdentity` token | PUT `status` and `finalizers`, gated by `allowed_status_controller_ids` |
 
 Controller tokens cannot perform item-level PUT or other operator operations.
@@ -70,7 +69,7 @@ Version behavior follows Kubernetes-style semantics:
 
 ## Deletion
 
-`DELETE` always cascades: the resource and its entire subtree are removed. The resource is tombstoned, its subtree drains as finalizers clear, and rows are collected bottom-up. To delete a parent while keeping its children, `reparent` the children to another valid parent first, then delete the now-childless parent.
+`DELETE` always cascades: the resource and its entire subtree are removed. The resource is tombstoned, its subtree drains as finalizers clear, and rows are collected bottom-up.
 
 `GET /api/v1/resources/pending-deletion` lists resources that are tombstoned and still draining — useful for spotting a deletion stuck on a finalizer.
 

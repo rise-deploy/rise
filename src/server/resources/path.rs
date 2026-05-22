@@ -71,7 +71,6 @@ pub struct CollectionRef {
 pub enum Subresource {
     Status,
     Finalizers,
-    Reparent,
 }
 
 impl Subresource {
@@ -80,7 +79,6 @@ impl Subresource {
         match value {
             "status" => Some(Self::Status),
             "finalizers" => Some(Self::Finalizers),
-            "reparent" => Some(Self::Reparent),
             _ => None,
         }
     }
@@ -220,10 +218,7 @@ mod tests {
             Subresource::from_keyword("finalizers"),
             Some(Subresource::Finalizers)
         );
-        assert_eq!(
-            Subresource::from_keyword("reparent"),
-            Some(Subresource::Reparent)
-        );
+        assert_eq!(Subresource::from_keyword("reparent"), None);
         assert_eq!(Subresource::from_keyword("widgets"), None);
     }
 

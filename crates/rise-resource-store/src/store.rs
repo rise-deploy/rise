@@ -151,19 +151,6 @@ pub trait ResourceStore: Send + Sync {
     /// Tombstoned rows are returned (callers decide how to handle them).
     async fn resolve_path(&self, segments: &[PathSegment]) -> Result<Vec<ResourceRow>, StoreError>;
 
-    /// Atomically move a resource. The destination is validated against the resource's own
-    /// declared parent type: a root-scoped resource (built-in `Organization`/`ResourceDefinition`,
-    /// or any `ResourceDefinition` with `scope = Root`) must move to root (`new_parent_uid =
-    /// None`); a resource whose `ResourceDefinition` declares a `parent` must move under a row of
-    /// the declared parent's API group + kind (the version is ignored, so an older served
-    /// version is accepted). Rejects cycles and surfaces name/discriminator collisions at the
-    /// destination scope as `NameConflict`.
-    async fn reparent(
-        &self,
-        uid: Uuid,
-        new_parent_uid: Option<Uuid>,
-    ) -> Result<ResourceRow, StoreError>;
-
     async fn update_controller_status(
         &self,
         uid: Uuid,

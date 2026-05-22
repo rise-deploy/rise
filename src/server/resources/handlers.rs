@@ -26,7 +26,7 @@ use uuid::Uuid;
 use super::error_map::store_error_to_server_error;
 use super::models::{
     row_to_resource, row_to_resource_with_api_version, ControllerFinalizerUpdate,
-    ControllerStatusUpdate, ReparentRequest, ResourceList,
+    ControllerStatusUpdate, ResourceList,
 };
 use super::path::{
     parse_identifier, parse_resource_path, parse_uid_token, CollectionRef, RawResourcePath,
@@ -467,7 +467,7 @@ async fn classify_path(
         2 => {
             let subresource = Subresource::from_keyword(&segments[depth + 1]).ok_or_else(|| {
                 ServerError::bad_request(format!(
-                    "expected a subresource keyword (status, finalizers, reparent) after \
+                    "expected a subresource keyword (status, finalizers) after \
                      the item name, got '{}'",
                     segments[depth + 1]
                 ))
@@ -630,20 +630,9 @@ async fn dispatch_post_inner(
                 create_resource(ctx, &resolved, parent_uid, body, &user).await?;
             Ok((status, resource).into_response())
         }
-        ResolvedPath::Subresource {
-            resolved,
-            leaf,
-            subresource: Subresource::Reparent,
-        } => {
-            let body: ReparentRequest = serde_json::from_value(body)
-                .map_err(|e| ServerError::bad_request(format!("invalid request body: {e}")))?;
-            let row = resolve_leaf(&ctx.store, &resolved, leaf).await?;
-            let resp = apply_reparent(ctx, &resolved.info, &row, body, &user).await?;
-            Ok(resp.into_response())
-        }
         _ => Err(ServerError::new(
             StatusCode::METHOD_NOT_ALLOWED,
-            "POST is only valid for collection paths and reparent",
+            "POST is only valid for collection paths",
         )),
     }
 }
@@ -692,14 +681,6 @@ async fn dispatch_put_inner(
             leaf,
             subresource,
         } => {
-            // `reparent` is POST-only; reject PUT before auth discrimination so
-            // every caller gets a consistent 405 (not a 403 about controllers).
-            if matches!(subresource, Subresource::Reparent) {
-                return Err(ServerError::new(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "PUT is not valid for reparent; use POST",
-                ));
-            }
             // User tokens cannot update status/finalizers. The caller is
             // authenticated (a user/SA token), so this is an authorization
             // failure (403), not an authentication failure (401).
@@ -748,7 +729,6 @@ async fn dispatch_put_inner(
                     .await?;
                     Ok(resp.into_response())
                 }
-                Subresource::Reparent => unreachable!("handled above"),
             }
         }
         _ => Err(ServerError::new(
@@ -993,34 +973,6 @@ async fn apply_controller_finalizers(
     Ok(Json(row_to_resource_with_api_version(
         &updated,
         response_api_version,
-    )))
-}
-
-async fn apply_reparent(
-    ctx: &ResourceApiCtx,
-    info: &CollectionInfo,
-    row: &ResourceRow,
-    body: ReparentRequest,
-    user: &User,
-) -> Result<Json<rise_resource_api::Resource>, ServerError> {
-    let updated = ctx
-        .store
-        .reparent(row.uid, body.new_parent_uid)
-        .await
-        .map_err(store_error_to_server_error)?;
-    tracing::info!(
-        target: "rise::audit",
-        actor = %user.email,
-        uid = %row.uid,
-        kind = %row.kind,
-        name = %row.name,
-        old_parent_uid = ?row.parent_uid,
-        new_parent_uid = ?body.new_parent_uid,
-        "resource.reparent"
-    );
-    Ok(Json(row_to_resource_with_api_version(
-        &updated,
-        &info.api_version,
     )))
 }
 
@@ -1369,46 +1321,6 @@ mod dispatch_tests {
     }
 
     // -------------------------------------------------------------------------
-    // Auth tier: reparent is a normal operator operation
-    // -------------------------------------------------------------------------
-
-    #[sqlx::test]
-    async fn reparent_allowed_for_operator(pool: sqlx::PgPool) {
-        let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
-        create_widget(&ctx, "example.dev/v1", "w1").await;
-
-        // Any operator may reparent — there is no separate admin tier.
-        let resp = dispatch_post_inner(
-            &ctx,
-            "example.dev/v1/widgets/w1/reparent".to_string(),
-            auth(OPERATOR),
-            json!({"newParentUid": null}),
-        )
-        .await
-        .expect("operator may reparent");
-        let (status, _) = read(resp).await;
-        assert_eq!(status, StatusCode::OK);
-    }
-
-    #[sqlx::test]
-    async fn reparent_rejects_non_operator(pool: sqlx::PgPool) {
-        let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
-        create_widget(&ctx, "example.dev/v1", "w1").await;
-
-        let err = dispatch_post_inner(
-            &ctx,
-            "example.dev/v1/widgets/w1/reparent".to_string(),
-            auth(PLAIN_USER),
-            json!({"newParentUid": null}),
-        )
-        .await
-        .expect_err("a non-operator must not reparent");
-        assert_eq!(err.status, StatusCode::FORBIDDEN);
-    }
-
-    // -------------------------------------------------------------------------
     // Auth tier: status/finalizers require a controller token (Fix E)
     // -------------------------------------------------------------------------
 
@@ -1550,7 +1462,7 @@ mod dispatch_tests {
         register_widget_rd(&ctx, &[]).await;
         create_widget(&ctx, "example.dev/v1", "w1").await;
 
-        // POST is only valid for collection paths and reparent.
+        // POST is only valid for collection paths.
         let err = dispatch_post_inner(
             &ctx,
             "example.dev/v1/widgets/w1".to_string(),
@@ -2012,29 +1924,6 @@ mod dispatch_tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["items"].as_array().expect("items array").len(), 1);
         assert_eq!(body["items"][0]["apiVersion"], "example.dev/v2");
-    }
-
-    // -------------------------------------------------------------------------
-    // Method correctness: reparent is POST-only
-    // -------------------------------------------------------------------------
-
-    #[sqlx::test]
-    async fn put_on_reparent_yields_405(pool: sqlx::PgPool) {
-        let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
-        create_widget(&ctx, "example.dev/v1", "w1").await;
-
-        // reparent is POST-only; a PUT must be 405 for every caller, not a 403
-        // about controller authentication.
-        let err = dispatch_put_inner(
-            &ctx,
-            "example.dev/v1/widgets/w1/reparent".to_string(),
-            any_user(OPERATOR),
-            json!({"newParentUid": null}),
-        )
-        .await
-        .expect_err("PUT on reparent must be 405");
-        assert_eq!(err.status, StatusCode::METHOD_NOT_ALLOWED);
     }
 
     // -------------------------------------------------------------------------
