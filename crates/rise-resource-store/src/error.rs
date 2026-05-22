@@ -20,7 +20,7 @@ pub enum StoreError {
     #[error("intermediate path segment not found")]
     ParentNotFound,
 
-    #[error("{0}")]
+    #[error("unknown version: {0}")]
     UnknownVersion(String),
 
     #[error("reserved finalizer namespace: '{0}'")]
