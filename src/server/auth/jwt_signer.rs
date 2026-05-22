@@ -34,6 +34,15 @@ pub struct RiseClaims {
     pub aud: String,
 }
 
+/// Subject info for workload identity JWT claims.
+pub struct WorkloadSubjectInfo<'a> {
+    pub sub: &'a str,
+    pub project: &'a str,
+    pub environment: &'a str,
+    pub deployment_group: &'a str,
+    pub deployment_id: &'a str,
+}
+
 /// Claims for Rise-issued workload identity JWTs (RS256).
 ///
 /// Issued to deployed apps so they can federate identity to external systems
@@ -417,18 +426,12 @@ impl JwtSigner {
     /// endpoints already cover verification.
     ///
     /// # Arguments
-    /// * `sub` - Subject (`rise:proj:<project>:env:<environment>`)
-    /// * `project` / `environment` / `deployment_group` / `deployment_id` - informational claims
+    /// * `info` - Subject and informational claims for the workload identity
     /// * `audience` - the `aud` claim, supplied per request
     /// * `ttl_secs` - token lifetime in seconds
-    #[allow(clippy::too_many_arguments)]
     pub fn sign_workload_jwt(
         &self,
-        sub: &str,
-        project: &str,
-        environment: &str,
-        deployment_group: &str,
-        deployment_id: &str,
+        info: &WorkloadSubjectInfo<'_>,
         audience: &str,
         ttl_secs: u64,
     ) -> Result<String, JwtSignerError> {
@@ -442,16 +445,16 @@ impl JwtSigner {
 
         let claims = WorkloadClaims {
             iss: self.issuer.clone(),
-            sub: sub.to_string(),
+            sub: info.sub.to_string(),
             aud: audience.to_string(),
             iat: now,
             nbf: now,
             exp: now + ttl_secs,
             jti,
-            project: project.to_string(),
-            environment: environment.to_string(),
-            deployment_group: deployment_group.to_string(),
-            deployment_id: deployment_id.to_string(),
+            project: info.project.to_string(),
+            environment: info.environment.to_string(),
+            deployment_group: info.deployment_group.to_string(),
+            deployment_id: info.deployment_id.to_string(),
         };
 
         let mut header = Header::new(Algorithm::RS256);
@@ -706,11 +709,13 @@ mod tests {
 
         let token = signer
             .sign_workload_jwt(
-                "rise:proj:myapp:env:prod",
-                "myapp",
-                "prod",
-                "default",
-                "20260101-000000",
+                &WorkloadSubjectInfo {
+                    sub: "rise:proj:myapp:env:prod",
+                    project: "myapp",
+                    environment: "prod",
+                    deployment_group: "default",
+                    deployment_id: "20260101-000000",
+                },
                 "sts.amazonaws.com",
                 900,
             )

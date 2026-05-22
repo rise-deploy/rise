@@ -31,6 +31,7 @@ use crate::db::{
     deployments as db_deployments, env_vars as db_env_vars, environments as db_environments,
     projects as db_projects,
 };
+use crate::server::auth::jwt_signer::WorkloadSubjectInfo;
 use crate::server::deployment::crd;
 use crate::server::deployment::resource_builder::{
     IdentityMount, ResourceBuilder, ANNOTATION_ENV_SECRET_HASH, ANNOTATION_LAST_REFRESH,
@@ -1423,14 +1424,17 @@ async fn prepare_identity_secret(
             (observed_tokens, observed_refresh.unwrap_or_else(Utc::now))
         } else {
             let sub = workload_subject(&project.name, environment_name);
+            let subject_info = WorkloadSubjectInfo {
+                sub: &sub,
+                project: &project.name,
+                environment: environment_name.unwrap_or(NO_ENVIRONMENT),
+                deployment_group: &deployment.deployment_group,
+                deployment_id: &deployment.deployment_id,
+            };
             let mut minted = BTreeMap::new();
             for (filename, audience) in &audiences {
                 let jwt = state.jwt_signer.sign_workload_jwt(
-                    &sub,
-                    &project.name,
-                    environment_name.unwrap_or(NO_ENVIRONMENT),
-                    &deployment.deployment_group,
-                    &deployment.deployment_id,
+                    &subject_info,
                     audience,
                     IDENTITY_TOKEN_TTL_SECS,
                 )?;
