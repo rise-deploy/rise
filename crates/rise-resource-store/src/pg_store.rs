@@ -233,10 +233,9 @@ impl PgResourceStore {
 
         // Lock the matching ResourceDefinition's `resources` row directly — the
         // `resource_definitions` projection is a view and cannot be locked.
-        // The JSONB containment check includes `served: true` so that a version
-        // declared with `served=false` is not treated as a valid write target;
-        // non-served versions must be rejected at the store level, not just at
-        // the HTTP layer.
+        // The JSONB containment check uses `storage: true` because `api_version` here is
+        // always the storage version (the HTTP layer already translated any served→storage
+        // before calling the store). A storage version need not be served.
         let row = sqlx::query(
             r#"
             SELECT uid
@@ -251,13 +250,13 @@ impl PgResourceStore {
         .bind(RESOURCE_DEFINITION_KIND)
         .bind(group)
         .bind(kind)
-        .bind(serde_json::json!([{ "name": version, "served": true }]))
+        .bind(serde_json::json!([{ "name": version, "storage": true }]))
         .fetch_optional(&mut **tx)
         .await?;
 
         if required && row.is_none() {
             return Err(StoreError::Validation(format!(
-                "no ResourceDefinition serves '{api_version}/{kind}'"
+                "no ResourceDefinition declares '{api_version}' as storage version for kind '{kind}'"
             )));
         }
 
