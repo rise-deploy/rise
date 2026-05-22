@@ -39,7 +39,7 @@ use crate::server::deployment::resource_builder::{
 };
 use crate::server::deployment::state_machine;
 use crate::server::state::AppState;
-use crate::server::workload_tokens::workload_subject;
+use crate::server::workload_tokens::{sha256_hex, workload_subject};
 
 // ── Metacontroller webhook protocol types ──────────────────────────────
 
@@ -1301,17 +1301,6 @@ async fn build_image_pull_secret(
     Ok(Some(secret))
 }
 
-/// SHA-256 hex digest of the given bytes.
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-
 /// A prepared workload-identity Secret plus the mount description for the pod.
 struct PreparedIdentitySecret {
     secret: Secret,
@@ -1321,11 +1310,13 @@ struct PreparedIdentitySecret {
 /// Build the per-deployment workload-identity Secret.
 ///
 /// The bootstrap credential is generated once and then reused from the observed
-/// Secret on subsequent syncs; its SHA-256 hash is persisted to the deployment
-/// row so the token-exchange endpoint can authenticate the app. Auto-minted
-/// workload tokens (one per `[identity]` audience) are re-minted only when the
-/// observed Secret is stale or its audience set changed, avoiding a Secret
-/// rewrite on every resync.
+/// Secret on subsequent syncs. Its SHA-256 hash is persisted to the deployment
+/// row only once the credential has been read back from the *observed* Secret —
+/// never in the generate-fresh path — so that with multiple controller replicas
+/// the persisted hash always matches the credential in the Secret that was
+/// actually applied. Auto-minted workload tokens (one per `[identity]` audience)
+/// are re-minted only when the observed Secret is stale or its audience set
+/// changed, avoiding a Secret rewrite on every resync.
 async fn prepare_identity_secret(
     state: &AppState,
     resource_builder: &ResourceBuilder,
@@ -1354,25 +1345,35 @@ async fn prepare_identity_secret(
         .and_then(|b| String::from_utf8(b.0.clone()).ok());
 
     let credential = match observed_credential {
-        Some(c) => c,
+        Some(c) => {
+            // HA-safe: only the credential read back from the *observed* Secret is
+            // authoritative. Persist its hash so the token-exchange endpoint can
+            // authenticate the app. This is idempotent — every replica observes the
+            // same applied Secret and writes the same hash.
+            let credential_hash = sha256_hex(c.as_bytes());
+            if deployment.identity_credential_hash.as_deref() != Some(credential_hash.as_str()) {
+                db_deployments::set_identity_credential_hash(
+                    &state.db_pool,
+                    deployment.id,
+                    &credential_hash,
+                )
+                .await
+                .context("Failed to persist identity credential hash")?;
+            }
+            c
+        }
         None => {
+            // No Secret observed yet: generate a fresh credential but do NOT persist
+            // its hash. With multiple replicas behind the webhook Service, two
+            // replicas could generate different credentials; persisting here risks
+            // a DB hash that does not match the Secret that actually got applied.
+            // The hash is written on the next sync via the reuse path above, once
+            // some replica's Secret has been applied and is observed by all.
             let mut bytes = [0u8; 32];
             rand::rng().fill_bytes(&mut bytes);
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
         }
     };
-
-    // Persist the credential hash if it is missing or out of sync.
-    let credential_hash = sha256_hex(credential.as_bytes());
-    if deployment.identity_credential_hash.as_deref() != Some(credential_hash.as_str()) {
-        db_deployments::set_identity_credential_hash(
-            &state.db_pool,
-            deployment.id,
-            &credential_hash,
-        )
-        .await
-        .context("Failed to persist identity credential hash")?;
-    }
 
     // ── Auto-minted workload tokens ─────────────────────────────────────
     let audiences: BTreeMap<String, String> =
@@ -1381,16 +1382,20 @@ async fn prepare_identity_secret(
     let mut token_filenames: Vec<String> = audiences.keys().cloned().collect();
     token_filenames.sort();
 
-    let (tokens, refreshed_at) = if audiences.is_empty() {
-        (BTreeMap::new(), Utc::now())
-    } else {
-        let observed_refresh = observed_secret
-            .as_ref()
-            .and_then(|s| s.metadata.annotations.as_ref())
-            .and_then(|a| a.get(ANNOTATION_LAST_REFRESH))
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|ts| ts.with_timezone(&Utc));
+    // The Secret's last-refresh timestamp from the previous reconcile, if any.
+    let observed_refresh = observed_secret
+        .as_ref()
+        .and_then(|s| s.metadata.annotations.as_ref())
+        .and_then(|a| a.get(ANNOTATION_LAST_REFRESH))
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|ts| ts.with_timezone(&Utc));
 
+    let (tokens, refreshed_at) = if audiences.is_empty() {
+        // Nothing to mint — reuse the observed last-refresh timestamp so the
+        // annotation does not churn on every (~5s) reconcile, which would cause
+        // constant Secret rewrites. Fall back to now only when no Secret exists.
+        (BTreeMap::new(), observed_refresh.unwrap_or_else(Utc::now))
+    } else {
         let observed_tokens: BTreeMap<String, String> = observed_secret
             .as_ref()
             .and_then(|s| s.data.as_ref())
