@@ -23,7 +23,7 @@ struct ServiceAccountResponse {
 
 #[derive(Debug, Deserialize)]
 struct ListServiceAccountsResponse {
-    workload_identities: Vec<ServiceAccountResponse>,
+    service_accounts: Vec<ServiceAccountResponse>,
 }
 
 /// Create a new service account for a project
@@ -40,7 +40,7 @@ pub async fn create_service_account(
         .ok_or_else(|| anyhow::anyhow!("Not logged in. Please run 'rise login' first."))?;
 
     let url = format!(
-        "{}/api/v1/projects/{}/workload-identities",
+        "{}/api/v1/projects/{}/service-accounts",
         backend_url, project_name
     );
 
@@ -101,7 +101,7 @@ pub async fn list_service_accounts(
         .ok_or_else(|| anyhow::anyhow!("Not logged in. Please run 'rise login' first."))?;
 
     let url = format!(
-        "{}/api/v1/projects/{}/workload-identities",
+        "{}/api/v1/projects/{}/service-accounts",
         backend_url, project_name
     );
 
@@ -118,7 +118,7 @@ pub async fn list_service_accounts(
             .await
             .context("Failed to parse list service accounts response")?;
 
-        let service_accounts = list_response.workload_identities;
+        let service_accounts = list_response.service_accounts;
 
         if service_accounts.is_empty() {
             println!("No service accounts found for project '{}'.", project_name);
@@ -181,7 +181,7 @@ pub async fn show_service_account(
         .ok_or_else(|| anyhow::anyhow!("Not logged in. Please run 'rise login' first."))?;
 
     let url = format!(
-        "{}/api/v1/projects/{}/workload-identities/{}",
+        "{}/api/v1/projects/{}/service-accounts/{}",
         backend_url, project_name, service_account_id
     );
 
@@ -237,7 +237,7 @@ pub async fn delete_service_account(
         .ok_or_else(|| anyhow::anyhow!("Not logged in. Please run 'rise login' first."))?;
 
     let url = format!(
-        "{}/api/v1/projects/{}/workload-identities/{}",
+        "{}/api/v1/projects/{}/service-accounts/{}",
         backend_url, project_name, service_account_id
     );
 

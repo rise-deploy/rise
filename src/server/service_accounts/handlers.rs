@@ -9,12 +9,12 @@ use crate::db::{environments as db_environments, projects, service_accounts, use
 use crate::server::auth::context::AuthContext;
 use crate::server::error::{ServerError, ServerErrorExt};
 use crate::server::project::handlers::{check_read_permission, check_write_permission};
+use crate::server::service_accounts::models::{
+    CreateServiceAccountRequest, ListServiceAccountsResponse, ServiceAccountResponse,
+    UpdateServiceAccountRequest,
+};
 use crate::server::ssrf;
 use crate::server::state::AppState;
-use crate::server::workload_identity::models::{
-    CreateWorkloadIdentityRequest, ListWorkloadIdentitiesResponse, UpdateWorkloadIdentityRequest,
-    WorkloadIdentityResponse,
-};
 use std::collections::HashMap;
 
 /// Resolve allowed_environment_ids (UUIDs) to environment names for API responses.
@@ -136,12 +136,12 @@ async fn verify_oidc_issuer(
 }
 
 /// Create a new service account for a project
-pub async fn create_workload_identity(
+pub async fn create_service_account(
     State(state): State<AppState>,
     auth: AuthContext,
     Path(project_name): Path<String>,
-    Json(req): Json<CreateWorkloadIdentityRequest>,
-) -> Result<Json<WorkloadIdentityResponse>, ServerError> {
+    Json(req): Json<CreateServiceAccountRequest>,
+) -> Result<Json<ServiceAccountResponse>, ServerError> {
     let user = auth.user()?;
 
     // Get project
@@ -236,7 +236,7 @@ pub async fn create_workload_identity(
     let env_name_map: HashMap<uuid::Uuid, String> =
         environments.into_iter().map(|e| (e.id, e.name)).collect();
 
-    Ok(Json(WorkloadIdentityResponse {
+    Ok(Json(ServiceAccountResponse {
         id: sa.id.to_string(),
         email: sa_user.email,
         project_name: project.name,
@@ -248,11 +248,11 @@ pub async fn create_workload_identity(
 }
 
 /// List all service accounts for a project
-pub async fn list_workload_identities(
+pub async fn list_service_accounts(
     State(state): State<AppState>,
     auth: AuthContext,
     Path(project_name): Path<String>,
-) -> Result<Json<ListWorkloadIdentitiesResponse>, ServerError> {
+) -> Result<Json<ListServiceAccountsResponse>, ServerError> {
     let user = auth.user()?;
 
     // Get project
@@ -282,7 +282,7 @@ pub async fn list_workload_identities(
         environments.into_iter().map(|e| (e.id, e.name)).collect();
 
     // Convert to response
-    let mut workload_identities = Vec::new();
+    let mut service_accounts_response = Vec::new();
     for sa in sas {
         let sa_user = users::find_by_id(&state.db_pool, sa.user_id)
             .await
@@ -294,7 +294,7 @@ pub async fn list_workload_identities(
             serde_json::from_value(sa.claims.clone())
                 .internal_err("Failed to deserialize claims")?;
 
-        workload_identities.push(WorkloadIdentityResponse {
+        service_accounts_response.push(ServiceAccountResponse {
             id: sa.id.to_string(),
             email: sa_user.email,
             project_name: project.name.clone(),
@@ -308,17 +308,17 @@ pub async fn list_workload_identities(
         });
     }
 
-    Ok(Json(ListWorkloadIdentitiesResponse {
-        workload_identities,
+    Ok(Json(ListServiceAccountsResponse {
+        service_accounts: service_accounts_response,
     }))
 }
 
 /// Get a specific service account
-pub async fn get_workload_identity(
+pub async fn get_service_account(
     State(state): State<AppState>,
     auth: AuthContext,
     Path((project_name, sa_id)): Path<(String, Uuid)>,
-) -> Result<Json<WorkloadIdentityResponse>, ServerError> {
+) -> Result<Json<ServiceAccountResponse>, ServerError> {
     let user = auth.user()?;
 
     // Get project
@@ -368,7 +368,7 @@ pub async fn get_workload_identity(
     let env_name_map: HashMap<uuid::Uuid, String> =
         environments.into_iter().map(|e| (e.id, e.name)).collect();
 
-    Ok(Json(WorkloadIdentityResponse {
+    Ok(Json(ServiceAccountResponse {
         id: sa.id.to_string(),
         email: sa_user.email,
         project_name: project.name,
@@ -380,12 +380,12 @@ pub async fn get_workload_identity(
 }
 
 /// Update a service account's issuer_url and/or claims
-pub async fn update_workload_identity(
+pub async fn update_service_account(
     State(state): State<AppState>,
     auth: AuthContext,
     Path((project_name, sa_id)): Path<(String, Uuid)>,
-    Json(req): Json<UpdateWorkloadIdentityRequest>,
-) -> Result<Json<WorkloadIdentityResponse>, ServerError> {
+    Json(req): Json<UpdateServiceAccountRequest>,
+) -> Result<Json<ServiceAccountResponse>, ServerError> {
     let user = auth.user()?;
 
     // Get project
@@ -512,7 +512,7 @@ pub async fn update_workload_identity(
     let env_name_map: HashMap<uuid::Uuid, String> =
         environments.into_iter().map(|e| (e.id, e.name)).collect();
 
-    Ok(Json(WorkloadIdentityResponse {
+    Ok(Json(ServiceAccountResponse {
         id: updated_sa.id.to_string(),
         email: sa_user.email,
         project_name: project.name,
@@ -527,7 +527,7 @@ pub async fn update_workload_identity(
 }
 
 /// Delete a service account (soft delete)
-pub async fn delete_workload_identity(
+pub async fn delete_service_account(
     State(state): State<AppState>,
     auth: AuthContext,
     Path((project_name, sa_id)): Path<(String, Uuid)>,

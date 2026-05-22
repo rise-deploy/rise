@@ -524,7 +524,7 @@ export function ServiceAccountsList({ projectName }) {
     const loadServiceAccounts = useCallback(async () => {
         try {
             const response = await api.getProjectServiceAccounts(projectName);
-            setServiceAccounts(response.workload_identities || []);
+            setServiceAccounts(response.service_accounts || []);
             setLoading(false);
         } catch (err) {
             setError(err.message);

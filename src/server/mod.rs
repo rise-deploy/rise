@@ -16,11 +16,11 @@ pub mod rate_limit;
 pub mod registry;
 #[cfg(feature = "backend")]
 pub mod resources;
+pub mod service_accounts;
 pub mod settings;
 pub mod ssrf;
 pub mod state;
 pub mod team;
-pub mod workload_identity;
 
 use anyhow::Result;
 use axum::{extract::Request, middleware as axum_middleware, response::Response, Router};
@@ -180,7 +180,7 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         .merge(team::routes::team_routes())
         .merge(registry::routes::routes())
         .merge(deployment::routes::deployment_routes())
-        .merge(workload_identity::routes::routes())
+        .merge(service_accounts::routes::routes())
         .merge(env_vars::routes::routes())
         .merge(environments::routes::routes())
         .merge(extensions::routes::routes())
