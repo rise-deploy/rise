@@ -71,7 +71,7 @@ Version behavior follows Kubernetes-style semantics:
 
 `DELETE` always cascades: the resource and its entire subtree are removed. The resource is tombstoned, its subtree drains as finalizers clear, and rows are collected bottom-up.
 
-`GET /api/v1/resources/pending-deletion` lists resources that are tombstoned and still draining — useful for spotting a deletion stuck on a finalizer.
+`GET /api/v1/resources/pending-deletion` lists resources that are tombstoned and still draining — useful for spotting a deletion stuck on a finalizer. Accepts a `limit` query parameter (1–1000, default 100).
 
 ```bash
 curl -X DELETE \

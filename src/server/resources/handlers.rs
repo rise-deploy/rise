@@ -892,8 +892,8 @@ async fn update_resource(
 
     if body.metadata.name != row.name {
         return Err(ServerError::bad_request(format!(
-            "renaming a resource via PUT is not supported (stored name '{}', body '{}')",
-            row.name, body.metadata.name
+            "body metadata.name '{}' does not match stored name '{}'; resources cannot be renamed via PUT",
+            body.metadata.name, row.name
         )));
     }
 

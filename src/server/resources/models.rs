@@ -41,8 +41,9 @@ pub struct ResourceList {
 /// Convert a stored row into the wire envelope.
 ///
 /// We don't use `ResourceRow::to_resource` here because that helper requires
-/// typed spec/status. The generic API returns the raw JSON values verbatim, so
-/// callers can round-trip arbitrary external resources.
+/// typed spec/status. The generic API returns spec/status verbatim so callers
+/// can round-trip arbitrary external resources; `apiVersion` is projected to
+/// the requested served version by `row_to_resource_with_api_version`.
 pub fn row_to_resource(row: &ResourceRow) -> Resource {
     row_to_resource_with_api_version(row, &row.api_version)
 }
