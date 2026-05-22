@@ -312,12 +312,47 @@ impl PgResourceStore {
         Ok(())
     }
 
+    /// Read only the `parent` ref of a registered `ResourceDefinition` using
+    /// `conn`. Reading through the caller's transaction ensures the cycle check
+    /// sees a consistent snapshot under the advisory lock rather than relying on
+    /// the pool's read isolation.
+    async fn fetch_rd_parent_ref(
+        conn: &mut sqlx::PgConnection,
+        group: &str,
+        kind: &str,
+    ) -> Result<Option<rise_resource_api::ResourceParentRef>, StoreError> {
+        let row = sqlx::query(
+            r#"
+            SELECT r.spec
+            FROM resource_store.resource_definitions rd
+            JOIN resource_store.resources r ON r.uid = rd.uid
+            WHERE rd.group_name = $1 AND rd.kind = $2
+            "#,
+        )
+        .bind(group)
+        .bind(kind)
+        .fetch_optional(&mut *conn)
+        .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let spec: ResourceDefinitionSpec = serde_json::from_value(
+            row.try_get("spec").map_err(StoreError::Database)?,
+        )
+        .map_err(|e| {
+            StoreError::Validation(format!(
+                "invalid spec in ResourceDefinition '{group}/{kind}': {e}"
+            ))
+        })?;
+        Ok(spec.parent)
+    }
+
     /// Reject a `ResourceDefinition` whose declared `parent` chain forms a
-    /// cycle. The chain is walked via `resolve_collection_by_kind`; the new RD
-    /// is not yet stored, so its own identity is compared against each parent
-    /// ref directly — this also catches a cycle closed by a descendant that was
-    /// registered before this ancestor (the walk reaches that descendant, whose
-    /// parent ref points back at the kind being registered).
+    /// cycle. The chain is walked via `fetch_rd_parent_ref` using `conn` so the
+    /// reads are part of the same transaction that holds the advisory lock,
+    /// ensuring a consistent view.
     ///
     /// The caller must hold the `resource_definitions_parent_cycle` advisory lock
     /// (via `SELECT pg_advisory_xact_lock`) for the duration of the enclosing
@@ -326,6 +361,7 @@ impl PgResourceStore {
     async fn ensure_no_parent_cycle(
         &self,
         spec: &ResourceDefinitionSpec,
+        conn: &mut sqlx::PgConnection,
     ) -> Result<(), StoreError> {
         let mut current = spec.parent.clone();
         let mut depth = 0usize;
@@ -346,13 +382,7 @@ impl PgResourceStore {
                     spec.group, spec.kind
                 )));
             }
-            current = match self
-                .resolve_collection_by_kind(parent_group, &parent.kind)
-                .await?
-            {
-                Some(info) => info.parent,
-                None => break,
-            };
+            current = Self::fetch_rd_parent_ref(conn, parent_group, &parent.kind).await?;
         }
         Ok(())
     }
@@ -1249,8 +1279,9 @@ impl ResourceStore for PgResourceStore {
         .await?;
 
         // Reject a parent chain that would cycle back to this kind. The advisory lock above
-        // ensures the committed state read here is stable for the duration of this transaction.
-        self.ensure_no_parent_cycle(&spec).await?;
+        // serialises concurrent registrations; reads go through `tx` so they see the same
+        // consistent snapshot that the lock protects.
+        self.ensure_no_parent_cycle(&spec, &mut tx).await?;
 
         let metadata = serde_json::to_value(&params.annotations).unwrap_or_default();
 
