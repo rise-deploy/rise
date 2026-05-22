@@ -451,6 +451,10 @@ export function ProjectDetail({ projectName, initialTab }) {
     if (!project) return <EmptyState message="Project not found." />;
 
     const ownerInfo = getOwnerInfo(project);
+    // The source repository is either explicitly configured on the project, or
+    // resolved by the backend from the active/most recent deployment metadata.
+    const sourceUrl = project.source_url || project.resolved_source_url || null;
+    const sourceUrlInherited = !project.source_url && !!project.resolved_source_url;
     const appUsers = project.app_users || [];
     const appTeams = project.app_teams || [];
     const owner = project.owner || null;
@@ -615,23 +619,28 @@ export function ProjectDetail({ projectName, initialTab }) {
                         )}
                     </strong>
                 </div>
-                {project.source_url && (
+                {sourceUrl && (
                     <div>
                         <span>source</span>
                         <strong className="mono-copyable-value">
-                            {isSafeUrl(project.source_url) ? (
-                                <a href={project.source_url} target="_blank" rel="noopener noreferrer" className="underline">
-                                    {project.source_url}
+                            {isSafeUrl(sourceUrl) ? (
+                                <a href={sourceUrl} target="_blank" rel="noopener noreferrer" className="underline">
+                                    {sourceUrl}
                                 </a>
                             ) : (
-                                <span>{project.source_url}</span>
+                                <span>{sourceUrl}</span>
+                            )}
+                            {sourceUrlInherited && (
+                                <span className="text-[var(--mono-muted)] ml-1" title="Resolved from deployment metadata; not explicitly configured on the project">
+                                    (from deployment)
+                                </span>
                             )}
                             <button
                                 type="button"
                                 className="mono-copy-button"
                                 title="Copy source URL"
                                 aria-label="Copy source URL"
-                                onClick={() => handleCopy(project.source_url, 'Source URL')}
+                                onClick={() => handleCopy(sourceUrl, 'Source URL')}
                             >
                                 <span
                                     className="mono-copy-icon svg-mask"

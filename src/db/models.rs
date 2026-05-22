@@ -160,6 +160,8 @@ pub struct Deployment {
     pub job_url: Option<String>,
     /// URL to the pull request/merge request associated with this deployment
     pub pull_request_url: Option<String>,
+    /// HTTPS URL of the Git repository this deployment was created from
+    pub git_repository_url: Option<String>,
     /// Number of replicas for this deployment
     pub replicas: i32,
     /// CPU allocation (e.g., "500m", "1")

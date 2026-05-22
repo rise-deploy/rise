@@ -486,6 +486,7 @@ async fn convert_deployment(
         memory: deployment.memory,
         job_url: deployment.job_url,
         pull_request_url: deployment.pull_request_url,
+        git_repository_url: deployment.git_repository_url,
         created: deployment.created_at.to_rfc3339(),
         updated: deployment.updated_at.to_rfc3339(),
     }
@@ -755,6 +756,13 @@ pub async fn create_deployment(
         ),
         None => None,
     };
+    let git_repository_url = match payload.git_repository_url {
+        Some(ref url) => Some(
+            crate::server::project::handlers::validate_http_url(url)
+                .map_err(|e| ServerError::bad_request(format!("git_repository_url: {e}")))?,
+        ),
+        None => None,
+    };
 
     validate_env_overrides(&payload.env_overrides)?;
 
@@ -999,6 +1007,7 @@ pub async fn create_deployment(
                 is_active: false,                  // Deployments start as inactive
                 job_url: job_url.as_deref(),
                 pull_request_url: pull_request_url.as_deref(),
+                git_repository_url: git_repository_url.as_deref(),
                 replicas: effective_replicas as i32,
                 cpu: &effective_cpu,
                 memory: &effective_memory,
@@ -1153,6 +1162,7 @@ pub async fn create_deployment(
                     is_active: false,
                     job_url: job_url.as_deref(),
                     pull_request_url: pull_request_url.as_deref(),
+                    git_repository_url: git_repository_url.as_deref(),
                     replicas: effective_replicas as i32,
                     cpu: &effective_cpu,
                     memory: &effective_memory,
@@ -1244,6 +1254,7 @@ pub async fn create_deployment(
                 is_active: false,
                 job_url: job_url.as_deref(),
                 pull_request_url: pull_request_url.as_deref(),
+                git_repository_url: git_repository_url.as_deref(),
                 replicas: effective_replicas as i32,
                 cpu: &effective_cpu,
                 memory: &effective_memory,
@@ -1354,6 +1365,7 @@ pub async fn create_deployment(
                 is_active: false,                      // Deployments start as inactive
                 job_url: job_url.as_deref(),
                 pull_request_url: pull_request_url.as_deref(),
+                git_repository_url: git_repository_url.as_deref(),
                 replicas: effective_replicas as i32,
                 cpu: &effective_cpu,
                 memory: &effective_memory,
