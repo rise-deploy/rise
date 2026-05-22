@@ -557,18 +557,26 @@ impl ResourceStore for PgResourceStore {
         // a concurrent write that already incremented the revision will cause zero rows
         // to be affected, which we detect and map to RevisionConflict.
         let mut tx = self.pool.begin().await?;
-        if params.validator.is_some() {
-            let target_api_version = params
-                .api_version
-                .as_deref()
-                .unwrap_or(&current_api_version);
-            let is_builtin =
-                target_api_version == API_VERSION_V1ALPHA1 && kind == ORGANIZATION_KIND;
+        // Always acquire the FOR SHARE lock on the matching ResourceDefinition for
+        // non-builtin external kinds, regardless of whether a validator was provided.
+        // Without the lock, a concurrent hard-delete of the ResourceDefinition can
+        // pass its instance-count check and commit while this update is in flight,
+        // leaving the resource instance pointing at a definition that no longer exists.
+        let target_api_version = params
+            .api_version
+            .as_deref()
+            .unwrap_or(&current_api_version);
+        let is_builtin = target_api_version == API_VERSION_V1ALPHA1 && kind == ORGANIZATION_KIND;
+        if !is_builtin {
             Self::lock_matching_definition_for_write(
                 &mut tx,
                 target_api_version,
                 &kind,
-                !is_builtin,
+                // The instance already exists, so the RD may have been deleted between
+                // creation and this update. Don't require the lock to find a row; if
+                // the RD is already gone the instance is already orphaned — just lock
+                // it when it's there to block a racing deletion.
+                false,
             )
             .await?;
         }

@@ -73,6 +73,32 @@ async fn list_resources(pool: sqlx::PgPool) -> sqlx::Result<()> {
 async fn same_kind_name_is_isolated_by_api_version(pool: sqlx::PgPool) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
 
+    // Register ResourceDefinitions for both groups before creating instances.
+    for (group, plural) in [
+        ("alpha.example.dev", "alpha-widgets"),
+        ("beta.example.dev", "beta-widgets"),
+    ] {
+        store
+            .register_resource_definition(CreateResourceParams {
+                api_version: API_VERSION_V1ALPHA1.to_string(),
+                kind: RESOURCE_DEFINITION_KIND.to_string(),
+                name: format!("{plural}.{group}"),
+                parent_uid: None,
+                annotations: BTreeMap::new(),
+                finalizers: vec![],
+                spec: json!({
+                    "group": group,
+                    "kind": "Widget",
+                    "plural": plural,
+                    "versions": [{"name": "v1", "served": true, "storage": true}],
+                    "allowedStatusControllerIds": []
+                }),
+                validator: None,
+            })
+            .await
+            .unwrap();
+    }
+
     let first = store
         .create(CreateResourceParams {
             api_version: "alpha.example.dev/v1".to_string(),
@@ -230,6 +256,7 @@ async fn same_group_kind_name_conflicts_across_versions_at_root(
     pool: sqlx::PgPool,
 ) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
+    register_example_widget_rd(&store).await;
 
     store
         .create(CreateResourceParams {
@@ -273,6 +300,7 @@ async fn same_group_kind_name_conflicts_across_versions_in_child_scope(
     pool: sqlx::PgPool,
 ) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
+    register_example_widget_rd(&store).await;
     let parent = create_org(&store, "parent-org").await;
 
     store
@@ -315,6 +343,32 @@ async fn update_api_version_collision_returns_name_conflict(
     pool: sqlx::PgPool,
 ) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
+
+    // Register ResourceDefinitions for both groups before creating instances.
+    for (group, plural) in [
+        ("alpha.example.dev", "alpha-widgets"),
+        ("beta.example.dev", "beta-widgets"),
+    ] {
+        store
+            .register_resource_definition(CreateResourceParams {
+                api_version: API_VERSION_V1ALPHA1.to_string(),
+                kind: RESOURCE_DEFINITION_KIND.to_string(),
+                name: format!("{plural}.{group}"),
+                parent_uid: None,
+                annotations: BTreeMap::new(),
+                finalizers: vec![],
+                spec: json!({
+                    "group": group,
+                    "kind": "Widget",
+                    "plural": plural,
+                    "versions": [{"name": "v1", "served": true, "storage": true}],
+                    "allowedStatusControllerIds": []
+                }),
+                validator: None,
+            })
+            .await
+            .unwrap();
+    }
 
     // Two resources with the same kind + name but in different groups — allowed at root.
     let moving = store
@@ -1104,6 +1158,7 @@ async fn get_by_name(pool: sqlx::PgPool) -> sqlx::Result<()> {
 #[sqlx::test]
 async fn get_by_name_and_list_span_all_versions_of_a_group(pool: sqlx::PgPool) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
+    register_example_widget_rd(&store).await;
 
     // A row stored at one version of a group...
     let created = store
@@ -1825,6 +1880,41 @@ async fn create_org(store: &PgResourceStore, name: &str) -> rise_resource_store:
         .unwrap()
 }
 
+/// Register the `example.dev/Widget` ResourceDefinition with versions `v1` (storage) and `v2`
+/// (served). Required before creating any non-builtin `example.dev/Widget` resource instances,
+/// since `create` acquires a FOR SHARE lock on the matching RD to prevent concurrent deletions
+/// from orphaning newly-created instances.
+///
+/// Idempotent: silently ignores a `NameConflict` error so it can be called multiple times in
+/// the same test (e.g. once per `create_child` call).
+async fn register_example_widget_rd(store: &PgResourceStore) {
+    let result = store
+        .register_resource_definition(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: RESOURCE_DEFINITION_KIND.to_string(),
+            name: "widgets.example.dev".to_string(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec: json!({
+                "group": "example.dev",
+                "kind": "Widget",
+                "plural": "widgets",
+                "versions": [
+                    {"name": "v1", "served": true, "storage": true},
+                    {"name": "v2", "served": true, "storage": false}
+                ],
+                "allowedStatusControllerIds": []
+            }),
+            validator: None,
+        })
+        .await;
+    match result {
+        Ok(_) | Err(StoreError::NameConflict) => {}
+        Err(e) => panic!("register_example_widget_rd failed: {e:?}"),
+    }
+}
+
 async fn create_child(
     store: &PgResourceStore,
     parent: Uuid,
@@ -1832,6 +1922,8 @@ async fn create_child(
     name: &str,
     finalizers: Vec<String>,
 ) -> rise_resource_store::ResourceRow {
+    // Ensure the ResourceDefinition exists so that the FOR SHARE lock in `create` can find it.
+    register_example_widget_rd(store).await;
     store
         .create(CreateResourceParams {
             api_version: "example.dev/v1".to_string(),
