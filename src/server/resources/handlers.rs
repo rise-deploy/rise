@@ -74,6 +74,11 @@ impl ResourceApiCtx {
 
 /// Require an operator-authenticated user. Service-account/controller tokens
 /// and non-operator users get 401/403 respectively.
+///
+/// Admin users do **not** bypass this check. Unlike the typed project/team
+/// APIs — where admins skip permission checks — the generic resource API is
+/// operator-gated only; admin access here is intentionally deferred (see
+/// `MULTI_TENANCY_PLAN.md`). Do not add an `is_admin` shortcut.
 fn require_operator(ctx: &ResourceApiCtx, auth: &AuthContext) -> Result<User, ServerError> {
     let user = auth.user()?.clone();
     if !ctx.is_operator(&user.email) {
@@ -1577,13 +1582,12 @@ mod dispatch_tests {
     }
 
     #[sqlx::test]
-    async fn create_via_undefined_version_yields_400(pool: sqlx::PgPool) {
+    async fn create_via_undefined_version_yields_404(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
         register_widget_rd(&ctx, &[]).await;
-        // The `widgets` plural exists but `v3` is not a version it declares.
-        // The store distinguishes a truly unknown collection (404) from a known
-        // collection at an undefined/unserved version (a 400 — the request
-        // names a version the ResourceDefinition does not expose).
+        // The `widgets` plural exists but `v3` is not a version it declares. An
+        // undefined (or unserved) version is not addressable — 404, as
+        // Kubernetes returns for an unserved apiVersion.
         let err = dispatch_post_inner(
             &ctx,
             "example.dev/v3/widgets".to_string(),
@@ -1592,7 +1596,7 @@ mod dispatch_tests {
         )
         .await
         .expect_err("undefined version must not resolve to a collection");
-        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
     }
 
     // -------------------------------------------------------------------------

@@ -94,6 +94,9 @@ pub trait ResourceStore: Send + Sync {
 
     async fn get(&self, uid: Uuid) -> Result<Option<ResourceRow>, StoreError>;
 
+    /// Look up a resource by name. Matching is keyed on the API *group* of
+    /// `api_version` (the part before `/`), not the exact version, so the row
+    /// is found regardless of which declared version it is stored at.
     async fn get_by_name(
         &self,
         api_version: &str,
@@ -102,6 +105,9 @@ pub trait ResourceStore: Send + Sync {
         parent_uid: Option<Uuid>,
     ) -> Result<Option<ResourceRow>, StoreError>;
 
+    /// List resources of a kind. Like `get_by_name`, matching is keyed on the
+    /// API *group* of `api_version`, so the listing spans every declared
+    /// version of the kind.
     async fn list(
         &self,
         api_version: &str,

@@ -23,6 +23,9 @@ pub fn store_error_to_server_error(err: StoreError) -> ServerError {
             "path segment kind mismatch: expected '{expected}', got '{got}'"
         )),
         StoreError::ParentNotFound => ServerError::not_found("parent path segment not found"),
+        // An unserved/undefined apiVersion is not addressable — 404, matching
+        // Kubernetes' behaviour for an unserved version.
+        StoreError::UnknownVersion(msg) => ServerError::not_found(msg),
         StoreError::ReservedFinalizer(f) => ServerError::bad_request(format!(
             "finalizer '{f}' is in the reserved system.rise.dev/* namespace"
         )),
@@ -75,6 +78,14 @@ mod tests {
         let err = store_error_to_server_error(StoreError::Validation("bad spec".into()));
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert_eq!(err.message, "bad spec");
+    }
+
+    #[test]
+    fn maps_unknown_version_to_not_found() {
+        let err = store_error_to_server_error(StoreError::UnknownVersion(
+            "version 'v3' is not served".into(),
+        ));
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
     }
 
     #[test]

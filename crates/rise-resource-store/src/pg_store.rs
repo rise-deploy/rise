@@ -364,10 +364,14 @@ impl ResourceStore for PgResourceStore {
         name: &str,
         parent_uid: Option<Uuid>,
     ) -> Result<Option<ResourceRow>, StoreError> {
+        // Match on the API *group* (the part before `/`), not the full
+        // `api_version`: a resource's identity is unique per `(group, kind,
+        // name)` within a parent, so a lookup resolves the row regardless of
+        // which declared version it is stored at.
         let row =
             match parent_uid {
                 None => sqlx::query_as::<_, ResourceRow>(
-                    "SELECT * FROM resource_store.resources WHERE api_version = $1 AND kind = $2 AND name = $3 AND parent_uid IS NULL",
+                    "SELECT * FROM resource_store.resources WHERE split_part(api_version, '/', 1) = split_part($1, '/', 1) AND kind = $2 AND name = $3 AND parent_uid IS NULL",
                 )
                 .bind(api_version)
                 .bind(kind)
@@ -376,7 +380,7 @@ impl ResourceStore for PgResourceStore {
                 .await?,
                 Some(pid) => {
                     sqlx::query_as::<_, ResourceRow>(
-                        "SELECT * FROM resource_store.resources WHERE api_version = $1 AND kind = $2 AND name = $3 AND parent_uid = $4",
+                        "SELECT * FROM resource_store.resources WHERE split_part(api_version, '/', 1) = split_part($1, '/', 1) AND kind = $2 AND name = $3 AND parent_uid = $4",
                     )
                     .bind(api_version)
                     .bind(kind)
@@ -395,10 +399,12 @@ impl ResourceStore for PgResourceStore {
         kind: &str,
         parent_uid: Option<Uuid>,
     ) -> Result<Vec<ResourceRow>, StoreError> {
+        // Match on the API *group*, not the full `api_version` — list spans
+        // every declared version of the kind (see `get_by_name`).
         let rows =
             match parent_uid {
                 None => sqlx::query_as::<_, ResourceRow>(
-                    "SELECT * FROM resource_store.resources WHERE api_version = $1 AND kind = $2 AND parent_uid IS NULL ORDER BY name",
+                    "SELECT * FROM resource_store.resources WHERE split_part(api_version, '/', 1) = split_part($1, '/', 1) AND kind = $2 AND parent_uid IS NULL ORDER BY name",
                 )
                 .bind(api_version)
                 .bind(kind)
@@ -406,7 +412,7 @@ impl ResourceStore for PgResourceStore {
                 .await?,
                 Some(pid) => {
                     sqlx::query_as::<_, ResourceRow>(
-                        "SELECT * FROM resource_store.resources WHERE api_version = $1 AND kind = $2 AND parent_uid = $3 ORDER BY name",
+                        "SELECT * FROM resource_store.resources WHERE split_part(api_version, '/', 1) = split_part($1, '/', 1) AND kind = $2 AND parent_uid = $3 ORDER BY name",
                     )
                     .bind(api_version)
                     .bind(kind)
@@ -1022,13 +1028,17 @@ impl ResourceStore for PgResourceStore {
         .map_err(|e| StoreError::Validation(format!("invalid ResourceDefinition spec: {e}")))?;
 
         let versions = spec.versions.clone();
-        let requested = versions
-            .iter()
-            .find(|v| v.name == version)
-            .ok_or_else(|| StoreError::Validation(format!("version '{version}' is not defined")))?;
+        // An undefined or non-served version is not addressable — treat it like
+        // a missing collection (`UnknownVersion` maps to 404, as Kubernetes
+        // returns for an unserved apiVersion).
+        let requested = versions.iter().find(|v| v.name == version).ok_or_else(|| {
+            StoreError::UnknownVersion(format!(
+                "version '{version}' is not defined for collection '{collection}'"
+            ))
+        })?;
         if !requested.served {
-            return Err(StoreError::Validation(format!(
-                "version '{version}' is not served"
+            return Err(StoreError::UnknownVersion(format!(
+                "version '{version}' is not served by collection '{collection}'"
             )));
         }
 
@@ -1036,7 +1046,11 @@ impl ResourceStore for PgResourceStore {
             .iter()
             .find(|v| v.storage)
             .map(|v| v.name.clone())
-            .unwrap_or_else(|| "v1".to_string());
+            .ok_or_else(|| {
+                StoreError::Validation(format!(
+                    "ResourceDefinition '{collection}' has no storage version"
+                ))
+            })?;
         let storage_api_version = Self::api_version(group, &storage_version);
         let served_api_versions: Vec<String> = versions
             .iter()

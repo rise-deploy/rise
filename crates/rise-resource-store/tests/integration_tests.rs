@@ -1102,6 +1102,48 @@ async fn get_by_name(pool: sqlx::PgPool) -> sqlx::Result<()> {
 }
 
 #[sqlx::test]
+async fn get_by_name_and_list_span_all_versions_of_a_group(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+
+    // A row stored at one version of a group...
+    let created = store
+        .create(CreateResourceParams {
+            api_version: "example.dev/v1".to_string(),
+            kind: "Widget".to_string(),
+            name: "w1".to_string(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec: json!({}),
+            validator: None,
+        })
+        .await
+        .unwrap();
+
+    // ...is found by `get_by_name` / `list` keyed on *another* version of the
+    // same group — retrieval spans all api versions of the group.
+    let found = store
+        .get_by_name("example.dev/v2", "Widget", "w1", None)
+        .await
+        .unwrap()
+        .expect("widget found via a different version of the same group");
+    assert_eq!(found.uid, created.uid);
+
+    let listed = store.list("example.dev/v2", "Widget", None).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].uid, created.uid);
+
+    // A different group does not match.
+    assert!(store
+        .get_by_name("other.dev/v1", "Widget", "w1", None)
+        .await
+        .unwrap()
+        .is_none());
+
+    Ok(())
+}
+
+#[sqlx::test]
 async fn get_returns_none_for_unknown_uid(pool: sqlx::PgPool) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
     let result = store.get(Uuid::new_v4()).await.unwrap();
