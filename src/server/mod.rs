@@ -14,6 +14,8 @@ pub mod oci;
 pub mod project;
 pub mod rate_limit;
 pub mod registry;
+#[cfg(feature = "backend")]
+pub mod resources;
 pub mod service_accounts;
 pub mod settings;
 pub mod ssrf;
@@ -182,7 +184,12 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         .merge(env_vars::routes::routes())
         .merge(environments::routes::routes())
         .merge(extensions::routes::routes())
-        .merge(encryption::routes::routes())
+        .merge(encryption::routes::routes());
+
+    #[cfg(feature = "backend")]
+    let platform_routes = platform_routes.merge(resources::routes::routes());
+
+    let platform_routes = platform_routes
         // Apply platform access middleware (runs second, after auth)
         .route_layer(axum_middleware::from_fn_with_state(
             state.clone(),

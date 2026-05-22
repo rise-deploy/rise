@@ -16,12 +16,20 @@ pub trait PlatformAccessChecker {
 pub struct ConfigBasedAccessChecker<'a> {
     pub config: &'a PlatformAccessConfig,
     pub admin_users: &'a [String],
+    pub operator_users: &'a [String],
 }
 
 impl<'a> PlatformAccessChecker for ConfigBasedAccessChecker<'a> {
     fn has_platform_access(&self, user: &User, idp_groups: Option<&[String]>) -> bool {
         // Admin users always have platform access
         if super::admin::is_admin_user(self.admin_users, &user.email) {
+            return true;
+        }
+
+        // Operators always have platform access — they manage the generic
+        // resource API and must be able to reach it regardless of the
+        // platform access policy.
+        if super::admin::is_operator_user(self.operator_users, &user.email) {
             return true;
         }
 
@@ -79,6 +87,7 @@ mod tests {
         let checker = ConfigBasedAccessChecker {
             config: &config,
             admin_users: &[],
+            operator_users: &[],
         };
 
         let user = make_user("anyone@example.com");
@@ -95,10 +104,38 @@ mod tests {
         let checker = ConfigBasedAccessChecker {
             config: &config,
             admin_users: &["admin@example.com".to_string()],
+            operator_users: &[],
         };
 
         let user = make_user("admin@example.com");
         assert!(checker.has_platform_access(&user, None));
+    }
+
+    #[test]
+    fn test_operator_always_has_access() {
+        let config = PlatformAccessConfig {
+            policy: PlatformAccessPolicy::Restrictive,
+            allowed_user_emails: vec![],
+            allowed_idp_groups: vec![],
+        };
+        let checker = ConfigBasedAccessChecker {
+            config: &config,
+            admin_users: &[],
+            operator_users: &["ops@example.com".to_string()],
+        };
+
+        // Operator passes platform access even under Restrictive with no
+        // allowlists — they need the generic resource API.
+        let user = make_user("ops@example.com");
+        assert!(checker.has_platform_access(&user, None));
+
+        // Case-insensitive match (matches `is_operator_user` semantics).
+        let user_upper = make_user("OPS@EXAMPLE.COM");
+        assert!(checker.has_platform_access(&user_upper, None));
+
+        // Non-operator without allowlist match is still denied.
+        let other = make_user("someone@example.com");
+        assert!(!checker.has_platform_access(&other, None));
     }
 
     #[test]
@@ -111,6 +148,7 @@ mod tests {
         let checker = ConfigBasedAccessChecker {
             config: &config,
             admin_users: &[],
+            operator_users: &[],
         };
 
         let allowed_user = make_user("allowed@example.com");
@@ -130,6 +168,7 @@ mod tests {
         let checker = ConfigBasedAccessChecker {
             config: &config,
             admin_users: &[],
+            operator_users: &[],
         };
 
         let user = make_user("user@example.com");
@@ -154,6 +193,7 @@ mod tests {
         let checker = ConfigBasedAccessChecker {
             config: &config,
             admin_users: &["Admin@Example.Com".to_string()],
+            operator_users: &[],
         };
 
         // Email case insensitive
