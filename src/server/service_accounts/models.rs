@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 /// Request to create a new service account
 #[derive(Debug, Deserialize)]
-pub struct CreateWorkloadIdentityRequest {
+pub struct CreateServiceAccountRequest {
     pub issuer_url: String,
     pub claims: HashMap<String, String>,
     /// Restrict this service account to specific environments (by name).
@@ -13,7 +13,7 @@ pub struct CreateWorkloadIdentityRequest {
 
 /// Request to update an existing service account
 #[derive(Debug, Deserialize)]
-pub struct UpdateWorkloadIdentityRequest {
+pub struct UpdateServiceAccountRequest {
     pub issuer_url: Option<String>,
     pub claims: Option<HashMap<String, String>>,
     /// Update environment restrictions.
@@ -22,9 +22,9 @@ pub struct UpdateWorkloadIdentityRequest {
     pub allowed_environments: Option<Option<Vec<String>>>,
 }
 
-/// Response for a single workload identity
+/// Response for a single service account
 #[derive(Debug, Serialize)]
-pub struct WorkloadIdentityResponse {
+pub struct ServiceAccountResponse {
     pub id: String,
     pub email: String,
     pub project_name: String,
@@ -35,8 +35,8 @@ pub struct WorkloadIdentityResponse {
     pub created_at: String,
 }
 
-/// Response for listing workload identities
+/// Response for listing service accounts
 #[derive(Debug, Serialize)]
-pub struct ListWorkloadIdentitiesResponse {
-    pub workload_identities: Vec<WorkloadIdentityResponse>,
+pub struct ListServiceAccountsResponse {
+    pub service_accounts: Vec<ServiceAccountResponse>,
 }
