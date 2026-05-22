@@ -7,27 +7,23 @@ struct ExchangeTokenResponse {
     token: String,
 }
 
-/// Resolve the bootstrap credential from `--credential`, the
-/// `RISE_IDENTITY_CREDENTIAL` env var, or the file at
-/// `RISE_IDENTITY_CREDENTIAL_FILE` (in that order).
+/// Standard in-pod path of the workload-identity bootstrap credential.
+const IDENTITY_CREDENTIAL_FILE: &str = "/var/run/secrets/rise/identity/credential";
+
+/// Resolve the bootstrap credential from `--credential`, falling back to the
+/// standard credential file mounted into every Rise deployment.
 fn resolve_credential(explicit: Option<&str>) -> Result<String> {
     if let Some(c) = explicit {
         return Ok(c.to_string());
     }
-    if let Ok(c) = std::env::var("RISE_IDENTITY_CREDENTIAL") {
-        if !c.is_empty() {
-            return Ok(c);
-        }
-    }
-    if let Ok(path) = std::env::var("RISE_IDENTITY_CREDENTIAL_FILE") {
-        let c = std::fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read credential file '{}'", path))?;
-        return Ok(c.trim().to_string());
-    }
-    anyhow::bail!(
-        "No workload identity credential found. Pass --credential, or set \
-         RISE_IDENTITY_CREDENTIAL or RISE_IDENTITY_CREDENTIAL_FILE."
-    )
+    let credential = std::fs::read_to_string(IDENTITY_CREDENTIAL_FILE).with_context(|| {
+        format!(
+            "No workload identity credential found. Pass --credential, or run this \
+             inside a Rise deployment where '{}' is mounted.",
+            IDENTITY_CREDENTIAL_FILE
+        )
+    })?;
+    Ok(credential.trim().to_string())
 }
 
 /// Request a workload identity token for `audience` and print it to stdout.

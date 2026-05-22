@@ -34,14 +34,14 @@ impersonate another project or environment.
 
 ## Consuming tokens
 
-Every Rise deployment gets a `rise-identity` Secret mounted at
-`/var/run/secrets/rise/identity/`, plus these environment variables:
+Every Rise deployment gets a `rise-identity` Secret mounted at a standard,
+read-only path. Everything is exposed as files — no environment variables are
+injected:
 
-| Variable | Purpose |
+| Path | Contents |
 |---|---|
-| `RISE_IDENTITY_CREDENTIAL_FILE` | Path to the bootstrap credential file |
-| `RISE_IDENTITY_CREDENTIAL` | The bootstrap credential (same value, inline) |
-| `RISE_IDENTITY_TOKENS_DIR` | Directory holding auto-mounted token files |
+| `/var/run/secrets/rise/identity/credential` | The bootstrap credential |
+| `/var/run/secrets/rise/identity/tokens/<name>` | An auto-minted token, one file per configured audience |
 
 There are two ways to obtain a token.
 
@@ -55,13 +55,13 @@ aws = "sts.amazonaws.com"
 vault = "https://vault.example.com"
 ```
 
-On Kubernetes the controller mints a token per audience, writes them into the
-`rise-identity` Secret, and re-mints them before they expire. Your app just
-reads the files:
+The map key is the in-pod filename; the value is the audience. On Kubernetes
+the controller mints a token per audience, writes them into the `rise-identity`
+Secret, and re-mints them before they expire. Your app just reads the files:
 
 ```
-$RISE_IDENTITY_TOKENS_DIR/aws     → JWT with aud=sts.amazonaws.com
-$RISE_IDENTITY_TOKENS_DIR/vault   → JWT with aud=https://vault.example.com
+/var/run/secrets/rise/identity/tokens/aws     → JWT with aud=sts.amazonaws.com
+/var/run/secrets/rise/identity/tokens/vault   → JWT with aud=https://vault.example.com
 ```
 
 The kubelet keeps the mounted files up to date as Rise refreshes them, so
@@ -95,8 +95,9 @@ The `rise` CLI wraps this endpoint — useful from a shell inside the pod:
 rise identity token --audience sts.amazonaws.com
 ```
 
-It resolves the credential from `--credential`, then `RISE_IDENTITY_CREDENTIAL`,
-then the file at `RISE_IDENTITY_CREDENTIAL_FILE`, and prints the token.
+It reads the credential from `--credential`, falling back to the standard
+credential file (`/var/run/secrets/rise/identity/credential`), and prints the
+token.
 
 ## Example: federating to AWS STS
 
@@ -119,7 +120,7 @@ URL), then trust the project in a role:
 The app then assumes the role with the Rise token:
 
 ```bash
-TOKEN=$(cat "$RISE_IDENTITY_TOKENS_DIR/aws")
+TOKEN=$(cat /var/run/secrets/rise/identity/tokens/aws)
 aws sts assume-role-with-web-identity \
   --role-arn arn:aws:iam::<acct>:role/my-app \
   --role-session-name my-app \

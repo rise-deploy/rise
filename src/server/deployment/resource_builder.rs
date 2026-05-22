@@ -9,12 +9,11 @@
 
 use k8s_openapi::api::apps::v1::{Deployment as K8sDeployment, DeploymentSpec};
 use k8s_openapi::api::core::v1::{
-    Capabilities, Container, ContainerPort, EnvFromSource, EnvVar, EnvVarSource, HTTPGetAction,
-    HostAlias, KeyToPath, LocalObjectReference, Namespace, PodSecurityContext, PodSpec,
-    PodTemplateSpec, Probe, ProjectedVolumeSource, ResourceRequirements, SeccompProfile, Secret,
-    SecretEnvSource, SecretKeySelector, SecretVolumeSource, SecurityContext, Service,
-    ServiceAccount, ServiceAccountTokenProjection, ServicePort, ServiceSpec, Volume, VolumeMount,
-    VolumeProjection,
+    Capabilities, Container, ContainerPort, EnvFromSource, EnvVar, HTTPGetAction, HostAlias,
+    KeyToPath, LocalObjectReference, Namespace, PodSecurityContext, PodSpec, PodTemplateSpec,
+    Probe, ProjectedVolumeSource, ResourceRequirements, SeccompProfile, Secret, SecretEnvSource,
+    SecretVolumeSource, SecurityContext, Service, ServiceAccount, ServiceAccountTokenProjection,
+    ServicePort, ServiceSpec, Volume, VolumeMount, VolumeProjection,
 };
 use k8s_openapi::api::networking::v1::{
     HTTPIngressPath, HTTPIngressRuleValue, Ingress, IngressBackend, IngressRule,
@@ -706,39 +705,6 @@ impl ResourceBuilder {
         }
     }
 
-    fn identity_env_vars(identity: &IdentityMount) -> Vec<EnvVar> {
-        vec![
-            EnvVar {
-                name: "RISE_IDENTITY_CREDENTIAL_FILE".to_string(),
-                value: Some(format!(
-                    "{}/{}",
-                    IDENTITY_MOUNT_PATH, IDENTITY_CREDENTIAL_KEY
-                )),
-                ..Default::default()
-            },
-            EnvVar {
-                name: "RISE_IDENTITY_TOKENS_DIR".to_string(),
-                value: Some(format!(
-                    "{}/{}",
-                    IDENTITY_MOUNT_PATH, IDENTITY_TOKENS_SUBDIR
-                )),
-                ..Default::default()
-            },
-            EnvVar {
-                name: "RISE_IDENTITY_CREDENTIAL".to_string(),
-                value_from: Some(EnvVarSource {
-                    secret_key_ref: Some(SecretKeySelector {
-                        name: identity.secret_name.clone(),
-                        key: IDENTITY_CREDENTIAL_KEY.to_string(),
-                        optional: None,
-                    }),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        ]
-    }
-
     pub fn create_service(
         &self,
         project: &Project,
@@ -1064,7 +1030,7 @@ impl ResourceBuilder {
         namespace: &str,
         image: &str,
         http_port: u16,
-        mut env_vars: Vec<EnvVar>,
+        env_vars: Vec<EnvVar>,
         secret_env_name: Option<String>,
         secret_env_hash: Option<String>,
         service_account_name: Option<String>,
@@ -1081,10 +1047,12 @@ impl ResourceBuilder {
             volume_mounts.push(mount);
         }
 
+        // The bootstrap credential and auto-minted tokens are exposed purely as
+        // files under a standard path (IDENTITY_MOUNT_PATH); no env vars are
+        // injected, mirroring the `extra_service_token_audiences` mount.
         if let Some(ref identity) = identity {
             volumes.push(Self::create_identity_volume(identity));
             volume_mounts.push(Self::create_identity_volume_mount());
-            env_vars.extend(Self::identity_env_vars(identity));
         }
 
         let volumes = (!volumes.is_empty()).then_some(volumes);
@@ -1839,14 +1807,8 @@ mod tests {
         assert_eq!(mount.mount_path, IDENTITY_MOUNT_PATH);
         assert_eq!(mount.read_only, Some(true));
 
-        let env = container.env.as_ref().unwrap();
-        assert!(env
-            .iter()
-            .any(|e| e.name == "RISE_IDENTITY_CREDENTIAL_FILE"));
-        assert!(env.iter().any(|e| e.name == "RISE_IDENTITY_TOKENS_DIR"));
-        assert!(env
-            .iter()
-            .any(|e| e.name == "RISE_IDENTITY_CREDENTIAL" && e.value_from.is_some()));
+        // Identity is exposed purely as mounted files — no env vars injected.
+        assert!(container.env.is_none());
     }
 
     #[test]

@@ -268,8 +268,8 @@ enum IdentityCommands {
         /// Audience (`aud` claim) to request the token for
         #[arg(long)]
         audience: String,
-        /// Bootstrap credential. Defaults to the RISE_IDENTITY_CREDENTIAL env
-        /// var, or the file at RISE_IDENTITY_CREDENTIAL_FILE.
+        /// Bootstrap credential. Defaults to the credential file mounted into
+        /// every Rise deployment (/var/run/secrets/rise/identity/credential).
         #[arg(long)]
         credential: Option<String>,
     },
