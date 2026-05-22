@@ -30,6 +30,8 @@ pub struct CreateDeploymentParams<'a> {
     pub cpu: &'a str,
     /// Memory allocation (e.g., "256Mi", "1Gi")
     pub memory: &'a str,
+    /// Map of { in-pod filename -> token audience } for auto-minted workload JWTs.
+    pub identity_audiences: serde_json::Value,
 }
 
 /// List deployments for a project
@@ -49,7 +51,8 @@ pub async fn list_for_project(pool: &PgPool, project_id: Uuid) -> Result<Vec<Dep
             first_healthy_at, job_url, pull_request_url,
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
-            created_at, updated_at
+            created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value"
         FROM deployments
         WHERE project_id = $1
         ORDER BY created_at DESC
@@ -88,7 +91,8 @@ pub async fn list_non_terminal_for_project(
             first_healthy_at, job_url, pull_request_url,
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
-            created_at, updated_at
+            created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value"
         FROM deployments
         WHERE project_id = $1
           AND NOT is_terminal(status)
@@ -124,7 +128,8 @@ pub async fn get_deployments_batch(
             first_healthy_at, job_url, pull_request_url,
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
-            created_at, updated_at
+            created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value"
         FROM deployments
         WHERE id = ANY($1)
         "#,
@@ -159,7 +164,8 @@ pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Deployment>> {
             first_healthy_at, job_url, pull_request_url,
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
-            created_at, updated_at
+            created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value"
         FROM deployments
         WHERE id = $1
         "#,
@@ -192,7 +198,8 @@ pub async fn find_by_deployment_id(
             first_healthy_at, job_url, pull_request_url,
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
-            created_at, updated_at
+            created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value"
         FROM deployments
         WHERE deployment_id = $1 AND project_id = $2
         "#,
@@ -230,7 +237,8 @@ pub async fn find_by_deployment_id_unscoped(
             first_healthy_at, job_url, pull_request_url,
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
-            created_at, updated_at
+            created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value"
         FROM deployments
         WHERE deployment_id = $1
         ORDER BY created_at ASC
@@ -253,8 +261,8 @@ pub async fn create(pool: &PgPool, params: CreateDeploymentParams<'_>) -> Result
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
-        INSERT INTO deployments (deployment_id, project_id, created_by_id, status, image, image_digest, rolled_back_from_deployment_id, deployment_group, environment_id, expires_at, http_port, is_active, job_url, pull_request_url, replicas, cpu, memory)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+        INSERT INTO deployments (deployment_id, project_id, created_by_id, status, image, image_digest, rolled_back_from_deployment_id, deployment_group, environment_id, expires_at, http_port, is_active, job_url, pull_request_url, replicas, cpu, memory, identity_audiences)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
         RETURNING
             id, deployment_id, project_id, created_by_id,
             status as "status: DeploymentStatus",
@@ -267,7 +275,8 @@ pub async fn create(pool: &PgPool, params: CreateDeploymentParams<'_>) -> Result
             deploying_started_at,
             first_healthy_at, job_url, pull_request_url,
             replicas, cpu, memory,
-            created_at, updated_at
+            created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value"
         "#,
         params.deployment_id,
         params.project_id,
@@ -285,7 +294,8 @@ pub async fn create(pool: &PgPool, params: CreateDeploymentParams<'_>) -> Result
         params.pull_request_url,
         params.replicas,
         params.cpu,
-        params.memory
+        params.memory,
+        params.identity_audiences
     )
     .fetch_one(pool)
     .await
@@ -319,7 +329,8 @@ pub async fn update_status(
             first_healthy_at, job_url, pull_request_url,
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
-            created_at, updated_at
+            created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value"
         FROM deployments
         WHERE id = $1
         "#,
@@ -363,7 +374,8 @@ pub async fn update_status(
             first_healthy_at, job_url, pull_request_url,
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
-            created_at, updated_at
+            created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value"
         "#,
         id,
         status_str
@@ -406,7 +418,8 @@ pub async fn mark_failed(pool: &PgPool, id: Uuid, error_message: &str) -> Result
             first_healthy_at, job_url, pull_request_url,
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
-            created_at, updated_at
+            created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value"
         "#,
         id,
         error_message
@@ -444,7 +457,8 @@ pub async fn update_controller_metadata(
             first_healthy_at, job_url, pull_request_url,
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
-            created_at, updated_at
+            created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value"
         "#,
         id,
         metadata
@@ -491,7 +505,8 @@ pub async fn mark_cancelled(pool: &PgPool, id: Uuid) -> Result<Deployment> {
             deploying_started_at,
             first_healthy_at, job_url, pull_request_url,
             replicas, cpu, memory,
-            created_at, updated_at
+            created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value"
         "#,
         id
     )
@@ -527,7 +542,8 @@ pub async fn mark_stopped(pool: &PgPool, id: Uuid) -> Result<Deployment> {
             deploying_started_at,
             first_healthy_at, job_url, pull_request_url,
             replicas, cpu, memory,
-            created_at, updated_at
+            created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value"
         "#,
         id
     )
@@ -563,7 +579,8 @@ pub async fn mark_superseded(pool: &PgPool, id: Uuid) -> Result<Deployment> {
             deploying_started_at,
             first_healthy_at, job_url, pull_request_url,
             replicas, cpu, memory,
-            created_at, updated_at
+            created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value"
         "#,
         id
     )
@@ -599,7 +616,8 @@ pub async fn mark_expired(pool: &PgPool, id: Uuid) -> Result<Deployment> {
             deploying_started_at,
             first_healthy_at, job_url, pull_request_url,
             replicas, cpu, memory,
-            created_at, updated_at
+            created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value"
         "#,
         id
     )
@@ -635,7 +653,8 @@ pub async fn mark_healthy(pool: &PgPool, id: Uuid) -> Result<Deployment> {
             deploying_started_at,
             first_healthy_at, job_url, pull_request_url,
             replicas, cpu, memory,
-            created_at, updated_at
+            created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value"
         "#,
         id
     )
@@ -670,7 +689,8 @@ pub async fn mark_unhealthy(pool: &PgPool, id: Uuid, reason: String) -> Result<D
             deploying_started_at,
             first_healthy_at, job_url, pull_request_url,
             replicas, cpu, memory,
-            created_at, updated_at
+            created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value"
         "#,
         id,
         reason
@@ -709,7 +729,8 @@ pub async fn mark_terminating(
             deploying_started_at,
             first_healthy_at, job_url, pull_request_url,
             replicas, cpu, memory,
-            created_at, updated_at
+            created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value"
         "#,
         id,
         reason as TerminationReason
@@ -744,7 +765,8 @@ pub async fn mark_cancelling(pool: &PgPool, id: Uuid) -> Result<Deployment> {
             deploying_started_at,
             first_healthy_at, job_url, pull_request_url,
             replicas, cpu, memory,
-            created_at, updated_at
+            created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value"
         "#,
         id
     )
@@ -786,6 +808,58 @@ pub async fn clear_needs_reconcile(pool: &PgPool, id: Uuid) -> Result<()> {
     Ok(())
 }
 
+/// Find a deployment by the SHA-256 hash of its workload-identity bootstrap credential.
+///
+/// Used by the token-exchange endpoint to authenticate a deployed app.
+pub async fn get_by_identity_credential_hash(
+    pool: &PgPool,
+    hash: &str,
+) -> Result<Option<Deployment>> {
+    let deployment = sqlx::query_as!(
+        Deployment,
+        r#"
+        SELECT
+            id, deployment_id, project_id, created_by_id,
+            status as "status: DeploymentStatus",
+            deployment_group, environment_id, expires_at,
+            termination_reason as "termination_reason: _",
+            completed_at, error_message, build_logs,
+            controller_metadata as "controller_metadata: serde_json::Value",
+            image, image_digest, rolled_back_from_deployment_id,
+            http_port, needs_reconcile, is_active,
+            deploying_started_at,
+            first_healthy_at, job_url, pull_request_url,
+            replicas, cpu, memory,
+            created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value"
+        FROM deployments
+        WHERE identity_credential_hash = $1
+        "#,
+        hash
+    )
+    .fetch_optional(pool)
+    .await
+    .context("Failed to find deployment by identity credential hash")?;
+
+    Ok(deployment)
+}
+
+/// Persist the SHA-256 hash of a deployment's workload-identity bootstrap credential.
+///
+/// Called by the controller after generating the credential during reconciliation.
+pub async fn set_identity_credential_hash(pool: &PgPool, id: Uuid, hash: &str) -> Result<()> {
+    sqlx::query!(
+        "UPDATE deployments SET identity_credential_hash = $2, updated_at = NOW() WHERE id = $1",
+        id,
+        hash
+    )
+    .execute(pool)
+    .await
+    .context("Failed to set identity credential hash")?;
+
+    Ok(())
+}
+
 /// Find active deployment for a project in a specific group
 /// Active = most recent Healthy deployment in the group
 #[cfg(feature = "backend")]
@@ -809,7 +883,8 @@ pub async fn find_active_for_project_and_group(
             deploying_started_at,
             first_healthy_at, job_url, pull_request_url,
             replicas, cpu, memory,
-            created_at, updated_at
+            created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value"
         FROM deployments
         WHERE project_id = $1
           AND deployment_group = $2
@@ -848,7 +923,8 @@ pub async fn find_non_terminal_for_project_and_group(
             deploying_started_at,
             first_healthy_at, job_url, pull_request_url,
             replicas, cpu, memory,
-            created_at, updated_at
+            created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value"
         FROM deployments
         WHERE project_id = $1
           AND deployment_group = $2
@@ -887,7 +963,8 @@ pub async fn find_active_deployment_for_group(
             deploying_started_at,
             first_healthy_at, job_url, pull_request_url,
             replicas, cpu, memory,
-            created_at, updated_at
+            created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value"
         FROM deployments
         WHERE project_id = $1
           AND deployment_group = $2
@@ -926,7 +1003,8 @@ pub async fn find_last_for_project_and_group(
             deploying_started_at,
             first_healthy_at, job_url, pull_request_url,
             replicas, cpu, memory,
-            created_at, updated_at
+            created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value"
         FROM deployments
         WHERE project_id = $1
           AND deployment_group = $2
@@ -970,7 +1048,8 @@ pub async fn list_for_project_and_group(
                 deploying_started_at,
                 first_healthy_at, job_url, pull_request_url,
                 replicas, cpu, memory,
-                created_at, updated_at
+                created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value"
             FROM deployments
             WHERE project_id = $1 AND deployment_group = $2
             ORDER BY created_at DESC
@@ -1000,7 +1079,8 @@ pub async fn list_for_project_and_group(
                 deploying_started_at,
                 first_healthy_at, job_url, pull_request_url,
                 replicas, cpu, memory,
-                created_at, updated_at
+                created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value"
             FROM deployments
             WHERE project_id = $1
             ORDER BY created_at DESC
@@ -1141,7 +1221,8 @@ pub async fn get_active_deployments_for_project(
             first_healthy_at, job_url, pull_request_url,
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
-            created_at, updated_at
+            created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value"
         FROM deployments
         WHERE project_id = $1 AND is_active = TRUE
         ORDER BY deployment_group, created_at DESC
@@ -1403,6 +1484,7 @@ mod tests {
                 replicas: 1,
                 cpu: "500m",
                 memory: "256Mi",
+                identity_audiences: serde_json::json!({}),
             },
         )
         .await
@@ -1489,6 +1571,7 @@ mod tests {
                 replicas: 1,
                 cpu: "500m",
                 memory: "256Mi",
+                identity_audiences: serde_json::json!({}),
             },
         )
         .await

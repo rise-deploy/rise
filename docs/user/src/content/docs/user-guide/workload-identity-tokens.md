@@ -1,0 +1,127 @@
+---
+title: "Workload Identity Tokens"
+---
+
+Workload identity tokens let a *deployed app* federate its identity to external
+systems — AWS STS, GCP Workload Identity Federation, HashiCorp Vault, Snowflake,
+and any OIDC-trusting service — without storing long-lived secrets.
+
+Rise issues each app a short-lived, **Rise-signed OIDC JWT** whose claims
+describe the *Rise* identity (project + environment), not the underlying
+runtime. External systems trust `https://<your-rise>` as an OIDC identity
+provider and key their trust policies on `project` / `environment`. Because the
+token is Rise-shaped, the downstream trust configuration stays the same even if
+the app later moves to a different runtime.
+
+**How it works:** Rise already publishes OIDC discovery
+(`/.well-known/openid-configuration`) and a JWKS endpoint (`/api/v1/auth/jwks`).
+A workload token is a regular RS256 JWT signed with the same key, so any OIDC
+verifier can validate it.
+
+## Token claims
+
+| Claim | Value |
+|---|---|
+| `iss` | Your Rise backend URL |
+| `sub` | `rise:proj:<project>:env:<environment>` (`_none` if the deployment has no environment) |
+| `aud` | The audience you requested |
+| `exp` / `iat` / `nbf` | Lifetime bounds |
+| `jti` | Unique token ID |
+| `project`, `environment`, `deployment_group`, `deployment_id` | Informational |
+
+The subject is fixed and not user-configurable — it cannot be used to
+impersonate another project or environment.
+
+## Consuming tokens
+
+Every Rise deployment gets a `rise-identity` Secret mounted at
+`/var/run/secrets/rise/identity/`, plus these environment variables:
+
+| Variable | Purpose |
+|---|---|
+| `RISE_IDENTITY_CREDENTIAL_FILE` | Path to the bootstrap credential file |
+| `RISE_IDENTITY_CREDENTIAL` | The bootstrap credential (same value, inline) |
+| `RISE_IDENTITY_TOKENS_DIR` | Directory holding auto-mounted token files |
+
+There are two ways to obtain a token.
+
+### 1. Auto-mounted token files (Kubernetes)
+
+List the audiences you need in `.rise.toml`:
+
+```toml
+[identity.audiences]
+aws = "sts.amazonaws.com"
+vault = "https://vault.example.com"
+```
+
+On Kubernetes the controller mints a token per audience, writes them into the
+`rise-identity` Secret, and re-mints them before they expire. Your app just
+reads the files:
+
+```
+$RISE_IDENTITY_TOKENS_DIR/aws     → JWT with aud=sts.amazonaws.com
+$RISE_IDENTITY_TOKENS_DIR/vault   → JWT with aud=https://vault.example.com
+```
+
+The kubelet keeps the mounted files up to date as Rise refreshes them, so
+**always re-read the file** rather than caching the first read.
+
+### 2. The token-exchange endpoint
+
+For runtime-agnostic use, or audiences not known ahead of time, exchange the
+bootstrap credential for a token:
+
+```
+POST /api/v1/identity/token
+Authorization: Bearer <bootstrap credential>
+Content-Type: application/json
+
+{ "audience": "sts.amazonaws.com" }
+```
+
+Response:
+
+```json
+{ "token": "<JWT>", "token_type": "Bearer", "expires_in": 900 }
+```
+
+The bootstrap credential stops working once the deployment is torn down or
+superseded.
+
+The `rise` CLI wraps this endpoint — useful from a shell inside the pod:
+
+```bash
+rise identity token --audience sts.amazonaws.com
+```
+
+It resolves the credential from `--credential`, then `RISE_IDENTITY_CREDENTIAL`,
+then the file at `RISE_IDENTITY_CREDENTIAL_FILE`, and prints the token.
+
+## Example: federating to AWS STS
+
+Register Rise as an OIDC provider in AWS IAM (provider URL = your Rise backend
+URL), then trust the project in a role:
+
+```json
+{
+  "Effect": "Allow",
+  "Principal": { "Federated": "arn:aws:iam::<acct>:oidc-provider/<your-rise-host>" },
+  "Action": "sts:AssumeRoleWithWebIdentity",
+  "Condition": {
+    "StringEquals": {
+      "<your-rise-host>:sub": "rise:proj:my-app:env:production"
+    }
+  }
+}
+```
+
+The app then assumes the role with the Rise token:
+
+```bash
+TOKEN=$(cat "$RISE_IDENTITY_TOKENS_DIR/aws")
+aws sts assume-role-with-web-identity \
+  --role-arn arn:aws:iam::<acct>:role/my-app \
+  --role-session-name my-app \
+  --web-identity-token "$TOKEN"
+```

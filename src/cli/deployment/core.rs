@@ -587,6 +587,11 @@ pub async fn create_deployment(
         deploy_opts.replicas,
         deploy_opts.cpu.as_deref(),
         deploy_opts.memory.as_deref(),
+        deploy_opts
+            .toml_config
+            .as_ref()
+            .and_then(|c| c.identity.as_ref())
+            .map(|i| &i.audiences),
     )
     .await?;
 
@@ -987,6 +992,7 @@ async fn call_create_deployment_api(
     replicas: Option<u32>,
     cpu: Option<&str>,
     memory: Option<&str>,
+    identity_audiences: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Result<CreateDeploymentResponse> {
     let url = format!("{}/api/v1/deployments", backend_url);
     let mut payload = serde_json::json!({
@@ -1049,6 +1055,13 @@ async fn call_create_deployment_api(
     }
     if let Some(m) = memory {
         payload["memory"] = serde_json::json!(m);
+    }
+
+    // Add identity audiences from [identity] in rise.toml if any
+    if let Some(audiences) = identity_audiences {
+        if !audiences.is_empty() {
+            payload["identity_audiences"] = serde_json::json!(audiences);
+        }
     }
 
     // Add env_overrides if any

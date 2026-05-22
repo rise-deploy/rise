@@ -721,6 +721,7 @@ mod tests {
                 replicas: 1,
                 cpu: "500m",
                 memory: "256Mi",
+                identity_audiences: serde_json::json!({}),
             },
         )
         .await
@@ -769,6 +770,7 @@ mod tests {
                 replicas: 1,
                 cpu: "500m",
                 memory: "256Mi",
+                identity_audiences: serde_json::json!({}),
             },
         )
         .await
@@ -877,6 +879,7 @@ mod tests {
                 replicas: 1,
                 cpu: "500m",
                 memory: "256Mi",
+                identity_audiences: serde_json::json!({}),
             },
         )
         .await

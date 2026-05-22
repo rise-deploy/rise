@@ -9,11 +9,12 @@
 
 use k8s_openapi::api::apps::v1::{Deployment as K8sDeployment, DeploymentSpec};
 use k8s_openapi::api::core::v1::{
-    Capabilities, Container, ContainerPort, EnvFromSource, EnvVar, HTTPGetAction, HostAlias,
-    LocalObjectReference, Namespace, PodSecurityContext, PodSpec, PodTemplateSpec, Probe,
-    ProjectedVolumeSource, ResourceRequirements, SeccompProfile, Secret, SecretEnvSource,
-    SecurityContext, Service, ServiceAccount, ServiceAccountTokenProjection, ServicePort,
-    ServiceSpec, Volume, VolumeMount, VolumeProjection,
+    Capabilities, Container, ContainerPort, EnvFromSource, EnvVar, EnvVarSource, HTTPGetAction,
+    HostAlias, KeyToPath, LocalObjectReference, Namespace, PodSecurityContext, PodSpec,
+    PodTemplateSpec, Probe, ProjectedVolumeSource, ResourceRequirements, SeccompProfile, Secret,
+    SecretEnvSource, SecretKeySelector, SecretVolumeSource, SecurityContext, Service,
+    ServiceAccount, ServiceAccountTokenProjection, ServicePort, ServiceSpec, Volume, VolumeMount,
+    VolumeProjection,
 };
 use k8s_openapi::api::networking::v1::{
     HTTPIngressPath, HTTPIngressRuleValue, Ingress, IngressBackend, IngressRule,
@@ -45,6 +46,24 @@ pub const IMAGE_PULL_SECRET_NAME: &str = "rise-registry-creds";
 
 const EXTRA_SERVICE_TOKENS_VOLUME_NAME: &str = "rise-extra-service-tokens";
 const EXTRA_SERVICE_TOKENS_MOUNT_PATH: &str = "/var/run/secrets/rise/tokens";
+
+// Workload identity: a per-deployment Secret carrying the bootstrap credential
+// and any auto-minted workload tokens, mounted as files into the app's pod.
+const IDENTITY_VOLUME_NAME: &str = "rise-identity";
+const IDENTITY_MOUNT_PATH: &str = "/var/run/secrets/rise/identity";
+const IDENTITY_TOKENS_SUBDIR: &str = "tokens";
+/// Secret data key for the bootstrap credential.
+pub const IDENTITY_CREDENTIAL_KEY: &str = "credential";
+/// Prefix for Secret data keys holding auto-minted workload tokens.
+pub const IDENTITY_TOKEN_KEY_PREFIX: &str = "token-";
+
+/// Describes the workload-identity Secret mounted into a deployment's pod.
+pub struct IdentityMount {
+    /// Name of the `rise-identity` Secret.
+    pub secret_name: String,
+    /// Token filenames (the `[identity]` audience map keys) carried by the Secret.
+    pub token_filenames: Vec<String>,
+}
 
 /// Container waiting state reasons that indicate irrecoverable errors
 pub const IRRECOVERABLE_CONTAINER_REASONS: &[&str] = &[
@@ -139,6 +158,10 @@ impl ResourceBuilder {
 
     pub fn deployment_env_secret_name(project: &Project, deployment: &Deployment) -> String {
         format!("{}-env", Self::deployment_name(project, deployment))
+    }
+
+    pub fn deployment_identity_secret_name(project: &Project, deployment: &Deployment) -> String {
+        format!("{}-identity", Self::deployment_name(project, deployment))
     }
 
     pub fn ingress_name(_project: &Project, deployment: &Deployment) -> String {
@@ -597,6 +620,125 @@ impl ResourceBuilder {
         }
     }
 
+    /// Build the per-deployment workload-identity Secret.
+    ///
+    /// Carries the bootstrap `credential` plus one `token-<filename>` entry per
+    /// auto-minted workload token. `refreshed_at` is recorded in the
+    /// `rise.dev/last-refresh` annotation and drives token-staleness checks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_identity_secret(
+        &self,
+        project: &Project,
+        deployment: &Deployment,
+        namespace: &str,
+        environment_name: Option<&str>,
+        credential: &str,
+        tokens: &BTreeMap<String, String>,
+        refreshed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Secret {
+        let mut data: BTreeMap<String, ByteString> = BTreeMap::new();
+        data.insert(
+            IDENTITY_CREDENTIAL_KEY.to_string(),
+            ByteString(credential.as_bytes().to_vec()),
+        );
+        for (filename, jwt) in tokens {
+            data.insert(
+                format!("{}{}", IDENTITY_TOKEN_KEY_PREFIX, filename),
+                ByteString(jwt.as_bytes().to_vec()),
+            );
+        }
+
+        let mut annotations = BTreeMap::new();
+        annotations.insert(
+            ANNOTATION_LAST_REFRESH.to_string(),
+            refreshed_at.to_rfc3339(),
+        );
+
+        Secret {
+            metadata: ObjectMeta {
+                name: Some(Self::deployment_identity_secret_name(project, deployment)),
+                namespace: Some(namespace.to_string()),
+                labels: Some(Self::deployment_labels(
+                    project,
+                    deployment,
+                    environment_name,
+                )),
+                annotations: Some(annotations),
+                ..Default::default()
+            },
+            type_: Some("Opaque".to_string()),
+            data: Some(data),
+            ..Default::default()
+        }
+    }
+
+    fn create_identity_volume(identity: &IdentityMount) -> Volume {
+        let mut items = vec![KeyToPath {
+            key: IDENTITY_CREDENTIAL_KEY.to_string(),
+            path: IDENTITY_CREDENTIAL_KEY.to_string(),
+            ..Default::default()
+        }];
+        for filename in &identity.token_filenames {
+            items.push(KeyToPath {
+                key: format!("{}{}", IDENTITY_TOKEN_KEY_PREFIX, filename),
+                path: format!("{}/{}", IDENTITY_TOKENS_SUBDIR, filename),
+                ..Default::default()
+            });
+        }
+
+        Volume {
+            name: IDENTITY_VOLUME_NAME.to_string(),
+            secret: Some(SecretVolumeSource {
+                secret_name: Some(identity.secret_name.clone()),
+                items: Some(items),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn create_identity_volume_mount() -> VolumeMount {
+        VolumeMount {
+            name: IDENTITY_VOLUME_NAME.to_string(),
+            mount_path: IDENTITY_MOUNT_PATH.to_string(),
+            read_only: Some(true),
+            ..Default::default()
+        }
+    }
+
+    fn identity_env_vars(identity: &IdentityMount) -> Vec<EnvVar> {
+        vec![
+            EnvVar {
+                name: "RISE_IDENTITY_CREDENTIAL_FILE".to_string(),
+                value: Some(format!(
+                    "{}/{}",
+                    IDENTITY_MOUNT_PATH, IDENTITY_CREDENTIAL_KEY
+                )),
+                ..Default::default()
+            },
+            EnvVar {
+                name: "RISE_IDENTITY_TOKENS_DIR".to_string(),
+                value: Some(format!(
+                    "{}/{}",
+                    IDENTITY_MOUNT_PATH, IDENTITY_TOKENS_SUBDIR
+                )),
+                ..Default::default()
+            },
+            EnvVar {
+                name: "RISE_IDENTITY_CREDENTIAL".to_string(),
+                value_from: Some(EnvVarSource {
+                    secret_key_ref: Some(SecretKeySelector {
+                        name: identity.secret_name.clone(),
+                        key: IDENTITY_CREDENTIAL_KEY.to_string(),
+                        optional: None,
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ]
+    }
+
     pub fn create_service(
         &self,
         project: &Project,
@@ -922,18 +1064,31 @@ impl ResourceBuilder {
         namespace: &str,
         image: &str,
         http_port: u16,
-        env_vars: Vec<EnvVar>,
+        mut env_vars: Vec<EnvVar>,
         secret_env_name: Option<String>,
         secret_env_hash: Option<String>,
         service_account_name: Option<String>,
         environment_name: Option<&str>,
+        identity: Option<IdentityMount>,
     ) -> K8sDeployment {
-        let volumes = self
-            .create_extra_service_token_volume()
-            .map(|volume| vec![volume]);
-        let volume_mounts = self
-            .create_extra_service_token_volume_mount()
-            .map(|mount| vec![mount]);
+        let mut volumes: Vec<Volume> = Vec::new();
+        let mut volume_mounts: Vec<VolumeMount> = Vec::new();
+
+        if let Some(volume) = self.create_extra_service_token_volume() {
+            volumes.push(volume);
+        }
+        if let Some(mount) = self.create_extra_service_token_volume_mount() {
+            volume_mounts.push(mount);
+        }
+
+        if let Some(ref identity) = identity {
+            volumes.push(Self::create_identity_volume(identity));
+            volume_mounts.push(Self::create_identity_volume_mount());
+            env_vars.extend(Self::identity_env_vars(identity));
+        }
+
+        let volumes = (!volumes.is_empty()).then_some(volumes);
+        let volume_mounts = (!volume_mounts.is_empty()).then_some(volume_mounts);
 
         K8sDeployment {
             metadata: ObjectMeta {
@@ -1491,6 +1646,8 @@ mod tests {
             replicas: 1,
             cpu: "500m".to_string(),
             memory: "256Mi".to_string(),
+            identity_credential_hash: None,
+            identity_audiences: serde_json::json!({}),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -1562,6 +1719,7 @@ mod tests {
             Some("abc123".to_string()),
             None,
             None,
+            None,
         );
 
         let container = &k8s_deployment
@@ -1616,6 +1774,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let container = &k8s_deployment
@@ -1630,6 +1789,90 @@ mod tests {
 
         assert!(container.env.is_none());
         assert!(container.env_from.is_none());
+    }
+
+    #[test]
+    fn create_k8s_deployment_mounts_identity_secret() {
+        let builder = test_resource_builder();
+        let k8s_deployment = builder.create_k8s_deployment(
+            &test_project(),
+            &test_deployment(),
+            "demo",
+            "registry.example.test/rise/demo:latest",
+            8080,
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            Some(IdentityMount {
+                secret_name: "demo-20260502-000000-identity".to_string(),
+                token_filenames: vec!["aws".to_string()],
+            }),
+        );
+
+        let pod = pod_spec_from_deployment(&k8s_deployment);
+        let volume = pod
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|v| v.name == IDENTITY_VOLUME_NAME)
+            .expect("identity volume present");
+        let secret = volume.secret.as_ref().unwrap();
+        assert_eq!(
+            secret.secret_name.as_deref(),
+            Some("demo-20260502-000000-identity")
+        );
+        let items = secret.items.as_ref().unwrap();
+        assert!(items.iter().any(|i| i.path == "credential"));
+        assert!(items.iter().any(|i| i.path == "tokens/aws"));
+
+        let container = &pod.containers[0];
+        let mount = container
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.name == IDENTITY_VOLUME_NAME)
+            .expect("identity volume mount present");
+        assert_eq!(mount.mount_path, IDENTITY_MOUNT_PATH);
+        assert_eq!(mount.read_only, Some(true));
+
+        let env = container.env.as_ref().unwrap();
+        assert!(env
+            .iter()
+            .any(|e| e.name == "RISE_IDENTITY_CREDENTIAL_FILE"));
+        assert!(env.iter().any(|e| e.name == "RISE_IDENTITY_TOKENS_DIR"));
+        assert!(env
+            .iter()
+            .any(|e| e.name == "RISE_IDENTITY_CREDENTIAL" && e.value_from.is_some()));
+    }
+
+    #[test]
+    fn create_k8s_deployment_omits_identity_when_absent() {
+        let builder = test_resource_builder();
+        let k8s_deployment = builder.create_k8s_deployment(
+            &test_project(),
+            &test_deployment(),
+            "demo",
+            "registry.example.test/rise/demo:latest",
+            8080,
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let pod = pod_spec_from_deployment(&k8s_deployment);
+        let has_identity_volume = pod
+            .volumes
+            .as_ref()
+            .map(|vols| vols.iter().any(|v| v.name == IDENTITY_VOLUME_NAME))
+            .unwrap_or(false);
+        assert!(!has_identity_volume);
     }
 
     fn pod_spec_from_deployment(k8s_deployment: &K8sDeployment) -> &PodSpec {
@@ -1659,6 +1902,7 @@ mod tests {
             "registry.example.test/rise/demo:latest",
             8080,
             vec![],
+            None,
             None,
             None,
             None,

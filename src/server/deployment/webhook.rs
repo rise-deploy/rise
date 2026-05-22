@@ -33,11 +33,13 @@ use crate::db::{
 };
 use crate::server::deployment::crd;
 use crate::server::deployment::resource_builder::{
-    ResourceBuilder, ANNOTATION_ENV_SECRET_HASH, ANNOTATION_LAST_REFRESH, IMAGE_PULL_SECRET_NAME,
+    IdentityMount, ResourceBuilder, ANNOTATION_ENV_SECRET_HASH, ANNOTATION_LAST_REFRESH,
+    IDENTITY_CREDENTIAL_KEY, IDENTITY_TOKEN_KEY_PREFIX, IMAGE_PULL_SECRET_NAME,
     IRRECOVERABLE_CONTAINER_REASONS, LABEL_DEPLOYMENT_ID,
 };
 use crate::server::deployment::state_machine;
 use crate::server::state::AppState;
+use crate::server::workload_tokens::workload_subject;
 
 // ── Metacontroller webhook protocol types ──────────────────────────────
 
@@ -105,6 +107,10 @@ const PRE_PUSHED_TIMEOUT_MINUTES: i64 = 10;
 const SECRET_REFRESH_HOURS: i64 = 6;
 /// Maximum number of terminating/terminated pods to carry forward in controller_metadata
 const MAX_INACTIVE_PODS: usize = 5;
+/// Lifetime of auto-minted workload identity tokens.
+const IDENTITY_TOKEN_TTL_SECS: u64 = 3600;
+/// Age past which auto-minted workload tokens are re-minted (half of the TTL).
+const IDENTITY_TOKEN_REFRESH_SECS: i64 = 1800;
 
 #[derive(Debug, Default)]
 struct ResolvedDeploymentEnvVars {
@@ -1110,6 +1116,19 @@ async fn compute_desired_children(
             }
         };
 
+        // Workload identity Secret: bootstrap credential + auto-minted tokens.
+        let identity = prepare_identity_secret(
+            state,
+            resource_builder,
+            project,
+            deployment,
+            &namespace,
+            env_name.as_deref(),
+            observed,
+        )
+        .await?;
+        children.push(serde_json::to_value(&identity.secret)?);
+
         let k8s_deploy = resource_builder.create_k8s_deployment(
             project,
             deployment,
@@ -1121,6 +1140,7 @@ async fn compute_desired_children(
             secret_env_hash,
             sa_name,
             env_name.as_deref(),
+            Some(identity.mount),
         );
         children.push(serde_json::to_value(&k8s_deploy)?);
 
@@ -1192,7 +1212,7 @@ async fn compute_desired_children(
 }
 
 /// Returns true if this deployment should have K8s infrastructure (K8s Deployment resource).
-fn should_have_infrastructure(deployment: &Deployment) -> bool {
+pub(crate) fn should_have_infrastructure(deployment: &Deployment) -> bool {
     matches!(
         deployment.status,
         DeploymentStatus::Pushed
@@ -1279,6 +1299,158 @@ async fn build_image_pull_secret(
     )?;
 
     Ok(Some(secret))
+}
+
+/// SHA-256 hex digest of the given bytes.
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// A prepared workload-identity Secret plus the mount description for the pod.
+struct PreparedIdentitySecret {
+    secret: Secret,
+    mount: IdentityMount,
+}
+
+/// Build the per-deployment workload-identity Secret.
+///
+/// The bootstrap credential is generated once and then reused from the observed
+/// Secret on subsequent syncs; its SHA-256 hash is persisted to the deployment
+/// row so the token-exchange endpoint can authenticate the app. Auto-minted
+/// workload tokens (one per `[identity]` audience) are re-minted only when the
+/// observed Secret is stale or its audience set changed, avoiding a Secret
+/// rewrite on every resync.
+async fn prepare_identity_secret(
+    state: &AppState,
+    resource_builder: &ResourceBuilder,
+    project: &Project,
+    deployment: &Deployment,
+    namespace: &str,
+    environment_name: Option<&str>,
+    observed: &ObservedChildren,
+) -> anyhow::Result<PreparedIdentitySecret> {
+    use base64::Engine;
+    use rand::Rng;
+
+    let secret_name = ResourceBuilder::deployment_identity_secret_name(project, deployment);
+    let secret_key = format!("{}/{}", namespace, secret_name);
+
+    let observed_secret: Option<Secret> = observed
+        .secrets
+        .get(&secret_key)
+        .and_then(|json| serde_json::from_value(json.clone()).ok());
+
+    // ── Bootstrap credential: generate once, then reuse ─────────────────
+    let observed_credential = observed_secret
+        .as_ref()
+        .and_then(|s| s.data.as_ref())
+        .and_then(|d| d.get(IDENTITY_CREDENTIAL_KEY))
+        .and_then(|b| String::from_utf8(b.0.clone()).ok());
+
+    let credential = match observed_credential {
+        Some(c) => c,
+        None => {
+            let mut bytes = [0u8; 32];
+            rand::rng().fill_bytes(&mut bytes);
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+        }
+    };
+
+    // Persist the credential hash if it is missing or out of sync.
+    let credential_hash = sha256_hex(credential.as_bytes());
+    if deployment.identity_credential_hash.as_deref() != Some(credential_hash.as_str()) {
+        db_deployments::set_identity_credential_hash(
+            &state.db_pool,
+            deployment.id,
+            &credential_hash,
+        )
+        .await
+        .context("Failed to persist identity credential hash")?;
+    }
+
+    // ── Auto-minted workload tokens ─────────────────────────────────────
+    let audiences: BTreeMap<String, String> =
+        serde_json::from_value(deployment.identity_audiences.clone()).unwrap_or_default();
+
+    let mut token_filenames: Vec<String> = audiences.keys().cloned().collect();
+    token_filenames.sort();
+
+    let (tokens, refreshed_at) = if audiences.is_empty() {
+        (BTreeMap::new(), Utc::now())
+    } else {
+        let observed_refresh = observed_secret
+            .as_ref()
+            .and_then(|s| s.metadata.annotations.as_ref())
+            .and_then(|a| a.get(ANNOTATION_LAST_REFRESH))
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|ts| ts.with_timezone(&Utc));
+
+        let observed_tokens: BTreeMap<String, String> = observed_secret
+            .as_ref()
+            .and_then(|s| s.data.as_ref())
+            .map(|d| {
+                d.iter()
+                    .filter_map(|(k, v)| {
+                        let name = k.strip_prefix(IDENTITY_TOKEN_KEY_PREFIX)?;
+                        let jwt = String::from_utf8(v.0.clone()).ok()?;
+                        Some((name.to_string(), jwt))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let fresh = observed_refresh
+            .map(|ts| {
+                Utc::now().signed_duration_since(ts)
+                    < chrono::Duration::seconds(IDENTITY_TOKEN_REFRESH_SECS)
+            })
+            .unwrap_or(false);
+
+        if fresh && observed_tokens.keys().eq(audiences.keys()) {
+            // Reuse observed tokens unchanged, preserving the refresh timestamp.
+            (observed_tokens, observed_refresh.unwrap_or_else(Utc::now))
+        } else {
+            let sub = workload_subject(&project.name, environment_name);
+            let mut minted = BTreeMap::new();
+            for (filename, audience) in &audiences {
+                let jwt = state.jwt_signer.sign_workload_jwt(
+                    &sub,
+                    &project.name,
+                    environment_name.unwrap_or("_none"),
+                    &deployment.deployment_group,
+                    &deployment.deployment_id,
+                    audience,
+                    IDENTITY_TOKEN_TTL_SECS,
+                )?;
+                minted.insert(filename.clone(), jwt);
+            }
+            (minted, Utc::now())
+        }
+    };
+
+    let secret = resource_builder.create_identity_secret(
+        project,
+        deployment,
+        namespace,
+        environment_name,
+        &credential,
+        &tokens,
+        refreshed_at,
+    );
+
+    Ok(PreparedIdentitySecret {
+        secret,
+        mount: IdentityMount {
+            secret_name,
+            token_filenames,
+        },
+    })
 }
 
 fn hash_deployment_env_secret(data: &BTreeMap<String, ByteString>) -> String {
@@ -1899,6 +2071,8 @@ mod tests {
             replicas: 1,
             cpu: "500m".to_string(),
             memory: "256Mi".to_string(),
+            identity_credential_hash: None,
+            identity_audiences: serde_json::json!({}),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

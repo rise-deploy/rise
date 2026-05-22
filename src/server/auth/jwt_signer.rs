@@ -34,6 +34,39 @@ pub struct RiseClaims {
     pub aud: String,
 }
 
+/// Claims for Rise-issued workload identity JWTs (RS256).
+///
+/// Issued to deployed apps so they can federate identity to external systems
+/// (AWS STS, GCP WIF, Vault, ...). The subject describes the *Rise* identity —
+/// `rise:proj:<project>:env:<environment>` — independent of the runtime.
+/// These are distinct from [`RiseClaims`], which is user-shaped and requires
+/// an `email` claim; workload tokens must never be accepted by Rise's own auth.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct WorkloadClaims {
+    /// Issuer (Rise backend URL)
+    pub iss: String,
+    /// Subject: `rise:proj:<project>:env:<environment>`
+    pub sub: String,
+    /// Audience supplied by the caller
+    pub aud: String,
+    /// Issued at timestamp
+    pub iat: u64,
+    /// Not before timestamp
+    pub nbf: u64,
+    /// Expiration timestamp
+    pub exp: u64,
+    /// Unique token ID
+    pub jti: String,
+    /// Rise project name (informational)
+    pub project: String,
+    /// Rise environment name (informational; `_none` if the deployment has none)
+    pub environment: String,
+    /// Deployment group (informational)
+    pub deployment_group: String,
+    /// Rise deployment ID (informational)
+    pub deployment_id: String,
+}
+
 /// JWT signer supporting both HS256 (symmetric) and RS256 (asymmetric) algorithms
 ///
 /// - HS256 is used for user authentication (aud = Rise public URL)
@@ -377,6 +410,57 @@ impl JwtSigner {
         Ok(token)
     }
 
+    /// Sign a Rise workload identity JWT (RS256)
+    ///
+    /// Issued to a deployed app for federating identity to external systems.
+    /// Uses the same RS256 key as ingress tokens, so the existing JWKS/discovery
+    /// endpoints already cover verification.
+    ///
+    /// # Arguments
+    /// * `sub` - Subject (`rise:proj:<project>:env:<environment>`)
+    /// * `project` / `environment` / `deployment_group` / `deployment_id` - informational claims
+    /// * `audience` - the `aud` claim, supplied per request
+    /// * `ttl_secs` - token lifetime in seconds
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_workload_jwt(
+        &self,
+        sub: &str,
+        project: &str,
+        environment: &str,
+        deployment_group: &str,
+        deployment_id: &str,
+        audience: &str,
+        ttl_secs: u64,
+    ) -> Result<String, JwtSignerError> {
+        use rand::Rng;
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+
+        let mut jti_bytes = [0u8; 16];
+        rand::rng().fill_bytes(&mut jti_bytes);
+        let jti = BASE64URL.encode(jti_bytes);
+
+        let claims = WorkloadClaims {
+            iss: self.issuer.clone(),
+            sub: sub.to_string(),
+            aud: audience.to_string(),
+            iat: now,
+            nbf: now,
+            exp: now + ttl_secs,
+            jti,
+            project: project.to_string(),
+            environment: environment.to_string(),
+            deployment_group: deployment_group.to_string(),
+            deployment_id: deployment_id.to_string(),
+        };
+
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(self.rs256_key_id.clone());
+        let token = encode(&header, &claims, &self.rs256_encoding_key)?;
+
+        Ok(token)
+    }
+
     /// Verify and decode a Rise user JWT (HS256 only) with audience validation
     ///
     /// This is used by the API middleware to authenticate user requests.
@@ -614,6 +698,43 @@ mod tests {
 
         let result = signer.verify_user_jwt(&token, "https://rise.test");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sign_workload_jwt() {
+        let signer = create_test_signer();
+
+        let token = signer
+            .sign_workload_jwt(
+                "rise:proj:myapp:env:prod",
+                "myapp",
+                "prod",
+                "default",
+                "20260101-000000",
+                "sts.amazonaws.com",
+                900,
+            )
+            .unwrap();
+
+        let header = jsonwebtoken::decode_header(&token).unwrap();
+        assert_eq!(header.alg, Algorithm::RS256);
+        assert_eq!(header.kid.as_deref(), Some(signer.rs256_key_id.as_str()));
+
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.set_issuer(&["https://rise.test"]);
+        validation.set_audience(&["sts.amazonaws.com"]);
+        let data =
+            decode::<WorkloadClaims>(&token, &signer.rs256_decoding_key, &validation).unwrap();
+
+        assert_eq!(data.claims.iss, "https://rise.test");
+        assert_eq!(data.claims.sub, "rise:proj:myapp:env:prod");
+        assert_eq!(data.claims.aud, "sts.amazonaws.com");
+        assert_eq!(data.claims.project, "myapp");
+        assert_eq!(data.claims.environment, "prod");
+        assert_eq!(data.claims.deployment_group, "default");
+        assert_eq!(data.claims.deployment_id, "20260101-000000");
+        assert_eq!(data.claims.exp, data.claims.iat + 900);
+        assert!(!data.claims.jti.is_empty());
     }
 
     #[test]

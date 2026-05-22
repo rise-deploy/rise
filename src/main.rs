@@ -252,10 +252,27 @@ enum Commands {
     #[command(subcommand)]
     #[command(visible_alias = "sa")]
     ServiceAccount(ServiceAccountCommands),
+    /// Workload identity token commands (run inside a Rise deployment)
+    #[command(subcommand)]
+    Identity(IdentityCommands),
     /// Team management commands
     #[command(subcommand)]
     #[command(visible_alias = "t")]
     Team(TeamCommands),
+}
+
+#[derive(Subcommand, Debug)]
+enum IdentityCommands {
+    /// Request a workload identity token for an audience
+    Token {
+        /// Audience (`aud` claim) to request the token for
+        #[arg(long)]
+        audience: String,
+        /// Bootstrap credential. Defaults to the RISE_IDENTITY_CREDENTIAL env
+        /// var, or the file at RISE_IDENTITY_CREDENTIAL_FILE.
+        #[arg(long)]
+        credential: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1525,6 +1542,14 @@ async fn main() -> Result<()> {
                     id,
                 )
                 .await?;
+            }
+        },
+        Commands::Identity(identity_cmd) => match identity_cmd {
+            IdentityCommands::Token {
+                audience,
+                credential,
+            } => {
+                cli::identity::token_command(&http_client, audience, credential.as_deref()).await?;
             }
         },
         Commands::Environment(env_cmd) => {

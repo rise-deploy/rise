@@ -642,6 +642,33 @@ async fn resolve_effective_http_port(
 /// Constraints are resolved from: environment-specific overrides > platform defaults.
 /// When `is_redeploy` is true, error messages include a hint about using CLI flags to override
 /// inherited resource values.
+/// Validate `[identity].audiences` from a deploy request.
+///
+/// Keys become in-pod token filenames, so they must be safe path segments.
+/// Audience values must be non-empty.
+fn validate_identity_audiences(
+    audiences: &std::collections::BTreeMap<String, String>,
+) -> Result<(), ServerError> {
+    let name_re = Regex::new(r"^[A-Za-z0-9._-]+$")
+        .map_err(|e| ServerError::internal(format!("Failed to compile regex: {}", e)))?;
+
+    for (name, audience) in audiences {
+        if name.is_empty() || name == "." || name == ".." || !name_re.is_match(name) {
+            return Err(ServerError::bad_request(format!(
+                "Invalid identity audience name '{}'; use only letters, numbers, '.', '_' or '-'",
+                name
+            )));
+        }
+        if audience.trim().is_empty() {
+            return Err(ServerError::bad_request(format!(
+                "Identity audience '{}' has an empty value",
+                name
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(feature = "backend")]
 fn validate_resource_constraints(
     state: &AppState,
@@ -902,6 +929,16 @@ pub async fn create_deployment(
         }
     };
 
+    // Resolve effective workload-identity audiences from the request payload.
+    // On redeploy without an explicit value, inherited from the source deployment below.
+    let mut effective_identity_audiences: serde_json::Value =
+        if let Some(ref audiences) = payload.identity_audiences {
+            validate_identity_audiences(audiences)?;
+            serde_json::to_value(audiences).unwrap_or_else(|_| serde_json::json!({}))
+        } else {
+            serde_json::json!({})
+        };
+
     // Handle deployment creation from an existing deployment (redeploy/rollback)
     if let Some(ref from_deployment_id) = payload.from_deployment {
         info!(
@@ -966,6 +1003,9 @@ pub async fn create_deployment(
         if payload.memory.is_none() {
             effective_memory = source_deployment.memory.clone();
         }
+        if payload.identity_audiences.is_none() {
+            effective_identity_audiences = source_deployment.identity_audiences.clone();
+        }
 
         // Validate resources against constraints (after rollback inheritance)
         #[cfg(feature = "backend")]
@@ -1002,6 +1042,7 @@ pub async fn create_deployment(
                 replicas: effective_replicas as i32,
                 cpu: &effective_cpu,
                 memory: &effective_memory,
+                identity_audiences: effective_identity_audiences.clone(),
             },
             &project,
         )
@@ -1156,6 +1197,7 @@ pub async fn create_deployment(
                     replicas: effective_replicas as i32,
                     cpu: &effective_cpu,
                     memory: &effective_memory,
+                    identity_audiences: effective_identity_audiences.clone(),
                 },
                 &project,
             )
@@ -1247,6 +1289,7 @@ pub async fn create_deployment(
                 replicas: effective_replicas as i32,
                 cpu: &effective_cpu,
                 memory: &effective_memory,
+                identity_audiences: effective_identity_audiences.clone(),
             },
             &project,
         )
@@ -1357,6 +1400,7 @@ pub async fn create_deployment(
                 replicas: effective_replicas as i32,
                 cpu: &effective_cpu,
                 memory: &effective_memory,
+                identity_audiences: effective_identity_audiences.clone(),
             },
             &project,
         )
@@ -2328,14 +2372,43 @@ pub async fn stream_deployment_logs(
 mod tests {
     use super::{
         normalize_env_override_is_protected, validate_env_override, validate_env_override_key,
+        validate_identity_audiences,
     };
     use crate::server::deployment::models::EnvOverride;
     use axum::http::StatusCode;
+    use std::collections::BTreeMap;
 
     #[test]
     fn env_override_key_validation_rejects_empty_keys() {
         assert!(!validate_env_override_key(""));
         assert!(validate_env_override_key("VALID_KEY_123"));
+    }
+
+    #[test]
+    fn identity_audiences_accepts_valid_entries() {
+        let mut audiences = BTreeMap::new();
+        audiences.insert("aws".to_string(), "sts.amazonaws.com".to_string());
+        audiences.insert("vault".to_string(), "https://vault.example.com".to_string());
+        assert!(validate_identity_audiences(&audiences).is_ok());
+        assert!(validate_identity_audiences(&BTreeMap::new()).is_ok());
+    }
+
+    #[test]
+    fn identity_audiences_rejects_bad_filename() {
+        let mut audiences = BTreeMap::new();
+        audiences.insert("bad/name".to_string(), "sts.amazonaws.com".to_string());
+        assert!(validate_identity_audiences(&audiences).is_err());
+
+        let mut dotdot = BTreeMap::new();
+        dotdot.insert("..".to_string(), "sts.amazonaws.com".to_string());
+        assert!(validate_identity_audiences(&dotdot).is_err());
+    }
+
+    #[test]
+    fn identity_audiences_rejects_empty_audience() {
+        let mut audiences = BTreeMap::new();
+        audiences.insert("aws".to_string(), "  ".to_string());
+        assert!(validate_identity_audiences(&audiences).is_err());
     }
 
     #[test]
