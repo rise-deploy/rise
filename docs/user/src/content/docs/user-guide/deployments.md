@@ -125,12 +125,17 @@ New projects start with a `production` environment mapped to the `default` group
 
 When `rise deploy` runs inside a CI pipeline, the CLI automatically attaches deployment source metadata by reading well-known environment variables:
 
-| Metadata | GitLab CI | GitHub Actions |
-|----------|-----------|---------------|
-| Job URL | `CI_JOB_URL` | `GITHUB_SERVER_URL` + `GITHUB_REPOSITORY` + `GITHUB_RUN_ID` |
-| MR/PR URL | `CI_MERGE_REQUEST_URL` | `GITHUB_SERVER_URL` + `GITHUB_REPOSITORY` + `GITHUB_REF` (on `pull_request` events) |
+| Metadata | GitLab CI | GitHub Actions | Other CI |
+|----------|-----------|---------------|----------|
+| Job URL | `CI_JOB_URL` | `GITHUB_SERVER_URL` + `GITHUB_REPOSITORY` + `GITHUB_RUN_ID` | `CIRCLE_BUILD_URL`, `BUILDKITE_BUILD_URL`, `DRONE_BUILD_LINK`, `BUILD_URL` (Jenkins) |
+| MR/PR URL | `CI_MERGE_REQUEST_URL` | `GITHUB_SERVER_URL` + `GITHUB_REPOSITORY` + `GITHUB_REF` (on `pull_request` events) | — |
+| Git repository | `CI_PROJECT_URL` | `GITHUB_SERVER_URL` + `GITHUB_REPOSITORY` | `BITBUCKET_GIT_HTTP_ORIGIN`, `CIRCLE_REPOSITORY_URL`, `BUILD_REPOSITORY_URI` (Azure), `BUILDKITE_REPO`, `DRONE_GIT_HTTP_URL`, `GIT_URL` (Jenkins) |
 
 This metadata is stored with the deployment and displayed in the Rise web UI, making it easy to trace a running deployment back to the pipeline job and merge/pull request that created it. No extra configuration is needed — detection is fully automatic.
+
+When no CI environment is detected, the Git repository falls back to the local `origin` remote. Repository URLs in `ssh://`, `git://`, and `git@host:owner/repo` form are normalized to `https://` (credentials, ports, and the trailing `.git` are stripped). You can override detection with `rise deploy --git-repository <url>`.
+
+A project also has a configurable `source` URL (set with `rise project create --source-url` or `rise project update`). When it is left unset, the web UI shows the repository resolved from the project's active deployment, falling back to its most recent deployment.
 
 ### Auto-Expiration
 

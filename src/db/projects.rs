@@ -718,6 +718,7 @@ mod tests {
                 is_active: false, // Initially not active
                 job_url: None,
                 pull_request_url: None,
+                git_repository_url: None,
                 replicas: 1,
                 cpu: "500m",
                 memory: "256Mi",
@@ -766,6 +767,7 @@ mod tests {
                 is_active: false, // This is NOT active
                 job_url: None,
                 pull_request_url: None,
+                git_repository_url: None,
                 replicas: 1,
                 cpu: "500m",
                 memory: "256Mi",
@@ -874,6 +876,7 @@ mod tests {
                 is_active: false,
                 job_url: None,
                 pull_request_url: None,
+                git_repository_url: None,
                 replicas: 1,
                 cpu: "500m",
                 memory: "256Mi",
