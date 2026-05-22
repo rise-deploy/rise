@@ -1,4 +1,4 @@
-use axum::{extract::State, http::HeaderMap, Json};
+use axum::{extract::State, http::HeaderMap, response::IntoResponse, Json};
 
 use crate::db::{
     deployments as db_deployments, environments as db_environments, projects as db_projects,
@@ -6,6 +6,7 @@ use crate::db::{
 use crate::server::auth::middleware::extract_bearer_token;
 use crate::server::deployment::webhook::should_have_infrastructure;
 use crate::server::error::{ServerError, ServerErrorExt};
+use crate::server::rate_limit::{extract_client_ip, rate_limit_response};
 use crate::server::state::AppState;
 use crate::server::workload_tokens::models::{ExchangeTokenRequest, ExchangeTokenResponse};
 use crate::server::workload_tokens::{sha256_hex, workload_subject, NO_ENVIRONMENT};
@@ -23,7 +24,16 @@ pub async fn exchange_token(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<ExchangeTokenRequest>,
-) -> Result<Json<ExchangeTokenResponse>, ServerError> {
+) -> Result<impl IntoResponse, ServerError> {
+    let ip = extract_client_ip(&headers);
+    if let Err(retry_after) = state
+        .oauth_rate_limiter
+        .increment_and_check(&ip, None, "identity")
+        .await
+    {
+        return Ok(rate_limit_response(retry_after).into_response());
+    }
+
     let credential = extract_bearer_token(&headers)
         .map(|c| c.trim().to_string())
         .filter(|c| !c.is_empty())
@@ -84,7 +94,8 @@ pub async fn exchange_token(
         token,
         token_type: "Bearer".to_string(),
         expires_in: WORKLOAD_TOKEN_TTL_SECS,
-    }))
+    })
+    .into_response())
 }
 
 #[cfg(test)]

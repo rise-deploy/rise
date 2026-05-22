@@ -8,6 +8,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use regex::Regex;
+use std::sync::LazyLock;
 use tracing::{debug, error, info, warn};
 
 use super::models::{self, *};
@@ -642,6 +643,9 @@ async fn resolve_effective_http_port(
 /// Constraints are resolved from: environment-specific overrides > platform defaults.
 /// When `is_redeploy` is true, error messages include a hint about using CLI flags to override
 /// inherited resource values.
+static IDENTITY_AUDIENCE_NAME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Za-z0-9._-]+$").unwrap());
+
 /// Validate `[identity].audiences` from a deploy request.
 ///
 /// Keys become in-pod token filenames, so they must be safe path segments.
@@ -649,11 +653,12 @@ async fn resolve_effective_http_port(
 fn validate_identity_audiences(
     audiences: &std::collections::BTreeMap<String, String>,
 ) -> Result<(), ServerError> {
-    let name_re = Regex::new(r"^[A-Za-z0-9._-]+$")
-        .map_err(|e| ServerError::internal(format!("Failed to compile regex: {}", e)))?;
-
     for (name, audience) in audiences {
-        if name.is_empty() || name == "." || name == ".." || !name_re.is_match(name) {
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || !IDENTITY_AUDIENCE_NAME_RE.is_match(name)
+        {
             return Err(ServerError::bad_request(format!(
                 "Invalid identity audience name '{}'; use only letters, numbers, '.', '_' or '-'",
                 name
