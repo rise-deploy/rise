@@ -129,7 +129,8 @@ pub struct ResourceDefinitionSpec {
     pub group: String,
     pub kind: String,
     pub plural: String,
-    pub scope: ResourceScope,
+    /// The resource is root-scoped when this is absent; otherwise it must live
+    /// under a parent of the referenced API group and kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<ResourceParentRef>,
     pub versions: Vec<ResourceDefinitionVersion>,
@@ -142,14 +143,6 @@ pub struct ResourceDefinitionSpec {
 pub struct ResourceParentRef {
     pub api_version: String,
     pub kind: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
-#[serde(rename_all = "camelCase")]
-pub enum ResourceScope {
-    #[default]
-    Root,
-    Organization,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

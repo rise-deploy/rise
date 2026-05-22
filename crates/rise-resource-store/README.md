@@ -21,9 +21,10 @@ is an exact synonym for a root-scoped resource: a non-root resource always has a
 (resources are only ever removed by cascading delete, never detached). A name-uniqueness
 violation surfaces as `StoreError::NameConflict`, never a raw database error.
 
-`resource_definitions` is a projection table holding the indexed/queryable identity fields
-(group, kind, plural, scope) of `ResourceDefinition` rows; it stays in sync via
-`register_resource_definition` and `update_resource_definition`.
+`resource_definitions` is a view over `resources` that projects the indexed/queryable
+identity fields (group, kind, plural, versions, allowed status controller IDs) of
+`ResourceDefinition` rows out of their `spec`. Being a view it cannot drift from the
+backing row; identity uniqueness is enforced by partial unique indexes on `resources`.
 
 ## Deletion model
 
@@ -101,8 +102,8 @@ tooling that needs to spot resources stuck mid-deletion.
 against the resource's *own* declared parent type — `reparent` self-determines this from the
 resource's definition, so the caller passes no scope:
 
-- Built-in kinds (`Organization`, `ResourceDefinition`) and any `ResourceDefinition` with
-  `scope = Root` are root-scoped: they have no declared parent and must move to root
+- Built-in kinds (`Organization`, `ResourceDefinition`) and any `ResourceDefinition` that
+  declares no `parent` are root-scoped: they have no declared parent and must move to root
   (`new_parent_uid = None`).
 - A resource whose `ResourceDefinition` declares a `parent` must move under a row matching
   the declared parent's API **group** and **kind**. The version is ignored, so a parent

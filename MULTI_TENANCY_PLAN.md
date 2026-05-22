@@ -71,17 +71,17 @@ Backend startup migration order:
   - `status JSONB NOT NULL DEFAULT '{}'`
   - `revision BIGINT NOT NULL DEFAULT 1`
   - timestamps
-- Add a dedicated `resource_definitions` table for ResourceDefinition identity and registry lookup:
-  - `uid UUID PRIMARY KEY REFERENCES resources(uid) ON DELETE RESTRICT`
-  - `group_name TEXT NOT NULL`
-  - `kind TEXT NOT NULL`
-  - `plural TEXT NOT NULL`
-  - `scope JSONB NOT NULL`
-  - `versions JSONB NOT NULL`
-  - `allowed_status_controller_ids TEXT[] NOT NULL DEFAULT '{}'`
-  - timestamps
-  - unique indexes for `plural` and ResourceDefinition identity tuples
-- Store the ResourceDefinition envelope/spec/status in `resources`, but treat `resource_definitions` as the canonical indexed projection used for uniqueness, routing, registry resolution, and immutable identity checks.
+- Expose `resource_definitions` as a VIEW over `resources` that projects the
+  ResourceDefinition identity fields (`group_name`, `kind`, `plural`,
+  `versions`, `allowed_status_controller_ids`) out of `spec`. Being a view it
+  can never drift from the backing `resources` row.
+  - Identity uniqueness (`plural`, and the `(group, kind)` tuple) is enforced by
+    partial unique indexes on `resources` scoped to `kind = 'ResourceDefinition'`.
+  - The store takes its RD create/delete race locks (`FOR UPDATE` / `FOR SHARE`)
+    on the underlying `resources` row directly.
+- Store the ResourceDefinition envelope/spec/status in `resources`; the
+  `resource_definitions` view is the indexed projection used for uniqueness,
+  routing, registry resolution, and immutable identity checks.
 - Add database-level checks:
   - `discriminator` is exactly 8 lowercase DNS-safe characters matching `^[a-z0-9][a-z0-9-]{6}[a-z0-9]$` (no leading or trailing hyphens)
   - `name` follows the resource name format accepted by the API
@@ -119,7 +119,7 @@ Backend startup migration order:
   - REST collection name, e.g. `organizations`
   - `apiVersion`, e.g. `rise.dev/v1alpha1`
   - `kind`, e.g. `Organization`
-  - scope/root or parent resource kind
+  - root, or the declared parent resource kind
   - typed spec/status validators
   - schema generation hooks
 - Add built-in `Organization`:
@@ -133,8 +133,8 @@ Backend startup migration order:
 - Add built-in `ResourceDefinition`:
   - root-scoped
   - operator-admin managed
-  - describes external resource group/version/kind/plural/scope/schema/status controller ownership
-  - persisted as both a normal built-in resource row and a row in the dedicated `resource_definitions` registry table
+  - describes external resource group/version/kind/plural, optional parent, schema, and status controller ownership
+  - persisted as a normal built-in resource row and surfaced through the `resource_definitions` registry view
 - Reserved collection names (built-ins implemented now or planned for a future phase): `organizations`, `projects`, `users`, `teams`, `environments`, `deployments`, `serviceaccounts`. Reject any ResourceDefinition whose plural matches one of these names.
 
 ## External Custom Resources
@@ -145,10 +145,10 @@ Backend startup migration order:
   - versions with `served`, `storage`, and JSON Schema
   - kind
   - plural collection name
-  - scope, initially root or child of Organization
+  - optional parent (a ResourceDefinition with no declared parent is root-scoped)
   - allowed status controller IDs
 - Reject ResourceDefinitions whose plural collection name collides with built-ins or reserved future names.
-- Enforce database-level uniqueness for ResourceDefinitions through the dedicated `resource_definitions` table:
+- Enforce database-level uniqueness for ResourceDefinitions through partial unique indexes on `resources` (scoped to ResourceDefinition rows):
   - plural collection names are globally unique across external ResourceDefinitions
   - resource identity tuples, e.g. `(group, version, kind)`, are unique across external ResourceDefinitions
   - immutable identity fields cannot be changed while resources for that definition exist; enforced via application-layer pre-update check (Postgres has no conditional immutability)
@@ -205,6 +205,26 @@ Backend startup migration order:
   - controller JWTs are never treated as user JWTs or existing project service-account JWTs
   - controller-authenticated callers can use only controller-specific status/finalizer paths
   - controller-authenticated callers cannot use normal operator CRUD paths unless separately granted as Operators
+
+### Generic API — planned follow-ups
+
+Not in the initial generic resource API; sequenced before migrating
+high-cardinality or end-user-owned kinds onto the resource store:
+
+- **List scalability** — `list` / `list_versions` currently return every row.
+  Add pagination and label/field selectors before high-cardinality kinds
+  (deployments, env vars) migrate.
+- **Watch API** — a change feed (or an `updated_at`-cursor polling contract) so
+  controllers reconcile without repeatedly polling `list`.
+- **Secret fields** — support for write-once, never-read-back secret values.
+  Today extensions encrypt a value via a dedicated encrypt API and store the
+  ciphertext in `spec` (controllers store ciphertext too); the plaintext is
+  never surfaced back to users. Encrypting JSONB at the storage layer is a
+  separate, weaker barrier — it does not stop an authorized reader from seeing
+  the value — and is a distinct decision.
+- **RBAC / per-resource authorization** — the generic resource API is
+  operator-only. End-user-owned kinds (projects, teams, deployments) need an
+  ownership/role model before they can move onto the resource store.
 
 ## Operator Role
 

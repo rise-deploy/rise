@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use rise_resource_api::{
     validate_controller_id, validate_resource_name, ResourceDefinitionSpec, ResourceParentRef,
-    ResourceScope, API_VERSION_V1ALPHA1, ORGANIZATION_COLLECTION, ORGANIZATION_KIND,
+    API_VERSION_V1ALPHA1, ORGANIZATION_COLLECTION, ORGANIZATION_KIND,
     RESOURCE_DEFINITION_COLLECTION, RESOURCE_DEFINITION_KIND,
 };
 use sqlx::{PgPool, Row};
@@ -14,7 +14,8 @@ use crate::error::StoreError;
 use crate::models::ResourceRow;
 use crate::store::{
     CollectionInfo, CreateResourceParams, DeleteOutcome, PathSegment, ResourceStore,
-    UpdateResourceParams, CASCADE_DELETION_FINALIZER, SYSTEM_FINALIZER_PREFIX,
+    UpdateResourceParams, CASCADE_DELETION_FINALIZER, MAX_PARENT_CHAIN_DEPTH,
+    SYSTEM_FINALIZER_PREFIX,
 };
 use crate::validation::{
     JsonSchemaValidator, NoOpValidator, OrganizationValidator, ResourceDefinitionValidator,
@@ -54,6 +55,25 @@ impl PgResourceStore {
         false
     }
 
+    /// Map a `ResourceDefinition` identity unique-index violation to a
+    /// validation error. These partial indexes live on the `resources` table
+    /// (the `resource_definitions` projection is a view), so a duplicate plural
+    /// or `(group, kind)` surfaces on the `resources` INSERT.
+    fn rd_uniqueness_conflict(err: &sqlx::Error) -> Option<StoreError> {
+        let sqlx::Error::Database(db) = err else {
+            return None;
+        };
+        match db.constraint().unwrap_or("") {
+            "resource_definitions_plural_unique" => Some(StoreError::Validation(
+                "a ResourceDefinition with this plural already exists".into(),
+            )),
+            "resource_definitions_group_kind_unique" => Some(StoreError::Validation(
+                "a ResourceDefinition for this group and kind already exists".into(),
+            )),
+            _ => None,
+        }
+    }
+
     fn builtin_collection_info(collection: &str) -> Option<CollectionInfo> {
         match collection {
             ORGANIZATION_COLLECTION => Some(CollectionInfo {
@@ -62,7 +82,6 @@ impl PgResourceStore {
                 served_api_versions: vec![API_VERSION_V1ALPHA1.to_string()],
                 declared_api_versions: vec![API_VERSION_V1ALPHA1.to_string()],
                 kind: ORGANIZATION_KIND.to_string(),
-                scope: ResourceScope::Root,
                 parent: None,
                 spec_validator: Arc::new(OrganizationValidator),
                 allowed_status_controller_ids: vec![],
@@ -73,7 +92,6 @@ impl PgResourceStore {
                 served_api_versions: vec![API_VERSION_V1ALPHA1.to_string()],
                 declared_api_versions: vec![API_VERSION_V1ALPHA1.to_string()],
                 kind: RESOURCE_DEFINITION_KIND.to_string(),
-                scope: ResourceScope::Root,
                 parent: None,
                 spec_validator: Arc::new(ResourceDefinitionValidator),
                 allowed_status_controller_ids: vec![],
@@ -114,7 +132,9 @@ impl PgResourceStore {
                 Ok(row) => return Ok(row),
                 Err(ref e) if Self::is_name_conflict(e) => return Err(StoreError::NameConflict),
                 Err(ref e) if Self::is_discriminator_conflict(e) => continue,
-                Err(e) => return Err(StoreError::Database(e)),
+                Err(e) => {
+                    return Err(Self::rd_uniqueness_conflict(&e).unwrap_or(StoreError::Database(e)))
+                }
             }
         }
 
@@ -136,15 +156,14 @@ impl PgResourceStore {
             .map(|version| format!("{}/{}", spec.group, version.name))
             .collect();
 
-        // Lock the resource_definitions row for the duration of this transaction.
-        // Instance writes acquire a FOR SHARE lock on the same row before inserting,
-        // so they cannot slip in after this count check and before deletion commits.
-        sqlx::query(
-            "SELECT uid FROM resource_store.resource_definitions WHERE uid = $1 FOR UPDATE",
-        )
-        .bind(row.uid)
-        .execute(&mut **tx)
-        .await?;
+        // Lock the ResourceDefinition's `resources` row for the duration of this
+        // transaction. Instance writes acquire a FOR SHARE lock on the same row
+        // before inserting, so they cannot slip in after this count check and
+        // before deletion commits.
+        sqlx::query("SELECT uid FROM resource_store.resources WHERE uid = $1 FOR UPDATE")
+            .bind(row.uid)
+            .execute(&mut **tx)
+            .await?;
 
         let instance_count: i64 = sqlx::query_scalar(
             r#"
@@ -184,16 +203,20 @@ impl PgResourceStore {
             return Ok(());
         };
 
+        // Lock the matching ResourceDefinition's `resources` row directly — the
+        // `resource_definitions` projection is a view and cannot be locked.
         let row = sqlx::query(
             r#"
-            SELECT rd.uid
-            FROM resource_store.resource_definitions rd
-            WHERE rd.group_name = $1
-              AND rd.kind = $2
-              AND rd.versions @> $3::jsonb
+            SELECT uid
+            FROM resource_store.resources
+            WHERE kind = $1
+              AND spec->>'group' = $2
+              AND spec->>'kind' = $3
+              AND spec->'versions' @> $4::jsonb
             FOR SHARE
             "#,
         )
+        .bind(RESOURCE_DEFINITION_KIND)
         .bind(group)
         .bind(kind)
         .bind(serde_json::json!([{ "name": version }]))
@@ -226,7 +249,7 @@ impl PgResourceStore {
     /// - Built-in kinds (`Organization`, `ResourceDefinition`) are root-scoped with no declared
     ///   parent.
     /// - User-defined kinds resolve their `ResourceDefinition` by `(group, kind)`; the RD's
-    ///   stored `resources.spec` carries `scope` and the optional `spec.parent`.
+    ///   stored `resources.spec` carries the optional `spec.parent` (absent ⇒ root-scoped).
     ///
     /// Returns `None` for a root-scoped resource (must reparent to root) and `Some(parent_ref)`
     /// for a resource that must live under a row of the referenced group + kind.
@@ -265,14 +288,8 @@ impl PgResourceStore {
         )
         .map_err(|e| StoreError::Validation(format!("invalid ResourceDefinition spec: {e}")))?;
 
-        match spec.scope {
-            ResourceScope::Root => Ok(None),
-            ResourceScope::Organization => spec.parent.map(Some).ok_or_else(|| {
-                StoreError::Validation(format!(
-                    "ResourceDefinition for '{group}/{kind}' is non-root but declares no parent"
-                ))
-            }),
-        }
+        // A ResourceDefinition with no declared `parent` is root-scoped.
+        Ok(spec.parent)
     }
 
     fn invalidate_schema_cache(&self, group: &str, plural: &str) {
@@ -302,6 +319,50 @@ impl PgResourceStore {
                     ))
                 })?;
             }
+        }
+        Ok(())
+    }
+
+    /// Reject a `ResourceDefinition` whose declared `parent` chain forms a
+    /// cycle. The chain is walked via `resolve_collection_by_kind`; the new RD
+    /// is not yet stored, so its own identity is compared against each parent
+    /// ref directly — this also catches a cycle closed by a descendant that was
+    /// registered before this ancestor (the walk reaches that descendant, whose
+    /// parent ref points back at the kind being registered).
+    ///
+    /// The walk reads outside any transaction, so it is best-effort against a
+    /// concurrent RD registration; the runtime `MAX_PARENT_CHAIN_DEPTH` cap in
+    /// the resource API's path resolution is the hard backstop.
+    async fn ensure_no_parent_cycle(
+        &self,
+        spec: &ResourceDefinitionSpec,
+    ) -> Result<(), StoreError> {
+        let mut current = spec.parent.clone();
+        let mut depth = 0usize;
+        while let Some(parent) = current {
+            depth += 1;
+            if depth > MAX_PARENT_CHAIN_DEPTH {
+                return Err(StoreError::Validation(format!(
+                    "ResourceDefinition '{}/{}' parent chain exceeds the maximum \
+                     depth of {MAX_PARENT_CHAIN_DEPTH}",
+                    spec.group, spec.kind
+                )));
+            }
+            let parent_group = Self::group_of(&parent.api_version);
+            if parent_group == spec.group && parent.kind == spec.kind {
+                return Err(StoreError::Validation(format!(
+                    "ResourceDefinition '{}/{}' declares a parent chain that \
+                     cycles back to itself",
+                    spec.group, spec.kind
+                )));
+            }
+            current = match self
+                .resolve_collection_by_kind(parent_group, &parent.kind)
+                .await?
+            {
+                Some(info) => info.parent,
+                None => break,
+            };
         }
         Ok(())
     }
@@ -606,11 +667,9 @@ impl ResourceStore for PgResourceStore {
         if row.kind == RESOURCE_DEFINITION_KIND {
             self.ensure_resource_definition_has_no_instances(&row, &mut tx)
                 .await?;
-            sqlx::query("DELETE FROM resource_store.resource_definitions WHERE uid = $1")
-                .bind(uid)
-                .execute(&mut *tx)
-                .await?;
         }
+        // Deleting the `resources` row also removes it from the
+        // `resource_definitions` view.
         sqlx::query("DELETE FROM resource_store.resources WHERE uid = $1")
             .bind(uid)
             .execute(&mut *tx)
@@ -710,11 +769,9 @@ impl ResourceStore for PgResourceStore {
         if row.kind == RESOURCE_DEFINITION_KIND {
             self.ensure_resource_definition_has_no_instances(&row, &mut tx)
                 .await?;
-            sqlx::query("DELETE FROM resource_store.resource_definitions WHERE uid = $1")
-                .bind(uid)
-                .execute(&mut *tx)
-                .await?;
         }
+        // Deleting the `resources` row also removes it from the
+        // `resource_definitions` view.
         sqlx::query("DELETE FROM resource_store.resources WHERE uid = $1")
             .bind(uid)
             .execute(&mut *tx)
@@ -1043,7 +1100,7 @@ impl ResourceStore for PgResourceStore {
 
         let row = sqlx::query(
             r#"
-            SELECT rd.uid, rd.group_name, rd.kind, rd.scope, rd.versions,
+            SELECT rd.uid, rd.group_name, rd.kind, rd.versions,
                    rd.allowed_status_controller_ids, r.spec
             FROM resource_store.resource_definitions rd
             JOIN resource_store.resources r ON r.uid = rd.uid
@@ -1110,7 +1167,7 @@ impl ResourceStore for PgResourceStore {
 
         let row = sqlx::query(
             r#"
-            SELECT rd.uid, rd.group_name, rd.kind, rd.scope, rd.versions,
+            SELECT rd.uid, rd.group_name, rd.kind, rd.versions,
                    rd.allowed_status_controller_ids, r.spec
             FROM resource_store.resource_definitions rd
             JOIN resource_store.resources r ON r.uid = rd.uid
@@ -1163,10 +1220,6 @@ impl ResourceStore for PgResourceStore {
             .try_get("allowed_status_controller_ids")
             .map_err(StoreError::Database)?;
 
-        let scope: ResourceScope = serde_json::from_value(
-            row.try_get("scope").map_err(StoreError::Database)?,
-        )
-        .map_err(|e| StoreError::Validation(format!("invalid scope in ResourceDefinition: {e}")))?;
         let kind: String = row.try_get("kind").map_err(StoreError::Database)?;
 
         // Use the cached validator, or compile one and store it in the cache. A schema that
@@ -1197,7 +1250,6 @@ impl ResourceStore for PgResourceStore {
             served_api_versions,
             declared_api_versions,
             kind,
-            scope,
             parent: spec.parent,
             spec_validator: schema_validator,
             allowed_status_controller_ids: allowed,
@@ -1293,50 +1345,19 @@ impl ResourceStore for PgResourceStore {
         // fail only when that version is first used.
         Self::validate_version_schemas(&spec, &format!("'{}'", params.name))?;
 
+        // Reject a parent chain that would cycle back to this kind.
+        self.ensure_no_parent_cycle(&spec).await?;
+
         let mut tx = self.pool.begin().await?;
 
         let metadata = serde_json::to_value(&params.annotations).unwrap_or_default();
 
+        // The `resources` INSERT enforces RD identity uniqueness via the partial
+        // `resource_definitions_{plural,group_kind}_unique` indexes;
+        // `insert_resource_row_with_retry` maps those violations to a validation
+        // error. The `resource_definitions` projection is a view, so there is no
+        // second row to write.
         let resource_row = Self::insert_resource_row_with_retry(&mut tx, &params, metadata).await?;
-
-        // Insert into the resource_definitions projection table
-        let scope_val = serde_json::to_value(&spec.scope).unwrap_or_default();
-        let versions_val = serde_json::to_value(&spec.versions).unwrap_or_default();
-
-        sqlx::query(
-            r#"
-            INSERT INTO resource_store.resource_definitions
-                (uid, group_name, kind, plural, scope, versions, allowed_status_controller_ids)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            "#,
-        )
-        .bind(resource_row.uid)
-        .bind(&spec.group)
-        .bind(&spec.kind)
-        .bind(&spec.plural)
-        .bind(scope_val)
-        .bind(versions_val)
-        .bind(&spec.allowed_status_controller_ids)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| {
-            if let sqlx::Error::Database(ref db) = e {
-                let constraint = db.constraint().unwrap_or("");
-                if constraint == "resource_definitions_plural_unique" {
-                    return StoreError::Validation(format!(
-                        "a ResourceDefinition with plural '{}' already exists",
-                        spec.plural
-                    ));
-                }
-                if constraint == "resource_definitions_group_kind_unique" {
-                    return StoreError::Validation(format!(
-                        "a ResourceDefinition for group '{}' kind '{}' already exists",
-                        spec.group, spec.kind
-                    ));
-                }
-            }
-            StoreError::Database(e)
-        })?;
 
         tx.commit().await?;
 
@@ -1385,11 +1406,10 @@ impl ResourceStore for PgResourceStore {
         if new_spec.group != old_spec.group
             || new_spec.kind != old_spec.kind
             || new_spec.plural != old_spec.plural
-            || new_spec.scope != old_spec.scope
             || new_spec.parent != old_spec.parent
         {
             return Err(StoreError::Validation(
-                "ResourceDefinition identity fields (group, kind, plural, scope, parent) are immutable"
+                "ResourceDefinition identity fields (group, kind, plural, parent) are immutable"
                     .to_string(),
             ));
         }
@@ -1406,15 +1426,14 @@ impl ResourceStore for PgResourceStore {
             .map(|ov| Self::api_version(&new_spec.group, &ov.name))
             .collect();
         if !removed_api_versions.is_empty() {
-            // Lock the projection row so concurrent instance creates (which take a
-            // FOR SHARE lock on the same row via lock_matching_definition_for_write)
-            // cannot slip in between this count and the commit.
-            sqlx::query(
-                "SELECT uid FROM resource_store.resource_definitions WHERE uid = $1 FOR UPDATE",
-            )
-            .bind(uid)
-            .execute(&mut *tx)
-            .await?;
+            // Lock the ResourceDefinition's `resources` row so concurrent
+            // instance creates (which take a FOR SHARE lock on the same row via
+            // lock_matching_definition_for_write) cannot slip in between this
+            // count and the commit.
+            sqlx::query("SELECT uid FROM resource_store.resources WHERE uid = $1 FOR UPDATE")
+                .bind(uid)
+                .execute(&mut *tx)
+                .await?;
 
             let instance_count: i64 = sqlx::query_scalar(
                 r#"
@@ -1481,21 +1500,9 @@ impl ResourceStore for PgResourceStore {
             }
         };
 
-        // Sync the projection table (mutable fields only: versions and allowed controllers)
-        let versions_val = serde_json::to_value(&new_spec.versions).unwrap_or_default();
-        sqlx::query(
-            r#"
-            UPDATE resource_store.resource_definitions
-            SET versions = $1, allowed_status_controller_ids = $2
-            WHERE uid = $3
-            "#,
-        )
-        .bind(versions_val)
-        .bind(&new_spec.allowed_status_controller_ids)
-        .bind(uid)
-        .execute(&mut *tx)
-        .await?;
-
+        // The mutable fields (versions, allowed_status_controller_ids) live in
+        // `spec`, which the `resources` UPDATE above already wrote — the
+        // `resource_definitions` view reflects it with no separate sync.
         tx.commit().await?;
 
         self.invalidate_schema_cache(&new_spec.group, &new_spec.plural);

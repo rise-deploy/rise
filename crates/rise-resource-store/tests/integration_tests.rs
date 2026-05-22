@@ -616,7 +616,6 @@ async fn resolve_collection_by_kind_resolves_builtins_and_rds(
                 "group": "example.dev",
                 "kind": "Widget",
                 "plural": "widgets",
-                "scope": "root",
                 "versions": [{"name": "v1", "served": true, "storage": true}],
                 "allowedStatusControllerIds": []
             }),
@@ -655,7 +654,6 @@ async fn resolve_collection_by_kind_resolves_builtins_and_rds(
                 "group": "example.dev",
                 "kind": "Gauge",
                 "plural": "gauges",
-                "scope": "root",
                 "versions": [
                     {"name": "v1", "served": false, "storage": true},
                     {"name": "v2", "served": true, "storage": false}
@@ -685,7 +683,6 @@ async fn register_resource_definition(pool: sqlx::PgPool) -> sqlx::Result<()> {
         "group": "example.dev",
         "kind": "Widget",
         "plural": "widgets",
-        "scope": "root",
         "versions": [{"name": "v1", "served": true, "storage": true}],
         "allowedStatusControllerIds": []
     });
@@ -724,7 +721,6 @@ async fn delete_resource_definition_rejects_existing_instances(
         "group": "example.dev",
         "kind": "Widget",
         "plural": "widgets",
-        "scope": "root",
         "versions": [{"name": "v1", "served": true, "storage": true}],
         "allowedStatusControllerIds": []
     });
@@ -777,7 +773,6 @@ async fn delete_resource_definition_rejects_instances_in_any_served_version(
         "group": "example.dev",
         "kind": "Widget",
         "plural": "widgets",
-        "scope": "root",
         "versions": [
             {"name": "v1", "served": true, "storage": false},
             {"name": "v2", "served": true, "storage": true}
@@ -829,7 +824,6 @@ async fn register_resource_definition_rejects_reserved_plural(
         "group": "example.dev",
         "kind": "Organization",
         "plural": "organizations",
-        "scope": "root",
         "versions": [{"name": "v1", "served": true, "storage": true}],
         "allowedStatusControllerIds": []
     });
@@ -865,7 +859,6 @@ async fn register_resource_definition_rejects_zero_served_versions(
         "group": "example.dev",
         "kind": "Widget",
         "plural": "widgets",
-        "scope": "root",
         "versions": [{"name": "v1", "served": false, "storage": true}],
         "allowedStatusControllerIds": []
     });
@@ -893,45 +886,19 @@ async fn register_resource_definition_rejects_zero_served_versions(
 }
 
 #[sqlx::test]
-async fn register_resource_definition_requires_parent_for_non_root_scope(
+async fn register_resource_definition_root_and_parent_validation(
     pool: sqlx::PgPool,
 ) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
 
-    let missing_parent = json!({
+    // No `parent` declared — registers as a root-scoped collection.
+    let root = json!({
         "group": "example.dev",
         "kind": "Widget",
         "plural": "widgets",
-        "scope": "organization",
         "versions": [{"name": "v1", "served": true, "storage": true}],
         "allowedStatusControllerIds": []
     });
-
-    let err = store
-        .register_resource_definition(CreateResourceParams {
-            api_version: API_VERSION_V1ALPHA1.to_string(),
-            kind: RESOURCE_DEFINITION_KIND.to_string(),
-            name: "widgets.example.dev".to_string(),
-            parent_uid: None,
-            annotations: BTreeMap::new(),
-            finalizers: vec![],
-            spec: missing_parent,
-            validator: None,
-        })
-        .await
-        .unwrap_err();
-    assert!(matches!(err, StoreError::Validation(_)));
-
-    let with_parent = json!({
-        "group": "example.dev",
-        "kind": "Widget",
-        "plural": "widgets",
-        "scope": "organization",
-        "parent": {"apiVersion": API_VERSION_V1ALPHA1, "kind": ORGANIZATION_KIND},
-        "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
-    });
-
     store
         .register_resource_definition(CreateResourceParams {
             api_version: API_VERSION_V1ALPHA1.to_string(),
@@ -940,11 +907,162 @@ async fn register_resource_definition_requires_parent_for_non_root_scope(
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
-            spec: with_parent,
+            spec: root,
             validator: None,
         })
         .await
         .unwrap();
+
+    // A malformed `parent` (apiVersion not '<group>/<version>') is rejected.
+    let bad_parent = json!({
+        "group": "example.dev",
+        "kind": "Gadget",
+        "plural": "gadgets",
+        "parent": {"apiVersion": "no-slash", "kind": ORGANIZATION_KIND},
+        "versions": [{"name": "v1", "served": true, "storage": true}],
+        "allowedStatusControllerIds": []
+    });
+    let err = store
+        .register_resource_definition(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: RESOURCE_DEFINITION_KIND.to_string(),
+            name: "gadgets.example.dev".to_string(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec: bad_parent,
+            validator: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Validation(_)));
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn register_resource_definition_rejects_parent_cycles(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+
+    // Build RD params for `kind`/`plural` (group `cycle.dev`, version `v1`),
+    // optionally declaring a parent kind in the same group.
+    let rd = |kind: &str, plural: &str, parent_kind: Option<&str>| {
+        let mut spec = json!({
+            "group": "cycle.dev",
+            "kind": kind,
+            "plural": plural,
+            "versions": [{"name": "v1", "served": true, "storage": true}],
+            "allowedStatusControllerIds": []
+        });
+        if let Some(pk) = parent_kind {
+            spec["parent"] = json!({"apiVersion": "cycle.dev/v1", "kind": pk});
+        }
+        CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: RESOURCE_DEFINITION_KIND.to_string(),
+            name: format!("{plural}.cycle.dev"),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec,
+            validator: None,
+        }
+    };
+
+    // A ResourceDefinition that declares itself as its own parent is rejected.
+    let err = store
+        .register_resource_definition(rd("Selfish", "selfishes", Some("Selfish")))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Validation(_)),
+        "self-parent must be rejected: {err:?}"
+    );
+
+    // `Alpha` → `Beta` with `Beta` not yet registered: a dangling parent is allowed.
+    store
+        .register_resource_definition(rd("Alpha", "alphas", Some("Beta")))
+        .await
+        .unwrap();
+
+    // Registering `Beta` → `Alpha` now closes the cycle `Alpha→Beta→Alpha`.
+    let err = store
+        .register_resource_definition(rd("Beta", "betas", Some("Alpha")))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Validation(_)),
+        "a mutual parent cycle must be rejected: {err:?}"
+    );
+
+    // A deep but acyclic chain registers cleanly — the walk must not false-positive.
+    store
+        .register_resource_definition(rd("Tier0", "tier0s", None))
+        .await
+        .unwrap();
+    store
+        .register_resource_definition(rd("Tier1", "tier1s", Some("Tier0")))
+        .await
+        .unwrap();
+    store
+        .register_resource_definition(rd("Tier2", "tier2s", Some("Tier1")))
+        .await
+        .unwrap();
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn register_resource_definition_rejects_duplicate_identity(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+
+    let rd = |group: &str, kind: &str, plural: &str| CreateResourceParams {
+        api_version: API_VERSION_V1ALPHA1.to_string(),
+        kind: RESOURCE_DEFINITION_KIND.to_string(),
+        name: format!("{plural}.{group}"),
+        parent_uid: None,
+        annotations: BTreeMap::new(),
+        finalizers: vec![],
+        spec: json!({
+            "group": group,
+            "kind": kind,
+            "plural": plural,
+            "versions": [{"name": "v1", "served": true, "storage": true}],
+            "allowedStatusControllerIds": []
+        }),
+        validator: None,
+    };
+
+    store
+        .register_resource_definition(rd("example.dev", "Widget", "widgets"))
+        .await
+        .unwrap();
+
+    // The `resource_definitions` projection is a view; identity uniqueness is
+    // enforced by partial unique indexes on `resources`. A duplicate plural
+    // (different group) must surface as a Validation error, not a raw 500.
+    let err = store
+        .register_resource_definition(rd("other.dev", "Gizmo", "widgets"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Validation(_)),
+        "duplicate plural must be a validation error: {err:?}"
+    );
+
+    // A duplicate (group, kind) with a different plural is likewise rejected.
+    let err = store
+        .register_resource_definition(rd("example.dev", "Widget", "widgetz"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Validation(_)),
+        "duplicate group+kind must be a validation error: {err:?}"
+    );
 
     Ok(())
 }
@@ -1094,7 +1212,6 @@ async fn update_resource_definition_updates_projection(pool: sqlx::PgPool) -> sq
         "group": "example.dev",
         "kind": "Widget",
         "plural": "widgets",
-        "scope": "root",
         "versions": [{"name": "v1", "served": true, "storage": true}],
         "allowedStatusControllerIds": []
     });
@@ -1118,7 +1235,6 @@ async fn update_resource_definition_updates_projection(pool: sqlx::PgPool) -> sq
         "group": "example.dev",
         "kind": "Widget",
         "plural": "widgets",
-        "scope": "root",
         "versions": [
             {"name": "v1", "served": true, "storage": false},
             {"name": "v2", "served": true, "storage": true}
@@ -1160,7 +1276,6 @@ async fn added_version_serves_existing_instances_without_rewriting(
         "group": "example.dev",
         "kind": "Widget",
         "plural": "widgets",
-        "scope": "root",
         "versions": [{"name": "v1", "served": true, "storage": true}],
         "allowedStatusControllerIds": []
     });
@@ -1197,7 +1312,6 @@ async fn added_version_serves_existing_instances_without_rewriting(
         "group": "example.dev",
         "kind": "Widget",
         "plural": "widgets",
-        "scope": "root",
         "versions": [
             {"name": "v1", "served": true, "storage": false},
             {"name": "v2", "served": true, "storage": true}
@@ -1249,7 +1363,6 @@ async fn update_resource_definition_rejects_identity_change(
         "group": "example.dev",
         "kind": "Widget",
         "plural": "widgets",
-        "scope": "root",
         "versions": [{"name": "v1", "served": true, "storage": true}],
         "allowedStatusControllerIds": []
     });
@@ -1273,7 +1386,6 @@ async fn update_resource_definition_rejects_identity_change(
         "group": "changed.dev",
         "kind": "Widget",
         "plural": "widgets",
-        "scope": "root",
         "versions": [{"name": "v1", "served": true, "storage": true}],
         "allowedStatusControllerIds": []
     });
@@ -1311,7 +1423,6 @@ async fn update_resource_definition_rejects_removing_version_with_instances(
         "group": "example.dev",
         "kind": "Widget",
         "plural": "widgets",
-        "scope": "root",
         "versions": [
             {"name": "v1", "served": true, "storage": true},
             {"name": "v2", "served": true, "storage": false}
@@ -1354,7 +1465,6 @@ async fn update_resource_definition_rejects_removing_version_with_instances(
         "group": "example.dev",
         "kind": "Widget",
         "plural": "widgets",
-        "scope": "root",
         "versions": [{"name": "v2", "served": true, "storage": true}],
         "allowedStatusControllerIds": []
     });
@@ -1383,7 +1493,6 @@ async fn update_resource_definition_rejects_removing_version_with_instances(
         "group": "example.dev",
         "kind": "Widget",
         "plural": "widgets",
-        "scope": "root",
         "versions": [{"name": "v1", "served": true, "storage": true}],
         "allowedStatusControllerIds": []
     });
@@ -1413,7 +1522,6 @@ async fn update_resource_definition_rejects_parent_change(pool: sqlx::PgPool) ->
         "group": "example.dev",
         "kind": "Widget",
         "plural": "widgets",
-        "scope": "organization",
         "parent": {"apiVersion": API_VERSION_V1ALPHA1, "kind": ORGANIZATION_KIND},
         "versions": [{"name": "v1", "served": true, "storage": true}],
         "allowedStatusControllerIds": []
@@ -1437,7 +1545,6 @@ async fn update_resource_definition_rejects_parent_change(pool: sqlx::PgPool) ->
         "group": "example.dev",
         "kind": "Widget",
         "plural": "widgets",
-        "scope": "organization",
         "parent": {"apiVersion": API_VERSION_V1ALPHA1, "kind": "Project"},
         "versions": [{"name": "v1", "served": true, "storage": true}],
         "allowedStatusControllerIds": []
@@ -1476,7 +1583,6 @@ async fn register_resource_definition_rejects_invalid_non_storage_schema(
         "group": "example.dev",
         "kind": "Widget",
         "plural": "widgets",
-        "scope": "root",
         "versions": [
             {"name": "v1", "served": true, "storage": true},
             {"name": "v2", "served": true, "storage": false, "schema": {"type": "not-a-json-schema-type"}}
@@ -1516,7 +1622,6 @@ async fn update_resource_definition_invalidates_schema_cache(
         "group": "example.dev",
         "kind": "Widget",
         "plural": "widgets",
-        "scope": "root",
         "versions": [{
             "name": "v1",
             "served": true,
@@ -1558,7 +1663,6 @@ async fn update_resource_definition_invalidates_schema_cache(
         "group": "example.dev",
         "kind": "Widget",
         "plural": "widgets",
-        "scope": "root",
         "versions": [{
             "name": "v1",
             "served": true,
@@ -1617,7 +1721,6 @@ async fn update_rejects_resource_definition(pool: sqlx::PgPool) -> sqlx::Result<
         "group": "example.dev",
         "kind": "Gadget",
         "plural": "gadgets",
-        "scope": "root",
         "versions": [{"name": "v1", "served": true, "storage": true}],
         "allowedStatusControllerIds": []
     });
@@ -1702,8 +1805,8 @@ async fn create_child(
         .unwrap()
 }
 
-/// Register a ResourceDefinition. `parent` is `Some((apiVersion, kind))` for non-root scopes.
-/// `versions` are `(name, served, storage)` triples.
+/// Register a ResourceDefinition. `parent` is `Some((apiVersion, kind))` for a
+/// non-root resource. `versions` are `(name, served, storage)` triples.
 async fn register_rd(
     store: &PgResourceStore,
     group: &str,
@@ -1712,11 +1815,6 @@ async fn register_rd(
     parent: Option<(&str, &str)>,
     versions: &[(&str, bool, bool)],
 ) -> rise_resource_store::ResourceRow {
-    let scope = if parent.is_some() {
-        "organization"
-    } else {
-        "root"
-    };
     let versions_json: Vec<_> = versions
         .iter()
         .map(|(name, served, storage)| json!({"name": name, "served": served, "storage": storage}))
@@ -1725,7 +1823,6 @@ async fn register_rd(
         "group": group,
         "kind": kind,
         "plural": plural,
-        "scope": scope,
         "versions": versions_json,
         "allowedStatusControllerIds": []
     });
@@ -2365,70 +2462,10 @@ async fn reparent_rejects_non_root_resource_to_root(pool: sqlx::PgPool) -> sqlx:
     Ok(())
 }
 
-#[sqlx::test]
-async fn reparent_rejects_cycle(pool: sqlx::PgPool) -> sqlx::Result<()> {
-    let store = PgResourceStore::new(pool);
-    // A self-referential kind: a Folder's declared parent is another Folder. This lets us
-    // build a same-typed ancestor chain and exercise the ancestor->descendant cycle check.
-    register_rd(
-        &store,
-        "example.dev",
-        "Folder",
-        "folders",
-        Some(("example.dev/v1", "Folder")),
-        &[("v1", true, true)],
-    )
-    .await;
-    let org = create_org(&store, "org").await;
-    // `create` does not enforce parent type, so the top folder can be seeded under the org.
-    let root_folder =
-        create_resource(&store, "example.dev/v1", "Folder", "root", Some(org.uid)).await;
-    let child_folder = create_resource(
-        &store,
-        "example.dev/v1",
-        "Folder",
-        "child",
-        Some(root_folder.uid),
-    )
-    .await;
-
-    // Moving `root_folder` under its own descendant `child_folder` would form a cycle.
-    // The parent type (Folder) matches, so this reaches the cycle detector.
-    let err = store
-        .reparent(root_folder.uid, Some(child_folder.uid))
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(err, StoreError::ReparentCycle),
-        "expected ReparentCycle, got {err:?}"
-    );
-
-    Ok(())
-}
-
-#[sqlx::test]
-async fn reparent_rejects_self_loop(pool: sqlx::PgPool) -> sqlx::Result<()> {
-    let store = PgResourceStore::new(pool);
-    register_rd(
-        &store,
-        "example.dev",
-        "Folder",
-        "folders",
-        Some(("example.dev/v1", "Folder")),
-        &[("v1", true, true)],
-    )
-    .await;
-    let org = create_org(&store, "org").await;
-    let folder = create_resource(&store, "example.dev/v1", "Folder", "f1", Some(org.uid)).await;
-
-    let err = store
-        .reparent(folder.uid, Some(folder.uid))
-        .await
-        .unwrap_err();
-    assert!(matches!(err, StoreError::ReparentCycle));
-
-    Ok(())
-}
+// Note: instance-level reparent cycles (and the `reparent_rejects_cycle` /
+// `reparent_rejects_self_loop` tests that exercised them) are gone — recursive
+// ResourceDefinitions are now rejected at registration, so a same-typed
+// ancestor chain can no longer be constructed.
 
 #[sqlx::test]
 async fn reparent_respects_uniqueness(pool: sqlx::PgPool) -> sqlx::Result<()> {

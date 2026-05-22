@@ -96,36 +96,32 @@ CREATE TRIGGER resources_updated_at
 -- ---------------------------------------------------------------------------
 -- resource_definitions
 --
--- Projection table holding the indexed/queryable identity fields of
--- `ResourceDefinition` rows; kept in sync with the backing `resources` row.
+-- A VIEW over `resources` that projects the identity/queryable fields of
+-- `ResourceDefinition` rows out of their `spec`. Being a view (not a separate
+-- table) it can never drift from the backing row. Identity uniqueness is
+-- enforced by partial unique indexes on `resources`; the store takes its
+-- RD create/delete race locks on the underlying `resources` row directly.
 -- ---------------------------------------------------------------------------
 
-CREATE TABLE resource_store.resource_definitions (
-    uid                          UUID        PRIMARY KEY REFERENCES resource_store.resources(uid) ON DELETE RESTRICT,
-    group_name                   TEXT        NOT NULL,
-    kind                         TEXT        NOT NULL,
-    plural                       TEXT        NOT NULL,
-    scope                        JSONB       NOT NULL,
-    versions                     JSONB       NOT NULL,
-    allowed_status_controller_ids TEXT[]     NOT NULL DEFAULT '{}',
-    created_at                   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at                   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
 CREATE UNIQUE INDEX resource_definitions_plural_unique
-    ON resource_store.resource_definitions (plural);
+    ON resource_store.resources ((spec->>'plural'))
+    WHERE kind = 'ResourceDefinition';
 
 CREATE UNIQUE INDEX resource_definitions_group_kind_unique
-    ON resource_store.resource_definitions (group_name, kind);
+    ON resource_store.resources ((spec->>'group'), (spec->>'kind'))
+    WHERE kind = 'ResourceDefinition';
 
-CREATE OR REPLACE FUNCTION resource_store.resource_definitions_set_updated_at()
-RETURNS TRIGGER AS $$
-BEGIN
-    NEW.updated_at = NOW();
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER resource_definitions_updated_at
-    BEFORE UPDATE ON resource_store.resource_definitions
-    FOR EACH ROW EXECUTE FUNCTION resource_store.resource_definitions_set_updated_at();
+CREATE VIEW resource_store.resource_definitions AS
+SELECT uid,
+       spec->>'group'   AS group_name,
+       spec->>'kind'    AS kind,
+       spec->>'plural'  AS plural,
+       spec->'versions' AS versions,
+       ARRAY(
+           SELECT jsonb_array_elements_text(
+               COALESCE(spec->'allowedStatusControllerIds', '[]'::jsonb))
+       )::text[] AS allowed_status_controller_ids,
+       created_at,
+       updated_at
+FROM resource_store.resources
+WHERE kind = 'ResourceDefinition';

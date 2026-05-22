@@ -34,6 +34,12 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 When a UID-prefixed identifier is used in a PUT URL, the body's `metadata.name` is not validated against the URL. It still must match the stored resource name.
 
+## Discriminator
+
+Every resource carries a system-generated 8-character `discriminator`. It is unique among all resources that share the same parent (its siblings), regardless of kind — but **not** unique across different parents or globally.
+
+Like `name`, the discriminator identifies a resource within its sibling scope. Unlike `name` (chosen by the user and potentially reconstructable from external inputs), it is random — so controllers can use it as a collision-free token when constructing derived identifiers in external systems while reconciling a resource.
+
 ## Authentication and Authorization
 
 | Tier | Credentials | Permitted operations |
@@ -47,8 +53,8 @@ Controller tokens cannot perform item-level PUT or other operator operations.
 
 `ResourceDefinition` declares the group, kind, plural, versions, storage version, and parent type for a collection.
 
-- Root-scoped resources set `scope: "root"` and do not declare `parent`.
-- Non-root resources must declare `parent: { "apiVersion": "...", "kind": "..." }`.
+- A resource is root-scoped when its `ResourceDefinition` declares no `parent`.
+- A non-root resource declares `parent: { "apiVersion": "...", "kind": "..." }`; its `ResourceDefinition` parent chain must be acyclic (registration rejects cycles).
 - The ancestor *types* in a URL are derived from this parent chain — the URL carries only ancestor *names*, so a child can never be addressed under a parent of the wrong type.
 - A child may only exist directly under a parent of the declared parent kind.
 - A `ResourceDefinition` cannot be deleted while any related resources exist in any declared version.

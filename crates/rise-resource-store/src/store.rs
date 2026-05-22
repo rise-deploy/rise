@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use rise_resource_api::{ResourceParentRef, ResourceScope};
+use rise_resource_api::ResourceParentRef;
 
 use crate::error::StoreError;
 use crate::models::ResourceRow;
@@ -15,6 +15,11 @@ pub const SYSTEM_FINALIZER_PREFIX: &str = "system.rise.dev/";
 /// Finalizer added to a parent resource when it is deleted while it still has children.
 /// Removed by the store once the subtree has drained.
 pub const CASCADE_DELETION_FINALIZER: &str = "system.rise.dev/cascade-deletion";
+
+/// Maximum `ResourceDefinition` parent-chain depth. Registration rejects a
+/// chain longer than this (or one that cycles), and resource-path resolution
+/// caps its ancestor walk at the same bound.
+pub const MAX_PARENT_CHAIN_DEPTH: usize = 32;
 
 pub struct CreateResourceParams {
     pub api_version: String,
@@ -78,7 +83,6 @@ pub struct CollectionInfo {
     /// still found; `served_api_versions` only gates URL accessibility.
     pub declared_api_versions: Vec<String>,
     pub kind: String,
-    pub scope: ResourceScope,
     pub parent: Option<ResourceParentRef>,
     pub spec_validator: Arc<dyn SpecValidator>,
     pub allowed_status_controller_ids: Vec<String>,

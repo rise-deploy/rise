@@ -177,12 +177,6 @@ fn api_group(api_version: &str) -> &str {
     api_version.split('/').next().unwrap_or(api_version)
 }
 
-/// Maximum `ResourceDefinition` parent-chain depth. The chain is walked per
-/// request to derive ancestor types; there is no cycle check at registration,
-/// so a cyclic `parent` graph would otherwise loop forever. Hitting this cap is
-/// treated as a server misconfiguration (500).
-const MAX_PARENT_CHAIN_DEPTH: usize = 32;
-
 /// Resolve a leaf resource addressed by `uid:` form.
 ///
 /// A UID is globally unique, so the ancestor chain is redundant and is not
@@ -218,8 +212,9 @@ async fn resolve_item_by_uid(
 /// depth `D`.
 ///
 /// Each ancestor is resolved by `(group, kind)` via `resolve_collection_by_kind`.
-/// An ancestor kind with no registered collection is a 404. The walk is capped
-/// at `MAX_PARENT_CHAIN_DEPTH` to guard against a cyclic RD `parent` graph.
+/// An ancestor kind with no registered collection is a 404. Registration
+/// rejects cyclic `parent` graphs, but the walk is still capped at
+/// `MAX_PARENT_CHAIN_DEPTH` as a hard backstop.
 async fn resolve_parent_chain(
     store: &Arc<dyn ResourceStore>,
     leaf: &CollectionInfo,
@@ -227,11 +222,12 @@ async fn resolve_parent_chain(
     let mut chain: Vec<CollectionInfo> = Vec::new();
     let mut current = leaf.parent.clone();
     while let Some(parent_ref) = current {
-        if chain.len() >= MAX_PARENT_CHAIN_DEPTH {
+        if chain.len() >= rise_resource_store::MAX_PARENT_CHAIN_DEPTH {
             return Err(ServerError::internal(format!(
                 "ResourceDefinition parent chain for kind '{}' exceeds the maximum depth \
-                 of {MAX_PARENT_CHAIN_DEPTH}; the parent graph may contain a cycle",
-                leaf.kind
+                 of {}; the parent graph may contain a cycle",
+                leaf.kind,
+                rise_resource_store::MAX_PARENT_CHAIN_DEPTH,
             )));
         }
         let group = api_group(&parent_ref.api_version);
@@ -1031,7 +1027,6 @@ async fn apply_reparent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rise_resource_api::ResourceScope;
 
     #[test]
     fn assert_body_matches_uid_url_does_not_enforce_name() {
@@ -1041,7 +1036,6 @@ mod tests {
             served_api_versions: vec!["rise.dev/v1alpha1".into()],
             declared_api_versions: vec!["rise.dev/v1alpha1".into()],
             kind: "Organization".into(),
-            scope: ResourceScope::Root,
             parent: None,
             spec_validator: std::sync::Arc::new(rise_resource_store::NoOpValidator),
             allowed_status_controller_ids: vec![],
@@ -1079,7 +1073,6 @@ mod tests {
             served_api_versions: vec!["example.dev/v1".into()],
             declared_api_versions: vec!["example.dev/v1".into()],
             kind: "Widget".into(),
-            scope: ResourceScope::Root,
             parent: None,
             spec_validator: std::sync::Arc::new(rise_resource_store::NoOpValidator),
             allowed_status_controller_ids: allowed,
@@ -1202,7 +1195,6 @@ mod dispatch_tests {
             "group": "example.dev",
             "kind": "Widget",
             "plural": "widgets",
-            "scope": "root",
             "versions": [
                 {"name": "v1", "served": true, "storage": true},
                 {"name": "v2", "served": true, "storage": false},
@@ -1233,7 +1225,6 @@ mod dispatch_tests {
             "group": "example.dev",
             "kind": "Gadget",
             "plural": "gadgets",
-            "scope": "organization",
             "parent": {"apiVersion": "rise.dev/v1alpha1", "kind": "Organization"},
             "versions": [{"name": "v1", "served": true, "storage": true}],
             "allowedStatusControllerIds": allowed,
@@ -1260,7 +1251,6 @@ mod dispatch_tests {
             "group": "example.dev",
             "kind": "Gizmo",
             "plural": "gizmos",
-            "scope": "organization",
             "parent": {"apiVersion": "example.dev/v1", "kind": "Gadget"},
             "versions": [{"name": "v1", "served": true, "storage": true}],
             "allowedStatusControllerIds": [],
@@ -1962,7 +1952,6 @@ mod dispatch_tests {
             "group": "example.dev",
             "kind": "Widget",
             "plural": "widgets",
-            "scope": "root",
             "versions": [
                 {"name": "v1", "served": false, "storage": true},
                 {"name": "v2", "served": true, "storage": false},
@@ -2238,49 +2227,5 @@ mod dispatch_tests {
         let (status, body) = read(resp).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["metadata"]["name"], "status");
-    }
-
-    #[sqlx::test]
-    async fn cyclic_parent_chain_yields_500(pool: sqlx::PgPool) {
-        let ctx = ctx(pool).await;
-
-        // Two ResourceDefinitions whose `parent` refs point at each other. There
-        // is no cycle check at registration, so the parent-chain walk must
-        // terminate on the depth cap rather than loop forever.
-        for (kind, plural, parent_kind) in [("Alpha", "alphas", "Beta"), ("Beta", "betas", "Alpha")]
-        {
-            let spec = json!({
-                "group": "cycle.dev",
-                "kind": kind,
-                "plural": plural,
-                "scope": "organization",
-                "parent": {"apiVersion": "cycle.dev/v1", "kind": parent_kind},
-                "versions": [{"name": "v1", "served": true, "storage": true}],
-                "allowedStatusControllerIds": [],
-            });
-            ctx.store
-                .register_resource_definition(CreateResourceParams {
-                    api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
-                    kind: RESOURCE_DEFINITION_KIND.to_string(),
-                    name: format!("{plural}.cycle.dev"),
-                    parent_uid: None,
-                    annotations: BTreeMap::new(),
-                    finalizers: vec![],
-                    spec,
-                    validator: None,
-                })
-                .await
-                .expect("register cyclic RD");
-        }
-
-        let err = dispatch_get_inner(
-            &ctx,
-            "cycle.dev/v1/alphas".to_string(),
-            auth(OPERATOR),
-            PendingDeletionQuery::default(),
-        )
-        .await
-        .expect_err("a cyclic parent chain must error, not hang");
-        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
