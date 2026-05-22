@@ -286,9 +286,10 @@ impl PgResourceStore {
                 let key_group = parts.next().unwrap_or("");
                 let _key_version = parts.next();
                 let key_plural = parts.next().unwrap_or("");
-                // If there are fewer than 3 parts the key is malformed; retain it.
+                // If there are fewer than 3 parts the key is malformed; evict it
+                // so it cannot accumulate indefinitely.
                 if _key_version.is_none() {
-                    return true;
+                    return false;
                 }
                 key_group != group || key_plural != plural
             });
@@ -895,7 +896,7 @@ impl ResourceStore for PgResourceStore {
                     };
                     if row.kind != *kind || !api_versions.iter().any(|v| v == &row.api_version) {
                         return Err(StoreError::KindMismatch {
-                            expected: format!("one of {:?}/{kind}", api_versions),
+                            expected: format!("kind {kind} in one of {api_versions:?}"),
                             got: format!("{}/{}", row.api_version, row.kind),
                         });
                     }
