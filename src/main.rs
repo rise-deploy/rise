@@ -144,6 +144,11 @@ struct DeployArgs {
     /// Auto-detected from: CI_MERGE_REQUEST_URL (GitLab), GITHUB_SERVER_URL + GITHUB_REPOSITORY + GITHUB_REF + GITHUB_EVENT_NAME (GitHub Actions).
     #[arg(long)]
     pull_request_url: Option<String>,
+    /// URL of the Git repository this deployment is created from.
+    /// Auto-detected from common CI environment variables, or the local `origin`
+    /// git remote. ssh://, git:// and git@ URLs are converted to HTTPS.
+    #[arg(long)]
+    git_repository: Option<String>,
     /// Number of replicas for this deployment (overrides rise.toml)
     #[arg(long)]
     replicas: Option<u32>,
@@ -1398,6 +1403,7 @@ async fn main() -> Result<()> {
                         env_overrides,
                         job_url: args.job_url.clone(),
                         pull_request_url: args.pull_request_url.clone(),
+                        git_repository_url: args.git_repository.clone(),
                         toml_config,
                         replicas,
                         cpu,

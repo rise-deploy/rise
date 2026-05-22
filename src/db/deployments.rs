@@ -24,6 +24,8 @@ pub struct CreateDeploymentParams<'a> {
     pub job_url: Option<&'a str>,
     /// URL to the pull request/merge request associated with this deployment
     pub pull_request_url: Option<&'a str>,
+    /// HTTPS URL of the Git repository this deployment was created from
+    pub git_repository_url: Option<&'a str>,
     /// Number of replicas
     pub replicas: i32,
     /// CPU allocation (e.g., "500m", "1")
@@ -48,7 +50,7 @@ pub async fn list_for_project(pool: &PgPool, project_id: Uuid) -> Result<Vec<Dep
             image, image_digest, rolled_back_from_deployment_id,
             http_port, needs_reconcile, is_active,
             deploying_started_at,
-            first_healthy_at, job_url, pull_request_url,
+            first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
             created_at, updated_at, identity_credential_hash,
@@ -64,6 +66,31 @@ pub async fn list_for_project(pool: &PgPool, project_id: Uuid) -> Result<Vec<Dep
     .context("Failed to list deployments for project")?;
 
     Ok(deployments)
+}
+
+/// Resolve a project's Git repository URL from its deployment history.
+///
+/// Prefers the URL recorded on the active deployment in the default group
+/// (the "primary" deployment); otherwise falls back to the most recent
+/// deployment that has a repository URL recorded. Returns `None` when no
+/// deployment carries Git metadata.
+#[cfg(feature = "backend")]
+pub async fn resolve_git_repository_url(pool: &PgPool, project_id: Uuid) -> Result<Option<String>> {
+    let url = sqlx::query_scalar!(
+        r#"
+        SELECT git_repository_url
+        FROM deployments
+        WHERE project_id = $1 AND git_repository_url IS NOT NULL
+        ORDER BY (is_active AND deployment_group = 'default') DESC, created_at DESC
+        LIMIT 1
+        "#,
+        project_id
+    )
+    .fetch_optional(pool)
+    .await
+    .context("Failed to resolve git repository URL for project")?;
+
+    Ok(url.flatten())
 }
 
 /// List non-terminal deployments for a project.
@@ -88,7 +115,7 @@ pub async fn list_non_terminal_for_project(
             image, image_digest, rolled_back_from_deployment_id,
             http_port, needs_reconcile, is_active,
             deploying_started_at,
-            first_healthy_at, job_url, pull_request_url,
+            first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
             created_at, updated_at, identity_credential_hash,
@@ -125,7 +152,7 @@ pub async fn get_deployments_batch(
             image, image_digest, rolled_back_from_deployment_id,
             http_port, needs_reconcile, is_active,
             deploying_started_at,
-            first_healthy_at, job_url, pull_request_url,
+            first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
             created_at, updated_at, identity_credential_hash,
@@ -161,7 +188,7 @@ pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Deployment>> {
             image, image_digest, rolled_back_from_deployment_id,
             http_port, needs_reconcile, is_active,
             deploying_started_at,
-            first_healthy_at, job_url, pull_request_url,
+            first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
             created_at, updated_at, identity_credential_hash,
@@ -195,7 +222,7 @@ pub async fn find_by_deployment_id(
             image, image_digest, rolled_back_from_deployment_id,
             http_port, needs_reconcile, is_active,
             deploying_started_at,
-            first_healthy_at, job_url, pull_request_url,
+            first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
             created_at, updated_at, identity_credential_hash,
@@ -234,7 +261,7 @@ pub async fn find_by_deployment_id_unscoped(
             image, image_digest, rolled_back_from_deployment_id,
             http_port, needs_reconcile, is_active,
             deploying_started_at,
-            first_healthy_at, job_url, pull_request_url,
+            first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
             created_at, updated_at, identity_credential_hash,
@@ -261,8 +288,8 @@ pub async fn create(pool: &PgPool, params: CreateDeploymentParams<'_>) -> Result
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
-        INSERT INTO deployments (deployment_id, project_id, created_by_id, status, image, image_digest, rolled_back_from_deployment_id, deployment_group, environment_id, expires_at, http_port, is_active, job_url, pull_request_url, replicas, cpu, memory, identity_audiences)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+        INSERT INTO deployments (deployment_id, project_id, created_by_id, status, image, image_digest, rolled_back_from_deployment_id, deployment_group, environment_id, expires_at, http_port, is_active, job_url, pull_request_url, git_repository_url, replicas, cpu, memory, identity_audiences)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
         RETURNING
             id, deployment_id, project_id, created_by_id,
             status as "status: DeploymentStatus",
@@ -273,7 +300,7 @@ pub async fn create(pool: &PgPool, params: CreateDeploymentParams<'_>) -> Result
             image, image_digest, rolled_back_from_deployment_id,
             http_port, needs_reconcile, is_active,
             deploying_started_at,
-            first_healthy_at, job_url, pull_request_url,
+            first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             created_at, updated_at, identity_credential_hash,
             identity_audiences as "identity_audiences: serde_json::Value"
@@ -292,6 +319,7 @@ pub async fn create(pool: &PgPool, params: CreateDeploymentParams<'_>) -> Result
         params.is_active,
         params.job_url,
         params.pull_request_url,
+        params.git_repository_url,
         params.replicas,
         params.cpu,
         params.memory,
@@ -326,7 +354,7 @@ pub async fn update_status(
             image, image_digest, rolled_back_from_deployment_id,
             http_port, needs_reconcile, is_active,
             deploying_started_at,
-            first_healthy_at, job_url, pull_request_url,
+            first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
             created_at, updated_at, identity_credential_hash,
@@ -371,7 +399,7 @@ pub async fn update_status(
             image, image_digest, rolled_back_from_deployment_id,
             http_port, needs_reconcile, is_active,
             deploying_started_at,
-            first_healthy_at, job_url, pull_request_url,
+            first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
             created_at, updated_at, identity_credential_hash,
@@ -415,7 +443,7 @@ pub async fn mark_failed(pool: &PgPool, id: Uuid, error_message: &str) -> Result
             image, image_digest, rolled_back_from_deployment_id,
             http_port, needs_reconcile, is_active,
             deploying_started_at,
-            first_healthy_at, job_url, pull_request_url,
+            first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
             created_at, updated_at, identity_credential_hash,
@@ -454,7 +482,7 @@ pub async fn update_controller_metadata(
             image, image_digest, rolled_back_from_deployment_id,
             http_port, needs_reconcile, is_active,
             deploying_started_at,
-            first_healthy_at, job_url, pull_request_url,
+            first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
             created_at, updated_at, identity_credential_hash,
@@ -503,7 +531,7 @@ pub async fn mark_cancelled(pool: &PgPool, id: Uuid) -> Result<Deployment> {
             image, image_digest, rolled_back_from_deployment_id,
             http_port, needs_reconcile, is_active,
             deploying_started_at,
-            first_healthy_at, job_url, pull_request_url,
+            first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             created_at, updated_at, identity_credential_hash,
             identity_audiences as "identity_audiences: serde_json::Value"
@@ -540,7 +568,7 @@ pub async fn mark_stopped(pool: &PgPool, id: Uuid) -> Result<Deployment> {
             image, image_digest, rolled_back_from_deployment_id,
             http_port, needs_reconcile, is_active,
             deploying_started_at,
-            first_healthy_at, job_url, pull_request_url,
+            first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             created_at, updated_at, identity_credential_hash,
             identity_audiences as "identity_audiences: serde_json::Value"
@@ -577,7 +605,7 @@ pub async fn mark_superseded(pool: &PgPool, id: Uuid) -> Result<Deployment> {
             image, image_digest, rolled_back_from_deployment_id,
             http_port, needs_reconcile, is_active,
             deploying_started_at,
-            first_healthy_at, job_url, pull_request_url,
+            first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             created_at, updated_at, identity_credential_hash,
             identity_audiences as "identity_audiences: serde_json::Value"
@@ -614,7 +642,7 @@ pub async fn mark_expired(pool: &PgPool, id: Uuid) -> Result<Deployment> {
             image, image_digest, rolled_back_from_deployment_id,
             http_port, needs_reconcile, is_active,
             deploying_started_at,
-            first_healthy_at, job_url, pull_request_url,
+            first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             created_at, updated_at, identity_credential_hash,
             identity_audiences as "identity_audiences: serde_json::Value"
@@ -651,7 +679,7 @@ pub async fn mark_healthy(pool: &PgPool, id: Uuid) -> Result<Deployment> {
             image, image_digest, rolled_back_from_deployment_id,
             http_port, needs_reconcile, is_active,
             deploying_started_at,
-            first_healthy_at, job_url, pull_request_url,
+            first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             created_at, updated_at, identity_credential_hash,
             identity_audiences as "identity_audiences: serde_json::Value"
@@ -687,7 +715,7 @@ pub async fn mark_unhealthy(pool: &PgPool, id: Uuid, reason: String) -> Result<D
             image, image_digest, rolled_back_from_deployment_id,
             http_port, needs_reconcile, is_active,
             deploying_started_at,
-            first_healthy_at, job_url, pull_request_url,
+            first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             created_at, updated_at, identity_credential_hash,
             identity_audiences as "identity_audiences: serde_json::Value"
@@ -727,7 +755,7 @@ pub async fn mark_terminating(
             image, image_digest, rolled_back_from_deployment_id,
             http_port, needs_reconcile, is_active,
             deploying_started_at,
-            first_healthy_at, job_url, pull_request_url,
+            first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             created_at, updated_at, identity_credential_hash,
             identity_audiences as "identity_audiences: serde_json::Value"
@@ -763,7 +791,7 @@ pub async fn mark_cancelling(pool: &PgPool, id: Uuid) -> Result<Deployment> {
             image, image_digest, rolled_back_from_deployment_id,
             http_port, needs_reconcile, is_active,
             deploying_started_at,
-            first_healthy_at, job_url, pull_request_url,
+            first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             created_at, updated_at, identity_credential_hash,
             identity_audiences as "identity_audiences: serde_json::Value"
@@ -833,7 +861,7 @@ pub async fn get_by_identity_credential_hash(
             image, image_digest, rolled_back_from_deployment_id,
             http_port, needs_reconcile, is_active,
             deploying_started_at,
-            first_healthy_at, job_url, pull_request_url,
+            first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             created_at, updated_at, identity_credential_hash,
             identity_audiences as "identity_audiences: serde_json::Value"
@@ -886,7 +914,7 @@ pub async fn find_active_for_project_and_group(
             image, image_digest, rolled_back_from_deployment_id,
             http_port, needs_reconcile, is_active,
             deploying_started_at,
-            first_healthy_at, job_url, pull_request_url,
+            first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             created_at, updated_at, identity_credential_hash,
             identity_audiences as "identity_audiences: serde_json::Value"
@@ -926,7 +954,7 @@ pub async fn find_non_terminal_for_project_and_group(
             image, image_digest, rolled_back_from_deployment_id,
             http_port, needs_reconcile, is_active,
             deploying_started_at,
-            first_healthy_at, job_url, pull_request_url,
+            first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             created_at, updated_at, identity_credential_hash,
             identity_audiences as "identity_audiences: serde_json::Value"
@@ -966,7 +994,7 @@ pub async fn find_active_deployment_for_group(
             image, image_digest, rolled_back_from_deployment_id,
             http_port, needs_reconcile, is_active,
             deploying_started_at,
-            first_healthy_at, job_url, pull_request_url,
+            first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             created_at, updated_at, identity_credential_hash,
             identity_audiences as "identity_audiences: serde_json::Value"
@@ -1006,7 +1034,7 @@ pub async fn find_last_for_project_and_group(
             image, image_digest, rolled_back_from_deployment_id,
             http_port, needs_reconcile, is_active,
             deploying_started_at,
-            first_healthy_at, job_url, pull_request_url,
+            first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             created_at, updated_at, identity_credential_hash,
             identity_audiences as "identity_audiences: serde_json::Value"
@@ -1051,7 +1079,7 @@ pub async fn list_for_project_and_group(
                 image, image_digest, rolled_back_from_deployment_id,
                 http_port, needs_reconcile, is_active,
                 deploying_started_at,
-                first_healthy_at, job_url, pull_request_url,
+                first_healthy_at, job_url, pull_request_url, git_repository_url,
                 replicas, cpu, memory,
                 created_at, updated_at, identity_credential_hash,
                 identity_audiences as "identity_audiences: serde_json::Value"
@@ -1082,7 +1110,7 @@ pub async fn list_for_project_and_group(
                 image, image_digest, rolled_back_from_deployment_id,
                 http_port, needs_reconcile, is_active,
                 deploying_started_at,
-                first_healthy_at, job_url, pull_request_url,
+                first_healthy_at, job_url, pull_request_url, git_repository_url,
                 replicas, cpu, memory,
                 created_at, updated_at, identity_credential_hash,
                 identity_audiences as "identity_audiences: serde_json::Value"
@@ -1223,7 +1251,7 @@ pub async fn get_active_deployments_for_project(
             image, image_digest, rolled_back_from_deployment_id,
             http_port, needs_reconcile, is_active,
             deploying_started_at,
-            first_healthy_at, job_url, pull_request_url,
+            first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
             created_at, updated_at, identity_credential_hash,
@@ -1486,6 +1514,7 @@ mod tests {
                 is_active: false,
                 job_url: None,
                 pull_request_url: None,
+                git_repository_url: None,
                 replicas: 1,
                 cpu: "500m",
                 memory: "256Mi",
@@ -1573,6 +1602,7 @@ mod tests {
                 is_active: false,
                 job_url: None,
                 pull_request_url: None,
+                git_repository_url: None,
                 replicas: 1,
                 cpu: "500m",
                 memory: "256Mi",

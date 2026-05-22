@@ -509,6 +509,10 @@ pub struct DeploymentOptions<'a> {
     /// URL to the pull request/merge request associated with this deployment.
     /// If None, auto-detection from CI environment variables is attempted.
     pub pull_request_url: Option<String>,
+    /// URL to the Git repository this deployment was created from.
+    /// If None, auto-detection from CI environment variables (or the local
+    /// `origin` remote) is attempted.
+    pub git_repository_url: Option<String>,
     /// Pre-loaded project config from rise.toml to avoid re-loading during build.
     pub toml_config: Option<build::config::ProjectBuildConfig>,
     /// Number of replicas (resolved from CLI flag > rise.toml > server default)
@@ -555,12 +559,24 @@ pub async fn create_deployment(
         .pull_request_url
         .clone()
         .or_else(detect_ci_pull_request_url);
+    // Resolve the Git repository: use the explicit value (normalized), or
+    // auto-detect from the CI environment / local git remote.
+    let resolved_git_repository_url = match deploy_opts.git_repository_url.as_deref() {
+        Some(raw) => match normalize_git_url(raw) {
+            Some(url) => Some(url),
+            None => anyhow::bail!("--git-repository: could not parse {:?} as a Git URL", raw),
+        },
+        None => detect_git_repository_url(),
+    };
 
     if let Some(ref url) = resolved_job_url {
         info!("Deployment job URL: {}", url);
     }
     if let Some(ref url) = resolved_pull_request_url {
         info!("Deployment pull request URL: {}", url);
+    }
+    if let Some(ref url) = resolved_git_repository_url {
+        info!("Deployment git repository: {}", url);
     }
 
     // Step 1: Create deployment and get deployment ID + credentials
@@ -584,6 +600,7 @@ pub async fn create_deployment(
         &deploy_opts.env_overrides,
         resolved_job_url.as_deref(),
         resolved_pull_request_url.as_deref(),
+        resolved_git_repository_url.as_deref(),
         deploy_opts.replicas,
         deploy_opts.cpu.as_deref(),
         deploy_opts.memory.as_deref(),
@@ -905,29 +922,47 @@ async fn login_to_registry(
     Ok(())
 }
 
-/// Auto-detect CI source URL from well-known CI environment variables.
+/// Read an environment variable, returning `None` when it is unset or empty.
+fn env_non_empty(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+/// Auto-detect the CI pipeline/job URL from well-known CI environment variables.
 ///
-/// Checks common CI platforms in order:
+/// Supported CI platforms:
 /// - GitLab CI: `CI_JOB_URL`
 /// - GitHub Actions: `GITHUB_SERVER_URL` + `GITHUB_REPOSITORY` + `GITHUB_RUN_ID`
+/// - CircleCI: `CIRCLE_BUILD_URL`
+/// - Buildkite: `BUILDKITE_BUILD_URL`
+/// - Drone CI: `DRONE_BUILD_LINK`
+/// - Jenkins: `BUILD_URL`
 ///
 /// Returns the first detected URL, or None if no CI environment is detected.
 fn detect_ci_job_url() -> Option<String> {
     // GitLab CI
-    if let Ok(url) = std::env::var("CI_JOB_URL") {
-        if !url.is_empty() {
-            return Some(url);
-        }
+    if let Some(url) = env_non_empty("CI_JOB_URL") {
+        return Some(url);
     }
 
-    // GitHub Actions
-    if let (Ok(server), Ok(repo), Ok(run_id)) = (
-        std::env::var("GITHUB_SERVER_URL"),
-        std::env::var("GITHUB_REPOSITORY"),
-        std::env::var("GITHUB_RUN_ID"),
+    // GitHub Actions — construct the workflow run URL
+    if let (Some(server), Some(repo), Some(run_id)) = (
+        env_non_empty("GITHUB_SERVER_URL"),
+        env_non_empty("GITHUB_REPOSITORY"),
+        env_non_empty("GITHUB_RUN_ID"),
     ) {
-        if !server.is_empty() && !repo.is_empty() && !run_id.is_empty() {
-            return Some(format!("{}/{}/actions/runs/{}", server, repo, run_id));
+        let server = server.trim_end_matches('/');
+        return Some(format!("{server}/{repo}/actions/runs/{run_id}"));
+    }
+
+    // Other CI platforms that expose the build/job URL directly
+    for var in [
+        "CIRCLE_BUILD_URL",    // CircleCI
+        "BUILDKITE_BUILD_URL", // Buildkite
+        "DRONE_BUILD_LINK",    // Drone CI
+        "BUILD_URL",           // Jenkins
+    ] {
+        if let Some(url) = env_non_empty(var) {
+            return Some(url);
         }
     }
 
@@ -972,6 +1007,130 @@ fn detect_ci_pull_request_url() -> Option<String> {
     None
 }
 
+/// Auto-detect the Git repository URL this deployment is created from.
+///
+/// Prefers well-known CI environment variables, and otherwise falls back to the
+/// local `origin` Git remote. The detected URL is normalized to an HTTPS URL.
+///
+/// Returns None if no repository can be determined.
+fn detect_git_repository_url() -> Option<String> {
+    let raw = detect_ci_repository_url().or_else(detect_git_remote_url)?;
+    normalize_git_url(&raw)
+}
+
+/// Detect the repository URL exposed by well-known CI platforms.
+///
+/// Supported CI platforms:
+/// - GitHub Actions: `GITHUB_SERVER_URL` + `GITHUB_REPOSITORY`
+/// - GitLab CI: `CI_PROJECT_URL`
+/// - Bitbucket Pipelines: `BITBUCKET_GIT_HTTP_ORIGIN`
+/// - CircleCI: `CIRCLE_REPOSITORY_URL`
+/// - Azure Pipelines: `BUILD_REPOSITORY_URI`
+/// - Buildkite: `BUILDKITE_REPO`
+/// - Drone CI: `DRONE_GIT_HTTP_URL`
+/// - Jenkins: `GIT_URL`
+fn detect_ci_repository_url() -> Option<String> {
+    // GitHub Actions — construct the repository URL
+    if let (Some(server), Some(repo)) = (
+        env_non_empty("GITHUB_SERVER_URL"),
+        env_non_empty("GITHUB_REPOSITORY"),
+    ) {
+        return Some(format!("{}/{}", server.trim_end_matches('/'), repo));
+    }
+
+    // GitLab CI — CI_PROJECT_URL is the canonical web URL of the project
+    if let Some(url) = env_non_empty("CI_PROJECT_URL") {
+        return Some(url);
+    }
+
+    // Other CI platforms expose the clone/repository URL directly
+    for var in [
+        "BITBUCKET_GIT_HTTP_ORIGIN", // Bitbucket Pipelines
+        "CIRCLE_REPOSITORY_URL",     // CircleCI
+        "BUILD_REPOSITORY_URI",      // Azure Pipelines
+        "BUILDKITE_REPO",            // Buildkite
+        "DRONE_GIT_HTTP_URL",        // Drone CI
+        // GIT_URL is checked last: it is a generic name used by Jenkins (git
+        // plugin) but also set by many scripts and CI systems to non-repository
+        // values (API endpoints, webhooks, etc.), making it the most
+        // collision-prone variable in this list.
+        "GIT_URL", // Jenkins (git plugin)
+    ] {
+        if let Some(url) = env_non_empty(var) {
+            return Some(url);
+        }
+    }
+
+    None
+}
+
+/// Read the URL of the local `origin` Git remote, if available.
+///
+/// Equivalent to the fetch URL reported by `git remote show origin`, but
+/// resolved offline via `git remote get-url origin`.
+fn detect_git_remote_url() -> Option<String> {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    // Run git in a separate thread so we can apply a timeout. `git remote
+    // get-url` normally completes instantly (it reads `.git/config`), but a
+    // misconfigured credential helper can cause it to block indefinitely.
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = std::process::Command::new("git")
+            .args(["remote", "get-url", "origin"])
+            .output();
+        let _ = tx.send(result);
+    });
+
+    let output = rx.recv_timeout(Duration::from_secs(5)).ok()?.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if url.is_empty() {
+        None
+    } else {
+        Some(url)
+    }
+}
+
+/// Normalize a Git repository URL to a canonical `https://host/path` form.
+///
+/// Handles `git@host:owner/repo.git` (scp-like), `ssh://`, `git://`, and
+/// `http(s)://` URLs. Any embedded credentials, port, and trailing `.git`
+/// suffix are stripped. Returns `None` if the input cannot be parsed.
+fn normalize_git_url(raw: &str) -> Option<String> {
+    let raw = raw.trim().trim_end_matches('/');
+    if raw.is_empty() {
+        return None;
+    }
+
+    // Split into the authority (`[user@]host[:port]`) and path components.
+    let (authority, path) = if let Some(idx) = raw.find("://") {
+        // scheme://[user@]host[:port]/path
+        raw[idx + 3..].split_once('/')?
+    } else {
+        // scp-like: [user@]host:path
+        raw.split_once(':')?
+    };
+
+    // Drop any userinfo prefix and port suffix from the authority.
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, h)| h)
+        .split(':')
+        .next()?;
+
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+
+    if host.is_empty() || path.is_empty() {
+        return None;
+    }
+    Some(format!("https://{host}/{path}"))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn call_create_deployment_api(
     http_client: &Client,
@@ -989,6 +1148,7 @@ async fn call_create_deployment_api(
     env_overrides: &[EnvOverride],
     job_url: Option<&str>,
     pull_request_url: Option<&str>,
+    git_repository_url: Option<&str>,
     replicas: Option<u32>,
     cpu: Option<&str>,
     memory: Option<&str>,
@@ -1044,6 +1204,11 @@ async fn call_create_deployment_api(
     // Add pull_request_url if provided
     if let Some(url) = pull_request_url {
         payload["pull_request_url"] = serde_json::json!(url);
+    }
+
+    // Add git_repository_url if provided
+    if let Some(url) = git_repository_url {
+        payload["git_repository_url"] = serde_json::json!(url);
     }
 
     // Add resource fields if provided
@@ -1499,4 +1664,56 @@ pub(super) async fn open_log_stream(
         stream: response.bytes_stream().boxed(),
         buffer: String::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_git_url;
+
+    #[test]
+    fn normalizes_scp_like_url() {
+        assert_eq!(
+            normalize_git_url("git@github.com:owner/repo.git").as_deref(),
+            Some("https://github.com/owner/repo")
+        );
+    }
+
+    #[test]
+    fn normalizes_ssh_url_with_port() {
+        assert_eq!(
+            normalize_git_url("ssh://git@github.com:22/owner/repo.git").as_deref(),
+            Some("https://github.com/owner/repo")
+        );
+    }
+
+    #[test]
+    fn normalizes_git_protocol_url() {
+        assert_eq!(
+            normalize_git_url("git://gitlab.com/group/sub/repo.git").as_deref(),
+            Some("https://gitlab.com/group/sub/repo")
+        );
+    }
+
+    #[test]
+    fn strips_credentials_and_git_suffix_from_https_url() {
+        assert_eq!(
+            normalize_git_url("https://user:token@github.com/owner/repo.git").as_deref(),
+            Some("https://github.com/owner/repo")
+        );
+    }
+
+    #[test]
+    fn passes_through_clean_https_url() {
+        assert_eq!(
+            normalize_git_url("https://github.com/owner/repo").as_deref(),
+            Some("https://github.com/owner/repo")
+        );
+    }
+
+    #[test]
+    fn rejects_unparseable_input() {
+        assert_eq!(normalize_git_url(""), None);
+        assert_eq!(normalize_git_url("not-a-url"), None);
+        assert_eq!(normalize_git_url("/local/path/repo"), None);
+    }
 }
