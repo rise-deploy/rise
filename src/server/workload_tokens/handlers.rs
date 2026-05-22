@@ -12,9 +12,6 @@ use crate::server::state::AppState;
 use crate::server::workload_tokens::models::{ExchangeTokenRequest, ExchangeTokenResponse};
 use crate::server::workload_tokens::{sha256_hex, workload_subject, NO_ENVIRONMENT};
 
-/// Lifetime of exchange-endpoint workload identity tokens.
-const WORKLOAD_TOKEN_TTL_SECS: u64 = 900;
-
 /// Exchange a deployment's bootstrap credential for a workload identity token.
 ///
 /// This route is unauthenticated: the bootstrap credential presented in the
@@ -88,6 +85,9 @@ pub async fn exchange_token(
 
     let sub = workload_subject(&project.name, environment.as_deref());
 
+    let max_ttl = state.server_settings.workload_token_max_ttl_seconds;
+    let ttl = req.ttl_seconds.map(|t| t.min(max_ttl)).unwrap_or(max_ttl);
+
     let token = state
         .jwt_signer
         .sign_workload_jwt(
@@ -99,7 +99,7 @@ pub async fn exchange_token(
                 deployment_id: &deployment.deployment_id,
             },
             audience,
-            WORKLOAD_TOKEN_TTL_SECS,
+            ttl,
         )
         .map_err(|e| ServerError::internal(format!("Failed to sign workload token: {:?}", e)))?;
 
@@ -108,13 +108,15 @@ pub async fn exchange_token(
         deployment_group = %deployment.deployment_group,
         deployment_id = %deployment.deployment_id,
         audience = %audience,
+        ttl_seconds = ttl,
         "Issued workload identity token"
     );
 
     Ok(Json(ExchangeTokenResponse {
         token,
         token_type: "Bearer".to_string(),
-        expires_in: WORKLOAD_TOKEN_TTL_SECS,
+        expires_in: ttl,
+        audience: audience.to_string(),
     })
     .into_response())
 }

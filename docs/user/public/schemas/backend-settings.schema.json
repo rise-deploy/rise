@@ -336,6 +336,13 @@
               "description": "Host aliases to inject into pod specs (hostname -> IP address)\nMaps hostnames to IP addresses, injected as Kubernetes hostAliases.\nUseful for local development where pods need to resolve custom hostnames.\nExample: {\"rise.local\": \"192.168.49.1\"}",
               "type": "object"
             },
+            "identity_token_ttl_seconds": {
+              "default": 3600,
+              "description": "Lifetime in seconds of workload identity tokens auto-minted by the controller\nand mounted into deployment pods. The controller re-mints tokens when they\nare older than half this value. Default: 3600 (1 hour).",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
             "image_pull_secret_name": {
               "default": null,
               "description": "Optional name of an existing imagePullSecret to use for deployments\n\nIf not specified:\n  - With a registry provider (e.g., ECR): The controller creates and manages the secret\n  - Without a registry provider: No image pull secret is used\n\nIf specified:\n  - The named secret must exist in each project namespace\n  - The controller will NOT create or manage the secret\n  - Useful for static registries where credentials are managed externally\n\nExample: \"my-registry-secret\"",
@@ -1396,6 +1403,13 @@
             "string",
             "null"
           ]
+        },
+        "workload_token_max_ttl_seconds": {
+          "default": 900,
+          "description": "Maximum TTL in seconds for workload identity tokens issued via the token-exchange endpoint.\nRequests that specify a higher TTL are silently capped to this value.\nDefault: 900 (15 minutes).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [

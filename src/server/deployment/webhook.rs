@@ -108,10 +108,6 @@ const PRE_PUSHED_TIMEOUT_MINUTES: i64 = 10;
 const SECRET_REFRESH_HOURS: i64 = 6;
 /// Maximum number of terminating/terminated pods to carry forward in controller_metadata
 const MAX_INACTIVE_PODS: usize = 5;
-/// Lifetime of auto-minted workload identity tokens.
-const IDENTITY_TOKEN_TTL_SECS: u64 = 3600;
-/// Age past which auto-minted workload tokens are re-minted (half of the TTL).
-const IDENTITY_TOKEN_REFRESH_SECS: i64 = 1800;
 
 #[derive(Debug, Default)]
 struct ResolvedDeploymentEnvVars {
@@ -1412,10 +1408,12 @@ async fn prepare_identity_secret(
             })
             .unwrap_or_default();
 
+        let ttl_secs = state.identity_token_ttl_seconds;
+        let refresh_secs = (ttl_secs / 2) as i64;
+
         let fresh = observed_refresh
             .map(|ts| {
-                Utc::now().signed_duration_since(ts)
-                    < chrono::Duration::seconds(IDENTITY_TOKEN_REFRESH_SECS)
+                Utc::now().signed_duration_since(ts) < chrono::Duration::seconds(refresh_secs)
             })
             .unwrap_or(false);
 
@@ -1433,11 +1431,9 @@ async fn prepare_identity_secret(
             };
             let mut minted = BTreeMap::new();
             for (filename, audience) in &audiences {
-                let jwt = state.jwt_signer.sign_workload_jwt(
-                    &subject_info,
-                    audience,
-                    IDENTITY_TOKEN_TTL_SECS,
-                )?;
+                let jwt = state
+                    .jwt_signer
+                    .sign_workload_jwt(&subject_info, audience, ttl_secs)?;
                 minted.insert(filename.clone(), jwt);
             }
             (minted, Utc::now())

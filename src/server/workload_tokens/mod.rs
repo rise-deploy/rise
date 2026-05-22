@@ -32,14 +32,13 @@ pub fn workload_subject(project: &str, environment: Option<&str>) -> String {
 /// the deployment).
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hasher
-        .finalize()
+    use std::fmt::Write;
+    Sha256::digest(bytes)
         .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+        .fold(String::with_capacity(64), |mut acc, b| {
+            write!(acc, "{b:02x}").unwrap();
+            acc
+        })
 }
 
 #[cfg(test)]

@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 pub struct ExchangeTokenRequest {
     /// Audience (`aud` claim) to mint the token for.
     pub audience: String,
+    /// Requested token lifetime in seconds. Capped at the server's configured maximum
+    /// (`workload_token_max_ttl_seconds`, default 900). Omitting this field uses the maximum.
+    pub ttl_seconds: Option<u64>,
 }
 
 /// Response from `POST /api/v1/identity/token`.
@@ -16,4 +19,6 @@ pub struct ExchangeTokenResponse {
     pub token_type: String,
     /// Token lifetime in seconds.
     pub expires_in: u64,
+    /// The audience the token was minted for.
+    pub audience: String,
 }

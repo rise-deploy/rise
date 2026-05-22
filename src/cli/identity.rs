@@ -5,6 +5,7 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 struct ExchangeTokenResponse {
     token: String,
+    expires_in: u64,
 }
 
 /// Standard in-pod path of the workload-identity bootstrap credential.
@@ -34,6 +35,7 @@ pub async fn token_command(
     http_client: &Client,
     audience: &str,
     credential: Option<&str>,
+    ttl_seconds: Option<u64>,
 ) -> Result<()> {
     let credential = resolve_credential(credential)?;
 
@@ -41,10 +43,15 @@ pub async fn token_command(
         .context("RISE_ISSUER is not set; this command runs inside a Rise deployment")?;
     let url = format!("{}/api/v1/identity/token", issuer.trim_end_matches('/'));
 
+    let mut body = serde_json::json!({ "audience": audience });
+    if let Some(ttl) = ttl_seconds {
+        body["ttl_seconds"] = serde_json::json!(ttl);
+    }
+
     let response = http_client
         .post(&url)
         .header("Authorization", format!("Bearer {}", credential))
-        .json(&serde_json::json!({ "audience": audience }))
+        .json(&body)
         .send()
         .await
         .context("Failed to send token exchange request")?;
@@ -63,6 +70,7 @@ pub async fn token_command(
         .await
         .context("Failed to parse token exchange response")?;
 
+    eprintln!("expires_in: {}s", token.expires_in);
     println!("{}", token.token);
     Ok(())
 }
