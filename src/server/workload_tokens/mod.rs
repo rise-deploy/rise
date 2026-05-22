@@ -8,15 +8,20 @@ pub mod handlers;
 pub mod models;
 pub mod routes;
 
+/// Sentinel used for the environment in workload identity claims when a
+/// deployment has no environment. Deliberately contains characters (`<`, `>`)
+/// that a real environment name cannot, so it can never collide with one.
+pub(crate) const NO_ENVIRONMENT: &str = "<null>";
+
 /// Build the subject claim for a workload identity token.
 ///
 /// Fixed and environment-aware: `rise:proj:<project>:env:<environment>`.
-/// `_none` is used literally when the deployment has no environment.
+/// [`NO_ENVIRONMENT`] is used when the deployment has no environment.
 pub fn workload_subject(project: &str, environment: Option<&str>) -> String {
     format!(
         "rise:proj:{}:env:{}",
         project,
-        environment.unwrap_or("_none")
+        environment.unwrap_or(NO_ENVIRONMENT)
     )
 }
 
@@ -51,7 +56,10 @@ mod tests {
 
     #[test]
     fn workload_subject_without_environment() {
-        assert_eq!(workload_subject("myapp", None), "rise:proj:myapp:env:_none");
+        assert_eq!(
+            workload_subject("myapp", None),
+            "rise:proj:myapp:env:<null>"
+        );
     }
 
     #[test]

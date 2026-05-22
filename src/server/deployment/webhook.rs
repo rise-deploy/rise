@@ -39,7 +39,7 @@ use crate::server::deployment::resource_builder::{
 };
 use crate::server::deployment::state_machine;
 use crate::server::state::AppState;
-use crate::server::workload_tokens::{sha256_hex, workload_subject};
+use crate::server::workload_tokens::{sha256_hex, workload_subject, NO_ENVIRONMENT};
 
 // ── Metacontroller webhook protocol types ──────────────────────────────
 
@@ -1427,7 +1427,7 @@ async fn prepare_identity_secret(
                 let jwt = state.jwt_signer.sign_workload_jwt(
                     &sub,
                     &project.name,
-                    environment_name.unwrap_or("_none"),
+                    environment_name.unwrap_or(NO_ENVIRONMENT),
                     &deployment.deployment_group,
                     &deployment.deployment_id,
                     audience,

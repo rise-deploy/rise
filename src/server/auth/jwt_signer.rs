@@ -59,7 +59,7 @@ pub struct WorkloadClaims {
     pub jti: String,
     /// Rise project name (informational)
     pub project: String,
-    /// Rise environment name (informational; `_none` if the deployment has none)
+    /// Rise environment name (informational; `<null>` if the deployment has none)
     pub environment: String,
     /// Deployment group (informational)
     pub deployment_group: String,

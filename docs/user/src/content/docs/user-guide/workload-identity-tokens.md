@@ -23,7 +23,7 @@ verifier can validate it.
 | Claim | Value |
 |---|---|
 | `iss` | Your Rise backend URL |
-| `sub` | `rise:proj:<project>:env:<environment>` (`_none` if the deployment has no environment) |
+| `sub` | `rise:proj:<project>:env:<environment>` (`<null>` if the deployment has no environment) |
 | `aud` | The audience you requested |
 | `exp` / `iat` / `nbf` | Lifetime bounds |
 | `jti` | Unique token ID |

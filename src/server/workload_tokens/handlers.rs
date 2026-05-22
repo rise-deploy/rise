@@ -8,7 +8,7 @@ use crate::server::deployment::webhook::should_have_infrastructure;
 use crate::server::error::{ServerError, ServerErrorExt};
 use crate::server::state::AppState;
 use crate::server::workload_tokens::models::{ExchangeTokenRequest, ExchangeTokenResponse};
-use crate::server::workload_tokens::{sha256_hex, workload_subject};
+use crate::server::workload_tokens::{sha256_hex, workload_subject, NO_ENVIRONMENT};
 
 /// Lifetime of exchange-endpoint workload identity tokens.
 const WORKLOAD_TOKEN_TTL_SECS: u64 = 900;
@@ -48,8 +48,8 @@ pub async fn exchange_token(
 
     // Resolve the environment name. A deployment with `environment_id = Some(..)`
     // MUST have a matching environment row — if the lookup yields `None`, fail
-    // closed rather than minting a token with the `_none` environment, which
-    // would be a wrong, potentially cross-environment identity.
+    // closed rather than minting a token with the `NO_ENVIRONMENT` sentinel,
+    // which would be a wrong, potentially cross-environment identity.
     let environment = match deployment.environment_id {
         Some(env_id) => {
             let env = db_environments::find_by_id(&state.db_pool, env_id)
@@ -72,7 +72,7 @@ pub async fn exchange_token(
         .sign_workload_jwt(
             &sub,
             &project.name,
-            environment.as_deref().unwrap_or("_none"),
+            environment.as_deref().unwrap_or(NO_ENVIRONMENT),
             &deployment.deployment_group,
             &deployment.deployment_id,
             audience,
