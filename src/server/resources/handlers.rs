@@ -281,8 +281,6 @@ fn assert_body_matches(
     info: &CollectionInfo,
     body_api_version: &str,
     body_kind: &str,
-    body_name: &str,
-    url_name: &str,
 ) -> Result<(), ServerError> {
     if !info
         .served_api_versions
@@ -299,14 +297,6 @@ fn assert_body_matches(
         return Err(ServerError::bad_request(format!(
             "body kind '{body_kind}' does not match collection ({})",
             info.kind
-        )));
-    }
-    // For plain-name URLs the body's name must match the URL segment. For
-    // `uid:<uuid>` URLs the URL segment doesn't constrain the name, but
-    // `update_resource` still requires the body name to match the stored row.
-    if !url_name.starts_with("uid:") && body_name != url_name {
-        return Err(ServerError::bad_request(format!(
-            "body metadata.name '{body_name}' does not match URL name '{url_name}'"
         )));
     }
     Ok(())
@@ -340,16 +330,6 @@ enum LeafRef {
     Uid(Uuid),
 }
 
-impl LeafRef {
-    /// The identifier as it appeared in the URL — a bare name, or `uid:<uuid>`.
-    fn url_name(&self) -> String {
-        match self {
-            LeafRef::Named { name, .. } => name.clone(),
-            LeafRef::Uid(uid) => format!("{UID_PREFIX}{uid}"),
-        }
-    }
-}
-
 /// A resource path classified against the leaf kind's parent-chain depth.
 enum ResolvedPath {
     /// `pending-deletion`: resources tombstoned and awaiting GC.
@@ -374,14 +354,22 @@ enum ResolvedPath {
 
 /// Build the "wrong number of segments" 400 for a named path.
 fn segment_count_error(resolved: &ResolvedCollection, depth: usize, got: usize) -> ServerError {
-    ServerError::bad_request(format!(
-        "collection '{}' has parent-chain depth {depth}: a list expects {depth} ancestor \
-         name segment(s), an item {}, a subresource {} (the item name plus a subresource \
-         keyword); got {got}",
-        resolved.collection,
-        depth + 1,
-        depth + 2,
-    ))
+    if depth == 0 {
+        ServerError::bad_request(format!(
+            "collection '{}' is root-scoped: an item path takes 1 name segment, \
+             a subresource path takes 2 (got {got})",
+            resolved.info.kind
+        ))
+    } else {
+        ServerError::bad_request(format!(
+            "collection '{}' has parent-chain depth {depth}: a list expects {depth} ancestor \
+             name segment(s), an item {}, a subresource {} (the item name plus a subresource \
+             keyword); got {got}",
+            resolved.info.kind,
+            depth + 1,
+            depth + 2,
+        ))
+    }
 }
 
 /// Classify a parsed resource path against the resource store.
@@ -520,14 +508,14 @@ async fn resolve_parent_row(
 async fn resolve_leaf(
     store: &Arc<dyn ResourceStore>,
     resolved: &ResolvedCollection,
-    leaf: LeafRef,
+    leaf: &LeafRef,
 ) -> Result<ResourceRow, ServerError> {
     match leaf {
         LeafRef::Named {
             ancestor_segs,
             name,
-        } => resolve_item(store, ancestor_segs, &resolved.info, &name).await,
-        LeafRef::Uid(uid) => resolve_item_by_uid(store, resolved, uid).await,
+        } => resolve_item(store, ancestor_segs.clone(), &resolved.info, name).await,
+        LeafRef::Uid(uid) => resolve_item_by_uid(store, resolved, *uid).await,
     }
 }
 
@@ -599,7 +587,7 @@ async fn dispatch_get_inner(
             .into_response())
         }
         ResolvedPath::Item { resolved, leaf } => {
-            let row = resolve_leaf(&ctx.store, &resolved, leaf).await?;
+            let row = resolve_leaf(&ctx.store, &resolved, &leaf).await?;
             Ok(Json(row_to_resource_with_api_version(
                 &row,
                 &resolved.info.api_version,
@@ -698,9 +686,8 @@ async fn dispatch_put_inner(
             };
             let body: UpdateResourceRequest = serde_json::from_value(body)
                 .map_err(|e| ServerError::bad_request(format!("invalid request body: {e}")))?;
-            let url_name = leaf.url_name();
-            let row = resolve_leaf(&ctx.store, &resolved, leaf).await?;
-            let resp = update_resource(ctx, &resolved, &row, &url_name, body, &user).await?;
+            let row = resolve_leaf(&ctx.store, &resolved, &leaf).await?;
+            let resp = update_resource(ctx, &resolved, &row, &leaf, body, &user).await?;
             Ok(resp.into_response())
         }
         ResolvedPath::Subresource {
@@ -708,53 +695,82 @@ async fn dispatch_put_inner(
             leaf,
             subresource,
         } => {
-            // User tokens cannot update status/finalizers. The caller is
-            // authenticated (a user/SA token), so this is an authorization
-            // failure (403), not an authentication failure (401).
-            let controller = match &auth {
-                AnyAuth::Controller(ctrl) => ctrl,
+            let row = resolve_leaf(&ctx.store, &resolved, &leaf).await?;
+            match auth {
+                AnyAuth::Controller(ref controller) => {
+                    enforce_controller_allowed(
+                        &resolved.info,
+                        &resolved.collection,
+                        &controller.0.identity_id,
+                    )?;
+                    match subresource {
+                        Subresource::Status => {
+                            let body: ControllerStatusUpdate = serde_json::from_value(body)
+                                .map_err(|e| {
+                                    ServerError::bad_request(format!("invalid request body: {e}"))
+                                })?;
+                            let resp = apply_controller_status(
+                                ctx,
+                                controller,
+                                &row,
+                                body,
+                                &resolved.info.api_version,
+                            )
+                            .await?;
+                            Ok(resp.into_response())
+                        }
+                        Subresource::Finalizers => {
+                            let body: ControllerFinalizerUpdate = serde_json::from_value(body)
+                                .map_err(|e| {
+                                    ServerError::bad_request(format!("invalid request body: {e}"))
+                                })?;
+                            let resp = apply_controller_finalizers(
+                                ctx,
+                                controller,
+                                &row,
+                                body,
+                                &resolved.info.api_version,
+                            )
+                            .await?;
+                            Ok(resp.into_response())
+                        }
+                    }
+                }
                 AnyAuth::User(_) => {
-                    return Err(ServerError::forbidden(
-                        "controller authentication required for status/finalizer updates",
-                    ));
-                }
-            };
-            enforce_controller_allowed(
-                &resolved.info,
-                &resolved.collection,
-                &controller.0.identity_id,
-            )?;
-            let row = resolve_leaf(&ctx.store, &resolved, leaf).await?;
-            match subresource {
-                Subresource::Status => {
-                    let body: ControllerStatusUpdate =
-                        serde_json::from_value(body).map_err(|e| {
-                            ServerError::bad_request(format!("invalid request body: {e}"))
-                        })?;
-                    let resp = apply_controller_status(
-                        ctx,
-                        controller,
-                        &row,
-                        body,
-                        &resolved.info.api_version,
-                    )
-                    .await?;
-                    Ok(resp.into_response())
-                }
-                Subresource::Finalizers => {
-                    let body: ControllerFinalizerUpdate =
-                        serde_json::from_value(body).map_err(|e| {
-                            ServerError::bad_request(format!("invalid request body: {e}"))
-                        })?;
-                    let resp = apply_controller_finalizers(
-                        ctx,
-                        controller,
-                        &row,
-                        body,
-                        &resolved.info.api_version,
-                    )
-                    .await?;
-                    Ok(resp.into_response())
+                    // Operators have unrestricted access to all subresources.
+                    let user = operator_user.expect("operator_user is Some for AnyAuth::User");
+                    match subresource {
+                        Subresource::Status => {
+                            let body: ControllerStatusUpdate = serde_json::from_value(body)
+                                .map_err(|e| {
+                                    ServerError::bad_request(format!("invalid request body: {e}"))
+                                })?;
+                            let resp = apply_operator_status(
+                                ctx,
+                                &user,
+                                &row,
+                                body,
+                                &resolved.info.api_version,
+                            )
+                            .await?;
+                            Ok(resp.into_response())
+                        }
+                        Subresource::Finalizers => {
+                            let body: ControllerFinalizerUpdate = serde_json::from_value(body)
+                                .map_err(|e| {
+                                    ServerError::bad_request(format!("invalid request body: {e}"))
+                                })?;
+                            let resp = apply_operator_finalizers(
+                                ctx,
+                                &user,
+                                &row,
+                                body,
+                                &resolved.info.api_version,
+                            )
+                            .await?;
+                            Ok(resp.into_response())
+                        }
+                    }
                 }
             }
         }
@@ -783,9 +799,8 @@ async fn dispatch_delete_inner(
     let user = require_operator(ctx, &auth)?;
     match classify_path(&ctx.store, raw_path).await? {
         ResolvedPath::Item { resolved, leaf } => {
-            let row = resolve_leaf(&ctx.store, &resolved, leaf).await?;
-            let resp = delete_resource(ctx, &row, &user, &resolved.info.api_version).await?;
-            Ok(resp.into_response())
+            let row = resolve_leaf(&ctx.store, &resolved, &leaf).await?;
+            delete_resource(ctx, &row, &user, &resolved.info.api_version).await
         }
         _ => Err(ServerError::new(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -805,6 +820,18 @@ async fn create_resource(
     body: CreateResourceRequest,
     user: &User,
 ) -> Result<(StatusCode, Json<rise_resource_api::Resource>), ServerError> {
+    // Reject writes to non-storage versions until version conversion is implemented.
+    if resolved.info.api_version != resolved.info.storage_api_version {
+        return Err(ServerError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "writes to version '{}' are not supported; the storage version is '{}' \
+                 (version conversion is not yet implemented — use the storage version for writes)",
+                resolved.info.api_version, resolved.info.storage_api_version
+            ),
+        ));
+    }
+
     // POST creates have no URL name segment — only validate type identity.
     if !resolved
         .info
@@ -878,17 +905,39 @@ async fn update_resource(
     ctx: &ResourceApiCtx,
     resolved: &ResolvedCollection,
     row: &ResourceRow,
-    url_name: &str,
+    leaf: &LeafRef,
     body: UpdateResourceRequest,
     user: &User,
 ) -> Result<Json<rise_resource_api::Resource>, ServerError> {
-    assert_body_matches(
-        &resolved.info,
-        &body.api_version,
-        &body.kind,
-        &body.metadata.name,
-        url_name,
-    )?;
+    // Reject writes to non-storage versions until version conversion is implemented.
+    if resolved.info.api_version != resolved.info.storage_api_version {
+        return Err(ServerError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "writes to version '{}' are not supported; the storage version is '{}' \
+                 (version conversion is not yet implemented — use the storage version for writes)",
+                resolved.info.api_version, resolved.info.storage_api_version
+            ),
+        ));
+    }
+
+    assert_body_matches(&resolved.info, &body.api_version, &body.kind)?;
+
+    // For named-form URLs the body name must match the URL segment. For
+    // `uid:` URLs the URL segment doesn't constrain the name, but the body
+    // name must still match the stored row (checked below).
+    if let LeafRef::Named {
+        name: url_leaf_name,
+        ..
+    } = leaf
+    {
+        if body.metadata.name != *url_leaf_name {
+            return Err(ServerError::bad_request(format!(
+                "body metadata.name '{}' does not match URL name '{}'",
+                body.metadata.name, url_leaf_name
+            )));
+        }
+    }
 
     if body.metadata.name != row.name {
         return Err(ServerError::bad_request(format!(
@@ -943,7 +992,7 @@ async fn delete_resource(
     row: &ResourceRow,
     user: &User,
     response_api_version: &str,
-) -> Result<Json<serde_json::Value>, ServerError> {
+) -> Result<Response, ServerError> {
     let outcome = ctx
         .store
         .delete(row.uid)
@@ -962,15 +1011,22 @@ async fn delete_resource(
         "resource.deleted"
     );
 
-    let body = match outcome {
-        DeleteOutcome::Deleted => serde_json::json!({"deleted": true, "uid": row.uid}),
-        DeleteOutcome::MarkedForDeletion(marked) => serde_json::json!({
-            "deleted": false,
-            "markedForDeletion": true,
-            "resource": row_to_resource_with_api_version(&marked, response_api_version),
-        }),
-    };
-    Ok(Json(body))
+    match outcome {
+        DeleteOutcome::Deleted => Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({"deleted": true, "uid": row.uid})),
+        )
+            .into_response()),
+        DeleteOutcome::MarkedForDeletion(marked) => Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "deleted": false,
+                "markedForDeletion": true,
+                "resource": row_to_resource_with_api_version(&marked, response_api_version),
+            })),
+        )
+            .into_response()),
+    }
 }
 
 async fn apply_controller_status(
@@ -985,6 +1041,15 @@ async fn apply_controller_status(
         .update_controller_status(row.uid, &controller.0.identity_id, body.status)
         .await
         .map_err(store_error_to_server_error)?;
+    tracing::info!(
+        target: "rise::audit",
+        actor = %controller.0.identity_id,
+        uid = %row.uid,
+        api_version = %row.api_version,
+        kind = %row.kind,
+        name = %row.name,
+        "resource.controller_status_updated"
+    );
     Ok(Json(row_to_resource_with_api_version(
         &updated,
         response_api_version,
@@ -1003,6 +1068,69 @@ async fn apply_controller_finalizers(
         .update_controller_finalizers(row.uid, &controller.0.identity_id, &body.add, &body.remove)
         .await
         .map_err(store_error_to_server_error)?;
+    tracing::info!(
+        target: "rise::audit",
+        actor = %controller.0.identity_id,
+        uid = %row.uid,
+        api_version = %row.api_version,
+        kind = %row.kind,
+        name = %row.name,
+        "resource.controller_finalizers_updated"
+    );
+    Ok(Json(row_to_resource_with_api_version(
+        &updated,
+        response_api_version,
+    )))
+}
+
+async fn apply_operator_status(
+    ctx: &ResourceApiCtx,
+    user: &User,
+    row: &ResourceRow,
+    body: ControllerStatusUpdate,
+    response_api_version: &str,
+) -> Result<Json<rise_resource_api::Resource>, ServerError> {
+    let updated = ctx
+        .store
+        .operator_update_status(row.uid, &user.email, body.status)
+        .await
+        .map_err(store_error_to_server_error)?;
+    tracing::info!(
+        target: "rise::audit",
+        actor = %user.email,
+        uid = %row.uid,
+        api_version = %row.api_version,
+        kind = %row.kind,
+        name = %row.name,
+        "resource.operator_status_updated"
+    );
+    Ok(Json(row_to_resource_with_api_version(
+        &updated,
+        response_api_version,
+    )))
+}
+
+async fn apply_operator_finalizers(
+    ctx: &ResourceApiCtx,
+    user: &User,
+    row: &ResourceRow,
+    body: ControllerFinalizerUpdate,
+    response_api_version: &str,
+) -> Result<Json<rise_resource_api::Resource>, ServerError> {
+    let updated = ctx
+        .store
+        .operator_update_finalizers(row.uid, &user.email, &body.add, &body.remove)
+        .await
+        .map_err(store_error_to_server_error)?;
+    tracing::info!(
+        target: "rise::audit",
+        actor = %user.email,
+        uid = %row.uid,
+        api_version = %row.api_version,
+        kind = %row.kind,
+        name = %row.name,
+        "resource.operator_finalizers_updated"
+    );
     Ok(Json(row_to_resource_with_api_version(
         &updated,
         response_api_version,
@@ -1014,7 +1142,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn assert_body_matches_uid_url_does_not_enforce_name() {
+    fn assert_body_matches_validates_api_version_and_kind() {
         let info = CollectionInfo {
             api_version: "rise.dev/v1alpha1".into(),
             storage_api_version: "rise.dev/v1alpha1".into(),
@@ -1026,29 +1154,14 @@ mod tests {
             allowed_status_controller_ids: vec![],
         };
 
-        // UID-form URL: body name need not match (typical UID-prefixed paths).
-        assert!(assert_body_matches(
-            &info,
-            "rise.dev/v1alpha1",
-            "Organization",
-            "acme",
-            "uid:00000000-0000-0000-0000-000000000000",
-        )
-        .is_ok());
-
-        // Name-form URL: body name must match.
-        assert!(
-            assert_body_matches(&info, "rise.dev/v1alpha1", "Organization", "acme", "other",)
-                .is_err()
-        );
+        // Matching apiVersion and kind must be accepted.
+        assert!(assert_body_matches(&info, "rise.dev/v1alpha1", "Organization",).is_ok());
 
         // Wrong apiVersion.
-        assert!(assert_body_matches(&info, "wrong/v1", "Organization", "acme", "acme",).is_err());
+        assert!(assert_body_matches(&info, "wrong/v1", "Organization",).is_err());
 
         // Wrong kind.
-        assert!(
-            assert_body_matches(&info, "rise.dev/v1alpha1", "Widget", "acme", "acme",).is_err()
-        );
+        assert!(assert_body_matches(&info, "rise.dev/v1alpha1", "Widget",).is_err());
     }
 
     fn collection_info(allowed: Vec<String>) -> CollectionInfo {
@@ -1354,37 +1467,64 @@ mod dispatch_tests {
     }
 
     // -------------------------------------------------------------------------
-    // Auth tier: status/finalizers require a controller token (Fix E)
+    // Auth tier: status/finalizers — operators can write, non-operators cannot
     // -------------------------------------------------------------------------
 
     #[sqlx::test]
-    async fn status_subresource_rejects_user_token_with_403(pool: sqlx::PgPool) {
+    async fn status_subresource_rejects_non_operator_user_with_403(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
         register_widget_rd(&ctx, &["controller.example.com"]).await;
         create_widget(&ctx, "example.dev/v1", "w1").await;
 
-        // Fix E: an authenticated user hitting a controller subresource is an
-        // authorization failure (403), not an authentication failure (401).
+        // A non-operator user hitting a subresource path must be rejected with 403.
         let err = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/w1/status".to_string(),
-            any_user(OPERATOR),
+            any_user(PLAIN_USER),
             json!({"status": {"phase": "Ready"}}),
         )
         .await
-        .expect_err("user token must be rejected for status writes");
+        .expect_err("non-operator user must be rejected for status writes");
         assert_eq!(err.status, StatusCode::FORBIDDEN);
 
         // Same for finalizers.
         let err = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/w1/finalizers".to_string(),
-            any_user(OPERATOR),
+            any_user(PLAIN_USER),
             json!({"add": ["x/y"], "remove": []}),
         )
         .await
-        .expect_err("user token must be rejected for finalizer writes");
+        .expect_err("non-operator user must be rejected for finalizer writes");
         assert_eq!(err.status, StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test]
+    async fn status_subresource_allows_operator_user(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx, &["controller.example.com"]).await;
+        create_widget(&ctx, "example.dev/v1", "w1").await;
+
+        // An operator user can write status and finalizers without a controller token.
+        let resp = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/w1/status".to_string(),
+            any_user(OPERATOR),
+            json!({"status": {"phase": "Ready"}}),
+        )
+        .await
+        .expect("operator status write must succeed");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/w1/finalizers".to_string(),
+            any_user(OPERATOR),
+            json!({"add": ["some.controller/cleanup"], "remove": []}),
+        )
+        .await
+        .expect("operator finalizer write must succeed");
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[sqlx::test]
@@ -1625,6 +1765,55 @@ mod dispatch_tests {
         .await
         .expect_err("undefined version must not resolve to a collection");
         assert_eq!(err.status, StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    async fn write_to_non_storage_version_yields_422(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        // `register_widget_rd` registers v1 as storage, v2 as served non-storage.
+        register_widget_rd(&ctx, &[]).await;
+
+        // POST to the non-storage served version v2 must be rejected with 422.
+        let err = dispatch_post_inner(
+            &ctx,
+            "example.dev/v2/widgets".to_string(),
+            auth(OPERATOR),
+            widget_body("example.dev/v2", "w1"),
+        )
+        .await
+        .expect_err("write to non-storage version must be 422");
+        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        // Seed a widget at the storage version directly so the PUT test has a row.
+        ctx.store
+            .create(CreateResourceParams {
+                api_version: "example.dev/v1".to_string(),
+                kind: "Widget".to_string(),
+                name: "w1".to_string(),
+                parent_uid: None,
+                annotations: BTreeMap::new(),
+                finalizers: vec![],
+                spec: serde_json::json!({"size": "large"}),
+                validator: None,
+            })
+            .await
+            .expect("create widget at storage v1");
+
+        // PUT to the non-storage served version v2 must also be rejected.
+        let err = dispatch_put_inner(
+            &ctx,
+            "example.dev/v2/widgets/w1".to_string(),
+            any_user(OPERATOR),
+            json!({
+                "apiVersion": "example.dev/v2",
+                "kind": "Widget",
+                "metadata": {"name": "w1", "revision": 1},
+                "spec": {"size": "medium"},
+            }),
+        )
+        .await
+        .expect_err("PUT to non-storage version must be 422");
+        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     // -------------------------------------------------------------------------
@@ -1916,18 +2105,22 @@ mod dispatch_tests {
             .await
             .expect("register widgets RD");
 
-        // Create through the served v2 endpoint — the row lands at storage v1.
-        let resp = dispatch_post_inner(
-            &ctx,
-            "example.dev/v2/widgets".to_string(),
-            auth(OPERATOR),
-            widget_body("example.dev/v2", "w1"),
-        )
-        .await
-        .expect("create widget via v2");
-        let (status, created) = read(resp).await;
-        assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(created["apiVersion"], "example.dev/v2");
+        // Create directly via the store at the (non-served) storage version v1.
+        // Writing to v2 via the HTTP dispatch layer is rejected (Change 4 — writes
+        // to non-storage versions are not supported), so we seed the row directly.
+        ctx.store
+            .create(CreateResourceParams {
+                api_version: "example.dev/v1".to_string(),
+                kind: "Widget".to_string(),
+                name: "w1".to_string(),
+                parent_uid: None,
+                annotations: BTreeMap::new(),
+                finalizers: vec![],
+                spec: serde_json::json!({"size": "large"}),
+                validator: None,
+            })
+            .await
+            .expect("create widget at storage v1");
 
         // GET via v2 must find the row stored at the non-served v1.
         let resp = dispatch_get_inner(

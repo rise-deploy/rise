@@ -33,6 +33,8 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 When a UID-prefixed identifier is used in a PUT URL, the body's `metadata.name` is not validated against the URL. It still must match the stored resource name.
 
+The `uid:` form skips ancestor-chain resolution entirely — it does not walk or validate the parent hierarchy. This means it works even if an ancestor `ResourceDefinition` has been removed from the system. This is the intended recovery path in disaster scenarios: if an RD is deleted while instances still exist, named addressing will fail because the ancestor chain can no longer be resolved, but a controller can still write status or finalizers to a resource via `uid:`, and operators can reach any resource regardless of whether its parent hierarchy is intact.
+
 ## Discriminator
 
 Every resource carries a system-generated 8-character `discriminator`. It is unique among all resources that share the same parent (its siblings), regardless of kind — but **not** unique across different parents or globally.
@@ -43,10 +45,12 @@ Like `name`, the discriminator identifies a resource within its sibling scope. U
 
 | Tier | Credentials | Permitted operations |
 |---|---|---|
-| Operator | Listed in `auth.operator_users` | GET, POST, item PUT, DELETE |
+| Operator | Listed in `auth.operator_users` | GET, POST, item PUT, DELETE, PUT `status` and `finalizers` |
 | Controller | Configured `ControllerIdentity` token | PUT `status` and `finalizers`, gated by `allowed_status_controller_ids` |
 
 Controller tokens cannot perform item-level PUT or other operator operations.
+
+Operators have full, unrestricted access to all resource API endpoints including the `status` and `finalizers` subresources. When an operator updates finalizers, controller ownership checks are bypassed — this is the intended recovery path for stuck cascade deletions when a controller has been deprovisioned. All operator subresource writes are audit-logged.
 
 ## Resource Definitions
 
@@ -67,11 +71,15 @@ Version behavior follows Kubernetes-style semantics:
 - A version cannot be removed from a `ResourceDefinition` while resources are still stored at it.
 - Conversion is currently no-op only: the API projects `apiVersion` but does not transform `spec`.
 
+Reads (GET/LIST) work for any served version. Writes (POST/PUT) must use the storage version — there is currently no version conversion webhook support, so a write targeting a served non-storage version is rejected with `422 Unprocessable Entity`. Version conversion (allowing writes to any served version with automatic conversion to storage) is planned for a future release.
+
 ## Deletion
 
 `DELETE` always cascades: the resource and its entire subtree are removed. The resource is tombstoned, its subtree drains as finalizers clear, and rows are collected bottom-up.
 
 `GET /api/v1/resources/pending-deletion` lists resources that are tombstoned and still draining — useful for spotting a deletion stuck on a finalizer. Accepts a `limit` query parameter (1–1000, default 100).
+
+Tombstoned resources (those pending cascade deletion) also appear in normal list responses — `GET` collection endpoints return them alongside live resources. They are identifiable by the presence of `metadata.deletionTimestamp`. This differs from kubectl's default behavior, which hides terminating resources; the resource API surfaces them explicitly so consumers can react to in-progress deletions. Use `pending-deletion` for an operator-level view of all tombstoned resources across the entire system.
 
 ```bash
 curl -X DELETE \

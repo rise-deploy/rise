@@ -184,6 +184,30 @@ pub trait ResourceStore: Send + Sync {
         remove: &[String],
     ) -> Result<ResourceRow, StoreError>;
 
+    /// Force-update a resource's status as an operator, bypassing controller restrictions.
+    ///
+    /// Stores the status under `status.controllers.operator:<operator>` (same nested
+    /// structure as `update_controller_status` but using the operator identifier as the key).
+    async fn operator_update_status(
+        &self,
+        uid: Uuid,
+        operator: &str,
+        status_value: serde_json::Value,
+    ) -> Result<ResourceRow, StoreError>;
+
+    /// Force-update a resource's finalizers as an operator, bypassing controller ownership checks.
+    ///
+    /// Applies the same `add`/`remove` logic as `update_controller_finalizers` but without
+    /// the controller-ownership check on each finalizer. Still blocks modifying
+    /// `system.rise.dev/*` finalizers to prevent cascade deletion corruption.
+    async fn operator_update_finalizers(
+        &self,
+        uid: Uuid,
+        operator: &str,
+        add: &[String],
+        remove: &[String],
+    ) -> Result<ResourceRow, StoreError>;
+
     async fn resolve_collection(
         &self,
         collection: &str,

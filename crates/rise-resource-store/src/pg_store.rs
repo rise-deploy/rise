@@ -1017,6 +1017,97 @@ impl ResourceStore for PgResourceStore {
         Ok(row)
     }
 
+    async fn operator_update_status(
+        &self,
+        uid: Uuid,
+        operator: &str,
+        status_value: serde_json::Value,
+    ) -> Result<ResourceRow, StoreError> {
+        // Store under `status.controllers.operator:<operator>` — same nested
+        // structure as update_controller_status but with the operator key.
+        let operator_key = format!("operator:{operator}");
+        let row = sqlx::query_as::<_, ResourceRow>(
+            r#"
+            UPDATE resource_store.resources
+            SET status = status || jsonb_build_object(
+                    'controllers',
+                    COALESCE(status->'controllers', '{}'::jsonb)
+                    || jsonb_build_object($2::text, $3::jsonb)
+                ),
+                revision   = revision + 1,
+                updated_at = NOW()
+            WHERE uid = $1
+            RETURNING *
+            "#,
+        )
+        .bind(uid)
+        .bind(&operator_key)
+        .bind(status_value)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+
+        Ok(row)
+    }
+
+    async fn operator_update_finalizers(
+        &self,
+        uid: Uuid,
+        operator: &str,
+        add: &[String],
+        remove: &[String],
+    ) -> Result<ResourceRow, StoreError> {
+        // Block system-managed finalizers — operators must not clear cascade
+        // deletion finalizers to prevent GC corruption.
+        for f in add.iter().chain(remove.iter()) {
+            if f.starts_with(SYSTEM_FINALIZER_PREFIX) {
+                return Err(StoreError::ReservedFinalizer(f.clone()));
+            }
+        }
+
+        let _ = operator; // operator identity is recorded in the audit log by the handler
+
+        let mut tx = self.pool.begin().await?;
+
+        let current = sqlx::query_as::<_, ResourceRow>(
+            "SELECT * FROM resource_store.resources WHERE uid = $1 FOR UPDATE",
+        )
+        .bind(uid)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+
+        let remove_set: std::collections::HashSet<&str> =
+            remove.iter().map(String::as_str).collect();
+        let mut new_finalizers: Vec<String> = current
+            .finalizers
+            .into_iter()
+            .filter(|f| !remove_set.contains(f.as_str()))
+            .collect();
+        for f in add {
+            if !new_finalizers.contains(f) {
+                new_finalizers.push(f.clone());
+            }
+        }
+
+        let row = sqlx::query_as::<_, ResourceRow>(
+            r#"
+            UPDATE resource_store.resources
+            SET finalizers = $1, revision = revision + 1, updated_at = NOW()
+            WHERE uid = $2
+            RETURNING *
+            "#,
+        )
+        .bind(&new_finalizers)
+        .bind(uid)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(row)
+    }
+
     async fn resolve_collection(
         &self,
         collection: &str,
