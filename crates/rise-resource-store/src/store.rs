@@ -75,6 +75,8 @@ impl std::fmt::Debug for DeleteOutcome {
 }
 
 pub struct CollectionInfo {
+    /// The requested/served API version for this collection (used for response projection).
+    /// This is NOT the storage version; see `storage_api_version` for that.
     pub api_version: String,
     pub storage_api_version: String,
     pub served_api_versions: Vec<String>,

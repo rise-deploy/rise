@@ -244,6 +244,7 @@ impl PgResourceStore {
               AND spec->>'group' = $2
               AND spec->>'kind' = $3
               AND spec->'versions' @> $4::jsonb
+              AND deletion_timestamp IS NULL
             FOR SHARE
             "#,
         )

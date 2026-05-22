@@ -2,8 +2,6 @@
 //!
 //! This module provides the *pure-syntax* half of resource-path handling:
 //!
-//! * [`parse_identifier`] — turns a single `<identifier>` segment into a
-//!   `PathSegment` (name or `uid:<uuid>` form) for the resource store.
 //! * [`parse_uid_token`] — parses a `uid:<uuid>` token into its `Uuid`.
 //! * [`parse_resource_path`] — splits a full resource URL path into a
 //!   [`RawResourcePath`]: the leaf collection (`{group}/{version}/{plural}`)
@@ -14,7 +12,6 @@
 //! knowing the leaf kind's parent-chain depth, which only the resource store
 //! knows. Store-aware classification lives in [`super::handlers`].
 
-use rise_resource_store::PathSegment;
 use uuid::Uuid;
 
 use crate::server::error::ServerError;
@@ -33,30 +30,6 @@ pub fn parse_uid_token(raw: &str) -> Result<Uuid, ServerError> {
     rest.parse().map_err(|_| {
         ServerError::bad_request(format!("invalid uid token '{raw}': expected uid:<uuid>"))
     })
-}
-
-/// Parse a URL path identifier into a `PathSegment`.
-///
-/// A bare value is treated as a name; a `uid:<uuid>` prefix selects a UID.
-/// Malformed UIDs return 400 — the caller does not need to distinguish.
-pub fn parse_identifier(
-    api_version: &str,
-    kind: &str,
-    raw: &str,
-) -> Result<PathSegment, ServerError> {
-    if raw.starts_with(UID_PREFIX) {
-        Ok(PathSegment::Uid {
-            api_versions: vec![api_version.to_string()],
-            kind: kind.to_string(),
-            uid: parse_uid_token(raw)?,
-        })
-    } else {
-        Ok(PathSegment::Name {
-            api_versions: vec![api_version.to_string()],
-            kind: kind.to_string(),
-            name: raw.to_string(),
-        })
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -152,58 +125,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_name() {
-        let seg = parse_identifier("rise.dev/v1alpha1", "Organization", "acme").unwrap();
-        match seg {
-            PathSegment::Name {
-                api_versions,
-                kind,
-                name,
-            } => {
-                assert_eq!(api_versions, vec!["rise.dev/v1alpha1"]);
-                assert_eq!(kind, "Organization");
-                assert_eq!(name, "acme");
-            }
-            other => panic!("expected Name, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_uid_token() {
+    fn parse_uid_token_succeeds_for_valid_uuid() {
         let uid = Uuid::new_v4();
         let raw = format!("uid:{uid}");
-        let seg = parse_identifier("rise.dev/v1alpha1", "Organization", &raw).unwrap();
-        match seg {
-            PathSegment::Uid {
-                api_versions,
-                kind,
-                uid: got,
-            } => {
-                assert_eq!(api_versions, vec!["rise.dev/v1alpha1"]);
-                assert_eq!(kind, "Organization");
-                assert_eq!(got, uid);
-            }
-            other => panic!("expected Uid, got {other:?}"),
-        }
+        assert_eq!(parse_uid_token(&raw).unwrap(), uid);
     }
 
     #[test]
-    fn rejects_malformed_uid_token() {
-        let err =
-            parse_identifier("rise.dev/v1alpha1", "Organization", "uid:not-a-uuid").unwrap_err();
+    fn parse_uid_token_rejects_malformed_uuid() {
+        let err = parse_uid_token("uid:not-a-uuid").unwrap_err();
         assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
         assert!(err.message.contains("invalid uid token"));
     }
 
     #[test]
-    fn does_not_treat_uid_substring_as_uid_token() {
-        // Only the literal `uid:` prefix triggers the UID branch; `myuid:x` is a name.
-        let seg = parse_identifier("example.dev/v1", "Widget", "myuid:abcd").unwrap();
-        assert!(matches!(seg, PathSegment::Name { .. }));
-    }
-
-    #[test]
-    fn parse_uid_token_rejects_non_uid() {
+    fn parse_uid_token_rejects_non_uid_prefix() {
         let err = parse_uid_token("acme").unwrap_err();
         assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
     }

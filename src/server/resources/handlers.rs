@@ -29,8 +29,7 @@ use super::models::{
     ControllerStatusUpdate, ResourceList,
 };
 use super::path::{
-    parse_identifier, parse_resource_path, parse_uid_token, CollectionRef, RawResourcePath,
-    Subresource, UID_PREFIX,
+    parse_resource_path, parse_uid_token, CollectionRef, RawResourcePath, Subresource, UID_PREFIX,
 };
 use crate::db::models::User;
 use crate::server::auth::context::{AnyAuth, AuthContext};
@@ -156,21 +155,18 @@ fn path_segment(
     kind: &str,
     raw: &str,
 ) -> Result<PathSegment, ServerError> {
-    match parse_identifier(
-        api_versions.first().map(String::as_str).unwrap_or_default(),
-        kind,
-        raw,
-    )? {
-        PathSegment::Name { name, .. } => Ok(PathSegment::Name {
+    if raw.starts_with(UID_PREFIX) {
+        Ok(PathSegment::Uid {
             api_versions: api_versions.to_vec(),
             kind: kind.to_string(),
-            name,
-        }),
-        PathSegment::Uid { uid, .. } => Ok(PathSegment::Uid {
+            uid: parse_uid_token(raw)?,
+        })
+    } else {
+        Ok(PathSegment::Name {
             api_versions: api_versions.to_vec(),
             kind: kind.to_string(),
-            uid,
-        }),
+            name: raw.to_string(),
+        })
     }
 }
 
@@ -681,6 +677,11 @@ async fn dispatch_put_inner(
     } else {
         None
     };
+    // `classify_path` performs store I/O (resolving the collection) before the
+    // controller token is rejected for item-level paths. This means a controller
+    // token can observe whether a collection (ResourceDefinition) exists. This
+    // is acceptable: controllers can already probe collection existence via GET
+    // requests to listing paths, so the information is not meaningfully secret.
     match classify_path(&ctx.store, raw_path).await? {
         ResolvedPath::Item { resolved, leaf } => {
             // Controller tokens must not update items
