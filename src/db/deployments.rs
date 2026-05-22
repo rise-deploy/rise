@@ -808,9 +808,14 @@ pub async fn clear_needs_reconcile(pool: &PgPool, id: Uuid) -> Result<()> {
     Ok(())
 }
 
-/// Find a deployment by the SHA-256 hash of its workload-identity bootstrap credential.
+/// Find a deployment by its workload-identity bootstrap credential hash.
 ///
-/// Used by the token-exchange endpoint to authenticate a deployed app.
+/// **Security note**: the caller MUST filter the result through
+/// `should_have_infrastructure` before treating the deployment as a valid
+/// token-exchange subject. A hash match alone is not sufficient — the
+/// deployment must also have live infrastructure (i.e. be in a status where
+/// tokens are meaningful). See `should_have_infrastructure` in
+/// `server::deployment::webhook`.
 pub async fn get_by_identity_credential_hash(
     pool: &PgPool,
     hash: &str,
@@ -1049,7 +1054,7 @@ pub async fn list_for_project_and_group(
                 first_healthy_at, job_url, pull_request_url,
                 replicas, cpu, memory,
                 created_at, updated_at, identity_credential_hash,
-            identity_audiences as "identity_audiences: serde_json::Value"
+                identity_audiences as "identity_audiences: serde_json::Value"
             FROM deployments
             WHERE project_id = $1 AND deployment_group = $2
             ORDER BY created_at DESC
@@ -1080,7 +1085,7 @@ pub async fn list_for_project_and_group(
                 first_healthy_at, job_url, pull_request_url,
                 replicas, cpu, memory,
                 created_at, updated_at, identity_credential_hash,
-            identity_audiences as "identity_audiences: serde_json::Value"
+                identity_audiences as "identity_audiences: serde_json::Value"
             FROM deployments
             WHERE project_id = $1
             ORDER BY created_at DESC

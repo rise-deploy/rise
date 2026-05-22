@@ -939,7 +939,8 @@ pub async fn create_deployment(
     let mut effective_identity_audiences: serde_json::Value =
         if let Some(ref audiences) = payload.identity_audiences {
             validate_identity_audiences(audiences)?;
-            serde_json::to_value(audiences).unwrap_or_else(|_| serde_json::json!({}))
+            serde_json::to_value(audiences)
+                .expect("BTreeMap<String, String> serialization is infallible")
         } else {
             serde_json::json!({})
         };
