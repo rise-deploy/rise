@@ -406,6 +406,19 @@ async fn classify_path(
             segments,
         } => (collection, segments),
     };
+
+    // Structural check (pure, no I/O): a `uid:` token in a non-first position
+    // is always invalid, regardless of which collection is being addressed.
+    // Validate before the DB call so a malformed path is rejected cheaply.
+    if !segments.first().is_some_and(|s| s.starts_with(UID_PREFIX)) {
+        if let Some(pos) = segments.iter().position(|s| s.starts_with(UID_PREFIX)) {
+            return Err(ServerError::bad_request(format!(
+                "uid: token at segment {pos} is invalid; a uid: identifier may only appear as \
+                 the sole identifier segment, with no ancestor names"
+            )));
+        }
+    }
+
     let resolved = resolve_collection(store, &collection).await?;
 
     // `uid:` form: a `uid:` token as the sole identifier segment. A UID is
@@ -436,14 +449,6 @@ async fn classify_path(
                 "a uid: identifier may be followed only by an optional subresource keyword",
             )),
         };
-    }
-
-    // Named form: a `uid:` token is valid only as the sole identifier segment.
-    if let Some(pos) = segments.iter().position(|s| s.starts_with(UID_PREFIX)) {
-        return Err(ServerError::bad_request(format!(
-            "uid: token at segment {pos} is invalid; a uid: identifier may only appear as \
-             the sole identifier segment, with no ancestor names"
-        )));
     }
 
     // Derive the parent-chain depth `D` and classify the segment count.
@@ -666,25 +671,23 @@ async fn dispatch_put_inner(
     auth: AnyAuth,
     body: serde_json::Value,
 ) -> Result<Response, ServerError> {
-    // Reject non-operator users before any store I/O so path existence is not probeable.
-    // Store the result so it can be reused inside the Item branch without a second call.
+    // Parse the path first (pure, no I/O) to return 400 on a malformed path
+    // before performing any auth check, matching the GET/POST/DELETE handlers.
+    // Store the operator result so it can be reused inside the Item branch
+    // without a second call.
+    let raw_path = parse_resource_path(&raw)?;
     let operator_user = if let AnyAuth::User(auth_ctx) = &auth {
         Some(require_operator(ctx, auth_ctx)?)
     } else {
         None
     };
-    let raw_path = parse_resource_path(&raw)?;
     match classify_path(&ctx.store, raw_path).await? {
         ResolvedPath::Item { resolved, leaf } => {
             // Controller tokens must not update items
             let user = match &auth {
                 AnyAuth::User(_auth_ctx) => {
                     // Already validated by the early gate above; reuse the result.
-                    operator_user.unwrap_or_else(|| {
-                        // Safety: the early gate at the top of this function sets
-                        // operator_user = Some(...) for every AnyAuth::User variant.
-                        unreachable!("operator_user is always Some when auth is User")
-                    })
+                    operator_user.expect("operator_user is Some for AnyAuth::User")
                 }
                 AnyAuth::Controller(_) => {
                     return Err(ServerError::forbidden(
@@ -2144,5 +2147,70 @@ mod dispatch_tests {
         let (status, body) = read(resp).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["metadata"]["name"], "status");
+    }
+
+    // -------------------------------------------------------------------------
+    // ResourceDefinition update via HTTP PUT dispatch
+    // -------------------------------------------------------------------------
+
+    /// PUT a `ResourceDefinition` through `dispatch_put_inner` — this exercises
+    /// the `update_resource_definition` code path that all the other tests bypass
+    /// by calling `store.register_resource_definition` directly.
+    #[sqlx::test]
+    async fn update_resource_definition_via_put(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx, &[]).await;
+
+        // Step 1: GET the RD through the HTTP layer to obtain its current revision.
+        let resp = dispatch_get_inner(
+            &ctx,
+            "rise.dev/v1alpha1/resourcedefinitions/widgets.example.dev".to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("get ResourceDefinition");
+        let (status, rd_body) = read(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(rd_body["metadata"]["name"], "widgets.example.dev");
+        let revision = rd_body["metadata"]["revision"].as_i64().unwrap();
+
+        // Step 2: PUT an updated version — add a `v3` served (non-storage) version.
+        let updated_spec = json!({
+            "group": "example.dev",
+            "kind": "Widget",
+            "plural": "widgets",
+            "versions": [
+                {"name": "v1", "served": true, "storage": true},
+                {"name": "v2", "served": true, "storage": false},
+                {"name": "v3", "served": true, "storage": false},
+            ],
+            "allowedStatusControllerIds": [],
+        });
+        let resp = dispatch_put_inner(
+            &ctx,
+            "rise.dev/v1alpha1/resourcedefinitions/widgets.example.dev".to_string(),
+            any_user(OPERATOR),
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": RESOURCE_DEFINITION_KIND,
+                "metadata": {"name": "widgets.example.dev", "revision": revision},
+                "spec": updated_spec,
+            }),
+        )
+        .await
+        .expect("update ResourceDefinition via PUT");
+
+        // Step 3: Assert the response is 200 and the returned body reflects the update.
+        let (status, put_body) = read(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(put_body["metadata"]["name"], "widgets.example.dev");
+        assert_eq!(put_body["apiVersion"], "rise.dev/v1alpha1");
+        assert_eq!(put_body["kind"], RESOURCE_DEFINITION_KIND);
+        // The new version should be visible in the returned spec.
+        let versions = put_body["spec"]["versions"]
+            .as_array()
+            .expect("versions array");
+        assert_eq!(versions.len(), 3, "expected 3 versions after update");
     }
 }
