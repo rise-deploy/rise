@@ -561,11 +561,13 @@ pub async fn create_deployment(
         .or_else(detect_ci_pull_request_url);
     // Resolve the Git repository: use the explicit value (normalized), or
     // auto-detect from the CI environment / local git remote.
-    let resolved_git_repository_url = deploy_opts
-        .git_repository_url
-        .as_deref()
-        .and_then(normalize_git_url)
-        .or_else(detect_git_repository_url);
+    let resolved_git_repository_url = match deploy_opts.git_repository_url.as_deref() {
+        Some(raw) => match normalize_git_url(raw) {
+            Some(url) => Some(url),
+            None => anyhow::bail!("--git-repository: could not parse {:?} as a Git URL", raw),
+        },
+        None => detect_git_repository_url(),
+    };
 
     if let Some(ref url) = resolved_job_url {
         info!("Deployment job URL: {}", url);
@@ -1043,7 +1045,11 @@ fn detect_ci_repository_url() -> Option<String> {
         "BUILD_REPOSITORY_URI",      // Azure Pipelines
         "BUILDKITE_REPO",            // Buildkite
         "DRONE_GIT_HTTP_URL",        // Drone CI
-        "GIT_URL",                   // Jenkins (git plugin)
+        // GIT_URL is checked last: it is a generic name used by Jenkins (git
+        // plugin) but also set by many scripts and CI systems to non-repository
+        // values (API endpoints, webhooks, etc.), making it the most
+        // collision-prone variable in this list.
+        "GIT_URL", // Jenkins (git plugin)
     ] {
         if let Some(url) = env_non_empty(var) {
             return Some(url);
@@ -1058,10 +1064,21 @@ fn detect_ci_repository_url() -> Option<String> {
 /// Equivalent to the fetch URL reported by `git remote show origin`, but
 /// resolved offline via `git remote get-url origin`.
 fn detect_git_remote_url() -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .output()
-        .ok()?;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    // Run git in a separate thread so we can apply a timeout. `git remote
+    // get-url` normally completes instantly (it reads `.git/config`), but a
+    // misconfigured credential helper can cause it to block indefinitely.
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = std::process::Command::new("git")
+            .args(["remote", "get-url", "origin"])
+            .output();
+        let _ = tx.send(result);
+    });
+
+    let output = rx.recv_timeout(Duration::from_secs(5)).ok()?.ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1088,11 +1105,9 @@ fn normalize_git_url(raw: &str) -> Option<String> {
     let (authority, path) = if let Some(idx) = raw.find("://") {
         // scheme://[user@]host[:port]/path
         raw[idx + 3..].split_once('/')?
-    } else if let Some(split) = raw.split_once(':') {
-        // scp-like: [user@]host:path
-        split
     } else {
-        return None;
+        // scp-like: [user@]host:path
+        raw.split_once(':')?
     };
 
     // Drop any userinfo prefix and port suffix from the authority.
