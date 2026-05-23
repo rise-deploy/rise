@@ -15,28 +15,26 @@ kubectl = "latest"
 k9s = "latest"
 vault = "latest"
 
+[tasks.setup]
+description = "One-stop dev environment setup (hosts, docker, cluster). Cross-platform (Linux + macOS). Run interactively."
+run = "./scripts/dev-setup.sh"
+
 [tasks."check:hosts"]
 description = "Verify /etc/hosts has the required rise-registry, rise-jfrog and rise.local entries."
 run = """
 ok=true
-if ! grep -q '\\brise-registry\\b' /etc/hosts; then
-  echo "MISSING: /etc/hosts entry for 'rise-registry'"
-  ok=false
-fi
-if ! grep -q '\\brise-jfrog\\b' /etc/hosts; then
-  echo "MISSING: /etc/hosts entry for 'rise-jfrog'"
-  ok=false
-fi
-if ! grep -q '\\brise\\.local\\b' /etc/hosts; then
-  echo "MISSING: /etc/hosts entry for 'rise.local'"
-  ok=false
-fi
+for h in rise-registry rise-jfrog rise.local; do
+  if ! grep -qE "\\<${h//./\\.}\\>" /etc/hosts; then
+    echo "MISSING: /etc/hosts entry for '$h'"
+    ok=false
+  fi
+done
 if [ "$ok" = false ]; then
   echo ""
-  echo "Run 'mise setup:hosts' to fix this."
+  echo "Run './scripts/dev-setup.sh hosts' to fix this."
   exit 1
 fi
-echo "OK: /etc/hosts has rise-registry, rise-jfrog and rise.local entries."
+echo "OK: /etc/hosts is configured."
 """
 
 [tasks."check:docker"]
@@ -44,13 +42,17 @@ description = "Verify Docker is running and has insecure-registries configured."
 run = """
 if ! docker info > /dev/null 2>&1; then
   echo "FAIL: Docker daemon is not running."
-  echo "Start Docker and try again."
+  echo "Start Docker (Docker Desktop on macOS) and try again."
   exit 1
 fi
-if [ -f /etc/docker/daemon.json ] && ! grep -q 'rise-registry:5000' /etc/docker/daemon.json; then
-  echo "MISSING: 'rise-registry:5000' not in /etc/docker/daemon.json insecure-registries."
+case "$(uname -s)" in
+  Darwin) daemon_json="$HOME/.docker/daemon.json" ;;
+  *)      daemon_json="/etc/docker/daemon.json" ;;
+esac
+if [ -f "$daemon_json" ] && ! grep -q 'rise-registry:5000' "$daemon_json"; then
+  echo "MISSING: 'rise-registry:5000' not in $daemon_json insecure-registries."
   echo ""
-  echo "Run 'mise setup:docker' to fix this."
+  echo "Run './scripts/dev-setup.sh docker' to fix this."
   exit 1
 fi
 echo "OK: Docker is running and configured."
@@ -62,7 +64,7 @@ run = """
 if ! kubectl cluster-info > /dev/null 2>&1; then
   echo "FAIL: No Kubernetes cluster reachable via kubectl."
   echo ""
-  echo "Run 'mise minikube:up' or 'mise k3s:up' to set one up."
+  echo "Run './scripts/dev-setup.sh minikube' (or 'k3s' on Linux) to set one up."
   exit 1
 fi
 echo "OK: Kubernetes cluster is reachable."
@@ -237,177 +239,31 @@ cargo install cargo-dist --locked
 cargo dist build --target x86_64-unknown-linux-gnu --target x86_64-apple-darwin --target aarch64-apple-darwin
 """
 
-[tasks."setup:hosts"]
-description = "Ensure /etc/hosts has rise-registry, rise-jfrog and rise.local entries (idempotent)."
-run = """
-set -x
-# Remove any existing entries and re-add to ensure correctness
-sudo sed -i '/\\brise-registry\\b/d; /\\brise-jfrog\\b/d; /\\brise\\.local\\b/d' /etc/hosts
-echo '127.0.0.1 rise-registry' | sudo tee -a /etc/hosts
-echo '127.0.0.1 rise-jfrog' | sudo tee -a /etc/hosts
-echo '127.0.0.1 rise.local' | sudo tee -a /etc/hosts
-"""
-
-[tasks."setup:docker"]
-description = "Ensure Docker daemon has insecure-registries configured for the local registry (idempotent)."
-run = """
-set -x
-DAEMON_JSON="/etc/docker/daemon.json"
-DAEMON_DIR=$(dirname "$DAEMON_JSON")
-REQUIRED_REGISTRIES='["rise-registry:5000","localhost:5000","127.0.0.1:5000","rise-jfrog:8082","localhost:3082"]'
-if [ ! -d "$DAEMON_DIR" ]; then
-  echo "Skipping Docker daemon config because $DAEMON_DIR does not exist."
-  exit 0
-fi
-if [ ! -f "$DAEMON_JSON" ]; then
-  echo "Creating $DAEMON_JSON with insecure-registries..."
-  echo "{\"insecure-registries\": $REQUIRED_REGISTRIES}" | sudo tee "$DAEMON_JSON"
-  sudo systemctl restart docker || true
-elif ! grep -q 'rise-registry:5000' "$DAEMON_JSON"; then
-  echo "Adding insecure-registries to existing $DAEMON_JSON..."
-  UPDATED=$(jq --argjson regs "$REQUIRED_REGISTRIES" '.["insecure-registries"] = ((.["insecure-registries"] // []) + $regs | unique)' "$DAEMON_JSON")
-  echo "$UPDATED" | sudo tee "$DAEMON_JSON" > /dev/null
-  echo "Restarting Docker..."
-  sudo systemctl restart docker || true
-else
-  echo "Docker daemon already configured."
-fi
-"""
-
 [tasks."minikube:up"]
 description = "Start Minikube with local Docker registry access and ingress port-forwarding."
-depends = ["setup:hosts", "setup:docker"]
-run = """
-set -x
-
-docker compose up -d registry
-NETWORK_NAME=rise_default
-REGISTRY_NAME=rise-registry
-REGISTRY_DIR="/etc/containerd/certs.d/localhost:5000"
-JFROG_REGISTRY_DIR="/etc/containerd/certs.d/rise-jfrog:8082"
-
-minikube delete
-minikube start --driver=docker --insecure-registry="${REGISTRY_NAME}:5000" --insecure-registry="rise-jfrog:8082" --memory=4096mb --cpus=2 --cni=calico
-minikube addons enable ingress
-
-for node in $(minikube node list | awk '{print $1}'); do
-  docker exec "${node}" mkdir -p "${REGISTRY_DIR}"
-  cat <<EOF | docker exec -i "${node}" cp /dev/stdin "${REGISTRY_DIR}/hosts.toml"
-[host."http://${REGISTRY_NAME}:5000"]
-EOF
-  docker exec "${node}" mkdir -p "${JFROG_REGISTRY_DIR}"
-  cat <<EOF | docker exec -i "${node}" cp /dev/stdin "${JFROG_REGISTRY_DIR}/hosts.toml"
-[host."http://rise-jfrog:8082"]
-EOF
-done
-
-docker network connect "${NETWORK_NAME}" minikube || true
-
-echo
-echo "Minikube started. Port-forwarding ingress-nginx-controller to localhost:8080 (HTTP) and localhost:8443 (HTTPS)..."
-echo
-
-kubectl port-forward --namespace ingress-nginx svc/ingress-nginx-controller 8080:80 8443:443 &
-echo "Port-forward running in background (PID: $!)"
-
-# Install Metacontroller + Rise CRDs for development
-HOST_IP=$(ip -4 route get 1.1.1.1 | awk '{for (i = 1; i <= NF; i++) if ($i == "src") {print $(i + 1); exit}}')
-if [ -f .env ]; then
-  sed -i '/^# BEGIN RISE K8S DEV$/,/^# END RISE K8S DEV$/d' .env
-fi
-cat >> .env <<EOF
-# BEGIN RISE K8S DEV
-export RISE_K8S_HOST_IP="${HOST_IP}"
-export RISE_AUTH_BACKEND_URL="http://${HOST_IP}:3000"
-export RISE_METACONTROLLER_WEBHOOK_BASE_URL="http://${HOST_IP}:3001"
-# END RISE K8S DEV
-EOF
-helm dependency build helm/rise
-helm upgrade --install rise-dev ./helm/rise \
-  -f helm/rise/values-dev.yaml \
-  --set "metacontroller.webhookBaseUrl=${RISE_METACONTROLLER_WEBHOOK_BASE_URL:-http://${HOST_IP}:3001}" \
-  --namespace rise \
-  --create-namespace
-"""
+run = "./scripts/dev-setup.sh minikube"
 
 [tasks."minikube:down"]
 description = "Stop and delete Minikube."
 run = "minikube delete"
 
 [tasks."k3s:up"]
-depends = ["setup:hosts", "setup:docker"]
+description = "Install and configure k3s (Linux only)."
+run = "./scripts/dev-setup.sh k3s"
+
+[tasks."k3s:down"]
+description = "Uninstall k3s (Linux only)."
 run = """
-set -x
-
-# Configure K3s registries for insecure access to rise-registry:5000
-sudo mkdir -p /etc/rancher/k3s
-sudo tee /etc/rancher/k3s/registries.yaml > /dev/null <<EOF
-mirrors:
-  "rise-registry:5000":
-    endpoint:
-      - "http://rise-registry:5000"
-  "rise-jfrog:8082":
-    endpoint:
-      - "http://localhost:3082"
-EOF
-
-# Ensure the local Docker registry is running
-docker compose up -d registry
-
-# Install K3s
-curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--flannel-backend=none --cluster-cidr=192.168.0.0/16 --disable-network-policy --disable=traefik" sh -
-sleep 10
-mkdir -p ~/.kube
-sudo cat /etc/rancher/k3s/k3s.yaml > ~/.kube/config
-kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.4/manifests/operator-crds.yaml --server-side --force-conflicts
-kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.4/manifests/tigera-operator.yaml --server-side --force-conflicts
-kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.4/manifests/custom-resources.yaml --server-side --force-conflicts
-helm upgrade --install ingress-nginx ingress-nginx \
-  --repo https://kubernetes.github.io/ingress-nginx \
-  --namespace ingress-nginx --create-namespace \
-  --set controller.hostPort.enabled=true \
-  --set controller.hostPort.ports.http=8080 \
-  --set controller.hostPort.ports.https=8443 \
-  --set controller.service.type=ClusterIP
-
-# Install Metacontroller + Rise CRDs for development
-HOST_IP=$(kubectl get node $(hostname) -o jsonpath='{.metadata.annotations.k3s\\.io/internal-ip}')
-if [ -f .env ]; then
-  sed -i '/^# BEGIN RISE K8S DEV$/,/^# END RISE K8S DEV$/d' .env
+if [ "$(uname -s)" != "Linux" ]; then
+  echo "k3s is Linux only."
+  exit 1
 fi
-cat >> .env <<EOF
-# BEGIN RISE K8S DEV
-export RISE_K8S_HOST_IP="${HOST_IP}"
-export RISE_AUTH_BACKEND_URL="http://${HOST_IP}:3000"
-export RISE_METACONTROLLER_WEBHOOK_BASE_URL="http://${HOST_IP}:3001"
-# END RISE K8S DEV
-EOF
-helm dependency build helm/rise
-kubectl apply --server-side --force-conflicts -f helm/rise/crds/
-helm upgrade --install rise-dev ./helm/rise \
-  -f helm/rise/values-dev.yaml \
-  --set "metacontroller.webhookBaseUrl=${RISE_METACONTROLLER_WEBHOOK_BASE_URL:-http://${HOST_IP}:3001}" \
-  --skip-crds \
-  --namespace rise \
-  --create-namespace
-
-set +x
-echo
-echo
-echo "Note: Wrote Kubernetes host reachability settings to .env."
-echo "If you use direnv, run 'direnv reload' or restart 'mise backend:run' so Rise picks them up."
-echo
-echo "K3s internal IP: $(kubectl get node $(hostname) -o jsonpath='{.metadata.annotations.k3s\\.io/internal-ip}')"
+sudo /usr/local/bin/k3s-uninstall.sh
 """
 
 [tasks."test:e2e-build"]
 description = "Run end-to-end build backend tests (all or specific backends)."
 run = "bash tests/e2e-build/run.sh"
-
-[tasks."k3s:down"]
-run = """
-sudo /usr/local/bin/k3s-uninstall.sh
-"""
 
 [tasks."dev:oidc-issuer"]
 run = """

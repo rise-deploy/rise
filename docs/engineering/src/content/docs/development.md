@@ -15,18 +15,20 @@ title: "Local Development"
 # Install mise-managed tools (minikube, helm, kubectl, etc.)
 mise install
 
-# Configure /etc/hosts and Docker daemon (idempotent, requires sudo).
-# On WSL with Docker Desktop, setup:docker skips cleanly if /etc/docker is not present.
-mise setup:hosts
-mise setup:docker
-
-# Start a local Kubernetes cluster
-mise minikube:up   # preferred on most developer machines (see below)
+# One-stop dev environment setup. Cross-platform (Linux + macOS), idempotent,
+# and interactive. Configures /etc/hosts (sudo), Docker insecure registries,
+# and brings up a local cluster (minikube by default; offers k3s on Linux).
+mise setup
 ```
 
-The cluster setup task writes pod-reachable host URLs to `.env`. If you use
-direnv, run `direnv allow` once and `.envrc` will load those values
-automatically.
+`mise setup` is a thin wrapper around `./scripts/dev-setup.sh`. Run individual
+steps with `./scripts/dev-setup.sh <hosts|docker|minikube|k3s|preflight>` if
+you only need one part. The script writes pod-reachable host URLs to `.env`;
+if you use direnv, run `direnv allow` once and `.envrc` will load them.
+
+On macOS, Docker Desktop's daemon config lives at `~/.docker/daemon.json` and
+the script updates it there. The script offers to restart Docker Desktop for
+you so the new insecure-registries take effect.
 
 ## Day-to-Day
 
@@ -74,13 +76,14 @@ mise frontend:dev  # Vite dev server only
 
 | Task | Purpose |
 |------|---------|
-| `setup:hosts` | Add `rise-registry` and `rise.local` to `/etc/hosts` |
-| `setup:docker` | Configure Docker daemon insecure registries |
-| `minikube:up` | Start Minikube with registry access and ingress port-forwarding (**preferred**) |
+| `setup` | One-stop dev setup: hosts + docker + cluster (interactive) |
+| `minikube:up` | Bring up Minikube with registry access and ingress port-forwarding (**preferred**) |
 | `minikube:down` | Stop and delete Minikube |
-| `k3s:up` / `k3s:down` | Alternative: K3s (use when Minikube doesn't work, or in ephemeral/dedicated Rise dev environments) |
+| `k3s:up` / `k3s:down` | Alternative: K3s (Linux only — use when Minikube doesn't work, or in ephemeral/dedicated Rise dev environments) |
 
-**Minikube vs K3s**: `minikube:up` is preferred on most developer machines — it runs a single-node Kubernetes cluster inside a Docker container, starts quickly, and integrates well with the local Docker network so pods can reach `rise-registry:5000`. Use `k3s:up` when Minikube doesn't work on your machine (e.g., nested virtualization issues) or when setting up an ephemeral or dedicated environment solely for Rise development where the slight extra K3s overhead doesn't matter.
+All three tasks delegate to `./scripts/dev-setup.sh`. The script can also be invoked directly with subcommands `hosts`, `docker`, `minikube`, `k3s`, or `preflight` (hosts + docker only).
+
+**Minikube vs K3s**: `minikube:up` is preferred on most developer machines — it runs a single-node Kubernetes cluster inside a Docker container, starts quickly, and integrates well with the local Docker network so pods can reach `rise-registry:5000`. Use `k3s:up` (Linux only) when Minikube doesn't work on your machine (e.g., nested virtualization issues) or when setting up an ephemeral or dedicated environment solely for Rise development where the slight extra K3s overhead doesn't matter.
 
 ### Development
 
@@ -180,7 +183,7 @@ Host Machine (127.0.0.1)
 
 ## Troubleshooting
 
-**`http: server gave HTTP response to HTTPS client`** — insecure registries not configured. Run `mise setup:docker`.
+**`http: server gave HTTP response to HTTPS client`** — insecure registries not configured. Run `./scripts/dev-setup.sh docker`.
 
 **BuildKit can't push to registry** — verify `RISE_MANAGED_BUILDKIT_NETWORK_NAME=rise_default` is set in your environment (should be in `.envrc`).
 
