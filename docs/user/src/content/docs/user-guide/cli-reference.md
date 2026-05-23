@@ -28,7 +28,15 @@ The Rise CLI (`rise`) provides commands for managing projects, deployments, team
 
 ## Project Name Resolution
 
-Most commands accept `-p <project>` to specify the project name. If omitted, Rise reads the project name from `rise.toml` or `.rise.toml` in the current directory (or the path specified by `--path`).
+Commands that operate on a project accept the project name as a positional argument (e.g. `rise project show my-app`), and deployment and environment commands also accept it via `-p <project>`. If omitted, Rise reads the project name from the `[project]` section of `rise.toml` or `.rise.toml` in the directory given by `--path` (defaults to the current directory).
+
+This means `rise project show`, `update`, and `delete` can be run with no project name when a `rise.toml` is present:
+
+```bash
+# Equivalent when rise.toml has [project] name = "my-app"
+rise project show my-app
+rise project show
+```
 
 ## Environment Variables
 

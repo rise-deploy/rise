@@ -12,12 +12,19 @@ user-defined kind). Hierarchy is encoded by a single FK:
 parent_uid UUID NULL REFERENCES resources(uid)
 ```
 
-Uniqueness of `(kind, name)` within a parent scope is enforced by partial unique indexes —
-one for `parent_uid IS NULL` (root) and one for `parent_uid IS NOT NULL`.
+Resource identity is unique per `(group, kind, name)` within a parent scope, enforced by
+partial unique indexes — one for `parent_uid IS NULL` (root) and one for
+`parent_uid IS NOT NULL`. The group is the substring of `api_version` before `/`, so the
+same logical resource cannot be created twice under two different versions of the same
+group; resources from *different* groups may still share `(kind, name)`. `parent_uid IS NULL`
+is an exact synonym for a root-scoped resource: a non-root resource always has a parent
+(resources are only ever removed by cascading delete, never detached). A name-uniqueness
+violation surfaces as `StoreError::NameConflict`, never a raw database error.
 
-`resource_definitions` is a projection table holding the indexed/queryable identity fields
-(group, kind, plural, scope) of `ResourceDefinition` rows; it stays in sync via
-`register_resource_definition` and `update_resource_definition`.
+`resource_definitions` is a view over `resources` that projects the indexed/queryable
+identity fields (group, kind, plural, versions, allowed status controller IDs) of
+`ResourceDefinition` rows out of their `spec`. Being a view it cannot drift from the
+backing row; identity uniqueness is enforced by partial unique indexes on `resources`.
 
 ## Deletion model
 
@@ -25,8 +32,8 @@ Inspired by Kubernetes finalizers, but adapted to a hierarchical store with a ha
 
 ### Lifecycle
 
-1. `delete(uid, policy)` marks the row (`deletion_timestamp = NOW()`) and reacts to children
-   per `policy`.
+1. `delete(uid)` marks the row (`deletion_timestamp = NOW()`) and stamps its immediate
+   children.
 2. Controllers observe `deletion_timestamp`, do their teardown work, and clear their own
    finalizers via `update_controller_finalizers`.
 3. A GC worker iterates `list_pending_collection()` and calls `try_collect(uid)` on each
@@ -39,20 +46,16 @@ Tombstoned rows are **visible by default** in `get`, `get_by_name`, `list`, and
 `resolve_path`. Filtering them out is the caller's responsibility — controllers, operators,
 and resolution paths all need to observe in-progress teardown.
 
-### Propagation policy
+### Cascade
 
-`PropagationPolicy` controls what happens to children when a parent is deleted.
+Deletion always cascades. `delete` stamps `deletion_timestamp` on the parent and its
+**immediate children**, and attaches the store-managed finalizer
+`system.rise.dev/cascade-deletion` to the parent (if children exist). Subsequent GC sweeps
+via `try_collect` fan out down the tree as each level drains. The parent stays observable
+until the entire subtree has been collected; because the `parent_uid` FK forbids deleting a
+referenced row, collection is necessarily bottom-up.
 
-- **`Cascade`** (default). Stamps `deletion_timestamp` on the parent and its **immediate
-  children**, and attaches the store-managed finalizer
-  `system.rise.dev/cascade-deletion` to the parent (if children exist). Subsequent GC
-  sweeps via `try_collect` fan out down the tree as each level drains. The parent stays
-  observable until the entire subtree has been collected.
-
-- **`Orphan`**. Detaches immediate children (`UPDATE resources SET parent_uid = NULL WHERE
-  parent_uid = $1`) and then deletes the parent normally. Children continue as root-level
-  resources. This is an admin/break-glass operation; **admin gating is the caller's
-  responsibility** (the store accepts the policy unconditionally).
+There is no detach/orphan operation — a non-root resource can never become parentless.
 
 ### Finalizer ownership
 
@@ -67,37 +70,26 @@ Two kinds of finalizers live in the `finalizers` array:
 
 ## Path resolution
 
-`resolve_path(&[PathSegment])` walks a path of `(kind, identifier)` pairs in a single
-transaction and returns the full ancestor chain (leaf is the last element). Two segment
+`resolve_path(&[PathSegment])` walks a path of `(api_versions, kind, identifier)` pairs in a
+single transaction and returns the full ancestor chain (leaf is the last element). Two segment
 forms:
 
 ```rust
-PathSegment::Name { kind, name }    // "widgets/foo"
-PathSegment::Uid  { kind, uid }     // "widgets/uid:aaaa-bbbb"
+PathSegment::Name { api_versions: vec!["widgets.example.com/v1".into()], kind: "Widget".into(), name: "foo".into() }
+PathSegment::Uid  { api_versions: vec!["widgets.example.com/v1".into()], kind: "Widget".into(), uid }
 ```
 
-`kind` is always required, even for UID-addressed segments. This lets the API layer:
+`api_versions` is the set of API versions the caller accepts for that segment (typically the
+served versions of a collection). The stored row must match one of them. `kind` is always
+required, even for UID-addressed segments. Together they let the API layer:
 
 - Determine the response shape from the URL alone (no resolve-before-route round-trip).
 - Surface `KindMismatch` when a UUID was copy-pasted into the wrong slot.
 - Catch cross-subtree references (`ParentNotFound`) — a UID whose `parent_uid` doesn't
   match the resolved ancestor chain.
 
-## Orphan discovery
+## Pending-deletion discovery
 
-`list_orphans(parent_uid)` returns rows whose parent has `deletion_timestamp IS NOT NULL`
-(i.e. children of an in-progress teardown). Scoped optionally to a single subtree. Useful
-for admin tooling that needs to inspect or repair in-flight cascade operations.
-
-Note: the FK on `parent_uid` makes "dangling" orphans (parent row gone) impossible. Orphan
-mode explicitly nulls `parent_uid` instead.
-
-## Reparenting
-
-`reparent(uid, new_parent_uid)` atomically moves a resource. Rejects:
-
-- `ReparentCycle` — self-loop or moving a node under one of its own descendants.
-- `NameConflict` — destination scope already has a row with the same `(kind, name)` or
-  discriminator.
-
-Use this in preference to delete-then-recreate, which loses the UID and revision history.
+`list_pending_collection(limit)` returns tombstoned rows (`deletion_timestamp IS NOT NULL`),
+oldest first. The GC worker iterates it to drive `try_collect`; it also backs operator
+tooling that needs to spot resources stuck mid-deletion.

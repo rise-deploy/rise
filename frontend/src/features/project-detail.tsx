@@ -121,6 +121,11 @@ export function ProjectDetail({ projectName, initialTab }: { projectName: string
     const ownerLabel = project.owner?.email || project.owner?.name || '—';
     const accessLabel = accessClasses.find(a => a.id === project.access_class)?.display_name || project.access_class || '—';
 
+    // The source repository is either explicitly configured on the project, or
+    // resolved by the backend from the active/most recent deployment metadata.
+    const sourceUrl: string | null = project.source_url || project.resolved_source_url || null;
+    const sourceUrlInherited = !project.source_url && !!project.resolved_source_url;
+
     const tabs = TAB_IDS.map(id => ({ id, label: TAB_LABELS[id], count: tabCounts[id] }));
 
     return (
@@ -177,8 +182,14 @@ export function ProjectDetail({ projectName, initialTab }: { projectName: string
                 {project.primary_url && (
                     <Button icon="ext" onClick={() => window.open(project.primary_url, '_blank', 'noopener,noreferrer')}>Open URL</Button>
                 )}
-                {project.source_url && isSafeUrl(project.source_url) && (
-                    <Button icon="git" onClick={() => window.open(project.source_url, '_blank', 'noopener,noreferrer')}>Repo</Button>
+                {sourceUrl && isSafeUrl(sourceUrl) && (
+                    <Button
+                        icon="git"
+                        onClick={() => window.open(sourceUrl, '_blank', 'noopener,noreferrer')}
+                        title={sourceUrlInherited ? 'Source URL resolved from deployment metadata' : undefined}
+                    >
+                        Repo
+                    </Button>
                 )}
                 <Button variant="danger" icon="trash" onClick={() => setConfirmOpen(true)}>Delete</Button>
             </div>
@@ -379,11 +390,21 @@ function ProjectOverview({ project, projectName, accessLabel, environments, onCo
                                     </a>
                                 </KVRow>
                             )}
-                            {project.source_url && isSafeUrl(project.source_url) && (
+                            {sourceUrl && isSafeUrl(sourceUrl) && (
                                 <KVRow k="Source">
-                                    <a className="r-link mono" style={{ fontSize: 12.5 }} href={project.source_url} target="_blank" rel="noopener noreferrer">
-                                        {stripUrlScheme(project.source_url)}
-                                    </a>
+                                    <span style={{ display: 'inline-flex', alignItems: 'baseline', gap: 6, flexWrap: 'wrap' }}>
+                                        <a className="r-link mono" style={{ fontSize: 12.5 }} href={sourceUrl} target="_blank" rel="noopener noreferrer">
+                                            {stripUrlScheme(sourceUrl)}
+                                        </a>
+                                        {sourceUrlInherited && (
+                                            <span
+                                                style={{ fontSize: 11, color: 'var(--text-soft)' }}
+                                                title="Resolved from deployment metadata; not explicitly configured on the project"
+                                            >
+                                                from deployment
+                                            </span>
+                                        )}
+                                    </span>
                                 </KVRow>
                             )}
                             {project.created && (

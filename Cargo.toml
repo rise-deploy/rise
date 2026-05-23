@@ -61,6 +61,7 @@ cli = [
 ]
 backend = [
     # Server core (former "server" feature)
+    "dep:rise-resource-api",
     "dep:rise-resource-store",
     "dep:config",
     "dep:openssl",
@@ -99,6 +100,7 @@ backend = [
 
 [dependencies]
 # Workspace crates (backend only)
+rise-resource-api = { path = "crates/rise-resource-api", optional = true }
 rise-resource-store = { path = "crates/rise-resource-store", optional = true }
 
 # Common (always enabled - shared across features)

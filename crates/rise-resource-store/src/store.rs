@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use rise_resource_api::ResourceScope;
+use rise_resource_api::ResourceParentRef;
 
 use crate::error::StoreError;
 use crate::models::ResourceRow;
@@ -12,11 +12,22 @@ use crate::validation::SpecValidator;
 /// finalizers in this namespace via `update_controller_finalizers`.
 pub const SYSTEM_FINALIZER_PREFIX: &str = "system.rise.dev/";
 
-/// Finalizer added to a parent resource when it is deleted with `PropagationPolicy::Cascade`
-/// and still has children. Removed by the store once the subtree has drained.
+/// Finalizer added to a parent resource when it is deleted while it still has children.
+/// Removed by the store once the subtree has drained.
 pub const CASCADE_DELETION_FINALIZER: &str = "system.rise.dev/cascade-deletion";
 
+/// Maximum `ResourceDefinition` parent-chain depth. Registration rejects a
+/// chain longer than this (or one that cycles), and resource-path resolution
+/// caps its ancestor walk at the same bound.
+pub const MAX_PARENT_CHAIN_DEPTH: usize = 32;
+
 pub struct CreateResourceParams {
+    /// Canonical storage API version for the row.
+    ///
+    /// Callers that accept a served API version from clients must resolve the
+    /// collection first and pass its `storage_api_version` here. This mirrors
+    /// Kubernetes CRD behavior: served versions are an API boundary concern,
+    /// while persisted rows use the current storage version.
     pub api_version: String,
     pub kind: String,
     pub name: String,
@@ -28,6 +39,11 @@ pub struct CreateResourceParams {
 }
 
 pub struct UpdateResourceParams {
+    /// New canonical storage API version for the row, when migrating it.
+    ///
+    /// HTTP/API callers should translate any served request version to the
+    /// collection's `storage_api_version` before calling the store.
+    pub api_version: Option<String>,
     pub revision: i64,
     pub annotations: BTreeMap<String, String>,
     pub finalizers: Vec<String>,
@@ -35,30 +51,23 @@ pub struct UpdateResourceParams {
     pub validator: Option<Arc<dyn SpecValidator>>,
 }
 
-/// Controls how child resources are handled when a parent is deleted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PropagationPolicy {
-    /// Default. Stamp `deletion_timestamp` on the parent and its immediate children, and attach a
-    /// `system.rise.dev/cascade-deletion` finalizer to the parent. A background GC sweep (via
-    /// `try_collect`) drives the rest of the subtree to completion bottom-up.
-    #[default]
-    Cascade,
-
-    /// Detach all immediate children (`parent_uid = NULL`) and then delete the parent normally.
-    /// Children continue to exist as root-level resources. This is an admin/break-glass operation;
-    /// it should be gated at the API layer.
-    Orphan,
-}
-
 /// One segment of a resource path. Always carries the kind so the response shape and ancestor
 /// integrity can be verified without a round-trip.
 #[derive(Debug, Clone)]
 pub enum PathSegment {
     /// Address by name within the parent scope (root if first segment).
-    Name { kind: String, name: String },
+    Name {
+        api_versions: Vec<String>,
+        kind: String,
+        name: String,
+    },
     /// Address by UID. The kind is still required and checked against the stored row; mismatches
     /// surface as `StoreError::KindMismatch`.
-    Uid { kind: String, uid: Uuid },
+    Uid {
+        api_versions: Vec<String>,
+        kind: String,
+        uid: Uuid,
+    },
 }
 
 pub enum DeleteOutcome {
@@ -76,9 +85,17 @@ impl std::fmt::Debug for DeleteOutcome {
 }
 
 pub struct CollectionInfo {
+    /// The requested/served API version for this collection (used for response projection).
+    /// This is NOT the storage version; see `storage_api_version` for that.
     pub api_version: String,
+    pub storage_api_version: String,
+    pub served_api_versions: Vec<String>,
+    /// Every api_version the collection declares (served and non-served).
+    /// Used for row lookups so a resource stored at a non-served version is
+    /// still found; `served_api_versions` only gates URL accessibility.
+    pub declared_api_versions: Vec<String>,
     pub kind: String,
-    pub scope: ResourceScope,
+    pub parent: Option<ResourceParentRef>,
     pub spec_validator: Arc<dyn SpecValidator>,
     pub allowed_status_controller_ids: Vec<String>,
 }
@@ -89,15 +106,30 @@ pub trait ResourceStore: Send + Sync {
 
     async fn get(&self, uid: Uuid) -> Result<Option<ResourceRow>, StoreError>;
 
+    /// Look up a resource by name. Matching is keyed on the API *group* of
+    /// `api_version` (the part before `/`), not the exact version, so the row
+    /// is found regardless of which declared version it is stored at.
     async fn get_by_name(
         &self,
+        api_version: &str,
         kind: &str,
         name: &str,
         parent_uid: Option<Uuid>,
     ) -> Result<Option<ResourceRow>, StoreError>;
 
+    /// List resources of a kind. Like `get_by_name`, matching is keyed on the
+    /// API *group* of `api_version`, so the listing spans every declared
+    /// version of the kind.
     async fn list(
         &self,
+        api_version: &str,
+        kind: &str,
+        parent_uid: Option<Uuid>,
+    ) -> Result<Vec<ResourceRow>, StoreError>;
+
+    async fn list_versions(
+        &self,
+        api_versions: &[String],
         kind: &str,
         parent_uid: Option<Uuid>,
     ) -> Result<Vec<ResourceRow>, StoreError>;
@@ -108,20 +140,13 @@ pub trait ResourceStore: Send + Sync {
         params: UpdateResourceParams,
     ) -> Result<ResourceRow, StoreError>;
 
-    /// Delete (or mark for deletion) a resource. `policy` controls child handling.
+    /// Delete (or mark for deletion) a resource, cascading to its subtree.
     ///
-    /// - `Cascade`: stamps `deletion_timestamp` on the parent and its immediate children, and
-    ///   attaches `system.rise.dev/cascade-deletion` to the parent if children exist. The actual
-    ///   removal of the parent row happens when the subtree has drained and all finalizers are
-    ///   gone, via `try_collect`.
-    /// - `Orphan`: clears `parent_uid` on immediate children, then deletes the parent normally
-    ///   (marked if it carries finalizers, hard-deleted otherwise). Admin gate is the caller's
-    ///   responsibility.
-    async fn delete(
-        &self,
-        uid: Uuid,
-        policy: PropagationPolicy,
-    ) -> Result<DeleteOutcome, StoreError>;
+    /// Stamps `deletion_timestamp` on the resource and its immediate children, and attaches
+    /// `system.rise.dev/cascade-deletion` to the resource if children exist. The row is removed
+    /// once the subtree has drained and all finalizers are gone, via `try_collect`; a childless
+    /// resource with no finalizers is hard-deleted immediately.
+    async fn delete(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError>;
 
     /// GC sweep entry point. Idempotent.
     ///
@@ -144,19 +169,6 @@ pub trait ResourceStore: Send + Sync {
     /// Tombstoned rows are returned (callers decide how to handle them).
     async fn resolve_path(&self, segments: &[PathSegment]) -> Result<Vec<ResourceRow>, StoreError>;
 
-    /// List children whose parent is currently tombstoned (`deletion_timestamp IS NOT NULL`).
-    /// Optionally scoped to a single parent. Useful for break-glass discovery of in-progress
-    /// teardowns.
-    async fn list_orphans(&self, parent_uid: Option<Uuid>) -> Result<Vec<ResourceRow>, StoreError>;
-
-    /// Atomically move a resource to a new parent (or to root with `None`). Rejects cycles and
-    /// respects the partial unique indexes on name/discriminator at the destination scope.
-    async fn reparent(
-        &self,
-        uid: Uuid,
-        new_parent_uid: Option<Uuid>,
-    ) -> Result<ResourceRow, StoreError>;
-
     async fn update_controller_status(
         &self,
         uid: Uuid,
@@ -172,9 +184,55 @@ pub trait ResourceStore: Send + Sync {
         remove: &[String],
     ) -> Result<ResourceRow, StoreError>;
 
+    /// Force-update a resource's status as an operator, bypassing controller restrictions.
+    ///
+    /// Stores the status under `status.controllers.operator:<operator>` (same nested
+    /// structure as `update_controller_status` but using the operator identifier as the key).
+    async fn operator_update_status(
+        &self,
+        uid: Uuid,
+        operator: &str,
+        status_value: serde_json::Value,
+    ) -> Result<ResourceRow, StoreError>;
+
+    /// Force-update a resource's finalizers as an operator, bypassing controller ownership checks.
+    ///
+    /// Applies the same `add`/`remove` logic as `update_controller_finalizers` but without
+    /// the controller-ownership check on each finalizer. Still blocks modifying
+    /// `system.rise.dev/*` finalizers to prevent cascade deletion corruption.
+    async fn operator_update_finalizers(
+        &self,
+        uid: Uuid,
+        operator: &str,
+        add: &[String],
+        remove: &[String],
+    ) -> Result<ResourceRow, StoreError>;
+
     async fn resolve_collection(
         &self,
         collection: &str,
+    ) -> Result<Option<CollectionInfo>, StoreError>;
+
+    async fn resolve_collection_version(
+        &self,
+        group: &str,
+        version: &str,
+        collection: &str,
+    ) -> Result<Option<CollectionInfo>, StoreError>;
+
+    /// Resolve a collection by its API group and kind, rather than by plural.
+    ///
+    /// Used to walk the parent chain of a `ResourceDefinition`: the `parent`
+    /// ref carries `{api_version, kind}`, not the plural. The collection is
+    /// resolved at its storage version (ancestors are never version-addressed);
+    /// when the storage version is not served, any served version is used
+    /// instead — the resolved `kind`, `declared_api_versions`, and `parent` are
+    /// version-independent. Returns `None` when no built-in or
+    /// `ResourceDefinition` declares that `(group, kind)`.
+    async fn resolve_collection_by_kind(
+        &self,
+        group: &str,
+        kind: &str,
     ) -> Result<Option<CollectionInfo>, StoreError>;
 
     async fn register_resource_definition(

@@ -1,12 +1,12 @@
 use crate::db::models::User;
 use crate::db::service_accounts;
 use crate::server::auth::controller::{
-    match_controller_identity, ControllerIdentity, ControllerMatch,
+    match_controller_identity, ControllerAuthContext, ControllerIdentity, ControllerMatch,
 };
 use crate::server::auth::jwt::JwtValidator;
 use crate::server::error::{ServerError, ServerErrorExt};
 use crate::server::state::AppState;
-use axum::{extract::FromRequestParts, http::request::Parts};
+use axum::{extract::FromRequestParts, http::request::Parts, http::StatusCode};
 use sqlx::PgPool;
 use std::collections::HashMap;
 
@@ -213,11 +213,45 @@ impl FromRequestParts<AppState> for AuthContext {
     }
 }
 
+/// Authentication context that accepts either a user/SA token or a controller token.
+///
+/// Used by endpoints that must handle both kinds of callers (e.g. `dispatch_put`).
+/// Controller auth is tried first (it is more specific — requires both a
+/// `VerifiedExternalToken` extension *and* matching `ControllerIdentity` claims).
+/// If that fails, regular user/SA auth is attempted.
+#[derive(Clone, Debug)]
+pub enum AnyAuth {
+    User(AuthContext),
+    Controller(ControllerAuthContext),
+}
+
+impl FromRequestParts<AppState> for AnyAuth {
+    type Rejection = ServerError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        // Try controller first (more specific — requires VerifiedExternalToken
+        // AND matching ControllerIdentity claims).
+        // Only fall back to user/SA auth on 401 (not a controller token).
+        // Any other error (e.g. 409 ambiguous config) is propagated immediately.
+        match ControllerAuthContext::from_request_parts(parts, state).await {
+            Ok(ctrl) => return Ok(AnyAuth::Controller(ctrl)),
+            Err(e) if e.status == StatusCode::UNAUTHORIZED => {}
+            Err(e) => return Err(e),
+        }
+        // Fall back to user/SA auth
+        Ok(AnyAuth::User(
+            AuthContext::from_request_parts(parts, state).await?,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::{models::ProjectStatus, projects, service_accounts, users};
-    use axum::http::StatusCode;
 
     fn empty_controller_index() -> HashMap<String, Vec<ControllerIdentity>> {
         HashMap::new()

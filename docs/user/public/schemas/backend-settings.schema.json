@@ -136,7 +136,7 @@
         },
         "operator_users": {
           "default": [],
-          "description": "List of Operator user emails. Operators have full access to generic\nresource storage and built-in resource management. This is a separate\nrole from `admin_users`.",
+          "description": "List of Operator user emails. Operators have full access to generic\nresource storage and built-in resource management. This is a separate\nrole from `admin_users`. Matching is case-insensitive.",
           "items": {
             "type": "string"
           },
@@ -1631,8 +1631,7 @@
   },
   "required": [
     "server",
-    "auth",
-    "database"
+    "auth"
   ],
   "title": "Settings",
   "type": "object"

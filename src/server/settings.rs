@@ -7,6 +7,7 @@ use std::env;
 pub struct Settings {
     pub server: ServerSettings,
     pub auth: AuthSettings,
+    #[serde(default)]
     pub database: DatabaseSettings,
     #[serde(default)]
     pub registry: Option<RegistrySettings>,
@@ -230,7 +231,7 @@ pub struct AuthSettings {
     pub admin_users: Vec<String>,
     /// List of Operator user emails. Operators have full access to generic
     /// resource storage and built-in resource management. This is a separate
-    /// role from `admin_users`.
+    /// role from `admin_users`. Matching is case-insensitive.
     #[serde(default)]
     pub operator_users: Vec<String>,
     /// Trusted external controller identities. Each entry binds a stable
@@ -273,7 +274,7 @@ pub struct AuthSettings {
     pub active_sync_interval_secs: u64,
 }
 
-#[derive(Debug, Deserialize, Clone, JsonSchema)]
+#[derive(Debug, Default, Deserialize, Clone, JsonSchema)]
 pub struct DatabaseSettings {
     #[serde(default)]
     pub url: String,
@@ -1122,11 +1123,12 @@ impl Settings {
             tracing::warn!("Unknown configuration field in backend config: {}", field);
         }
 
-        // Special handling for DATABASE_URL environment variable (common convention)
-        // This takes precedence over both TOML config and RISE_DATABASE__URL
-        if let Some(database_url) = env_lookup("DATABASE_URL") {
-            if !database_url.is_empty() {
-                settings.database.url = database_url;
+        // Fall back to DATABASE_URL environment variable if database.url is not set in config
+        if settings.database.url.is_empty() {
+            if let Some(database_url) = env_lookup("DATABASE_URL") {
+                if !database_url.is_empty() {
+                    settings.database.url = database_url;
+                }
             }
         }
 
@@ -1453,6 +1455,93 @@ deployment_controller:
             extra_service_token_audiences.get("vault"),
             Some(&"https://vault.example.com".to_string())
         );
+    }
+
+    #[test]
+    fn test_database_url_config_takes_precedence_over_env() {
+        // Verify that database.url in config is not overridden by DATABASE_URL env var
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("development.yaml");
+
+        fs::write(
+            &config_path,
+            r#"
+server:
+  host: "0.0.0.0"
+  port: 3000
+  public_url: "http://localhost:3000"
+  jwt_signing_secret: "test-secret-key-for-testing-123456"
+
+database:
+  url: "postgres://config-user@config-host/config-db"
+
+auth:
+  issuer: "http://localhost:5556"
+  client_id: "test"
+  client_secret: "test"
+"#,
+        )
+        .unwrap();
+
+        let env_lookup = |name: &str| {
+            (name == "DATABASE_URL").then(|| "postgres://env-user@env-host/env-db".to_string())
+        };
+
+        let settings = Settings::new_with_env(
+            temp_dir.path().to_str().unwrap(),
+            "development",
+            &env_lookup,
+        )
+        .expect("config should load");
+
+        // The explicit config value must win over DATABASE_URL
+        assert_eq!(
+            settings.database.url,
+            "postgres://config-user@config-host/config-db"
+        );
+    }
+
+    #[test]
+    fn test_database_url_env_used_as_fallback_when_config_unset() {
+        // Verify that DATABASE_URL env var is used when database.url is not set in config
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("development.yaml");
+
+        fs::write(
+            &config_path,
+            r#"
+server:
+  host: "0.0.0.0"
+  port: 3000
+  public_url: "http://localhost:3000"
+  jwt_signing_secret: "test-secret-key-for-testing-123456"
+
+auth:
+  issuer: "http://localhost:5556"
+  client_id: "test"
+  client_secret: "test"
+"#,
+        )
+        .unwrap();
+
+        let env_lookup = |name: &str| {
+            (name == "DATABASE_URL").then(|| "postgres://env-user@env-host/env-db".to_string())
+        };
+
+        let settings = Settings::new_with_env(
+            temp_dir.path().to_str().unwrap(),
+            "development",
+            &env_lookup,
+        )
+        .expect("config should load using DATABASE_URL fallback");
+
+        assert_eq!(settings.database.url, "postgres://env-user@env-host/env-db");
     }
 
     #[test]

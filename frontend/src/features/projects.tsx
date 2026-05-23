@@ -98,7 +98,7 @@ export function AppUsersList({ projectName, project, accessClasses, currentUserE
     const loadServiceAccounts = async () => {
         try {
             const response = await api.getProjectServiceAccounts(projectName);
-            setServiceAccounts(response?.workload_identities || []);
+            setServiceAccounts(response?.service_accounts || []);
         } catch (err) {
             console.error('Failed to load service accounts:', err);
         }

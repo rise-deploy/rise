@@ -2,7 +2,7 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
-import { copyToClipboard, formatDate, formatISO8601, formatRelativeTimeRounded, formatTimeRemaining } from '../lib/utils';
+import { copyToClipboard, formatDate, formatISO8601, formatRelativeTimeRounded, formatTimeRemaining, isSafeUrl, stripUrlScheme } from '../lib/utils';
 import { useToast } from '../components/toast';
 import { Button, ENV_COLOR_STYLES, EnvironmentColorDot, SourceLinkGroup, SourceLinkGroupAction, StatusBadge } from '../components/ui';
 import { MonoSortButton, MonoTable, MonoTableBody, MonoTableEmptyRow, MonoTableFrame, MonoTableHead, MonoTableRow, MonoTd, MonoTh } from '../components/table';
@@ -1567,6 +1567,25 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                     {(deployment.job_url || deployment.pull_request_url) && (
                         <KVRow k="Source">
                             <SourceLinkGroup jobUrl={deployment.job_url} prUrl={deployment.pull_request_url} />
+                        </KVRow>
+                    )}
+                    {deployment.git_repository_url && (
+                        <KVRow k="Repository">
+                            {isSafeUrl(deployment.git_repository_url) ? (
+                                <a
+                                    className="r-link mono"
+                                    style={{ fontSize: 12.5, wordBreak: 'break-all' }}
+                                    href={deployment.git_repository_url}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                >
+                                    {stripUrlScheme(deployment.git_repository_url)}
+                                </a>
+                            ) : (
+                                <span className="mono" style={{ fontSize: 12.5, wordBreak: 'break-all' }}>
+                                    {deployment.git_repository_url}
+                                </span>
+                            )}
                         </KVRow>
                     )}
                 </KV>

@@ -1488,6 +1488,7 @@ mod tests {
             first_healthy_at: None,
             job_url: None,
             pull_request_url: None,
+            git_repository_url: None,
             replicas: 1,
             cpu: "500m".to_string(),
             memory: "256Mi".to_string(),

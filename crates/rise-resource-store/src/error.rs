@@ -20,8 +20,8 @@ pub enum StoreError {
     #[error("intermediate path segment not found")]
     ParentNotFound,
 
-    #[error("reparent would create a cycle")]
-    ReparentCycle,
+    #[error("unknown version: {0}")]
+    UnknownVersion(String),
 
     #[error("reserved finalizer namespace: '{0}'")]
     ReservedFinalizer(String),
