@@ -64,6 +64,8 @@ The codebase is organized into functional modules:
    - **Authentication Module** (`auth/`): OAuth2/OIDC with Dex, JWT validation
    - **Project Management** (`project/`): Project CRUD and lifecycle management
    - **Team Management** (`team/`): Team and membership management
+   - **Service Accounts** (`service_accounts/`): CI/CD service accounts (inbound OIDC federation into Rise)
+   - **Workload Identity Tokens** (`workload_tokens/`): Token-exchange endpoint issuing Rise-signed workload JWTs to deployed apps
    - **Container Registry** (`registry/`): Temporary credentials for ECR registries
    - **Deployment Module** (`deployment/`): Kubernetes controller for deployments
    - **ECR Integration** (`ecr/`): AWS ECR repository management

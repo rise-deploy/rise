@@ -21,6 +21,7 @@ pub mod settings;
 pub mod ssrf;
 pub mod state;
 pub mod team;
+pub mod workload_tokens;
 
 use anyhow::Result;
 use axum::{extract::Request, middleware as axum_middleware, response::Response, Router};
@@ -161,7 +162,8 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
             "/schema/rise-toml/v1",
             axum::routing::get(rise_toml_schema_v1_redirect),
         )
-        .merge(auth::routes::public_routes());
+        .merge(auth::routes::public_routes())
+        .merge(workload_tokens::routes::routes());
 
     // Auth-only routes (require authentication but NOT platform access)
     let auth_only_routes = Router::new()

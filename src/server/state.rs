@@ -101,6 +101,10 @@ pub struct AppState {
     /// Platform-level constraints for deployment resources
     #[cfg(feature = "backend")]
     pub deployment_constraints: Option<crate::server::settings::DeploymentConstraints>,
+    /// Lifetime in seconds of controller-minted workload identity tokens.
+    /// Refresh threshold is derived as TTL / 2.
+    #[cfg(feature = "backend")]
+    pub identity_token_ttl_seconds: u64,
 }
 
 /// Initialize encryption provider from settings
@@ -600,6 +604,7 @@ impl AppState {
             webhook_port,
             deployment_defaults_opt,
             deployment_constraints_opt,
+            identity_token_ttl_seconds,
         ) = {
             use crate::server::deployment::resource_builder::ResourceBuilder;
             use crate::server::settings::DeploymentControllerSettings;
@@ -634,6 +639,7 @@ impl AppState {
                 metacontroller_pod_namespace,
                 metacontroller_pod_label_selector,
                 namespace_format,
+                identity_token_ttl_seconds,
                 ..
             }) = &settings.deployment_controller
             {
@@ -725,9 +731,10 @@ impl AppState {
                     Some(*metacontroller_webhook_port),
                     Some(deployment_defaults.clone()),
                     Some(_deployment_constraints.clone()),
+                    *identity_token_ttl_seconds,
                 )
             } else {
-                (None, None, None, None, None, None)
+                (None, None, None, None, None, None, 3600)
             }
         };
 
@@ -1073,6 +1080,8 @@ impl AppState {
             deployment_defaults: deployment_defaults_opt,
             #[cfg(feature = "backend")]
             deployment_constraints: deployment_constraints_opt,
+            #[cfg(feature = "backend")]
+            identity_token_ttl_seconds,
         })
     }
 }

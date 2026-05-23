@@ -265,6 +265,11 @@ pub struct CreateDeploymentRequest {
     /// Memory allocation (e.g., "256Mi", "1Gi") — overrides rise.toml and platform defaults
     #[serde(default)]
     pub memory: Option<String>,
+    /// Workload-identity token audiences from `[identity]` in rise.toml.
+    /// Map of { in-pod filename -> token audience }. On redeploy without an
+    /// explicit value, inherited from the source deployment.
+    #[serde(default)]
+    pub identity_audiences: Option<std::collections::BTreeMap<String, String>>,
 }
 
 // Response from creating a deployment

@@ -7,6 +7,7 @@ pub mod encrypt;
 pub mod env;
 pub mod environment;
 pub mod extension;
+pub mod identity;
 pub mod login;
 pub mod project;
 pub mod run;

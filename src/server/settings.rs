@@ -84,6 +84,12 @@ pub struct ServerSettings {
     /// OAuth endpoint rate limiting configuration.
     #[serde(default)]
     pub oauth_rate_limit: OAuthRateLimitSettings,
+
+    /// Maximum TTL in seconds for workload identity tokens issued via the token-exchange endpoint.
+    /// Requests that specify a higher TTL are silently capped to this value.
+    /// Default: 900 (15 minutes).
+    #[serde(default = "default_workload_token_max_ttl_seconds")]
+    pub workload_token_max_ttl_seconds: u64,
 }
 
 /// Rate limiting configuration for OAuth endpoints (authorize, callback, token).
@@ -161,6 +167,14 @@ fn default_jwt_claims() -> Vec<String> {
 
 fn default_jwt_expiry_seconds() -> u64 {
     86400 // 24 hours
+}
+
+fn default_workload_token_max_ttl_seconds() -> u64 {
+    900 // 15 minutes
+}
+
+fn default_identity_token_ttl_seconds() -> u64 {
+    3600 // 1 hour
 }
 
 fn default_oauth_per_project_max() -> u32 {
@@ -749,6 +763,12 @@ pub enum DeploymentControllerSettings {
         /// If not set, uses defaults (HTTP probes on app port at "/" path)
         #[serde(default)]
         health_probes: Option<HealthProbeConfig>,
+
+        /// Lifetime in seconds of workload identity tokens auto-minted by the controller
+        /// and mounted into deployment pods. The controller re-mints tokens when they
+        /// are older than half this value. Default: 3600 (1 hour).
+        #[serde(default = "default_identity_token_ttl_seconds")]
+        identity_token_ttl_seconds: u64,
 
         /// Port for the internal metacontroller webhook listener.
         /// Webhook endpoints are served on this separate port instead of the main HTTP port.
