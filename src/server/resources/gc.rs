@@ -263,6 +263,24 @@ mod tests {
             .unwrap()
     }
 
+    /// Create an Organization carrying a controller-scoped finalizer so that
+    /// `delete()` leaves it tombstoned instead of hard-deleting immediately.
+    async fn create_org_with_finalizer(store: &dyn ResourceStore, name: &str) -> ResourceRow {
+        store
+            .create(CreateResourceParams {
+                api_version: API_VERSION_V1ALPHA1.to_string(),
+                kind: ORGANIZATION_KIND.to_string(),
+                name: name.to_string(),
+                parent_uid: None,
+                annotations: BTreeMap::new(),
+                finalizers: vec![CONTROLLER_FINALIZER.to_string()],
+                spec: json!({"displayName": name}),
+                validator: None,
+            })
+            .await
+            .unwrap()
+    }
+
     async fn register_widget_definition(store: &dyn ResourceStore) {
         store
             .register_resource_definition(CreateResourceParams {
@@ -354,11 +372,25 @@ mod tests {
             .await
             .unwrap();
 
-        // Second sweep collects the child (no remaining finalizers) and the
-        // parent (no remaining children — cascade finalizer cleared by store).
-        let stats = gc.sweep().await.unwrap();
-        assert_eq!(stats.collected, 2);
-        assert_eq!(stats.errors, 0);
+        // Drain the cascade. The first post-clear sweep collects the child
+        // (no finalizers, no children) but cannot yet collect the parent
+        // because the in-batch view still sees the child as a child. The
+        // next sweep re-lists, sees the parent has no children, clears its
+        // cascade finalizer, and hard-deletes it. Allow a few sweeps so the
+        // assertion does not depend on `list_pending_collection`'s
+        // unspecified order for rows with identical `deletion_timestamp`.
+        let mut total_collected = 0u64;
+        for _ in 0..8 {
+            let s = gc.sweep().await.unwrap();
+            total_collected += s.collected;
+            assert_eq!(s.errors, 0);
+            if store.get(parent.uid).await.unwrap().is_none()
+                && store.get(child.uid).await.unwrap().is_none()
+            {
+                break;
+            }
+        }
+        assert_eq!(total_collected, 2);
         assert!(store.get(parent.uid).await.unwrap().is_none());
         assert!(store.get(child.uid).await.unwrap().is_none());
         Ok(())
@@ -368,14 +400,30 @@ mod tests {
     async fn sweep_isolates_per_row_errors(pool: PgPool) -> sqlx::Result<()> {
         let inner = store_for(pool.clone()).await;
 
-        // Three independent tombstoned root rows. Each is collectable in one
-        // pass (no children, no controller finalizers), so a normal sweep
-        // would hard-delete all three.
-        let a = create_org(&*inner, "row-a").await;
-        let b = create_org(&*inner, "row-b").await;
-        let c = create_org(&*inner, "row-c").await;
+        // Each row carries a controller-scoped finalizer at creation time so
+        // `delete()` tombstones it instead of hard-deleting (a finalizer-free,
+        // childless root is collected immediately by `delete` itself, which
+        // would leave nothing for the sweep to process).
+        let a = create_org_with_finalizer(&*inner, "row-a").await;
+        let b = create_org_with_finalizer(&*inner, "row-b").await;
+        let c = create_org_with_finalizer(&*inner, "row-c").await;
         for r in [&a, &b, &c] {
             inner.delete(r.uid).await.unwrap();
+        }
+
+        // Drop the finalizer on the two rows we expect the sweep to collect.
+        // `b` keeps its finalizer, but the failing decorator errors before
+        // `try_collect` is reached anyway.
+        for r in [&a, &c] {
+            inner
+                .update_controller_finalizers(
+                    r.uid,
+                    CONTROLLER_ID,
+                    &[],
+                    &[CONTROLLER_FINALIZER.to_string()],
+                )
+                .await
+                .unwrap();
         }
 
         let failing: Arc<dyn ResourceStore> = Arc::new(FailingStore {
