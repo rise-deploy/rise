@@ -17,6 +17,13 @@ pub struct Settings {
     pub encryption: Option<EncryptionSettings>,
     #[serde(default)]
     pub extensions: Option<ExtensionsSettings>,
+    /// Background garbage-collection worker for the generic resource store.
+    /// Drains tombstoned resource rows once their controller finalizers clear.
+    /// Omitting the section keeps the worker running with the documented defaults;
+    /// the worker is essential to draining cascading deletes and is therefore
+    /// always on when the `backend` feature is enabled.
+    #[serde(default)]
+    pub resource_gc: Option<ResourceGcSettings>,
 }
 
 #[derive(Debug, Deserialize, Clone, JsonSchema)]
@@ -1600,6 +1607,64 @@ auth:
             "Config should fail without required run_mode file"
         );
     }
+
+    #[test]
+    fn test_resource_gc_settings_defaults() {
+        let s = ResourceGcSettings::default();
+        assert_eq!(s.interval_secs, 10);
+        assert_eq!(s.batch_size, 50);
+        assert_eq!(s.max_batches_per_tick, 4);
+        assert_eq!(s.stuck_threshold_secs, 3600);
+        assert_eq!(s.lease_duration_secs, 60);
+    }
+
+    #[test]
+    fn test_resource_gc_settings_partial_yaml_fills_defaults() {
+        // Only override two fields; the rest must fall back to defaults.
+        let s: ResourceGcSettings =
+            serde_yaml::from_str("interval_secs: 5\nbatch_size: 100\n").unwrap();
+        assert_eq!(s.interval_secs, 5);
+        assert_eq!(s.batch_size, 100);
+        assert_eq!(s.max_batches_per_tick, 4);
+        assert_eq!(s.stuck_threshold_secs, 3600);
+        assert_eq!(s.lease_duration_secs, 60);
+    }
+
+    #[test]
+    fn test_resource_gc_section_is_optional() {
+        // Loading a config that omits `resource_gc` must succeed and leave
+        // the field as `None`; the runtime then falls back to defaults.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("development.yaml");
+
+        fs::write(
+            &config_path,
+            r#"
+server:
+  host: "0.0.0.0"
+  port: 3000
+  public_url: "http://localhost:3000"
+  jwt_signing_secret: "test-secret-key-for-testing-123456"
+
+database:
+  url: "postgres://test@localhost/test"
+
+auth:
+  issuer: "http://localhost:5556"
+  client_id: "test"
+  client_secret: "test"
+"#,
+        )
+        .unwrap();
+
+        let settings =
+            Settings::new_with_env(temp_dir.path().to_str().unwrap(), "development", &|_| None)
+                .expect("config should load without resource_gc section");
+        assert!(settings.resource_gc.is_none());
+    }
 }
 
 /// Extensions configuration
@@ -1825,4 +1890,66 @@ impl Default for PlatformAccessConfig {
 
 fn default_platform_access_policy() -> PlatformAccessPolicy {
     PlatformAccessPolicy::AllowAll
+}
+
+/// Background garbage-collection worker for the generic resource store.
+///
+/// Polls `list_pending_collection` and drives `try_collect` per row. Each tick
+/// processes at most `batch_size × max_batches_per_tick` rows, capping the
+/// effective throughput at `batch_size × max_batches_per_tick / interval_secs`
+/// rows per second. Rows whose `deletion_timestamp` is older than
+/// `stuck_threshold_secs` are flagged with a `warn!` log per sweep.
+#[derive(Debug, Deserialize, Clone, JsonSchema)]
+pub struct ResourceGcSettings {
+    /// Sweep cadence in seconds. Default: 10.
+    #[serde(default = "default_resource_gc_interval_secs")]
+    pub interval_secs: u64,
+    /// Rows per `list_pending_collection` call. Default: 50.
+    #[serde(default = "default_resource_gc_batch_size")]
+    pub batch_size: i64,
+    /// Maximum number of consecutive full batches processed in a single tick.
+    /// Lets a deep backlog drain faster without monopolizing the worker.
+    /// Default: 4.
+    #[serde(default = "default_resource_gc_max_batches_per_tick")]
+    pub max_batches_per_tick: u32,
+    /// Seconds after which a tombstoned row is logged as `stuck` on each
+    /// sweep. Logs-only; does not change collection behavior. Default: 3600.
+    #[serde(default = "default_resource_gc_stuck_threshold_secs")]
+    pub stuck_threshold_secs: u64,
+    /// Leader-election lease duration in seconds. Mirrors the project
+    /// controller's value. Default: 60.
+    #[serde(default = "default_resource_gc_lease_duration_secs")]
+    pub lease_duration_secs: u64,
+}
+
+impl Default for ResourceGcSettings {
+    fn default() -> Self {
+        Self {
+            interval_secs: default_resource_gc_interval_secs(),
+            batch_size: default_resource_gc_batch_size(),
+            max_batches_per_tick: default_resource_gc_max_batches_per_tick(),
+            stuck_threshold_secs: default_resource_gc_stuck_threshold_secs(),
+            lease_duration_secs: default_resource_gc_lease_duration_secs(),
+        }
+    }
+}
+
+fn default_resource_gc_interval_secs() -> u64 {
+    10
+}
+
+fn default_resource_gc_batch_size() -> i64 {
+    50
+}
+
+fn default_resource_gc_max_batches_per_tick() -> u32 {
+    4
+}
+
+fn default_resource_gc_stuck_threshold_secs() -> u64 {
+    3600
+}
+
+fn default_resource_gc_lease_duration_secs() -> u64 {
+    60
 }
