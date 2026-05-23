@@ -39,12 +39,12 @@ pub async fn exchange_token(
     }
 
     let hash = sha256_hex(credential.as_bytes());
-    let deployment_opt = db_deployments::get_by_identity_credential_hash(&state.db_pool, &hash)
-        .await
-        .internal_err("Failed to look up deployment")?
-        .filter(should_have_infrastructure);
+    let deployment_by_credential =
+        db_deployments::get_by_identity_credential_hash(&state.db_pool, &hash)
+            .await
+            .internal_err("Failed to look up deployment")?;
 
-    let rate_limit_key = deployment_opt
+    let rate_limit_key = deployment_by_credential
         .as_ref()
         .map(|d| d.id.to_string())
         .unwrap_or_else(|| "invalid-credential".to_string());
@@ -56,8 +56,13 @@ pub async fn exchange_token(
         return Ok(rate_limit_response(retry_after).into_response());
     }
 
-    let deployment =
-        deployment_opt.ok_or_else(|| ServerError::unauthorized("Invalid bootstrap credential"))?;
+    let deployment = match deployment_by_credential {
+        None => return Err(ServerError::forbidden("Invalid bootstrap credential")),
+        Some(d) if !should_have_infrastructure(&d) => {
+            return Err(ServerError::bad_request("Deployment is not running"))
+        }
+        Some(d) => d,
+    };
 
     let project = db_projects::find_by_id(&state.db_pool, deployment.project_id)
         .await
@@ -179,7 +184,7 @@ mod tests {
         .await
         .unwrap();
 
-        // An unknown credential resolves to no deployment → 401.
+        // An unknown credential resolves to no deployment → 403.
         let unknown_hash = sha256_hex(b"never-issued-credential");
         assert!(
             db_deployments::get_by_identity_credential_hash(&pool, &unknown_hash)
@@ -230,17 +235,20 @@ mod tests {
             };
 
         // A deployment whose credential is on record but which has no live
-        // infrastructure (still Pending) is filtered out by
-        // `should_have_infrastructure` exactly as the handler does → 401.
+        // infrastructure (still Pending) resolves to a deployment but is rejected
+        // by `should_have_infrastructure` → the handler returns 400.
         let (_pending, pending_hash) =
             make_deployment("pending-deploy", DeploymentStatus::Pending, "pending-cred").await;
         let resolved = db_deployments::get_by_identity_credential_hash(&pool, &pending_hash)
             .await
-            .unwrap()
-            .filter(should_have_infrastructure);
+            .unwrap();
         assert!(
-            resolved.is_none(),
-            "a Pending deployment has no live infrastructure and must not be a valid subject"
+            resolved.is_some(),
+            "a Pending deployment with a known credential hash must resolve to a deployment"
+        );
+        assert!(
+            !should_have_infrastructure(resolved.as_ref().unwrap()),
+            "a Pending deployment has no live infrastructure"
         );
 
         // A deployment in a status with live infrastructure (Pushed) and a
