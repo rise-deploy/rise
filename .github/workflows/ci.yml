@@ -496,6 +496,7 @@ jobs:
     environment:
       name: github-pages
     permissions:
+      actions: read
       contents: read
       id-token: write
       issues: write
@@ -533,6 +534,55 @@ jobs:
           RISE_DOCS_SWITCH_URL: /${{ github.event.repository.name }}/preview/pr-${{ github.event.pull_request.number }}/user/
           RISE_DOCS_SWITCH_LABEL: User docs
         run: npm run build
+
+      - name: Seed docs-preview with current live site
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # GitHub Pages deployments are atomic full-site replacements, so a
+        # preview-only artifact would wipe the production site and any other
+        # PRs' previews. Seed docs-preview/ with the latest live Pages artifact
+        # (preserving other PRs' previews), then overlay the latest production
+        # artifact from the default branch so prod content is always restored
+        # even if the current live state was clobbered by a previous bug.
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY}"
+          mkdir -p docs-preview
+
+          fetch_artifact() {
+            local artifact_id="$1"
+            local label="$2"
+            if [[ -z "${artifact_id}" || "${artifact_id}" == "null" ]]; then
+              echo "No ${label} artifact found; skipping."
+              return 0
+            fi
+            echo "Seeding docs-preview with ${label} artifact ${artifact_id}"
+            local tmp
+            tmp="$(mktemp -d)"
+            gh api "repos/${repo}/actions/artifacts/${artifact_id}/zip" > "${tmp}/artifact.zip"
+            unzip -q "${tmp}/artifact.zip" -d "${tmp}"
+            if [[ -f "${tmp}/artifact.tar" ]]; then
+              tar -xf "${tmp}/artifact.tar" -C docs-preview
+            else
+              echo "::warning::${label} artifact ${artifact_id} did not contain artifact.tar"
+            fi
+            rm -rf "${tmp}"
+          }
+
+          default_branch="$(gh api "repos/${repo}" --jq '.default_branch')"
+          artifacts_json="$(gh api "repos/${repo}/actions/artifacts?name=github-pages&per_page=100")"
+
+          live_id="$(echo "${artifacts_json}" \
+            | jq -r '[.artifacts[] | select(.expired == false)] | first | .id // empty')"
+          fetch_artifact "${live_id}" "live"
+
+          prod_id="$(echo "${artifacts_json}" \
+            | jq -r --arg branch "${default_branch}" \
+              '[.artifacts[] | select(.expired == false and .workflow_run.head_branch == $branch)] | first | .id // empty')"
+          if [[ -n "${prod_id}" && "${prod_id}" != "${live_id}" ]]; then
+            fetch_artifact "${prod_id}" "production"
+          fi
 
       - name: Stage docs preview
         shell: bash
