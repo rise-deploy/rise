@@ -245,7 +245,7 @@ pub struct AuthSettings {
     pub admin_users: Vec<String>,
     /// List of Operator user emails. Operators have full access to generic
     /// resource storage and built-in resource management. This is a separate
-    /// role from `admin_users`.
+    /// role from `admin_users`. Matching is case-insensitive.
     #[serde(default)]
     pub operator_users: Vec<String>,
     /// Trusted external controller identities. Each entry binds a stable

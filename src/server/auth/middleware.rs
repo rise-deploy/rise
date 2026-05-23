@@ -310,6 +310,7 @@ pub async fn platform_access_middleware(
     let checker = ConfigBasedAccessChecker {
         config: &state.auth_settings.platform_access,
         admin_users: &state.admin_users,
+        operator_users: &state.operator_users,
     };
 
     // Pass groups from Rise JWT to platform access checker

@@ -55,6 +55,11 @@ pub struct AppState {
     pub controllers: Arc<HashMap<String, ControllerIdentity>>,
     /// Controller identities indexed by issuer URL for middleware lookup.
     pub controllers_by_issuer: Arc<HashMap<String, Vec<ControllerIdentity>>>,
+    /// Generic-resource store used by the `/api/v1/resources` HTTP API and
+    /// (later) by internal controllers wanting to reconcile against Rise state
+    /// without a network round-trip.
+    #[cfg(feature = "backend")]
+    pub resource_store: Arc<dyn rise_resource_store::ResourceStore>,
     pub auth_settings: Arc<AuthSettings>,
     pub server_settings: Arc<ServerSettings>,
     pub token_store: Arc<dyn TokenStore>,
@@ -256,6 +261,13 @@ impl AppState {
         rise_resource_store::run_migrations(&db_pool)
             .await
             .context("Failed to run resource store migrations")?;
+
+        // Initialize the generic-resource store now that its schema exists. The
+        // store is cheap to construct (it caches compiled JSON schemas lazily),
+        // so we instantiate it once and clone the Arc into every handler.
+        #[cfg(feature = "backend")]
+        let resource_store: Arc<dyn rise_resource_store::ResourceStore> =
+            Arc::new(rise_resource_store::PgResourceStore::new(db_pool.clone()));
 
         // Initialize JWT validator (JWKS is fetched on-demand)
         let jwt_validator = Arc::new(JwtValidator::new(settings.server.ssrf.clone()));
@@ -1039,6 +1051,8 @@ impl AppState {
             operator_users,
             controllers,
             controllers_by_issuer,
+            #[cfg(feature = "backend")]
+            resource_store,
             auth_settings,
             server_settings,
             token_store,
