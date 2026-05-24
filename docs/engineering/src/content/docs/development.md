@@ -77,13 +77,25 @@ mise frontend:dev  # Vite dev server only
 | Task | Purpose |
 |------|---------|
 | `setup` | One-stop dev setup: hosts + docker + cluster (interactive) |
-| `minikube:up` | Bring up Minikube with registry access and ingress port-forwarding (**preferred**) |
-| `minikube:down` | Stop and delete Minikube |
-| `k3s:up` / `k3s:down` | Alternative: K3s (Linux only — use when Minikube doesn't work, or in ephemeral/dedicated Rise dev environments) |
+| `down` | Undo what `setup` did (kills port-forward, deletes cluster, strips .env block + daemon.json registries + /etc/hosts block) |
 
-All three tasks delegate to `./scripts/dev-setup.sh`. The script can also be invoked directly with subcommands `hosts`, `docker`, `minikube`, `k3s`, or `preflight` (hosts + docker only).
+Everything is driven by `./scripts/dev-setup.sh`. `mise setup` and `mise down` are convenience wrappers; positional args pass through, so any script subcommand works as `mise setup <subcmd>`:
 
-**Minikube vs K3s**: `minikube:up` is preferred on most developer machines — it runs a single-node Kubernetes cluster inside a Docker container, starts quickly, and integrates well with the local Docker network so pods can reach `rise-registry:5000`. Use `k3s:up` (Linux only) when Minikube doesn't work on your machine (e.g., nested virtualization issues) or when setting up an ephemeral or dedicated environment solely for Rise development where the slight extra K3s overhead doesn't matter.
+| Invocation | What it does |
+|------------|--------------|
+| `mise setup hosts` | Rewrite the managed `/etc/hosts` block (base hosts + `*.rise.local` ingress hosts enumerated from the current cluster) |
+| `mise setup hosts-clear` | Remove the managed `/etc/hosts` block |
+| `mise setup docker` | Configure Docker insecure-registries (asks to restart Docker Desktop on macOS) |
+| `mise setup docker-clear` | Remove rise registries from `daemon.json` |
+| `mise setup minikube` | Bring up Minikube + ingress port-forward + Helm install (**preferred** on most dev machines) |
+| `mise setup minikube-down` | `minikube delete` |
+| `mise setup k3s` | Bring up k3s (Linux only — use when Minikube doesn't work, or in ephemeral/dedicated Rise dev environments) |
+| `mise setup k3s-down` | Uninstall k3s |
+| `mise setup pf` | Start the ingress port-forward (`localhost:8080` + `:8443`) in the background |
+| `mise setup pf-down` | Stop the ingress port-forward |
+| `mise setup preflight` | hosts + docker only, no cluster |
+
+**Minikube vs K3s**: Minikube is preferred on most developer machines — it runs a single-node Kubernetes cluster inside a Docker container, starts quickly, and integrates well with the local Docker network so pods can reach `rise-registry:5000`. Use k3s (Linux only) when Minikube doesn't work on your machine (e.g., nested virtualization issues) or when setting up an ephemeral or dedicated environment solely for Rise development where the slight extra k3s overhead doesn't matter.
 
 ### Development
 
@@ -194,7 +206,7 @@ Host Machine (127.0.0.1)
 minikube ssh -- curl http://rise-registry:5000/v2/
 # Should return: {}
 ```
-If it fails, re-run `mise minikube:up`.
+If it fails, re-run `mise setup minikube`.
 
 **Reset everything:**
 ```bash
