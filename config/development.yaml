@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=../docs/user/public/schemas/backend-settings.schema.json
+# yaml-language-server: $schema=../docs/engineering/public/schemas/backend-settings.schema.json
 # Insecure development configuration - DO NOT USE IN PRODUCTION.
 
 server:
@@ -91,7 +91,7 @@ deployment_controller:
   auth_signin_url: "http://rise.local:3000" # Domain for user-facing OAuth redirects, must be resolvable by users' browsers
   ingress_annotations:
     nginx.ingress.kubernetes.io/ssl-redirect: "false"
-  ingress_port: 8080 # `mise minikube:up` port-forwards ingress to this port
+  ingress_port: 8080 # `mise setup minikube` (or `mise setup pf`) port-forwards ingress to this port
   ingress_schema: "http" # Use http for local development
   host_aliases:
     rise.local: "${RISE_K8S_HOST_IP:-192.168.49.1}" # Host IP reachable from Kubernetes pods
