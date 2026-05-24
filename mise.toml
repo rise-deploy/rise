@@ -24,7 +24,7 @@ description = "Verify /etc/hosts has the required rise-registry, rise-jfrog and 
 run = """
 ok=true
 for h in rise-registry rise-jfrog rise.local; do
-  if ! grep -qE "\\<${h//./\\.}\\>" /etc/hosts; then
+  if ! awk -v h="$h" '{for (i = 1; i <= NF; i++) if ($i == h) {found = 1; exit}} END {exit !found}' /etc/hosts; then
     echo "MISSING: /etc/hosts entry for '$h'"
     ok=false
   fi

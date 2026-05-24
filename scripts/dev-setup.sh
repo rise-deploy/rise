@@ -54,9 +54,23 @@ setup_hosts() {
   log "Configuring /etc/hosts entries: ${REQUIRED_HOSTS[*]}"
   local tmp
   tmp=$(mktemp)
-  # Drop any existing lines that mention our hosts (the older `sed -i` was
-  # GNU-only; awk is portable across Linux and BSD/macOS).
-  awk -v pat='\\<(rise-registry|rise-jfrog|rise\\.local)\\>' '$0 !~ pat' /etc/hosts > "$tmp"
+  # Drop any existing lines that contain one of our hostnames as a
+  # whitespace-separated token. We avoid \< / \> word boundaries because BSD
+  # awk on macOS doesn't honor them — that bug caused this dedup to silently
+  # match nothing and entries to accumulate across runs. Field-based exact
+  # comparison is portable.
+  awk '
+    {
+      keep = 1
+      for (i = 1; i <= NF; i++) {
+        if ($i == "rise-registry" || $i == "rise-jfrog" || $i == "rise.local") {
+          keep = 0
+          break
+        }
+      }
+      if (keep) print
+    }
+  ' /etc/hosts > "$tmp"
   {
     echo '127.0.0.1 rise-registry'
     echo '127.0.0.1 rise-jfrog'
@@ -74,7 +88,12 @@ setup_hosts() {
 check_hosts() {
   local missing=()
   for h in "${REQUIRED_HOSTS[@]}"; do
-    grep -qE "\\<${h//./\\.}\\>" /etc/hosts || missing+=("$h")
+    awk -v h="$h" '
+      {
+        for (i = 1; i <= NF; i++) if ($i == h) { found = 1; exit }
+      }
+      END { exit !found }
+    ' /etc/hosts || missing+=("$h")
   done
   (( ${#missing[@]} == 0 ))
 }
