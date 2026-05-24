@@ -89,9 +89,13 @@ setup_hosts() {
     echo "127.0.0.1 rise-registry"
     echo "127.0.0.1 rise-jfrog"
     echo "127.0.0.1 rise.local"
-    for h in "${ingress_hosts[@]}"; do
-      echo "127.0.0.1 $h"
-    done
+    # Guard the expansion because bash 3.2 (the system bash on macOS) errors
+    # on "${arr[@]}" under set -u when arr is empty.
+    if (( ${#ingress_hosts[@]} > 0 )); then
+      for h in "${ingress_hosts[@]}"; do
+        echo "127.0.0.1 $h"
+      done
+    fi
     echo "$HOSTS_END_MARKER"
   } >> "$tmp"
 
