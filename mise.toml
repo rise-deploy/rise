@@ -19,6 +19,10 @@ vault = "latest"
 description = "One-stop dev environment setup (hosts, docker, cluster). Cross-platform (Linux + macOS). Run interactively."
 run = "./scripts/dev-setup.sh"
 
+[tasks.down]
+description = "Tear down what 'mise setup' brought up (cluster, .env block, daemon.json registries, /etc/hosts block). Interactive."
+run = "./scripts/dev-setup.sh down"
+
 [tasks."check:hosts"]
 description = "Verify /etc/hosts has the required rise-registry, rise-jfrog and rise.local entries."
 run = """

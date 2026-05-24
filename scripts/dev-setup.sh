@@ -2,15 +2,20 @@
 # One-stop dev environment setup for Rise. Cross-platform (Linux + macOS).
 #
 # Usage:
-#   ./scripts/dev-setup.sh              # interactive: do everything
-#   ./scripts/dev-setup.sh hosts        # write the managed /etc/hosts block
-#                                         (base + *.rise.local ingress hosts
-#                                          enumerated from the current cluster)
-#   ./scripts/dev-setup.sh hosts-clear  # remove the managed /etc/hosts block
-#   ./scripts/dev-setup.sh docker       # only Docker insecure-registries
-#   ./scripts/dev-setup.sh minikube     # bring up local minikube + helm install
-#   ./scripts/dev-setup.sh k3s          # bring up local k3s (Linux only)
-#   ./scripts/dev-setup.sh preflight    # hosts + docker, no cluster
+#   ./scripts/dev-setup.sh               # interactive: do everything
+#   ./scripts/dev-setup.sh down          # interactive: undo everything
+#
+#   ./scripts/dev-setup.sh hosts         # write the managed /etc/hosts block
+#                                          (base + *.rise.local ingress hosts
+#                                           enumerated from the current cluster)
+#   ./scripts/dev-setup.sh hosts-clear   # remove the managed /etc/hosts block
+#   ./scripts/dev-setup.sh docker        # only Docker insecure-registries
+#   ./scripts/dev-setup.sh docker-clear  # remove rise registries from daemon.json
+#   ./scripts/dev-setup.sh minikube      # bring up local minikube + helm install
+#   ./scripts/dev-setup.sh minikube-down # 'minikube delete'
+#   ./scripts/dev-setup.sh k3s           # bring up local k3s (Linux only)
+#   ./scripts/dev-setup.sh k3s-down      # uninstall k3s (Linux only)
+#   ./scripts/dev-setup.sh preflight     # hosts + docker, no cluster
 #
 # Run this script directly (not via a `mise` task dependency chain) so that
 # sudo can prompt on a real TTY when needed.
@@ -511,6 +516,139 @@ EOF
   ok "k3s ready. K3s internal IP: $host_ip. If you use direnv: run 'direnv reload'."
 }
 
+# ---- Teardown -------------------------------------------------------------
+
+# Kill any kubectl port-forward this script (or a previous run of it) started
+# for ingress-nginx. We match by command line because the process is detached
+# and we don't track PIDs across runs.
+kill_ingress_port_forward() {
+  local pids
+  pids=$(pgrep -f 'kubectl port-forward.*ingress-nginx.*8080:80' 2>/dev/null || true)
+  if [[ -n "$pids" ]]; then
+    log "Killing ingress port-forward processes: $pids"
+    kill $pids 2>/dev/null || true
+    ok "Port-forward processes terminated"
+  else
+    ok "No ingress port-forward processes running"
+  fi
+}
+
+down_minikube() {
+  command -v minikube >/dev/null 2>&1 || { ok "minikube not installed; nothing to delete"; return 0; }
+  if minikube profile list 2>/dev/null | awk '{print $2}' | grep -qx 'minikube'; then
+    log "Deleting minikube cluster"
+    minikube delete >/dev/null 2>&1 || warn "minikube delete reported an error"
+    ok "minikube cluster deleted"
+  else
+    ok "No minikube cluster to delete"
+  fi
+}
+
+down_k3s() {
+  if [[ "$OS" != "Linux" ]]; then
+    ok "k3s is Linux-only; nothing to uninstall on $OS"
+    return 0
+  fi
+  if [[ -x /usr/local/bin/k3s-uninstall.sh ]]; then
+    log "Uninstalling k3s"
+    sudo /usr/local/bin/k3s-uninstall.sh
+    ok "k3s uninstalled"
+  else
+    ok "No k3s installation found"
+  fi
+}
+
+clear_dev_env_block() {
+  local f="$REPO_ROOT/.env"
+  if [[ ! -f "$f" ]]; then
+    ok "No .env file; nothing to strip"
+    return 0
+  fi
+  if ! grep -q '^# BEGIN RISE K8S DEV$' "$f" 2>/dev/null; then
+    ok ".env has no rise-managed block"
+    return 0
+  fi
+  log "Stripping rise-managed block from $f"
+  awk '
+    /^# BEGIN RISE K8S DEV$/ { skip = 1; next }
+    /^# END RISE K8S DEV$/   { skip = 0; next }
+    !skip
+  ' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+  ok ".env cleaned"
+}
+
+clear_docker() {
+  require_cmd jq
+  local target
+  target=$(daemon_json_path)
+  if [[ ! -f "$target" ]]; then
+    ok "No $target; nothing to clean"
+    return 0
+  fi
+  if ! grep -q 'rise-registry:5000' "$target" 2>/dev/null; then
+    ok "Docker daemon.json has no rise registries to remove"
+    return 0
+  fi
+  log "Removing rise insecure-registries from $target"
+  local cleaned
+  cleaned=$(jq --argjson drop "$REQUIRED_REGISTRIES" '
+    if has("insecure-registries") then
+      .["insecure-registries"] = (.["insecure-registries"] - $drop)
+      | if (.["insecure-registries"] | length) == 0
+        then del(.["insecure-registries"]) else . end
+    else . end
+  ' "$target")
+
+  if [[ "$OS" == "Darwin" ]]; then
+    printf '%s\n' "$cleaned" > "$target"
+    ok "Removed rise registries from $target"
+    warn "Docker Desktop must be restarted for the change to take effect."
+    if [[ "${RISE_DEV_RESTART_DOCKER:-}" != "0" ]]; then
+      local ans
+      ans=$(ask "Restart Docker Desktop now? (y/N)" "N")
+      if [[ "$ans" =~ ^[Yy]$ ]]; then
+        restart_docker_desktop_mac || warn "Automatic restart failed; restart Docker Desktop manually."
+      fi
+    fi
+  else
+    ensure_sudo
+    printf '%s\n' "$cleaned" | sudo tee "$target" >/dev/null
+    ok "Removed rise registries from $target"
+    if command -v systemctl >/dev/null 2>&1; then
+      log "Restarting docker.service"
+      sudo systemctl restart docker || warn "systemctl restart docker failed; restart manually."
+    fi
+  fi
+}
+
+cmd_down() {
+  log "This will undo what 'mise setup' did:"
+  echo "    - terminate any 'kubectl port-forward' for ingress-nginx (8080/8443)"
+  echo "    - delete the minikube cluster (if present)"
+  [[ "$OS" == "Linux" ]] && echo "    - uninstall k3s (if installed)"
+  echo "    - strip the rise-managed block from .env"
+  echo "    - remove rise insecure-registries from $(daemon_json_path)"
+  echo "      (you will be asked to restart Docker)"
+  echo "    - remove the rise-managed block from /etc/hosts (sudo)"
+  echo
+  local ans
+  ans=$(ask "Proceed? (y/N)" "N")
+  if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+    log "Aborted; nothing changed."
+    return 0
+  fi
+
+  # Reverse order of setup, so we don't pull /etc/hosts entries out from
+  # under a still-running cluster.
+  kill_ingress_port_forward
+  down_minikube
+  down_k3s
+  clear_dev_env_block
+  clear_docker
+  clear_hosts
+  ok "Teardown complete."
+}
+
 # ---- Top-level commands ---------------------------------------------------
 
 cmd_preflight() {
@@ -568,14 +706,18 @@ main() {
   local cmd=${1:-all}
   case "$cmd" in
     -h|--help|help) usage 0 ;;
-    hosts)        setup_hosts ;;
-    hosts-clear)  clear_hosts ;;
-    docker)       setup_docker ;;
-    minikube)     setup_minikube ;;
-    k3s)          setup_k3s ;;
-    preflight)    cmd_preflight ;;
-    all)          cmd_all ;;
-    *)            err "Unknown command: $cmd"; usage 1 ;;
+    hosts)         setup_hosts ;;
+    hosts-clear)   clear_hosts ;;
+    docker)        setup_docker ;;
+    docker-clear)  clear_docker ;;
+    minikube)      setup_minikube ;;
+    minikube-down) down_minikube ;;
+    k3s)           setup_k3s ;;
+    k3s-down)      down_k3s ;;
+    preflight)     cmd_preflight ;;
+    all)           cmd_all ;;
+    down)          cmd_down ;;
+    *)             err "Unknown command: $cmd"; usage 1 ;;
   esac
 }
 
