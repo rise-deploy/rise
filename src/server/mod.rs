@@ -145,9 +145,9 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
 
     // Start the resource GC worker. Always on under the backend feature: the
     // worker drains tombstoned rows produced by cascading deletes; without it,
-    // tombstoned subtrees never collect. The internal `tokio::spawn` matches
-    // the `ProjectController::start` pattern, so the task is dropped on
-    // runtime shutdown (no entry in `controller_handles`).
+    // tombstoned subtrees never collect. A small wrapper task awaits the
+    // shutdown signal and releases the leader lease so a peer replica can
+    // acquire immediately rather than waiting for the lease TTL to decay.
     #[cfg(feature = "backend")]
     {
         info!("Starting resource GC controller");
@@ -159,7 +159,13 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
             store,
             gc_settings,
         ));
-        controller.start();
+        controller.clone().start();
+        let handle = tokio::spawn(async move {
+            shutdown_signal().await;
+            info!("Resource GC controller shutting down");
+            controller.shutdown().await;
+        });
+        controller_handles.push(handle);
     }
 
     // Start Entra active sync if configured

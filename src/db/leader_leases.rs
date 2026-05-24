@@ -9,6 +9,15 @@ use uuid::Uuid;
 
 const MIN_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Outcome of a DB-backed leadership check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaderStatus {
+    /// We are the current lease holder.
+    Leader,
+    /// Another holder (or no holder) owns the lease. Stop irreversible work.
+    NotLeader,
+}
+
 struct TaskGuard {
     task: JoinHandle<()>,
     is_leader: Arc<AtomicBool>,
@@ -81,6 +90,44 @@ impl LeaderElection {
                 self.holder_id
             ))
         }
+    }
+
+    /// Verifies leadership against the DB without conflating transient
+    /// transport errors with lease loss. Use this when the caller needs to
+    /// distinguish "we lost the lease" from "the DB is briefly unreachable".
+    ///
+    /// On Err(_) the caller should treat the result as inconclusive —
+    /// typically: log and retry, or fall back to the cached `is_leader()`
+    /// atomic for a conservative decision.
+    pub async fn verify_leader(&self) -> Result<LeaderStatus, sqlx::Error> {
+        if is_held_db_raw(&self.pool, &self.name, self.holder_id).await? {
+            Ok(LeaderStatus::Leader)
+        } else {
+            Ok(LeaderStatus::NotLeader)
+        }
+    }
+
+    /// Best-effort lease release for graceful shutdown.
+    ///
+    /// Must be called BEFORE the `LeaderElection` is dropped (`Drop` only
+    /// aborts the heartbeat, it does not release the lease — the row will
+    /// otherwise linger until `expires_at`, blocking peers from acquiring
+    /// for up to the full lease TTL).
+    ///
+    /// Idempotent: safe to call multiple times. Returns `Ok(())` even if
+    /// the row is already gone or owned by another holder. The
+    /// `WHERE holder_id = $2` guard ensures we only delete OUR row, not a
+    /// row a peer has since acquired (concurrency safe).
+    pub async fn release(&self) -> Result<(), sqlx::Error> {
+        sqlx::query!(
+            "DELETE FROM leader_leases WHERE name = $1 AND holder_id = $2",
+            self.name,
+            self.holder_id,
+        )
+        .execute(&self.pool)
+        .await?;
+        self.is_leader.store(false, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -187,7 +234,7 @@ async fn renew(
     Ok(result.rows_affected() == 1)
 }
 
-async fn is_held_db(pool: &PgPool, name: &str, holder_id: Uuid) -> Result<bool> {
+async fn is_held_db_raw(pool: &PgPool, name: &str, holder_id: Uuid) -> Result<bool, sqlx::Error> {
     let row = sqlx::query_scalar!(
         "SELECT holder_id FROM leader_leases WHERE name = $1 AND expires_at > NOW()",
         name,
@@ -195,6 +242,10 @@ async fn is_held_db(pool: &PgPool, name: &str, holder_id: Uuid) -> Result<bool> 
     .fetch_optional(pool)
     .await?;
     Ok(row == Some(holder_id))
+}
+
+async fn is_held_db(pool: &PgPool, name: &str, holder_id: Uuid) -> Result<bool> {
+    Ok(is_held_db_raw(pool, name, holder_id).await?)
 }
 
 #[cfg(test)]
@@ -315,6 +366,71 @@ mod tests {
         assert!(
             non_holder.assert_leader().await.is_err(),
             "assert_leader should fail for non-holder"
+        );
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn verify_leader_returns_leader_for_holder(pool: PgPool) -> Result<()> {
+        let holder = LeaderElection::spawn(
+            pool.clone(),
+            "rise-test-lease",
+            Uuid::new_v4(),
+            Duration::from_millis(1500),
+        );
+        assert!(wait_for_leader(&holder, LEADER_TIMEOUT).await);
+
+        let status = holder.verify_leader().await?;
+        assert_eq!(status, LeaderStatus::Leader);
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn verify_leader_returns_not_leader_for_non_holder(pool: PgPool) -> Result<()> {
+        let holder = LeaderElection::spawn(
+            pool.clone(),
+            "rise-test-lease",
+            Uuid::new_v4(),
+            Duration::from_millis(1500),
+        );
+        let non_holder = LeaderElection::spawn(
+            pool.clone(),
+            "rise-test-lease",
+            Uuid::new_v4(),
+            Duration::from_millis(1500),
+        );
+        assert!(wait_for_leader(&holder, LEADER_TIMEOUT).await);
+        assert!(!non_holder.is_leader());
+
+        let status = non_holder.verify_leader().await?;
+        assert_eq!(status, LeaderStatus::NotLeader);
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn release_lets_peer_acquire_immediately(pool: PgPool) -> Result<()> {
+        let first = LeaderElection::spawn(
+            pool.clone(),
+            "rise-test-lease",
+            Uuid::new_v4(),
+            // Long lease TTL so we can prove the peer acquires via release(),
+            // not via expiry.
+            Duration::from_secs(60),
+        );
+        assert!(wait_for_leader(&first, LEADER_TIMEOUT).await);
+
+        first.release().await?;
+
+        let second = LeaderElection::spawn(
+            pool.clone(),
+            "rise-test-lease",
+            Uuid::new_v4(),
+            Duration::from_secs(60),
+        );
+        assert!(
+            wait_for_leader(&second, Duration::from_secs(1)).await,
+            "second should acquire immediately after release(), \
+             not wait for the 60s lease TTL"
         );
         Ok(())
     }
