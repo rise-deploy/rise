@@ -172,6 +172,13 @@ setup_docker() {
     exit 1
   fi
 
+  # Idempotency: if the required registries are already present, skip the
+  # rewrite (and the needless Docker Desktop restart prompt on macOS).
+  if check_docker; then
+    ok "Docker insecure-registries already configured ($target)"
+    return 0
+  fi
+
   if [[ "$OS" == "Darwin" ]]; then
     writer=""
     log "Updating Docker Desktop daemon config at $target"
@@ -290,12 +297,27 @@ setup_minikube() {
   local reg_dir="/etc/containerd/certs.d/localhost:5000"
   local jfrog_dir="/etc/containerd/certs.d/rise-jfrog:8082"
 
-  log "Recreating minikube cluster"
-  minikube delete || true
-  minikube start --driver=docker \
-    --insecure-registry="${reg_name}:5000" \
-    --insecure-registry="rise-jfrog:8082" \
-    --memory=4096mb --cpus=2 --cni=calico
+  # Start minikube only if it's not already reachable. Recreating wastes
+  # 30-60s and nukes state the developer may want to keep — `minikube delete`
+  # explicitly when a fresh cluster is wanted.
+  #
+  # `minikube status` parses container IPs and breaks when minikube has more
+  # than one network attached (which our setup intentionally does). Use
+  # kubectl reachability against the minikube context as the source of truth.
+  if kubectl --context=minikube get nodes >/dev/null 2>&1; then
+    ok "minikube cluster already reachable; skipping 'minikube start'"
+  else
+    log "Starting minikube"
+    minikube start --driver=docker \
+      --insecure-registry="${reg_name}:5000" \
+      --insecure-registry="rise-jfrog:8082" \
+      --memory=4096mb --cpus=2 --cni=calico
+  fi
+
+  log "Setting kubectl context to 'minikube'"
+  kubectl config use-context minikube >/dev/null
+
+  log "Ensuring ingress addon is enabled"
   minikube addons enable ingress
 
   log "Wiring containerd registry mirrors inside minikube"
@@ -312,10 +334,14 @@ EOF
 
   docker network connect "${network}" minikube 2>/dev/null || true
 
-  log "Port-forwarding ingress-nginx-controller to localhost:8080 (HTTP) and 8443 (HTTPS)"
-  kubectl port-forward --namespace ingress-nginx svc/ingress-nginx-controller 8080:80 8443:443 \
-    >/dev/null 2>&1 &
-  ok "Port-forward running in background (PID: $!)"
+  if lsof -iTCP:8080 -sTCP:LISTEN >/dev/null 2>&1; then
+    ok "Port 8080 already in use; assuming ingress port-forward is running"
+  else
+    log "Port-forwarding ingress-nginx-controller to localhost:8080 (HTTP) and 8443 (HTTPS)"
+    kubectl port-forward --namespace ingress-nginx svc/ingress-nginx-controller 8080:80 8443:443 \
+      >/dev/null 2>&1 &
+    ok "Port-forward running in background (PID: $!)"
+  fi
 
   local host_ip
   host_ip=$(get_host_ip)
