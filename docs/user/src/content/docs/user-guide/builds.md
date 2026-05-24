@@ -88,28 +88,33 @@ no_cache = true
 
 ## Target Platform
 
-Rise builds for `linux/amd64` by default because the backend Kubernetes cluster runs linux/amd64 containers. This is the correct setting for deployments and you typically don't need to change it.
+Rise normally picks the right build platform for you:
 
-On ARM Macs or other non-amd64 machines, builds will cross-compile by default. To build a native image for local use instead:
+- **`rise deploy`**: the backend tells the CLI what architecture its cluster expects (read from the controller's `node_selector["kubernetes.io/arch"]`). A production backend pinning amd64 will produce amd64 images even when you deploy from an ARM Mac.
+- **`rise build` / `rise run` / no backend hint**: the CLI builds for your host architecture (so an ARM Mac builds `linux/arm64`, an Intel machine builds `linux/amd64`).
+
+You only need to specify a platform explicitly to override the inference — for example, building an amd64 image on an ARM Mac for sharing with a colleague:
 
 ```bash
-rise build myapp:latest --platform linux/arm64
+rise build myapp:latest --platform linux/amd64
 ```
 
 Or in `rise.toml`:
 
 ```toml
 [build]
-platform = "linux/arm64"
+platform = "linux/amd64"
 ```
 
 Or via environment variable:
 
 ```bash
-RISE_PLATFORM=linux/arm64 rise build myapp:latest
+RISE_PLATFORM=linux/amd64 rise build myapp:latest
 ```
 
-Precedence: `--platform` flag > `RISE_PLATFORM` env var > `rise.toml` > default (`linux/amd64`).
+Precedence (highest to lowest): `--platform` flag → `RISE_PLATFORM` env var → `rise.toml` → backend-advertised target → host architecture.
+
+When the platform is inferred rather than explicitly set, the CLI prints a one-line notice so the choice isn't silent.
 
 ## SSL and Proxy
 
