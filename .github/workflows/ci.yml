@@ -140,9 +140,6 @@ jobs:
       - name: Run cargo audit
         run: cargo audit
 
-      - name: Verify SQLX offline query data
-        run: mise run sqlx:check
-
   unit-tests-linux:
     name: Linux tests
     runs-on: ubuntu-latest
@@ -186,6 +183,15 @@ jobs:
         run: |
           sqlx database create
           sqlx migrate run
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/rise_test
+
+      - name: Verify SQLX offline query data is in sync with schema
+        # Runs here (not in rust-quality) because sqlx-cli 0.9+ requires a
+        # live DB for `prepare --check` to detect schema drift. Coverage
+        # drift (missing cache entry for a new query!() macro) is still
+        # caught by the SQLX_OFFLINE=true clippy step in rust-quality.
+        run: mise run sqlx:check
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/rise_test
 
