@@ -597,7 +597,7 @@ pub async fn run_entra_sync_loop(
     );
     let schedule = GlobalSchedule::new(
         pool.clone(),
-        "rise-entra-sync",
+        "rise-entra-sync-cycle",
         Duration::from_secs(interval_secs),
     );
 

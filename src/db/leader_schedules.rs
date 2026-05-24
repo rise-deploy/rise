@@ -164,14 +164,31 @@ mod tests {
 
     #[sqlx::test]
     async fn concurrent_callers_only_one_wins(pool: PgPool) -> sqlx::Result<()> {
-        // Simulates a split-brain transient where two replicas both try to
-        // claim the slot simultaneously. The atomic UPSERT must serialize
-        // so exactly one wins.
-        let s1 = GlobalSchedule::new(pool.clone(), "test-race", Duration::from_secs(60));
-        let s2 = GlobalSchedule::new(pool, "test-race", Duration::from_secs(60));
+        // Simulates a split-brain transient where N replicas all try to
+        // claim the slot simultaneously. Each claimer runs on its own task
+        // and waits on a barrier so they all hit the DB at ~the same instant;
+        // the atomic UPSERT must serialize so exactly one wins.
+        use std::sync::Arc;
+        use tokio::sync::Barrier;
 
-        let (a, b) = tokio::join!(s1.try_claim(), s2.try_claim());
-        let wins = [a?, b?].iter().filter(|w| **w).count();
+        const N: usize = 8;
+        let barrier = Arc::new(Barrier::new(N));
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let s = GlobalSchedule::new(pool.clone(), "test-race", Duration::from_secs(60));
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                s.try_claim().await
+            }));
+        }
+
+        let mut wins = 0;
+        for h in handles {
+            if h.await.expect("task panicked")? {
+                wins += 1;
+            }
+        }
         assert_eq!(wins, 1, "exactly one concurrent claimer must win");
         Ok(())
     }

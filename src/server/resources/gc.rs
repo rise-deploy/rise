@@ -58,6 +58,7 @@ use crate::server::settings::ResourceGcSettings;
 
 const ACTOR: &str = "system:resource-gc";
 const LEASE_NAME: &str = "rise-resource-gc";
+const SCHEDULE_NAME: &str = "rise-resource-gc-sweep";
 /// Minimum lease validity required before each destructive `try_collect` call.
 /// Comfortably above the p99 cost of one `try_collect` round-trip with headroom;
 /// well below the `LEASE_DURATION / 2` ceiling enforced by `ensure_leader_for`,
@@ -80,7 +81,7 @@ impl ResourceGcController {
             LeaderElection::spawn(pool.clone(), LEASE_NAME, Uuid::new_v4(), LEASE_DURATION);
         let schedule = GlobalSchedule::new(
             pool,
-            LEASE_NAME,
+            SCHEDULE_NAME,
             Duration::from_secs(settings.interval_secs),
         );
         Self {
