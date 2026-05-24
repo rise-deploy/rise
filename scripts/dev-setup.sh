@@ -15,6 +15,9 @@
 #   ./scripts/dev-setup.sh minikube-down # 'minikube delete'
 #   ./scripts/dev-setup.sh k3s           # bring up local k3s (Linux only)
 #   ./scripts/dev-setup.sh k3s-down      # uninstall k3s (Linux only)
+#   ./scripts/dev-setup.sh pf            # background ingress port-forward
+#                                          (localhost:8080 + :8443)
+#   ./scripts/dev-setup.sh pf-down       # stop the ingress port-forward
 #   ./scripts/dev-setup.sh preflight     # hosts + docker, no cluster
 #
 # Run this script directly (not via a `mise` task dependency chain) so that
@@ -443,14 +446,7 @@ EOF
 
   docker network connect "${network}" minikube 2>/dev/null || true
 
-  if lsof -iTCP:8080 -sTCP:LISTEN >/dev/null 2>&1; then
-    ok "Port 8080 already in use; assuming ingress port-forward is running"
-  else
-    log "Port-forwarding ingress-nginx-controller to localhost:8080 (HTTP) and 8443 (HTTPS)"
-    kubectl port-forward --namespace ingress-nginx svc/ingress-nginx-controller 8080:80 8443:443 \
-      >/dev/null 2>&1 &
-    ok "Port-forward running in background (PID: $!)"
-  fi
+  start_ingress_port_forward
 
   local host_ip
   host_ip=$(get_host_ip)
@@ -461,6 +457,43 @@ EOF
   write_dev_env_block "$host_ip"
   helm_install_rise_dev "$host_ip" ""
   ok "minikube ready. If you use direnv: run 'direnv reload'."
+}
+
+# ---- Ingress port-forward -------------------------------------------------
+
+# Background a `kubectl port-forward` for the ingress controller, exposing
+# the cluster ingresses at localhost:8080 (HTTP) and localhost:8443 (HTTPS).
+# Idempotent: a port already in use is treated as "already running".
+start_ingress_port_forward() {
+  require_cmd kubectl
+  if lsof -iTCP:8080 -sTCP:LISTEN >/dev/null 2>&1; then
+    ok "Port 8080 already in use; ingress port-forward is already running"
+    return 0
+  fi
+  if ! kubectl get svc -n ingress-nginx ingress-nginx-controller >/dev/null 2>&1; then
+    err "Service ingress-nginx/ingress-nginx-controller not found."
+    err "Bring up a cluster first (e.g. ./scripts/dev-setup.sh minikube)."
+    return 1
+  fi
+  log "Port-forwarding ingress-nginx-controller to localhost:8080 (HTTP) and 8443 (HTTPS)"
+  kubectl port-forward --namespace ingress-nginx svc/ingress-nginx-controller 8080:80 8443:443 \
+    >/dev/null 2>&1 &
+  ok "Port-forward running in background (PID: $!)"
+}
+
+# Kill any kubectl port-forward this script (or a previous run) started for
+# ingress-nginx. Matched by command line because we don't track PIDs across
+# invocations.
+stop_ingress_port_forward() {
+  local pids
+  pids=$(pgrep -f 'kubectl port-forward.*ingress-nginx.*8080:80' 2>/dev/null || true)
+  if [[ -n "$pids" ]]; then
+    log "Killing ingress port-forward processes: $pids"
+    kill $pids 2>/dev/null || true
+    ok "Port-forward processes terminated"
+  else
+    ok "No ingress port-forward processes running"
+  fi
 }
 
 # ---- K3s (Linux only) -----------------------------------------------------
@@ -521,21 +554,6 @@ EOF
 }
 
 # ---- Teardown -------------------------------------------------------------
-
-# Kill any kubectl port-forward this script (or a previous run of it) started
-# for ingress-nginx. We match by command line because the process is detached
-# and we don't track PIDs across runs.
-kill_ingress_port_forward() {
-  local pids
-  pids=$(pgrep -f 'kubectl port-forward.*ingress-nginx.*8080:80' 2>/dev/null || true)
-  if [[ -n "$pids" ]]; then
-    log "Killing ingress port-forward processes: $pids"
-    kill $pids 2>/dev/null || true
-    ok "Port-forward processes terminated"
-  else
-    ok "No ingress port-forward processes running"
-  fi
-}
 
 down_minikube() {
   command -v minikube >/dev/null 2>&1 || { ok "minikube not installed; nothing to delete"; return 0; }
@@ -644,7 +662,7 @@ cmd_down() {
 
   # Reverse order of setup, so we don't pull /etc/hosts entries out from
   # under a still-running cluster.
-  kill_ingress_port_forward
+  stop_ingress_port_forward
   down_minikube
   down_k3s
   clear_dev_env_block
@@ -718,6 +736,8 @@ main() {
     minikube-down) down_minikube ;;
     k3s)           setup_k3s ;;
     k3s-down)      down_k3s ;;
+    pf)            start_ingress_port_forward ;;
+    pf-down)       stop_ingress_port_forward ;;
     preflight)     cmd_preflight ;;
     all)           cmd_all ;;
     down)          cmd_down ;;
