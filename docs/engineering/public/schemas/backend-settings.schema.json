@@ -1306,6 +1306,40 @@
         }
       ]
     },
+    "ResourceGcSettings": {
+      "description": "Background garbage-collection worker for the generic resource store.\n\nPolls `list_pending_collection` and drives `try_collect` per row. Each tick\nprocesses at most `batch_size × max_batches_per_tick` rows, capping the\neffective throughput at `batch_size × max_batches_per_tick / interval_secs`\nrows per second. Rows whose `deletion_timestamp` is older than\n`stuck_threshold_secs` are flagged with a `warn!` log per sweep.",
+      "properties": {
+        "batch_size": {
+          "default": 50,
+          "description": "Rows per `list_pending_collection` call. Must be >= 1. Default: 50.",
+          "format": "int64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "interval_secs": {
+          "default": 10,
+          "description": "Sweep cadence in seconds. Must be >= 1 (`tokio::time::interval` panics\non zero). Default: 10.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_batches_per_tick": {
+          "default": 4,
+          "description": "Maximum number of consecutive full batches processed in a single tick.\nLets a deep backlog drain faster without monopolizing the worker. Must\nbe >= 1. Default: 4.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "stuck_threshold_secs": {
+          "default": 3600,
+          "description": "Seconds after which a tombstoned row is logged as `stuck` on each\nsweep. Logs-only; does not change collection behavior. Default: 3600.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "ServerSettings": {
       "properties": {
         "cookie_domain": {
@@ -1638,6 +1672,17 @@
           "type": "null"
         }
       ]
+    },
+    "resource_gc": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ResourceGcSettings"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Background garbage-collection worker for the generic resource store.\nDrains tombstoned resource rows once their controller finalizers clear.\nOmitting the section keeps the worker running with the documented defaults;\nthe worker is essential to draining cascading deletes and is therefore\nalways on when the `backend` feature is enabled."
     },
     "server": {
       "$ref": "#/$defs/ServerSettings"

@@ -143,6 +143,31 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         controller_handles.push(handle);
     }
 
+    // Start the resource GC worker. Always on under the backend feature: the
+    // worker drains tombstoned rows produced by cascading deletes; without it,
+    // tombstoned subtrees never collect. A small wrapper task awaits the
+    // shutdown signal and releases the leader lease so a peer replica can
+    // acquire immediately rather than waiting for the lease TTL to decay.
+    #[cfg(feature = "backend")]
+    {
+        info!("Starting resource GC controller");
+        let store = state.resource_store.clone();
+        let pool = state.db_pool.clone();
+        let gc_settings = settings.resource_gc.clone().unwrap_or_default();
+        let controller = Arc::new(resources::gc::ResourceGcController::new(
+            pool,
+            store,
+            gc_settings,
+        ));
+        controller.clone().start();
+        let handle = tokio::spawn(async move {
+            shutdown_signal().await;
+            info!("Resource GC controller shutting down");
+            controller.shutdown().await;
+        });
+        controller_handles.push(handle);
+    }
+
     // Start Entra active sync if configured
     if let Some(settings::ActiveSyncSource::Entra) = &settings.auth.active_sync_source {
         info!("Starting Entra ID active sync");
