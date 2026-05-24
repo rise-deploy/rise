@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=../docs/user/public/schemas/backend-settings.schema.json
+# yaml-language-server: $schema=../docs/engineering/public/schemas/backend-settings.schema.json
 # Production configuration example.
 #
 # This file is intentionally complete (not layered on a base config).
