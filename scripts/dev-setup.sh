@@ -421,17 +421,41 @@ cmd_preflight() {
 cmd_all() {
   setup_hosts
   setup_docker
-  local cluster default=minikube
-  if [[ "$OS" == "Linux" ]]; then
-    cluster=$(ask "Bring up which cluster? [minikube/k3s/skip]" "$default")
+
+  local action
+  if kubectl --context=minikube get nodes >/dev/null 2>&1; then
+    if [[ "$OS" == "Linux" ]]; then
+      action=$(ask "minikube already running. Action? [keep/recreate/k3s/skip]" "keep")
+    else
+      action=$(ask "minikube already running. Action? [keep/recreate/skip]" "keep")
+    fi
   else
-    cluster=$(ask "Bring up minikube now? [minikube/skip]" "$default")
+    if [[ "$OS" == "Linux" ]]; then
+      action=$(ask "Bring up which cluster? [minikube/k3s/skip]" "minikube")
+    else
+      action=$(ask "Bring up minikube now? [minikube/skip]" "minikube")
+    fi
   fi
-  case "$cluster" in
-    minikube) setup_minikube ;;
-    k3s)      setup_k3s ;;
-    skip|"")  log "Skipping cluster bring-up" ;;
-    *)        err "Unknown cluster: $cluster"; exit 1 ;;
+
+  case "$action" in
+    keep|minikube)
+      setup_minikube
+      ;;
+    recreate)
+      log "Deleting existing minikube cluster before recreate"
+      minikube delete >/dev/null || warn "minikube delete reported an error; continuing"
+      setup_minikube
+      ;;
+    k3s)
+      setup_k3s
+      ;;
+    skip|"")
+      log "Skipping cluster bring-up"
+      ;;
+    *)
+      err "Unknown action: $action"
+      exit 1
+      ;;
   esac
 }
 
