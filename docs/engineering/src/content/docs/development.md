@@ -38,7 +38,7 @@ mise dev
 
 This single command:
 
-1. **Checks prerequisites** — verifies `/etc/hosts` entries, Docker daemon, and Kubernetes connectivity. If anything is missing it tells you exactly what to run.
+1. **Checks prerequisites** — verifies `/etc/hosts` entries, Docker daemon, and Kubernetes connectivity. If anything is missing it lists the issues and asks whether to continue anyway.
 2. **Starts Docker Compose services** — PostgreSQL, Dex (OIDC), container registry.
 3. **Runs database migrations.**
 4. **Starts the Vite frontend dev server** (background).
@@ -63,14 +63,6 @@ mise frontend:dev  # Vite dev server only
 ```
 
 ## Mise Tasks Reference
-
-### Checks (run automatically by `mise dev`)
-
-| Task | Purpose |
-|------|---------|
-| `check:hosts` | Verify `/etc/hosts` has `rise-registry` and `rise.local` |
-| `check:docker` | Verify Docker is running and insecure registries are configured |
-| `check:k8s` | Verify a Kubernetes cluster is reachable via `kubectl` |
 
 ### Setup (one-time, idempotent)
 
@@ -101,7 +93,7 @@ Everything is driven by `./scripts/dev-setup.sh`. `mise setup` and `mise down` a
 
 | Task | Purpose |
 |------|---------|
-| `dev` | Full dev stack (checks + services + frontend + backend) |
+| `dev` | Full dev stack (preflight prompt + services + frontend + backend) |
 | `backend:run` | Backend only (starts deps + migrates) |
 | `frontend:dev` | Vite frontend dev server |
 | `db:migrate` | Run database migrations |

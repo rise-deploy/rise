@@ -23,60 +23,30 @@ run = "./scripts/dev-setup.sh"
 description = "Tear down what 'mise setup' brought up (cluster, .env block, daemon.json registries, /etc/hosts block). Interactive."
 run = "./scripts/dev-setup.sh down"
 
-[tasks."check:hosts"]
-description = "Verify /etc/hosts has the required rise-registry, rise-jfrog and rise.local entries."
+[tasks.dev]
 run = """
-ok=true
+issues=""
 for h in rise-registry rise-jfrog rise.local; do
-  if ! awk -v h="$h" '{for (i = 1; i <= NF; i++) if ($i == h) {found = 1; exit}} END {exit !found}' /etc/hosts; then
-    echo "MISSING: /etc/hosts entry for '$h'"
-    ok=false
+  if ! awk -v h="$h" '{for(i=1;i<=NF;i++) if($i==h){found=1;exit}} END{exit !found}' /etc/hosts 2>/dev/null; then
+    issues="${issues}\n  - /etc/hosts missing '$h'  →  mise setup hosts"
   fi
 done
-if [ "$ok" = false ]; then
-  echo ""
-  echo "Run './scripts/dev-setup.sh hosts' to fix this."
-  exit 1
-fi
-echo "OK: /etc/hosts is configured."
-"""
-
-[tasks."check:docker"]
-description = "Verify Docker is running and has insecure-registries configured."
-run = """
 if ! docker info > /dev/null 2>&1; then
-  echo "FAIL: Docker daemon is not running."
-  echo "Start Docker (Docker Desktop on macOS) and try again."
-  exit 1
+  issues="${issues}\n  - Docker is not running"
 fi
-case "$(uname -s)" in
-  Darwin) daemon_json="$HOME/.docker/daemon.json" ;;
-  *)      daemon_json="/etc/docker/daemon.json" ;;
-esac
-if [ -f "$daemon_json" ] && ! grep -q 'rise-registry:5000' "$daemon_json"; then
-  echo "MISSING: 'rise-registry:5000' not in $daemon_json insecure-registries."
-  echo ""
-  echo "Run './scripts/dev-setup.sh docker' to fix this."
-  exit 1
-fi
-echo "OK: Docker is running and configured."
-"""
-
-[tasks."check:k8s"]
-description = "Verify a Kubernetes cluster (minikube or k3s) is reachable."
-run = """
 if ! kubectl cluster-info > /dev/null 2>&1; then
-  echo "FAIL: No Kubernetes cluster reachable via kubectl."
-  echo ""
-  echo "Run './scripts/dev-setup.sh minikube' (or 'k3s' on Linux) to set one up."
-  exit 1
+  issues="${issues}\n  - No Kubernetes cluster reachable  →  mise setup minikube"
 fi
-echo "OK: Kubernetes cluster is reachable."
-"""
+if [ -n "$issues" ]; then
+  printf "Preflight issues:\n%b\n\n" "$issues"
+  printf "Continue anyway? [y/N] "
+  read -r answer
+  case "$answer" in
+    [yY]*) ;;
+    *) exit 1 ;;
+  esac
+fi
 
-[tasks.dev]
-depends = ["check:hosts", "check:docker", "check:k8s"]
-run = """
 docker compose up -d
 mise run db:migrate
 mise run frontend:dev &
