@@ -87,12 +87,22 @@ impl ResourceGcController {
     /// Run a single sweep across up to `max_batches_per_tick` batches. Each
     /// batch invokes `try_collect` once per row and isolates per-row errors so
     /// a single failure cannot stall the loop.
+    ///
+    /// Leadership is re-verified against the DB at the start of every batch.
+    /// `try_collect` may hard-delete rows; without a DB-backed check, a
+    /// stale-leader replica that lost its lease mid-loop could keep deleting
+    /// alongside the new leader (split-brain).
     async fn sweep(&self) -> anyhow::Result<SweepStats> {
         let stuck_threshold = Duration::from_secs(self.settings.stuck_threshold_secs);
         let now = Utc::now();
         let mut stats = SweepStats::default();
 
         for _ in 0..self.settings.max_batches_per_tick {
+            if let Err(e) = self.election.assert_leader().await {
+                warn!(error = ?e, "lost leader lease mid-sweep; aborting");
+                break;
+            }
+
             let batch = self
                 .store
                 .list_pending_collection(self.settings.batch_size)
@@ -237,6 +247,21 @@ mod tests {
         }
     }
 
+    /// Wait until the controller's election task has acquired the lease.
+    /// `sweep()` now asserts leadership against the DB on every batch, so
+    /// tests that drive it synchronously must give the spawned election
+    /// loop a chance to claim the lease first.
+    async fn wait_for_leader(gc: &ResourceGcController) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if gc.election.is_leader() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("resource GC election did not acquire leadership within 5s");
+    }
+
     /// Layer the resource-store schema on top of the root migrations that
     /// `#[sqlx::test]` already ran, mirroring the pattern in
     /// `src/server/resources/handlers.rs` tests.
@@ -351,6 +376,7 @@ mod tests {
         // `list_pending_collection` feed immediately.
 
         let gc = ResourceGcController::new(pool.clone(), store.clone(), default_settings());
+        wait_for_leader(&gc).await;
 
         // First sweep: parent has a child → MarkedForDeletion. Child has its
         // controller finalizer → MarkedForDeletion. Nothing collected yet.
@@ -431,6 +457,7 @@ mod tests {
             fail_for: b.uid,
         });
         let gc = ResourceGcController::new(pool.clone(), failing, default_settings());
+        wait_for_leader(&gc).await;
 
         let stats = gc.sweep().await.unwrap();
         assert_eq!(stats.errors, 1, "exactly one row should fail");
@@ -471,6 +498,7 @@ mod tests {
         let mut settings = default_settings();
         settings.stuck_threshold_secs = 60;
         let gc = ResourceGcController::new(pool.clone(), store.clone(), settings);
+        wait_for_leader(&gc).await;
 
         let stats = gc.sweep().await.unwrap();
         assert!(

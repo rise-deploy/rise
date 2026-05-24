@@ -1255,6 +1255,10 @@ impl Settings {
             }
         }
 
+        if let Some(ref resource_gc) = settings.resource_gc {
+            resource_gc.validate()?;
+        }
+
         Ok(settings)
     }
 
@@ -1631,6 +1635,55 @@ auth:
     }
 
     #[test]
+    fn test_resource_gc_settings_rejects_invalid_values() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let cases: &[(&str, &str)] = &[
+            ("interval_secs", "interval_secs: 0"),
+            ("batch_size", "batch_size: 0"),
+            ("batch_size_negative", "batch_size: -5"),
+            ("max_batches_per_tick", "max_batches_per_tick: 0"),
+            ("lease_duration_secs", "lease_duration_secs: 0"),
+        ];
+
+        for (case, override_yaml) in cases {
+            let temp_dir = TempDir::new().unwrap();
+            let config_path = temp_dir.path().join("development.yaml");
+            let yaml = format!(
+                r#"
+server:
+  host: "0.0.0.0"
+  port: 3000
+  public_url: "http://localhost:3000"
+  jwt_signing_secret: "test-secret-key-for-testing-123456"
+
+database:
+  url: "postgres://test@localhost/test"
+
+auth:
+  issuer: "http://localhost:5556"
+  client_id: "test"
+  client_secret: "test"
+
+resource_gc:
+  {}
+"#,
+                override_yaml
+            );
+            fs::write(&config_path, &yaml).unwrap();
+
+            let result =
+                Settings::new_with_env(temp_dir.path().to_str().unwrap(), "development", &|_| None);
+            assert!(
+                result.is_err(),
+                "resource_gc case '{}' should fail validation",
+                case
+            );
+        }
+    }
+
+    #[test]
     fn test_resource_gc_section_is_optional() {
         // Loading a config that omits `resource_gc` must succeed and leave
         // the field as `None`; the runtime then falls back to defaults.
@@ -1901,25 +1954,57 @@ fn default_platform_access_policy() -> PlatformAccessPolicy {
 /// `stuck_threshold_secs` are flagged with a `warn!` log per sweep.
 #[derive(Debug, Deserialize, Clone, JsonSchema)]
 pub struct ResourceGcSettings {
-    /// Sweep cadence in seconds. Default: 10.
+    /// Sweep cadence in seconds. Must be >= 1 (`tokio::time::interval` panics
+    /// on zero). Default: 10.
     #[serde(default = "default_resource_gc_interval_secs")]
+    #[schemars(range(min = 1))]
     pub interval_secs: u64,
-    /// Rows per `list_pending_collection` call. Default: 50.
+    /// Rows per `list_pending_collection` call. Must be >= 1. Default: 50.
     #[serde(default = "default_resource_gc_batch_size")]
+    #[schemars(range(min = 1))]
     pub batch_size: i64,
     /// Maximum number of consecutive full batches processed in a single tick.
-    /// Lets a deep backlog drain faster without monopolizing the worker.
-    /// Default: 4.
+    /// Lets a deep backlog drain faster without monopolizing the worker. Must
+    /// be >= 1. Default: 4.
     #[serde(default = "default_resource_gc_max_batches_per_tick")]
+    #[schemars(range(min = 1))]
     pub max_batches_per_tick: u32,
     /// Seconds after which a tombstoned row is logged as `stuck` on each
     /// sweep. Logs-only; does not change collection behavior. Default: 3600.
     #[serde(default = "default_resource_gc_stuck_threshold_secs")]
     pub stuck_threshold_secs: u64,
     /// Leader-election lease duration in seconds. Mirrors the project
-    /// controller's value. Default: 60.
+    /// controller's value. Must be >= 1. Default: 60.
     #[serde(default = "default_resource_gc_lease_duration_secs")]
+    #[schemars(range(min = 1))]
     pub lease_duration_secs: u64,
+}
+
+impl ResourceGcSettings {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.interval_secs == 0 {
+            return Err(ConfigError::Message(
+                "resource_gc.interval_secs must be >= 1".to_string(),
+            ));
+        }
+        if self.batch_size < 1 {
+            return Err(ConfigError::Message(format!(
+                "resource_gc.batch_size must be >= 1, got {}",
+                self.batch_size
+            )));
+        }
+        if self.max_batches_per_tick == 0 {
+            return Err(ConfigError::Message(
+                "resource_gc.max_batches_per_tick must be >= 1".to_string(),
+            ));
+        }
+        if self.lease_duration_secs == 0 {
+            return Err(ConfigError::Message(
+                "resource_gc.lease_duration_secs must be >= 1".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for ResourceGcSettings {

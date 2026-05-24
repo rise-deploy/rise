@@ -1311,29 +1311,30 @@
       "properties": {
         "batch_size": {
           "default": 50,
-          "description": "Rows per `list_pending_collection` call. Default: 50.",
+          "description": "Rows per `list_pending_collection` call. Must be >= 1. Default: 50.",
           "format": "int64",
+          "minimum": 1,
           "type": "integer"
         },
         "interval_secs": {
           "default": 10,
-          "description": "Sweep cadence in seconds. Default: 10.",
+          "description": "Sweep cadence in seconds. Must be >= 1 (`tokio::time::interval` panics\non zero). Default: 10.",
           "format": "uint64",
-          "minimum": 0,
+          "minimum": 1,
           "type": "integer"
         },
         "lease_duration_secs": {
           "default": 60,
-          "description": "Leader-election lease duration in seconds. Mirrors the project\ncontroller's value. Default: 60.",
+          "description": "Leader-election lease duration in seconds. Mirrors the project\ncontroller's value. Must be >= 1. Default: 60.",
           "format": "uint64",
-          "minimum": 0,
+          "minimum": 1,
           "type": "integer"
         },
         "max_batches_per_tick": {
           "default": 4,
-          "description": "Maximum number of consecutive full batches processed in a single tick.\nLets a deep backlog drain faster without monopolizing the worker.\nDefault: 4.",
+          "description": "Maximum number of consecutive full batches processed in a single tick.\nLets a deep backlog drain faster without monopolizing the worker. Must\nbe >= 1. Default: 4.",
           "format": "uint32",
-          "minimum": 0,
+          "minimum": 1,
           "type": "integer"
         },
         "stuck_threshold_secs": {
