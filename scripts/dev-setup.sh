@@ -2,12 +2,15 @@
 # One-stop dev environment setup for Rise. Cross-platform (Linux + macOS).
 #
 # Usage:
-#   ./scripts/dev-setup.sh             # interactive: do everything
-#   ./scripts/dev-setup.sh hosts       # only /etc/hosts entries
-#   ./scripts/dev-setup.sh docker      # only Docker insecure-registries
-#   ./scripts/dev-setup.sh minikube    # bring up local minikube + helm install
-#   ./scripts/dev-setup.sh k3s         # bring up local k3s (Linux only)
-#   ./scripts/dev-setup.sh preflight   # hosts + docker, no cluster
+#   ./scripts/dev-setup.sh              # interactive: do everything
+#   ./scripts/dev-setup.sh hosts        # write the managed /etc/hosts block
+#                                         (base + *.rise.local ingress hosts
+#                                          enumerated from the current cluster)
+#   ./scripts/dev-setup.sh hosts-clear  # remove the managed /etc/hosts block
+#   ./scripts/dev-setup.sh docker       # only Docker insecure-registries
+#   ./scripts/dev-setup.sh minikube     # bring up local minikube + helm install
+#   ./scripts/dev-setup.sh k3s          # bring up local k3s (Linux only)
+#   ./scripts/dev-setup.sh preflight    # hosts + docker, no cluster
 #
 # Run this script directly (not via a `mise` task dependency chain) so that
 # sudo can prompt on a real TTY when needed.
@@ -20,6 +23,11 @@ OS=$(uname -s)
 
 REQUIRED_HOSTS=(rise-registry rise-jfrog rise.local)
 REQUIRED_REGISTRIES='["rise-registry:5000","localhost:5000","127.0.0.1:5000","rise-jfrog:8082","localhost:3082"]'
+
+# Marker lines bracketing the section of /etc/hosts this script owns. Anything
+# between them is rewritten on each `hosts` run and removed on `hosts-clear`.
+HOSTS_BEGIN_MARKER='# >>> rise dev hosts (managed by scripts/dev-setup.sh) >>>'
+HOSTS_END_MARKER='# <<< rise dev hosts <<<'
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m OK\033[0m %s\n' "$*"; }
@@ -51,38 +59,111 @@ ensure_sudo() {
 # ---- /etc/hosts ------------------------------------------------------------
 
 setup_hosts() {
-  log "Configuring /etc/hosts entries: ${REQUIRED_HOSTS[*]}"
+  log "Configuring /etc/hosts (managed block + ingress enumeration)"
   local tmp
   tmp=$(mktemp)
-  # Drop any existing lines that contain one of our hostnames as a
-  # whitespace-separated token. We avoid \< / \> word boundaries because BSD
-  # awk on macOS doesn't honor them — that bug caused this dedup to silently
-  # match nothing and entries to accumulate across runs. Field-based exact
-  # comparison is portable.
-  awk '
-    {
-      keep = 1
-      for (i = 1; i <= NF; i++) {
-        if ($i == "rise-registry" || $i == "rise-jfrog" || $i == "rise.local") {
-          keep = 0
-          break
-        }
-      }
-      if (keep) print
-    }
-  ' /etc/hosts > "$tmp"
+
+  # 1) Strip the managed block (if any) AND any legacy unmanaged lines for
+  #    rise-registry / rise-jfrog / rise.local that pre-date the marker block
+  #    (so re-running cleans up duplicates accumulated by older script
+  #    versions).
+  strip_managed_block_and_legacy /etc/hosts > "$tmp"
+
+  # 2) Enumerate ingress hostnames ending in .rise.local from the current
+  #    cluster context, if reachable. The .rise.local filter is the safety
+  #    guarantee — we never hijack arbitrary hostnames, so this is safe even
+  #    if the user is on a non-dev kubectl context.
+  local ingress_hosts=() h
+  while IFS= read -r h; do
+    [[ -n "$h" ]] && ingress_hosts+=("$h")
+  done < <(collect_ingress_rise_hosts)
+
+  # 3) Re-emit the managed block.
   {
-    echo '127.0.0.1 rise-registry'
-    echo '127.0.0.1 rise-jfrog'
-    echo '127.0.0.1 rise.local'
+    echo "$HOSTS_BEGIN_MARKER"
+    echo "127.0.0.1 rise-registry"
+    echo "127.0.0.1 rise-jfrog"
+    echo "127.0.0.1 rise.local"
+    for h in "${ingress_hosts[@]}"; do
+      echo "127.0.0.1 $h"
+    done
+    echo "$HOSTS_END_MARKER"
   } >> "$tmp"
+
   if ! cmp -s "$tmp" /etc/hosts; then
     sudo cp "$tmp" /etc/hosts
-    ok "/etc/hosts updated"
+    if (( ${#ingress_hosts[@]} > 0 )); then
+      ok "/etc/hosts updated (base + ${#ingress_hosts[@]} ingress host(s): ${ingress_hosts[*]})"
+    else
+      ok "/etc/hosts updated (base hosts only; no cluster reachable or no *.rise.local ingresses)"
+    fi
   else
-    ok "/etc/hosts already configured"
+    ok "/etc/hosts already up to date"
   fi
   rm -f "$tmp"
+}
+
+clear_hosts() {
+  log "Removing the rise-managed block from /etc/hosts"
+  local tmp
+  tmp=$(mktemp)
+  strip_managed_block_only /etc/hosts > "$tmp"
+  if ! cmp -s "$tmp" /etc/hosts; then
+    sudo cp "$tmp" /etc/hosts
+    ok "rise-managed block removed from /etc/hosts"
+  else
+    ok "No rise-managed block found in /etc/hosts"
+  fi
+  rm -f "$tmp"
+}
+
+# Emit /etc/hosts with the managed block (BEGIN..END markers, inclusive)
+# stripped. Used by `hosts-clear`.
+strip_managed_block_only() {
+  awk -v begin="$HOSTS_BEGIN_MARKER" -v end="$HOSTS_END_MARKER" '
+    {
+      if (in_block) {
+        if ($0 == end) in_block = 0
+        next
+      }
+      if ($0 == begin) { in_block = 1; next }
+      print
+    }
+  ' "$1"
+}
+
+# Like strip_managed_block_only, but additionally drops legacy lines that
+# contain one of our base hostnames as a whitespace-separated token outside
+# the managed block. This is the one-time migration path for /etc/hosts
+# files written before we sectioned off entries.
+strip_managed_block_and_legacy() {
+  awk -v begin="$HOSTS_BEGIN_MARKER" -v end="$HOSTS_END_MARKER" '
+    {
+      if (in_block) {
+        if ($0 == end) in_block = 0
+        next
+      }
+      if ($0 == begin) { in_block = 1; next }
+      for (i = 1; i <= NF; i++) {
+        if ($i == "rise-registry" || $i == "rise-jfrog" || $i == "rise.local") next
+      }
+      print
+    }
+  ' "$1"
+}
+
+# Print *.rise.local ingress hostnames from the current kubectl context, one
+# per line. Always returns 0 — an unreachable cluster, missing kubectl, or
+# zero matches all produce an empty list.
+collect_ingress_rise_hosts() {
+  command -v kubectl >/dev/null 2>&1 || return 0
+  kubectl --request-timeout=3s get --raw /healthz >/dev/null 2>&1 || return 0
+  kubectl get ingress --all-namespaces \
+    -o jsonpath='{range .items[*]}{range .spec.rules[*]}{.host}{"\n"}{end}{end}' \
+    2>/dev/null \
+    | awk '/\.rise\.local$/' \
+    | sort -u
+  return 0
 }
 
 check_hosts() {
@@ -487,13 +568,14 @@ main() {
   local cmd=${1:-all}
   case "$cmd" in
     -h|--help|help) usage 0 ;;
-    hosts)     setup_hosts ;;
-    docker)    setup_docker ;;
-    minikube)  setup_minikube ;;
-    k3s)       setup_k3s ;;
-    preflight) cmd_preflight ;;
-    all)       cmd_all ;;
-    *)         err "Unknown command: $cmd"; usage 1 ;;
+    hosts)        setup_hosts ;;
+    hosts-clear)  clear_hosts ;;
+    docker)       setup_docker ;;
+    minikube)     setup_minikube ;;
+    k3s)          setup_k3s ;;
+    preflight)    cmd_preflight ;;
+    all)          cmd_all ;;
+    *)            err "Unknown command: $cmd"; usage 1 ;;
   esac
 }
 
