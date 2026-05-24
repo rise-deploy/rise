@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=../docs/user/public/schemas/backend-settings.schema.json
+# yaml-language-server: $schema=../docs/engineering/public/schemas/backend-settings.schema.json
 # Insecure development configuration - DO NOT USE IN PRODUCTION.
 
 server:

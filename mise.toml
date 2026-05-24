@@ -86,12 +86,12 @@ env.SQLX_OFFLINE = true
 
 [tasks."config:schema:generate"]
 description = "Generate the backend settings JSON schema."
-run = "cargo run --package rise-deploy --features cli,backend -- backend config-schema > docs/user/public/schemas/backend-settings.schema.json"
+run = "cargo run --package rise-deploy --features cli,backend -- backend config-schema > docs/engineering/public/schemas/backend-settings.schema.json"
 env.SQLX_OFFLINE = true
 
 [tasks."config:schema:check"]
 description = "Verify the committed backend settings JSON schema is up to date."
-run = "mise config:schema:generate && git --no-pager diff --exit-code -- docs/user/public/schemas/backend-settings.schema.json"
+run = "mise config:schema:generate && git --no-pager diff --exit-code -- docs/engineering/public/schemas/backend-settings.schema.json"
 env.SQLX_OFFLINE = true
 
 [tasks."rise-toml:schema:generate"]
