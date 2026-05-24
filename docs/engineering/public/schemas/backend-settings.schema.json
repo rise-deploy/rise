@@ -1323,13 +1323,6 @@
           "minimum": 1,
           "type": "integer"
         },
-        "lease_duration_secs": {
-          "default": 60,
-          "description": "Leader-election lease duration in seconds. Mirrors the project\ncontroller's value. Must be >= 1. Default: 60.",
-          "format": "uint64",
-          "minimum": 1,
-          "type": "integer"
-        },
         "max_batches_per_tick": {
           "default": 4,
           "description": "Maximum number of consecutive full batches processed in a single tick.\nLets a deep backlog drain faster without monopolizing the worker. Must\nbe >= 1. Default: 4.",

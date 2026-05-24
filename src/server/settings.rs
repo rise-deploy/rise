@@ -1619,7 +1619,6 @@ auth:
         assert_eq!(s.batch_size, 50);
         assert_eq!(s.max_batches_per_tick, 4);
         assert_eq!(s.stuck_threshold_secs, 3600);
-        assert_eq!(s.lease_duration_secs, 60);
     }
 
     #[test]
@@ -1631,7 +1630,6 @@ auth:
         assert_eq!(s.batch_size, 100);
         assert_eq!(s.max_batches_per_tick, 4);
         assert_eq!(s.stuck_threshold_secs, 3600);
-        assert_eq!(s.lease_duration_secs, 60);
     }
 
     #[test]
@@ -1644,7 +1642,6 @@ auth:
             ("batch_size", "batch_size: 0"),
             ("batch_size_negative", "batch_size: -5"),
             ("max_batches_per_tick", "max_batches_per_tick: 0"),
-            ("lease_duration_secs", "lease_duration_secs: 0"),
         ];
 
         for (case, override_yaml) in cases {
@@ -1973,11 +1970,6 @@ pub struct ResourceGcSettings {
     /// sweep. Logs-only; does not change collection behavior. Default: 3600.
     #[serde(default = "default_resource_gc_stuck_threshold_secs")]
     pub stuck_threshold_secs: u64,
-    /// Leader-election lease duration in seconds. Mirrors the project
-    /// controller's value. Must be >= 1. Default: 60.
-    #[serde(default = "default_resource_gc_lease_duration_secs")]
-    #[schemars(range(min = 1))]
-    pub lease_duration_secs: u64,
 }
 
 impl ResourceGcSettings {
@@ -1998,11 +1990,6 @@ impl ResourceGcSettings {
                 "resource_gc.max_batches_per_tick must be >= 1".to_string(),
             ));
         }
-        if self.lease_duration_secs == 0 {
-            return Err(ConfigError::Message(
-                "resource_gc.lease_duration_secs must be >= 1".to_string(),
-            ));
-        }
         Ok(())
     }
 }
@@ -2014,7 +2001,6 @@ impl Default for ResourceGcSettings {
             batch_size: default_resource_gc_batch_size(),
             max_batches_per_tick: default_resource_gc_max_batches_per_tick(),
             stuck_threshold_secs: default_resource_gc_stuck_threshold_secs(),
-            lease_duration_secs: default_resource_gc_lease_duration_secs(),
         }
     }
 }
@@ -2033,8 +2019,4 @@ fn default_resource_gc_max_batches_per_tick() -> u32 {
 
 fn default_resource_gc_stuck_threshold_secs() -> u64 {
     3600
-}
-
-fn default_resource_gc_lease_duration_secs() -> u64 {
-    60
 }

@@ -24,9 +24,14 @@
 //!   - **Panic supervisor**: `start()` wraps the GC loop in a supervisor that
 //!     respawns it after a brief backoff if it panics, so a single bad row
 //!     cannot silently stop garbage collection.
-//!   - **Per-row leadership check**: leadership is re-verified against the DB
-//!     immediately before each destructive `try_collect` call, matching the
-//!     pattern used by the project/ECR/Snowflake controllers.
+//!   - **Per-row leadership check**: leadership is re-verified immediately
+//!     before each destructive `try_collect` call via `ensure_leader_for`.
+//!     The heartbeat publishes a cached lease horizon after every successful
+//!     renew, so in the steady state the per-row check is a local-clock
+//!     comparison with zero DB cost. When the horizon is insufficient (or
+//!     stale), it falls back to a `verify_leader` DB round-trip — same
+//!     DB-blip-tolerant semantics as the sibling controllers (project/ECR/
+//!     Snowflake), but ~200 round-trips per sweep cheaper on the hot path.
 //!   - **Sweep-error backoff**: consecutive sweep failures (e.g. DB outage)
 //!     trigger an exponential backoff capped at 60s, preventing log spam.
 //!
@@ -47,11 +52,18 @@ use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::db::leader_leases::{LeaderElection, LeaderStatus};
+use crate::db::leader_leases::{LeaderElection, LeaderStatus, LeaseError, LEASE_DURATION};
 use crate::server::settings::ResourceGcSettings;
 
 const ACTOR: &str = "system:resource-gc";
 const LEASE_NAME: &str = "rise-resource-gc";
+/// Minimum lease validity required before each destructive `try_collect` call.
+/// Comfortably above the p99 cost of one `try_collect` round-trip with headroom;
+/// well below the `LEASE_DURATION / 2` ceiling enforced by `ensure_leader_for`,
+/// so the local-clock fast path succeeds essentially 100% of the time while
+/// heartbeats are healthy (cached horizon oscillates between ~2/3 × LEASE_DURATION
+/// and ~LEASE_DURATION).
+const PER_ROW_MIN_VALIDITY: Duration = Duration::from_secs(5);
 
 /// Background sweeper that drives `try_collect` over tombstoned resource rows.
 pub struct ResourceGcController {
@@ -62,12 +74,7 @@ pub struct ResourceGcController {
 
 impl ResourceGcController {
     pub fn new(pool: PgPool, store: Arc<dyn ResourceStore>, settings: ResourceGcSettings) -> Self {
-        let election = LeaderElection::spawn(
-            pool,
-            LEASE_NAME,
-            Uuid::new_v4(),
-            Duration::from_secs(settings.lease_duration_secs),
-        );
+        let election = LeaderElection::spawn(pool, LEASE_NAME, Uuid::new_v4(), LEASE_DURATION);
         Self {
             store,
             election,
@@ -187,22 +194,31 @@ impl ResourceGcController {
 
         'outer: for _ in 0..self.settings.max_batches_per_tick {
             // Cheap fast-fail across batches; `process_row` does the
-            // authoritative per-write check. We use `verify_leader` so a
-            // transient DB blip is not mistaken for lease loss — the
-            // heartbeat tolerates DB errors without flipping `is_leader`, so
-            // it's the right fallback on inconclusive results.
-            match self.election.verify_leader().await {
+            // authoritative per-row check. `ensure_leader_for` short-circuits
+            // to a local-clock check when the cached lease horizon already
+            // covers `PER_ROW_MIN_VALIDITY` — the steady-state path costs
+            // zero DB calls. When the horizon is insufficient it falls back
+            // to a `verify_leader` round-trip with the same DB-blip-tolerant
+            // semantics as before.
+            match self.election.ensure_leader_for(PER_ROW_MIN_VALIDITY).await {
                 Ok(LeaderStatus::Leader) => {}
                 Ok(LeaderStatus::NotLeader) => {
                     warn!("lost leader lease between batches; aborting sweep");
                     break;
                 }
-                Err(e) => {
+                Err(LeaseError::Db(e)) => {
                     if !self.election.is_leader() {
                         warn!(error = ?e, "leader verification failed and cached flag is false; aborting sweep");
                         break;
                     }
                     warn!(error = ?e, "leader verification DB blip between batches; falling back to cached flag and continuing");
+                }
+                Err(e @ LeaseError::InvalidMinValidity { .. }) => {
+                    // Programmer error: PER_ROW_MIN_VALIDITY must fit inside
+                    // LEASE_DURATION / 2. Surface loudly so it gets fixed
+                    // before deploy — the sweep can't safely proceed.
+                    error!(error = ?e, "ensure_leader_for misconfigured; aborting sweep");
+                    break;
                 }
             }
 
@@ -268,24 +284,27 @@ impl ResourceGcController {
         }
 
         // Re-verify leadership immediately before the destructive call.
-        // Matches `project/controller.rs`, `ecr/controller.rs`,
-        // `snowflake_oauth.rs`. `verify_leader` distinguishes lease loss
-        // from transient DB errors: on a DB blip we fall back to the
-        // cached `is_leader()` atomic (which the heartbeat keeps in sync
-        // and flips to false the moment lease loss is detected), so a
-        // brief Postgres reconnect doesn't abort the sweep.
-        match self.election.verify_leader().await {
+        // `ensure_leader_for` short-circuits via the cached lease horizon
+        // (no DB hit) when the heartbeat has confirmed at least
+        // `PER_ROW_MIN_VALIDITY` of remaining validity; otherwise it falls
+        // back to a `verify_leader` round-trip with the same DB-blip-tolerant
+        // semantics as the sibling controllers (project/ecr/snowflake_oauth).
+        match self.election.ensure_leader_for(PER_ROW_MIN_VALIDITY).await {
             Ok(LeaderStatus::Leader) => {}
             Ok(LeaderStatus::NotLeader) => {
                 warn!("lost leader lease before try_collect; aborting sweep");
                 return ProcessOutcome::LostLeadership;
             }
-            Err(e) => {
+            Err(LeaseError::Db(e)) => {
                 if !self.election.is_leader() {
                     warn!(error = ?e, "leader verification failed and cached flag is false; aborting sweep");
                     return ProcessOutcome::LostLeadership;
                 }
                 warn!(error = ?e, "leader verification DB blip before try_collect; falling back to cached flag");
+            }
+            Err(e @ LeaseError::InvalidMinValidity { .. }) => {
+                error!(error = ?e, "ensure_leader_for misconfigured; aborting sweep");
+                return ProcessOutcome::LostLeadership;
             }
         }
 
@@ -399,14 +418,14 @@ mod tests {
             batch_size: 50,
             max_batches_per_tick: 4,
             stuck_threshold_secs: 3600,
-            lease_duration_secs: 60,
         }
     }
 
     /// Wait until the controller's election task has acquired the lease.
-    /// `sweep()` now asserts leadership against the DB on every batch, so
-    /// tests that drive it synchronously must give the spawned election
-    /// loop a chance to claim the lease first.
+    /// `sweep()` asserts leadership at the start of every batch (and before
+    /// every destructive write) via `ensure_leader_for`, so tests that drive
+    /// it synchronously must give the spawned election loop a chance to
+    /// claim the lease — and publish its lease horizon — first.
     async fn wait_for_leader(gc: &ResourceGcController) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while tokio::time::Instant::now() < deadline {
@@ -717,7 +736,6 @@ mod tests {
             batch_size: 2,
             max_batches_per_tick: 3,
             stuck_threshold_secs: 3600,
-            lease_duration_secs: 60,
         };
         let gc = ResourceGcController::new(pool.clone(), store.clone(), settings);
         wait_for_leader(&gc).await;
