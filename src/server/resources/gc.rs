@@ -53,6 +53,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::db::leader_leases::{LeaderElection, LeaderStatus, LeaseError, LEASE_DURATION};
+use crate::db::leader_schedules::GlobalSchedule;
 use crate::server::settings::ResourceGcSettings;
 
 const ACTOR: &str = "system:resource-gc";
@@ -69,15 +70,23 @@ const PER_ROW_MIN_VALIDITY: Duration = Duration::from_secs(5);
 pub struct ResourceGcController {
     store: Arc<dyn ResourceStore>,
     election: LeaderElection,
+    schedule: GlobalSchedule,
     settings: ResourceGcSettings,
 }
 
 impl ResourceGcController {
     pub fn new(pool: PgPool, store: Arc<dyn ResourceStore>, settings: ResourceGcSettings) -> Self {
-        let election = LeaderElection::spawn(pool, LEASE_NAME, Uuid::new_v4(), LEASE_DURATION);
+        let election =
+            LeaderElection::spawn(pool.clone(), LEASE_NAME, Uuid::new_v4(), LEASE_DURATION);
+        let schedule = GlobalSchedule::new(
+            pool,
+            LEASE_NAME,
+            Duration::from_secs(settings.interval_secs),
+        );
         Self {
             store,
             election,
+            schedule,
             settings,
         }
     }
@@ -141,6 +150,12 @@ impl ResourceGcController {
         loop {
             ticker.tick().await;
             if !self.election.is_leader() {
+                continue;
+            }
+            // Global cadence gate: prevents leader-transition bursts where
+            // the new leader's first tick fires sooner than the old leader's
+            // next-scheduled sweep would have.
+            if !self.schedule.try_claim_or_skip("resource GC").await {
                 continue;
             }
             match self.sweep().await {

@@ -5,6 +5,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::db::leader_leases::LeaderElection;
+use crate::db::leader_schedules::GlobalSchedule;
 use crate::db::projects as db_projects;
 use crate::server::ecr::{EcrRepoManager, ECR_FINALIZER};
 use crate::server::state::ControllerState;
@@ -28,24 +29,46 @@ pub struct EcrController {
     provision_interval: Duration,
     cleanup_interval: Duration,
     drift_interval: Duration,
+    provision_schedule: GlobalSchedule,
+    cleanup_schedule: GlobalSchedule,
+    drift_schedule: GlobalSchedule,
 }
 
 impl EcrController {
     /// Create a new ECR controller
     pub fn new(state: Arc<ControllerState>, manager: Arc<EcrRepoManager>) -> Self {
+        let provision_interval = Duration::from_secs(10);
+        let cleanup_interval = Duration::from_secs(5);
+        let drift_interval = Duration::from_secs(60);
         let election = LeaderElection::spawn(
             state.db_pool.clone(),
             "rise-ecr-controller",
             Uuid::new_v4(),
             Duration::from_secs(60),
         );
+        // One schedule per loop: the three loops share a lease but have
+        // independent cadences. The 60s drift schedule is the most
+        // bursting-sensitive — short cadences (5s/10s) make transition
+        // bursts harder to notice but the gate is still cheap.
+        let provision_schedule = GlobalSchedule::new(
+            state.db_pool.clone(),
+            "rise-ecr-provision",
+            provision_interval,
+        );
+        let cleanup_schedule =
+            GlobalSchedule::new(state.db_pool.clone(), "rise-ecr-cleanup", cleanup_interval);
+        let drift_schedule =
+            GlobalSchedule::new(state.db_pool.clone(), "rise-ecr-drift", drift_interval);
         Self {
             state,
             manager,
             election,
-            provision_interval: Duration::from_secs(10),
-            cleanup_interval: Duration::from_secs(5),
-            drift_interval: Duration::from_secs(60),
+            provision_interval,
+            cleanup_interval,
+            drift_interval,
+            provision_schedule,
+            cleanup_schedule,
+            drift_schedule,
         }
     }
 
@@ -81,6 +104,14 @@ impl EcrController {
             ticker.tick().await;
 
             if !self.election.is_leader() {
+                continue;
+            }
+
+            if !self
+                .provision_schedule
+                .try_claim_or_skip("ECR provision")
+                .await
+            {
                 continue;
             }
 
@@ -148,6 +179,10 @@ impl EcrController {
             ticker.tick().await;
 
             if !self.election.is_leader() {
+                continue;
+            }
+
+            if !self.cleanup_schedule.try_claim_or_skip("ECR cleanup").await {
                 continue;
             }
 
@@ -243,6 +278,10 @@ impl EcrController {
             ticker.tick().await;
 
             if !self.election.is_leader() {
+                continue;
+            }
+
+            if !self.drift_schedule.try_claim_or_skip("ECR drift").await {
                 continue;
             }
 
