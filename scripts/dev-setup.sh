@@ -122,23 +122,20 @@ wait_for_docker() {
 }
 
 restart_docker_desktop_mac() {
-  # Prefer the built-in CLI; it cleanly stops the GUI + engine and starts them
-  # back up, and it blocks until the engine is reachable. Available since
-  # Docker Desktop 4.37 (Jan 2025).
+  # `docker desktop restart` has been observed to return successfully while
+  # leaving the engine dead, so we drive the restart explicitly: stop -> wait
+  # for processes to exit -> relaunch via Launch Services (which reliably
+  # brings the GUI + engine up) -> poll for the daemon.
+  log "Stopping Docker Desktop"
   if docker desktop --help >/dev/null 2>&1; then
-    log "Restarting Docker Desktop via 'docker desktop restart'"
-    if docker desktop restart; then
-      wait_for_docker 180 || return 1
-      return 0
-    fi
-    warn "'docker desktop restart' failed; falling back to manual quit + open"
+    docker desktop stop >/dev/null 2>&1 || true
+  else
+    # The bundle id is com.docker.docker regardless of whether the app is
+    # named "Docker" or "Docker Desktop"; target it by id.
+    osascript -e 'tell application id "com.docker.docker" to quit' >/dev/null 2>&1 || true
   fi
 
-  log "Quitting Docker Desktop"
-  # The bundle id is com.docker.docker regardless of whether the app is named
-  # "Docker" or "Docker Desktop", so target it by id.
-  osascript -e 'tell application id "com.docker.docker" to quit' >/dev/null 2>&1 || true
-  # Wait for the helper processes to actually exit before relaunching.
+  # Wait for the GUI/engine processes to actually exit before relaunching.
   local i=0
   while pgrep -fq 'Docker Desktop|/Applications/Docker.app/Contents/MacOS/Docker'; do
     if (( i >= 30 )); then
@@ -153,10 +150,16 @@ restart_docker_desktop_mac() {
 
   log "Launching Docker Desktop"
   if ! open -b com.docker.docker; then
-    err "Could not launch Docker Desktop (bundle id com.docker.docker)"
+    err "Could not launch Docker Desktop via bundle id com.docker.docker."
+    err "Start it manually from Spotlight or /Applications/Docker.app and re-run."
     return 1
   fi
-  wait_for_docker 180
+
+  if ! wait_for_docker 180; then
+    err "Docker daemon did not come up. Try launching Docker Desktop manually"
+    err "(Spotlight -> Docker) and then re-run './scripts/dev-setup.sh minikube'."
+    return 1
+  fi
 }
 
 setup_docker() {
@@ -213,17 +216,29 @@ check_docker() {
 # ---- Host IP detection (cross-platform) -----------------------------------
 
 get_host_ip() {
+  # Print the host's outbound IPv4 to stdout, or nothing if it can't be
+  # determined. MUST always return 0 — callers do their own empty-check, and
+  # we don't want `set -e` to kill the script silently from inside a $().
+  local ip=""
   case "$OS" in
     Linux)
-      ip -4 route get 1.1.1.1 2>/dev/null \
-        | awk '{for (i = 1; i <= NF; i++) if ($i == "src") {print $(i + 1); exit}}'
+      ip=$(ip -4 route get 1.1.1.1 2>/dev/null \
+        | awk '{for (i = 1; i <= NF; i++) if ($i == "src") {print $(i + 1); exit}}') || true
       ;;
     Darwin)
       local iface
-      iface=$(route -n get 1.1.1.1 2>/dev/null | awk '/interface:/ {print $2}')
-      [[ -n "$iface" ]] && ipconfig getifaddr "$iface"
+      iface=$(route -n get 1.1.1.1 2>/dev/null | awk '/interface:/ {print $2}') || true
+      if [[ -n "$iface" ]]; then
+        # `ifconfig` is more reliable than `ipconfig getifaddr`, which returns
+        # empty (with rc=1) for cellular/tether/utun interfaces even when an
+        # inet address is configured.
+        ip=$(ifconfig "$iface" 2>/dev/null \
+          | awk '/^[[:space:]]+inet / {print $2; exit}') || true
+      fi
       ;;
   esac
+  [[ -n "$ip" ]] && printf '%s\n' "$ip"
+  return 0
 }
 
 # ---- .env management ------------------------------------------------------
