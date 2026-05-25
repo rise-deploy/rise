@@ -189,7 +189,9 @@ const TERMINAL_DEPLOYMENT_STATUSES = new Set([
 ]);
 
 function EnvironmentCard({ env, projectName, deployments, onEdit, onDelete }) {
-    const [open, setOpen] = useState(true);
+    // Only the production environment card starts expanded; other envs
+    // collapse by default to keep the page compact on first load.
+    const [open, setOpen] = useState(!!env.is_production);
 
     const activeDeployments = deployments.filter(d => !TERMINAL_DEPLOYMENT_STATUSES.has(d.status));
 
@@ -333,7 +335,6 @@ export function EnvironmentsList({ projectName, platformConstraints = null }) {
     const [saving, setSaving] = useState(false);
     const [currentUser, setCurrentUser] = useState(null);
     const [deployments, setDeployments] = useState([]);
-    const [envFilter, setEnvFilter] = useState('all');
     const { showToast } = useToast();
 
     const loadEnvironments = useCallback(async () => {
@@ -465,8 +466,6 @@ export function EnvironmentsList({ projectName, platformConstraints = null }) {
 
     const deploymentsForEnv = (envName) => deployments.filter(d => d.environment === envName);
 
-    const visibleEnvs = environments.filter(env => envFilter === 'all' || env.name === envFilter);
-
     return (
         <div>
             <div className="r-section-head">
@@ -489,17 +488,7 @@ export function EnvironmentsList({ projectName, platformConstraints = null }) {
                 </RPanel>
             ) : (
                 <div className="r-stack">
-                    {environments.length > 1 && (
-                        <RSegmented
-                            value={envFilter}
-                            options={[
-                                { value: 'all', label: 'All' },
-                                ...environments.map(env => ({ value: env.name, label: env.name })),
-                            ]}
-                            onChange={setEnvFilter}
-                        />
-                    )}
-                    {visibleEnvs.map(env => (
+                    {environments.map(env => (
                         <EnvironmentCard
                             key={env.name}
                             env={env}
