@@ -4,7 +4,7 @@ import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
 import { copyToClipboard, formatISO8601, formatRelativeTimeRounded, isSafeUrl, stripUrlScheme } from '../lib/utils';
 import { useToast } from '../components/toast';
-import { Button, ConfirmDialog, Empty, EnvPill, EnvironmentColorDot, KV, KVRow, Modal, Panel, PanelBody, PanelHead, Pill, Status, Tabs, cx } from '../components/r-ui';
+import { Button, ConfirmDialog, Empty, EnvPill, EnvironmentColorDot, KV, KVRow, Modal, Panel, PanelBody, PanelHead, Pill, SourceLinkGroup, Status, Tabs, cx } from '../components/r-ui';
 import { Icon } from '../components/icon';
 import { LoadingState, ErrorState, EmptyState } from '../components/states';
 
@@ -360,9 +360,26 @@ function CurrentDeploymentPanel({ projectName, environments }: { projectName: st
             ) : (
                 <PanelBody style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 20 }}>
                     <div>
-                        <div className="r-stat-label">Image</div>
-                        <div className="mono" style={{ marginTop: 8, fontSize: 12.5, wordBreak: 'break-all' }}>
-                            {current.image ? current.image.split('/').pop() : '—'}
+                        <div className="r-stat-label">Source</div>
+                        <div style={{ marginTop: 8 }} onClick={(e) => e.stopPropagation()}>
+                            {(current.pull_request_url || current.job_url) ? (
+                                <SourceLinkGroup
+                                    jobUrl={current.job_url}
+                                    prUrl={current.pull_request_url}
+                                />
+                            ) : current.git_repository_url && isSafeUrl(current.git_repository_url) ? (
+                                <a
+                                    className="r-link mono"
+                                    style={{ fontSize: 12.5 }}
+                                    href={current.git_repository_url}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                >
+                                    {stripUrlScheme(current.git_repository_url)}
+                                </a>
+                            ) : (
+                                <span style={{ color: 'var(--text-soft)', fontSize: 12.5 }}>—</span>
+                            )}
                         </div>
                     </div>
                     <div>
@@ -446,21 +463,34 @@ function ProjectOverview({ project, projectName, accessLabel, environments, onCo
                             <Empty title="No environments" />
                         ) : (
                             <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                                {environments.map(env => (
-                                    <div key={env.name} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
-                                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-                                            <EnvPill env={env.name} color={env.color} />
-                                            {env.is_production && env.name !== 'production' && (
-                                                <Pill kind="env-prod">production</Pill>
-                                            )}
-                                        </span>
-                                        {env.primary_deployment_group && (
-                                            <span style={{ fontSize: 12, color: 'var(--text-soft)' }}>
-                                                <span className="mono">{env.primary_deployment_group}</span> group
+                                {environments.map(env => {
+                                    const target = `/project/${projectName}/environment/${env.name}`;
+                                    return (
+                                        <div
+                                            key={env.name}
+                                            className="r-env-row"
+                                            role="link"
+                                            tabIndex={0}
+                                            aria-label={`Open ${env.name} environment`}
+                                            onClick={() => navigate(target)}
+                                            onKeyDown={(e) => {
+                                                if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); navigate(target); }
+                                            }}
+                                        >
+                                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                                                <EnvPill env={env.name} color={env.color} />
+                                                {env.is_production && env.name !== 'production' && (
+                                                    <Pill kind="env-prod">production</Pill>
+                                                )}
                                             </span>
-                                        )}
-                                    </div>
-                                ))}
+                                            {env.primary_deployment_group && (
+                                                <span style={{ fontSize: 12, color: 'var(--text-soft)' }}>
+                                                    <span className="mono">{env.primary_deployment_group}</span> group
+                                                </span>
+                                            )}
+                                        </div>
+                                    );
+                                })}
                             </div>
                         )}
                     </PanelBody>

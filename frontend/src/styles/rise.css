@@ -801,6 +801,21 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
 [data-density="compact"] .r-chip-icon { padding: 0 5px; }
 [data-density="compact"] .r-chip-name { padding: 0 7px; }
 
+/* Clickable env row in the project-overview Environments card. */
+.r-env-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 6px 8px;
+    margin: 0 -8px;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background 80ms ease;
+}
+.r-env-row:hover { background: var(--hover); }
+.r-env-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; background: var(--hover); }
+
 /* ---------- Status ---------- */
 .r-status {
     display: inline-flex;
