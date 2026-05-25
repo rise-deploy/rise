@@ -504,7 +504,18 @@ export function Combobox(props: ComboboxProps) {
         });
     }, [options, query]);
 
-    useEffect(() => { setActiveIndex(0); }, [query, open]);
+    // On open, highlight the currently-selected option so Enter just confirms
+    // it and ArrowUp/Down navigates away from where the user already is. We
+    // only react to `open` (not selectedValues/filtered) so this fires on the
+    // open transition and doesn't fight with the [query] reset below.
+    useEffect(() => {
+        if (!open) return;
+        const idx = filtered.findIndex(o => selectedValues.includes(o.value));
+        setActiveIndex(idx >= 0 ? idx : 0);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [open]);
+
+    useEffect(() => { setActiveIndex(0); }, [query]);
 
     useEffect(() => {
         if (!open) return;
