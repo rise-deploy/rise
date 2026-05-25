@@ -758,11 +758,12 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
 .r-pill.env-global { color: var(--text-muted); background: var(--surface-2); border-color: transparent; }
 .r-pill.accent { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
 
-/* ---------- Env pill (two-tone: colored icon | neutral name) ---------- */
-/* Sized to match .r-status and .r-pill: 11.75/1.45 + 2px y-padding + 1px border
+/* ---------- BasePill / Chip (two-tone: icon cell | name cell) ----------
+   Shared base for EnvPill, GroupPill, and any future compound chip. Sized to
+   match .r-status and .r-pill: font 11.75/1.45 + 1px y-padding + 1px border
    each side gives the same total box height as the borderless 2px-padded
-   status pill, so all three chip families line up in tables and meta rows. */
-.r-env-pill {
+   status pill, so all chip families line up in tables and meta rows. */
+.r-chip {
     display: inline-flex;
     align-items: stretch;
     border: 1px solid var(--border-faint);
@@ -774,7 +775,7 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
     white-space: nowrap;
     vertical-align: middle;
 }
-.r-env-pill-icon {
+.r-chip-icon {
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -783,54 +784,22 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
     color: var(--text-soft);
     border-right: 1px solid var(--border-faint);
 }
-.r-env-pill-name {
-    display: inline-flex;
-    align-items: center;
-    padding: 1px 8px;
-    color: var(--text-muted);
-    font-weight: 500;
-}
-[data-density="compact"] .r-env-pill { font-size: 11px; }
-[data-density="compact"] .r-env-pill-icon { padding: 0 5px; }
-[data-density="compact"] .r-env-pill-name { padding: 0 7px; }
-
-/* ---------- Group pill (mirrors env pill, neutral icon, mono name) ---------- */
-.r-group-pill {
-    display: inline-flex;
-    align-items: stretch;
-    border: 1px solid var(--border-faint);
-    border-radius: 4px;
-    overflow: hidden;
-    font-size: 11.75px;
-    line-height: 1.45;
-    background: var(--surface);
-    white-space: nowrap;
-    vertical-align: middle;
-}
-.r-group-pill-icon {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    padding: 1px 6px;
-    background: var(--surface-2);
-    color: var(--text-soft);
-    border-right: 1px solid var(--border-faint);
-}
-.r-group-pill-name {
+.r-chip-name {
     display: inline-flex;
     align-items: center;
     padding: 1px 8px;
     color: var(--text-muted);
 }
-.r-group-pill.primary .r-group-pill-icon {
+.r-chip-name-strong { color: var(--text); font-weight: 500; }
+.r-chip.primary .r-chip-icon {
     background: var(--accent-soft);
     color: var(--accent);
     border-right-color: var(--accent-soft);
 }
-.r-group-pill.primary .r-group-pill-name { color: var(--text); }
-[data-density="compact"] .r-group-pill { font-size: 11px; }
-[data-density="compact"] .r-group-pill-icon { padding: 0 5px; }
-[data-density="compact"] .r-group-pill-name { padding: 0 7px; }
+.r-chip.primary .r-chip-name { color: var(--text); }
+[data-density="compact"] .r-chip { font-size: 11px; }
+[data-density="compact"] .r-chip-icon { padding: 0 5px; }
+[data-density="compact"] .r-chip-name { padding: 0 7px; }
 
 /* ---------- Status ---------- */
 .r-status {

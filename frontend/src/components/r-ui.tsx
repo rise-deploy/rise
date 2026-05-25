@@ -23,43 +23,57 @@ export function Pill({ children, kind, className }: { children: React.ReactNode;
     return <span className={cx('r-pill', kind, className)}>{children}</span>;
 }
 
-// Two-tone chip: a small icon cell tinted with the environment's color
-// next to a neutral name cell. The name styling stays consistent across
-// environments so different envs read as variants of the same shape; the
-// color signal is concentrated in the icon. This is the canonical way to
-// render an environment label across the app.
-export function EnvPill({ env, color }: { env: string; color?: string }) {
-    const palette = color ? ENV_COLOR_STYLES[color] : undefined;
-    const iconStyle = palette
-        ? { background: palette.background, color: palette.color }
-        : undefined;
+// Two-tone chip primitive: a small icon cell next to a name cell. The icon
+// cell can be tinted (e.g. by env color, or accent when `primary`); the name
+// cell stays neutral so different chip instances read as variants of the same
+// shape. EnvPill and GroupPill below are thin wrappers; new compound chips
+// (region, owner, …) should compose this primitive instead of restyling.
+export interface BasePillProps {
+    icon: React.ReactNode;
+    name: React.ReactNode;
+    iconStyle?: React.CSSProperties;
+    nameClassName?: string;
+    primary?: boolean;
+    title?: string;
+}
+export function BasePill({ icon, name, iconStyle, nameClassName, primary, title }: BasePillProps) {
     return (
-        <span className="r-env-pill">
-            <span className="r-env-pill-icon" style={iconStyle} aria-hidden>
-                <Icon name="layer" size={11} />
-            </span>
-            <span className="r-env-pill-name">{env}</span>
+        <span className={cx('r-chip', primary && 'primary')} title={title}>
+            <span className="r-chip-icon" style={iconStyle} aria-hidden>{icon}</span>
+            <span className={cx('r-chip-name', nameClassName)}>{name}</span>
         </span>
     );
 }
 
-// Two-tone chip mirroring EnvPill but for deployment groups. Groups don't
-// have a per-group color, so the icon cell stays neutral by default and turns
-// accent-tinted when `primary` is set — the icon section carries the
-// "highlighted" signal the way EnvPill's icon carries the env color. The name
-// renders in mono since groups are technical identifiers (branch names, PR
-// slugs, 'default').
+// Icon cell tinted with the environment's color; name cell neutral. The color
+// signal is concentrated in the icon so different envs read as variants of
+// the same chip shape.
+export function EnvPill({ env, color }: { env: string; color?: string }) {
+    const palette = color ? ENV_COLOR_STYLES[color] : undefined;
+    return (
+        <BasePill
+            icon={<Icon name="layer" size={11} />}
+            iconStyle={palette ? { background: palette.background, color: palette.color } : undefined}
+            name={env}
+            nameClassName="r-chip-name-strong"
+        />
+    );
+}
+
+// Groups don't carry a per-group color from the backend, so the icon cell
+// stays neutral by default. The `primary` modifier (env's primary deployment
+// group) tints the icon cell with the accent color — same role the env color
+// plays in EnvPill. Name renders mono since groups are technical identifiers
+// (branch names, PR slugs, 'default').
 export function GroupPill({ group, primary }: { group: string; primary?: boolean }) {
     return (
-        <span
-            className={cx('r-group-pill', primary && 'primary')}
+        <BasePill
+            icon={<Icon name="branch" size={11} />}
+            name={group}
+            nameClassName="mono"
+            primary={primary}
             title={primary ? 'Primary group for this environment' : undefined}
-        >
-            <span className="r-group-pill-icon" aria-hidden>
-                <Icon name="branch" size={11} />
-            </span>
-            <span className="r-group-pill-name mono">{group}</span>
-        </span>
+        />
     );
 }
 
