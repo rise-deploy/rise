@@ -23,13 +23,23 @@ export function Pill({ children, kind, className }: { children: React.ReactNode;
     return <span className={cx('r-pill', kind, className)}>{children}</span>;
 }
 
+// Two-tone chip: a small icon cell tinted with the environment's color
+// next to a neutral name cell. The name styling stays consistent across
+// environments so different envs read as variants of the same shape; the
+// color signal is concentrated in the icon. This is the canonical way to
+// render an environment label across the app.
 export function EnvPill({ env, color }: { env: string; color?: string }) {
-    const kind = env === 'production' ? 'env-prod' : env === 'staging' ? 'env-staging' : 'env-global';
+    const palette = color ? ENV_COLOR_STYLES[color] : undefined;
+    const iconStyle = palette
+        ? { background: palette.background, color: palette.color }
+        : undefined;
     return (
-        <Pill kind={kind}>
-            <EnvironmentIcon color={color} />
-            {env}
-        </Pill>
+        <span className="r-env-pill">
+            <span className="r-env-pill-icon" style={iconStyle} aria-hidden>
+                <Icon name="layer" size={11} />
+            </span>
+            <span className="r-env-pill-name">{env}</span>
+        </span>
     );
 }
 
