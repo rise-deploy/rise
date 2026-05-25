@@ -4,6 +4,7 @@ import { api } from '../lib/api';
 import { CONFIG } from '../lib/config';
 import { navigate } from '../lib/navigation';
 import { formatDate, formatRelativeTimeRounded } from '../lib/utils';
+import { usePolling } from '../lib/polling';
 import { useToast } from '../components/toast';
 import {
     Alert as RAlert,
@@ -1456,13 +1457,8 @@ export function ExtensionsList({ projectName }) {
         }
     }, [projectName]);
 
-    useEffect(() => {
-        loadExtensions();
-
-        // Auto-refresh every 5 seconds
-        const interval = setInterval(loadExtensions, 5000);
-        return () => clearInterval(interval);
-    }, [loadExtensions]);
+    // Auto-refresh every 5 seconds, paused when the tab is hidden.
+    usePolling(loadExtensions, 5000);
 
     // Handle UI spec changes - merge with JSON spec (upsert)
     const handleUiSpecChange = useCallback((newUiSpec) => {

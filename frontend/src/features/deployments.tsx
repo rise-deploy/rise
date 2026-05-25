@@ -3,6 +3,7 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'rea
 import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
 import { copyToClipboard, formatDate, formatISO8601, formatRelativeTimeRounded, formatTimeRemaining, isSafeUrl, stripUrlScheme } from '../lib/utils';
+import { usePolling } from '../lib/polling';
 import { useToast } from '../components/toast';
 import { MonoSortButton, MonoTable, MonoTableBody, MonoTableEmptyRow, MonoTableFrame, MonoTableHead, MonoTableRow, MonoTd, MonoTh } from '../components/table';
 import { Button as RButton, Combobox, ConfirmDialog, ENV_COLOR_STYLES, Empty, EnvPill, EnvironmentColorDot, GroupPill, KV, KVRow, Modal, Panel, PanelBody, PanelHead, Pill, SearchInput, Segmented, SourceLinkGroup, SourceLinkGroupAction, Status, Tabs } from '../components/r-ui';
@@ -92,14 +93,14 @@ export function ActiveDeploymentsSummary({ projectName }) {
         }
     }, [projectName]);
 
+    // Auto-refresh every 5 seconds, paused when the tab is hidden.
+    usePolling(loadSummary, 5000);
+
     useEffect(() => {
-        loadSummary();
         api.getProjectEnvironments(projectName)
             .then(data => setEnvironments(data || []))
             .catch(() => {});
-        const interval = setInterval(loadSummary, 5000);
-        return () => clearInterval(interval);
-    }, [loadSummary]);
+    }, [projectName]);
 
     if (loading) return <LoadingState label="Loading active deployments..." />;
     if (error) return <ErrorState message={`Error loading active deployments: ${error}`} onRetry={loadSummary} />;
@@ -343,11 +344,8 @@ export function DeploymentsList({ projectName }) {
         }
     }, [projectName, page, groupFilter]);
 
-    useEffect(() => {
-        loadDeployments();
-        const interval = setInterval(loadDeployments, 5000);
-        return () => clearInterval(interval);
-    }, [loadDeployments]);
+    // Auto-refresh every 5 seconds, paused when the tab is hidden.
+    usePolling(loadDeployments, 5000);
 
     const isTerminal = (status) => {
         return ['Cancelled', 'Stopped', 'Superseded', 'Failed', 'Expired'].includes(status);
