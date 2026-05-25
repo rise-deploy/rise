@@ -1574,6 +1574,11 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                             <span className="mono" style={{ fontSize: 12, wordBreak: 'break-all' }}>{deployment.image_digest}</span>
                         </KVRow>
                     )}
+                    {deployment.http_port ? (
+                        <KVRow k="HTTP port">
+                            <span className="mono" style={{ fontSize: 12 }}>{deployment.http_port}</span>
+                        </KVRow>
+                    ) : null}
                     <KVRow k="Created by">{deployment.created_by_email || '-'}</KVRow>
                     <KVRow k="Started">
                         <span title={formatISO8601(deployment.created)}>{formatRelativeTimeRounded(deployment.created)}</span>
