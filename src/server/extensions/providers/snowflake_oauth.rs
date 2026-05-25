@@ -1220,8 +1220,12 @@ impl SnowflakeOAuthProvisioner {
                 // against Snowflake every `verify_interval_seconds`. Otherwise
                 // the inner 5s tick would issue `SHOW INTEGRATIONS` constantly
                 // and (via the warehouse session) prevent auto-suspend.
+                //
+                // Compare elapsed in seconds (u64) to avoid any cast/overflow
+                // when building a `chrono::Duration` from the configured value.
                 let due = status.last_verified_at.is_none_or(|last| {
-                    Utc::now() - last >= Duration::seconds(self.verify_interval_seconds as i64)
+                    let elapsed_secs = (Utc::now() - last).num_seconds();
+                    elapsed_secs >= 0 && (elapsed_secs as u64) >= self.verify_interval_seconds
                 });
                 if !due {
                     return Ok(false);
