@@ -7,6 +7,7 @@ use std::env;
 pub struct Settings {
     pub server: ServerSettings,
     pub auth: AuthSettings,
+    #[serde(default)]
     pub database: DatabaseSettings,
     #[serde(default)]
     pub registry: Option<RegistrySettings>,
@@ -16,6 +17,13 @@ pub struct Settings {
     pub encryption: Option<EncryptionSettings>,
     #[serde(default)]
     pub extensions: Option<ExtensionsSettings>,
+    /// Background garbage-collection worker for the generic resource store.
+    /// Drains tombstoned resource rows once their controller finalizers clear.
+    /// Omitting the section keeps the worker running with the documented defaults;
+    /// the worker is essential to draining cascading deletes and is therefore
+    /// always on when the `backend` feature is enabled.
+    #[serde(default)]
+    pub resource_gc: Option<ResourceGcSettings>,
 }
 
 #[derive(Debug, Deserialize, Clone, JsonSchema)]
@@ -83,6 +91,12 @@ pub struct ServerSettings {
     /// OAuth endpoint rate limiting configuration.
     #[serde(default)]
     pub oauth_rate_limit: OAuthRateLimitSettings,
+
+    /// Maximum TTL in seconds for workload identity tokens issued via the token-exchange endpoint.
+    /// Requests that specify a higher TTL are silently capped to this value.
+    /// Default: 900 (15 minutes).
+    #[serde(default = "default_workload_token_max_ttl_seconds")]
+    pub workload_token_max_ttl_seconds: u64,
 }
 
 /// Rate limiting configuration for OAuth endpoints (authorize, callback, token).
@@ -162,6 +176,14 @@ fn default_jwt_expiry_seconds() -> u64 {
     86400 // 24 hours
 }
 
+fn default_workload_token_max_ttl_seconds() -> u64 {
+    900 // 15 minutes
+}
+
+fn default_identity_token_ttl_seconds() -> u64 {
+    3600 // 1 hour
+}
+
 fn default_oauth_per_project_max() -> u32 {
     500
 }
@@ -230,7 +252,7 @@ pub struct AuthSettings {
     pub admin_users: Vec<String>,
     /// List of Operator user emails. Operators have full access to generic
     /// resource storage and built-in resource management. This is a separate
-    /// role from `admin_users`.
+    /// role from `admin_users`. Matching is case-insensitive.
     #[serde(default)]
     pub operator_users: Vec<String>,
     /// Trusted external controller identities. Each entry binds a stable
@@ -273,7 +295,7 @@ pub struct AuthSettings {
     pub active_sync_interval_secs: u64,
 }
 
-#[derive(Debug, Deserialize, Clone, JsonSchema)]
+#[derive(Debug, Default, Deserialize, Clone, JsonSchema)]
 pub struct DatabaseSettings {
     #[serde(default)]
     pub url: String,
@@ -749,6 +771,12 @@ pub enum DeploymentControllerSettings {
         #[serde(default)]
         health_probes: Option<HealthProbeConfig>,
 
+        /// Lifetime in seconds of workload identity tokens auto-minted by the controller
+        /// and mounted into deployment pods. The controller re-mints tokens when they
+        /// are older than half this value. Default: 3600 (1 hour).
+        #[serde(default = "default_identity_token_ttl_seconds")]
+        identity_token_ttl_seconds: u64,
+
         /// Port for the internal metacontroller webhook listener.
         /// Webhook endpoints are served on this separate port instead of the main HTTP port.
         /// Defaults to 3001.
@@ -1122,11 +1150,12 @@ impl Settings {
             tracing::warn!("Unknown configuration field in backend config: {}", field);
         }
 
-        // Special handling for DATABASE_URL environment variable (common convention)
-        // This takes precedence over both TOML config and RISE_DATABASE__URL
-        if let Some(database_url) = env_lookup("DATABASE_URL") {
-            if !database_url.is_empty() {
-                settings.database.url = database_url;
+        // Fall back to DATABASE_URL environment variable if database.url is not set in config
+        if settings.database.url.is_empty() {
+            if let Some(database_url) = env_lookup("DATABASE_URL") {
+                if !database_url.is_empty() {
+                    settings.database.url = database_url;
+                }
             }
         }
 
@@ -1224,6 +1253,10 @@ impl Settings {
                     )));
                 }
             }
+        }
+
+        if let Some(ref resource_gc) = settings.resource_gc {
+            resource_gc.validate()?;
         }
 
         Ok(settings)
@@ -1456,6 +1489,93 @@ deployment_controller:
     }
 
     #[test]
+    fn test_database_url_config_takes_precedence_over_env() {
+        // Verify that database.url in config is not overridden by DATABASE_URL env var
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("development.yaml");
+
+        fs::write(
+            &config_path,
+            r#"
+server:
+  host: "0.0.0.0"
+  port: 3000
+  public_url: "http://localhost:3000"
+  jwt_signing_secret: "test-secret-key-for-testing-123456"
+
+database:
+  url: "postgres://config-user@config-host/config-db"
+
+auth:
+  issuer: "http://localhost:5556"
+  client_id: "test"
+  client_secret: "test"
+"#,
+        )
+        .unwrap();
+
+        let env_lookup = |name: &str| {
+            (name == "DATABASE_URL").then(|| "postgres://env-user@env-host/env-db".to_string())
+        };
+
+        let settings = Settings::new_with_env(
+            temp_dir.path().to_str().unwrap(),
+            "development",
+            &env_lookup,
+        )
+        .expect("config should load");
+
+        // The explicit config value must win over DATABASE_URL
+        assert_eq!(
+            settings.database.url,
+            "postgres://config-user@config-host/config-db"
+        );
+    }
+
+    #[test]
+    fn test_database_url_env_used_as_fallback_when_config_unset() {
+        // Verify that DATABASE_URL env var is used when database.url is not set in config
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("development.yaml");
+
+        fs::write(
+            &config_path,
+            r#"
+server:
+  host: "0.0.0.0"
+  port: 3000
+  public_url: "http://localhost:3000"
+  jwt_signing_secret: "test-secret-key-for-testing-123456"
+
+auth:
+  issuer: "http://localhost:5556"
+  client_id: "test"
+  client_secret: "test"
+"#,
+        )
+        .unwrap();
+
+        let env_lookup = |name: &str| {
+            (name == "DATABASE_URL").then(|| "postgres://env-user@env-host/env-db".to_string())
+        };
+
+        let settings = Settings::new_with_env(
+            temp_dir.path().to_str().unwrap(),
+            "development",
+            &env_lookup,
+        )
+        .expect("config should load using DATABASE_URL fallback");
+
+        assert_eq!(settings.database.url, "postgres://env-user@env-host/env-db");
+    }
+
+    #[test]
     fn test_run_mode_config_is_required_even_if_local_exists() {
         use std::fs;
         use tempfile::TempDir;
@@ -1490,6 +1610,110 @@ auth:
             result.is_err(),
             "Config should fail without required run_mode file"
         );
+    }
+
+    #[test]
+    fn test_resource_gc_settings_defaults() {
+        let s = ResourceGcSettings::default();
+        assert_eq!(s.interval_secs, 10);
+        assert_eq!(s.batch_size, 50);
+        assert_eq!(s.max_batches_per_tick, 4);
+        assert_eq!(s.stuck_threshold_secs, 3600);
+    }
+
+    #[test]
+    fn test_resource_gc_settings_partial_yaml_fills_defaults() {
+        // Only override two fields; the rest must fall back to defaults.
+        let s: ResourceGcSettings =
+            serde_yaml::from_str("interval_secs: 5\nbatch_size: 100\n").unwrap();
+        assert_eq!(s.interval_secs, 5);
+        assert_eq!(s.batch_size, 100);
+        assert_eq!(s.max_batches_per_tick, 4);
+        assert_eq!(s.stuck_threshold_secs, 3600);
+    }
+
+    #[test]
+    fn test_resource_gc_settings_rejects_invalid_values() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let cases: &[(&str, &str)] = &[
+            ("interval_secs", "interval_secs: 0"),
+            ("batch_size", "batch_size: 0"),
+            ("batch_size_negative", "batch_size: -5"),
+            ("max_batches_per_tick", "max_batches_per_tick: 0"),
+        ];
+
+        for (case, override_yaml) in cases {
+            let temp_dir = TempDir::new().unwrap();
+            let config_path = temp_dir.path().join("development.yaml");
+            let yaml = format!(
+                r#"
+server:
+  host: "0.0.0.0"
+  port: 3000
+  public_url: "http://localhost:3000"
+  jwt_signing_secret: "test-secret-key-for-testing-123456"
+
+database:
+  url: "postgres://test@localhost/test"
+
+auth:
+  issuer: "http://localhost:5556"
+  client_id: "test"
+  client_secret: "test"
+
+resource_gc:
+  {}
+"#,
+                override_yaml
+            );
+            fs::write(&config_path, &yaml).unwrap();
+
+            let result =
+                Settings::new_with_env(temp_dir.path().to_str().unwrap(), "development", &|_| None);
+            assert!(
+                result.is_err(),
+                "resource_gc case '{}' should fail validation",
+                case
+            );
+        }
+    }
+
+    #[test]
+    fn test_resource_gc_section_is_optional() {
+        // Loading a config that omits `resource_gc` must succeed and leave
+        // the field as `None`; the runtime then falls back to defaults.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("development.yaml");
+
+        fs::write(
+            &config_path,
+            r#"
+server:
+  host: "0.0.0.0"
+  port: 3000
+  public_url: "http://localhost:3000"
+  jwt_signing_secret: "test-secret-key-for-testing-123456"
+
+database:
+  url: "postgres://test@localhost/test"
+
+auth:
+  issuer: "http://localhost:5556"
+  client_id: "test"
+  client_secret: "test"
+"#,
+        )
+        .unwrap();
+
+        let settings =
+            Settings::new_with_env(temp_dir.path().to_str().unwrap(), "development", &|_| None)
+                .expect("config should load without resource_gc section");
+        assert!(settings.resource_gc.is_none());
     }
 }
 
@@ -1623,6 +1847,15 @@ pub enum ExtensionProviderConfig {
         /// Refresh token validity in seconds (default: 7776000 = 90 days)
         #[serde(default = "default_refresh_token_validity_seconds")]
         refresh_token_validity_seconds: i64,
+        /// How often (in seconds) to re-verify that the SECURITY INTEGRATION still
+        /// exists in Snowflake once the extension is `Available`. The provisioner
+        /// runs an inner 5s tick for transitional states, but `Available`
+        /// extensions are only re-verified after this interval elapses. Default:
+        /// 3600 (1 hour). The metadata query used for the check (`SHOW
+        /// INTEGRATIONS`) does not activate the configured warehouse, so a
+        /// healthy steady state lets Snowflake auto-suspend the warehouse.
+        #[serde(default = "default_snowflake_verify_interval_seconds")]
+        verify_interval_seconds: u64,
     },
 }
 
@@ -1680,6 +1913,11 @@ fn default_refresh_token_validity_seconds() -> i64 {
     7776000 // 90 days
 }
 
+#[allow(dead_code)]
+fn default_snowflake_verify_interval_seconds() -> u64 {
+    3600 // 1 hour
+}
+
 /// Platform access control configuration
 #[derive(Debug, Deserialize, Clone, JsonSchema)]
 pub struct PlatformAccessConfig {
@@ -1716,4 +1954,83 @@ impl Default for PlatformAccessConfig {
 
 fn default_platform_access_policy() -> PlatformAccessPolicy {
     PlatformAccessPolicy::AllowAll
+}
+
+/// Background garbage-collection worker for the generic resource store.
+///
+/// Polls `list_pending_collection` and drives `try_collect` per row. Each tick
+/// processes at most `batch_size × max_batches_per_tick` rows, capping the
+/// effective throughput at `batch_size × max_batches_per_tick / interval_secs`
+/// rows per second. Rows whose `deletion_timestamp` is older than
+/// `stuck_threshold_secs` are flagged with a `warn!` log per sweep.
+#[derive(Debug, Deserialize, Clone, JsonSchema)]
+pub struct ResourceGcSettings {
+    /// Sweep cadence in seconds. Must be >= 1 (`tokio::time::interval` panics
+    /// on zero). Default: 10.
+    #[serde(default = "default_resource_gc_interval_secs")]
+    #[schemars(range(min = 1))]
+    pub interval_secs: u64,
+    /// Rows per `list_pending_collection` call. Must be >= 1. Default: 50.
+    #[serde(default = "default_resource_gc_batch_size")]
+    #[schemars(range(min = 1))]
+    pub batch_size: i64,
+    /// Maximum number of consecutive full batches processed in a single tick.
+    /// Lets a deep backlog drain faster without monopolizing the worker. Must
+    /// be >= 1. Default: 4.
+    #[serde(default = "default_resource_gc_max_batches_per_tick")]
+    #[schemars(range(min = 1))]
+    pub max_batches_per_tick: u32,
+    /// Seconds after which a tombstoned row is logged as `stuck` on each
+    /// sweep. Logs-only; does not change collection behavior. Default: 3600.
+    #[serde(default = "default_resource_gc_stuck_threshold_secs")]
+    pub stuck_threshold_secs: u64,
+}
+
+impl ResourceGcSettings {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.interval_secs == 0 {
+            return Err(ConfigError::Message(
+                "resource_gc.interval_secs must be >= 1".to_string(),
+            ));
+        }
+        if self.batch_size < 1 {
+            return Err(ConfigError::Message(format!(
+                "resource_gc.batch_size must be >= 1, got {}",
+                self.batch_size
+            )));
+        }
+        if self.max_batches_per_tick == 0 {
+            return Err(ConfigError::Message(
+                "resource_gc.max_batches_per_tick must be >= 1".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for ResourceGcSettings {
+    fn default() -> Self {
+        Self {
+            interval_secs: default_resource_gc_interval_secs(),
+            batch_size: default_resource_gc_batch_size(),
+            max_batches_per_tick: default_resource_gc_max_batches_per_tick(),
+            stuck_threshold_secs: default_resource_gc_stuck_threshold_secs(),
+        }
+    }
+}
+
+fn default_resource_gc_interval_secs() -> u64 {
+    10
+}
+
+fn default_resource_gc_batch_size() -> i64 {
+    50
+}
+
+fn default_resource_gc_max_batches_per_tick() -> u32 {
+    4
+}
+
+fn default_resource_gc_stuck_threshold_secs() -> u64 {
+    3600
 }

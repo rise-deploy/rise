@@ -80,7 +80,8 @@ pub struct BuildArgs {
     pub no_cache: bool,
 
     /// Target platform for the container image build (e.g., linux/amd64, linux/arm64).
-    /// Defaults to linux/amd64 for Rise server compatibility.
+    /// When unset, falls back to the backend-advertised cluster arch (during
+    /// `rise deploy`) or the host architecture.
     #[arg(long)]
     pub platform: Option<String>,
 }
@@ -116,6 +117,9 @@ pub(crate) struct BuildOptions {
     pub no_cache: bool,
     /// Target platform (e.g., "linux/amd64")
     pub platform: String,
+    /// Where `platform` was sourced from (CLI / env / rise.toml / backend / host).
+    /// Lets callers report or react to the precedence level that won.
+    pub platform_source: crate::build::PlatformSource,
 }
 
 impl BuildOptions {
@@ -130,12 +134,17 @@ impl BuildOptions {
     ///
     /// When `preloaded_config` is provided, its `.build` section is used instead
     /// of loading rise.toml from disk, avoiding duplicate file reads/warnings.
+    ///
+    /// `backend_platform_hint` is the `target_platform` advertised by the
+    /// backend (from the registry-credentials response); it sits below
+    /// rise.toml in precedence but above the host-arch fallback.
     pub(crate) fn from_build_args(
         config: &Config,
         image_tag: String,
         app_path: String,
         build_args: &BuildArgs,
         preloaded_config: Option<crate::build::config::ProjectBuildConfig>,
+        backend_platform_hint: Option<&str>,
     ) -> Self {
         use tracing::warn;
 
@@ -154,6 +163,17 @@ impl BuildOptions {
                 }
             }
         };
+
+        // Read RISE_PLATFORM exactly once here (instead of inside
+        // resolve_platform) and pass it explicitly. Keeps resolve_platform
+        // pure / unit-testable without touching process-global env.
+        let env_platform = crate::build::env_var_non_empty("RISE_PLATFORM");
+        let (platform, platform_source) = crate::build::resolve_platform(
+            build_args.platform.as_deref(),
+            env_platform.as_deref(),
+            project_config.as_ref().and_then(|c| c.platform.as_deref()),
+            backend_platform_hint,
+        );
 
         // Merge: CLI > Project > Environment (via Config) > Global (via Config) > Defaults
         Self {
@@ -252,12 +272,8 @@ impl BuildOptions {
                     .and_then(|c| c.no_cache)
                     .unwrap_or(false),
 
-            platform: build_args
-                .platform
-                .clone()
-                .or_else(|| crate::build::env_var_non_empty("RISE_PLATFORM"))
-                .or_else(|| project_config.as_ref().and_then(|c| c.platform.clone()))
-                .unwrap_or_else(|| crate::build::DEFAULT_PLATFORM.to_string()),
+            platform,
+            platform_source,
 
             push: false,
         }

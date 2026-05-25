@@ -25,9 +25,23 @@ pub struct ProjectBuildConfig {
     #[serde(default)]
     pub deploy: Option<DeployConfig>,
 
+    /// Workload identity configuration (optional)
+    #[serde(default)]
+    pub identity: Option<IdentityConfig>,
+
     /// Per-environment configuration (optional)
     #[serde(default)]
     pub environments: BTreeMap<String, EnvironmentConfig>,
+}
+
+/// Workload identity configuration
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[cfg_attr(feature = "backend", derive(schemars::JsonSchema))]
+pub struct IdentityConfig {
+    /// Audiences to auto-mint workload identity tokens for and mount as files.
+    /// Map key = in-pod token filename, value = the token audience.
+    #[serde(default)]
+    pub audiences: BTreeMap<String, String>,
 }
 
 /// Per-environment configuration

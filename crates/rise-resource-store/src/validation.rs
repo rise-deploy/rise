@@ -52,6 +52,21 @@ impl SpecValidator for ResourceDefinitionValidator {
             )));
         }
 
+        // A ResourceDefinition is root-scoped when it declares no `parent`;
+        // otherwise the parent reference must be well-formed.
+        if let Some(parent) = &parsed.parent {
+            let Some((group, version)) = parent.api_version.split_once('/') else {
+                return Err(StoreError::Validation(
+                    "parent.apiVersion must be '<group>/<version>'".into(),
+                ));
+            };
+            validate_resource_group(group).map_err(|e| StoreError::Validation(e.to_string()))?;
+            validate_resource_version(version)
+                .map_err(|e| StoreError::Validation(e.to_string()))?;
+            validate_resource_kind(&parent.kind)
+                .map_err(|e| StoreError::Validation(e.to_string()))?;
+        }
+
         if parsed.versions.is_empty() {
             return Err(StoreError::Validation(
                 "ResourceDefinition must have at least one version".into(),
@@ -61,6 +76,11 @@ impl SpecValidator for ResourceDefinitionValidator {
         if storage_count != 1 {
             return Err(StoreError::Validation(
                 "ResourceDefinition must have exactly one storage version".into(),
+            ));
+        }
+        if !parsed.versions.iter().any(|v| v.served) {
+            return Err(StoreError::Validation(
+                "ResourceDefinition must have at least one served version".into(),
             ));
         }
         for v in &parsed.versions {

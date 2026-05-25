@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT git_repository_url\n        FROM deployments\n        WHERE project_id = $1 AND git_repository_url IS NOT NULL\n        ORDER BY (is_active AND deployment_group = 'default') DESC, created_at DESC\n        LIMIT 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "git_repository_url",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "c848be8d9f06883ec7d8ae2de781812cec08bd901528d0fd66719fc5a48a6e2e"
+}

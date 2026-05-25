@@ -64,6 +64,8 @@ The codebase is organized into functional modules:
    - **Authentication Module** (`auth/`): OAuth2/OIDC with Dex, JWT validation
    - **Project Management** (`project/`): Project CRUD and lifecycle management
    - **Team Management** (`team/`): Team and membership management
+   - **Service Accounts** (`service_accounts/`): CI/CD service accounts (inbound OIDC federation into Rise)
+   - **Workload Identity Tokens** (`workload_tokens/`): Token-exchange endpoint issuing Rise-signed workload JWTs to deployed apps
    - **Container Registry** (`registry/`): Temporary credentials for ECR registries
    - **Deployment Module** (`deployment/`): Kubernetes controller for deployments
    - **ECR Integration** (`ecr/`): AWS ECR repository management
@@ -175,7 +177,7 @@ For user-facing documentation, see the [`/docs`](./docs) directory. Key topics i
 - Keep the documentation updated. Don't be overly verbose when documenting the project. People can read the code, but things that are not obvious or help getting started and context are usually helpful in documentation, as well as well-placed and lean examples.
 - When removing a feature, do a comprehensive check on the codebase to ensure any remaining references to that feature are removed or updated. This includes documentation files/READMEs, config files, code comments, etc.
 - The CLI should first and foremost always accept the names of things (e.g. project names, or project names + deployment timestamp). The UUIDs in our tables are only for internal book-keeping.
-- The admin user(s) should always have full access to perform any operation. When we work on a new API endpoint, we make sure admin users don't need to pass regular permission checks.
+- Admin users (`auth.admin_users`) bypass the regular permission checks on the typed APIs (projects, teams, deployments, etc.) — they have full access there without passing ownership/membership checks. This does **not** extend to the generic resource API (`/api/v1/resources`), which is operator-gated (`auth.operator_users`): admins are not operators and do not bypass its checks. Granting admins access to the resource API is intentionally deferred (see `MULTI_TENANCY_PLAN.md`).
 - Any SQLX queries are to be wrapped by helper functions in the `rise_deploy::db` crate. No SQLX queries outside of this crate are allowed.
 - When we log errors and don't handle them further, we should include a sensible amount of information about the error. Often logging the error with `{:?}` is good enough.
 - When capturing screenshots, the playwright tool will successfully install the driver even if you might think its install step failed. Always use minimum 1280px width and 800px height for the browser.
@@ -208,7 +210,7 @@ cargo clippy --all-features --all-targets -- -D warnings  # Lint (uses cached bu
 |---|---|---|
 | Any `.rs` file | `cargo test --all-features` | Unit tests (requires `mise run db:migrate` once) |
 | SQLX queries (`sqlx::query!` etc.) | `mise run sqlx:prepare` | Regenerate offline query cache (commit the result) |
-| Server settings structs (`src/server/settings.rs`) | `mise run config:schema:generate` | Regenerate `docs/user/public/schemas/backend-settings.schema.json` (commit the result) |
+| Server settings structs (`src/server/settings.rs`) | `mise run config:schema:generate` | Regenerate `docs/engineering/public/schemas/backend-settings.schema.json` (commit the result) |
 | `src/rise_toml.rs` structs | `mise run rise-toml:schema:generate` | Regenerate `docs/user/public/schemas/rise-toml-v1.schema.json` (commit the result) |
 | CRD structs (`src/server/deployment/crd.rs`) | `mise run crd:generate` | Regenerate `helm/rise/crds/riseproject-crd.yaml` (commit the result) |
 | Helm chart (`helm/rise/`) | `helm lint helm/rise` | Validate chart templates |

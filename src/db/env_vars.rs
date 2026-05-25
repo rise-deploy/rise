@@ -428,9 +428,11 @@ mod tests {
                 is_active: false,
                 job_url: None,
                 pull_request_url: None,
+                git_repository_url: None,
                 replicas: 1,
                 cpu: "500m",
                 memory: "256Mi",
+                identity_audiences: serde_json::json!({}),
             },
         )
         .await
@@ -530,9 +532,11 @@ mod tests {
                 is_active: false,
                 job_url: None,
                 pull_request_url: None,
+                git_repository_url: None,
                 replicas: 1,
                 cpu: "500m",
                 memory: "256Mi",
+                identity_audiences: serde_json::json!({}),
             },
         )
         .await

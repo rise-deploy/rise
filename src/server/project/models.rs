@@ -87,7 +87,11 @@ pub struct Project {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub app_teams: Vec<TeamInfo>, // Teams whose members can access the deployed app
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_url: Option<String>, // URL to where the project code lives
+    pub source_url: Option<String>, // URL to where the project code lives (explicitly configured)
+    /// Git repository URL resolved from deployment metadata. Populated only when
+    /// `source_url` is unset, so the UI can still show where the project is deployed from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_source_url: Option<String>,
     /// Effective deployment defaults (platform defaults, shown to users)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deployment_defaults: Option<DeploymentDefaultsInfo>,
