@@ -37,6 +37,9 @@ fi
 if ! kubectl cluster-info > /dev/null 2>&1; then
   issues="${issues}\n  - No Kubernetes cluster reachable  →  mise setup minikube"
 fi
+if [ ! -f .env ] || ! grep -q '^# BEGIN RISE K8S DEV$' .env 2>/dev/null; then
+  issues="${issues}\n  - .env missing rise-managed block (RISE_K8S_HOST_IP, RISE_AUTH_BACKEND_URL, ...)  →  mise setup"
+fi
 if [ -n "$issues" ]; then
   printf "Preflight issues:\n%b\n\n" "$issues"
   printf "Continue anyway? [y/N] "
@@ -165,11 +168,13 @@ depends = ["backend:deps", "db:migrate"]
 run = """
 if [ -f .env ]; then
   . ./.env
+else
+  printf "Error: .env not found. Run 'mise setup' first — it writes the\n  RISE_K8S_HOST_IP / RISE_AUTH_BACKEND_URL block the backend needs.\n" >&2
+  exit 1
 fi
-if [ -z "${RISE_AUTH_BACKEND_URL:-}" ]; then
-  HOST_IP=$(ip -4 route get 1.1.1.1 | awk '{for (i = 1; i <= NF; i++) if ($i == "src") {print $(i + 1); exit}}')
-  export RISE_K8S_HOST_IP="${HOST_IP}"
-  export RISE_AUTH_BACKEND_URL="http://${HOST_IP}:3000"
+if [ -z "${RISE_AUTH_BACKEND_URL:-}" ] || [ -z "${RISE_K8S_HOST_IP:-}" ]; then
+  printf "Error: .env is missing the rise-managed block (RISE_K8S_HOST_IP, RISE_AUTH_BACKEND_URL).\n  Run 'mise setup' to (re)write it.\n" >&2
+  exit 1
 fi
 cargo run --features cli,backend -- backend server
 """
@@ -183,11 +188,13 @@ depends = ["backend:deps", "db:migrate"]
 run = """
 if [ -f .env ]; then
   . ./.env
+else
+  printf "Error: .env not found. Run 'mise setup' first — it writes the\n  RISE_K8S_HOST_IP / RISE_AUTH_BACKEND_URL block the backend needs.\n" >&2
+  exit 1
 fi
-if [ -z "${RISE_AUTH_BACKEND_URL:-}" ]; then
-  HOST_IP=$(ip -4 route get 1.1.1.1 | awk '{for (i = 1; i <= NF; i++) if ($i == "src") {print $(i + 1); exit}}')
-  export RISE_K8S_HOST_IP="${HOST_IP}"
-  export RISE_AUTH_BACKEND_URL="http://${HOST_IP}:3000"
+if [ -z "${RISE_AUTH_BACKEND_URL:-}" ] || [ -z "${RISE_K8S_HOST_IP:-}" ]; then
+  printf "Error: .env is missing the rise-managed block (RISE_K8S_HOST_IP, RISE_AUTH_BACKEND_URL).\n  Run 'mise setup' to (re)write it.\n" >&2
+  exit 1
 fi
 docker build . -t rise --target rise && docker run --rm --network host -v $PWD/config:/etc/rise:ro -v $HOME/.kube:/root/.kube:ro -v $HOME/.minikube:$HOME/.minikube:ro -e DATABASE_URL=$DATABASE_URL -e RISE_CONFIG_DIR=/etc/rise -e RISE_CONFIG_RUN_MODE=development -e RISE_AUTH_BACKEND_URL=$RISE_AUTH_BACKEND_URL -e RISE_K8S_HOST_IP=$RISE_K8S_HOST_IP rise backend server
 """
