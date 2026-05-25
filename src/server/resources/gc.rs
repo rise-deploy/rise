@@ -155,8 +155,15 @@ impl ResourceGcController {
             }
             // Global cadence gate: prevents leader-transition bursts where
             // the new leader's first tick fires sooner than the old leader's
-            // next-scheduled sweep would have.
-            if !self.schedule.try_claim_or_skip("resource GC").await {
+            // next-scheduled sweep would have. `_as_leader` re-verifies
+            // leadership against the DB (fast-path on the cached lease
+            // horizon) before the schedule UPSERT, so a stale-cached
+            // non-leader cannot poison `last_run_at`.
+            if !self
+                .schedule
+                .try_claim_or_skip_as_leader("resource GC", &self.election)
+                .await
+            {
                 continue;
             }
             match self.sweep().await {

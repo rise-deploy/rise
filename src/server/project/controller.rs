@@ -77,10 +77,12 @@ impl ProjectController {
 
             // Global cadence gate: ensures the new leader's first deletion
             // pass after a transition waits the full interval since the
-            // previous leader's last pass. See `GlobalSchedule` docs.
+            // previous leader's last pass. `_as_leader` re-verifies
+            // leadership against the DB (fast-path on the cached lease
+            // horizon) before the schedule UPSERT — see `GlobalSchedule` docs.
             if !self
                 .deletion_schedule
-                .try_claim_or_skip("project deletion")
+                .try_claim_or_skip_as_leader("project deletion", &self.election)
                 .await
             {
                 continue;

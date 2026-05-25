@@ -618,7 +618,13 @@ pub async fn run_entra_sync_loop(
         // Global cadence gate: see `GlobalSchedule` docs. Long sync intervals
         // (often 1h+) make leader-transition bursts much more visible than
         // for short-cadence workers, so this matters especially here.
-        if !schedule.try_claim_or_skip("Entra sync").await {
+        // `_as_leader` re-verifies leadership against the DB before the
+        // schedule UPSERT, so a stale-cached non-leader cannot poison
+        // `last_run_at` and delay the true leader by the full interval.
+        if !schedule
+            .try_claim_or_skip_as_leader("Entra sync", &election)
+            .await
+        {
             continue;
         }
 

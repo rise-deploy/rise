@@ -109,7 +109,7 @@ impl EcrController {
 
             if !self
                 .provision_schedule
-                .try_claim_or_skip("ECR provision")
+                .try_claim_or_skip_as_leader("ECR provision", &self.election)
                 .await
             {
                 continue;
@@ -182,7 +182,11 @@ impl EcrController {
                 continue;
             }
 
-            if !self.cleanup_schedule.try_claim_or_skip("ECR cleanup").await {
+            if !self
+                .cleanup_schedule
+                .try_claim_or_skip_as_leader("ECR cleanup", &self.election)
+                .await
+            {
                 continue;
             }
 
@@ -281,7 +285,11 @@ impl EcrController {
                 continue;
             }
 
-            if !self.drift_schedule.try_claim_or_skip("ECR drift").await {
+            if !self
+                .drift_schedule
+                .try_claim_or_skip_as_leader("ECR drift", &self.election)
+                .await
+            {
                 continue;
             }
 
