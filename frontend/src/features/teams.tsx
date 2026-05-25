@@ -132,7 +132,7 @@ export function TeamsList({ currentUser, openCreate = false }) {
                     </div>
                 </div>
                 {currentUser?.can_create_teams && (
-                    <RButton variant="primary" onClick={handleCreateClick}>
+                    <RButton variant="primary" icon="plus" onClick={handleCreateClick}>
                         New team
                     </RButton>
                 )}
