@@ -314,6 +314,62 @@ fn merge_annotations(
     merged
 }
 
+/// Resolved view of the default Organization for downstream consumers.
+///
+/// Returned by [`load_default_organization_view`] so the Kubernetes
+/// controller can read its namespace prefix and `deploymentControllerClass`
+/// without re-running the bootstrap path.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct DefaultOrganizationView {
+    pub uid: uuid::Uuid,
+    pub discriminator: String,
+    pub namespace_prefix: Option<String>,
+    pub deployment_controller_class: Option<String>,
+}
+
+impl DefaultOrganizationView {
+    /// Namespace prefix to apply to projects in this Organization.
+    /// Falls back to `org-{discriminator}-` when no annotation is set, per
+    /// the plan.
+    pub fn resolved_namespace_prefix(&self) -> String {
+        self.namespace_prefix
+            .clone()
+            .unwrap_or_else(|| format!("org-{}-", self.discriminator))
+    }
+}
+
+/// Look up the default Organization row from the store and project the
+/// fields the Kubernetes controller needs. Returns `None` only when the
+/// resource is absent (controllers should fail startup in that case).
+pub async fn load_default_organization_view(
+    store: &Arc<dyn ResourceStore>,
+    default_org: &DefaultOrganizationSettings,
+) -> Result<Option<DefaultOrganizationView>> {
+    let row = store
+        .get_by_name(
+            API_VERSION_V1ALPHA1,
+            ORGANIZATION_KIND,
+            &default_org.name,
+            None,
+        )
+        .await
+        .map_err(|e| anyhow!("Failed to load default Organization: {e}"))?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let annotations = annotations_from_metadata(&row.metadata);
+    let namespace_prefix = annotations.get(NAMESPACE_PREFIX_ANNOTATION).cloned();
+    let spec: OrganizationSpec = serde_json::from_value(row.spec.clone())
+        .context("Stored Organization spec is malformed")?;
+    Ok(Some(DefaultOrganizationView {
+        uid: row.uid,
+        discriminator: row.discriminator,
+        namespace_prefix,
+        deployment_controller_class: spec.deployment_controller_class,
+    }))
+}
+
 /// Validation pass that fails startup on a partial backfill. Runs after the
 /// idempotent backfill has had a chance to repair earlier mid-backfill
 /// crashes.

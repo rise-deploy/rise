@@ -211,6 +211,17 @@ async fn process_sync(
         }
     };
 
+    // 1b. Verify the project's Organization is assigned to this controller.
+    //
+    // The Kubernetes controller filters strictly by the configured
+    // `controller_class_name`. Projects whose Organization carries a
+    // different (or unset) `spec.deploymentControllerClass` belong to a
+    // different controller — surface that as an error so Metacontroller
+    // does not garbage-collect children it doesn't own. We deliberately
+    // bail (HTTP 500) instead of returning an empty children list, mirroring
+    // the existing "no resource builder" path.
+    enforce_controller_class(state, &project).await?;
+
     // 2. Load non-terminal deployments for this project (avoids loading full history)
     let non_terminal_deployments =
         db_deployments::list_non_terminal_for_project(&state.db_pool, project.id).await?;
@@ -264,6 +275,82 @@ async fn process_sync(
         children,
         resync_after_seconds: None,
     })
+}
+
+/// Reject reconciliation when the project's Organization's
+/// `spec.deploymentControllerClass` does not match the controller's
+/// configured `controller_class_name`. The function bails (`Err`) on a
+/// mismatch so the HTTP layer returns 500 — that prevents Metacontroller
+/// from applying an empty children list, which would otherwise garbage-collect
+/// children owned by another controller. When the controller has no
+/// configured class (legacy installs), this is a no-op.
+async fn enforce_controller_class(state: &AppState, project: &Project) -> anyhow::Result<()> {
+    let Some(configured) = state.deployment_controller_class_name.as_deref() else {
+        return Ok(());
+    };
+
+    let project_org_uid = match crate::db::organization_links::organization_uid_for_project(
+        &state.db_pool,
+        project.id,
+    )
+    .await?
+    {
+        Some(uid) => uid,
+        None => {
+            warn!(
+                project = %project.name,
+                "Project has no organization linkage — refusing to reconcile until bootstrap backfills it"
+            );
+            anyhow::bail!(
+                "project '{}' is missing organization_resource_uid; bootstrap must backfill before reconciliation",
+                project.name,
+            );
+        }
+    };
+
+    let row = state
+        .resource_store
+        .get(project_org_uid)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to load Organization {project_org_uid} for project '{}': {e}",
+                project.name,
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Organization {project_org_uid} for project '{}' is missing — refusing to reconcile",
+                project.name,
+            )
+        })?;
+
+    let spec: rise_resource_api::OrganizationSpec = serde_json::from_value(row.spec.clone())
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Organization {project_org_uid} for project '{}' has malformed spec: {e}",
+                project.name,
+            )
+        })?;
+
+    match spec.deployment_controller_class.as_deref() {
+        Some(class) if class == configured => Ok(()),
+        other => {
+            debug!(
+                project = %project.name,
+                configured = %configured,
+                org_class = ?other,
+                "Refusing to reconcile — project Organization's deploymentControllerClass does not match"
+            );
+            anyhow::bail!(
+                "project '{}' belongs to an Organization with deploymentControllerClass={:?}; \
+                 this controller is configured as '{}'",
+                project.name,
+                other,
+                configured,
+            )
+        }
+    }
 }
 
 /// Inspect the observed Kubernetes state for each non-terminal deployment and

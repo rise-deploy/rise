@@ -206,6 +206,24 @@ pub async fn organization_uid_for_team(
     Ok(row.and_then(|r| r.organization_resource_uid))
 }
 
+/// Look up the organization linkage UID for a project by project_id. Returns
+/// `None` when the project has no organization linkage (which, post-bootstrap,
+/// only happens for newly created rows where the typed API has not yet set
+/// the column).
+pub async fn organization_uid_for_project(
+    pool: &sqlx::PgPool,
+    project_id: Uuid,
+) -> Result<Option<Uuid>> {
+    let row = sqlx::query!(
+        r#"SELECT organization_resource_uid FROM projects WHERE id = $1"#,
+        project_id
+    )
+    .fetch_optional(pool)
+    .await
+    .context("Failed to look up project organization linkage")?;
+    Ok(row.and_then(|r| r.organization_resource_uid))
+}
+
 /// Stamp `organization_resource_uid` on a team. Used when creating a new team
 /// in the default-org bootstrap window.
 #[allow(dead_code)]

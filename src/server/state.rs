@@ -66,6 +66,12 @@ pub struct AppState {
     #[cfg(feature = "backend")]
     #[allow(dead_code)]
     pub default_organization_uid: uuid::Uuid,
+    /// `controller_class_name` for the configured Kubernetes deployment
+    /// controller. The webhook only reconciles projects whose Organization's
+    /// `spec.deploymentControllerClass` matches this value. `None` when no
+    /// Kubernetes deployment controller is configured.
+    #[cfg(feature = "backend")]
+    pub deployment_controller_class_name: Option<String>,
     pub auth_settings: Arc<AuthSettings>,
     pub server_settings: Arc<ServerSettings>,
     pub token_store: Arc<dyn TokenStore>,
@@ -284,6 +290,26 @@ impl AppState {
             .context("Default-Organization bootstrap failed")?;
         #[cfg(feature = "backend")]
         let default_organization_uid = bootstrap_outcome.default_organization_uid;
+
+        // Load the bootstrapped Organization back so the Kubernetes
+        // controller (instantiated below) can honour its namespace-prefix
+        // annotation and `spec.deploymentControllerClass`. Bootstrap creates
+        // the row before this returns, so absence is a programmer error and
+        // a `None` here is a hard startup failure.
+        #[cfg(feature = "backend")]
+        let default_organization_view = crate::server::bootstrap::load_default_organization_view(
+            &resource_store,
+            &settings.default_organization,
+        )
+        .await
+        .context("Failed to load default Organization view after bootstrap")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Default Organization '{}' is missing after bootstrap — refusing to start \
+                 the Kubernetes controller without it",
+                settings.default_organization.name
+            )
+        })?;
 
         // Initialize JWT validator (JWKS is fetched on-demand)
         let jwt_validator = Arc::new(JwtValidator::new(settings.server.ssrf.clone()));
@@ -621,6 +647,7 @@ impl AppState {
             deployment_defaults_opt,
             deployment_constraints_opt,
             identity_token_ttl_seconds,
+            deployment_controller_class_name,
         ) = {
             use crate::server::deployment::resource_builder::ResourceBuilder;
             use crate::server::settings::DeploymentControllerSettings;
@@ -655,6 +682,7 @@ impl AppState {
                 metacontroller_pod_namespace,
                 metacontroller_pod_label_selector,
                 namespace_format,
+                controller_class_name,
                 identity_token_ttl_seconds,
                 ..
             }) = &settings.deployment_controller
@@ -685,6 +713,24 @@ impl AppState {
                     .filter_map(|(k, v)| v.as_ref().map(|ac| (k.clone(), ac.clone())))
                     .collect();
 
+                // Prefer the default Organization's `kubernetes.rise.dev/namespace-prefix`
+                // annotation over the historical static `namespace_format`. The
+                // namespace_format setting is treated as a legacy fallback for now: when
+                // the annotation is set, we synthesise `{prefix}{project_name}` so the
+                // builder still uses a format string but the prefix is authoritative.
+                let resolved_namespace_format = {
+                    let prefix = default_organization_view.resolved_namespace_prefix();
+                    let format = format!("{prefix}{{project_name}}");
+                    if format != *namespace_format {
+                        tracing::info!(
+                            org_prefix = %prefix,
+                            configured_format = %namespace_format,
+                            "Using namespace format derived from default Organization annotation"
+                        );
+                    }
+                    format
+                };
+
                 let rb = ResourceBuilder {
                     production_ingress_url_template: production_ingress_url_template.clone(),
                     staging_ingress_url_template: staging_ingress_url_template.clone(),
@@ -711,7 +757,7 @@ impl AppState {
                     network_policy: network_policy.clone(),
                     pod_security_enabled: *pod_security_enabled,
                     health_probes: health_probes.clone(),
-                    namespace_format: namespace_format.clone(),
+                    namespace_format: resolved_namespace_format,
                 };
 
                 let run_mode =
@@ -748,9 +794,10 @@ impl AppState {
                     Some(deployment_defaults.clone()),
                     Some(_deployment_constraints.clone()),
                     *identity_token_ttl_seconds,
+                    Some(controller_class_name.clone()),
                 )
             } else {
-                (None, None, None, None, None, None, 3600)
+                (None, None, None, None, None, None, 3600, None)
             }
         };
 
@@ -1073,6 +1120,8 @@ impl AppState {
             resource_store,
             #[cfg(feature = "backend")]
             default_organization_uid,
+            #[cfg(feature = "backend")]
+            deployment_controller_class_name,
             auth_settings,
             server_settings,
             token_store,
