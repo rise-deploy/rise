@@ -2,7 +2,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
-import { copyToClipboard, formatISO8601, formatRelativeTimeRounded, isSafeUrl, stripUrlScheme } from '../lib/utils';
+import { formatISO8601, formatRelativeTimeRounded, isSafeUrl, stripUrlScheme } from '../lib/utils';
 import { useToast } from '../components/toast';
 import { Button, ConfirmDialog, Empty, EnvPill, EnvironmentColorDot, KV, KVRow, Modal, Panel, PanelBody, PanelHead, Pill, SourceLinkGroup, Status, Tabs, cx } from '../components/r-ui';
 import { Icon } from '../components/icon';
@@ -101,16 +101,6 @@ export function ProjectDetail({ projectName, initialTab }: { projectName: string
             showToast(`Failed to delete project: ${err.message}`, 'error');
         } finally {
             setDeleting(false);
-        }
-    };
-
-    const handleCopy = async (value: string, label: string) => {
-        if (!value) return;
-        try {
-            await copyToClipboard(value);
-            showToast(`${label} copied`, 'success');
-        } catch (err: any) {
-            showToast(`Failed to copy ${label.toLowerCase()}: ${err.message}`, 'error');
         }
     };
 
@@ -219,7 +209,7 @@ export function ProjectDetail({ projectName, initialTab }: { projectName: string
 
             <div>
                 {activeTab === 'overview' && (
-                    <ProjectOverview project={project} projectName={projectName} accessLabel={accessLabel} environments={environments} onCopy={handleCopy} />
+                    <ProjectOverview project={project} projectName={projectName} accessLabel={accessLabel} environments={environments} />
                 )}
                 {activeTab === 'deployments' && <DeploymentsList projectName={projectName} />}
                 {activeTab === 'environments' && (
@@ -403,7 +393,7 @@ function CurrentDeploymentPanel({ projectName, environments }: { projectName: st
     );
 }
 
-function ProjectOverview({ project, projectName, accessLabel, environments, onCopy }: { project: any; projectName: string; accessLabel: string; environments: any[]; onCopy: (v: string, l: string) => void }) {
+function ProjectOverview({ project, projectName, accessLabel, environments }: { project: any; projectName: string; accessLabel: string; environments: any[] }) {
     const sourceUrl: string | null = project.source_url || project.resolved_source_url || null;
     const sourceUrlInherited = !project.source_url && !!project.resolved_source_url;
     return (

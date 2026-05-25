@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
 import { formatDate } from '../lib/utils';
@@ -7,7 +7,6 @@ import { useToast } from '../components/toast';
 import { AutocompleteInput } from '../components/r-ui';
 import { ProjectTable } from '../components/project-table';
 import { EmptyState, ErrorState, LoadingState } from '../components/states';
-import { useRowKeyboardNavigation, useSortableData } from '../lib/table';
 import { Alert, ConfirmDialog as RConfirmDialog, Panel, PanelBody, PanelHead, Button as RButton, Empty, Field as RField, Input as RInput, Modal as RModal, Pill, Tooltip, colorFor } from '../components/r-ui';
 import { AddMenu, Menu, RosterTable } from '../components/roster-table';
 import { Icon } from '../components/icon';
@@ -24,13 +23,13 @@ export function TeamsList({ currentUser, openCreate = false }) {
     const [saving, setSaving] = useState(false);
     const [actionStatus, setActionStatus] = useState('');
     const { showToast } = useToast();
-    const { sortedItems: sortedTeams, sortKey, sortDirection, requestSort } = useSortableData(teams, 'name');
-    const { activeIndex, setActiveIndex, onKeyDown } = useRowKeyboardNavigation(
-        (idx) => {
-            const team = sortedTeams[idx];
-            if (team) navigate(`/team/${team.name}`);
-        },
-        sortedTeams.length
+    // Sort by team name (case-insensitive, numeric-aware) — matches the
+    // previous useSortableData default behaviour.
+    const sortedTeams = useMemo(
+        () => [...teams].sort((a, b) =>
+            String(a.name ?? '').localeCompare(String(b.name ?? ''), undefined, { numeric: true, sensitivity: 'base' })
+        ),
+        [teams]
     );
 
     const loadTeams = useCallback(async () => {

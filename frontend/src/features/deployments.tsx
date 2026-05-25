@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
 import { copyToClipboard, formatDate, formatISO8601, formatRelativeTimeRounded, formatTimeRemaining, isSafeUrl, stripUrlScheme } from '../lib/utils';
@@ -9,7 +9,6 @@ import { Button as RButton, Combobox, ConfirmDialog, ENV_COLOR_STYLES, Empty, En
 import { Icon } from '../components/icon';
 import { EnvVarsList } from './resources';
 import { EmptyState, ErrorState, LoadingState } from '../components/states';
-import { useRowKeyboardNavigation, useSortableData } from '../lib/table';
 
 const STATUS_TONES = {
     Healthy: 'ok',
@@ -218,7 +217,11 @@ export function ActiveDeploymentsSummary({ projectName }) {
                             </div>
                             <div>
                                 <dt className="text-gray-600 dark:text-gray-400">URL</dt>
-                                <dd>{deployment.primary_url ? <a href={deployment.primary_url} target="_blank" rel="noopener noreferrer" className="text-indigo-600 dark:text-indigo-400 hover:text-indigo-700 dark:hover:text-indigo-300">{deployment.primary_url}</a> : '-'}</dd>
+                                <dd>{deployment.primary_url
+                                    ? (isSafeUrl(deployment.primary_url)
+                                        ? <a href={deployment.primary_url} target="_blank" rel="noopener noreferrer" className="text-indigo-600 dark:text-indigo-400 hover:text-indigo-700 dark:hover:text-indigo-300">{deployment.primary_url}</a>
+                                        : <span className="text-gray-900 dark:text-gray-200">{deployment.primary_url}</span>)
+                                    : '-'}</dd>
                             </div>
                             <div>
                                 <dt className="text-gray-600 dark:text-gray-400">Created</dt>
@@ -293,14 +296,18 @@ export function DeploymentsList({ projectName }) {
     const [actionStatus, setActionStatus] = useState('');
     const { showToast } = useToast();
     const pageSize = 10;
-    const { sortedItems: sortedDeployments, sortKey, sortDirection, requestSort } = useSortableData(deployments, 'created', 'desc');
-    const { activeIndex, setActiveIndex, onKeyDown } = useRowKeyboardNavigation(
-        (idx) => {
-            const deployment = sortedDeployments[idx];
-            if (deployment) navigate(`/deployment/${projectName}/${deployment.deployment_id}`);
-        },
-        sortedDeployments.length
-    );
+    // Sort deployments by created desc — the new r-table doesn't expose
+    // sort headers, so we keep the default ordering only.
+    const sortedDeployments = useMemo(() => {
+        return [...deployments].sort((a, b) => {
+            const av = a?.created;
+            const bv = b?.created;
+            if (av == null && bv == null) return 0;
+            if (av == null) return 1;
+            if (bv == null) return -1;
+            return String(bv).localeCompare(String(av), undefined, { numeric: true, sensitivity: 'base' });
+        });
+    }, [deployments]);
 
     // Load deployment groups and environments
     useEffect(() => {
@@ -911,7 +918,6 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
     // Effect to restart streaming when tailLines changes and we're currently streaming
     useEffect(() => {
         if (streaming) {
-            console.log('Tail lines changed to', tailLines, ', restarting stream...');
             startStreaming();
         }
     }, [tailLines]); // Only depend on tailLines, not streaming or startStreaming to avoid loops
@@ -1626,16 +1632,26 @@ export function DeploymentDetail({ projectName, deploymentId }) {
             <PanelBody style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                 {allDomains.length > 0 ? (
                     allDomains.map((url) => (
-                        <a
-                            key={url}
-                            href={url}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="r-link mono"
-                            style={{ fontSize: 12.5, wordBreak: 'break-all' }}
-                        >
-                            {url.replace(/^https?:\/\//, '')}
-                        </a>
+                        isSafeUrl(url) ? (
+                            <a
+                                key={url}
+                                href={url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="r-link mono"
+                                style={{ fontSize: 12.5, wordBreak: 'break-all' }}
+                            >
+                                {url.replace(/^https?:\/\//, '')}
+                            </a>
+                        ) : (
+                            <span
+                                key={url}
+                                className="mono"
+                                style={{ fontSize: 12.5, wordBreak: 'break-all' }}
+                            >
+                                {url.replace(/^https?:\/\//, '')}
+                            </span>
+                        )
                     ))
                 ) : (
                     <span style={{ fontSize: 12.5, color: 'var(--text-soft)' }}>No domains configured.</span>

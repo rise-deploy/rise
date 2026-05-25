@@ -34,8 +34,19 @@ export function Home({ user }: HomeProps) {
 
     const counts = {
         healthy: projects.filter(p => (p.status || '').toLowerCase() === 'running').length,
-        unhealthy: projects.filter(p => (p.status || '').toLowerCase() === 'failed').length,
+        // "unhealthy" surfaces anything operator attention should care about:
+        // failed rollouts and projects currently being deleted (deletes can stall).
+        unhealthy: projects.filter(p => {
+            const s = (p.status || '').toLowerCase();
+            return s === 'failed' || s === 'deleting';
+        }).length,
         deploying: projects.filter(p => (p.status || '').toLowerCase() === 'deploying').length,
+        // Stopped/Terminated projects exist but aren't running and aren't unhealthy;
+        // surface them as their own stat so the totals reconcile.
+        inactive: projects.filter(p => {
+            const s = (p.status || '').toLowerCase();
+            return s === 'stopped' || s === 'terminated';
+        }).length,
     };
 
     const recent = [...projects]
@@ -62,7 +73,13 @@ export function Home({ user }: HomeProps) {
                     label="Healthy"
                     value={counts.healthy}
                     unit={` / ${projects.length}`}
-                    delta={counts.unhealthy > 0 ? `${counts.unhealthy} need attention` : 'all probes passing'}
+                    delta={
+                        counts.unhealthy > 0
+                            ? `${counts.unhealthy} need attention`
+                            : counts.inactive > 0
+                                ? `${counts.inactive} stopped or terminated`
+                                : 'all probes passing'
+                    }
                     deltaTone={counts.unhealthy > 0 ? 'down' : undefined}
                 />
                 <Stat
@@ -101,18 +118,16 @@ export function Home({ user }: HomeProps) {
                                         key={p.id || p.name}
                                         className="click"
                                         onClick={() => navigate(`/project/${p.name}`)}
-                                        tabIndex={0}
-                                        role="button"
-                                        aria-label={`Open project ${p.name}`}
-                                        onKeyDown={(e) => {
-                                            if (e.key === 'Enter' || e.key === ' ') {
-                                                e.preventDefault();
-                                                navigate(`/project/${p.name}`);
-                                            }
-                                        }}
                                     >
                                         <td>
-                                            <div style={{ fontWeight: 500, fontSize: 13.5 }}>{p.name}</div>
+                                            <a
+                                                className="r-link"
+                                                href={`/project/${p.name}`}
+                                                style={{ fontWeight: 500, fontSize: 13.5 }}
+                                                onClick={(e) => { e.preventDefault(); navigate(`/project/${p.name}`); }}
+                                            >
+                                                {p.name}
+                                            </a>
                                             {p.primary_url && (
                                                 <div className="mono" style={{ fontSize: 11.5, color: 'var(--text-soft)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 280 }}>
                                                     {p.primary_url}

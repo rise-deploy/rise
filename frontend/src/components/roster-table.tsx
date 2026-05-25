@@ -1,17 +1,27 @@
-// @ts-nocheck
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { Icon } from './icon';
 import { Button as RButton, Empty, Panel, Pill, Segmented } from './r-ui';
 
+export interface MenuItem {
+    label: string;
+    icon?: string;
+    onClick: () => void;
+}
+
+export interface MenuProps {
+    trigger: (args: { toggle: () => void; open: boolean }) => ReactNode;
+    items: MenuItem[];
+}
+
 // Generic dropdown menu. `trigger` is a render prop receiving { toggle, open };
 // the item list is portaled and fixed-positioned so it is never clipped by a
 // surrounding panel/overflow container.
-export function Menu({ trigger, items }) {
+export function Menu({ trigger, items }: MenuProps) {
     const [open, setOpen] = useState(false);
-    const [rect, setRect] = useState(null);
-    const wrapRef = useRef(null);
-    const popRef = useRef(null);
+    const [rect, setRect] = useState<{ top: number; right: number } | null>(null);
+    const wrapRef = useRef<HTMLDivElement | null>(null);
+    const popRef = useRef<HTMLDivElement | null>(null);
 
     useEffect(() => {
         if (!open) { setRect(null); return; }
@@ -32,9 +42,10 @@ export function Menu({ trigger, items }) {
 
     useEffect(() => {
         if (!open) return;
-        const onClick = (e) => {
-            if (wrapRef.current && wrapRef.current.contains(e.target)) return;
-            if (popRef.current && popRef.current.contains(e.target)) return;
+        const onClick = (e: MouseEvent) => {
+            const target = e.target as Node | null;
+            if (target && wrapRef.current && wrapRef.current.contains(target)) return;
+            if (target && popRef.current && popRef.current.contains(target)) return;
             setOpen(false);
         };
         document.addEventListener('mousedown', onClick);
@@ -79,8 +90,8 @@ export function Menu({ trigger, items }) {
                                 color: 'var(--text)',
                                 textAlign: 'left',
                             }}
-                            onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--surface-2)'; }}
-                            onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+                            onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.background = 'var(--surface-2)'; }}
+                            onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.background = 'transparent'; }}
                             onClick={() => { setOpen(false); item.onClick(); }}
                         >
                             {item.icon && <Icon name={item.icon} size={14} />}
@@ -95,7 +106,7 @@ export function Menu({ trigger, items }) {
 }
 
 // "Add" split button — a primary button that opens a dropdown of choices.
-export function AddMenu({ items }) {
+export function AddMenu({ items }: { items: MenuItem[] }) {
     return (
         <Menu
             items={items}
@@ -106,12 +117,38 @@ export function AddMenu({ items }) {
     );
 }
 
+export interface RosterRow {
+    key: string;
+    icon?: string;
+    name: ReactNode;
+    kindLabel?: ReactNode | ReactNode[];
+    badge?: ReactNode;
+    extra?: ReactNode;
+    actions?: ReactNode;
+}
+
+export interface RosterFilter<T extends string = string> {
+    value: T;
+    options: { value: T; label: string }[] | T[];
+    onChange: (value: T) => void;
+}
+
+export interface RosterTableProps {
+    title: ReactNode;
+    sub?: ReactNode;
+    addControl?: ReactNode;
+    filter?: RosterFilter;
+    rows: RosterRow[];
+    extraColumnLabel?: ReactNode;
+    emptyText?: ReactNode;
+}
+
 // Reusable "roster" table — a section header with optional add control and
 // type filter, followed by a panel with a unified subject/kind/actions table.
 //
 // rows: { key, icon, name, kindLabel, badge?, extra?, actions? }[]
 // kindLabel may be a string or an array of strings (rendered as multiple pills).
-export function RosterTable({ title, sub, addControl, filter, rows, extraColumnLabel, emptyText }) {
+export function RosterTable({ title, sub, addControl, filter, rows, extraColumnLabel, emptyText }: RosterTableProps) {
     return (
         <>
             <div className="r-section-head">
@@ -154,7 +191,7 @@ export function RosterTable({ title, sub, addControl, filter, rows, extraColumnL
                                         <span style={{ display: 'inline-flex', gap: 6, flexWrap: 'wrap' }}>
                                             {(Array.isArray(row.kindLabel) ? row.kindLabel : [row.kindLabel])
                                                 .filter(Boolean)
-                                                .map(k => <Pill key={k}>{k}</Pill>)}
+                                                .map((k, i) => <Pill key={typeof k === 'string' ? k : i}>{k}</Pill>)}
                                         </span>
                                     </td>
                                     {extraColumnLabel && (

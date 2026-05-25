@@ -441,7 +441,10 @@ export function Modal({ isOpen, onClose, title, sub, children, footer, width }: 
                 last.focus();
             }
         } else {
-            if (active === last) {
+            // Pull focus back to the first focusable when it has escaped the
+            // modal entirely (e.g. via a portaled child that the trap can't
+            // see), in addition to the normal wrap from `last`.
+            if (active === last || !root.contains(active)) {
                 e.preventDefault();
                 first.focus();
             }
@@ -537,6 +540,11 @@ export function Combobox(props: ComboboxProps) {
     const [query, setQuery] = useState('');
     const [activeIndex, setActiveIndex] = useState(0);
     const [popRect, setPopRect] = useState<{ top: number; left: number; width: number } | null>(null);
+    // When the combobox lives inside a Modal, portaling the listbox to
+    // document.body would put it outside the modal's focus-trap root — Tab
+    // from the search input/options would escape into the modal's first
+    // focusable. Render inline in that case so the trap sees the popover.
+    const [inModal, setInModal] = useState(false);
     const wrapRef = useRef<HTMLDivElement>(null);
     const triggerRef = useRef<HTMLDivElement>(null);
     const popRef = useRef<HTMLDivElement>(null);
@@ -584,6 +592,7 @@ export function Combobox(props: ComboboxProps) {
 
     useEffect(() => {
         if (!open) { setPopRect(null); setQuery(''); return; }
+        setInModal(Boolean(wrapRef.current?.closest('.r-modal')));
         const update = () => {
             const el = triggerRef.current;
             if (!el) return;
@@ -725,70 +734,75 @@ export function Combobox(props: ComboboxProps) {
                 )}
                 <Icon name="chevd" size={14} className="chev" />
             </div>
-            {open && popRect && createPortal(
-                <div
-                    ref={popRef}
-                    id={listboxId}
-                    className="r-cbox-pop"
-                    role="listbox"
-                    style={{ position: 'fixed', top: popRect.top, left: popRect.left, width: popRect.width }}
-                >
-                    <div className="r-cbox-search">
-                        <Icon name="search" size={13} />
-                        <input
-                            ref={inputRef}
-                            value={query}
-                            onChange={(e) => setQuery(e.target.value)}
-                            onKeyDown={onKeyDown}
-                            onBlur={handleSearchBlur}
-                            placeholder={searchPlaceholder}
-                            aria-controls={listboxId}
-                            aria-activedescendant={filtered[activeIndex] ? optionId(activeIndex) : undefined}
-                        />
+            {open && popRect && (() => {
+                const popover = (
+                    <div
+                        ref={popRef}
+                        id={listboxId}
+                        className="r-cbox-pop"
+                        role="listbox"
+                        style={{ position: 'fixed', top: popRect.top, left: popRect.left, width: popRect.width }}
+                    >
+                        <div className="r-cbox-search">
+                            <Icon name="search" size={13} />
+                            <input
+                                ref={inputRef}
+                                value={query}
+                                onChange={(e) => setQuery(e.target.value)}
+                                onKeyDown={onKeyDown}
+                                onBlur={handleSearchBlur}
+                                placeholder={searchPlaceholder}
+                                aria-controls={listboxId}
+                                aria-activedescendant={filtered[activeIndex] ? optionId(activeIndex) : undefined}
+                            />
+                        </div>
+                        <div className="r-cbox-list">
+                            {filtered.length === 0 ? (
+                                <div className="r-cbox-empty">{emptyText}</div>
+                            ) : (
+                                filtered.map((o, i) => {
+                                    const on = selectedValues.includes(o.value);
+                                    return (
+                                        <div
+                                            key={o.value}
+                                            id={optionId(i)}
+                                            className={cx('r-cbox-item', on && 'on', i === activeIndex && 'sel')}
+                                            role="option"
+                                            aria-selected={on}
+                                            onMouseEnter={() => setActiveIndex(i)}
+                                            // Keep focus on the search input during click so the
+                                            // input's onBlur handler doesn't close the popover
+                                            // before the click event reaches us.
+                                            onMouseDown={(e) => e.preventDefault()}
+                                            onClick={() => toggleValue(o.value)}
+                                        >
+                                            {isMulti && (
+                                                <span className="check">
+                                                    {on && <Icon name="check" size={10} />}
+                                                </span>
+                                            )}
+                                            {o.icon && <span className="r-cbox-icon" aria-hidden>{o.icon}</span>}
+                                            {o.hint ? (
+                                                <span className="r-cbox-item-text">
+                                                    <span className="label">{o.label}</span>
+                                                    <span className="hint">{o.hint}</span>
+                                                </span>
+                                            ) : (
+                                                <span className="grow">{o.label}</span>
+                                            )}
+                                            {!isMulti && on && <Icon name="check" size={13} />}
+                                        </div>
+                                    );
+                                })
+                            )}
+                        </div>
                     </div>
-                    <div className="r-cbox-list">
-                        {filtered.length === 0 ? (
-                            <div className="r-cbox-empty">{emptyText}</div>
-                        ) : (
-                            filtered.map((o, i) => {
-                                const on = selectedValues.includes(o.value);
-                                return (
-                                    <div
-                                        key={o.value}
-                                        id={optionId(i)}
-                                        className={cx('r-cbox-item', on && 'on', i === activeIndex && 'sel')}
-                                        role="option"
-                                        aria-selected={on}
-                                        onMouseEnter={() => setActiveIndex(i)}
-                                        // Keep focus on the search input during click so the
-                                        // input's onBlur handler doesn't close the popover
-                                        // before the click event reaches us.
-                                        onMouseDown={(e) => e.preventDefault()}
-                                        onClick={() => toggleValue(o.value)}
-                                    >
-                                        {isMulti && (
-                                            <span className="check">
-                                                {on && <Icon name="check" size={10} />}
-                                            </span>
-                                        )}
-                                        {o.icon && <span className="r-cbox-icon" aria-hidden>{o.icon}</span>}
-                                        {o.hint ? (
-                                            <span className="r-cbox-item-text">
-                                                <span className="label">{o.label}</span>
-                                                <span className="hint">{o.hint}</span>
-                                            </span>
-                                        ) : (
-                                            <span className="grow">{o.label}</span>
-                                        )}
-                                        {!isMulti && on && <Icon name="check" size={13} />}
-                                    </div>
-                                );
-                            })
-                        )}
-                    </div>
-                </div>,
-                document.body
-            )}
+                );
+                // Render inline (no portal) when inside a Modal so the modal's
+                // focus trap can see the popover; otherwise portal to body to
+                // escape any surrounding overflow clipping.
+                return inModal ? popover : createPortal(popover, document.body);
+            })()}
         </div>
     );
 }
@@ -1010,12 +1024,13 @@ export function AutocompleteInput({
     };
 
     return (
-        <div ref={wrapRef} className={cx('relative', className)}>
+        <div ref={wrapRef} className={cx('relative', className)} style={{ position: 'relative' }}>
             <input
                 ref={inputRef}
                 type={type}
                 id={id}
-                className="mono-input w-full"
+                className={cx('r-field', 'mono')}
+                style={{ width: '100%' }}
                 placeholder={placeholder}
                 value={value}
                 onChange={(e) => {
@@ -1030,29 +1045,35 @@ export function AutocompleteInput({
                 disabled={disabled || loading}
             />
             {isOpen && popRect && createPortal(
+                // Mirrors `.r-cbox-pop` visually: same surface/border/shadow tokens
+                // as the Combobox dropdown so all autocomplete surfaces match.
                 <div
                     ref={popRef}
-                    className="bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded shadow-lg max-h-48 overflow-y-auto"
+                    className="r-cbox-pop"
                     // Above legacy.css `.modal-backdrop` (9998) and modal content (9999) so the
                     // suggestion list stays visible when AutocompleteInput is rendered in a legacy modal.
                     style={{ position: 'fixed', top: popRect.top, left: popRect.left, width: popRect.width, zIndex: 10000 }}
                 >
-                    {loading ? (
-                        <div className="px-3 py-2 text-sm text-gray-500">Loading...</div>
-                    ) : filteredOptions.length === 0 ? (
-                        <div className="px-3 py-2 text-sm text-gray-500">{noMatchesText}</div>
-                    ) : (
-                        filteredOptions.map((opt) => (
-                            <button
-                                key={opt}
-                                type="button"
-                                className="w-full text-left px-3 py-2 text-sm hover:bg-gray-100 dark:hover:bg-gray-700"
-                                onClick={() => handleSelect(opt)}
-                            >
-                                {opt}
-                            </button>
-                        ))
-                    )}
+                    <div className="r-cbox-list">
+                        {loading ? (
+                            <div className="r-cbox-empty">Loading…</div>
+                        ) : filteredOptions.length === 0 ? (
+                            <div className="r-cbox-empty">{noMatchesText}</div>
+                        ) : (
+                            filteredOptions.map((opt) => (
+                                <div
+                                    key={opt}
+                                    role="option"
+                                    aria-selected={false}
+                                    className="r-cbox-item"
+                                    onMouseDown={(e) => e.preventDefault()}
+                                    onClick={() => handleSelect(opt)}
+                                >
+                                    <span className="grow">{opt}</span>
+                                </div>
+                            ))
+                        )}
+                    </div>
                 </div>,
                 document.body
             )}
@@ -1063,7 +1084,12 @@ export function AutocompleteInput({
 // ---------- Tooltip ----------
 // Custom hover/focus tooltip, replaces native `title` attributes. The bubble is
 // portaled so it is never clipped by a surrounding overflow container.
-export function Tooltip({ content, children }: { content: React.ReactNode; children: React.ReactNode }) {
+//
+// `focusable` defaults to `false` because most callers wrap decorative chips
+// (pills, status dots) where adding a tab stop just clutters the tab order.
+// Pass `focusable` when the tooltip carries information that keyboard-only
+// users would otherwise miss (e.g. tooltipped icon-only buttons).
+export function Tooltip({ content, children, focusable = false }: { content: React.ReactNode; children: React.ReactNode; focusable?: boolean }) {
     const [pos, setPos] = React.useState<{ top: number; left: number } | null>(null);
     const ref = React.useRef<HTMLSpanElement | null>(null);
     const show = () => {
@@ -1077,7 +1103,7 @@ export function Tooltip({ content, children }: { content: React.ReactNode; child
         <span
             ref={ref}
             className="r-tip"
-            tabIndex={0}
+            tabIndex={focusable ? 0 : undefined}
             onMouseEnter={show}
             onMouseLeave={hide}
             onFocus={show}

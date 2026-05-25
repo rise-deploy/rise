@@ -152,9 +152,11 @@ export function App() {
             setPaletteTeams([]);
             return;
         }
+        let cancelled = false;
         async function loadPaletteTargets() {
             try {
                 const [projects, teams] = await Promise.all([api.getProjects(), api.getTeams()]);
+                if (cancelled) return;
                 setPaletteProjects(projects || []);
                 setPaletteTeams(teams || []);
             } catch (err) {
@@ -163,6 +165,11 @@ export function App() {
             }
         }
         loadPaletteTargets();
+        window.addEventListener('rise:mutation', loadPaletteTargets);
+        return () => {
+            cancelled = true;
+            window.removeEventListener('rise:mutation', loadPaletteTargets);
+        };
     }, [user?.id]);
 
     if (!authChecked) {
@@ -197,7 +204,6 @@ export function App() {
             if (parts[4] === 'group' && parts[5]) params.groupName = parts[5];
         } else if (parts[2] === 'extensions') {
             if (parts.length === 3) { view = 'project-detail'; params.projectName = parts[1]; params.tab = 'extensions'; }
-            else if (parts.length === 4 && parts[3] === '@new') { view = 'extension-create'; params.projectName = parts[1]; params.extensionType = null; }
             else if (parts.length === 5 && parts[3]) {
                 if (parts[4] === '@new') { view = 'extension-detail'; params.projectName = parts[1]; params.extensionType = parts[3]; params.extensionInstance = null; }
                 else { view = 'extension-detail'; params.projectName = parts[1]; params.extensionType = parts[3]; params.extensionInstance = parts[4]; }
@@ -248,8 +254,7 @@ export function App() {
             { label: params.projectName, href: `/project/${params.projectName}` },
             { label: params.deploymentId },
         ]; break;
-        case 'extension-detail':
-        case 'extension-create':  breadcrumbs = [
+        case 'extension-detail':  breadcrumbs = [
             { label: 'Projects', href: '/projects' },
             { label: params.projectName, href: `/project/${params.projectName}` },
             { label: 'Extensions', href: `/project/${params.projectName}/extensions` },

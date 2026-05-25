@@ -397,23 +397,23 @@ pub async fn list_team_projects(
     let user = auth.user()?;
     let team_id = resolve_team_identifier(&state.db_pool, &id_or_name).await?;
 
-    let mut projects = projects::list_accessible_by_team(&state.db_pool, team_id)
+    // Admins can see every team's projects. Everyone else must be a member of
+    // the resolved team — otherwise we'd leak team existence by distinguishing
+    // 200-empty from 404-not-found. Service-account access does not count,
+    // matching the boundary intended for this endpoint.
+    if !state.is_admin(&user.email) {
+        let is_member = db_teams::is_member(&state.db_pool, team_id, user.id)
+            .await
+            .internal_err("Failed to check team membership")?;
+
+        if !is_member {
+            return Err(ServerError::forbidden("You are not a member of this team"));
+        }
+    }
+
+    let projects = projects::list_accessible_by_team(&state.db_pool, team_id)
         .await
         .internal_err("Failed to list team projects")?;
-
-    // Admins can see every project, so the ownership filter does not apply to
-    // them. Everyone else only sees the team's projects they own themselves
-    // (directly or via team membership) — service-account access does not
-    // count, so this stays narrower than `list_accessible_by_user`.
-    if !state.is_admin(&user.email) {
-        let owned_project_ids: std::collections::HashSet<_> =
-            projects::list_owned_project_ids_by_user(&state.db_pool, user.id)
-                .await
-                .internal_err("Failed to list user projects")?
-                .into_iter()
-                .collect();
-        projects.retain(|project| owned_project_ids.contains(&project.id));
-    }
 
     let api_projects = projects_to_api(&state, projects).await?;
     Ok(Json(api_projects))

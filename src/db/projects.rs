@@ -89,8 +89,11 @@ pub async fn list_accessible_by_user(pool: &PgPool, user_id: Uuid) -> Result<Vec
 /// List the IDs of projects a user owns directly or via team membership.
 ///
 /// Unlike [`list_accessible_by_user`], this excludes service-account access:
-/// it reflects project ownership only. Used to test ownership membership
-/// when filtering another result set, without paying for full `Project` rows.
+/// it reflects project ownership only. Currently exercised by the
+/// `test_list_owned_excludes_service_account_only_access` sqlx test, which
+/// pins the ownership-vs-service-account boundary that team-projects
+/// authorization relies on at the handler layer.
+#[allow(dead_code)]
 pub async fn list_owned_project_ids_by_user(pool: &PgPool, user_id: Uuid) -> Result<Vec<Uuid>> {
     let ids = sqlx::query_scalar!(
         r#"

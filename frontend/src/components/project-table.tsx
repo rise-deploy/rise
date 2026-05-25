@@ -1,9 +1,36 @@
-// @ts-nocheck
 import { Icon } from './icon';
 import { Panel, Status } from './r-ui';
 import { formatRelativeTimeRounded, stripUrlScheme } from '../lib/utils';
 
-function OwnerCell({ owner }) {
+export interface ProjectOwner {
+    id?: string;
+    email?: string;
+    name?: string;
+}
+
+export interface ProjectRow {
+    id?: string;
+    name: string;
+    status?: string;
+    primary_url?: string;
+    access_class?: string;
+    owner?: ProjectOwner;
+    created?: string;
+    updated?: string;
+    updated_at?: string;
+}
+
+export interface AccessClassOption {
+    id: string;
+    display_name?: string;
+    description?: string;
+}
+
+interface OwnerCellProps {
+    owner?: ProjectOwner;
+}
+
+function OwnerCell({ owner }: OwnerCellProps) {
     if (!owner || (!owner.email && !owner.name)) {
         return <span style={{ color: 'var(--text-soft)' }}>—</span>;
     }
@@ -16,6 +43,14 @@ function OwnerCell({ owner }) {
     );
 }
 
+export interface ProjectTableProps {
+    projects: ProjectRow[];
+    accessClasses?: AccessClassOption[];
+    onRowClick: (project: ProjectRow) => void;
+    emptyText?: string;
+    isOwnRow?: (project: ProjectRow) => boolean;
+}
+
 // Shared project listing table (r-* design system). Renders inside a Panel and
 // owns its empty state. Used by the Projects page and the team detail page.
 //
@@ -26,7 +61,7 @@ export function ProjectTable({
     onRowClick,
     emptyText = 'No projects found.',
     isOwnRow,
-}) {
+}: ProjectTableProps) {
     return (
         <Panel>
             {projects.length === 0 ? (
@@ -58,15 +93,6 @@ export function ProjectTable({
                                     key={project.id || project.name}
                                     className={`click${ownClass}`}
                                     onClick={() => onRowClick(project)}
-                                    tabIndex={0}
-                                    role="button"
-                                    aria-label={`Open project ${project.name}`}
-                                    onKeyDown={(e) => {
-                                        if (e.key === 'Enter' || e.key === ' ') {
-                                            e.preventDefault();
-                                            onRowClick(project);
-                                        }
-                                    }}
                                 >
                                     <td style={{ maxWidth: 280 }}>
                                         <div style={{ fontWeight: 500, fontSize: 13.5 }}>{project.name}</div>

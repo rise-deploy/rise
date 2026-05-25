@@ -50,18 +50,28 @@ function Sidebar({ route, user, onLogout, onToggleTheme, theme }: { route: strin
     const userColor = colorFor(userEmail || 'user');
     const [navCounts, setNavCounts] = useState<{ projects?: number; teams?: number }>({});
 
-    // Fetch nav badge counts (projects / teams). Best-effort; failures are ignored.
-    // Re-fetches on the global `rise:mutation` event so that creates/deletes
-    // elsewhere in the app keep the sidebar counts in sync.
+    // Fetch nav badge counts (projects / teams). Best-effort: errors are logged
+    // and, on platform-access-denied, we stop listening for further mutation
+    // events so we don't hammer a backend that's already rejecting us.
+    // App.tsx surfaces the access-denied UI; mirroring its detection here just
+    // bails on refetch.
     useEffect(() => {
         let cancelled = false;
+        let denied = false;
         const loadCounts = () => {
+            if (denied) return;
             api.getProjects()
-                .then((p: any[]) => { if (!cancelled) setNavCounts(c => ({ ...c, projects: Array.isArray(p) ? p.length : undefined })); })
-                .catch(() => {});
+                .then((p: unknown) => { if (!cancelled) setNavCounts(c => ({ ...c, projects: Array.isArray(p) ? p.length : undefined })); })
+                .catch((err: { isPlatformAccessDenied?: boolean } | undefined) => {
+                    if (err?.isPlatformAccessDenied) { denied = true; return; }
+                    console.error('Sidebar: failed to load projects count', err);
+                });
             api.getTeams()
-                .then((t: any[]) => { if (!cancelled) setNavCounts(c => ({ ...c, teams: Array.isArray(t) ? t.length : undefined })); })
-                .catch(() => {});
+                .then((t: unknown) => { if (!cancelled) setNavCounts(c => ({ ...c, teams: Array.isArray(t) ? t.length : undefined })); })
+                .catch((err: { isPlatformAccessDenied?: boolean } | undefined) => {
+                    if (err?.isPlatformAccessDenied) { denied = true; return; }
+                    console.error('Sidebar: failed to load teams count', err);
+                });
         };
         loadCounts();
         window.addEventListener('rise:mutation', loadCounts);
@@ -79,10 +89,24 @@ function Sidebar({ route, user, onLogout, onToggleTheme, theme }: { route: strin
 
     return (
         <aside className="r-side">
-            <div className="r-brand" onClick={() => navigate('/home')} style={{ cursor: 'pointer' }}>
+            <button
+                type="button"
+                className="r-brand"
+                onClick={() => navigate('/home')}
+                aria-label="Go to home"
+                style={{
+                    cursor: 'pointer',
+                    background: 'transparent',
+                    border: 'none',
+                    padding: 0,
+                    color: 'inherit',
+                    font: 'inherit',
+                    textAlign: 'left',
+                }}
+            >
                 <div className="r-brand-mark">R</div>
                 <div className="r-brand-name">Rise</div>
-            </div>
+            </button>
             {/*
               Non-functional placeholder for future multi-tenancy / workspace
               switching. Renders a static workspace label only — there is no

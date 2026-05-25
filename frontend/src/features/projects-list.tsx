@@ -62,11 +62,15 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
         if (!projects) return [];
         return projects.filter(p => {
             const s = (p.status || '').toLowerCase();
+            // Filter buckets cover every ProjectStatus the backend can emit
+            // (Running, Stopped, Deploying, Failed, Deleting, Terminated) so
+            // no project is silently hidden by a non-"all" selection.
             const matchesStatus =
                 statusFilter === 'all' ||
                 (statusFilter === 'healthy' && s === 'running') ||
-                (statusFilter === 'unhealthy' && s === 'failed') ||
-                (statusFilter === 'deploying' && s === 'deploying');
+                (statusFilter === 'deploying' && s === 'deploying') ||
+                (statusFilter === 'unhealthy' && (s === 'failed' || s === 'deleting')) ||
+                (statusFilter === 'inactive' && (s === 'stopped' || s === 'terminated'));
             if (!matchesStatus) return false;
             if (accessFilter !== 'all' && p.access_class !== accessFilter) return false;
             if (search) {
@@ -105,8 +109,17 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
 
     const counts = {
         healthy: projects.filter(p => (p.status || '').toLowerCase() === 'running').length,
-        unhealthy: projects.filter(p => (p.status || '').toLowerCase() === 'failed').length,
+        // Failed rollouts and deletes that may be stalled need attention.
+        unhealthy: projects.filter(p => {
+            const s = (p.status || '').toLowerCase();
+            return s === 'failed' || s === 'deleting';
+        }).length,
         deploying: projects.filter(p => (p.status || '').toLowerCase() === 'deploying').length,
+        // Stopped or fully terminated projects — present but not running.
+        inactive: projects.filter(p => {
+            const s = (p.status || '').toLowerCase();
+            return s === 'stopped' || s === 'terminated';
+        }).length,
     };
 
     return (
@@ -118,6 +131,7 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
                         {projects.length} project{projects.length === 1 ? '' : 's'} · {counts.healthy} healthy
                         {counts.unhealthy ? `, ${counts.unhealthy} need attention` : ''}
                         {counts.deploying ? `, ${counts.deploying} deploying` : ''}
+                        {counts.inactive ? `, ${counts.inactive} inactive` : ''}
                     </div>
                 </div>
                 <Button onClick={loadProjects} icon="refresh">Refresh</Button>
@@ -127,7 +141,19 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
             </div>
 
             <StatGrid cols={3}>
-                <Stat label="Healthy" value={counts.healthy} unit={` / ${projects.length}`} delta={counts.unhealthy ? `${counts.unhealthy} need attention` : 'all probes passing'} deltaTone={counts.unhealthy ? 'down' : undefined} />
+                <Stat
+                    label="Healthy"
+                    value={counts.healthy}
+                    unit={` / ${projects.length}`}
+                    delta={
+                        counts.unhealthy
+                            ? `${counts.unhealthy} need attention`
+                            : counts.inactive
+                                ? `${counts.inactive} stopped or terminated`
+                                : 'all probes passing'
+                    }
+                    deltaTone={counts.unhealthy ? 'down' : undefined}
+                />
                 <Stat label="Deploying" value={counts.deploying} delta={counts.deploying ? 'builds or rollouts in progress' : 'no active deploys'} />
             </StatGrid>
 
@@ -135,7 +161,13 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
                 <SearchInput value={search} onChange={setSearch} placeholder="Filter projects…" style={{ flex: 1, maxWidth: 360 }} />
                 <Segmented<string>
                     value={statusFilter}
-                    options={[{ value: 'all', label: 'All' }, { value: 'healthy', label: 'Healthy' }, { value: 'deploying', label: 'Deploying' }, { value: 'unhealthy', label: 'Unhealthy' }]}
+                    options={[
+                        { value: 'all', label: 'All' },
+                        { value: 'healthy', label: 'Healthy' },
+                        { value: 'deploying', label: 'Deploying' },
+                        { value: 'unhealthy', label: 'Unhealthy' },
+                        { value: 'inactive', label: 'Inactive' },
+                    ]}
                     onChange={setStatusFilter}
                 />
                 {accessClasses.length > 0 && (
