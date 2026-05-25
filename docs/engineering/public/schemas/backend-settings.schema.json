@@ -831,6 +831,13 @@
               "description": "Snowflake user with CREATE INTEGRATION privilege",
               "type": "string"
             },
+            "verify_interval_seconds": {
+              "default": 3600,
+              "description": "How often (in seconds) to re-verify that the SECURITY INTEGRATION still\nexists in Snowflake once the extension is `Available`. The provisioner\nruns an inner 5s tick for transitional states, but `Available`\nextensions are only re-verified after this interval elapses. Default:\n3600 (1 hour). The metadata query used for the check (`SHOW\nINTEGRATIONS`) does not activate the configured warehouse, so a\nhealthy steady state lets Snowflake auto-suspend the warehouse.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
             "warehouse": {
               "default": null,
               "description": "Snowflake warehouse to use for queries\nRequired for executing SQL statements",

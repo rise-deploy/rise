@@ -940,6 +940,7 @@ impl AppState {
                     default_blocked_roles,
                     default_scopes,
                     refresh_token_validity_seconds,
+                    verify_interval_seconds,
                 } = provider_config
                 {
                     tracing::info!("Initializing Snowflake OAuth provisioner");
@@ -962,6 +963,7 @@ impl AppState {
                                 default_blocked_roles: default_blocked_roles.clone(),
                                 default_scopes: default_scopes.clone(),
                                 refresh_token_validity_seconds: *refresh_token_validity_seconds,
+                                verify_interval_seconds: *verify_interval_seconds,
                             },
                         );
 
