@@ -6,7 +6,7 @@ use crate::server::auth::{
         CompletedAuthSession, OAuth2State,
     },
 };
-use crate::server::frontend::load_static_file;
+use crate::server::frontend::load_auth_template;
 use crate::server::state::AppState;
 use axum::{
     extract::{Query, State},
@@ -17,7 +17,6 @@ use axum::{
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tera::Tera;
 use tracing::instrument;
 
 /// Build the project URL for the `aud` claim from the ingress URL template
@@ -771,34 +770,7 @@ pub async fn signin_page(
         )
     })?;
 
-    let template_content = load_static_file(static_dir, "auth-signin.html.tera")
-        .await
-        .ok_or_else(|| {
-            tracing::error!("auth-signin.html.tera template not found");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Template not found".to_string(),
-            )
-        })?;
-
-    let template_str = std::str::from_utf8(&template_content).map_err(|e| {
-        tracing::error!("Failed to parse template as UTF-8: {:#}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Template encoding error".to_string(),
-        )
-    })?;
-
-    // Create Tera instance and add template
-    let mut tera = Tera::default();
-    tera.add_raw_template("auth-signin.html.tera", template_str)
-        .map_err(|e| {
-            tracing::error!("Failed to parse template: {:#}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Template error".to_string(),
-            )
-        })?;
+    let tera = load_auth_template(static_dir, "auth-signin.html.tera").await?;
 
     // Determine if this is via `/.rise/auth` path (custom domain Ingress routing)
     let is_rise_path = uri.path().starts_with("/.rise/auth");
@@ -1310,34 +1282,7 @@ async fn render_success_page(
         )
     })?;
 
-    let template_content = load_static_file(static_dir, "auth-success.html.tera")
-        .await
-        .ok_or_else(|| {
-            tracing::error!("auth-success.html.tera template not found");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Template not found".to_string(),
-            )
-        })?;
-
-    let template_str = std::str::from_utf8(&template_content).map_err(|e| {
-        tracing::error!("Failed to parse template as UTF-8: {:#}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Template encoding error".to_string(),
-        )
-    })?;
-
-    // Create Tera instance and add template
-    let mut tera = Tera::default();
-    tera.add_raw_template("auth-success.html.tera", template_str)
-        .map_err(|e| {
-            tracing::error!("Failed to parse template: {:#}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Template error".to_string(),
-            )
-        })?;
+    let tera = load_auth_template(static_dir, "auth-success.html.tera").await?;
 
     // Render success template
     let mut context = tera::Context::new();
@@ -1379,34 +1324,7 @@ async fn render_ui_login_success_page(
         )
     })?;
 
-    let template_content = load_static_file(static_dir, "auth-ui-success.html.tera")
-        .await
-        .ok_or_else(|| {
-            tracing::error!("auth-ui-success.html.tera template not found");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Template not found".to_string(),
-            )
-        })?;
-
-    let template_str = std::str::from_utf8(&template_content).map_err(|e| {
-        tracing::error!("Failed to decode template: {:#}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Template encoding error".to_string(),
-        )
-    })?;
-
-    // Create Tera instance and add template
-    let mut tera = Tera::default();
-    tera.add_raw_template("auth-ui-success.html.tera", template_str)
-        .map_err(|e| {
-            tracing::error!("Failed to parse template: {:#}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Template error".to_string(),
-            )
-        })?;
+    let tera = load_auth_template(static_dir, "auth-ui-success.html.tera").await?;
 
     // Render success template
     let mut context = tera::Context::new();
@@ -1797,34 +1715,7 @@ pub async fn cli_auth_success(
         )
     })?;
 
-    let template_content = load_static_file(static_dir, "cli-auth-success.html.tera")
-        .await
-        .ok_or_else(|| {
-            tracing::error!("cli-auth-success.html.tera template not found");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Template not found".to_string(),
-            )
-        })?;
-
-    let template_str = std::str::from_utf8(&template_content).map_err(|e| {
-        tracing::error!("Failed to parse template as UTF-8: {:#}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Template encoding error".to_string(),
-        )
-    })?;
-
-    // Create Tera instance and add template
-    let mut tera = Tera::default();
-    tera.add_raw_template("cli-auth-success.html.tera", template_str)
-        .map_err(|e| {
-            tracing::error!("Failed to parse template: {:#}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Template error".to_string(),
-            )
-        })?;
+    let tera = load_auth_template(static_dir, "cli-auth-success.html.tera").await?;
 
     // Render success template
     let mut context = tera::Context::new();
