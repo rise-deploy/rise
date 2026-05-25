@@ -1,7 +1,6 @@
 import React from 'react';
 import { Palette, Density, PALETTES, DENSITIES, usePrefs } from '../lib/prefs';
-import { Avatar, Button, Field, KV, KVRow, Panel, PanelBody, PanelHead, Segmented, cx, colorFor } from '../components/r-ui';
-import { Icon } from '../components/icon';
+import { Avatar, Button, Field, KV, KVRow, Panel, PanelBody, PanelHead, Segmented, colorFor } from '../components/r-ui';
 
 interface ProfileProps {
     user: { email?: string; id?: string } | null;

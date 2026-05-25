@@ -189,7 +189,10 @@ The frontend exposes a small set of reusable tag-like components from `frontend/
 | Component | Style | Purpose |
 |---|---|---|
 | **`Status`** (from `r-ui`) | Dot + label | Deployment/project lifecycle status (Running, Failed, Stopped, …) |
-| **`Pill`** (from `r-ui`) | Bordered, colored bg | Environment / accent labels and other state indicators |
+| **`Pill`** (from `r-ui`) | Bordered, colored bg | Accent labels via `kind="accent"`, env labels via `kind="env-*"` |
+| **`BasePill`** (from `r-ui`) | Icon + name pill | Generic two-cell pill — building block for `EnvPill` / `GroupPill` |
+| **`EnvPill`** (from `r-ui`) | Color dot + env name | Environment chip; pairs with `EnvironmentColorDot` |
+| **`GroupPill`** (from `r-ui`) | Layer glyph + group name | Group chip |
 | **`EnvironmentColorDot`** (from `r-ui`) | Tinted layer glyph | Placed next to environment names to indicate color |
 
 ### Before Commit & Push

@@ -4,7 +4,7 @@ import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
 import { formatISO8601, formatRelativeTimeRounded, isSafeUrl, stripUrlScheme } from '../lib/utils';
 import { useToast } from '../components/toast';
-import { Button, ConfirmDialog, Empty, EnvPill, EnvironmentColorDot, KV, KVRow, Modal, Panel, PanelBody, PanelHead, Pill, SourceLinkGroup, Status, Tabs, cx } from '../components/r-ui';
+import { Button, ConfirmDialog, Empty, EnvPill, KV, KVRow, Panel, PanelBody, PanelHead, Pill, SourceLinkGroup, Status, Tabs } from '../components/r-ui';
 import { Icon } from '../components/icon';
 import { LoadingState, ErrorState, EmptyState } from '../components/states';
 

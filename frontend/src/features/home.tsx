@@ -2,7 +2,7 @@
 import React, { useEffect, useState } from 'react';
 import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
-import { Button, EnvPill, Panel, PanelBody, PanelHead, Stat, StatGrid, Status, cx, colorFor, Avatar } from '../components/r-ui';
+import { Button, Panel, PanelBody, PanelHead, Stat, StatGrid, Status, colorFor, Avatar } from '../components/r-ui';
 import { LoadingState, ErrorState } from '../components/states';
 import { formatRelativeTimeRounded } from '../lib/utils';
 
