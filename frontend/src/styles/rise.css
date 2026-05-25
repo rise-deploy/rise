@@ -822,6 +822,12 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
     padding: 1px 8px;
     color: var(--text-muted);
 }
+.r-group-pill.primary .r-group-pill-icon {
+    background: var(--accent-soft);
+    color: var(--accent);
+    border-right-color: var(--accent-soft);
+}
+.r-group-pill.primary .r-group-pill-name { color: var(--text); }
 [data-density="compact"] .r-group-pill { font-size: 11px; }
 [data-density="compact"] .r-group-pill-icon { padding: 0 5px; }
 [data-density="compact"] .r-group-pill-name { padding: 0 7px; }

@@ -44,11 +44,17 @@ export function EnvPill({ env, color }: { env: string; color?: string }) {
 }
 
 // Two-tone chip mirroring EnvPill but for deployment groups. Groups don't
-// have a per-group color, so the icon cell stays neutral; the name renders in
-// mono since groups are technical identifiers (branch names, PR slugs).
-export function GroupPill({ group }: { group: string }) {
+// have a per-group color, so the icon cell stays neutral by default and turns
+// accent-tinted when `primary` is set — the icon section carries the
+// "highlighted" signal the way EnvPill's icon carries the env color. The name
+// renders in mono since groups are technical identifiers (branch names, PR
+// slugs, 'default').
+export function GroupPill({ group, primary }: { group: string; primary?: boolean }) {
     return (
-        <span className="r-group-pill">
+        <span
+            className={cx('r-group-pill', primary && 'primary')}
+            title={primary ? 'Primary group for this environment' : undefined}
+        >
             <span className="r-group-pill-icon" aria-hidden>
                 <Icon name="branch" size={11} />
             </span>
