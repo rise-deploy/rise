@@ -229,7 +229,7 @@ export function ActiveDeploymentsSummary({ projectName }) {
                             {deployment.environment && (
                                 <div>
                                     <dt className="text-gray-600 dark:text-gray-400">Environment</dt>
-                                    <dd className="text-gray-900 dark:text-gray-200 flex items-center gap-2"><EnvironmentColorDot color={deployment.environment_color} />{deployment.environment}</dd>
+                                    <dd><EnvPill env={deployment.environment} color={deployment.environment_color} /></dd>
                                 </div>
                             )}
                             {deployment.expires_at && (
@@ -521,10 +521,7 @@ export function DeploymentsList({ projectName }) {
                                     <td><Status status={d.status} /></td>
                                     <td>
                                         {d.environment ? (
-                                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                                                <EnvironmentColorDot color={d.environment_color} />
-                                                {d.environment}
-                                            </span>
+                                            <EnvPill env={d.environment} color={d.environment_color} />
                                         ) : <span style={{ color: 'var(--text-soft)' }}>—</span>}
                                     </td>
                                     <td className="mono" style={{ fontSize: 12.5 }}>{d.deployment_group}</td>

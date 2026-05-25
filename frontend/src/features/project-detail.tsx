@@ -4,9 +4,8 @@ import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
 import { copyToClipboard, formatISO8601, formatRelativeTimeRounded, isSafeUrl, stripUrlScheme } from '../lib/utils';
 import { useToast } from '../components/toast';
-import { Button, ConfirmDialog, Empty, KV, KVRow, Modal, Panel, PanelBody, PanelHead, Pill, Status, Tabs, Tooltip, cx } from '../components/r-ui';
+import { Button, ConfirmDialog, Empty, EnvPill, EnvironmentColorDot, KV, KVRow, Modal, Panel, PanelBody, PanelHead, Pill, Status, Tabs, Tooltip, cx } from '../components/r-ui';
 import { Icon } from '../components/icon';
-import { EnvironmentColorDot } from '../components/r-ui';
 import { LoadingState, ErrorState, EmptyState } from '../components/states';
 
 import { DeploymentsList } from './deployments';
@@ -298,10 +297,7 @@ function RecentDeploymentsPanel({ projectName }: { projectName: string }) {
                                 <td><Status status={d.status || 'Unknown'} /></td>
                                 <td>
                                     {d.environment ? (
-                                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                                            <EnvironmentColorDot color={d.environment_color} size="0.5rem" />
-                                            {d.environment}
-                                        </span>
+                                        <EnvPill env={d.environment} color={d.environment_color} />
                                     ) : <span style={{ color: 'var(--text-soft)' }}>—</span>}
                                 </td>
                                 <td style={{ textAlign: 'right', color: 'var(--text-muted)' }}>
@@ -450,9 +446,8 @@ function ProjectOverview({ project, projectName, accessLabel, environments, onCo
                             <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
                                 {environments.map(env => (
                                     <div key={env.name} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
-                                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 13.5, fontWeight: 500 }}>
-                                            <EnvironmentColorDot color={env.color} size="0.6rem" />
-                                            {env.name}
+                                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                                            <EnvPill env={env.name} color={env.color} />
                                             {env.is_production && env.name !== 'production' && (
                                                 <Pill kind="env-prod">production</Pill>
                                             )}
