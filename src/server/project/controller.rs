@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::db::models::DeploymentStatus;
 use crate::db::{
     deployments as db_deployments, extensions as db_extensions, leader_leases::LeaderElection,
-    projects as db_projects,
+    leader_schedules::GlobalSchedule, projects as db_projects,
 };
 use crate::server::deployment::state_machine;
 use crate::server::state::ControllerState;
@@ -22,22 +22,30 @@ pub struct ProjectController {
     deletion_interval: Duration,
     cleanup_tick: AtomicU64,
     election: LeaderElection,
+    deletion_schedule: GlobalSchedule,
 }
 
 impl ProjectController {
     /// Create a new project controller
     pub fn new(state: Arc<ControllerState>) -> Self {
+        let deletion_interval = Duration::from_secs(5);
         let election = LeaderElection::spawn(
             state.db_pool.clone(),
             "rise-project-controller",
             Uuid::new_v4(),
             Duration::from_secs(60),
         );
+        let deletion_schedule = GlobalSchedule::new(
+            state.db_pool.clone(),
+            "rise-project-deletion",
+            deletion_interval,
+        );
         Self {
             state,
-            deletion_interval: Duration::from_secs(5),
+            deletion_interval,
             cleanup_tick: AtomicU64::new(1),
             election,
+            deletion_schedule,
         }
     }
 
@@ -64,6 +72,19 @@ impl ProjectController {
             ticker.tick().await;
 
             if !self.election.is_leader() {
+                continue;
+            }
+
+            // Global cadence gate: ensures the new leader's first deletion
+            // pass after a transition waits the full interval since the
+            // previous leader's last pass. `_as_leader` re-verifies
+            // leadership against the DB (fast-path on the cached lease
+            // horizon) before the schedule UPSERT — see `GlobalSchedule` docs.
+            if !self
+                .deletion_schedule
+                .try_claim_or_skip_as_leader("project deletion", &self.election)
+                .await
+            {
                 continue;
             }
 
