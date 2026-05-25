@@ -60,6 +60,12 @@ pub struct AppState {
     /// without a network round-trip.
     #[cfg(feature = "backend")]
     pub resource_store: Arc<dyn rise_resource_store::ResourceStore>,
+    /// Resource UID of the default Organization. Populated by the bootstrap
+    /// pass at startup; typed APIs use this to stamp newly created
+    /// users/teams/projects with the configured default Organization.
+    #[cfg(feature = "backend")]
+    #[allow(dead_code)]
+    pub default_organization_uid: uuid::Uuid,
     pub auth_settings: Arc<AuthSettings>,
     pub server_settings: Arc<ServerSettings>,
     pub token_store: Arc<dyn TokenStore>,
@@ -268,6 +274,16 @@ impl AppState {
         #[cfg(feature = "backend")]
         let resource_store: Arc<dyn rise_resource_store::ResourceStore> =
             Arc::new(rise_resource_store::PgResourceStore::new(db_pool.clone()));
+
+        // Run default-Organization bootstrap. Must complete before
+        // controllers begin processing typed projects, so we await it before
+        // the rest of AppState comes up.
+        #[cfg(feature = "backend")]
+        let bootstrap_outcome = crate::server::bootstrap::run(&db_pool, &resource_store, settings)
+            .await
+            .context("Default-Organization bootstrap failed")?;
+        #[cfg(feature = "backend")]
+        let default_organization_uid = bootstrap_outcome.default_organization_uid;
 
         // Initialize JWT validator (JWKS is fetched on-demand)
         let jwt_validator = Arc::new(JwtValidator::new(settings.server.ssrf.clone()));
@@ -1055,6 +1071,8 @@ impl AppState {
             controllers_by_issuer,
             #[cfg(feature = "backend")]
             resource_store,
+            #[cfg(feature = "backend")]
+            default_organization_uid,
             auth_settings,
             server_settings,
             token_store,

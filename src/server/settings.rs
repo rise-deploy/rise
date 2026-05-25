@@ -24,6 +24,68 @@ pub struct Settings {
     /// always on when the `backend` feature is enabled.
     #[serde(default)]
     pub resource_gc: Option<ResourceGcSettings>,
+    /// Default Organization that owns existing typed data (users, teams,
+    /// projects) until org-aware multi-tenancy lands. Bootstrap creates this
+    /// Organization (under an advisory lock) before any backfill runs, so it
+    /// is guaranteed to exist by the time controllers begin processing
+    /// projects. Omitting the section accepts the documented defaults:
+    /// name="default", display name="Default", namespace prefix="rise-".
+    #[serde(default)]
+    pub default_organization: DefaultOrganizationSettings,
+}
+
+/// Configuration for the bootstrapped default Organization resource.
+///
+/// The `name` and `display_name` fields populate the Organization's metadata
+/// and spec respectively. `kubernetes_namespace_prefix`, when set, is written
+/// to the `kubernetes.rise.dev/namespace-prefix` annotation. Unrelated
+/// annotations on an existing default Organization are preserved across
+/// bootstrap runs.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct DefaultOrganizationSettings {
+    /// Resource name of the default Organization (DNS-label form). Default:
+    /// `default`.
+    #[serde(default = "default_default_organization_name")]
+    pub name: String,
+    /// Human-readable display name stored in `spec.displayName`. Default:
+    /// `Default`.
+    #[serde(default = "default_default_organization_display_name")]
+    pub display_name: String,
+    /// Extra annotations to apply to the Organization's metadata. The
+    /// `kubernetes.rise.dev/namespace-prefix` annotation is managed
+    /// separately by `kubernetes_namespace_prefix` and overrides any entry
+    /// with the same key set here.
+    #[serde(default)]
+    pub annotations: std::collections::BTreeMap<String, String>,
+    /// Value for the `kubernetes.rise.dev/namespace-prefix` annotation. When
+    /// `None`, the default (`rise-`) is used to preserve the existing
+    /// `rise-{project_name}` namespace naming for installs that previously
+    /// relied on the historic default.
+    #[serde(default)]
+    pub kubernetes_namespace_prefix: Option<String>,
+}
+
+impl Default for DefaultOrganizationSettings {
+    fn default() -> Self {
+        Self {
+            name: default_default_organization_name(),
+            display_name: default_default_organization_display_name(),
+            annotations: std::collections::BTreeMap::new(),
+            kubernetes_namespace_prefix: None,
+        }
+    }
+}
+
+impl DefaultOrganizationSettings {
+    /// Resolve the namespace prefix that should appear on the Organization's
+    /// `kubernetes.rise.dev/namespace-prefix` annotation. Falls back to the
+    /// historic default (`rise-`) when nothing is configured so existing
+    /// installs keep their namespace names.
+    pub fn resolved_namespace_prefix(&self) -> String {
+        self.kubernetes_namespace_prefix
+            .clone()
+            .unwrap_or_else(default_default_organization_namespace_prefix)
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, JsonSchema)]
@@ -311,6 +373,22 @@ fn default_ingress_schema() -> String {
 
 fn default_namespace_format() -> String {
     "rise-{project_name}".to_string()
+}
+
+fn default_controller_class_name() -> String {
+    "kubernetes.rise.dev/default".to_string()
+}
+
+fn default_default_organization_name() -> String {
+    "default".to_string()
+}
+
+fn default_default_organization_display_name() -> String {
+    "Default".to_string()
+}
+
+fn default_default_organization_namespace_prefix() -> String {
+    "rise-".to_string()
 }
 
 fn default_node_selector() -> std::collections::HashMap<String, String> {
@@ -662,6 +740,15 @@ pub enum DeploymentControllerSettings {
         /// Defaults to "rise-{project_name}"
         #[serde(default = "default_namespace_format")]
         namespace_format: String,
+
+        /// Stable identifier for this deployment controller, written to the
+        /// default Organization's `spec.deploymentControllerClass` at startup.
+        /// The Kubernetes controller only reconciles projects whose
+        /// Organization's `spec.deploymentControllerClass` matches this value.
+        /// Defaults to `kubernetes.rise.dev/default` to keep existing installs
+        /// working without explicit configuration.
+        #[serde(default = "default_controller_class_name")]
+        controller_class_name: String,
 
         /// Labels to apply to all managed namespaces
         /// Example: {"environment": "production", "team": "platform"}

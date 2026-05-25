@@ -7,6 +7,7 @@ pub mod leader_leases;
 pub mod leader_schedules;
 pub mod models;
 pub mod oauth_transient_state;
+pub mod organization_links;
 pub mod postgres_admin;
 pub mod project_app_users;
 pub mod projects;
