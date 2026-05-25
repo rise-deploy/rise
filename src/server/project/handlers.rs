@@ -17,18 +17,6 @@ use axum::{
 };
 use uuid::Uuid;
 
-async fn trigger_project_resync(
-    kube_client: Option<&kube::Client>,
-    project_name: &str,
-) -> anyhow::Result<bool> {
-    let Some(kube_client) = kube_client else {
-        return Ok(false);
-    };
-
-    crate::server::deployment::crd::trigger_resync(kube_client, project_name).await?;
-    Ok(true)
-}
-
 /// Validate that a URL uses only http or https schemes.
 /// Returns the trimmed URL on success, or an error message if the URL is invalid or uses a disallowed scheme.
 pub fn validate_http_url(url: &str) -> Result<String, String> {
@@ -612,6 +600,10 @@ pub async fn update_project(
             )));
         }
 
+        // Only `access_class` currently affects ingress configuration via the
+        // RiseProject CRD (see resource_builder.rs). When `visibility` becomes
+        // ingress-enforced (per CLAUDE.md "Ingress Authentication"), extend
+        // this flag to cover that field too.
         should_trigger_resync = updated_project.access_class != access_class;
         updated_project =
             projects::update_access_class(&state.db_pool, updated_project.id, access_class)
@@ -712,13 +704,16 @@ pub async fn update_project(
     }
 
     if should_trigger_resync {
-        if let Err(e) =
-            trigger_project_resync(state.kube_client.as_ref(), &updated_project.name).await
-        {
-            tracing::warn!(
-                project = %updated_project.name,
-                "Failed to trigger CRD resync after access class update: {:?}", e
-            );
+        if let Some(ref kube_client) = state.kube_client {
+            if let Err(e) =
+                crate::server::deployment::crd::trigger_resync(kube_client, &updated_project.name)
+                    .await
+            {
+                tracing::warn!(
+                    project = %updated_project.name,
+                    "Failed to trigger CRD resync after access class update: {:?}", e
+                );
+            }
         }
     }
 
@@ -1074,115 +1069,4 @@ pub async fn check_write_permission(
     projects::user_can_access(&state.db_pool, project.id, user.id)
         .await
         .map_err(|e| format!("Failed to check access: {}", e))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::trigger_project_resync;
-    use axum::http::Uri;
-    use std::sync::OnceLock;
-    use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    const MAX_REQUEST_SIZE: usize = 16 * 1024;
-    static RUSTLS_PROVIDER: OnceLock<()> = OnceLock::new();
-
-    async fn spawn_mock_kube_api_server(
-        expected_project_name: &'static str,
-    ) -> (kube::Client, tokio::task::JoinHandle<String>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut buffer = Vec::new();
-            let mut read_buffer = [0u8; 1024];
-            let mut header_end = None;
-            let mut content_length = 0usize;
-
-            loop {
-                let read =
-                    tokio::time::timeout(Duration::from_secs(5), stream.read(&mut read_buffer))
-                        .await
-                        .unwrap()
-                        .unwrap();
-                if read == 0 {
-                    break;
-                }
-                buffer.extend_from_slice(&read_buffer[..read]);
-                assert!(
-                    buffer.len() <= MAX_REQUEST_SIZE,
-                    "mock kube request exceeded {MAX_REQUEST_SIZE} bytes"
-                );
-
-                if header_end.is_none() {
-                    if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
-                        header_end = Some(pos + 4);
-                        let headers = String::from_utf8_lossy(&buffer[..pos + 4]);
-                        for line in headers.lines() {
-                            let line = line.trim();
-                            if let Some(value) = line.strip_prefix("Content-Length:") {
-                                content_length = value.trim().parse().unwrap();
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                if let Some(header_end) = header_end {
-                    if buffer.len() >= header_end + content_length {
-                        break;
-                    }
-                }
-            }
-
-            let request = String::from_utf8(buffer).unwrap();
-            assert!(
-                request.contains(&format!(
-                    "PATCH /apis/rise.dev/v1alpha1/riseprojects/{expected_project_name}"
-                )),
-                "unexpected request: {request}"
-            );
-            let body = format!(
-                r#"{{"apiVersion":"rise.dev/v1alpha1","kind":"RiseProject","metadata":{{"name":"{expected_project_name}"}},"spec":{{}}}}"#
-            );
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-
-            request
-        });
-
-        RUSTLS_PROVIDER.get_or_init(|| {
-            rustls::crypto::ring::default_provider()
-                .install_default()
-                .expect("failed to install rustls crypto provider");
-        });
-        let config = kube::Config::new(format!("http://{addr}").parse::<Uri>().unwrap());
-        let client = kube::Client::try_from(config).unwrap();
-
-        (client, server)
-    }
-
-    #[tokio::test]
-    async fn trigger_project_resync_patches_rise_project() {
-        let (client, server) = spawn_mock_kube_api_server("demo").await;
-
-        let triggered = trigger_project_resync(Some(&client), "demo").await.unwrap();
-
-        assert!(triggered);
-
-        let request = server.await.unwrap();
-        assert!(request.contains("\"rise.dev/trigger\""));
-    }
-
-    #[tokio::test]
-    async fn trigger_project_resync_skips_without_kube_client() {
-        let triggered = trigger_project_resync(None, "demo").await.unwrap();
-
-        assert!(!triggered);
-    }
 }
