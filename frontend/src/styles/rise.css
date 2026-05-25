@@ -746,7 +746,8 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
     align-items: center;
     gap: 6px;
     padding: 2px 8px;
-    font-size: 11.5px;
+    font-size: 11.75px;
+    line-height: 1.45;
     background: var(--surface-2);
     border: 1px solid var(--border-faint);
     border-radius: 4px;
@@ -758,14 +759,17 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
 .r-pill.accent { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
 
 /* ---------- Env pill (two-tone: colored icon | neutral name) ---------- */
+/* Sized to match .r-status and .r-pill: 11.75/1.45 + 2px y-padding + 1px border
+   each side gives the same total box height as the borderless 2px-padded
+   status pill, so all three chip families line up in tables and meta rows. */
 .r-env-pill {
     display: inline-flex;
     align-items: stretch;
     border: 1px solid var(--border-faint);
     border-radius: 4px;
     overflow: hidden;
-    font-size: 11.5px;
-    line-height: 1;
+    font-size: 11.75px;
+    line-height: 1.45;
     background: var(--surface);
     white-space: nowrap;
     vertical-align: middle;
@@ -774,7 +778,7 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    padding: 3px 6px;
+    padding: 1px 6px;
     background: var(--surface-2);
     color: var(--text-soft);
     border-right: 1px solid var(--border-faint);
@@ -782,13 +786,13 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
 .r-env-pill-name {
     display: inline-flex;
     align-items: center;
-    padding: 3px 8px;
+    padding: 1px 8px;
     color: var(--text-muted);
     font-weight: 500;
 }
 [data-density="compact"] .r-env-pill { font-size: 11px; }
-[data-density="compact"] .r-env-pill-icon { padding: 2px 5px; }
-[data-density="compact"] .r-env-pill-name { padding: 2px 7px; }
+[data-density="compact"] .r-env-pill-icon { padding: 0 5px; }
+[data-density="compact"] .r-env-pill-name { padding: 0 7px; }
 
 /* ---------- Status ---------- */
 .r-status {
