@@ -1847,6 +1847,15 @@ pub enum ExtensionProviderConfig {
         /// Refresh token validity in seconds (default: 7776000 = 90 days)
         #[serde(default = "default_refresh_token_validity_seconds")]
         refresh_token_validity_seconds: i64,
+        /// How often (in seconds) to re-verify that the SECURITY INTEGRATION still
+        /// exists in Snowflake once the extension is `Available`. The provisioner
+        /// runs an inner 5s tick for transitional states, but `Available`
+        /// extensions are only re-verified after this interval elapses. Default:
+        /// 3600 (1 hour). The metadata query used for the check (`SHOW
+        /// INTEGRATIONS`) does not activate the configured warehouse, so a
+        /// healthy steady state lets Snowflake auto-suspend the warehouse.
+        #[serde(default = "default_snowflake_verify_interval_seconds")]
+        verify_interval_seconds: u64,
     },
 }
 
@@ -1902,6 +1911,11 @@ fn default_scopes() -> Vec<String> {
 #[allow(dead_code)]
 fn default_refresh_token_validity_seconds() -> i64 {
     7776000 // 90 days
+}
+
+#[allow(dead_code)]
+fn default_snowflake_verify_interval_seconds() -> u64 {
+    3600 // 1 hour
 }
 
 /// Platform access control configuration

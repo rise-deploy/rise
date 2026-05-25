@@ -16,7 +16,6 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-#[cfg(feature = "backend")]
 use snowflake_connector_rs::{SnowflakeAuthMethod, SnowflakeClient, SnowflakeClientConfig};
 
 /// User-facing extension spec - minimal configuration
@@ -65,6 +64,12 @@ pub struct SnowflakeOAuthProvisionerStatus {
     /// Timestamp when the integration was created
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<DateTime<Utc>>,
+
+    /// Last time the Snowflake integration was successfully re-verified while
+    /// `Available`. Used to throttle the drift check to
+    /// `verify_interval_seconds` so the reconciler does not hammer Snowflake.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_verified_at: Option<DateTime<Utc>>,
 }
 
 /// State machine for Snowflake OAuth provisioning lifecycle
@@ -108,6 +113,7 @@ pub struct SnowflakeOAuthProvisionerConfig {
     pub default_blocked_roles: Vec<String>,
     pub default_scopes: Vec<String>,
     pub refresh_token_validity_seconds: i64,
+    pub verify_interval_seconds: u64,
 }
 
 /// Main Snowflake OAuth provisioner implementation
@@ -128,6 +134,7 @@ pub struct SnowflakeOAuthProvisioner {
     default_blocked_roles: Vec<String>,
     default_scopes: Vec<String>,
     refresh_token_validity_seconds: i64,
+    verify_interval_seconds: u64,
 }
 
 impl Clone for SnowflakeOAuthProvisioner {
@@ -147,6 +154,7 @@ impl Clone for SnowflakeOAuthProvisioner {
             default_blocked_roles: self.default_blocked_roles.clone(),
             default_scopes: self.default_scopes.clone(),
             refresh_token_validity_seconds: self.refresh_token_validity_seconds,
+            verify_interval_seconds: self.verify_interval_seconds,
         }
     }
 }
@@ -192,6 +200,7 @@ impl SnowflakeOAuthProvisioner {
             default_blocked_roles: config.default_blocked_roles,
             default_scopes: config.default_scopes,
             refresh_token_validity_seconds: config.refresh_token_validity_seconds,
+            verify_interval_seconds: config.verify_interval_seconds,
         }
     }
 
@@ -308,7 +317,6 @@ impl SnowflakeOAuthProvisioner {
     }
 
     /// Create Snowflake client using configured credentials
-    #[cfg(feature = "backend")]
     fn create_snowflake_client(&self) -> Result<SnowflakeClient> {
         let auth_method = match &self.auth {
             SnowflakeAuth::Password { password } => SnowflakeAuthMethod::Password(password.clone()),
@@ -424,29 +432,42 @@ impl SnowflakeOAuthProvisioner {
         Ok(client)
     }
 
-    /// Execute SQL statement on Snowflake
-    #[cfg(feature = "backend")]
+    /// Execute SQL statement on Snowflake using the configured warehouse.
     async fn execute_sql(&self, sql: &str) -> Result<Vec<Value>> {
+        self.execute_sql_inner(sql, true).await
+    }
+
+    /// Execute a metadata-only SQL statement on Snowflake without activating a
+    /// warehouse. Use for `SHOW`/`DESCRIBE`-style queries that the Snowflake
+    /// query engine can answer from metadata alone — avoids waking the
+    /// warehouse on the steady-state drift check.
+    async fn execute_metadata_sql(&self, sql: &str) -> Result<Vec<Value>> {
+        self.execute_sql_inner(sql, false).await
+    }
+
+    async fn execute_sql_inner(&self, sql: &str, use_warehouse: bool) -> Result<Vec<Value>> {
         let client = self.create_snowflake_client()?;
         let session = client
             .create_session()
             .await
             .context("Failed to create Snowflake session")?;
 
-        // Explicitly set warehouse if configured
-        // The warehouse field in SnowflakeClientConfig might not automatically apply to sessions
-        if let Some(ref warehouse) = self.warehouse {
-            debug!("Setting warehouse for session: {}", warehouse);
-            let use_warehouse_sql =
-                format!("USE WAREHOUSE {}", Self::escape_identifier(warehouse)?);
-            debug!("Executing: {}", use_warehouse_sql);
-            session
-                .query(use_warehouse_sql.as_str())
-                .await
-                .context("Failed to set warehouse for session")?;
-            debug!("Warehouse set successfully");
-        } else {
-            debug!("No warehouse configured - session will have no active warehouse");
+        // Only attach a warehouse when the caller's query actually needs one.
+        // Metadata-only queries skip this to let the warehouse auto-suspend.
+        if use_warehouse {
+            if let Some(ref warehouse) = self.warehouse {
+                debug!("Setting warehouse for session: {}", warehouse);
+                let use_warehouse_sql =
+                    format!("USE WAREHOUSE {}", Self::escape_identifier(warehouse)?);
+                debug!("Executing: {}", use_warehouse_sql);
+                session
+                    .query(use_warehouse_sql.as_str())
+                    .await
+                    .context("Failed to set warehouse for session")?;
+                debug!("Warehouse set successfully");
+            } else {
+                debug!("No warehouse configured - session will have no active warehouse");
+            }
         }
 
         let rows = session
@@ -508,14 +529,6 @@ impl SnowflakeOAuthProvisioner {
             .collect();
 
         Ok(json_rows)
-    }
-
-    /// Stub for when snowflake feature is not enabled
-    #[cfg(not(feature = "backend"))]
-    async fn execute_sql(&self, _sql: &str) -> Result<Vec<Value>> {
-        Err(anyhow!(
-            "Snowflake feature not enabled. Rebuild with --features snowflake"
-        ))
     }
 
     /// Handle Pending state: generate names and add finalizer
@@ -814,6 +827,7 @@ impl SnowflakeOAuthProvisioner {
                     oauth_extension_name
                 );
                 status.state = SnowflakeOAuthState::Available;
+                status.last_verified_at = Some(Utc::now());
                 return Ok(());
             } else {
                 // Extension exists but is marked for deletion
@@ -901,6 +915,7 @@ impl SnowflakeOAuthProvisioner {
 
         status.state = SnowflakeOAuthState::Available;
         status.error = None;
+        status.last_verified_at = Some(Utc::now());
 
         Ok(())
     }
@@ -919,11 +934,13 @@ impl SnowflakeOAuthProvisioner {
             .as_ref()
             .ok_or_else(|| anyhow!("Integration name not set"))?;
 
-        // Check if integration still exists with proper escaping
+        // Check if integration still exists with proper escaping.
+        // SHOW INTEGRATIONS is metadata-only, so we use the no-warehouse path
+        // — keeps the warehouse suspended during steady-state drift checks.
         let integration_name_escaped = Self::escape_string_literal(integration_name);
         let sql = format!("SHOW INTEGRATIONS LIKE '{}'", integration_name_escaped);
 
-        match self.execute_sql(&sql).await {
+        match self.execute_metadata_sql(&sql).await {
             Ok(rows) => {
                 if rows.is_empty() {
                     warn!(
@@ -1199,6 +1216,21 @@ impl SnowflakeOAuthProvisioner {
                 .await?;
             }
             SnowflakeOAuthState::Available => {
+                // Throttle the drift check: once Available, we only re-verify
+                // against Snowflake every `verify_interval_seconds`. Otherwise
+                // the inner 5s tick would issue `SHOW INTEGRATIONS` constantly
+                // and (via the warehouse session) prevent auto-suspend.
+                //
+                // Compare elapsed in seconds (u64) to avoid any cast/overflow
+                // when building a `chrono::Duration` from the configured value.
+                let due = status.last_verified_at.is_none_or(|last| {
+                    let elapsed_secs = (Utc::now() - last).num_seconds();
+                    elapsed_secs >= 0 && (elapsed_secs as u64) >= self.verify_interval_seconds
+                });
+                if !due {
+                    return Ok(false);
+                }
+
                 self.verify_integration_available(
                     &mut status,
                     project.id,
@@ -1207,6 +1239,11 @@ impl SnowflakeOAuthProvisioner {
                     &spec,
                 )
                 .await?;
+
+                // Stamp regardless of the inner result: transient Snowflake
+                // errors are intentionally swallowed inside the helper, and we
+                // don't want a flaky `SHOW INTEGRATIONS` to defeat the throttle.
+                status.last_verified_at = Some(Utc::now());
             }
             SnowflakeOAuthState::Failed => {
                 // Stay in Failed state - don't retry automatically
