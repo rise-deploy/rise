@@ -53,6 +53,7 @@ export default defineConfig({
           items: [
             { label: 'Authentication', slug: 'user-guide/authentication' },
             { label: 'Service Accounts', slug: 'user-guide/service-accounts' },
+            { label: 'Workload Identity Tokens', slug: 'user-guide/workload-identity-tokens' },
             {
               label: 'Authentication for Applications',
               items: [

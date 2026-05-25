@@ -161,7 +161,7 @@ class RiseAPI {
 
     // Service account endpoints
     async getProjectServiceAccounts(projectName) {
-        return this.request(`/projects/${projectName}/workload-identities`);
+        return this.request(`/projects/${projectName}/service-accounts`);
     }
 
     async createServiceAccount(projectName, issuerUrl, claims, allowedEnvironments = null) {
@@ -169,7 +169,7 @@ class RiseAPI {
         if (allowedEnvironments !== null) {
             body.allowed_environments = allowedEnvironments;
         }
-        return this.request(`/projects/${projectName}/workload-identities`, {
+        return this.request(`/projects/${projectName}/service-accounts`, {
             method: 'POST',
             body: JSON.stringify(body)
         });
@@ -180,14 +180,14 @@ class RiseAPI {
         if (allowedEnvironments !== undefined) {
             body.allowed_environments = allowedEnvironments;
         }
-        return this.request(`/projects/${projectName}/workload-identities/${saId}`, {
+        return this.request(`/projects/${projectName}/service-accounts/${saId}`, {
             method: 'PUT',
             body: JSON.stringify(body)
         });
     }
 
     async deleteServiceAccount(projectName, saId) {
-        return this.request(`/projects/${projectName}/workload-identities/${saId}`, {
+        return this.request(`/projects/${projectName}/service-accounts/${saId}`, {
             method: 'DELETE'
         });
     }

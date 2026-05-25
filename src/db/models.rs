@@ -160,12 +160,19 @@ pub struct Deployment {
     pub job_url: Option<String>,
     /// URL to the pull request/merge request associated with this deployment
     pub pull_request_url: Option<String>,
+    /// HTTPS URL of the Git repository this deployment was created from
+    pub git_repository_url: Option<String>,
     /// Number of replicas for this deployment
     pub replicas: i32,
     /// CPU allocation (e.g., "500m", "1")
     pub cpu: String,
     /// Memory allocation (e.g., "256Mi", "1Gi")
     pub memory: String,
+    /// SHA-256 hash of the per-deployment workload-identity bootstrap credential.
+    /// NULL until the controller has reconciled the deployment.
+    pub identity_credential_hash: Option<String>,
+    /// Map of { in-pod filename -> token audience } for auto-minted workload JWTs.
+    pub identity_audiences: serde_json::Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

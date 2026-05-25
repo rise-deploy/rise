@@ -100,6 +100,8 @@ pub struct Deployment {
     pub job_url: Option<String>, // URL to the CI pipeline/job that created this deployment
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pull_request_url: Option<String>, // URL to the PR/MR associated with this deployment
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_repository_url: Option<String>, // HTTPS URL of the Git repository this deployment was created from
     #[serde(default)]
     pub created: String,
     #[serde(default)]
@@ -251,6 +253,9 @@ pub struct CreateDeploymentRequest {
     /// URL to the pull request/merge request associated with this deployment. Auto-detected from CI environment if not provided.
     #[serde(default)]
     pub pull_request_url: Option<String>,
+    /// HTTPS URL of the Git repository this deployment was created from. Auto-detected from CI environment or the local git remote if not provided.
+    #[serde(default)]
+    pub git_repository_url: Option<String>,
     /// Number of replicas (overrides rise.toml and platform defaults)
     #[serde(default)]
     pub replicas: Option<u32>,
@@ -260,6 +265,11 @@ pub struct CreateDeploymentRequest {
     /// Memory allocation (e.g., "256Mi", "1Gi") — overrides rise.toml and platform defaults
     #[serde(default)]
     pub memory: Option<String>,
+    /// Workload-identity token audiences from `[identity]` in rise.toml.
+    /// Map of { in-pod filename -> token audience }. On redeploy without an
+    /// explicit value, inherited from the source deployment.
+    #[serde(default)]
+    pub identity_audiences: Option<std::collections::BTreeMap<String, String>>,
 }
 
 // Response from creating a deployment

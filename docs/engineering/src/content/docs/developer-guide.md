@@ -23,6 +23,18 @@ cargo sqlx prepare --check      # Verify cache matches current schema (run in CI
 
 Regenerate after adding migrations or changing SQL queries. See the [CLAUDE.md](../../../../CLAUDE.md) for when to run this.
 
+### DATABASE_URL at Compile Time
+
+`DATABASE_URL` must be set when running `cargo sqlx prepare` (or any `cargo build` that invokes `sqlx::query!` macros without an up-to-date `.sqlx/` cache). It must point to a running PostgreSQL instance with all migrations applied so SQLX can verify queries against the schema.
+
+```bash
+export DATABASE_URL="postgres://postgres:postgres@localhost:5432/rise"
+sqlx migrate run          # ensure migrations are applied
+cargo sqlx prepare        # regenerate the .sqlx/ cache
+```
+
+At **runtime** the database URL comes from `settings.database.url` (resolved from the config file, with `DATABASE_URL` as a fallback). See [Configuration](./configuration.md) for the full precedence rules.
+
 ### Writing Queries
 
 Use the `sqlx::query!` macro for compile-time verification of syntax, types, and columns.

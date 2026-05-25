@@ -73,19 +73,22 @@ auth:
 
 ### Special Cases
 
-**DATABASE_URL**: For convenience, the DATABASE_URL environment variable is checked after config loading and will override any `database.url` setting. This is optional — you can use `${DATABASE_URL}` in YAML instead:
+**DATABASE_URL**: The `DATABASE_URL` environment variable is used as a fallback when `database.url` is not set in the config file. If `database.url` is explicitly set (including via `${VAR}` substitution), it takes precedence over `DATABASE_URL`.
 
 ```yaml
-# Option 1: Direct environment variable (checked after config loads)
+# Option 1: Explicit value in config (takes precedence over DATABASE_URL env var)
 database:
-  url: ""  # Empty, DATABASE_URL env var will be used
+  url: "postgres://rise:password@rds-endpoint:5432/rise"
 
-# Option 2: Explicit substitution (recommended for consistency)
+# Option 2: Explicit substitution (recommended when you want a specific env var)
 database:
   url: "${DATABASE_URL}"
+
+# Option 3: Leave unset — DATABASE_URL env var will be used as fallback
+# (omit the database.url key entirely)
 ```
 
-**Note**: DATABASE_URL is only required at compile time for SQLX query verification. At runtime, you can set it via either method above.
+**Note**: `DATABASE_URL` is also required at **compile time** for SQLX query verification. See the [Developer Guide](./developer-guide.md#database_url-at-compile-time) for details.
 
 ## Examples
 
@@ -410,14 +413,14 @@ Checking backend configuration...
 
 ### JSON Schema
 
-Rise provides a JSON Schema for backend configuration, hosted in the user docs:
+Rise provides a JSON Schema for backend configuration, hosted alongside these operator docs:
 
-- [`backend-settings.schema.json`](/docs/schemas/backend-settings.schema.json)
+- [`backend-settings.schema.json`](../schemas/backend-settings.schema.json)
 
 Generate it with:
 
 ```bash
-cargo run --features cli,backend -- backend config-schema > docs/user/public/schemas/backend-settings.schema.json
+cargo run --features cli,backend -- backend config-schema > docs/engineering/public/schemas/backend-settings.schema.json
 ```
 
 CI verifies this file is up to date on every PR and push.

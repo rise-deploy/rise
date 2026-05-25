@@ -153,6 +153,20 @@
       },
       "type": "object"
     },
+    "IdentityConfig": {
+      "description": "Workload identity configuration",
+      "properties": {
+        "audiences": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Audiences to auto-mint workload identity tokens for and mount as files.\nMap key = in-pod token filename, value = the token audience.",
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
     "ProjectConfig": {
       "description": "Project metadata configuration",
       "properties": {
@@ -209,6 +223,18 @@
       "default": {},
       "description": "Per-environment configuration (optional)",
       "type": "object"
+    },
+    "identity": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/IdentityConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Workload identity configuration (optional)"
     },
     "project": {
       "anyOf": [

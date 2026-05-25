@@ -55,6 +55,11 @@ pub struct AppState {
     pub controllers: Arc<HashMap<String, ControllerIdentity>>,
     /// Controller identities indexed by issuer URL for middleware lookup.
     pub controllers_by_issuer: Arc<HashMap<String, Vec<ControllerIdentity>>>,
+    /// Generic-resource store used by the `/api/v1/resources` HTTP API and
+    /// (later) by internal controllers wanting to reconcile against Rise state
+    /// without a network round-trip.
+    #[cfg(feature = "backend")]
+    pub resource_store: Arc<dyn rise_resource_store::ResourceStore>,
     pub auth_settings: Arc<AuthSettings>,
     pub server_settings: Arc<ServerSettings>,
     pub token_store: Arc<dyn TokenStore>,
@@ -96,6 +101,10 @@ pub struct AppState {
     /// Platform-level constraints for deployment resources
     #[cfg(feature = "backend")]
     pub deployment_constraints: Option<crate::server::settings::DeploymentConstraints>,
+    /// Lifetime in seconds of controller-minted workload identity tokens.
+    /// Refresh threshold is derived as TTL / 2.
+    #[cfg(feature = "backend")]
+    pub identity_token_ttl_seconds: u64,
 }
 
 /// Initialize encryption provider from settings
@@ -252,6 +261,13 @@ impl AppState {
         rise_resource_store::run_migrations(&db_pool)
             .await
             .context("Failed to run resource store migrations")?;
+
+        // Initialize the generic-resource store now that its schema exists. The
+        // store is cheap to construct (it caches compiled JSON schemas lazily),
+        // so we instantiate it once and clone the Arc into every handler.
+        #[cfg(feature = "backend")]
+        let resource_store: Arc<dyn rise_resource_store::ResourceStore> =
+            Arc::new(rise_resource_store::PgResourceStore::new(db_pool.clone()));
 
         // Initialize JWT validator (JWKS is fetched on-demand)
         let jwt_validator = Arc::new(JwtValidator::new(settings.server.ssrf.clone()));
@@ -588,6 +604,7 @@ impl AppState {
             webhook_port,
             deployment_defaults_opt,
             deployment_constraints_opt,
+            identity_token_ttl_seconds,
         ) = {
             use crate::server::deployment::resource_builder::ResourceBuilder;
             use crate::server::settings::DeploymentControllerSettings;
@@ -622,6 +639,7 @@ impl AppState {
                 metacontroller_pod_namespace,
                 metacontroller_pod_label_selector,
                 namespace_format,
+                identity_token_ttl_seconds,
                 ..
             }) = &settings.deployment_controller
             {
@@ -713,9 +731,10 @@ impl AppState {
                     Some(*metacontroller_webhook_port),
                     Some(deployment_defaults.clone()),
                     Some(_deployment_constraints.clone()),
+                    *identity_token_ttl_seconds,
                 )
             } else {
-                (None, None, None, None, None, None)
+                (None, None, None, None, None, None, 3600)
             }
         };
 
@@ -921,6 +940,7 @@ impl AppState {
                     default_blocked_roles,
                     default_scopes,
                     refresh_token_validity_seconds,
+                    verify_interval_seconds,
                 } = provider_config
                 {
                     tracing::info!("Initializing Snowflake OAuth provisioner");
@@ -943,6 +963,7 @@ impl AppState {
                                 default_blocked_roles: default_blocked_roles.clone(),
                                 default_scopes: default_scopes.clone(),
                                 refresh_token_validity_seconds: *refresh_token_validity_seconds,
+                                verify_interval_seconds: *verify_interval_seconds,
                             },
                         );
 
@@ -1032,6 +1053,8 @@ impl AppState {
             operator_users,
             controllers,
             controllers_by_issuer,
+            #[cfg(feature = "backend")]
+            resource_store,
             auth_settings,
             server_settings,
             token_store,
@@ -1059,6 +1082,8 @@ impl AppState {
             deployment_defaults: deployment_defaults_opt,
             #[cfg(feature = "backend")]
             deployment_constraints: deployment_constraints_opt,
+            #[cfg(feature = "backend")]
+            identity_token_ttl_seconds,
         })
     }
 }

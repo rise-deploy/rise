@@ -230,6 +230,7 @@ FOO = "bar"
             }),
             build: None,
             deploy: None,
+            identity: None,
             environments: BTreeMap::from([(
                 "staging".to_string(),
                 EnvironmentConfig {

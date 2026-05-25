@@ -381,7 +381,8 @@ pub async fn list_projects(
             app_users: vec![],       // Not populated in list view for performance
             app_teams: vec![],       // Not populated in list view for performance
             source_url: project.source_url,
-            deployment_defaults: None,  // Not populated in list view
+            resolved_source_url: None, // Not populated in list view for performance
+            deployment_defaults: None, // Not populated in list view
             platform_constraints: None, // Not populated in list view
         });
     }
@@ -461,6 +462,15 @@ pub async fn get_project(
     api_project.default_url = default_url;
     api_project.primary_url = primary_url;
     api_project.custom_domain_urls = custom_domain_urls;
+
+    // When no source URL is explicitly configured, resolve one from deployment
+    // metadata (active primary deployment, else most recent deployment).
+    if api_project.source_url.is_none() {
+        api_project.resolved_source_url =
+            crate::db::deployments::resolve_git_repository_url(&state.db_pool, project.id)
+                .await
+                .internal_err("Failed to resolve project source URL")?;
+    }
 
     // Get active deployment groups
     let deployment_groups =
@@ -1000,6 +1010,7 @@ fn convert_project(
         app_users: vec![], // Will be populated by caller if needed
         app_teams: vec![], // Will be populated by caller if needed
         source_url: project.source_url,
+        resolved_source_url: None, // Will be populated by caller if source_url is unset
         deployment_defaults,
         platform_constraints,
     }
