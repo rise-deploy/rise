@@ -4,7 +4,7 @@ import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
 import { copyToClipboard, formatISO8601, formatRelativeTimeRounded, isSafeUrl, stripUrlScheme } from '../lib/utils';
 import { useToast } from '../components/toast';
-import { Button, ConfirmDialog, Empty, EnvPill, KV, KVRow, Modal, Panel, PanelBody, PanelHead, Pill, Status, Tabs, cx } from '../components/r-ui';
+import { Button, ConfirmDialog, Empty, KV, KVRow, Modal, Panel, PanelBody, PanelHead, Pill, Status, Tabs, Tooltip, cx } from '../components/r-ui';
 import { Icon } from '../components/icon';
 import { EnvironmentColorDot } from '../components/ui';
 import { LoadingState, ErrorState, EmptyState } from '../components/states';
@@ -119,7 +119,9 @@ export function ProjectDetail({ projectName, initialTab }: { projectName: string
 
     const ownerType: 'user' | 'team' | null = project.owner?.email ? 'user' : project.owner?.name ? 'team' : null;
     const ownerLabel = project.owner?.email || project.owner?.name || '—';
-    const accessLabel = accessClasses.find(a => a.id === project.access_class)?.display_name || project.access_class || '—';
+    const accessClass = accessClasses.find(a => a.id === project.access_class);
+    const accessLabel = accessClass?.display_name || project.access_class || '—';
+    const accessDescription = accessClass?.description || '';
 
     // The source repository is either explicitly configured on the project, or
     // resolved by the backend from the active/most recent deployment metadata.
@@ -134,14 +136,18 @@ export function ProjectDetail({ projectName, initialTab }: { projectName: string
                 <div className="title-stack">
                     <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8, flexWrap: 'wrap' }}>
                         <h1 className="r-page-title">{project.name}</h1>
-                        <Status status={project.status || 'Unknown'} />
-                        <Pill kind="accent">{accessLabel}</Pill>
-                        {environments.map(env => (
-                            <span key={env.name} style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
-                                <EnvironmentColorDot color={env.color} size="0.55rem" />
-                                <EnvPill env={env.name} />
-                            </span>
-                        ))}
+                        <Tooltip content={`Lifecycle status: ${project.status || 'Unknown'}`}>
+                            <Status status={project.status || 'Unknown'} />
+                        </Tooltip>
+                        <Tooltip
+                            content={
+                                accessDescription
+                                    ? <><div><strong>{accessLabel}</strong></div><div>{accessDescription}</div></>
+                                    : `Access class: ${accessLabel}`
+                            }
+                        >
+                            <Pill kind="accent">{accessLabel}</Pill>
+                        </Tooltip>
                     </div>
                     <div className="r-meta-bar" style={{ marginTop: 8 }}>
                         {ownerType && (
@@ -366,6 +372,8 @@ function CurrentDeploymentPanel({ projectName, environments }: { projectName: st
 }
 
 function ProjectOverview({ project, projectName, accessLabel, environments, onCopy }: { project: any; projectName: string; accessLabel: string; environments: any[]; onCopy: (v: string, l: string) => void }) {
+    const sourceUrl: string | null = project.source_url || project.resolved_source_url || null;
+    const sourceUrlInherited = !project.source_url && !!project.resolved_source_url;
     return (
         <div className="r-grid-2-1">
             <div className="r-stack">
@@ -428,7 +436,9 @@ function ProjectOverview({ project, projectName, accessLabel, environments, onCo
                                         <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 13.5, fontWeight: 500 }}>
                                             <EnvironmentColorDot color={env.color} size="0.6rem" />
                                             {env.name}
-                                            {env.is_production && <Pill kind="env-prod">production</Pill>}
+                                            {env.is_production && env.name !== 'production' && (
+                                                <Pill kind="env-prod">production</Pill>
+                                            )}
                                         </span>
                                         {env.primary_deployment_group && (
                                             <span style={{ fontSize: 12, color: 'var(--text-soft)' }}>

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 
 export type Palette = 'mint' | 'indigo' | 'ember' | 'slate';
 export type Density = 'compact' | 'cozy';
-export type Theme = 'light' | 'dark';
+export type Theme = 'system' | 'light' | 'dark';
 
 export interface Prefs {
     palette: Palette;
@@ -12,11 +12,12 @@ export interface Prefs {
 
 export const PALETTES: Palette[] = ['mint', 'indigo', 'ember', 'slate'];
 export const DENSITIES: Density[] = ['compact', 'cozy'];
+export const THEMES: Theme[] = ['system', 'light', 'dark'];
 
 export const DEFAULT_PREFS: Prefs = {
     palette: 'indigo',
     density: 'cozy',
-    theme: 'light',
+    theme: 'system',
 };
 
 const STORAGE_KEY = 'rise.prefs.v1';
@@ -35,7 +36,7 @@ function readStored(): Partial<Prefs> {
 function sanitize(stored: Partial<Prefs>): Prefs {
     const palette = PALETTES.includes(stored.palette as Palette) ? (stored.palette as Palette) : DEFAULT_PREFS.palette;
     const density = DENSITIES.includes(stored.density as Density) ? (stored.density as Density) : DEFAULT_PREFS.density;
-    const theme = stored.theme === 'dark' || stored.theme === 'light' ? stored.theme : DEFAULT_PREFS.theme;
+    const theme = THEMES.includes(stored.theme as Theme) ? (stored.theme as Theme) : DEFAULT_PREFS.theme;
     return { palette, density, theme };
 }
 
@@ -47,12 +48,23 @@ function persist(prefs: Prefs) {
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(prefs)); } catch { /* ignore */ }
 }
 
+/** Resolve `system` to the OS's current preference. SSR-safe. */
+export function resolveTheme(theme: Theme): 'light' | 'dark' {
+    if (theme === 'system') {
+        if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
+            return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        }
+        return 'light';
+    }
+    return theme;
+}
+
 /** Apply prefs to the document root so descendant CSS picks them up. */
 export function applyPrefs(prefs: Prefs) {
     const root = document.documentElement;
     root.dataset.palette = prefs.palette;
     root.dataset.density = prefs.density;
-    if (prefs.theme === 'dark') {
+    if (resolveTheme(prefs.theme) === 'dark') {
         root.classList.add('dark');
     } else {
         root.classList.remove('dark');
@@ -67,6 +79,16 @@ export function usePrefs(): [Prefs, (next: Partial<Prefs>) => void] {
     useEffect(() => {
         applyPrefs(prefs);
     }, [prefs.palette, prefs.density, prefs.theme]);
+
+    // Follow OS color-scheme changes while theme is `system`.
+    useEffect(() => {
+        if (prefs.theme !== 'system') return;
+        if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+        const mq = window.matchMedia('(prefers-color-scheme: dark)');
+        const onMqChange = () => applyPrefs(prefs);
+        mq.addEventListener('change', onMqChange);
+        return () => mq.removeEventListener('change', onMqChange);
+    }, [prefs.theme]);
 
     useEffect(() => {
         const onChange = (e: Event) => {

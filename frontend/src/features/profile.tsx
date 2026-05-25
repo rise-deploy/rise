@@ -68,10 +68,19 @@ export function Profile({ user }: ProfileProps) {
                                     <div style={{ marginTop: 4 }}>
                                         <Segmented
                                             value={prefs.theme}
-                                            options={[{ value: 'light', label: 'Light' }, { value: 'dark', label: 'Dark' }]}
-                                            onChange={(t) => setPrefs({ theme: t as 'light' | 'dark' })}
+                                            options={[
+                                                { value: 'system', label: 'System' },
+                                                { value: 'light', label: 'Light' },
+                                                { value: 'dark', label: 'Dark' },
+                                            ]}
+                                            onChange={(t) => setPrefs({ theme: t as 'system' | 'light' | 'dark' })}
                                         />
                                     </div>
+                                    {prefs.theme === 'system' && (
+                                        <p style={{ fontSize: 12, color: 'var(--text-soft)', marginTop: 10, marginBottom: 0 }}>
+                                            Follows your operating system preference.
+                                        </p>
+                                    )}
                                 </div>
                             </div>
                         </PanelBody>
@@ -100,10 +109,10 @@ export function Profile({ user }: ProfileProps) {
                         <PanelHead title="Reset preferences" />
                         <PanelBody>
                             <p style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 0 }}>
-                                Restores the defaults: <span className="mono">indigo</span> palette, <span className="mono">cozy</span> density, and light mode.
+                                Restores the defaults: <span className="mono">indigo</span> palette, <span className="mono">cozy</span> density, and system color mode.
                             </p>
                             <Button
-                                onClick={() => setPrefs({ palette: 'indigo', density: 'cozy', theme: 'light' })}
+                                onClick={() => setPrefs({ palette: 'indigo', density: 'cozy', theme: 'system' })}
                                 icon="refresh"
                             >
                                 Reset to defaults

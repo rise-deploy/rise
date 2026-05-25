@@ -181,26 +181,28 @@ function sortObjectKeys(obj) {
         }, {});
 }
 
-// Format an elapsed duration between two ISO timestamps as a compact string.
-function formatDuration(start, end) {
-    if (!start || !end) return null;
-    const ms = new Date(end).getTime() - new Date(start).getTime();
-    if (!isFinite(ms) || ms < 0) return null;
-    const secs = Math.round(ms / 1000);
-    if (secs < 60) return `${secs}s`;
-    const mins = Math.floor(secs / 60);
-    const remSecs = secs % 60;
-    if (mins < 60) return remSecs ? `${mins}m ${remSecs}s` : `${mins}m`;
-    const hrs = Math.floor(mins / 60);
-    const remMins = mins % 60;
-    return remMins ? `${hrs}h ${remMins}m` : `${hrs}h`;
-}
+// Deployment statuses considered terminal — those deployments are no longer
+// running or relevant to the environment's current state, so they're excluded
+// from the environment's active-deployments view.
+const TERMINAL_DEPLOYMENT_STATUSES = new Set([
+    'Cancelled', 'Stopped', 'Superseded', 'Failed', 'Expired',
+]);
 
-// Collapsible deployment-group card: GroupBar header + deployment history table.
-function DeploymentGroupCard({ groupName, deployments, projectName, environmentName, defaultOpen }) {
-    const [open, setOpen] = useState(defaultOpen);
-    const active = deployments.find(d => d.is_active);
-    const replicas = active?.replicas;
+function EnvironmentCard({ env, projectName, deployments, onEdit, onDelete }) {
+    const [open, setOpen] = useState(true);
+
+    const activeDeployments = deployments.filter(d => !TERMINAL_DEPLOYMENT_STATUSES.has(d.status));
+
+    const primaryGroup = env.primary_deployment_group || 'default';
+    const isPrimary = (d) =>
+        d.is_active && (d.deployment_group || 'default') === primaryGroup;
+
+    // The deployment serving traffic on the env's primary URL — drives the
+    // status/replicas summary shown in the collapsed header.
+    const primaryDeploy = activeDeployments.find(isPrimary);
+    const headerStatus = primaryDeploy?.status || (activeDeployments[0]?.status) || null;
+    const headerReplicas = primaryDeploy?.replicas;
+
     return (
         <RPanel>
             <RGroupBar
@@ -208,74 +210,77 @@ function DeploymentGroupCard({ groupName, deployments, projectName, environmentN
                 onToggle={() => setOpen(o => !o)}
                 right={
                     <>
-                        {active && <RStatus status={active.status || 'Unknown'} />}
-                        {replicas != null && (
+                        {headerStatus && <RStatus status={headerStatus} />}
+                        {headerReplicas != null && (
                             <span style={{ fontSize: 11.5, color: 'var(--text-soft)' }}>
-                                {replicas} replica{replicas === 1 ? '' : 's'}
+                                {headerReplicas} replica{headerReplicas === 1 ? '' : 's'}
                             </span>
                         )}
+                        <RButton
+                            size="sm"
+                            icon="edit"
+                            onClick={(e) => { e.stopPropagation(); onEdit(env); }}
+                        >
+                            Edit
+                        </RButton>
+                        <RButton
+                            size="sm"
+                            variant="danger"
+                            icon="trash"
+                            disabled={env.is_production}
+                            onClick={(e) => { e.stopPropagation(); onDelete(env); }}
+                        >
+                            Delete
+                        </RButton>
                     </>
                 }
             >
+                <EnvironmentColorDot color={env.color} size="0.7rem" />
                 <a
                     className="r-link"
-                    style={{ fontWeight: 600, fontSize: 13 }}
+                    style={{ fontWeight: 600, fontSize: 14, textTransform: 'capitalize' }}
                     onClick={(e) => {
                         e.stopPropagation();
-                        navigate(`/project/${projectName}/environment/${environmentName}/group/${groupName}`);
+                        navigate(`/project/${projectName}/environment/${env.name}`);
                     }}
-                    title="View the active deployment of this group"
+                    title="View the active deployment of this environment"
                 >
-                    {groupName}
+                    {env.name}
                 </a>
+                {env.is_production && env.name.toLowerCase() !== 'production' && (
+                    <span className="r-pill env-prod">production</span>
+                )}
                 <span style={{ fontSize: 11.5, color: 'var(--text-soft)' }}>
-                    · {deployments.length} deployment{deployments.length === 1 ? '' : 's'}
+                    · {activeDeployments.length} active deployment{activeDeployments.length === 1 ? '' : 's'}
                 </span>
             </RGroupBar>
             {open && (
-                <>
-                {active && (
-                    <div style={{ display: 'flex', gap: 32, padding: '12px 18px', borderBottom: '1px solid var(--border-faint)' }}>
-                        <div>
-                            <div className="r-stat-label">Current</div>
-                            <a
-                                className="r-link mono"
-                                style={{ fontSize: 12.5, marginTop: 4, display: 'inline-block' }}
-                                onClick={(e) => { e.stopPropagation(); navigate(`/deployment/${projectName}/${active.deployment_id}`); }}
-                            >
-                                {active.deployment_id}
-                            </a>
-                        </div>
-                        {replicas != null && (
-                            <div>
-                                <div className="r-stat-label">Replicas</div>
-                                <div style={{ fontSize: 13, marginTop: 4 }}>{replicas}</div>
-                            </div>
-                        )}
-                    </div>
-                )}
-                {deployments.length === 0 ? (
+                activeDeployments.length === 0 ? (
                     <div style={{ padding: 28, textAlign: 'center', color: 'var(--text-soft)', fontSize: 13 }}>
-                        No deployments in this group.
+                        No active deployments in this environment.
                     </div>
                 ) : (
                     <table className="r-table r-table-fixed">
                         <colgroup>
-                            <col style={{ width: 220 }} />
+                            <col style={{ width: 230 }} />
                             <col style={{ width: 130 }} />
+                            <col style={{ width: 180 }} />
                             <col />
-                            <col style={{ width: 120 }} />
                             <col style={{ width: 110 }} />
                         </colgroup>
                         <thead>
                             <tr>
-                                <th>ID</th><th>Status</th><th>Author</th><th>Duration</th>
+                                <th>ID</th>
+                                <th>Status</th>
+                                <th>Group</th>
+                                <th>Author</th>
                                 <th style={{ textAlign: 'right' }}>Age</th>
                             </tr>
                         </thead>
                         <tbody>
-                            {deployments.map(d => {
-                                const duration = formatDuration(d.created, d.completed_at);
+                            {activeDeployments.map(d => {
+                                const group = d.deployment_group || 'default';
+                                const groupIsPrimary = group === primaryGroup;
                                 return (
                                     <tr
                                         key={d.deployment_id}
@@ -284,19 +289,19 @@ function DeploymentGroupCard({ groupName, deployments, projectName, environmentN
                                     >
                                         <td className="mono" style={{ fontSize: 12.25 }}>
                                             {d.deployment_id}
-                                            {d.is_active && (
+                                            {isPrimary(d) && (
                                                 <span style={{
                                                     marginLeft: 8, fontSize: 10.5, padding: '1px 6px',
                                                     background: 'var(--accent-soft)', color: 'var(--accent)',
                                                     borderRadius: 4, fontFamily: 'Inter',
-                                                }}>CURRENT</span>
+                                                }} title="Currently serving this environment's primary URL">PRIMARY</span>
                                             )}
                                         </td>
                                         <td><RStatus status={d.status || 'Unknown'} /></td>
-                                        <td>{d.created_by_email || <span style={{ color: 'var(--text-soft)' }}>—</span>}</td>
-                                        <td className="mono" style={{ fontSize: 12.25 }}>
-                                            {duration || <span style={{ color: 'var(--text-soft)' }}>—</span>}
+                                        <td className="mono" style={{ fontSize: 12.25, color: groupIsPrimary ? 'var(--text)' : 'var(--text-muted)' }}>
+                                            {group}
                                         </td>
+                                        <td>{d.created_by_email || <span style={{ color: 'var(--text-soft)' }}>—</span>}</td>
                                         <td style={{ textAlign: 'right', color: 'var(--text-muted)' }}>
                                             {d.created ? formatRelativeTimeRounded(d.created) : '—'}
                                         </td>
@@ -305,8 +310,7 @@ function DeploymentGroupCard({ groupName, deployments, projectName, environmentN
                             })}
                         </tbody>
                     </table>
-                )}
-                </>
+                )
             )}
         </RPanel>
     );
@@ -459,20 +463,7 @@ export function EnvironmentsList({ projectName, platformConstraints = null }) {
     if (loading) return <LoadingState label="Loading environments…" />;
     if (error) return <ErrorState message={`Error loading environments: ${error}`} onRetry={loadEnvironments} />;
 
-    // Build the env → deployment-group → deployments hierarchy client-side.
     const deploymentsForEnv = (envName) => deployments.filter(d => d.environment === envName);
-    const groupsForEnv = (env) => {
-        const envDeployments = deploymentsForEnv(env.name);
-        const groupNames = Array.from(new Set(envDeployments.map(d => d.deployment_group || 'default')));
-        // Surface the env's primary group even if it has no deployments yet.
-        if (env.primary_deployment_group && !groupNames.includes(env.primary_deployment_group)) {
-            groupNames.unshift(env.primary_deployment_group);
-        }
-        return groupNames.map(name => ({
-            name,
-            deployments: envDeployments.filter(d => (d.deployment_group || 'default') === name),
-        }));
-    };
 
     const visibleEnvs = environments.filter(env => envFilter === 'all' || env.name === envFilter);
 
@@ -508,68 +499,16 @@ export function EnvironmentsList({ projectName, platformConstraints = null }) {
                             onChange={setEnvFilter}
                         />
                     )}
-                    {visibleEnvs.map(env => {
-                        const groups = groupsForEnv(env);
-                        const deployCount = deploymentsForEnv(env.name).length;
-                        return (
-                            <div key={env.name} className="r-stack tight">
-                                <div
-                                    className="r-section-head"
-                                    style={{ marginBottom: 0, padding: '12px 16px', background: 'var(--surface-2)', border: '1px solid var(--border-faint)', borderRadius: 'var(--radius)' }}
-                                >
-                                    <div>
-                                        <div style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
-                                            <EnvironmentColorDot color={env.color} size="0.7rem" />
-                                            <a
-                                                className="r-link"
-                                                style={{ fontSize: 15, fontWeight: 600, letterSpacing: '-0.01em', textTransform: 'capitalize' }}
-                                                onClick={() => navigate(`/project/${projectName}/environment/${env.name}`)}
-                                                title="View the active deployment of this environment"
-                                            >
-                                                {env.name}
-                                            </a>
-                                            {env.is_production && env.name.toLowerCase() !== 'production' && (
-                                                <span className="r-pill env-prod">production</span>
-                                            )}
-                                        </div>
-                                        <div className="r-section-sub" style={{ marginTop: 3 }}>
-                                            {groups.length} group{groups.length === 1 ? '' : 's'} · {deployCount} deployment{deployCount === 1 ? '' : 's'}
-                                        </div>
-                                    </div>
-                                    <div style={{ display: 'flex', gap: 6 }}>
-                                        <RButton size="sm" icon="edit" onClick={() => handleEditClick(env)}>Edit</RButton>
-                                        <RButton
-                                            size="sm"
-                                            variant="danger"
-                                            icon="trash"
-                                            onClick={() => handleDeleteClick(env)}
-                                            disabled={env.is_production}
-                                        >
-                                            Delete
-                                        </RButton>
-                                    </div>
-                                </div>
-                                {groups.length === 0 ? (
-                                    <RPanel>
-                                        <div style={{ padding: 24, textAlign: 'center', color: 'var(--text-soft)', fontSize: 13 }}>
-                                            No deployment groups in this environment.
-                                        </div>
-                                    </RPanel>
-                                ) : (
-                                    groups.map((g, i) => (
-                                        <DeploymentGroupCard
-                                            key={g.name}
-                                            groupName={g.name}
-                                            deployments={g.deployments}
-                                            projectName={projectName}
-                                            environmentName={env.name}
-                                            defaultOpen={i === 0 || g.name === env.primary_deployment_group}
-                                        />
-                                    ))
-                                )}
-                            </div>
-                        );
-                    })}
+                    {visibleEnvs.map(env => (
+                        <EnvironmentCard
+                            key={env.name}
+                            env={env}
+                            projectName={projectName}
+                            deployments={deploymentsForEnv(env.name)}
+                            onEdit={handleEditClick}
+                            onDelete={handleDeleteClick}
+                        />
+                    ))}
                 </div>
             )}
 
@@ -626,7 +565,7 @@ export function EnvironmentsList({ projectName, platformConstraints = null }) {
                     <div className="pt-4 border-t border-gray-200 dark:border-gray-700">
                         <span className="mono-label">Resource Constraints</span>
                         <p className="text-xs text-gray-500 dark:text-gray-400 mb-3">
-                            Limit the resource range for deployments in this environment. Leave empty to use platform defaults.
+                            Bounds for what a deployment can <em>request</em> at deploy time (via <span className="mono">rise.toml</span> or the CLI). These are not Kubernetes requests/limits — they constrain the user's choice. Leave empty to use platform defaults.
                         </p>
                         <div className="grid grid-cols-2 gap-3">
                             <RField label="Min Replicas">

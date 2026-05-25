@@ -6,7 +6,7 @@ import { copyToClipboard, formatDate, formatISO8601, formatRelativeTimeRounded, 
 import { useToast } from '../components/toast';
 import { Button, ENV_COLOR_STYLES, EnvironmentColorDot, SourceLinkGroup, SourceLinkGroupAction, StatusBadge } from '../components/ui';
 import { MonoSortButton, MonoTable, MonoTableBody, MonoTableEmptyRow, MonoTableFrame, MonoTableHead, MonoTableRow, MonoTd, MonoTh } from '../components/table';
-import { Button as RButton, Combobox, ConfirmDialog, Empty, KV, KVRow, Modal, Panel, PanelBody, PanelHead, Pill, SearchInput, Segmented, Status, Tabs, Tooltip } from '../components/r-ui';
+import { Button as RButton, Combobox, ConfirmDialog, Empty, EnvPill, KV, KVRow, Modal, Panel, PanelBody, PanelHead, Pill, SearchInput, Segmented, Status, Tabs, Tooltip } from '../components/r-ui';
 import { Icon } from '../components/icon';
 import { EnvVarsList } from './resources';
 import { EmptyState, ErrorState, LoadingState } from '../components/states';
@@ -673,6 +673,35 @@ export function DeploymentsList({ projectName }) {
     );
 }
 
+// Split button used in the logs header: left half toggles live streaming on/off
+// (pulsing dot when active), right half independently toggles auto-scroll.
+function StreamToggle({ streaming, autoScroll, onToggleStream, onToggleAutoScroll }) {
+    return (
+        <div className="r-split-btn">
+            <button
+                type="button"
+                className={`r-split-btn-main${streaming ? ' active' : ''}`}
+                onClick={onToggleStream}
+                aria-pressed={streaming}
+                title={streaming ? 'Stop streaming' : 'Stream logs'}
+            >
+                <span className="dot" />
+                <span>{streaming ? 'Live streaming' : 'Stream'}</span>
+            </button>
+            <button
+                type="button"
+                className={`r-split-btn-side${autoScroll ? ' active' : ''}`}
+                onClick={onToggleAutoScroll}
+                aria-pressed={autoScroll}
+                aria-label="Toggle auto-scroll"
+                title={autoScroll ? 'Auto-scroll on' : 'Auto-scroll off'}
+            >
+                <Icon name="chevd" size={12} />
+            </button>
+        </div>
+    );
+}
+
 // Deployment Logs Component with SSE streaming
 function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
     // Active deployments auto-follow live logs starting from just the most
@@ -917,15 +946,9 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
 
     return (
         <Panel style={{ display: 'flex', flexDirection: 'column' }}>
-            <div className="r-panel-head">
-                <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
+            <div className="r-panel-head r-logs-head">
+                <div className="r-logs-head-left">
                     <div className="r-panel-title">Runtime logs</div>
-                    {streaming && (
-                        <span className="r-status running" style={{ padding: '2px 9px' }}>
-                            <span className="dot" />
-                            <span>Live streaming</span>
-                        </span>
-                    )}
                     <Segmented
                         value={levelFilter}
                         options={['all', 'info', 'warn', 'error']}
@@ -933,8 +956,8 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                         capitalize
                     />
                 </div>
-                <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-                    <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text-muted)' }}>
+                <div className="r-logs-head-right">
+                    <label className="r-logs-tail">
                         <span>Tail</span>
                         <input
                             type="number"
@@ -944,35 +967,16 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                             onKeyPress={handleTailLinesKeyPress}
                             min="1"
                             className="r-field"
-                            style={{ width: 78 }}
                         />
                     </label>
-                    <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text-muted)' }}>
-                        <input
-                            type="checkbox"
-                            checked={autoScroll}
-                            onChange={(e) => setAutoScroll(e.target.checked)}
-                        />
-                        Auto-scroll
-                    </label>
-                    {!streaming ? (
-                        <>
-                            <RButton size="sm" onClick={loadInitialLogs}>Load</RButton>
-                            <RButton size="sm" variant="primary" onClick={startStreaming}>Follow</RButton>
-                        </>
-                    ) : (
-                        <RButton size="sm" variant="primary" onClick={stopStreaming}>
-                            <span
-                                style={{
-                                    width: 7,
-                                    height: 7,
-                                    borderRadius: '50%',
-                                    background: 'currentColor',
-                                    display: 'inline-block',
-                                }}
-                            />
-                            Following
-                        </RButton>
+                    <StreamToggle
+                        streaming={streaming}
+                        autoScroll={autoScroll}
+                        onToggleStream={() => (streaming ? stopStreaming() : startStreaming())}
+                        onToggleAutoScroll={() => setAutoScroll((v) => !v)}
+                    />
+                    {!streaming && (
+                        <RButton size="sm" onClick={loadInitialLogs}>Load</RButton>
                     )}
                     <RButton size="sm" onClick={clearLogs} disabled={logs.length === 0}>Clear</RButton>
                     <RButton size="sm" onClick={handleCopyLogs} disabled={logs.length === 0} title="Copy logs">
@@ -1636,7 +1640,9 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                 <div className="title-stack">
                     <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
                         <h1 className="r-page-title mono" style={{ fontSize: 20 }}>{deployment.deployment_id}</h1>
-                        <Status status={deployment.status} />
+                        <Tooltip content={`Deployment status: ${deployment.status}`}>
+                            <Status status={deployment.status} />
+                        </Tooltip>
                         {deployment.environment ? (
                             <Tooltip
                                 content={
@@ -1649,15 +1655,10 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                                     </>
                                 }
                             >
-                                <Pill className="r-row" style={{ gap: 6 }}>
-                                    <EnvironmentColorDot color={deployment.environment_color} />
-                                    <span className="mono">{deployment.environment}</span>
-                                    <span className="mono" style={{ color: 'var(--text-soft)' }}>
-                                        ({deployment.deployment_group})
-                                    </span>
-                                </Pill>
+                                <EnvPill env={deployment.environment} color={deployment.environment_color} />
                             </Tooltip>
-                        ) : (
+                        ) : null}
+                        {deployment.deployment_group && deployment.deployment_group !== 'default' && (
                             <Pill className="mono">{deployment.deployment_group}</Pill>
                         )}
                     </div>

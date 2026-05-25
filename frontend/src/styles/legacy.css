@@ -321,6 +321,9 @@
     overflow: hidden;
     background: var(--surface);
 }
+/* Allow horizontal scrolling for wide tables — prevents clipping when the
+   viewport is narrower than the table's natural width. */
+.mono-table-frame:has(> .mono-table) { overflow-x: auto; }
 .mono-table {
     width: 100%;
     border-collapse: collapse;

@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Icon } from './icon';
 import { Avatar, cx, colorFor } from './r-ui';
 import { navigate } from '../lib/navigation';
-import { usePrefs } from '../lib/prefs';
+import { resolveTheme, usePrefs } from '../lib/prefs';
 import { api } from '../lib/api';
 
 interface NavItem { id: string; label: string; icon: string; href: string; matches: (route: string) => boolean }
@@ -24,11 +24,18 @@ export interface ShellProps {
 
 export function Shell({ route, breadcrumbs, user, onLogout, onOpenPalette, children }: ShellProps) {
     const [prefs, setPrefs] = usePrefs();
+    const effectiveTheme = resolveTheme(prefs.theme);
 
     return (
         <div className="r-app">
             <div className="r-layout">
-                <Sidebar route={route} user={user} onLogout={onLogout} onToggleTheme={() => setPrefs({ theme: prefs.theme === 'dark' ? 'light' : 'dark' })} theme={prefs.theme} />
+                <Sidebar
+                    route={route}
+                    user={user}
+                    onLogout={onLogout}
+                    onToggleTheme={() => setPrefs({ theme: effectiveTheme === 'dark' ? 'light' : 'dark' })}
+                    theme={effectiveTheme}
+                />
                 <main className="r-main">
                     <Topbar breadcrumbs={breadcrumbs} onOpenPalette={onOpenPalette} />
                     <div className="r-content">{children}</div>

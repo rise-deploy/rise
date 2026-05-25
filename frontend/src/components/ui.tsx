@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { isSafeUrl } from '../lib/utils';
+import { Icon } from './icon';
 
 function cx(...parts: Array<string | false | null | undefined>) {
     return parts.filter(Boolean).join(' ');
@@ -301,33 +302,56 @@ export const ENV_COLOR_STYLES = {
 
 const ENV_COLORS = Object.keys(ENV_COLOR_STYLES) as Array<keyof typeof ENV_COLOR_STYLES>;
 
+// Visually represents an environment with a layer-stack glyph tinted with the
+// environment's color. Kept named `EnvironmentColorDot` so existing call sites
+// don't have to churn; the glyph is intentionally distinct from a status dot.
 export function EnvironmentColorDot({ color = 'green', size = '0.75rem', className = '' }) {
     const style = ENV_COLOR_STYLES[color] || ENV_COLOR_STYLES.green;
+    // Sizes are passed in rem (e.g. "0.55rem"). Convert to a pixel value the
+    // Icon component can use; bump slightly so stroked icons read at the same
+    // optical weight as the old filled dots.
+    let pxSize = 12;
+    if (typeof size === 'number') pxSize = size;
+    else if (typeof size === 'string') {
+        const match = size.match(/^([\d.]+)(rem|px)?$/);
+        if (match) {
+            const value = parseFloat(match[1]);
+            pxSize = match[2] === 'px' ? value : Math.round(value * 16 + 4);
+        }
+    }
     return (
         <span
             className={className}
-            style={{ display: 'inline-block', width: size, height: size, borderRadius: '50%', backgroundColor: style.color, flexShrink: 0 }}
-        />
+            style={{ display: 'inline-flex', color: style.color, flexShrink: 0, lineHeight: 0 }}
+            aria-hidden
+        >
+            <Icon name="layer" size={pxSize} />
+        </span>
     );
 }
 
 export function EnvironmentColorPicker({ value, onChange }) {
     return (
-        <div className="flex items-center gap-2">
-            {ENV_COLORS.map((c) => (
-                <button
-                    key={c}
-                    type="button"
-                    onClick={() => onChange(c)}
-                    className="mono-color-pick"
-                    style={{
-                        outlineColor: value === c ? ENV_COLOR_STYLES[c].color : 'transparent',
-                    }}
-                    aria-label={c}
-                >
-                    <EnvironmentColorDot color={c} size="0.75rem" />
-                </button>
-            ))}
+        <div role="radiogroup" aria-label="Environment color" style={{ display: 'inline-flex', gap: 6 }}>
+            {ENV_COLORS.map((c) => {
+                const checked = value === c;
+                const style = ENV_COLOR_STYLES[c];
+                return (
+                    <button
+                        key={c}
+                        type="button"
+                        role="radio"
+                        aria-checked={checked}
+                        aria-label={c}
+                        title={c}
+                        onClick={() => onChange(c)}
+                        className="r-env-color-pick"
+                        style={{ color: style.color }}
+                    >
+                        <EnvironmentColorDot color={c} size="0.75rem" />
+                    </button>
+                );
+            })}
         </div>
     );
 }

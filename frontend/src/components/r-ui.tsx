@@ -22,10 +22,42 @@ export function Pill({ children, kind, className }: { children: React.ReactNode;
     return <span className={cx('r-pill', kind, className)}>{children}</span>;
 }
 
-export function EnvPill({ env }: { env: string }) {
+export function EnvPill({ env, color }: { env: string; color?: string }) {
     const kind = env === 'production' ? 'env-prod' : env === 'staging' ? 'env-staging' : 'env-global';
-    return <Pill kind={kind}>{env}</Pill>;
+    return (
+        <Pill kind={kind}>
+            <EnvironmentIcon color={color} />
+            {env}
+        </Pill>
+    );
 }
+
+// Tinted layer glyph used inside `EnvPill` (and standalone where an env is
+// shown without a surrounding pill). Color falls back to `currentColor` so it
+// inherits the pill's text color when no env color is supplied.
+export function EnvironmentIcon({ color, size = 11 }: { color?: string; size?: number }) {
+    const fill = color ? (ENV_ICON_COLORS[color] || color) : 'currentColor';
+    return (
+        <span
+            style={{ display: 'inline-flex', color: fill, flexShrink: 0, lineHeight: 0 }}
+            aria-hidden
+        >
+            <Icon name="layer" size={size} />
+        </span>
+    );
+}
+
+// Resolved palette for the named env colors. Kept here so r-ui has no
+// dependency on the `ui.tsx` ENV_COLOR_STYLES table.
+const ENV_ICON_COLORS: Record<string, string> = {
+    green:  '#34d399',
+    blue:   '#60a5fa',
+    yellow: '#fbbf24',
+    red:    '#f87171',
+    purple: '#a78bfa',
+    orange: '#fb923c',
+    gray:   '#9ca3af',
+};
 
 // ---------- Button ----------
 type ButtonVariant = 'default' | 'primary' | 'danger' | 'ghost';

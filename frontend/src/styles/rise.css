@@ -177,7 +177,10 @@ a { color: inherit; }
 .r-brand-name { font-weight: 600; font-size: 15px; letter-spacing: -0.01em; color: var(--text); }
 
 .r-org {
-    display: flex; align-items: center; gap: 9px;
+    /* Hidden until multi-tenancy / workspace switching ships. Markup retained
+       so the slot returns once an org switcher is wired in. */
+    display: none;
+    align-items: center; gap: 9px;
     padding: 8px 10px;
     background: var(--surface-2);
     border-radius: 5px;
@@ -414,6 +417,85 @@ a { color: inherit; }
 .r-btn.danger:hover { background: var(--err); filter: brightness(1.07); }
 .r-btn:disabled, .r-btn[aria-disabled="true"] { opacity: 0.5; cursor: not-allowed; }
 .r-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* ---------- Split button ----------
+   Two segments that share a single border. The left segment is a stateful
+   toggle (e.g. live streaming); the right segment is an independent secondary
+   toggle (e.g. auto-scroll). Sized to match `.r-btn.small`. */
+.r-split-btn {
+    display: inline-flex;
+    align-items: stretch;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--surface);
+    overflow: hidden;
+    line-height: 1.2;
+}
+.r-split-btn button {
+    all: unset;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 12px;
+    color: var(--text);
+    transition: background 0.14s, color 0.14s;
+    white-space: nowrap;
+}
+.r-split-btn button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.r-split-btn-main { padding: 5px 12px 5px 14px; }
+.r-split-btn-side {
+    padding: 5px 9px;
+    border-left: 1px solid var(--border);
+    color: var(--text-soft);
+}
+.r-split-btn button:hover { background: var(--hover); }
+.r-split-btn-main .dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--text-soft);
+    flex: 0 0 6px;
+}
+.r-split-btn-main.active { color: var(--ok); background: var(--ok-bg); }
+.r-split-btn-main.active .dot {
+    background: var(--ok);
+    box-shadow: 0 0 0 3px color-mix(in oklch, var(--ok) 30%, transparent);
+    animation: r-pulse-soft 2.4s infinite;
+}
+.r-split-btn-side.active { color: var(--accent); background: var(--accent-soft); }
+
+/* ---------- Logs panel header ----------
+   Title + level filter on the left, controls on the right. Both groups wrap
+   internally; the whole row also wraps onto two lines at narrow widths so
+   things don't get squeezed together. */
+.r-logs-head { flex-wrap: wrap; row-gap: 10px; }
+.r-logs-head-left {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+    min-width: 0;
+}
+.r-logs-head-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+.r-logs-tail {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text-muted);
+}
+.r-logs-tail .r-field { width: 64px; -moz-appearance: textfield; }
+.r-logs-tail .r-field::-webkit-outer-spin-button,
+.r-logs-tail .r-field::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+}
 
 /* ---------- Inputs ---------- *
    All form fields share a single visual style: same border, padding, focus
@@ -765,6 +847,10 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
     overflow: hidden;
     background: var(--surface);
 }
+/* When a panel contains a wide table, let it scroll horizontally instead of
+   clipping. The panel-head scrolls along with the table — acceptable since
+   the head content is short relative to the panel width. */
+.r-panel:has(> .r-table) { overflow-x: auto; }
 .r-panel-head {
     padding: 12px 18px;
     display: flex;
@@ -827,18 +913,21 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
 /* ---------- Stat group ---------- */
 .r-stat-grid {
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 0;
+    /* auto-fit ensures stat cards wrap to a new row instead of overflowing
+       when the viewport is narrower than the natural width of the grid. */
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    /* 1px gaps + a matching background act as natural inter-cell dividers
+       that work correctly whether the row is full or wraps. */
+    gap: 1px;
     margin-bottom: 26px;
     border: 1px solid var(--border-faint);
     border-radius: 6px;
     overflow: hidden;
-    background: var(--surface);
+    background: var(--border-faint);
 }
-.r-stat-grid.cols-3 { grid-template-columns: repeat(3, 1fr); }
-.r-stat-grid.cols-2 { grid-template-columns: repeat(2, 1fr); }
-.r-stat { padding: 14px 18px; border-right: 1px solid var(--border-faint); }
-.r-stat:last-child { border-right: none; }
+.r-stat-grid.cols-3 { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+.r-stat-grid.cols-2 { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+.r-stat { padding: 14px 18px; background: var(--surface); }
 .r-stat-label {
     font-size: 11px;
     text-transform: uppercase;
@@ -990,6 +1079,12 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
 .r-grid-2-1 { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; }
 .r-grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
 .r-grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+/* Collapse multi-column page layouts to a single column at narrow widths so
+   their contents don't overflow the viewport. */
+@media (max-width: 880px) {
+    .r-grid-2-1, .r-grid-2 { grid-template-columns: 1fr; }
+    .r-grid-3 { grid-template-columns: 1fr; }
+}
 .r-stack { display: flex; flex-direction: column; gap: 20px; }
 .r-stack.tight { gap: 12px; }
 .r-row { display: flex; align-items: center; gap: 14px; }
@@ -1207,6 +1302,27 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
     color: white;
     font-weight: 600;
     text-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+}
+
+/* ---------- Environment color picker ---------- */
+.r-env-color-pick {
+    all: unset;
+    cursor: pointer;
+    width: 28px;
+    height: 28px;
+    display: inline-grid;
+    place-items: center;
+    border-radius: 6px;
+    border: 1px solid var(--border-faint);
+    background: var(--surface-2);
+    transition: border-color 0.14s, box-shadow 0.14s, background 0.14s;
+}
+.r-env-color-pick:hover { background: var(--hover); border-color: var(--text-soft); }
+.r-env-color-pick:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.r-env-color-pick[aria-checked="true"] {
+    border-color: currentColor;
+    background: color-mix(in oklch, currentColor 12%, var(--surface));
+    box-shadow: 0 0 0 2px color-mix(in oklch, currentColor 35%, transparent);
 }
 
 /* ---------- Loading spinner ---------- */

@@ -3,7 +3,7 @@ import CodeMirror from '@uiw/react-codemirror';
 import { json, jsonParseLinter } from '@codemirror/lang-json';
 import { linter } from '@codemirror/lint';
 import { EditorView } from '@codemirror/view';
-import { usePrefs } from '../lib/prefs';
+import { resolveTheme, usePrefs } from '../lib/prefs';
 
 const baseTheme = EditorView.theme({
     '&': { fontSize: '12.5px', backgroundColor: 'var(--surface)' },
@@ -51,7 +51,7 @@ export function JsonEditor({
                 onChange={onChange}
                 readOnly={readOnly}
                 editable={!readOnly}
-                theme={prefs.theme === 'dark' ? 'dark' : 'light'}
+                theme={resolveTheme(prefs.theme) === 'dark' ? 'dark' : 'light'}
                 extensions={extensions}
                 minHeight={minHeight}
                 maxHeight={maxHeight}
