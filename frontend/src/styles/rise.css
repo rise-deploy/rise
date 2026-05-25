@@ -686,6 +686,22 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
 }
 .r-cbox-item.on .check { background: var(--accent); border-color: var(--accent); }
 .r-cbox-item .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.r-cbox-item-text {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    overflow: hidden;
+}
+.r-cbox-item-text .label { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.r-cbox-item-text .hint {
+    color: var(--text-soft);
+    font-size: 11.5px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
 .r-cbox-item .hint { color: var(--text-soft); font-size: 11.5px; }
 .r-cbox-empty {
     padding: 14px 11px;

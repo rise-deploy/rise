@@ -688,8 +688,14 @@ export function Combobox(props: ComboboxProps) {
                                                 {on && <Icon name="check" size={10} />}
                                             </span>
                                         )}
-                                        <span className="grow">{o.label}</span>
-                                        {o.hint && <span className="hint">{o.hint}</span>}
+                                        {o.hint ? (
+                                            <span className="r-cbox-item-text">
+                                                <span className="label">{o.label}</span>
+                                                <span className="hint">{o.hint}</span>
+                                            </span>
+                                        ) : (
+                                            <span className="grow">{o.label}</span>
+                                        )}
                                         {!isMulti && on && <Icon name="check" size={13} />}
                                     </div>
                                 );
