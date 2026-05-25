@@ -556,6 +556,9 @@ export function Combobox(props: ComboboxProps) {
         } else {
             (props.onChange as (value: string) => void)(v);
             setOpen(false);
+            // Return focus to the trigger so keyboard users can immediately
+            // reopen the combobox with Space/Enter (matches Escape behaviour).
+            triggerRef.current?.focus();
         }
     };
 
@@ -693,6 +696,10 @@ export function Combobox(props: ComboboxProps) {
                                         role="option"
                                         aria-selected={on}
                                         onMouseEnter={() => setActiveIndex(i)}
+                                        // Keep focus on the search input during click so the
+                                        // input's onBlur handler doesn't close the popover
+                                        // before the click event reaches us.
+                                        onMouseDown={(e) => e.preventDefault()}
                                         onClick={() => toggleValue(o.value)}
                                     >
                                         {isMulti && (

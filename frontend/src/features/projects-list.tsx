@@ -180,7 +180,7 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
                         autoFocus
                     />
                 </Field>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
                     <Field
                         label="Access class"
                         hint={accessClasses.find(a => a.id === formData.access_class)?.description}
