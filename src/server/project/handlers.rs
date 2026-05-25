@@ -512,7 +512,6 @@ pub async fn update_project(
 
     // Update project fields
     let mut updated_project = project;
-    let mut should_trigger_resync = false;
 
     // Update owner if provided
     if let Some(owner) = payload.owner {
@@ -603,12 +602,30 @@ pub async fn update_project(
         // Only `access_class` currently affects ingress configuration via the
         // RiseProject CRD (see resource_builder.rs). When `visibility` becomes
         // ingress-enforced (per CLAUDE.md "Ingress Authentication"), extend
-        // this flag to cover that field too.
-        should_trigger_resync = updated_project.access_class != access_class;
+        // the same resync trigger to that field too.
+        let access_class_changed = updated_project.access_class != access_class;
         updated_project =
             projects::update_access_class(&state.db_pool, updated_project.id, access_class)
                 .await
                 .internal_err("Failed to update project access class")?;
+
+        // Fire immediately after the DB write so a later validation error in
+        // this same request can't leave the DB updated and the CRD stale.
+        if access_class_changed {
+            if let Some(ref kube_client) = state.kube_client {
+                if let Err(e) = crate::server::deployment::crd::trigger_resync(
+                    kube_client,
+                    &updated_project.name,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        project = %updated_project.name,
+                        "Failed to trigger CRD resync after access class update: {:?}", e
+                    );
+                }
+            }
+        }
     }
 
     // Update app users if provided
@@ -701,20 +718,6 @@ pub async fn update_project(
             projects::update_source_url(&state.db_pool, updated_project.id, normalized)
                 .await
                 .internal_err("Failed to update project source URL")?;
-    }
-
-    if should_trigger_resync {
-        if let Some(ref kube_client) = state.kube_client {
-            if let Err(e) =
-                crate::server::deployment::crd::trigger_resync(kube_client, &updated_project.name)
-                    .await
-            {
-                tracing::warn!(
-                    project = %updated_project.name,
-                    "Failed to trigger CRD resync after access class update: {:?}", e
-                );
-            }
-        }
     }
 
     let owner_info = resolve_owner_info(&state, &updated_project)
