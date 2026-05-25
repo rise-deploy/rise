@@ -154,6 +154,27 @@ pub async fn create_project(
                 return Err(ServerError::forbidden("You are not a member of this team"));
             }
 
+            // Team-owned project creation must verify the team belongs to
+            // the same Organization the new project will be created in. In
+            // the single-default-Org compatibility phase the only valid
+            // Organization is the default one, so we compare the team's
+            // linkage against `state.default_organization_uid`.
+            {
+                let mut conn =
+                    state.db_pool.acquire().await.internal_err(
+                        "Failed to acquire DB connection for team organization lookup",
+                    )?;
+                let team_org =
+                    crate::db::organization_links::organization_uid_for_team(&mut conn, uuid)
+                        .await
+                        .internal_err("Failed to look up team organization linkage")?;
+                if team_org != Some(state.default_organization_uid) {
+                    return Err(ServerError::forbidden(
+                        "This team is not assigned to the same Organization as the project",
+                    ));
+                }
+            }
+
             (None, Some(uuid))
         }
     };
@@ -194,6 +215,17 @@ pub async fn create_project(
                 .with_context("user_email", &user.email)
         }
     })?;
+
+    // Stamp the default Organization linkage in the same transaction so the
+    // post-bootstrap invariant — every project row has a non-null
+    // `organization_resource_uid` — holds at all times after this PR.
+    crate::db::organization_links::set_project_organization(
+        &mut tx,
+        project.id,
+        state.default_organization_uid,
+    )
+    .await
+    .internal_err("Failed to stamp default Organization on new project")?;
 
     // Bootstrap default "production" environment for new project
     crate::db::environments::create_default_for_project(&mut *tx, project.id)

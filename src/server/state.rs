@@ -64,7 +64,6 @@ pub struct AppState {
     /// pass at startup; typed APIs use this to stamp newly created
     /// users/teams/projects with the configured default Organization.
     #[cfg(feature = "backend")]
-    #[allow(dead_code)]
     pub default_organization_uid: uuid::Uuid,
     /// `controller_class_name` for the configured Kubernetes deployment
     /// controller. The webhook only reconciles projects whose Organization's

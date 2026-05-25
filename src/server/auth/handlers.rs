@@ -215,16 +215,21 @@ async fn sync_groups_after_login(
             )
         })?;
 
-    // Get or create user
-    let user = users::find_or_create(&state.db_pool, &claims.email)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to find/create user for group sync: {:#}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Database error".to_string(),
-            )
-        })?;
+    // Get or create user. Always pairs the user row with a default-Org
+    // membership so bootstrap validation never observes a half-created user.
+    let user = users::find_or_create_with_default_organization(
+        &state.db_pool,
+        &claims.email,
+        state.default_organization_uid,
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to find/create user for group sync: {:#}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Database error".to_string(),
+        )
+    })?;
 
     // Sync groups if present in claims (including empty groups - user may have been removed from all groups)
     if let Some(ref groups) = claims.groups {
@@ -468,16 +473,20 @@ pub async fn code_exchange(
         .and_then(|v| v.as_str())
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "Email claim missing".to_string()))?;
 
-    // Find or create user
-    let user = users::find_or_create(&state.db_pool, email)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to find/create user: {:#}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to process user".to_string(),
-            )
-        })?;
+    // Find or create user (paired with default-Org membership in one transaction)
+    let user = users::find_or_create_with_default_organization(
+        &state.db_pool,
+        email,
+        state.default_organization_uid,
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to find/create user: {:#}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to process user".to_string(),
+        )
+    })?;
 
     // Issue Rise JWT for user authentication (consumed by the CLI)
     let rise_jwt = state
@@ -563,8 +572,14 @@ pub async fn device_exchange(
                 }
             };
 
-            // Find or create user
-            let user = match users::find_or_create(&state.db_pool, email).await {
+            // Find or create user (paired with default-Org membership in one transaction)
+            let user = match users::find_or_create_with_default_organization(
+                &state.db_pool,
+                email,
+                state.default_organization_uid,
+            )
+            .await
+            {
                 Ok(user) => user,
                 Err(e) => {
                     tracing::error!("Failed to find/create user: {:#}", e);
@@ -1064,16 +1079,21 @@ pub async fn oauth_callback(
             (StatusCode::UNAUTHORIZED, "Invalid token claims".to_string())
         })?;
 
-        // Find or create user to get user_id for team lookup
-        let user = users::find_or_create(&state.db_pool, user_email)
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to find/create user: {:#}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Database error".to_string(),
-                )
-            })?;
+        // Find or create user to get user_id for team lookup (paired with
+        // default-Org membership in one transaction)
+        let user = users::find_or_create_with_default_organization(
+            &state.db_pool,
+            user_email,
+            state.default_organization_uid,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to find/create user: {:#}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Database error".to_string(),
+            )
+        })?;
 
         // Issue Rise JWT with user's team memberships
         // Use custom domain URL as audience when available, otherwise build from ingress template
@@ -1190,16 +1210,20 @@ pub async fn oauth_callback(
             )
         })?;
 
-    // Find or create user
-    let user = users::find_or_create(&state.db_pool, email)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to find or create user: {:#}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to process user".to_string(),
-            )
-        })?;
+    // Find or create user (paired with default-Org membership in one transaction)
+    let user = users::find_or_create_with_default_organization(
+        &state.db_pool,
+        email,
+        state.default_organization_uid,
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to find or create user: {:#}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to process user".to_string(),
+        )
+    })?;
 
     // Sync groups after login
     sync_groups_after_login(&state, &token_info.id_token).await?;
@@ -1474,16 +1498,20 @@ pub async fn ingress_auth(
 
     let email = ingress_claims.email;
 
-    // Find or create user in database
-    let user = users::find_or_create(&state.db_pool, &email)
-        .await
-        .map_err(|e| {
-            tracing::error!("Database error finding/creating user: {:#}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Database error".to_string(),
-            )
-        })?;
+    // Find or create user in database (paired with default-Org membership)
+    let user = users::find_or_create_with_default_organization(
+        &state.db_pool,
+        &email,
+        state.default_organization_uid,
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("Database error finding/creating user: {:#}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Database error".to_string(),
+        )
+    })?;
 
     tracing::debug!(
         project = %params.project,

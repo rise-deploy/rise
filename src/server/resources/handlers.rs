@@ -52,6 +52,12 @@ use crate::server::state::AppState;
 pub(crate) struct ResourceApiCtx {
     store: Arc<dyn ResourceStore>,
     operator_users: Arc<Vec<String>>,
+    /// DB pool used by application-layer guards (e.g. blocking Organization
+    /// deletion while typed children — teams/projects — still reference it
+    /// via `organization_resource_uid`). Optional so the resource-API tests
+    /// (which run without a typed-table schema) can keep using a stripped-
+    /// down context; production handlers always have it set.
+    db_pool: Option<sqlx::PgPool>,
 }
 
 impl ResourceApiCtx {
@@ -59,6 +65,7 @@ impl ResourceApiCtx {
         Self {
             store: state.resource_store.clone(),
             operator_users: state.operator_users.clone(),
+            db_pool: Some(state.db_pool.clone()),
         }
     }
 
@@ -993,6 +1000,36 @@ async fn delete_resource(
     user: &User,
     response_api_version: &str,
 ) -> Result<Response, ServerError> {
+    // Application-layer guard: refuse to delete an Organization that still
+    // owns typed children (teams/projects via `organization_resource_uid`).
+    // Those rows are not in the `resources` table, so the store's generic
+    // child-detection (which scans `resources.parent_uid`) cannot see them.
+    if row.api_version == rise_resource_api::API_VERSION_V1ALPHA1
+        && row.kind == rise_resource_api::ORGANIZATION_KIND
+    {
+        if let Some(pool) = ctx.db_pool.as_ref() {
+            let count =
+                crate::db::organization_links::count_typed_children_for_organization(pool, row.uid)
+                    .await
+                    .map_err(|e| {
+                        ServerError::internal_anyhow(
+                            e,
+                            "Failed to count typed children for organization",
+                        )
+                    })?;
+            if count > 0 {
+                return Err(ServerError::new(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "Organization '{}' has {count} typed child(ren) (teams or projects); \
+                         delete or reassign them before deleting the organization",
+                        row.name,
+                    ),
+                ));
+            }
+        }
+    }
+
     let outcome = ctx
         .store
         .delete(row.uid)
@@ -1238,8 +1275,9 @@ mod dispatch_tests {
             .await
             .expect("resource store migrations");
         ResourceApiCtx {
-            store: Arc::new(PgResourceStore::new(pool)),
+            store: Arc::new(PgResourceStore::new(pool.clone())),
             operator_users: Arc::new(vec![OPERATOR.into()]),
+            db_pool: Some(pool),
         }
     }
 
@@ -1987,6 +2025,114 @@ mod dispatch_tests {
         .await
         .expect_err("deleted resource must be gone");
         assert_eq!(err.status, StatusCode::NOT_FOUND);
+    }
+
+    // -------------------------------------------------------------------------
+    // Application-layer guards for typed-table linkage
+    // -------------------------------------------------------------------------
+
+    #[sqlx::test]
+    async fn delete_organization_with_linked_team_yields_409(pool: sqlx::PgPool) {
+        // PR5 guard: an Organization with typed children (teams/projects via
+        // `organization_resource_uid`) cannot be deleted. Those rows do not
+        // live in the `resources` table, so the generic child check cannot
+        // catch them — we enforce it at the application layer.
+
+        let ctx = ctx(pool.clone()).await;
+
+        // Create an Organization through the store (operator-only API,
+        // bypassing the typed `delete_resource` path until we exercise it).
+        let org_spec = json!({
+            "displayName": "Multi-Tenancy Test",
+        });
+        let org = ctx
+            .store
+            .create(CreateResourceParams {
+                api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
+                kind: rise_resource_api::ORGANIZATION_KIND.to_string(),
+                name: "guard-test".to_string(),
+                parent_uid: None,
+                annotations: BTreeMap::new(),
+                finalizers: vec![],
+                spec: org_spec,
+                validator: Some(Arc::new(rise_resource_store::OrganizationValidator)),
+            })
+            .await
+            .expect("create organization");
+
+        // Seed a team in the typed table that points at this Organization.
+        let user_id =
+            sqlx::query_scalar::<_, Uuid>("INSERT INTO users (email) VALUES ($1) RETURNING id")
+                .bind(format!("guard-{}@example.com", Uuid::new_v4()))
+                .fetch_one(&pool)
+                .await
+                .expect("seed user");
+        let team_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO teams (name, organization_resource_uid) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(format!("guard-team-{}", Uuid::new_v4().simple()))
+        .bind(org.uid)
+        .fetch_one(&pool)
+        .await
+        .expect("seed team");
+
+        // Attempt to delete the Organization — the guard must surface 409.
+        let err = dispatch_delete_inner(
+            &ctx,
+            format!(
+                "{}/{}/{}/{}",
+                rise_resource_api::API_VERSION_V1ALPHA1
+                    .split_once('/')
+                    .unwrap()
+                    .0,
+                rise_resource_api::API_VERSION_V1ALPHA1
+                    .split_once('/')
+                    .unwrap()
+                    .1,
+                rise_resource_api::ORGANIZATION_COLLECTION,
+                org.name,
+            ),
+            auth(OPERATOR),
+        )
+        .await
+        .expect_err("organization with typed children must be 409");
+        assert_eq!(err.status, StatusCode::CONFLICT);
+
+        // Verify the row is still there.
+        assert!(ctx.store.get(org.uid).await.unwrap().is_some());
+
+        // Cleanup the linkage. After clearing it, the delete should succeed.
+        sqlx::query("DELETE FROM teams WHERE id = $1")
+            .bind(team_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let resp = dispatch_delete_inner(
+            &ctx,
+            format!(
+                "{}/{}/{}/{}",
+                rise_resource_api::API_VERSION_V1ALPHA1
+                    .split_once('/')
+                    .unwrap()
+                    .0,
+                rise_resource_api::API_VERSION_V1ALPHA1
+                    .split_once('/')
+                    .unwrap()
+                    .1,
+                rise_resource_api::ORGANIZATION_COLLECTION,
+                org.name,
+            ),
+            auth(OPERATOR),
+        )
+        .await
+        .expect("delete must succeed once the linked team is gone");
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     // -------------------------------------------------------------------------

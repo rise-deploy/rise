@@ -316,6 +316,7 @@ async fn sync_once(
     pool: &PgPool,
     client: &mut GraphClient,
     election: &LeaderElection,
+    default_organization_uid: Uuid,
 ) -> Result<()> {
     // Step 1: Get a fresh token
     client.ensure_token().await?;
@@ -411,7 +412,7 @@ async fn sync_once(
     election.assert_leader().await?;
 
     for group in &groups_to_sync {
-        if let Err(e) = sync_group(&mut tx, group).await {
+        if let Err(e) = sync_group(&mut tx, group, default_organization_uid).await {
             tracing::error!(
                 "Failed to sync group '{}' (team '{}'): {:?}",
                 group.display_name,
@@ -461,6 +462,7 @@ async fn sync_once(
 async fn sync_group(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     group: &GroupToSync,
+    default_organization_uid: Uuid,
 ) -> Result<()> {
     // Find or create the team
     let existing = teams::find_by_name(&mut **tx, &group.team_name)
@@ -502,15 +504,33 @@ async fn sync_group(
         teams::set_idp_managed(&mut **tx, new_team.id, true)
             .await
             .context("Failed to set IdP-managed flag on new team")?;
+        // Stamp default-Organization linkage on the freshly created team so
+        // bootstrap validation never observes a team without one.
+        crate::db::organization_links::set_team_organization(
+            tx,
+            new_team.id,
+            default_organization_uid,
+        )
+        .await
+        .context("Failed to stamp default Organization on new team")?;
         new_team.id
     };
 
-    // Resolve member emails to user IDs (create users if needed)
+    // Resolve member emails to user IDs (create users if needed). Each new
+    // user also gets a default-Organization membership in the same
+    // transaction so bootstrap validation never observes a user without one.
     let mut expected_user_ids: HashSet<Uuid> = HashSet::new();
     for email in &group.member_emails {
         let user = users::find_or_create_with_executor(tx, email)
             .await
             .with_context(|| format!("Failed to find/create user '{}'", email))?;
+        crate::db::organization_links::ensure_user_membership(
+            tx,
+            user.id,
+            default_organization_uid,
+        )
+        .await
+        .with_context(|| format!("Failed to ensure default-Org membership for '{}'", email))?;
         expected_user_ids.insert(user.id);
     }
 
@@ -546,6 +566,7 @@ async fn sync_group(
 pub async fn run_entra_sync_loop(
     pool: PgPool,
     auth_settings: crate::server::settings::AuthSettings,
+    default_organization_uid: Uuid,
 ) {
     let tenant_id = match extract_tenant_id(&auth_settings.issuer) {
         Ok(t) => t,
@@ -629,7 +650,7 @@ pub async fn run_entra_sync_loop(
         }
 
         tracing::debug!("Running Entra active sync cycle");
-        if let Err(e) = sync_once(&pool, &mut client, &election).await {
+        if let Err(e) = sync_once(&pool, &mut client, &election, default_organization_uid).await {
             tracing::error!("Entra active sync failed: {:?}", e);
         }
         tracing::info!("Next Entra active sync in {}s", interval_secs);

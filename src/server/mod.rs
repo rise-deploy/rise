@@ -175,8 +175,10 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         info!("Starting Entra ID active sync");
         let pool = state.db_pool.clone();
         let auth_settings = settings.auth.clone();
+        let default_organization_uid = state.default_organization_uid;
         let handle = tokio::spawn(async move {
-            auth::entra_sync::run_entra_sync_loop(pool, auth_settings).await;
+            auth::entra_sync::run_entra_sync_loop(pool, auth_settings, default_organization_uid)
+                .await;
         });
         controller_handles.push(handle);
     }

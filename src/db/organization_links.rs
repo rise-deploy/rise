@@ -11,7 +11,6 @@ use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 /// Insert a `(user_id, organization_resource_uid)` row when absent. Idempotent.
-#[allow(dead_code)]
 pub async fn ensure_user_membership(
     conn: &mut PgConnection,
     user_id: Uuid,
@@ -168,7 +167,6 @@ pub async fn count_projects_missing_organization(pool: &PgPool) -> Result<i64> {
 /// application-level guard that blocks deletion of an Organization with typed
 /// children — these rows are not in the `resources` table, so the generic
 /// child-detection check doesn't cover them.
-#[allow(dead_code)]
 pub async fn count_typed_children_for_organization(
     pool: &PgPool,
     organization_resource_uid: Uuid,
@@ -226,7 +224,6 @@ pub async fn organization_uid_for_project(
 
 /// Stamp `organization_resource_uid` on a team. Used when creating a new team
 /// in the default-org bootstrap window.
-#[allow(dead_code)]
 pub async fn set_team_organization(
     conn: &mut PgConnection,
     team_id: Uuid,
