@@ -10,3 +10,4 @@ pub mod handlers;
 pub mod models;
 pub mod path;
 pub mod routes;
+pub mod schemas;
