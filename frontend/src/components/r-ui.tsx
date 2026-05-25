@@ -447,6 +447,7 @@ export interface ComboboxOption {
     value: string;
     label: string;
     hint?: React.ReactNode;
+    icon?: React.ReactNode;
     keywords?: string;
 }
 
@@ -569,28 +570,39 @@ export function Combobox(props: ComboboxProps) {
         }
     };
 
-    const labelFor = (v: string) => options.find(o => o.value === v)?.label || v;
+    const optionFor = (v: string) => options.find(o => o.value === v);
+    const labelFor = (v: string) => optionFor(v)?.label || v;
 
     let triggerContent: React.ReactNode;
     if (isMulti && selectedValues.length > 0) {
         triggerContent = (
             <span className="r-cbox-chips">
-                {selectedValues.map(v => (
-                    <span key={v} className="r-cbox-chip">
-                        {labelFor(v)}
-                        <button
-                            type="button"
-                            onClick={(e) => { e.stopPropagation(); toggleValue(v); }}
-                            aria-label={`Remove ${labelFor(v)}`}
-                        >
-                            <Icon name="close" size={10} />
-                        </button>
-                    </span>
-                ))}
+                {selectedValues.map(v => {
+                    const opt = optionFor(v);
+                    return (
+                        <span key={v} className="r-cbox-chip">
+                            {opt?.icon && <span className="r-cbox-icon" aria-hidden>{opt.icon}</span>}
+                            {labelFor(v)}
+                            <button
+                                type="button"
+                                onClick={(e) => { e.stopPropagation(); toggleValue(v); }}
+                                aria-label={`Remove ${labelFor(v)}`}
+                            >
+                                <Icon name="close" size={10} />
+                            </button>
+                        </span>
+                    );
+                })}
             </span>
         );
     } else if (!isMulti && props.value) {
-        triggerContent = <span className="grow">{labelFor(props.value as string)}</span>;
+        const opt = optionFor(props.value as string);
+        triggerContent = (
+            <>
+                {opt?.icon && <span className="r-cbox-icon" aria-hidden>{opt.icon}</span>}
+                <span className="grow">{labelFor(props.value as string)}</span>
+            </>
+        );
     } else {
         triggerContent = <span className="grow">{placeholder}</span>;
     }
@@ -688,6 +700,7 @@ export function Combobox(props: ComboboxProps) {
                                                 {on && <Icon name="check" size={10} />}
                                             </span>
                                         )}
+                                        {o.icon && <span className="r-cbox-icon" aria-hidden>{o.icon}</span>}
                                         {o.hint ? (
                                             <span className="r-cbox-item-text">
                                                 <span className="label">{o.label}</span>

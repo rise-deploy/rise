@@ -4,6 +4,7 @@ import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
 import { useToast } from '../components/toast';
 import { Button, Combobox, Field, Input, Modal, SearchInput, Segmented, Stat, StatGrid } from '../components/r-ui';
+import { Icon } from '../components/icon';
 import { ProjectTable } from '../components/project-table';
 import { LoadingState, ErrorState } from '../components/states';
 
@@ -196,8 +197,18 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
                             value={formData.owner}
                             onChange={(v) => setFormData({ ...formData, owner: v })}
                             options={[
-                                { value: 'self', label: `Self (${currentUser?.email || 'me'})`, keywords: 'me self' },
-                                ...teams.map(t => ({ value: t.id, label: `team:${t.name}`, keywords: t.name })),
+                                {
+                                    value: 'self',
+                                    label: `You (${currentUser?.email || 'me'})`,
+                                    icon: <Icon name="user" size={13} />,
+                                    keywords: 'me self you',
+                                },
+                                ...teams.map(t => ({
+                                    value: t.id,
+                                    label: t.name,
+                                    icon: <Icon name="users" size={13} />,
+                                    keywords: `team ${t.name}`,
+                                })),
                             ]}
                             placeholder="Select owner"
                         />

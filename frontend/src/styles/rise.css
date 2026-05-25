@@ -686,6 +686,14 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
 }
 .r-cbox-item.on .check { background: var(--accent); border-color: var(--accent); }
 .r-cbox-item .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.r-cbox-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-soft);
+    flex: 0 0 auto;
+    line-height: 0;
+}
 .r-cbox-item-text {
     flex: 1;
     min-width: 0;
