@@ -68,10 +68,11 @@ impl GlobalSchedule {
     /// Returns `Ok(false)` if the interval has not yet elapsed. The caller
     /// should skip this tick and try again on the next one.
     ///
-    /// This method does not check leadership — callers must already be the
-    /// leader for the corresponding `LeaderElection` before invoking it.
-    /// Composing the two gates (`is_leader()` + `try_claim()`) is the
-    /// expected pattern.
+    /// This method does not check leadership. When composing with a
+    /// `LeaderElection`, prefer [`Self::try_claim_or_skip_as_leader`] over
+    /// gating on `is_leader()` alone — the atomic flag can be briefly stale
+    /// during a leadership handover, letting a non-leader's claim succeed,
+    /// advance `last_run_at`, and stall the true leader for a full interval.
     pub async fn try_claim(&self) -> Result<bool, sqlx::Error> {
         let interval_secs = self.interval.as_secs_f64();
         // First run for an unseen schedule name inserts a row with
@@ -79,16 +80,16 @@ impl GlobalSchedule {
         // through `ON CONFLICT DO UPDATE`, gated by the `WHERE` clause: if
         // the interval has not elapsed, no row is updated and `RETURNING`
         // yields nothing.
-        let row: Option<(String,)> = sqlx::query_as(
+        let row = sqlx::query_scalar!(
             "INSERT INTO leader_schedules (name, last_run_at)
              VALUES ($1, NOW())
              ON CONFLICT (name) DO UPDATE
                SET last_run_at = NOW()
                WHERE leader_schedules.last_run_at + ($2 * INTERVAL '1 second') <= NOW()
              RETURNING name",
+            &self.name,
+            interval_secs,
         )
-        .bind(&self.name)
-        .bind(interval_secs)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.is_some())
