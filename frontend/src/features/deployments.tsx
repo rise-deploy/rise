@@ -5,7 +5,7 @@ import { navigate } from '../lib/navigation';
 import { copyToClipboard, formatDate, formatISO8601, formatRelativeTimeRounded, formatTimeRemaining, isSafeUrl, stripUrlScheme } from '../lib/utils';
 import { useToast } from '../components/toast';
 import { MonoSortButton, MonoTable, MonoTableBody, MonoTableEmptyRow, MonoTableFrame, MonoTableHead, MonoTableRow, MonoTd, MonoTh } from '../components/table';
-import { Button as RButton, Combobox, ConfirmDialog, ENV_COLOR_STYLES, Empty, EnvPill, EnvironmentColorDot, GroupPill, KV, KVRow, Modal, Panel, PanelBody, PanelHead, Pill, SearchInput, Segmented, SourceLinkGroup, SourceLinkGroupAction, Status, Tabs, Tooltip } from '../components/r-ui';
+import { Button as RButton, Combobox, ConfirmDialog, ENV_COLOR_STYLES, Empty, EnvPill, EnvironmentColorDot, GroupPill, KV, KVRow, Modal, Panel, PanelBody, PanelHead, Pill, SearchInput, Segmented, SourceLinkGroup, SourceLinkGroupAction, Status, Tabs } from '../components/r-ui';
 import { Icon } from '../components/icon';
 import { EnvVarsList } from './resources';
 import { EmptyState, ErrorState, LoadingState } from '../components/states';
@@ -1650,12 +1650,12 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                 <div className="title-stack">
                     <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
                         <h1 className="r-page-title mono" style={{ fontSize: 20 }}>{deployment.deployment_id}</h1>
-                        <Tooltip content={`Deployment status: ${deployment.status}`}>
-                            <Status status={deployment.status} />
-                        </Tooltip>
+                        <Status status={deployment.status} tooltip={`Deployment status: ${deployment.status}`} />
                         {deployment.environment ? (
-                            <Tooltip
-                                content={
+                            <EnvPill
+                                env={deployment.environment}
+                                color={deployment.environment_color}
+                                tooltip={
                                     <>
                                         <div>Environment: <span className="mono">{deployment.environment}</span></div>
                                         <div>
@@ -1664,24 +1664,22 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                                         </div>
                                     </>
                                 }
-                            >
-                                <EnvPill env={deployment.environment} color={deployment.environment_color} />
-                            </Tooltip>
+                            />
                         ) : null}
                         {deployment.deployment_group && (() => {
                             const env = environments.find((e) => e.name === deployment.environment);
                             const isPrimaryGroup = !!env && env.primary_deployment_group === deployment.deployment_group;
                             return (
-                                <Tooltip
-                                    content={
+                                <GroupPill
+                                    group={deployment.deployment_group}
+                                    primary={isPrimaryGroup}
+                                    tooltip={
                                         <>
                                             <div>Deployment group: <span className="mono">{deployment.deployment_group}</span></div>
                                             {isPrimaryGroup && <div>Primary group for the {deployment.environment} environment.</div>}
                                         </>
                                     }
-                                >
-                                    <GroupPill group={deployment.deployment_group} primary={isPrimaryGroup} />
-                                </Tooltip>
+                                />
                             );
                         })()}
                     </div>

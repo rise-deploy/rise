@@ -8,19 +8,21 @@ export function cx(...parts: Array<string | false | null | undefined>) {
 }
 
 // ---------- Status ----------
-export function Status({ status, bare = false }: { status: string; bare?: boolean }) {
+export function Status({ status, bare = false, tooltip, title }: { status: string; bare?: boolean; tooltip?: React.ReactNode; title?: string }) {
     const key = (status || '').toLowerCase();
-    return (
-        <span className={cx('r-status', key, bare && 'bare')}>
+    const node = (
+        <span className={cx('r-status', key, bare && 'bare')} title={tooltip ? undefined : title}>
             <span className="dot" />
             <span>{status}</span>
         </span>
     );
+    return tooltip ? <Tooltip content={tooltip}>{node}</Tooltip> : node;
 }
 
 // ---------- Pill ----------
-export function Pill({ children, kind, className }: { children: React.ReactNode; kind?: 'env-prod' | 'env-staging' | 'env-global' | 'accent'; className?: string }) {
-    return <span className={cx('r-pill', kind, className)}>{children}</span>;
+export function Pill({ children, kind, className, tooltip, title }: { children: React.ReactNode; kind?: 'env-prod' | 'env-staging' | 'env-global' | 'accent'; className?: string; tooltip?: React.ReactNode; title?: string }) {
+    const node = <span className={cx('r-pill', kind, className)} title={tooltip ? undefined : title}>{children}</span>;
+    return tooltip ? <Tooltip content={tooltip}>{node}</Tooltip> : node;
 }
 
 // Two-tone chip primitive: a small icon cell next to a name cell. The icon
@@ -34,21 +36,25 @@ export interface BasePillProps {
     iconStyle?: React.CSSProperties;
     nameClassName?: string;
     primary?: boolean;
+    /** Plain-text hover hint via the HTML `title` attribute. Use `tooltip` for rich content. */
     title?: string;
+    /** Rich tooltip content. When set, wraps the chip with the shared <Tooltip>. */
+    tooltip?: React.ReactNode;
 }
-export function BasePill({ icon, name, iconStyle, nameClassName, primary, title }: BasePillProps) {
-    return (
-        <span className={cx('r-chip', primary && 'primary')} title={title}>
+export function BasePill({ icon, name, iconStyle, nameClassName, primary, title, tooltip }: BasePillProps) {
+    const chip = (
+        <span className={cx('r-chip', primary && 'primary')} title={tooltip ? undefined : title}>
             <span className="r-chip-icon" style={iconStyle} aria-hidden>{icon}</span>
             <span className={cx('r-chip-name', nameClassName)}>{name}</span>
         </span>
     );
+    return tooltip ? <Tooltip content={tooltip}>{chip}</Tooltip> : chip;
 }
 
 // Icon cell tinted with the environment's color; name cell neutral. The color
 // signal is concentrated in the icon so different envs read as variants of
 // the same chip shape.
-export function EnvPill({ env, color }: { env: string; color?: string }) {
+export function EnvPill({ env, color, tooltip, title }: { env: string; color?: string; tooltip?: React.ReactNode; title?: string }) {
     const palette = color ? ENV_COLOR_STYLES[color] : undefined;
     return (
         <BasePill
@@ -56,6 +62,8 @@ export function EnvPill({ env, color }: { env: string; color?: string }) {
             iconStyle={palette ? { background: palette.background, color: palette.color } : undefined}
             name={env}
             nameClassName="r-chip-name-strong"
+            tooltip={tooltip}
+            title={title}
         />
     );
 }
@@ -65,14 +73,15 @@ export function EnvPill({ env, color }: { env: string; color?: string }) {
 // group) tints the icon cell with the accent color — same role the env color
 // plays in EnvPill. Name renders mono since groups are technical identifiers
 // (branch names, PR slugs, 'default').
-export function GroupPill({ group, primary }: { group: string; primary?: boolean }) {
+export function GroupPill({ group, primary, tooltip, title }: { group: string; primary?: boolean; tooltip?: React.ReactNode; title?: string }) {
     return (
         <BasePill
             icon={<Icon name="branch" size={11} />}
             name={group}
             nameClassName="mono"
             primary={primary}
-            title={primary ? 'Primary group for this environment' : undefined}
+            tooltip={tooltip}
+            title={title ?? (primary ? 'Primary group for this environment' : undefined)}
         />
     );
 }

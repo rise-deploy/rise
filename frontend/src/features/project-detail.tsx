@@ -4,7 +4,7 @@ import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
 import { copyToClipboard, formatISO8601, formatRelativeTimeRounded, isSafeUrl, stripUrlScheme } from '../lib/utils';
 import { useToast } from '../components/toast';
-import { Button, ConfirmDialog, Empty, EnvPill, EnvironmentColorDot, KV, KVRow, Modal, Panel, PanelBody, PanelHead, Pill, Status, Tabs, Tooltip, cx } from '../components/r-ui';
+import { Button, ConfirmDialog, Empty, EnvPill, EnvironmentColorDot, KV, KVRow, Modal, Panel, PanelBody, PanelHead, Pill, Status, Tabs, cx } from '../components/r-ui';
 import { Icon } from '../components/icon';
 import { LoadingState, ErrorState, EmptyState } from '../components/states';
 
@@ -136,18 +136,20 @@ export function ProjectDetail({ projectName, initialTab }: { projectName: string
                 <div className="title-stack">
                     <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8, flexWrap: 'wrap' }}>
                         <h1 className="r-page-title">{project.name}</h1>
-                        <Tooltip content={`Lifecycle status: ${project.status || 'Unknown'}`}>
-                            <Status status={project.status || 'Unknown'} />
-                        </Tooltip>
-                        <Tooltip
-                            content={
+                        <Status
+                            status={project.status || 'Unknown'}
+                            tooltip={`Lifecycle status: ${project.status || 'Unknown'}`}
+                        />
+                        <Pill
+                            kind="accent"
+                            tooltip={
                                 accessDescription
                                     ? <><div><strong>{accessLabel}</strong></div><div>{accessDescription}</div></>
                                     : `Access class: ${accessLabel}`
                             }
                         >
-                            <Pill kind="accent">{accessLabel}</Pill>
-                        </Tooltip>
+                            {accessLabel}
+                        </Pill>
                     </div>
                     <div className="r-meta-bar" style={{ marginTop: 8 }}>
                         {ownerType && (
