@@ -1,0 +1,251 @@
+---
+/**
+ * Render a generated JSON Schema as a browsable reference table.
+ *
+ * Usage:
+ *
+ *   import JsonSchema from '../../../components/JsonSchema.astro';
+ *
+ *   <JsonSchema file="organization.schema.json" title="Organization" />
+ *
+ * The component reads the schema file from `docs/engineering/public/schemas/`
+ * at build time (no runtime fetch), so the rendered output is fully static.
+ *
+ * It renders:
+ *   - the root object's properties (name, type, required flag, description)
+ *   - each `$defs` entry as a nested section, also as a properties table
+ *   - a "Download" link to the raw JSON for tooling consumers
+ *
+ * It deliberately does not try to be a complete JSON Schema visualizer:
+ * generated schemas in this codebase use a small, predictable subset
+ * (typed objects, `$ref`s into `$defs`, enums, arrays). Anything richer
+ * (oneOf/anyOf/allOf with multiple branches, conditional schemas, etc.)
+ * falls back to a code block.
+ */
+
+import fs from 'node:fs';
+import path from 'node:path';
+
+interface Props {
+  /** Schema filename under `public/schemas/`, e.g. `organization.schema.json`. */
+  file: string;
+  /** Heading text for the root section. */
+  title: string;
+}
+
+const { file, title } = Astro.props;
+
+const schemaPath = path.resolve(process.cwd(), 'public', 'schemas', file);
+const raw = fs.readFileSync(schemaPath, 'utf8');
+const schema: any = JSON.parse(raw);
+
+const downloadHref = `${import.meta.env.BASE_URL.replace(/\/$/, '')}/schemas/${file}`;
+
+interface PropRow {
+  name: string;
+  type: string;
+  required: boolean;
+  description: string;
+  defaultRepr: string | null;
+}
+
+function typeOf(node: any): string {
+  if (!node || typeof node !== 'object') return 'any';
+  if (node.$ref) {
+    // `$ref` is `#/$defs/<Name>`; strip the prefix for display.
+    const m = String(node.$ref).match(/\$defs\/(.+)$/);
+    return m ? m[1] : node.$ref;
+  }
+  if (Array.isArray(node.type)) {
+    return node.type.join(' | ');
+  }
+  if (node.type === 'array') {
+    return `array<${typeOf(node.items)}>`;
+  }
+  if (node.type === 'object' && node.additionalProperties) {
+    if (node.additionalProperties === true) {
+      return 'object<string, any>';
+    }
+    return `object<string, ${typeOf(node.additionalProperties)}>`;
+  }
+  if (node.enum) {
+    return node.enum.map((v: unknown) => JSON.stringify(v)).join(' | ');
+  }
+  if (node.oneOf || node.anyOf) {
+    const arr = node.oneOf || node.anyOf;
+    return arr.map((b: any) => typeOf(b)).join(' | ');
+  }
+  return node.type ?? 'any';
+}
+
+function asPropRows(node: any): PropRow[] {
+  if (!node?.properties) return [];
+  const required: Set<string> = new Set(node.required ?? []);
+  return Object.entries<any>(node.properties).map(([name, value]) => ({
+    name,
+    type: typeOf(value),
+    required: required.has(name),
+    description: value.description ?? '',
+    defaultRepr:
+      value.default !== undefined ? JSON.stringify(value.default) : null,
+  }));
+}
+
+const rootProps = asPropRows(schema);
+const defs: Record<string, any> = schema.$defs ?? {};
+const defNames = Object.keys(defs).sort();
+---
+
+<section class="json-schema">
+  <div class="js-header">
+    <h3 id={`schema-${file}`}>{title}</h3>
+    <a class="js-download" href={downloadHref} download>Download JSON</a>
+  </div>
+
+  {schema.description && <p class="js-description">{schema.description}</p>}
+
+  {rootProps.length > 0 && (
+    <table class="js-table">
+      <thead>
+        <tr>
+          <th>Field</th>
+          <th>Type</th>
+          <th>Required</th>
+          <th>Description</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rootProps.map((row) => (
+          <tr>
+            <td><code>{row.name}</code></td>
+            <td><code>{row.type}</code></td>
+            <td>{row.required ? 'yes' : 'no'}</td>
+            <td>
+              {row.description}
+              {row.defaultRepr !== null && (
+                <span class="js-default">
+                  {' '}default: <code>{row.defaultRepr}</code>
+                </span>
+              )}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  )}
+
+  {defNames.length > 0 && (
+    <details class="js-defs">
+      <summary>Nested types ({defNames.length})</summary>
+      {defNames.map((name) => {
+        const def = defs[name];
+        const rows = asPropRows(def);
+        return (
+          <div class="js-def">
+            <h4 id={`schema-${file}-${name}`}>{name}</h4>
+            {def.description && <p>{def.description}</p>}
+            {rows.length > 0 ? (
+              <table class="js-table">
+                <thead>
+                  <tr>
+                    <th>Field</th>
+                    <th>Type</th>
+                    <th>Required</th>
+                    <th>Description</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((row) => (
+                    <tr>
+                      <td><code>{row.name}</code></td>
+                      <td><code>{row.type}</code></td>
+                      <td>{row.required ? 'yes' : 'no'}</td>
+                      <td>
+                        {row.description}
+                        {row.defaultRepr !== null && (
+                          <span class="js-default">
+                            {' '}default: <code>{row.defaultRepr}</code>
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ) : (
+              <pre class="js-raw">{JSON.stringify(def, null, 2)}</pre>
+            )}
+          </div>
+        );
+      })}
+    </details>
+  )}
+</section>
+
+<style>
+  .json-schema {
+    margin: 1.5rem 0 2rem;
+    padding: 1rem 1.25rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.5rem;
+    background: var(--sl-color-gray-7, var(--sl-color-bg));
+  }
+  .js-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+  .js-header h3 {
+    margin: 0;
+  }
+  .js-download {
+    font-size: var(--sl-text-sm);
+  }
+  .js-description {
+    color: var(--sl-color-gray-2);
+    font-size: var(--sl-text-sm);
+    margin: 0.25rem 0 0.75rem;
+  }
+  .js-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 0.5rem;
+    font-size: var(--sl-text-sm);
+  }
+  .js-table th,
+  .js-table td {
+    text-align: left;
+    padding: 0.4rem 0.6rem;
+    border-bottom: 1px solid var(--sl-color-gray-5);
+    vertical-align: top;
+  }
+  .js-table th {
+    font-weight: 600;
+    color: var(--sl-color-gray-2);
+  }
+  .js-defs {
+    margin-top: 1rem;
+  }
+  .js-defs summary {
+    cursor: pointer;
+    font-weight: 600;
+  }
+  .js-def {
+    margin-top: 1rem;
+    padding-top: 0.75rem;
+    border-top: 1px dashed var(--sl-color-gray-5);
+  }
+  .js-def h4 {
+    margin: 0 0 0.25rem;
+  }
+  .js-default {
+    color: var(--sl-color-gray-3);
+  }
+  .js-raw {
+    background: var(--sl-color-gray-6);
+    padding: 0.5rem;
+    font-size: 0.8em;
+    overflow-x: auto;
+  }
+</style>
