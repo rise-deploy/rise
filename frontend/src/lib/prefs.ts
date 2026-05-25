@@ -80,12 +80,14 @@ export function usePrefs(): [Prefs, (next: Partial<Prefs>) => void] {
         applyPrefs(prefs);
     }, [prefs.palette, prefs.density, prefs.theme]);
 
-    // Follow OS color-scheme changes while theme is `system`.
+    // Follow OS color-scheme changes while theme is `system`. Re-read prefs
+    // from storage on each event so the listener can't apply a stale palette
+    // or density after the user changed them without re-rendering the effect.
     useEffect(() => {
         if (prefs.theme !== 'system') return;
         if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
         const mq = window.matchMedia('(prefers-color-scheme: dark)');
-        const onMqChange = () => applyPrefs(prefs);
+        const onMqChange = () => applyPrefs(loadPrefs());
         mq.addEventListener('change', onMqChange);
         return () => mq.removeEventListener('change', onMqChange);
     }, [prefs.theme]);

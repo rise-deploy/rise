@@ -754,7 +754,9 @@ export function AutocompleteInput({
                 <div
                     ref={popRef}
                     className="bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded shadow-lg max-h-48 overflow-y-auto"
-                    style={{ position: 'fixed', top: popRect.top, left: popRect.left, width: popRect.width, zIndex: 100 }}
+                    // Above legacy.css `.modal-backdrop` (9998) and modal content (9999) so the
+                    // suggestion list stays visible when AutocompleteInput is rendered in a legacy modal.
+                    style={{ position: 'fixed', top: popRect.top, left: popRect.left, width: popRect.width, zIndex: 10000 }}
                 >
                     {loading ? (
                         <div className="px-3 py-2 text-sm text-gray-500">Loading...</div>

@@ -97,7 +97,20 @@ export function Home({ user }: HomeProps) {
                             </thead>
                             <tbody>
                                 {recent.map(p => (
-                                    <tr key={p.id || p.name} className="click" onClick={() => navigate(`/project/${p.name}`)}>
+                                    <tr
+                                        key={p.id || p.name}
+                                        className="click"
+                                        onClick={() => navigate(`/project/${p.name}`)}
+                                        tabIndex={0}
+                                        role="button"
+                                        aria-label={`Open project ${p.name}`}
+                                        onKeyDown={(e) => {
+                                            if (e.key === 'Enter' || e.key === ' ') {
+                                                e.preventDefault();
+                                                navigate(`/project/${p.name}`);
+                                            }
+                                        }}
+                                    >
                                         <td>
                                             <div style={{ fontWeight: 500, fontSize: 13.5 }}>{p.name}</div>
                                             {p.primary_url && (
@@ -129,6 +142,15 @@ export function Home({ user }: HomeProps) {
                                 <div
                                     key={t.id || t.name}
                                     onClick={() => navigate(`/team/${t.name}`)}
+                                    tabIndex={0}
+                                    role="button"
+                                    aria-label={`Open team ${t.name}`}
+                                    onKeyDown={(e) => {
+                                        if (e.key === 'Enter' || e.key === ' ') {
+                                            e.preventDefault();
+                                            navigate(`/team/${t.name}`);
+                                        }
+                                    }}
                                     style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px', borderRadius: 5, cursor: 'pointer' }}
                                     onMouseEnter={e => (e.currentTarget.style.background = 'var(--hover)')}
                                     onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}

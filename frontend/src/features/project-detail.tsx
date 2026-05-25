@@ -155,7 +155,18 @@ export function ProjectDetail({ projectName, initialTab }: { projectName: string
                                 <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
                                     <Icon name={ownerType === 'team' ? 'users' : 'user'} size={13} />
                                     {ownerType === 'team' ? (
-                                        <a className="r-link" onClick={() => navigate(`/team/${ownerLabel}`)}>{ownerLabel}</a>
+                                        <a
+                                            className="r-link"
+                                            href={`/team/${ownerLabel}`}
+                                            onClick={(e) => {
+                                                // Allow modifier-click and middle-click to open in a new tab / window.
+                                                if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+                                                e.preventDefault();
+                                                navigate(`/team/${ownerLabel}`);
+                                            }}
+                                        >
+                                            {ownerLabel}
+                                        </a>
                                     ) : ownerLabel}
                                 </span>
                                 <span className="dot-sep" />
