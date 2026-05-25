@@ -7,7 +7,7 @@ use serde::Deserialize;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-use crate::build::{self, BuildOptions};
+use crate::build::{self, BuildOptions, PlatformSource};
 use crate::config::Config;
 
 // Re-export models from API module (always available)
@@ -429,6 +429,31 @@ struct GetRegistryCredsResponse {
     credentials: RegistryCredentials,
     #[allow(dead_code)]
     repository: String,
+    /// Backend-advertised container platform for the target cluster (e.g.
+    /// "linux/amd64"). Absent when the backend doesn't pin a node arch — CLI
+    /// then falls back to the host architecture.
+    #[serde(default)]
+    target_platform: Option<String>,
+}
+
+/// Registry credentials plus the backend-advertised target platform.
+struct DeploymentRegistryInfo {
+    credentials: RegistryCredentials,
+    target_platform: Option<String>,
+}
+
+/// Log the resolved build platform and the source it was inferred from, so the
+/// choice isn't silent when Rise infers it. Explicit user choices (CLI flag,
+/// env var, rise.toml) stay quiet — the user already knows what they asked for.
+fn log_platform_choice(platform: &str, source: PlatformSource, operation: &str) {
+    use crate::build::PlatformSource::*;
+    match source {
+        CliFlag | EnvVar | RiseToml => {} // explicit user choice, stay silent
+        BackendHint => info!("{operation} for {platform} (target cluster architecture)"),
+        HostFallback => {
+            info!("{operation} for {platform} (host architecture; pass --platform to override)")
+        }
+    }
 }
 
 /// Fetch registry push credentials scoped to a specific deployment.
@@ -438,7 +463,7 @@ async fn fetch_deployment_registry_credentials(
     token: &str,
     project_name: &str,
     deployment_id: &str,
-) -> Result<RegistryCredentials> {
+) -> Result<DeploymentRegistryInfo> {
     let url = format!(
         "{}/api/v1/projects/{}/deployments/{}/registry-credentials",
         backend_url, project_name, deployment_id
@@ -469,7 +494,10 @@ async fn fetch_deployment_registry_credentials(
         .await
         .context("Failed to parse registry credentials response")?;
 
-    Ok(resp.credentials)
+    Ok(DeploymentRegistryInfo {
+        credentials: resp.credentials,
+        target_platform: resp.target_platform,
+    })
 }
 
 /// A runtime environment variable override for a deployment
@@ -660,7 +688,7 @@ pub async fn create_deployment(
             };
 
             // Fetch deployment-scoped registry credentials
-            let credentials = fetch_deployment_registry_credentials(
+            let registry_info = fetch_deployment_registry_credentials(
                 http_client,
                 backend_url,
                 &token,
@@ -668,25 +696,34 @@ pub async fn create_deployment(
                 &deployment_info.deployment_id,
             )
             .await?;
+            let credentials = &registry_info.credentials;
 
             login_to_registry(
                 http_client,
                 backend_url,
                 &token,
                 &container_cli,
-                &credentials,
+                credentials,
                 deploy_opts.project_name,
                 &deployment_info.deployment_id,
             )
             .await?;
 
-            // Pull the source image for the configured platform
-            let platform = deploy_opts
-                .build_args
-                .platform
-                .as_deref()
-                .unwrap_or(build::DEFAULT_PLATFORM);
-            if let Err(e) = build::docker_pull(&container_cli, source_image, platform) {
+            // Pull the source image for the configured platform.
+            let toml_platform = deploy_opts
+                .toml_config
+                .as_ref()
+                .and_then(|c| c.build.as_ref())
+                .and_then(|b| b.platform.as_deref());
+            let env = build::env_var_non_empty("RISE_PLATFORM");
+            let (platform, source) = build::resolve_platform(
+                deploy_opts.build_args.platform.as_deref(),
+                env.as_deref(),
+                toml_platform,
+                registry_info.target_platform.as_deref(),
+            );
+            log_platform_choice(&platform, source, "Pulling");
+            if let Err(e) = build::docker_pull(&container_cli, source_image, &platform) {
                 update_deployment_status(
                     http_client,
                     backend_url,
@@ -776,17 +813,11 @@ pub async fn create_deployment(
             }
         );
     } else {
-        // Build from source path: Execute build and push
-        let options = BuildOptions::from_build_args(
-            config,
-            deployment_info.image_tag.clone(),
-            deploy_opts.path.to_string(),
-            deploy_opts.build_args,
-            deploy_opts.toml_config,
-        );
-
-        // Step 2: Fetch deployment-scoped registry credentials and login
-        let credentials = fetch_deployment_registry_credentials(
+        // Build from source path: Execute build and push.
+        //
+        // Fetch credentials first so the backend's target_platform hint can
+        // feed into BuildOptions' platform precedence.
+        let registry_info = fetch_deployment_registry_credentials(
             http_client,
             backend_url,
             &token,
@@ -795,12 +826,22 @@ pub async fn create_deployment(
         )
         .await?;
 
+        let options = BuildOptions::from_build_args(
+            config,
+            deployment_info.image_tag.clone(),
+            deploy_opts.path.to_string(),
+            deploy_opts.build_args,
+            deploy_opts.toml_config,
+            registry_info.target_platform.as_deref(),
+        );
+        log_platform_choice(&options.platform, options.platform_source, "Building");
+
         login_to_registry(
             http_client,
             backend_url,
             &token,
             options.container_cli.command(),
-            &credentials,
+            &registry_info.credentials,
             deploy_opts.project_name,
             &deployment_info.deployment_id,
         )

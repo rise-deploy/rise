@@ -557,7 +557,11 @@ EOF
 
 down_minikube() {
   command -v minikube >/dev/null 2>&1 || { ok "minikube not installed; nothing to delete"; return 0; }
-  if minikube profile list 2>/dev/null | awk '{print $2}' | grep -qx 'minikube'; then
+  # Match the setup probe (kubectl reachability) — `minikube profile list` can
+  # disagree with kubectl when the profile metadata is stale or wiped while
+  # the cluster container is still running, leaving junk behind.
+  if kubectl --context=minikube get nodes >/dev/null 2>&1 \
+     || minikube profile list 2>/dev/null | awk '{print $2}' | grep -qx 'minikube'; then
     log "Deleting minikube cluster"
     minikube delete >/dev/null 2>&1 || warn "minikube delete reported an error"
     ok "minikube cluster deleted"
