@@ -1,5 +1,6 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { isSafeUrl } from '../lib/utils';
 import { Icon } from './icon';
 
 export function cx(...parts: Array<string | false | null | undefined>) {
@@ -36,7 +37,8 @@ export function EnvPill({ env, color }: { env: string; color?: string }) {
 // shown without a surrounding pill). Color falls back to `currentColor` so it
 // inherits the pill's text color when no env color is supplied.
 export function EnvironmentIcon({ color, size = 11 }: { color?: string; size?: number }) {
-    const fill = color ? (ENV_ICON_COLORS[color] || color) : 'currentColor';
+    const resolved = color ? ENV_COLOR_STYLES[color]?.color : undefined;
+    const fill = resolved || color || 'currentColor';
     return (
         <span
             style={{ display: 'inline-flex', color: fill, flexShrink: 0, lineHeight: 0 }}
@@ -47,17 +49,185 @@ export function EnvironmentIcon({ color, size = 11 }: { color?: string; size?: n
     );
 }
 
-// Resolved palette for the named env colors. Kept here so r-ui has no
-// dependency on the `ui.tsx` ENV_COLOR_STYLES table.
-const ENV_ICON_COLORS: Record<string, string> = {
-    green:  '#34d399',
-    blue:   '#60a5fa',
-    yellow: '#fbbf24',
-    red:    '#f87171',
-    purple: '#a78bfa',
-    orange: '#fb923c',
-    gray:   '#9ca3af',
+// Resolved palette for the named env colors. Single source of truth for both
+// the `EnvironmentIcon` glyph and the bordered `EnvironmentColorDot`/picker.
+export const ENV_COLOR_STYLES: Record<string, { color: string; borderColor: string; background: string }> = {
+    green:  { color: '#34d399', borderColor: '#2e6c44', background: 'rgba(44, 105, 66, 0.2)' },
+    blue:   { color: '#60a5fa', borderColor: '#2e5a8c', background: 'rgba(44, 80, 140, 0.2)' },
+    yellow: { color: '#fbbf24', borderColor: '#7b6333', background: 'rgba(139, 112, 57, 0.22)' },
+    red:    { color: '#f87171', borderColor: '#7d4b4b', background: 'rgba(125, 75, 75, 0.24)' },
+    purple: { color: '#a78bfa', borderColor: '#6b3fa0', background: 'rgba(107, 63, 160, 0.2)' },
+    orange: { color: '#fb923c', borderColor: '#8c5a2e', background: 'rgba(140, 90, 46, 0.22)' },
+    gray:   { color: '#9ca3af', borderColor: '#4a4a4a', background: 'rgba(74, 74, 74, 0.2)' },
 };
+
+const ENV_COLORS = Object.keys(ENV_COLOR_STYLES);
+
+// Visually represents an environment with a layer-stack glyph tinted with the
+// environment's color. Ported from legacy `ui.tsx`; accepts the same loose size
+// shapes ("0.75rem", "12", number, "12px") so Wave 2 migrations are mechanical.
+export function EnvironmentColorDot({ color = 'green', size = '0.75rem', className = '' }: { color?: string; size?: string | number; className?: string }) {
+    const style = ENV_COLOR_STYLES[color] || ENV_COLOR_STYLES.green;
+    let pxSize = 12;
+    if (typeof size === 'number') pxSize = size;
+    else if (typeof size === 'string') {
+        const match = size.match(/^([\d.]+)(rem|px)?$/);
+        if (match) {
+            const value = parseFloat(match[1]);
+            pxSize = match[2] === 'px' ? value : Math.round(value * 16 + 4);
+        }
+    }
+    return (
+        <span
+            className={className}
+            style={{ display: 'inline-flex', color: style.color, flexShrink: 0, lineHeight: 0 }}
+            aria-hidden
+        >
+            <Icon name="layer" size={pxSize} />
+        </span>
+    );
+}
+
+export function EnvironmentColorPicker({ value, onChange }: { value: string; onChange: (color: string) => void }) {
+    return (
+        <div role="radiogroup" aria-label="Environment color" style={{ display: 'inline-flex', gap: 6 }}>
+            {ENV_COLORS.map((c) => {
+                const checked = value === c;
+                const style = ENV_COLOR_STYLES[c];
+                return (
+                    <button
+                        key={c}
+                        type="button"
+                        role="radio"
+                        aria-checked={checked}
+                        aria-label={c}
+                        title={c}
+                        onClick={() => onChange(c)}
+                        className="r-env-color-pick"
+                        style={{ color: style.color }}
+                    >
+                        <EnvironmentColorDot color={c} size="0.75rem" />
+                    </button>
+                );
+            })}
+        </div>
+    );
+}
+
+// ---------- Source link helpers (ported from legacy ui.tsx) ----------
+function iconForUrl(href: string): string {
+    try {
+        const host = new URL(href).hostname;
+        if (host.includes('github')) return '/assets/github.svg';
+        if (host.includes('gitlab')) return '/assets/gitlab.svg';
+    } catch { /* fall through */ }
+    return '/assets/external-link.svg';
+}
+
+/** Extract a display label for a PR/MR URL, e.g. "Pull Request (#99)" or "Merge Request (!42)". */
+function prLabel(href: string): string {
+    try {
+        const url = new URL(href);
+        const parts = url.pathname.split('/').filter(Boolean);
+        if (url.hostname.includes('gitlab')) {
+            const idx = parts.indexOf('merge_requests');
+            const num = idx >= 0 ? parts[idx + 1] : undefined;
+            return num ? `Merge Request (!${num})` : 'Merge Request';
+        }
+        const idx = parts.indexOf('pull');
+        const num = idx >= 0 ? parts[idx + 1] : undefined;
+        return num ? `Pull Request (#${num})` : 'Pull Request';
+    } catch {
+        return 'Pull Request';
+    }
+}
+
+// Inline class strings mirror the legacy markup. The legacy `--mono-*` tokens
+// were retired with the redesign, so we map them onto the current token set
+// (`--border` / `--text-soft` / `--text` / `--err`) here.
+const sourceLinkBase = 'px-2.5 py-1 text-xs cursor-pointer hover:bg-[var(--hover)] transition-colors';
+const sourceLinkDefault = `${sourceLinkBase} text-[var(--text-soft)] hover:text-[var(--text)]`;
+
+export function ExternalLinkButton({ href, label, onClick }: { href: string; label: string; onClick?: (e: React.MouseEvent) => void }) {
+    if (!isSafeUrl(href)) return null;
+    const icon = iconForUrl(href);
+    return (
+        <a
+            href={href}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-[var(--border)] hover:border-[var(--border-strong)] text-[var(--text-soft)] hover:text-[var(--text)] transition-colors"
+            onClick={onClick}
+        >
+            <span
+                className="w-3 h-3 svg-mask inline-block"
+                style={{ maskImage: `url(${icon})`, WebkitMaskImage: `url(${icon})` }}
+            />
+            {label}
+        </a>
+    );
+}
+
+export function SourceLinkGroupAction({ onClick, variant, children }: { onClick?: (e: React.MouseEvent) => void; variant?: 'danger'; children: React.ReactNode }) {
+    const cls = variant === 'danger'
+        ? `${sourceLinkBase} text-[var(--err)] hover:text-[var(--text)]`
+        : sourceLinkDefault;
+    return <button type="button" className={cls} onClick={onClick}>{children}</button>;
+}
+
+export function SourceLinkGroup({ jobUrl, prUrl, onClick, children }: { jobUrl?: string | null; prUrl?: string | null; onClick?: (e: React.MouseEvent) => void; children?: React.ReactNode }) {
+    const safeJob = jobUrl && isSafeUrl(jobUrl) ? jobUrl : null;
+    const safePr = prUrl && isSafeUrl(prUrl) ? prUrl : null;
+    if (!safeJob && !safePr && !children) return null;
+
+    // Single link, no extra children → standalone button
+    if (!children && (safeJob ? 1 : 0) + (safePr ? 1 : 0) === 1) {
+        const href = (safeJob || safePr)!;
+        const label = safeJob ? 'CI Job' : prLabel(href);
+        return <ExternalLinkButton href={href} label={label} onClick={onClick} />;
+    }
+
+    const prIcon = safePr ? iconForUrl(safePr) : null;
+    const prText = safePr ? prLabel(safePr) : null;
+    const jobIcon = safeJob ? iconForUrl(safeJob) : null;
+    return (
+        <span className="inline-flex items-center text-xs border border-[var(--border)] hover:border-[var(--border-strong)] transition-colors">
+            {safePr && (
+                <a
+                    href={safePr}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className={`${sourceLinkDefault} inline-flex items-center gap-1.5`}
+                    onClick={onClick}
+                >
+                    <span
+                        className="w-3 h-3 svg-mask inline-block"
+                        style={{ maskImage: `url(${prIcon})`, WebkitMaskImage: `url(${prIcon})` }}
+                    />
+                    {prText}
+                </a>
+            )}
+            {safePr && safeJob && <span className="w-px self-stretch bg-[var(--border)]" />}
+            {safeJob && (
+                <a
+                    href={safeJob}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className={`${sourceLinkDefault} inline-flex items-center gap-1.5`}
+                    onClick={onClick}
+                >
+                    <span
+                        className="w-3 h-3 svg-mask inline-block"
+                        style={{ maskImage: `url(${jobIcon})`, WebkitMaskImage: `url(${jobIcon})` }}
+                    />
+                    CI Job
+                </a>
+            )}
+            {children && (safeJob || safePr) && <span className="w-px self-stretch bg-[var(--border)]" />}
+            {children}
+        </span>
+    );
+}
 
 // ---------- Button ----------
 type ButtonVariant = 'default' | 'primary' | 'danger' | 'ghost';
@@ -163,7 +333,15 @@ export function Stat({ label, value, unit, delta, deltaTone }: { label: React.Re
 }
 
 // ---------- Modal ----------
+// Focusable selector used for autofocus + focus-trap (mirrors the legacy modal).
+const FOCUSABLE_SELECTOR = 'a[href], area[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), button:not([disabled]), iframe, object, embed, [tabindex]:not([tabindex="-1"]), [contenteditable]';
+const AUTOFOCUS_SELECTOR = '[data-autofocus], input:not([type="hidden"]):not([disabled]), select:not([disabled]), textarea:not([disabled])';
+
 export function Modal({ isOpen, onClose, title, sub, children, footer, width }: { isOpen: boolean; onClose: () => void; title?: React.ReactNode; sub?: React.ReactNode; children: React.ReactNode; footer?: React.ReactNode; width?: 'default' | 'wide' | 'xwide' }) {
+    const modalRef = useRef<HTMLDivElement | null>(null);
+    const bodyRef = useRef<HTMLDivElement | null>(null);
+
+    // Escape-to-close
     useEffect(() => {
         if (!isOpen) return;
         const handler = (e: KeyboardEvent) => {
@@ -173,18 +351,69 @@ export function Modal({ isOpen, onClose, title, sub, children, footer, width }: 
         return () => window.removeEventListener('keydown', handler);
     }, [isOpen, onClose]);
 
+    // Body scroll lock (capture and restore the previous value so nested or
+    // strict-mode double-mounts don't accidentally clobber the user's prior
+    // value).
+    useEffect(() => {
+        if (!isOpen) return;
+        const prev = document.body.style.overflow;
+        document.body.style.overflow = 'hidden';
+        return () => { document.body.style.overflow = prev; };
+    }, [isOpen]);
+
+    // Autofocus the first focusable input after mount
+    useEffect(() => {
+        if (!isOpen) return;
+        const t = window.setTimeout(() => {
+            const el = bodyRef.current?.querySelector<HTMLElement>(AUTOFOCUS_SELECTOR);
+            el?.focus();
+        }, 0);
+        return () => window.clearTimeout(t);
+    }, [isOpen]);
+
+    // Focus trap: keep Tab cycling within the modal
+    const onKeyDownTrap = (e: React.KeyboardEvent<HTMLDivElement>) => {
+        if (e.key !== 'Tab') return;
+        const root = modalRef.current;
+        if (!root) return;
+        const focusables = Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR))
+            .filter(el => !el.hasAttribute('disabled') && el.tabIndex !== -1 && el.offsetParent !== null);
+        if (focusables.length === 0) return;
+        const first = focusables[0];
+        const last = focusables[focusables.length - 1];
+        const active = document.activeElement as HTMLElement | null;
+        if (e.shiftKey) {
+            if (active === first || !root.contains(active)) {
+                e.preventDefault();
+                last.focus();
+            }
+        } else {
+            if (active === last) {
+                e.preventDefault();
+                first.focus();
+            }
+        }
+    };
+
     if (!isOpen) return null;
 
     const node = (
         <div className="r-modal-mask" onClick={onClose}>
-            <div className={cx('r-modal', width === 'wide' && 'wide', width === 'xwide' && 'xwide')} onClick={e => e.stopPropagation()}>
+            <div
+                ref={modalRef}
+                className={cx('r-modal', width === 'wide' && 'wide', width === 'xwide' && 'xwide')}
+                onClick={e => e.stopPropagation()}
+                onKeyDown={onKeyDownTrap}
+                role="dialog"
+                aria-modal="true"
+            >
                 {(title || sub) && (
                     <div className="r-modal-head">
                         {title && <div className="r-modal-title">{title}</div>}
                         {sub && <div className="r-modal-sub">{sub}</div>}
                     </div>
                 )}
-                <div className="r-modal-body">{children}</div>
+                <div className="r-modal-body" ref={bodyRef}>{children}</div>
                 {footer && <div className="r-modal-foot">{footer}</div>}
             </div>
         </div>
@@ -246,6 +475,8 @@ interface ComboboxMultiProps extends ComboboxBaseProps {
 
 export type ComboboxProps = ComboboxSingleProps | ComboboxMultiProps;
 
+const COMBOBOX_POPOVER_ESTIMATED_HEIGHT = 280;
+
 export function Combobox(props: ComboboxProps) {
     const { options, placeholder = 'Select…', disabled, searchPlaceholder = 'Search…', emptyText = 'No matches', className, id, allowClear } = props;
     const [open, setOpen] = useState(false);
@@ -256,6 +487,9 @@ export function Combobox(props: ComboboxProps) {
     const triggerRef = useRef<HTMLDivElement>(null);
     const popRef = useRef<HTMLDivElement>(null);
     const inputRef = useRef<HTMLInputElement>(null);
+
+    const listboxId = useId();
+    const optionId = (i: number) => `${listboxId}-opt-${i}`;
 
     const isMulti = (props.multi as boolean) === true;
     const selectedValues = isMulti ? (props.value as string[]) : (props.value ? [props.value as string] : []);
@@ -289,13 +523,25 @@ export function Combobox(props: ComboboxProps) {
             const el = triggerRef.current;
             if (!el) return;
             const r = el.getBoundingClientRect();
-            setPopRect({ top: r.bottom + 4, left: r.left, width: r.width });
+            // Prefer the measured popover height once it has rendered; before
+            // that, fall back to a sane estimate so the first paint already
+            // flips when it needs to.
+            const measured = popRef.current?.offsetHeight;
+            const popHeight = measured && measured > 0 ? measured : COMBOBOX_POPOVER_ESTIMATED_HEIGHT;
+            const wouldOverflow = r.bottom + popHeight > window.innerHeight - 8;
+            const top = wouldOverflow
+                ? Math.max(8, r.top - popHeight - 4)
+                : r.bottom + 4;
+            setPopRect({ top, left: r.left, width: r.width });
         };
         update();
+        // Re-measure after the popover renders to flip when our estimate was wrong.
+        const raf = requestAnimationFrame(update);
         window.addEventListener('scroll', update, true);
         window.addEventListener('resize', update);
         setTimeout(() => inputRef.current?.focus(), 30);
         return () => {
+            cancelAnimationFrame(raf);
             window.removeEventListener('scroll', update, true);
             window.removeEventListener('resize', update);
         };
@@ -352,12 +598,24 @@ export function Combobox(props: ComboboxProps) {
     const isEmpty = isMulti ? selectedValues.length === 0 : !props.value;
     const showClear = allowClear && !isEmpty && !disabled;
 
+    // Close when focus leaves both the wrapper and the portaled popover. The
+    // existing mousedown click-away handles clicks; this covers keyboard Tab.
+    const handleSearchBlur = () => {
+        window.setTimeout(() => {
+            const active = document.activeElement as Node | null;
+            if (!active) { setOpen(false); return; }
+            if (wrapRef.current?.contains(active)) return;
+            if (popRef.current?.contains(active)) return;
+            setOpen(false);
+        }, 0);
+    };
+
     return (
         <div ref={wrapRef} className={cx('r-cbox', open && 'open', className)}>
             <div
                 ref={triggerRef}
                 id={id}
-                role="button"
+                role="combobox"
                 tabIndex={disabled ? -1 : 0}
                 aria-disabled={disabled || undefined}
                 className={cx('r-cbox-trigger', isEmpty && 'placeholder')}
@@ -369,6 +627,7 @@ export function Combobox(props: ComboboxProps) {
                 }}
                 aria-haspopup="listbox"
                 aria-expanded={open}
+                aria-controls={listboxId}
             >
                 {triggerContent}
                 {showClear && (
@@ -390,6 +649,7 @@ export function Combobox(props: ComboboxProps) {
             {open && popRect && createPortal(
                 <div
                     ref={popRef}
+                    id={listboxId}
                     className="r-cbox-pop"
                     role="listbox"
                     style={{ position: 'fixed', top: popRect.top, left: popRect.left, width: popRect.width }}
@@ -401,7 +661,10 @@ export function Combobox(props: ComboboxProps) {
                             value={query}
                             onChange={(e) => setQuery(e.target.value)}
                             onKeyDown={onKeyDown}
+                            onBlur={handleSearchBlur}
                             placeholder={searchPlaceholder}
+                            aria-controls={listboxId}
+                            aria-activedescendant={filtered[activeIndex] ? optionId(activeIndex) : undefined}
                         />
                     </div>
                     <div className="r-cbox-list">
@@ -413,6 +676,7 @@ export function Combobox(props: ComboboxProps) {
                                 return (
                                     <div
                                         key={o.value}
+                                        id={optionId(i)}
                                         className={cx('r-cbox-item', on && 'on', i === activeIndex && 'sel')}
                                         role="option"
                                         aria-selected={on}
@@ -568,6 +832,141 @@ export function ConfirmDialog({ isOpen, onClose, onConfirm, title, message, conf
                 </Field>
             )}
         </Modal>
+    );
+}
+
+// ---------- AutocompleteInput ----------
+// Freeform text input with a portaled suggestion dropdown. Unlike `Combobox`,
+// this lets users type values that aren't in the suggestion list — useful for
+// email entry where the suggestion list is an autocomplete helper, not a
+// constraint.
+export function AutocompleteInput({
+    id,
+    value,
+    onChange,
+    options = [],
+    type = 'text',
+    placeholder = '',
+    disabled = false,
+    loading = false,
+    multiValue = false,
+    noMatchesText = 'No matches',
+    className = '',
+    onEnter,
+}: {
+    id?: string;
+    value: string;
+    onChange: (v: string) => void;
+    options?: string[];
+    type?: string;
+    placeholder?: string;
+    disabled?: boolean;
+    loading?: boolean;
+    multiValue?: boolean;
+    noMatchesText?: string;
+    className?: string;
+    onEnter?: () => void;
+}) {
+    const [isOpen, setIsOpen] = useState(false);
+    const [popRect, setPopRect] = useState<{ top: number; left: number; width: number } | null>(null);
+    const wrapRef = useRef<HTMLDivElement | null>(null);
+    const inputRef = useRef<HTMLInputElement | null>(null);
+    const popRef = useRef<HTMLDivElement | null>(null);
+
+    useEffect(() => {
+        function handleClickOutside(e: MouseEvent) {
+            const t = e.target as Node;
+            if (wrapRef.current && wrapRef.current.contains(t)) return;
+            if (popRef.current && popRef.current.contains(t)) return;
+            setIsOpen(false);
+        }
+        document.addEventListener('mousedown', handleClickOutside);
+        return () => document.removeEventListener('mousedown', handleClickOutside);
+    }, []);
+
+    // Position the suggestion list as a fixed-position portal so it is not
+    // clipped by a surrounding modal/overflow container.
+    useEffect(() => {
+        if (!isOpen) { setPopRect(null); return; }
+        const update = () => {
+            const el = inputRef.current;
+            if (!el) return;
+            const r = el.getBoundingClientRect();
+            setPopRect({ top: r.bottom + 4, left: r.left, width: r.width });
+        };
+        update();
+        window.addEventListener('scroll', update, true);
+        window.addEventListener('resize', update);
+        return () => {
+            window.removeEventListener('scroll', update, true);
+            window.removeEventListener('resize', update);
+        };
+    }, [isOpen]);
+
+    const rawQuery = multiValue ? (value || '').split(',').pop() || '' : (value || '');
+    const query = rawQuery.trim().toLowerCase();
+    const uniqueOptions = Array.from(new Set((options || []).filter(Boolean)));
+    const filteredOptions = uniqueOptions.filter((opt) => opt.toLowerCase().includes(query));
+
+    const handleSelect = (selected: string) => {
+        if (multiValue) {
+            const chunks = (value || '').split(',');
+            const prefix = chunks.slice(0, -1).map((p) => p.trim()).filter(Boolean).join(', ');
+            onChange(prefix ? `${prefix}, ${selected}` : selected);
+        } else {
+            onChange(selected);
+        }
+        setIsOpen(false);
+    };
+
+    return (
+        <div ref={wrapRef} className={cx('relative', className)}>
+            <input
+                ref={inputRef}
+                type={type}
+                id={id}
+                className="mono-input w-full"
+                placeholder={placeholder}
+                value={value}
+                onChange={(e) => {
+                    onChange(e.target.value);
+                    if (!isOpen) setIsOpen(true);
+                }}
+                onKeyDown={(e) => {
+                    if (e.key === 'Enter' && onEnter) onEnter();
+                }}
+                onFocus={() => setIsOpen(true)}
+                onClick={() => setIsOpen(true)}
+                disabled={disabled || loading}
+            />
+            {isOpen && popRect && createPortal(
+                <div
+                    ref={popRef}
+                    className="bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded shadow-lg max-h-48 overflow-y-auto"
+                    // Above legacy.css `.modal-backdrop` (9998) and modal content (9999) so the
+                    // suggestion list stays visible when AutocompleteInput is rendered in a legacy modal.
+                    style={{ position: 'fixed', top: popRect.top, left: popRect.left, width: popRect.width, zIndex: 10000 }}
+                >
+                    {loading ? (
+                        <div className="px-3 py-2 text-sm text-gray-500">Loading...</div>
+                    ) : filteredOptions.length === 0 ? (
+                        <div className="px-3 py-2 text-sm text-gray-500">{noMatchesText}</div>
+                    ) : (
+                        filteredOptions.map((opt) => (
+                            <button
+                                key={opt}
+                                type="button"
+                                className="w-full text-left px-3 py-2 text-sm hover:bg-gray-100 dark:hover:bg-gray-700"
+                                onClick={() => handleSelect(opt)}
+                            >
+                                {opt}
+                            </button>
+                        ))
+                    )}
+                </div>,
+                document.body
+            )}
+        </div>
     );
 }
 

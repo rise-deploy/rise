@@ -4,7 +4,7 @@ import { api } from '../lib/api';
 import { CONFIG } from '../lib/config';
 import { navigate } from '../lib/navigation';
 import { useToast } from '../components/toast';
-import { AutocompleteInput } from '../components/ui';
+import { AutocompleteInput } from '../components/r-ui';
 import {
     Button as RButton,
     Combobox as RCombobox,

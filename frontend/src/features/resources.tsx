@@ -5,13 +5,14 @@ import { CONFIG } from '../lib/config';
 import { navigate } from '../lib/navigation';
 import { formatDate, formatRelativeTimeRounded } from '../lib/utils';
 import { useToast } from '../components/toast';
-import { Button, EnvironmentColorDot, EnvironmentColorPicker, ModalTabs, MonoTabButton, MonoTag } from '../components/ui';
 import {
     Alert as RAlert,
     Button as RButton,
     Combobox as RCombobox,
     ConfirmDialog as RConfirmDialog,
     Empty as REmpty,
+    EnvironmentColorDot,
+    EnvironmentColorPicker,
     Field as RField,
     GroupBar as RGroupBar,
     Input as RInput,
@@ -473,9 +474,9 @@ export function EnvironmentsList({ projectName, platformConstraints = null }) {
                     <div className="r-section-title">Environments</div>
                     <div className="r-section-sub">Deployment targets and their deployment groups for this project.</div>
                 </div>
-                <Button variant="primary" icon="plus" onClick={handleAddClick}>
+                <RButton variant="primary" icon="plus" onClick={handleAddClick}>
                     New environment
-                </Button>
+                </RButton>
             </div>
 
             {environments.length === 0 ? (
@@ -752,9 +753,9 @@ export function DomainsList({ projectName, defaultUrl = null }) {
                     <div className="r-section-title">Custom domains</div>
                     <div className="r-section-sub">Point your own domains at this project. The primary domain is used as the default URL.</div>
                 </div>
-                <Button variant="primary" icon="plus" onClick={handleAddClick}>
+                <RButton variant="primary" icon="plus" onClick={handleAddClick}>
                     Add domain
-                </Button>
+                </RButton>
             </div>
 
             <RPanel>
@@ -1713,29 +1714,23 @@ export function ExtensionsList({ projectName }) {
                     {selectedExtension && (
                         <>
                             {/* Tab Navigation */}
-                            <ModalTabs className="px-2">
-                                    {hasExtensionUI(selectedExtension.extension_type) && (
-                                        <MonoTabButton className="mr-4" active={modalTab === 'ui'} onClick={() => setModalTab('ui')}>
-                                            Configure
-                                        </MonoTabButton>
-                                    )}
-                                    <MonoTabButton className="mr-4" active={modalTab === 'config'} onClick={() => setModalTab('config')}>
-                                        {hasExtensionUI(selectedExtension.extension_type) ? 'JSON' : 'Configuration'}
-                                    </MonoTabButton>
-                                    <MonoTabButton className="mr-4" active={modalTab === 'schema'} onClick={() => setModalTab('schema')}>
-                                        Schema
-                                    </MonoTabButton>
-                                    {editMode && selectedExtensionData && (
-                                        <>
-                                            <MonoTabButton className="mr-4" active={modalTab === 'status'} onClick={() => setModalTab('status')}>
-                                                Status
-                                            </MonoTabButton>
-                                            <MonoTabButton tone="danger" active={modalTab === 'delete'} onClick={() => setModalTab('delete')}>
-                                                Delete
-                                            </MonoTabButton>
-                                        </>
-                                    )}
-                            </ModalTabs>
+                            <RTabs
+                                tabs={[
+                                    ...(hasExtensionUI(selectedExtension.extension_type)
+                                        ? [{ id: 'ui', label: 'Configure' }]
+                                        : []),
+                                    { id: 'config', label: hasExtensionUI(selectedExtension.extension_type) ? 'JSON' : 'Configuration' },
+                                    { id: 'schema', label: 'Schema' },
+                                    ...(editMode && selectedExtensionData
+                                        ? [
+                                            { id: 'status', label: 'Status' },
+                                            { id: 'delete', label: 'Delete' },
+                                        ]
+                                        : []),
+                                ]}
+                                active={modalTab}
+                                onChange={setModalTab}
+                            />
 
                             {/* Tab Content */}
                             {modalTab === 'ui' && hasExtensionUI(selectedExtension.extension_type) && (
@@ -2175,7 +2170,7 @@ export function ExtensionDetailPage({ projectName, extensionType: extensionTypeP
     );
 
     const saveButton = (
-        <Button
+        <RButton
             variant="primary"
             onClick={handleSave}
             loading={saving}
@@ -2183,7 +2178,7 @@ export function ExtensionDetailPage({ projectName, extensionType: extensionTypeP
             className={!isEnabled ? 'mono-btn-cta' : ''}
         >
             {isPreviewOnly ? 'Preview Only' : (isEnabled ? 'Update' : 'Enable')}
-        </Button>
+        </RButton>
     );
 
     return (
@@ -2202,13 +2197,13 @@ export function ExtensionDetailPage({ projectName, extensionType: extensionTypeP
                         <div className="r-page-sub">{extensionType.description}</div>
                     )}
                 </div>
-                <Button
-                    variant="secondary"
+                <RButton
+                    variant="default"
                     size="sm"
                     onClick={() => navigate(extensionDocsHref(extensionType.extension_type))}
                 >
                     Extension Docs
-                </Button>
+                </RButton>
                 {isEnabled && (
                     <RButton variant="danger" size="sm" icon="trash" onClick={() => setConfirmDeleteOpen(true)}>
                         Delete
@@ -2226,13 +2221,13 @@ export function ExtensionDetailPage({ projectName, extensionType: extensionTypeP
                     <RAlert tone="warn">
                         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
                             <span>Preview mode: this extension UI is available for configuration testing only. Install the backend provider to enable create and update actions.</span>
-                            <Button
-                                variant="secondary"
+                            <RButton
+                                variant="default"
                                 size="sm"
                                 onClick={() => disablePreviewExtensions(projectName)}
                             >
                                 Disable Preview Mode
-                            </Button>
+                            </RButton>
                         </div>
                     </RAlert>
                 </div>

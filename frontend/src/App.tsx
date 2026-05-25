@@ -137,7 +137,7 @@ export function App() {
                 target instanceof HTMLInputElement ||
                 target instanceof HTMLTextAreaElement ||
                 target?.isContentEditable;
-            const modalOpen = Boolean(document.querySelector('.r-modal-mask, .modal-backdrop'));
+            const modalOpen = Boolean(document.querySelector('.r-modal-mask, .modal-backdrop, .r-cmdp-mask'));
             if (isTypingTarget && !modalOpen) return;
             e.preventDefault();
             setCommandPaletteOpen(true);

@@ -15,7 +15,7 @@ interface Project {
     access_class?: string;
     owner?: { email?: string; name?: string; id?: string };
     created?: string;
-    updated_at?: string;
+    updated?: string;
 }
 
 export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
@@ -63,9 +63,9 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
             const s = (p.status || '').toLowerCase();
             const matchesStatus =
                 statusFilter === 'all' ||
-                (statusFilter === 'healthy' && ['healthy', 'running'].includes(s)) ||
-                (statusFilter === 'unhealthy' && ['unhealthy', 'failed'].includes(s)) ||
-                (statusFilter === 'deploying' && ['deploying', 'building', 'pushing', 'pending'].includes(s));
+                (statusFilter === 'healthy' && s === 'running') ||
+                (statusFilter === 'unhealthy' && s === 'failed') ||
+                (statusFilter === 'deploying' && s === 'deploying');
             if (!matchesStatus) return false;
             if (accessFilter !== 'all' && p.access_class !== accessFilter) return false;
             if (search) {
@@ -94,6 +94,7 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
             showToast(`Project ${formData.name} created`, 'success');
             setModalOpen(false);
             loadProjects();
+            window.dispatchEvent(new Event('rise:mutation'));
         } catch (err: any) {
             showToast(`Failed to create project: ${err.message}`, 'error');
         } finally {
@@ -102,9 +103,9 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
     };
 
     const counts = {
-        healthy: projects.filter(p => ['healthy', 'running'].includes((p.status || '').toLowerCase())).length,
-        unhealthy: projects.filter(p => ['unhealthy', 'failed'].includes((p.status || '').toLowerCase())).length,
-        deploying: projects.filter(p => ['deploying', 'building', 'pushing', 'pending'].includes((p.status || '').toLowerCase())).length,
+        healthy: projects.filter(p => (p.status || '').toLowerCase() === 'running').length,
+        unhealthy: projects.filter(p => (p.status || '').toLowerCase() === 'failed').length,
+        deploying: projects.filter(p => (p.status || '').toLowerCase() === 'deploying').length,
     };
 
     return (

@@ -6,7 +6,7 @@ import { copyToClipboard, formatISO8601, formatRelativeTimeRounded, isSafeUrl, s
 import { useToast } from '../components/toast';
 import { Button, ConfirmDialog, Empty, KV, KVRow, Modal, Panel, PanelBody, PanelHead, Pill, Status, Tabs, Tooltip, cx } from '../components/r-ui';
 import { Icon } from '../components/icon';
-import { EnvironmentColorDot } from '../components/ui';
+import { EnvironmentColorDot } from '../components/r-ui';
 import { LoadingState, ErrorState, EmptyState } from '../components/states';
 
 import { DeploymentsList } from './deployments';
@@ -96,6 +96,7 @@ export function ProjectDetail({ projectName, initialTab }: { projectName: string
         try {
             await api.deleteProject(project.name);
             showToast(`Project ${project.name} deleted`, 'success');
+            window.dispatchEvent(new Event('rise:mutation'));
             navigate('/projects');
         } catch (err: any) {
             showToast(`Failed to delete project: ${err.message}`, 'error');
@@ -172,7 +173,7 @@ export function ProjectDetail({ projectName, initialTab }: { projectName: string
                                 <span className="dot-sep" />
                             </>
                         )}
-                        {project.primary_url ? (
+                        {project.primary_url && isSafeUrl(project.primary_url) ? (
                             <>
                                 <a className="r-link mono" style={{ fontSize: 12.5 }} href={project.primary_url} target="_blank" rel="noopener noreferrer">
                                     {stripUrlScheme(project.primary_url)}
@@ -196,7 +197,7 @@ export function ProjectDetail({ projectName, initialTab }: { projectName: string
                         )}
                     </div>
                 </div>
-                {project.primary_url && (
+                {project.primary_url && isSafeUrl(project.primary_url) && (
                     <Button icon="ext" onClick={() => window.open(project.primary_url, '_blank', 'noopener,noreferrer')}>Open URL</Button>
                 )}
                 {sourceUrl && isSafeUrl(sourceUrl) && (
@@ -344,9 +345,14 @@ function CurrentDeploymentPanel({ projectName, environments }: { projectName: st
                 title="Current production deployment"
                 sub={current ? `${current.deployment_group || 'default'} group` : undefined}
                 right={current && (
-                    <a className="r-link" style={{ fontSize: 12.5 }} onClick={() => navigate(`/deployment/${projectName}/${current.deployment_id}`)}>
+                    <button
+                        type="button"
+                        className="r-link"
+                        style={{ fontSize: 12.5, background: 'none', border: 'none', padding: 0, font: 'inherit' }}
+                        onClick={() => navigate(`/deployment/${projectName}/${current.deployment_id}`)}
+                    >
                         View deployment →
-                    </a>
+                    </button>
                 )}
             />
             {deployments === null ? (
@@ -402,7 +408,7 @@ function ProjectOverview({ project, projectName, accessLabel, environments, onCo
                                 {project.owner?.email || project.owner?.name || '—'}
                             </KVRow>
                             <KVRow k="Access">{accessLabel}</KVRow>
-                            {project.primary_url && (
+                            {project.primary_url && isSafeUrl(project.primary_url) && (
                                 <KVRow k="Primary URL">
                                     <a className="r-link mono" style={{ fontSize: 12.5 }} href={project.primary_url} target="_blank" rel="noopener noreferrer">
                                         {stripUrlScheme(project.primary_url)}

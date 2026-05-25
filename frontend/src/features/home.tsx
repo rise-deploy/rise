@@ -33,13 +33,13 @@ export function Home({ user }: HomeProps) {
     if (!projects || !teams) return <LoadingState label="Loading workspace…" />;
 
     const counts = {
-        healthy: projects.filter(p => (p.status || '').toLowerCase() === 'healthy' || (p.status || '').toLowerCase() === 'running').length,
-        unhealthy: projects.filter(p => (p.status || '').toLowerCase() === 'unhealthy' || (p.status || '').toLowerCase() === 'failed').length,
-        deploying: projects.filter(p => ['deploying', 'building', 'pushing', 'pending'].includes((p.status || '').toLowerCase())).length,
+        healthy: projects.filter(p => (p.status || '').toLowerCase() === 'running').length,
+        unhealthy: projects.filter(p => (p.status || '').toLowerCase() === 'failed').length,
+        deploying: projects.filter(p => (p.status || '').toLowerCase() === 'deploying').length,
     };
 
     const recent = [...projects]
-        .sort((a, b) => new Date(b.updated_at || b.created || 0).getTime() - new Date(a.updated_at || a.created || 0).getTime())
+        .sort((a, b) => new Date(b.updated || b.created || 0).getTime() - new Date(a.updated || a.created || 0).getTime())
         .slice(0, 5);
 
     const firstName = (user?.email || '').split('@')[0].split('.')[0];
@@ -125,7 +125,7 @@ export function Home({ user }: HomeProps) {
                                         </td>
                                         <td style={{ color: 'var(--text-muted)' }}>{p.access_class || '—'}</td>
                                         <td style={{ textAlign: 'right', color: 'var(--text-muted)' }}>
-                                            {p.updated_at || p.created ? formatRelativeTimeRounded(p.updated_at || p.created) : '—'}
+                                            {p.updated || p.created ? formatRelativeTimeRounded(p.updated || p.created) : '—'}
                                         </td>
                                     </tr>
                                 ))}

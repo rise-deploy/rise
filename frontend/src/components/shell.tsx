@@ -51,15 +51,24 @@ function Sidebar({ route, user, onLogout, onToggleTheme, theme }: { route: strin
     const [navCounts, setNavCounts] = useState<{ projects?: number; teams?: number }>({});
 
     // Fetch nav badge counts (projects / teams). Best-effort; failures are ignored.
+    // Re-fetches on the global `rise:mutation` event so that creates/deletes
+    // elsewhere in the app keep the sidebar counts in sync.
     useEffect(() => {
         let cancelled = false;
-        api.getProjects()
-            .then((p: any[]) => { if (!cancelled) setNavCounts(c => ({ ...c, projects: Array.isArray(p) ? p.length : undefined })); })
-            .catch(() => {});
-        api.getTeams()
-            .then((t: any[]) => { if (!cancelled) setNavCounts(c => ({ ...c, teams: Array.isArray(t) ? t.length : undefined })); })
-            .catch(() => {});
-        return () => { cancelled = true; };
+        const loadCounts = () => {
+            api.getProjects()
+                .then((p: any[]) => { if (!cancelled) setNavCounts(c => ({ ...c, projects: Array.isArray(p) ? p.length : undefined })); })
+                .catch(() => {});
+            api.getTeams()
+                .then((t: any[]) => { if (!cancelled) setNavCounts(c => ({ ...c, teams: Array.isArray(t) ? t.length : undefined })); })
+                .catch(() => {});
+        };
+        loadCounts();
+        window.addEventListener('rise:mutation', loadCounts);
+        return () => {
+            cancelled = true;
+            window.removeEventListener('rise:mutation', loadCounts);
+        };
     }, []);
 
     const countFor = (id: string): number | undefined => {
@@ -110,24 +119,38 @@ function Sidebar({ route, user, onLogout, onToggleTheme, theme }: { route: strin
                     <Icon name={theme === 'dark' ? 'sun' : 'moon'} size={14} />
                     {theme === 'dark' ? 'Light mode' : 'Dark mode'}
                 </button>
-                <div
-                    className={cx('r-user', route === '/profile' && 'active')}
-                    role="button"
-                    tabIndex={0}
-                    onClick={() => navigate('/profile')}
-                    onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); navigate('/profile'); } }}
-                    aria-label="Open profile"
-                >
-                    <Avatar label={userEmail} color={userColor} size={26} />
-                    <div className="r-user-info">
-                        <div className="r-user-name">{userEmail.split('@')[0] || 'You'}</div>
-                        <div className="r-user-mail">{userEmail}</div>
-                    </div>
+                <div className={cx('r-user', route === '/profile' && 'active')}>
+                    <button
+                        type="button"
+                        className="r-user-main"
+                        onClick={() => navigate('/profile')}
+                        aria-label="Open profile"
+                        style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 10,
+                            flex: 1,
+                            minWidth: 0,
+                            background: 'transparent',
+                            border: 'none',
+                            padding: 0,
+                            cursor: 'pointer',
+                            color: 'inherit',
+                            textAlign: 'left',
+                            font: 'inherit',
+                        }}
+                    >
+                        <Avatar label={userEmail} color={userColor} size={26} />
+                        <div className="r-user-info">
+                            <div className="r-user-name">{userEmail.split('@')[0] || 'You'}</div>
+                            <div className="r-user-mail">{userEmail}</div>
+                        </div>
+                    </button>
                     <button
                         type="button"
                         className="r-icon-btn"
                         style={{ width: 26, height: 26, border: 'none', background: 'transparent', flex: '0 0 26px' }}
-                        onClick={(e) => { e.stopPropagation(); onLogout(); }}
+                        onClick={onLogout}
                         title="Logout"
                         aria-label="Logout"
                     >

@@ -4,7 +4,7 @@ import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
 import { formatDate } from '../lib/utils';
 import { useToast } from '../components/toast';
-import { AutocompleteInput, Button } from '../components/ui';
+import { AutocompleteInput } from '../components/r-ui';
 import { ProjectTable } from '../components/project-table';
 import { EmptyState, ErrorState, LoadingState } from '../components/states';
 import { useRowKeyboardNavigation, useSortableData } from '../lib/table';
@@ -109,6 +109,7 @@ export function TeamsList({ currentUser, openCreate = false }) {
             setActionStatus(`Created team ${formData.name}.`);
             setIsModalOpen(false);
             loadTeams();
+            window.dispatchEvent(new Event('rise:mutation'));
         } catch (err) {
             showToast(`Failed to create team: ${err.message}`, 'error');
             setActionStatus(`Failed to create team ${formData.name}.`);
@@ -131,9 +132,9 @@ export function TeamsList({ currentUser, openCreate = false }) {
                     </div>
                 </div>
                 {currentUser?.can_create_teams && (
-                    <Button variant="primary" onClick={handleCreateClick}>
+                    <RButton variant="primary" onClick={handleCreateClick}>
                         New team
-                    </Button>
+                    </RButton>
                 )}
             </div>
             {actionStatus && <p className="mono-inline-status mb-3">{actionStatus}</p>}
@@ -440,6 +441,7 @@ export function TeamDetail({ teamName, currentUser }) {
         try {
             await api.deleteTeam(team.id);
             showToast(`Team ${team.name} deleted successfully`, 'success');
+            window.dispatchEvent(new Event('rise:mutation'));
             navigate('/teams');
         } catch (err) {
             showToast(`Failed to delete team: ${err.message}`, 'error');

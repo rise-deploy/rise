@@ -4,9 +4,8 @@ import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
 import { copyToClipboard, formatDate, formatISO8601, formatRelativeTimeRounded, formatTimeRemaining, isSafeUrl, stripUrlScheme } from '../lib/utils';
 import { useToast } from '../components/toast';
-import { Button, ENV_COLOR_STYLES, EnvironmentColorDot, SourceLinkGroup, SourceLinkGroupAction, StatusBadge } from '../components/ui';
 import { MonoSortButton, MonoTable, MonoTableBody, MonoTableEmptyRow, MonoTableFrame, MonoTableHead, MonoTableRow, MonoTd, MonoTh } from '../components/table';
-import { Button as RButton, Combobox, ConfirmDialog, Empty, EnvPill, KV, KVRow, Modal, Panel, PanelBody, PanelHead, Pill, SearchInput, Segmented, Status, Tabs, Tooltip } from '../components/r-ui';
+import { Button as RButton, Combobox, ConfirmDialog, ENV_COLOR_STYLES, Empty, EnvPill, EnvironmentColorDot, KV, KVRow, Modal, Panel, PanelBody, PanelHead, Pill, SearchInput, Segmented, SourceLinkGroup, SourceLinkGroupAction, Status, Tabs, Tooltip } from '../components/r-ui';
 import { Icon } from '../components/icon';
 import { EnvVarsList } from './resources';
 import { EmptyState, ErrorState, LoadingState } from '../components/states';
@@ -195,7 +194,7 @@ export function ActiveDeploymentsSummary({ projectName }) {
                             <div className="flex justify-between items-center mb-4">
                                 <h5 className="text-lg font-semibold">{group}</h5>
                                 <div className="flex items-center gap-3">
-                                    <StatusBadge status={deployment.status} />
+                                    <Status status={deployment.status} />
                                     <SourceLinkGroup jobUrl={deployment.job_url} prUrl={deployment.pull_request_url} onClick={(e) => e.stopPropagation()}>
                                         {canStop && (
                                             <SourceLinkGroupAction
@@ -1423,9 +1422,9 @@ export function EnvironmentDeploymentView({ projectName, environmentName, groupN
                 <p style={{ color: 'var(--text-muted)', marginBottom: 16 }}>
                     No active deployment in {scope}.
                 </p>
-                <Button variant="secondary" size="sm" onClick={() => navigate(`/project/${projectName}/environments`)}>
+                <RButton variant="default" size="sm" onClick={() => navigate(`/project/${projectName}/environments`)}>
                     Back to Environments
-                </Button>
+                </RButton>
             </div>
         );
     }
