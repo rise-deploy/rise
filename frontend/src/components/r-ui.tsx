@@ -43,6 +43,20 @@ export function EnvPill({ env, color }: { env: string; color?: string }) {
     );
 }
 
+// Two-tone chip mirroring EnvPill but for deployment groups. Groups don't
+// have a per-group color, so the icon cell stays neutral; the name renders in
+// mono since groups are technical identifiers (branch names, PR slugs).
+export function GroupPill({ group }: { group: string }) {
+    return (
+        <span className="r-group-pill">
+            <span className="r-group-pill-icon" aria-hidden>
+                <Icon name="branch" size={11} />
+            </span>
+            <span className="r-group-pill-name mono">{group}</span>
+        </span>
+    );
+}
+
 // Tinted layer glyph used inside `EnvPill` (and standalone where an env is
 // shown without a surrounding pill). Color falls back to `currentColor` so it
 // inherits the pill's text color when no env color is supplied.

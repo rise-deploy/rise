@@ -5,7 +5,7 @@ import { navigate } from '../lib/navigation';
 import { copyToClipboard, formatDate, formatISO8601, formatRelativeTimeRounded, formatTimeRemaining, isSafeUrl, stripUrlScheme } from '../lib/utils';
 import { useToast } from '../components/toast';
 import { MonoSortButton, MonoTable, MonoTableBody, MonoTableEmptyRow, MonoTableFrame, MonoTableHead, MonoTableRow, MonoTd, MonoTh } from '../components/table';
-import { Button as RButton, Combobox, ConfirmDialog, ENV_COLOR_STYLES, Empty, EnvPill, EnvironmentColorDot, KV, KVRow, Modal, Panel, PanelBody, PanelHead, Pill, SearchInput, Segmented, SourceLinkGroup, SourceLinkGroupAction, Status, Tabs, Tooltip } from '../components/r-ui';
+import { Button as RButton, Combobox, ConfirmDialog, ENV_COLOR_STYLES, Empty, EnvPill, EnvironmentColorDot, GroupPill, KV, KVRow, Modal, Panel, PanelBody, PanelHead, Pill, SearchInput, Segmented, SourceLinkGroup, SourceLinkGroupAction, Status, Tabs, Tooltip } from '../components/r-ui';
 import { Icon } from '../components/icon';
 import { EnvVarsList } from './resources';
 import { EmptyState, ErrorState, LoadingState } from '../components/states';
@@ -524,7 +524,7 @@ export function DeploymentsList({ projectName }) {
                                             <EnvPill env={d.environment} color={d.environment_color} />
                                         ) : <span style={{ color: 'var(--text-soft)' }}>—</span>}
                                     </td>
-                                    <td className="mono" style={{ fontSize: 12.5 }}>{d.deployment_group}</td>
+                                    <td>{d.deployment_group ? <GroupPill group={d.deployment_group} /> : null}</td>
                                     <td className="mono" style={{ fontSize: 12, color: 'var(--text-muted)' }}>
                                         {d.image ? d.image.split('/').pop() : '—'}
                                     </td>
@@ -1654,8 +1654,17 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                                 <EnvPill env={deployment.environment} color={deployment.environment_color} />
                             </Tooltip>
                         ) : null}
-                        {deployment.deployment_group && deployment.deployment_group !== 'default' && (
-                            <Pill className="mono">{deployment.deployment_group}</Pill>
+                        {deployment.deployment_group && (
+                            <Tooltip
+                                content={
+                                    <>
+                                        <div>Deployment group: <span className="mono">{deployment.deployment_group}</span></div>
+                                        {deployment.deployment_group === 'default' && <div>Primary group for the environment.</div>}
+                                    </>
+                                }
+                            >
+                                <GroupPill group={deployment.deployment_group} />
+                            </Tooltip>
                         )}
                     </div>
                     <div className="r-meta-bar" style={{ marginTop: 8 }}>

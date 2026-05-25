@@ -794,6 +794,38 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
 [data-density="compact"] .r-env-pill-icon { padding: 0 5px; }
 [data-density="compact"] .r-env-pill-name { padding: 0 7px; }
 
+/* ---------- Group pill (mirrors env pill, neutral icon, mono name) ---------- */
+.r-group-pill {
+    display: inline-flex;
+    align-items: stretch;
+    border: 1px solid var(--border-faint);
+    border-radius: 4px;
+    overflow: hidden;
+    font-size: 11.75px;
+    line-height: 1.45;
+    background: var(--surface);
+    white-space: nowrap;
+    vertical-align: middle;
+}
+.r-group-pill-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1px 6px;
+    background: var(--surface-2);
+    color: var(--text-soft);
+    border-right: 1px solid var(--border-faint);
+}
+.r-group-pill-name {
+    display: inline-flex;
+    align-items: center;
+    padding: 1px 8px;
+    color: var(--text-muted);
+}
+[data-density="compact"] .r-group-pill { font-size: 11px; }
+[data-density="compact"] .r-group-pill-icon { padding: 0 5px; }
+[data-density="compact"] .r-group-pill-name { padding: 0 7px; }
+
 /* ---------- Status ---------- */
 .r-status {
     display: inline-flex;

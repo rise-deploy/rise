@@ -15,6 +15,7 @@ import {
     EnvironmentColorPicker,
     Field as RField,
     GroupBar as RGroupBar,
+    GroupPill as RGroupPill,
     Input as RInput,
     KV as RKV,
     KVRow as RKVRow,
@@ -301,8 +302,11 @@ function EnvironmentCard({ env, projectName, deployments, onEdit, onDelete }) {
                                             )}
                                         </td>
                                         <td><RStatus status={d.status || 'Unknown'} /></td>
-                                        <td className="mono" style={{ fontSize: 12.25, color: groupIsPrimary ? 'var(--text)' : 'var(--text-muted)' }}>
-                                            {group}
+                                        <td>
+                                            <RGroupPill group={group} />
+                                            {groupIsPrimary && (
+                                                <span style={{ marginLeft: 6, fontSize: 10.5, color: 'var(--text-soft)' }} title="Primary group for this environment">primary</span>
+                                            )}
                                         </td>
                                         <td>{d.created_by_email || <span style={{ color: 'var(--text-soft)' }}>—</span>}</td>
                                         <td style={{ textAlign: 'right', color: 'var(--text-muted)' }}>
