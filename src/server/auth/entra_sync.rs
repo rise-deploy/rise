@@ -27,6 +27,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::db::leader_leases::LeaderElection;
+use crate::db::leader_schedules::GlobalSchedule;
 use crate::db::{models::TeamRole, teams, users};
 
 // ============================================================================
@@ -594,6 +595,11 @@ pub async fn run_entra_sync_loop(
         Uuid::new_v4(),
         Duration::from_secs(interval_secs + 30),
     );
+    let schedule = GlobalSchedule::new(
+        pool.clone(),
+        "rise-entra-sync-cycle",
+        Duration::from_secs(interval_secs),
+    );
 
     loop {
         tokio::select! {
@@ -606,6 +612,19 @@ pub async fn run_entra_sync_loop(
 
         if !election.is_leader() {
             tracing::debug!("Skipping Entra sync cycle — another replica is the leader");
+            continue;
+        }
+
+        // Global cadence gate: see `GlobalSchedule` docs. Long sync intervals
+        // (often 1h+) make leader-transition bursts much more visible than
+        // for short-cadence workers, so this matters especially here.
+        // `_as_leader` re-verifies leadership against the DB before the
+        // schedule UPSERT, so a stale-cached non-leader cannot poison
+        // `last_run_at` and delay the true leader by the full interval.
+        if !schedule
+            .try_claim_or_skip_as_leader("Entra sync", &election)
+            .await
+        {
             continue;
         }
 

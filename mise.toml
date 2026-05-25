@@ -52,7 +52,10 @@ fi
 
 docker compose up -d
 mise run db:migrate
+set -m
 mise run frontend:dev &
+FE_PID=$!
+trap 'kill -TERM -$FE_PID 2>/dev/null; wait $FE_PID 2>/dev/null' EXIT INT TERM
 mise run backend:run
 """
 
