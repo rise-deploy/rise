@@ -524,7 +524,10 @@ export function DeploymentsList({ projectName }) {
                                             <EnvPill env={d.environment} color={d.environment_color} />
                                         ) : <span style={{ color: 'var(--text-soft)' }}>—</span>}
                                     </td>
-                                    <td>{d.deployment_group ? <GroupPill group={d.deployment_group} /> : null}</td>
+                                    <td>{d.deployment_group ? (() => {
+                                        const env = environments.find((e) => e.name === d.environment);
+                                        return <GroupPill group={d.deployment_group} primary={!!env && env.primary_deployment_group === d.deployment_group} />;
+                                    })() : null}</td>
                                     <td className="mono" style={{ fontSize: 12, color: 'var(--text-muted)' }}>
                                         {d.image ? d.image.split('/').pop() : '—'}
                                     </td>
@@ -1431,6 +1434,7 @@ export function EnvironmentDeploymentView({ projectName, environmentName, groupN
 
 export function DeploymentDetail({ projectName, deploymentId }) {
     const [deployment, setDeployment] = useState(null);
+    const [environments, setEnvironments] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
     const [rollbackDialogOpen, setRollbackDialogOpen] = useState(false);
@@ -1510,6 +1514,16 @@ export function DeploymentDetail({ projectName, deploymentId }) {
     useEffect(() => {
         loadDeployment();
     }, [loadDeployment]);
+
+    // Best-effort fetch of environments so we can flag the group pill as
+    // primary when the deployment's group matches the env's primary group.
+    useEffect(() => {
+        let cancelled = false;
+        api.getProjectEnvironments(projectName)
+            .then((envs) => { if (!cancelled) setEnvironments(Array.isArray(envs) ? envs : []); })
+            .catch(() => {});
+        return () => { cancelled = true; };
+    }, [projectName]);
 
     // Auto-refresh only if deployment is not in a terminal state
     useEffect(() => {
@@ -1654,18 +1668,22 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                                 <EnvPill env={deployment.environment} color={deployment.environment_color} />
                             </Tooltip>
                         ) : null}
-                        {deployment.deployment_group && (
-                            <Tooltip
-                                content={
-                                    <>
-                                        <div>Deployment group: <span className="mono">{deployment.deployment_group}</span></div>
-                                        {deployment.deployment_group === 'default' && <div>Primary group for the environment.</div>}
-                                    </>
-                                }
-                            >
-                                <GroupPill group={deployment.deployment_group} />
-                            </Tooltip>
-                        )}
+                        {deployment.deployment_group && (() => {
+                            const env = environments.find((e) => e.name === deployment.environment);
+                            const isPrimaryGroup = !!env && env.primary_deployment_group === deployment.deployment_group;
+                            return (
+                                <Tooltip
+                                    content={
+                                        <>
+                                            <div>Deployment group: <span className="mono">{deployment.deployment_group}</span></div>
+                                            {isPrimaryGroup && <div>Primary group for the {deployment.environment} environment.</div>}
+                                        </>
+                                    }
+                                >
+                                    <GroupPill group={deployment.deployment_group} primary={isPrimaryGroup} />
+                                </Tooltip>
+                            );
+                        })()}
                     </div>
                     <div className="r-meta-bar" style={{ marginTop: 8 }}>
                         <span>{projectName}</span>
