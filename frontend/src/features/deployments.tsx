@@ -1697,17 +1697,17 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                         )}
                     </div>
                 </div>
-                <RButton size="sm" onClick={() => handleCopy(deployment.deployment_id, 'Deployment ID')}>
-                    <Icon name="copy" size={13} /> Copy ID
+                <RButton icon="copy" onClick={() => handleCopy(deployment.deployment_id, 'Deployment ID')}>
+                    Copy ID
                 </RButton>
                 {deployment.can_rollback && (
-                    <RButton size="sm" onClick={handleRollbackClick}>
-                        <Icon name="refresh" size={13} /> {deployment.is_active ? 'Redeploy' : 'Rollback'}
+                    <RButton icon="refresh" onClick={handleRollbackClick}>
+                        {deployment.is_active ? 'Redeploy' : 'Rollback'}
                     </RButton>
                 )}
                 {!isTerminal(deployment.status) && (
-                    <RButton size="sm" variant="danger" onClick={() => setStopDialogOpen(true)}>
-                        <Icon name="stop" size={11} /> Stop
+                    <RButton variant="danger" icon="stop" onClick={() => setStopDialogOpen(true)}>
+                        Stop
                     </RButton>
                 )}
             </div>

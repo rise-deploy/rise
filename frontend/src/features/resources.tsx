@@ -2200,13 +2200,12 @@ export function ExtensionDetailPage({ projectName, extensionType: extensionTypeP
                 </div>
                 <RButton
                     variant="default"
-                    size="sm"
                     onClick={() => navigate(extensionDocsHref(extensionType.extension_type))}
                 >
                     Extension Docs
                 </RButton>
                 {isEnabled && (
-                    <RButton variant="danger" size="sm" icon="trash" onClick={() => setConfirmDeleteOpen(true)}>
+                    <RButton variant="danger" icon="trash" onClick={() => setConfirmDeleteOpen(true)}>
                         Delete
                     </RButton>
                 )}
