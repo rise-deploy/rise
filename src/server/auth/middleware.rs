@@ -34,7 +34,7 @@ fn is_rise_issued_jwt(issuer: &str, public_url: &str) -> bool {
 }
 
 /// Extract Bearer token from Authorization header
-fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
     let auth_header = headers.get("Authorization")?.to_str().ok()?;
 
     if !auth_header.starts_with("Bearer ") {

@@ -5,6 +5,7 @@
 //! See `MULTI_TENANCY_PLAN.md` § "Generic API".
 
 pub mod error_map;
+pub mod gc;
 pub mod handlers;
 pub mod models;
 pub mod path;

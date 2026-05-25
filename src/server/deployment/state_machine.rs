@@ -180,6 +180,8 @@ mod tests {
             replicas: 1,
             cpu: "500m".to_string(),
             memory: "256Mi".to_string(),
+            identity_credential_hash: None,
+            identity_audiences: serde_json::json!({}),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

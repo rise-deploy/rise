@@ -15,18 +15,20 @@ title: "Local Development"
 # Install mise-managed tools (minikube, helm, kubectl, etc.)
 mise install
 
-# Configure /etc/hosts and Docker daemon (idempotent, requires sudo).
-# On WSL with Docker Desktop, setup:docker skips cleanly if /etc/docker is not present.
-mise setup:hosts
-mise setup:docker
-
-# Start a local Kubernetes cluster
-mise minikube:up   # preferred on most developer machines (see below)
+# One-stop dev environment setup. Cross-platform (Linux + macOS), idempotent,
+# and interactive. Configures /etc/hosts (sudo), Docker insecure registries,
+# and brings up a local cluster (minikube by default; offers k3s on Linux).
+mise setup
 ```
 
-The cluster setup task writes pod-reachable host URLs to `.env`. If you use
-direnv, run `direnv allow` once and `.envrc` will load those values
-automatically.
+`mise setup` is a thin wrapper around `./scripts/dev-setup.sh`. Run individual
+steps with `./scripts/dev-setup.sh <hosts|docker|minikube|k3s|preflight>` if
+you only need one part. The script writes pod-reachable host URLs to `.env`;
+if you use direnv, run `direnv allow` once and `.envrc` will load them.
+
+On macOS, Docker Desktop's daemon config lives at `~/.docker/daemon.json` and
+the script updates it there. The script offers to restart Docker Desktop for
+you so the new insecure-registries take effect.
 
 ## Day-to-Day
 
@@ -36,7 +38,7 @@ mise dev
 
 This single command:
 
-1. **Checks prerequisites** — verifies `/etc/hosts` entries, Docker daemon, and Kubernetes connectivity. If anything is missing it tells you exactly what to run.
+1. **Checks prerequisites** — verifies `/etc/hosts` entries, Docker daemon, and Kubernetes connectivity. If anything is missing it lists the issues and asks whether to continue anyway.
 2. **Starts Docker Compose services** — PostgreSQL, Dex (OIDC), container registry.
 3. **Runs database migrations.**
 4. **Starts the Vite frontend dev server** (background).
@@ -62,31 +64,36 @@ mise frontend:dev  # Vite dev server only
 
 ## Mise Tasks Reference
 
-### Checks (run automatically by `mise dev`)
-
-| Task | Purpose |
-|------|---------|
-| `check:hosts` | Verify `/etc/hosts` has `rise-registry` and `rise.local` |
-| `check:docker` | Verify Docker is running and insecure registries are configured |
-| `check:k8s` | Verify a Kubernetes cluster is reachable via `kubectl` |
-
 ### Setup (one-time, idempotent)
 
 | Task | Purpose |
 |------|---------|
-| `setup:hosts` | Add `rise-registry` and `rise.local` to `/etc/hosts` |
-| `setup:docker` | Configure Docker daemon insecure registries |
-| `minikube:up` | Start Minikube with registry access and ingress port-forwarding (**preferred**) |
-| `minikube:down` | Stop and delete Minikube |
-| `k3s:up` / `k3s:down` | Alternative: K3s (use when Minikube doesn't work, or in ephemeral/dedicated Rise dev environments) |
+| `setup` | One-stop dev setup: hosts + docker + cluster (interactive) |
+| `down` | Undo what `setup` did (kills port-forward, deletes cluster, strips .env block + daemon.json registries + /etc/hosts block) |
 
-**Minikube vs K3s**: `minikube:up` is preferred on most developer machines — it runs a single-node Kubernetes cluster inside a Docker container, starts quickly, and integrates well with the local Docker network so pods can reach `rise-registry:5000`. Use `k3s:up` when Minikube doesn't work on your machine (e.g., nested virtualization issues) or when setting up an ephemeral or dedicated environment solely for Rise development where the slight extra K3s overhead doesn't matter.
+Everything is driven by `./scripts/dev-setup.sh`. `mise setup` and `mise down` are convenience wrappers; positional args pass through, so any script subcommand works as `mise setup <subcmd>`:
+
+| Invocation | What it does |
+|------------|--------------|
+| `mise setup hosts` | Rewrite the managed `/etc/hosts` block (base hosts + `*.rise.local` ingress hosts enumerated from the current cluster) |
+| `mise setup hosts-clear` | Remove the managed `/etc/hosts` block |
+| `mise setup docker` | Configure Docker insecure-registries (asks to restart Docker Desktop on macOS) |
+| `mise setup docker-clear` | Remove rise registries from `daemon.json` |
+| `mise setup minikube` | Bring up Minikube + ingress port-forward + Helm install (**preferred** on most dev machines) |
+| `mise setup minikube-down` | `minikube delete` |
+| `mise setup k3s` | Bring up k3s (Linux only — use when Minikube doesn't work, or in ephemeral/dedicated Rise dev environments) |
+| `mise setup k3s-down` | Uninstall k3s |
+| `mise setup pf` | Start the ingress port-forward (`localhost:8080` + `:8443`) in the background |
+| `mise setup pf-down` | Stop the ingress port-forward |
+| `mise setup preflight` | hosts + docker only, no cluster |
+
+**Minikube vs K3s**: Minikube is preferred on most developer machines — it runs a single-node Kubernetes cluster inside a Docker container, starts quickly, and integrates well with the local Docker network so pods can reach `rise-registry:5000`. Use k3s (Linux only) when Minikube doesn't work on your machine (e.g., nested virtualization issues) or when setting up an ephemeral or dedicated environment solely for Rise development where the slight extra k3s overhead doesn't matter.
 
 ### Development
 
 | Task | Purpose |
 |------|---------|
-| `dev` | Full dev stack (checks + services + frontend + backend) |
+| `dev` | Full dev stack (preflight prompt + services + frontend + backend) |
 | `backend:run` | Backend only (starts deps + migrates) |
 | `frontend:dev` | Vite frontend dev server |
 | `db:migrate` | Run database migrations |
@@ -180,7 +187,7 @@ Host Machine (127.0.0.1)
 
 ## Troubleshooting
 
-**`http: server gave HTTP response to HTTPS client`** — insecure registries not configured. Run `mise setup:docker`.
+**`http: server gave HTTP response to HTTPS client`** — insecure registries not configured. Run `./scripts/dev-setup.sh docker`.
 
 **BuildKit can't push to registry** — verify `RISE_MANAGED_BUILDKIT_NETWORK_NAME=rise_default` is set in your environment (should be in `.envrc`).
 
@@ -191,7 +198,7 @@ Host Machine (127.0.0.1)
 minikube ssh -- curl http://rise-registry:5000/v2/
 # Should return: {}
 ```
-If it fails, re-run `mise minikube:up`.
+If it fails, re-run `mise setup minikube`.
 
 **Reset everything:**
 ```bash

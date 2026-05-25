@@ -168,6 +168,11 @@ pub struct Deployment {
     pub cpu: String,
     /// Memory allocation (e.g., "256Mi", "1Gi")
     pub memory: String,
+    /// SHA-256 hash of the per-deployment workload-identity bootstrap credential.
+    /// NULL until the controller has reconciled the deployment.
+    pub identity_credential_hash: Option<String>,
+    /// Map of { in-pod filename -> token audience } for auto-minted workload JWTs.
+    pub identity_audiences: serde_json::Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

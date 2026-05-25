@@ -64,6 +64,8 @@ The codebase is organized into functional modules:
    - **Authentication Module** (`auth/`): OAuth2/OIDC with Dex, JWT validation
    - **Project Management** (`project/`): Project CRUD and lifecycle management
    - **Team Management** (`team/`): Team and membership management
+   - **Service Accounts** (`service_accounts/`): CI/CD service accounts (inbound OIDC federation into Rise)
+   - **Workload Identity Tokens** (`workload_tokens/`): Token-exchange endpoint issuing Rise-signed workload JWTs to deployed apps
    - **Container Registry** (`registry/`): Temporary credentials for ECR registries
    - **Deployment Module** (`deployment/`): Kubernetes controller for deployments
    - **ECR Integration** (`ecr/`): AWS ECR repository management
@@ -208,7 +210,7 @@ cargo clippy --all-features --all-targets -- -D warnings  # Lint (uses cached bu
 |---|---|---|
 | Any `.rs` file | `cargo test --all-features` | Unit tests (requires `mise run db:migrate` once) |
 | SQLX queries (`sqlx::query!` etc.) | `mise run sqlx:prepare` | Regenerate offline query cache (commit the result) |
-| Server settings structs (`src/server/settings.rs`) | `mise run config:schema:generate` | Regenerate `docs/user/public/schemas/backend-settings.schema.json` (commit the result) |
+| Server settings structs (`src/server/settings.rs`) | `mise run config:schema:generate` | Regenerate `docs/engineering/public/schemas/backend-settings.schema.json` (commit the result) |
 | `src/rise_toml.rs` structs | `mise run rise-toml:schema:generate` | Regenerate `docs/user/public/schemas/rise-toml-v1.schema.json` (commit the result) |
 | CRD structs (`src/server/deployment/crd.rs`) | `mise run crd:generate` | Regenerate `helm/rise/crds/riseproject-crd.yaml` (commit the result) |
 | Helm chart (`helm/rise/`) | `helm lint helm/rise` | Validate chart templates |

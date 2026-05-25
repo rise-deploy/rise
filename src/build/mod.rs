@@ -15,10 +15,69 @@ mod railpack;
 mod registry;
 mod ssl;
 
-/// Default target platform for container image builds.
-/// Rise server nodes run linux/amd64, so this is the default for compatibility.
-/// Users can override with `--platform`, `RISE_PLATFORM`, or `[build] platform` in rise.toml.
-pub const DEFAULT_PLATFORM: &str = "linux/amd64";
+/// Fallback target platform when nothing more specific (CLI flag, env var,
+/// rise.toml, backend hint) is provided. We default to the host architecture
+/// so local dev (e.g. ARM Mac + ARM minikube) just works; production deploys
+/// override via the backend's `target_platform` hint.
+pub fn host_platform() -> String {
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        // Pass through other arches verbatim (e.g. "s390x", "riscv64") —
+        // OCI platform strings happen to match Rust's arch names for these.
+        other => other,
+    };
+    format!("linux/{arch}")
+}
+
+/// Where the resolved build platform value originated from.
+///
+/// Returned alongside the platform string by [`resolve_platform`] so callers
+/// can report or react to the precedence level that was selected (e.g. log
+/// "using host arch" vs. "using backend hint").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlatformSource {
+    /// From the `--platform` CLI flag.
+    CliFlag,
+    /// From the `RISE_PLATFORM` environment variable.
+    EnvVar,
+    /// From `[build].platform` in rise.toml.
+    RiseToml,
+    /// From the backend-advertised `target_platform` hint.
+    BackendHint,
+    /// Fell through to `host_platform()` / `std::env::consts::ARCH`.
+    HostFallback,
+}
+
+/// Resolve the build platform from the standard precedence chain:
+/// CLI flag → `RISE_PLATFORM` → rise.toml `[build].platform` →
+/// backend-advertised hint → host architecture.
+///
+/// All inputs are passed in explicitly — this function never reads process
+/// state (env, files) of its own. That keeps it pure and trivially testable
+/// without `std::env::set_var` racing against parallel tests. Callers are
+/// responsible for reading `RISE_PLATFORM` (typically via
+/// [`env_var_non_empty`]) and passing it as `env`.
+pub fn resolve_platform(
+    cli: Option<&str>,
+    env: Option<&str>,
+    project: Option<&str>,
+    backend_hint: Option<&str>,
+) -> (String, PlatformSource) {
+    if let Some(v) = cli {
+        return (v.to_string(), PlatformSource::CliFlag);
+    }
+    if let Some(v) = env {
+        return (v.to_string(), PlatformSource::EnvVar);
+    }
+    if let Some(v) = project {
+        return (v.to_string(), PlatformSource::RiseToml);
+    }
+    if let Some(v) = backend_hint {
+        return (v.to_string(), PlatformSource::BackendHint);
+    }
+    (host_platform(), PlatformSource::HostFallback)
+}
 
 pub use method::BuildArgs;
 pub(crate) use method::{BuildMethod, BuildOptions};
@@ -361,5 +420,68 @@ mod tests {
             Some("   ".to_string())
         );
         std::env::remove_var("TEST_WHITESPACE_VAR");
+    }
+
+    #[test]
+    fn test_host_platform_format() {
+        // Whatever the host arch, we always produce a "linux/<arch>" string.
+        let p = host_platform();
+        assert!(
+            p.starts_with("linux/") && p.len() > "linux/".len(),
+            "host_platform produced unexpected value: {p:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_platform_cli_wins() {
+        // CLI flag wins over env, project, and backend hint.
+        let (value, source) = resolve_platform(
+            Some("linux/cli-wins"),
+            Some("linux/env"),
+            Some("linux/project"),
+            Some("linux/backend"),
+        );
+        assert_eq!(value, "linux/cli-wins");
+        assert_eq!(source, PlatformSource::CliFlag);
+    }
+
+    #[test]
+    fn test_resolve_platform_env_over_project_and_backend() {
+        // With no CLI flag, RISE_PLATFORM (passed in as `env`) outranks
+        // rise.toml and the backend hint. Previously hidden behind a
+        // process-global env mutation; now exercised purely via params.
+        let (value, source) = resolve_platform(
+            None,
+            Some("linux/env-wins"),
+            Some("linux/project"),
+            Some("linux/backend"),
+        );
+        assert_eq!(value, "linux/env-wins");
+        assert_eq!(source, PlatformSource::EnvVar);
+    }
+
+    #[test]
+    fn test_resolve_platform_project_over_backend() {
+        // With no CLI flag and no env, rise.toml outranks the backend hint.
+        let (value, source) =
+            resolve_platform(None, None, Some("linux/project"), Some("linux/backend"));
+        assert_eq!(value, "linux/project");
+        assert_eq!(source, PlatformSource::RiseToml);
+    }
+
+    #[test]
+    fn test_resolve_platform_backend_over_host() {
+        // With no user signal, the backend hint beats host arch fallback.
+        let (value, source) = resolve_platform(None, None, None, Some("linux/backend-arch"));
+        assert_eq!(value, "linux/backend-arch");
+        assert_eq!(source, PlatformSource::BackendHint);
+    }
+
+    #[test]
+    fn test_resolve_platform_host_fallback() {
+        // All inputs None → host architecture, marked as HostFallback.
+        let (value, source) = resolve_platform(None, None, None, None);
+        assert_eq!(value, host_platform());
+        assert_eq!(source, PlatformSource::HostFallback);
     }
 }

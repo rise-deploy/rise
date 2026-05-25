@@ -413,14 +413,14 @@ Checking backend configuration...
 
 ### JSON Schema
 
-Rise provides a JSON Schema for backend configuration, hosted in the user docs:
+Rise provides a JSON Schema for backend configuration, hosted alongside these operator docs:
 
-- [`backend-settings.schema.json`](/docs/schemas/backend-settings.schema.json)
+- [`backend-settings.schema.json`](../schemas/backend-settings.schema.json)
 
 Generate it with:
 
 ```bash
-cargo run --features cli,backend -- backend config-schema > docs/user/public/schemas/backend-settings.schema.json
+cargo run --features cli,backend -- backend config-schema > docs/engineering/public/schemas/backend-settings.schema.json
 ```
 
 CI verifies this file is up to date on every PR and push.

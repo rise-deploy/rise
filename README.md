@@ -46,7 +46,7 @@ Note that this does not include server code unless you use `--features cli,serve
 
 ### Prerequisites
 
-- Docker and Docker Compose
+- Docker (or Docker Desktop on macOS) and Docker Compose
 - Rust 1.91+
 - [mise](https://mise.jdx.dev/) (recommended for development)
 
@@ -59,19 +59,20 @@ direnv allow
 # Install development tools
 mise install
 
-# One-time host setup (requires sudo)
-mise setup:hosts
-mise setup:docker
+# One-stop dev environment setup (cross-platform: Linux + macOS).
+# Configures /etc/hosts (sudo), Docker insecure registries, and brings up
+# a local cluster (minikube by default; k3s on Linux). Run interactively
+# so the sudo prompt works.
+mise setup
 
-# Terminal (1): Start Minikube
-mise minikube:up
-
-# Terminal (2): Start the frontend
+# Terminal (1): Start the frontend
 mise frontend:dev
 
-# Terminal (3) Start the backend (will also start required containers with docker compose)
+# Terminal (2): Start the backend (will also start required containers with docker compose)
 mise backend:run
 ```
+
+`mise setup` invokes `./scripts/dev-setup.sh`. You can also run individual steps directly: `./scripts/dev-setup.sh hosts`, `docker`, `minikube`, `k3s`, or `preflight` (hosts + docker only).
 
 Services will be available at:
 - **Rise server**: http://localhost:3000

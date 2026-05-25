@@ -31,13 +31,16 @@ use crate::db::{
     deployments as db_deployments, env_vars as db_env_vars, environments as db_environments,
     projects as db_projects,
 };
+use crate::server::auth::jwt_signer::WorkloadSubjectInfo;
 use crate::server::deployment::crd;
 use crate::server::deployment::resource_builder::{
-    ResourceBuilder, ANNOTATION_ENV_SECRET_HASH, ANNOTATION_LAST_REFRESH, IMAGE_PULL_SECRET_NAME,
+    IdentityMount, ResourceBuilder, ANNOTATION_ENV_SECRET_HASH, ANNOTATION_LAST_REFRESH,
+    IDENTITY_CREDENTIAL_KEY, IDENTITY_TOKEN_KEY_PREFIX, IMAGE_PULL_SECRET_NAME,
     IRRECOVERABLE_CONTAINER_REASONS, LABEL_DEPLOYMENT_ID,
 };
 use crate::server::deployment::state_machine;
 use crate::server::state::AppState;
+use crate::server::workload_tokens::{sha256_hex, workload_subject, NO_ENVIRONMENT};
 
 // ── Metacontroller webhook protocol types ──────────────────────────────
 
@@ -1110,6 +1113,19 @@ async fn compute_desired_children(
             }
         };
 
+        // Workload identity Secret: bootstrap credential + auto-minted tokens.
+        let identity = prepare_identity_secret(
+            state,
+            resource_builder,
+            project,
+            deployment,
+            &namespace,
+            env_name.as_deref(),
+            observed,
+        )
+        .await?;
+        children.push(serde_json::to_value(&identity.secret)?);
+
         let k8s_deploy = resource_builder.create_k8s_deployment(
             project,
             deployment,
@@ -1121,6 +1137,7 @@ async fn compute_desired_children(
             secret_env_hash,
             sa_name,
             env_name.as_deref(),
+            Some(identity.mount),
         );
         children.push(serde_json::to_value(&k8s_deploy)?);
 
@@ -1192,13 +1209,14 @@ async fn compute_desired_children(
 }
 
 /// Returns true if this deployment should have K8s infrastructure (K8s Deployment resource).
-fn should_have_infrastructure(deployment: &Deployment) -> bool {
+pub(crate) fn should_have_infrastructure(deployment: &Deployment) -> bool {
     matches!(
         deployment.status,
         DeploymentStatus::Pushed
             | DeploymentStatus::Deploying
             | DeploymentStatus::Healthy
             | DeploymentStatus::Unhealthy
+            | DeploymentStatus::Terminating
     )
 }
 
@@ -1279,6 +1297,166 @@ async fn build_image_pull_secret(
     )?;
 
     Ok(Some(secret))
+}
+
+/// A prepared workload-identity Secret plus the mount description for the pod.
+struct PreparedIdentitySecret {
+    secret: Secret,
+    mount: IdentityMount,
+}
+
+/// Build the per-deployment workload-identity Secret.
+///
+/// The bootstrap credential is generated once and then reused from the observed
+/// Secret on subsequent syncs. Its SHA-256 hash is persisted to the deployment
+/// row only once the credential has been read back from the *observed* Secret —
+/// never in the generate-fresh path — so that with multiple controller replicas
+/// the persisted hash always matches the credential in the Secret that was
+/// actually applied. Auto-minted workload tokens (one per `[identity]` audience)
+/// are re-minted only when the observed Secret is stale or its audience set
+/// changed, avoiding a Secret rewrite on every resync.
+async fn prepare_identity_secret(
+    state: &AppState,
+    resource_builder: &ResourceBuilder,
+    project: &Project,
+    deployment: &Deployment,
+    namespace: &str,
+    environment_name: Option<&str>,
+    observed: &ObservedChildren,
+) -> anyhow::Result<PreparedIdentitySecret> {
+    use base64::Engine;
+    use rand::Rng;
+
+    let secret_name = ResourceBuilder::deployment_identity_secret_name(project, deployment);
+    let secret_key = format!("{}/{}", namespace, secret_name);
+
+    let observed_secret: Option<Secret> = observed
+        .secrets
+        .get(&secret_key)
+        .and_then(|json| serde_json::from_value(json.clone()).ok());
+
+    // ── Bootstrap credential: generate once, then reuse ─────────────────
+    let observed_credential = observed_secret
+        .as_ref()
+        .and_then(|s| s.data.as_ref())
+        .and_then(|d| d.get(IDENTITY_CREDENTIAL_KEY))
+        .and_then(|b| String::from_utf8(b.0.clone()).ok());
+
+    let credential = match observed_credential {
+        Some(c) => {
+            // HA-safe: only the credential read back from the *observed* Secret is
+            // authoritative. Persist its hash so the token-exchange endpoint can
+            // authenticate the app. This is idempotent — every replica observes the
+            // same applied Secret and writes the same hash.
+            let credential_hash = sha256_hex(c.as_bytes());
+            if deployment.identity_credential_hash.as_deref() != Some(credential_hash.as_str()) {
+                db_deployments::set_identity_credential_hash(
+                    &state.db_pool,
+                    deployment.id,
+                    &credential_hash,
+                )
+                .await
+                .context("Failed to persist identity credential hash")?;
+            }
+            c
+        }
+        None => {
+            // No Secret observed yet: generate a fresh credential but do NOT persist
+            // its hash. With multiple replicas behind the webhook Service, two
+            // replicas could generate different credentials; persisting here risks
+            // a DB hash that does not match the Secret that actually got applied.
+            // The hash is written on the next sync via the reuse path above, once
+            // some replica's Secret has been applied and is observed by all.
+            let mut bytes = [0u8; 32];
+            rand::rng().fill_bytes(&mut bytes);
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+        }
+    };
+
+    // ── Auto-minted workload tokens ─────────────────────────────────────
+    let audiences: BTreeMap<String, String> =
+        serde_json::from_value(deployment.identity_audiences.clone()).unwrap_or_default();
+
+    let mut token_filenames: Vec<String> = audiences.keys().cloned().collect();
+    token_filenames.sort();
+
+    // The Secret's last-refresh timestamp from the previous reconcile, if any.
+    let observed_refresh = observed_secret
+        .as_ref()
+        .and_then(|s| s.metadata.annotations.as_ref())
+        .and_then(|a| a.get(ANNOTATION_LAST_REFRESH))
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|ts| ts.with_timezone(&Utc));
+
+    let (tokens, refreshed_at) = if audiences.is_empty() {
+        // Nothing to mint — reuse the observed last-refresh timestamp so the
+        // annotation does not churn on every (~5s) reconcile, which would cause
+        // constant Secret rewrites. Fall back to now only when no Secret exists.
+        (BTreeMap::new(), observed_refresh.unwrap_or_else(Utc::now))
+    } else {
+        let observed_tokens: BTreeMap<String, String> = observed_secret
+            .as_ref()
+            .and_then(|s| s.data.as_ref())
+            .map(|d| {
+                d.iter()
+                    .filter_map(|(k, v)| {
+                        let name = k.strip_prefix(IDENTITY_TOKEN_KEY_PREFIX)?;
+                        let jwt = String::from_utf8(v.0.clone()).ok()?;
+                        Some((name.to_string(), jwt))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let ttl_secs = state.identity_token_ttl_seconds;
+        let refresh_secs = (ttl_secs / 2) as i64;
+
+        let fresh = observed_refresh
+            .map(|ts| {
+                Utc::now().signed_duration_since(ts) < chrono::Duration::seconds(refresh_secs)
+            })
+            .unwrap_or(false);
+
+        if fresh && observed_tokens.keys().eq(audiences.keys()) {
+            // Reuse observed tokens unchanged, preserving the refresh timestamp.
+            (observed_tokens, observed_refresh.unwrap_or_else(Utc::now))
+        } else {
+            let sub = workload_subject(&project.name, environment_name);
+            let subject_info = WorkloadSubjectInfo {
+                sub: &sub,
+                project: &project.name,
+                environment: environment_name.unwrap_or(NO_ENVIRONMENT),
+                deployment_group: &deployment.deployment_group,
+                deployment_id: &deployment.deployment_id,
+            };
+            let mut minted = BTreeMap::new();
+            for (filename, audience) in &audiences {
+                let jwt = state
+                    .jwt_signer
+                    .sign_workload_jwt(&subject_info, audience, ttl_secs)?;
+                minted.insert(filename.clone(), jwt);
+            }
+            (minted, Utc::now())
+        }
+    };
+
+    let secret = resource_builder.create_identity_secret(
+        project,
+        deployment,
+        namespace,
+        environment_name,
+        &credential,
+        &tokens,
+        refreshed_at,
+    );
+
+    Ok(PreparedIdentitySecret {
+        secret,
+        mount: IdentityMount {
+            secret_name,
+            token_filenames,
+        },
+    })
 }
 
 fn hash_deployment_env_secret(data: &BTreeMap<String, ByteString>) -> String {
@@ -1631,6 +1809,7 @@ mod tests {
             DeploymentStatus::Deploying,
             DeploymentStatus::Healthy,
             DeploymentStatus::Unhealthy,
+            DeploymentStatus::Terminating,
         ];
         for status in &statuses_with_infra {
             let d = test_deployment(status.clone());
@@ -1650,7 +1829,6 @@ mod tests {
             DeploymentStatus::Pushing,
             DeploymentStatus::Cancelling,
             DeploymentStatus::Cancelled,
-            DeploymentStatus::Terminating,
             DeploymentStatus::Stopped,
             DeploymentStatus::Superseded,
             DeploymentStatus::Failed,
@@ -1900,6 +2078,8 @@ mod tests {
             replicas: 1,
             cpu: "500m".to_string(),
             memory: "256Mi".to_string(),
+            identity_credential_hash: None,
+            identity_audiences: serde_json::json!({}),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

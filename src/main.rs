@@ -257,10 +257,31 @@ enum Commands {
     #[command(subcommand)]
     #[command(visible_alias = "sa")]
     ServiceAccount(ServiceAccountCommands),
+    /// Workload identity token commands (run inside a Rise deployment)
+    #[command(subcommand)]
+    Identity(IdentityCommands),
     /// Team management commands
     #[command(subcommand)]
     #[command(visible_alias = "t")]
     Team(TeamCommands),
+}
+
+#[derive(Subcommand, Debug)]
+enum IdentityCommands {
+    /// Request a workload identity token for an audience
+    Token {
+        /// Audience (`aud` claim) to request the token for
+        #[arg(long)]
+        audience: String,
+        /// Bootstrap credential. Defaults to the credential file mounted into
+        /// every Rise deployment (/var/run/secrets/rise/identity/credential).
+        #[arg(long)]
+        credential: Option<String>,
+        /// Requested token lifetime in seconds. Capped by the server's configured maximum
+        /// (default 900). Omitting this field uses the server maximum.
+        #[arg(long)]
+        ttl_seconds: Option<u64>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1546,6 +1567,21 @@ async fn main() -> Result<()> {
                 .await?;
             }
         },
+        Commands::Identity(identity_cmd) => match identity_cmd {
+            IdentityCommands::Token {
+                audience,
+                credential,
+                ttl_seconds,
+            } => {
+                cli::identity::token_command(
+                    &http_client,
+                    audience,
+                    credential.as_deref(),
+                    *ttl_seconds,
+                )
+                .await?;
+            }
+        },
         Commands::Environment(env_cmd) => {
             environment::handle_environment_command(&http_client, &backend_url, &config, env_cmd)
                 .await?;
@@ -1788,6 +1824,7 @@ async fn main() -> Result<()> {
                 tag.clone(),
                 path.clone(),
                 build_args,
+                None,
                 None,
             )
             .with_push(*push);
