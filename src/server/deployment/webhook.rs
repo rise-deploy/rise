@@ -250,6 +250,12 @@ async fn process_sync(
     // Metacontroller GC resources owned by another controller).
     enforce_controller_class(state, &project).await?;
 
+    // 1c. Resolve the project's Org-scoped namespace prefix once. Every
+    // helper below that names a namespace borrows this string, so the
+    // miss-loader runs at most once per sync (the cache hits the second
+    // and subsequent times within the 30s TTL).
+    let namespace_prefix = resolve_project_namespace_prefix(state, &project).await?;
+
     // 2. Load non-terminal deployments for this project (avoids loading full history)
     let non_terminal_deployments =
         db_deployments::list_non_terminal_for_project(&state.db_pool, project.id).await?;
@@ -257,7 +263,7 @@ async fn process_sync(
     let non_terminal: Vec<&Deployment> = non_terminal_deployments.iter().collect();
 
     // 3. Perform status transitions based on observed K8s state
-    perform_status_transitions(state, &project, &non_terminal, observed).await?;
+    perform_status_transitions(state, &project, &non_terminal, observed, &namespace_prefix).await?;
 
     // 4. Re-load non-terminal deployments since statuses may have changed
     let all_deployments =
@@ -295,6 +301,7 @@ async fn process_sync(
         &project,
         &all_deployments,
         observed,
+        &namespace_prefix,
     )
     .await?;
 
@@ -365,6 +372,73 @@ async fn load_org_controller_class(
     Ok(spec.deployment_controller_class)
 }
 
+/// Resolve the per-Organization Kubernetes namespace prefix from the
+/// resource store. Used as the cache miss-loader behind
+/// `AppState::org_namespace_prefix_cache`. Reads the
+/// `kubernetes.rise.dev/namespace-prefix` annotation when present and
+/// otherwise synthesizes the `org-{discriminator}-` fallback via the
+/// shared `bootstrap::resolve_namespace_prefix` helper. Missing
+/// Organizations surface as `Err` and are not cached.
+async fn load_org_namespace_prefix(
+    store: std::sync::Arc<dyn rise_resource_store::ResourceStore>,
+    uid: uuid::Uuid,
+) -> anyhow::Result<String> {
+    let row = store
+        .get(uid)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to load Organization {uid}: {e}"))?
+        .ok_or_else(|| anyhow::anyhow!("Organization {uid} is missing"))?;
+    let annotations: BTreeMap<String, String> =
+        serde_json::from_value(row.metadata.clone()).unwrap_or_default();
+    Ok(crate::server::bootstrap::resolve_namespace_prefix(
+        &annotations,
+        &row.discriminator,
+    ))
+}
+
+/// Resolve the project's Organization UID and look up its namespace
+/// prefix through `AppState::org_namespace_prefix_cache`. Called once per
+/// sync (and per log-stream request from `handlers::stream_deployment_logs`);
+/// this is what makes per-Org namespacing per-request instead of baked
+/// into the controller's `ResourceBuilder`.
+pub async fn resolve_project_namespace_prefix(
+    state: &AppState,
+    project: &Project,
+) -> anyhow::Result<String> {
+    let project_org_uid = crate::db::organization_links::organization_uid_for_project(
+        &state.db_pool,
+        project.id,
+    )
+    .await?
+    .ok_or_else(|| {
+        // Same invariant as `enforce_controller_class`: bootstrap
+        // validation refuses to start the server with unlinked
+        // projects, so a `None` here is a programmer error.
+        error!(
+            project = %project.name,
+            "Project has no organization linkage — bootstrap validation should have caught this"
+        );
+        anyhow::anyhow!(
+            "project '{}' is missing organization_resource_uid; bootstrap must backfill before reconciliation",
+            project.name,
+        )
+    })?;
+
+    state
+        .org_namespace_prefix_cache
+        .try_get_with(
+            project_org_uid,
+            load_org_namespace_prefix(state.resource_store.clone(), project_org_uid),
+        )
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to load namespace prefix for Organization {project_org_uid} (project '{}'): {e}",
+                project.name,
+            )
+        })
+}
+
 /// Reject reconciliation when the project's Organization's
 /// `spec.deploymentControllerClass` does not match the controller's
 /// configured `controller_class_name`. Reads the Org's class through a
@@ -431,6 +505,7 @@ async fn perform_status_transitions(
     project: &Project,
     non_terminal: &[&Deployment],
     observed: &ObservedChildren,
+    namespace_prefix: &str,
 ) -> anyhow::Result<()> {
     for deployment in non_terminal {
         // Skip pre-infrastructure deployments — the CLI drives those transitions
@@ -482,11 +557,25 @@ async fn perform_status_transitions(
 
             DeploymentStatus::Deploying => {
                 check_deploying_timeout(state, deployment, project).await?;
-                check_deployment_health_from_observed(state, deployment, project, observed).await?;
+                check_deployment_health_from_observed(
+                    state,
+                    deployment,
+                    project,
+                    observed,
+                    namespace_prefix,
+                )
+                .await?;
             }
 
             DeploymentStatus::Healthy | DeploymentStatus::Unhealthy => {
-                check_deployment_health_from_observed(state, deployment, project, observed).await?;
+                check_deployment_health_from_observed(
+                    state,
+                    deployment,
+                    project,
+                    observed,
+                    namespace_prefix,
+                )
+                .await?;
             }
 
             _ => {}
@@ -593,13 +682,10 @@ async fn check_deployment_health_from_observed(
     deployment: &Deployment,
     project: &Project,
     observed: &ObservedChildren,
+    namespace_prefix: &str,
 ) -> anyhow::Result<()> {
     // Metacontroller keys namespaced children of cluster-scoped parents as "namespace/name"
-    let resource_builder = match &state.resource_builder {
-        Some(rb) => rb,
-        None => return Ok(()),
-    };
-    let namespace = resource_builder.namespace_name(project);
+    let namespace = ResourceBuilder::namespace_name(project, namespace_prefix);
     let k8s_deploy_name = format!(
         "{}/{}-{}",
         namespace, project.name, deployment.deployment_id
@@ -640,6 +726,7 @@ async fn check_deployment_health_from_observed(
         desired_replicas,
         ready_replicas,
         &deployment.controller_metadata,
+        namespace_prefix,
     )
     .await;
 
@@ -747,6 +834,7 @@ async fn check_pod_errors_via_kube(
     desired_replicas: i32,
     ready_replicas: i32,
     prev_controller_metadata: &serde_json::Value,
+    namespace_prefix: &str,
 ) -> PodCheckResult {
     let kube_client = match &state.kube_client {
         Some(client) => client,
@@ -759,16 +847,7 @@ async fn check_pod_errors_via_kube(
         }
     };
 
-    let namespace = match &state.resource_builder {
-        Some(rb) => rb.namespace_name(project),
-        None => {
-            return PodCheckResult {
-                has_error: false,
-                error_message: None,
-                pod_status: None,
-            }
-        }
-    };
+    let namespace = ResourceBuilder::namespace_name(project, namespace_prefix);
     let pod_api: kube::Api<k8s_openapi::api::core::v1::Pod> =
         kube::Api::namespaced(kube_client.clone(), &namespace);
 
@@ -1145,9 +1224,10 @@ async fn compute_desired_children(
     project: &Project,
     all_deployments: &[Deployment],
     observed: &ObservedChildren,
+    namespace_prefix: &str,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
     let mut children: Vec<serde_json::Value> = Vec::new();
-    let namespace = resource_builder.namespace_name(project);
+    let namespace = ResourceBuilder::namespace_name(project, namespace_prefix);
 
     // Preload all environments for this project to avoid per-deployment DB lookups
     let environments: HashMap<uuid::Uuid, crate::db::models::Environment> =
@@ -1158,7 +1238,7 @@ async fn compute_desired_children(
             .collect();
 
     // 1. Namespace (always)
-    let ns = resource_builder.create_namespace(project);
+    let ns = resource_builder.create_namespace(project, namespace_prefix);
     children.push(serde_json::to_value(&ns)?);
 
     // 2. Image pull secret (if needed)
@@ -2284,7 +2364,6 @@ mod tests {
             },
             pod_security_enabled: true,
             health_probes: None,
-            namespace_format: "{project_name}".to_string(),
         }
     }
 

@@ -172,6 +172,14 @@ fn controller_class_name_for_bootstrap(settings: &Settings) -> Option<&str> {
 /// configured display name, namespace-prefix annotation, and
 /// `spec.deploymentControllerClass`. Unrelated annotations on an existing
 /// row are preserved.
+///
+/// Lookup is by configured name first; if that misses, falls back to the
+/// single-Org world's "find the only Organization in the store" rule so
+/// renaming `default_organization.name` in config re-keys the existing row
+/// (preserving its UID and every typed-row linkage) rather than minting a
+/// new Organization and orphaning the linkages. Two or more existing
+/// Organizations is treated as a configuration error: this PR's bootstrap
+/// cannot guess which one is "the default."
 async fn upsert_default_organization(
     store: &Arc<dyn ResourceStore>,
     default_org: &DefaultOrganizationSettings,
@@ -188,81 +196,139 @@ async fn upsert_default_organization(
         desired_annotations.insert(NAMESPACE_PREFIX_ANNOTATION.to_string(), prefix.clone());
     }
 
-    let existing = store
+    let spec = build_organization_spec(&default_org.display_name, controller_class_name);
+    let spec_value =
+        serde_json::to_value(&spec).context("Failed to serialize Organization spec")?;
+
+    let Some(row) = find_default_organization(store, &default_org.name).await? else {
+        // Fresh install: no Organizations exist yet.
+        let created = store
+            .create(CreateResourceParams {
+                api_version: API_VERSION_V1ALPHA1.to_string(),
+                kind: ORGANIZATION_KIND.to_string(),
+                name: default_org.name.clone(),
+                parent_uid: None,
+                annotations: desired_annotations,
+                finalizers: vec![],
+                spec: spec_value,
+                validator: Some(Arc::new(OrganizationValidator)),
+            })
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to create default Organization '{}': {e}",
+                    default_org.name
+                )
+            })?;
+        return Ok(created);
+    };
+
+    // If the row was located by the fallback (single-Org world) its name may
+    // differ from the configured one. Rename first; UID and discriminator
+    // are preserved, so every typed row's `organization_resource_uid`
+    // linkage remains valid.
+    let row = if row.name != default_org.name {
+        info!(
+            old_name = %row.name,
+            new_name = %default_org.name,
+            uid = %row.uid,
+            "Renaming existing default Organization to match configured default_organization.name"
+        );
+        store
+            .rename(row.uid, &default_org.name)
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to rename default Organization to '{}': {e}",
+                    default_org.name
+                )
+            })?
+    } else {
+        row
+    };
+
+    // Preserve unrelated annotations on the existing row; only ensure our
+    // managed ones (namespace prefix, plus configured extras) appear with
+    // the configured values.
+    let existing_annotations = annotations_from_metadata(&row.metadata);
+    let merged_annotations = merge_annotations(existing_annotations, &desired_annotations);
+
+    // Skip the write when nothing bootstrap-owned changes — keeps the row's
+    // revision stable across no-op restarts. Finalizers are controller-owned
+    // and preserved verbatim by the update path below, so their presence
+    // must not force a rewrite here.
+    if row.spec == spec_value && annotations_from_metadata(&row.metadata) == merged_annotations {
+        return Ok(row);
+    }
+
+    let updated = store
+        .update(
+            row.uid,
+            UpdateResourceParams {
+                api_version: None,
+                revision: row.revision,
+                annotations: merged_annotations,
+                finalizers: row.finalizers.clone(),
+                spec: spec_value,
+                validator: Some(Arc::new(OrganizationValidator)),
+            },
+        )
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "Failed to update default Organization '{}': {e}",
+                default_org.name
+            )
+        })?;
+    Ok(updated)
+}
+
+/// Locate the row this bootstrap pass should treat as the default
+/// Organization. Returns `None` only on a fresh install (no Organizations
+/// exist in the store).
+///
+/// - Fast path: look up by the configured name.
+/// - Fallback: list every Organization in the store. If exactly one exists,
+///   treat it as the default regardless of name (this is the rename path:
+///   `default_organization.name` was changed in config; the caller will
+///   rename the row's `name` to match).
+/// - If two or more Organizations exist and none match the configured name,
+///   refuse to guess and bail. This is unreachable on PR5 installs (only
+///   bootstrap mints Organizations and only the configured name) but is the
+///   safe behaviour once multi-org becomes reachable.
+async fn find_default_organization(
+    store: &Arc<dyn ResourceStore>,
+    configured_name: &str,
+) -> Result<Option<ResourceRow>> {
+    if let Some(row) = store
         .get_by_name(
             API_VERSION_V1ALPHA1,
             ORGANIZATION_KIND,
-            &default_org.name,
+            configured_name,
             None,
         )
         .await
-        .map_err(|e| anyhow!("Failed to look up default Organization: {e}"))?;
+        .map_err(|e| anyhow!("Failed to look up default Organization: {e}"))?
+    {
+        return Ok(Some(row));
+    }
 
-    let spec = build_organization_spec(&default_org.display_name, controller_class_name);
+    let mut existing = store
+        .list_versions(&[API_VERSION_V1ALPHA1.to_string()], ORGANIZATION_KIND, None)
+        .await
+        .map_err(|e| anyhow!("Failed to list existing Organizations: {e}"))?;
 
-    match existing {
-        Some(row) => {
-            // Preserve unrelated annotations on the existing row; only ensure
-            // our managed ones (namespace prefix, plus configured extras)
-            // appear with the configured values.
-            let existing_annotations = annotations_from_metadata(&row.metadata);
-            let merged_annotations = merge_annotations(existing_annotations, &desired_annotations);
-
-            // Skip the write when nothing bootstrap-owned changes — keeps the
-            // row's revision stable across no-op restarts. Finalizers are
-            // controller-owned and preserved verbatim by the update path below,
-            // so their presence must not force a rewrite here.
-            let spec_value =
-                serde_json::to_value(&spec).context("Failed to serialize Organization spec")?;
-            if row.spec == spec_value
-                && annotations_from_metadata(&row.metadata) == merged_annotations
-            {
-                return Ok(row);
-            }
-
-            let updated = store
-                .update(
-                    row.uid,
-                    UpdateResourceParams {
-                        api_version: None,
-                        revision: row.revision,
-                        annotations: merged_annotations,
-                        finalizers: row.finalizers.clone(),
-                        spec: spec_value,
-                        validator: Some(Arc::new(OrganizationValidator)),
-                    },
-                )
-                .await
-                .map_err(|e| {
-                    anyhow!(
-                        "Failed to update default Organization '{}': {e}",
-                        default_org.name
-                    )
-                })?;
-            Ok(updated)
-        }
-        None => {
-            let spec_value =
-                serde_json::to_value(&spec).context("Failed to serialize Organization spec")?;
-            let created = store
-                .create(CreateResourceParams {
-                    api_version: API_VERSION_V1ALPHA1.to_string(),
-                    kind: ORGANIZATION_KIND.to_string(),
-                    name: default_org.name.clone(),
-                    parent_uid: None,
-                    annotations: desired_annotations,
-                    finalizers: vec![],
-                    spec: spec_value,
-                    validator: Some(Arc::new(OrganizationValidator)),
-                })
-                .await
-                .map_err(|e| {
-                    anyhow!(
-                        "Failed to create default Organization '{}': {e}",
-                        default_org.name
-                    )
-                })?;
-            Ok(created)
+    match existing.len() {
+        0 => Ok(None),
+        1 => Ok(Some(existing.remove(0))),
+        n => {
+            let names: Vec<&str> = existing.iter().map(|r| r.name.as_str()).collect();
+            bail!(
+                "Found {n} existing Organizations (names: {names:?}) but none match the configured \
+                 default_organization.name '{configured_name}'. Refusing to guess which one is the \
+                 default. Set default_organization.name to one of the existing Organizations, or \
+                 delete the unwanted ones."
+            )
         }
     }
 }
@@ -322,16 +388,43 @@ impl DefaultOrganizationView {
     /// `default_organization.kubernetes_namespace_prefix = "rise-"` so
     /// bootstrap stamps the annotation; otherwise the discriminator
     /// fallback will rename the namespaces and orphan the legacy ones.
+    #[allow(dead_code)]
     pub fn resolved_namespace_prefix(&self) -> String {
-        self.namespace_prefix
-            .clone()
-            .unwrap_or_else(|| format!("org-{}-", self.discriminator))
+        match self.namespace_prefix.as_deref() {
+            Some(p) => p.to_string(),
+            None => resolve_namespace_prefix_fallback(&self.discriminator),
+        }
     }
+}
+
+/// Apply the `org-{discriminator}-` fallback when no namespace-prefix
+/// annotation is configured. Extracted so the per-request multi-org path
+/// (`webhook::load_org_namespace_prefix`) and the bootstrap-time
+/// `DefaultOrganizationView::resolved_namespace_prefix` agree by
+/// construction.
+pub fn resolve_namespace_prefix_fallback(discriminator: &str) -> String {
+    format!("org-{discriminator}-")
+}
+
+/// Resolve a project's Kubernetes namespace prefix from its Organization's
+/// annotation map and discriminator: the
+/// `kubernetes.rise.dev/namespace-prefix` annotation wins, otherwise fall
+/// back to `org-{discriminator}-`. The single source of truth shared by
+/// bootstrap and the webhook's per-sync cache loader.
+pub fn resolve_namespace_prefix(
+    annotations: &BTreeMap<String, String>,
+    discriminator: &str,
+) -> String {
+    annotations
+        .get(NAMESPACE_PREFIX_ANNOTATION)
+        .cloned()
+        .unwrap_or_else(|| resolve_namespace_prefix_fallback(discriminator))
 }
 
 /// Look up the default Organization row from the store and project the
 /// fields the Kubernetes controller needs. Returns `None` only when the
 /// resource is absent (controllers should fail startup in that case).
+#[allow(dead_code)]
 pub async fn load_default_organization_view(
     store: &Arc<dyn ResourceStore>,
     default_org: &DefaultOrganizationSettings,
@@ -425,10 +518,28 @@ mod tests {
         assert!(spec.deployment_controller_class.is_none());
     }
 
+    #[test]
+    fn resolve_namespace_prefix_uses_annotation_when_present() {
+        let mut annotations = BTreeMap::new();
+        annotations.insert(NAMESPACE_PREFIX_ANNOTATION.to_string(), "rise-".to_string());
+        // Discriminator is ignored when the annotation is set.
+        assert_eq!(resolve_namespace_prefix(&annotations, "abcd"), "rise-");
+    }
+
+    #[test]
+    fn resolve_namespace_prefix_falls_back_to_discriminator() {
+        let annotations = BTreeMap::new();
+        assert_eq!(resolve_namespace_prefix(&annotations, "abcd"), "org-abcd-");
+    }
+
     /// Construct a minimal `Settings` for tests. Only `default_organization`
     /// matters to `bootstrap::run`; the other required fields exist purely
     /// to satisfy `serde`.
     fn test_settings() -> Settings {
+        test_settings_with_org_name("default")
+    }
+
+    fn test_settings_with_org_name(name: &str) -> Settings {
         let json = serde_json::json!({
             "server": {
                 "host": "0.0.0.0",
@@ -440,6 +551,9 @@ mod tests {
                 "issuer": "http://test.local",
                 "client_id": "test",
                 "client_secret": "test",
+            },
+            "default_organization": {
+                "name": name,
             },
         });
         serde_json::from_value(json).expect("test settings")
@@ -530,5 +644,90 @@ mod tests {
         assert_eq!(third.memberships_backfilled, 0);
         assert_eq!(third.teams_backfilled, 0);
         assert_eq!(third.projects_backfilled, 0);
+    }
+
+    /// Renaming `default_organization.name` in config re-keys the existing
+    /// row rather than creating a new Organization. UID is preserved so
+    /// every typed-row linkage remains valid.
+    #[sqlx::test]
+    async fn bootstrap_renames_existing_default_organization(pool: sqlx::PgPool) {
+        rise_resource_store::run_migrations(&pool)
+            .await
+            .expect("resource store migrations");
+        let store: Arc<dyn ResourceStore> =
+            Arc::new(rise_resource_store::PgResourceStore::new(pool.clone()));
+
+        // First boot mints the Org under the configured name.
+        let first = run(&pool, &store, &test_settings_with_org_name("default"))
+            .await
+            .expect("first run");
+
+        // Second boot with a different name must reuse the same row.
+        let renamed = run(&pool, &store, &test_settings_with_org_name("acme"))
+            .await
+            .expect("second run after rename");
+        assert_eq!(
+            renamed.default_organization_uid, first.default_organization_uid,
+            "rename must preserve the Organization UID"
+        );
+
+        // The store row's name is now the new one.
+        let row = store
+            .get(first.default_organization_uid)
+            .await
+            .expect("get post-rename")
+            .expect("row exists");
+        assert_eq!(row.name, "acme");
+
+        // Third boot with the new name takes the fast path (no rename).
+        let again = run(&pool, &store, &test_settings_with_org_name("acme"))
+            .await
+            .expect("third run");
+        assert_eq!(
+            again.default_organization_uid,
+            first.default_organization_uid
+        );
+    }
+
+    /// Two or more existing Organizations, none matching the configured
+    /// name, is a configuration error: bootstrap cannot guess which is the
+    /// default and refuses to start.
+    #[sqlx::test]
+    async fn bootstrap_bails_on_multiple_existing_orgs_with_no_name_match(pool: sqlx::PgPool) {
+        rise_resource_store::run_migrations(&pool)
+            .await
+            .expect("resource store migrations");
+        let store: Arc<dyn ResourceStore> =
+            Arc::new(rise_resource_store::PgResourceStore::new(pool.clone()));
+
+        // Mint the first Org via bootstrap.
+        run(&pool, &store, &test_settings_with_org_name("default"))
+            .await
+            .expect("first run");
+
+        // Mint a second Org directly through the store.
+        store
+            .create(CreateResourceParams {
+                api_version: API_VERSION_V1ALPHA1.to_string(),
+                kind: ORGANIZATION_KIND.to_string(),
+                name: "other".to_string(),
+                parent_uid: None,
+                annotations: BTreeMap::new(),
+                finalizers: vec![],
+                spec: serde_json::json!({"displayName": "Other"}),
+                validator: Some(Arc::new(OrganizationValidator)),
+            })
+            .await
+            .expect("create second org");
+
+        // Bootstrap with a configured name matching neither must error.
+        let err = run(&pool, &store, &test_settings_with_org_name("renamed"))
+            .await
+            .expect_err("bootstrap should refuse to guess");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Found 2 existing Organizations"),
+            "expected the multi-org bail message, got: {msg}"
+        );
     }
 }

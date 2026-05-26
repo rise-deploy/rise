@@ -140,6 +140,18 @@ pub trait ResourceStore: Send + Sync {
         params: UpdateResourceParams,
     ) -> Result<ResourceRow, StoreError>;
 
+    /// Rename a resource. Bumps `revision` and `updated_at`; preserves
+    /// `uid`, `discriminator`, `spec`, `metadata`, `finalizers`, `parent_uid`
+    /// and `api_version`. A collision on the same-scope unique index
+    /// surfaces as [`StoreError::NameConflict`].
+    ///
+    /// Tombstoned rows are still renamable (this is the bootstrap rename
+    /// helper, not a generic API surface; callers must hold their own lock).
+    /// `ResourceDefinitions` cannot be renamed — their name is structural
+    /// (`{plural}.{group}`) and renaming would desync the projection table;
+    /// attempting to do so returns [`StoreError::Validation`].
+    async fn rename(&self, uid: Uuid, new_name: &str) -> Result<ResourceRow, StoreError>;
+
     /// Delete (or mark for deletion) a resource, cascading to its subtree.
     ///
     /// Stamps `deletion_timestamp` on the resource and its immediate children, and attaches

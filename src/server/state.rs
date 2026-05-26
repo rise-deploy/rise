@@ -81,6 +81,15 @@ pub struct AppState {
     /// and is never cached.
     #[cfg(feature = "backend")]
     pub org_controller_class_cache: Arc<moka::future::Cache<uuid::Uuid, Option<String>>>,
+    /// Short-TTL cache for an Organization's resolved namespace prefix
+    /// (`kubernetes.rise.dev/namespace-prefix` annotation, or
+    /// `org-{discriminator}-` fallback), keyed by Organization UID. Used
+    /// by the Metacontroller webhook to format per-project namespaces
+    /// without re-reading the Org resource on every sync. Mirrors
+    /// `org_controller_class_cache` exactly (30s TTL, 1024-entry cap);
+    /// Org-missing surfaces as `Err` and is not cached.
+    #[cfg(feature = "backend")]
+    pub org_namespace_prefix_cache: Arc<moka::future::Cache<uuid::Uuid, String>>,
     pub auth_settings: Arc<AuthSettings>,
     pub server_settings: Arc<ServerSettings>,
     pub token_store: Arc<dyn TokenStore>,
@@ -301,26 +310,6 @@ impl AppState {
             .context("Default-Organization bootstrap failed")?;
         #[cfg(feature = "backend")]
         let default_organization_uid = bootstrap_outcome.default_organization_uid;
-
-        // Load the bootstrapped Organization back so the Kubernetes
-        // controller (instantiated below) can honour its namespace-prefix
-        // annotation and `spec.deploymentControllerClass`. Bootstrap creates
-        // the row before this returns, so absence is a programmer error and
-        // a `None` here is a hard startup failure.
-        #[cfg(feature = "backend")]
-        let default_organization_view = crate::server::bootstrap::load_default_organization_view(
-            &resource_store,
-            &settings.default_organization,
-        )
-        .await
-        .context("Failed to load default Organization view after bootstrap")?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Default Organization '{}' is missing after bootstrap — refusing to start \
-                 the Kubernetes controller without it",
-                settings.default_organization.name
-            )
-        })?;
 
         // Initialize JWT validator (JWKS is fetched on-demand)
         let jwt_validator = Arc::new(JwtValidator::new(settings.server.ssrf.clone()));
@@ -723,21 +712,10 @@ impl AppState {
                     .filter_map(|(k, v)| v.as_ref().map(|ac| (k.clone(), ac.clone())))
                     .collect();
 
-                // Derive the namespace format from the default Organization's
-                // resolved namespace prefix. `resolved_namespace_prefix()` reads the
-                // `kubernetes.rise.dev/namespace-prefix` annotation when present and
-                // otherwise synthesizes `org-{discriminator}-` for the org.
-                //
-                // Upgrade note: single-org installs that previously named
-                // namespaces `rise-{project_name}` must set
-                // `default_organization.kubernetes_namespace_prefix = "rise-"` so
-                // bootstrap stamps the annotation; otherwise this resolves to
-                // `org-{discriminator}-{project_name}` and orphans the legacy
-                // namespaces on the first reconciliation.
-                let resolved_namespace_format = {
-                    let prefix = default_organization_view.resolved_namespace_prefix();
-                    format!("{prefix}{{project_name}}")
-                };
+                // Namespace prefix is resolved per-request by the
+                // webhook against the project's Organization, so
+                // `ResourceBuilder` no longer carries a baked format
+                // string.
 
                 let rb = ResourceBuilder {
                     production_ingress_url_template: production_ingress_url_template.clone(),
@@ -765,7 +743,6 @@ impl AppState {
                     network_policy: network_policy.clone(),
                     pod_security_enabled: *pod_security_enabled,
                     health_probes: health_probes.clone(),
-                    namespace_format: resolved_namespace_format,
                 };
 
                 let run_mode =
@@ -1076,6 +1053,19 @@ impl AppState {
                 .build(),
         );
 
+        // Cache for the per-Organization resolved namespace prefix
+        // (annotation or `org-{discriminator}-` fallback) keyed by Org
+        // UID. Mirrors `org_controller_class_cache` exactly — a change to
+        // the annotation propagates within ~30s without any manual
+        // invalidation. Org-missing is treated as an error and not cached.
+        #[cfg(feature = "backend")]
+        let org_namespace_prefix_cache = Arc::new(
+            moka::future::Cache::builder()
+                .time_to_live(Duration::from_secs(30))
+                .max_capacity(1024)
+                .build(),
+        );
+
         // Initialize OAuth endpoint rate limiter
         let rl = &settings.server.oauth_rate_limit;
         let oauth_rate_limiter = Arc::new(crate::server::rate_limit::OAuthRateLimiter::new(rl));
@@ -1148,6 +1138,8 @@ impl AppState {
             deployment_controller_class_name,
             #[cfg(feature = "backend")]
             org_controller_class_cache,
+            #[cfg(feature = "backend")]
+            org_namespace_prefix_cache,
             auth_settings,
             server_settings,
             token_store,
