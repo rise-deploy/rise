@@ -159,7 +159,6 @@ class RiseAPI {
                 from_deployment: sourceDeploymentId,
                 use_source_env_vars: useSourceEnvVars,
                 group: sourceDeployment.deployment_group || 'default',
-                http_port: sourceDeployment.controller_metadata?.http_port || 8080,
             })
         });
     }
