@@ -1137,11 +1137,15 @@ interface PodStatus {
     last_checked: string;
 }
 
-/** Returns the notable reason from a container's last_state (e.g. "OOMKilled"), or undefined. */
+/** Returns the notable reason from a container's last_state (e.g. "OOMKilled").
+ *  Falls back to "Exit N" when the previous run terminated with a non-zero exit
+ *  code but Kubernetes didn't supply a named reason — so crash-loops with bare
+ *  exit codes still get a visible badge without expanding the row. */
 function getLastStateReason(container: ContainerStatusInfo): string | undefined {
-    if (container.last_state?.state_type === 'terminated') {
-        return container.last_state.reason ?? undefined;
-    }
+    const last = container.last_state;
+    if (last?.state_type !== 'terminated') return undefined;
+    if (last.reason) return last.reason;
+    if (last.exit_code !== undefined && last.exit_code !== 0) return `Exit ${last.exit_code}`;
     return undefined;
 }
 
@@ -1162,7 +1166,7 @@ function PodInfoRow({ pod }: { pod: PodInfo }) {
             const existing = lastStateBadges.find(b => b.reason === reason);
             if (!existing) {
                 lastStateBadges.push({ reason, finishedAt });
-            } else if (finishedAt && (!existing.finishedAt || finishedAt > existing.finishedAt)) {
+            } else if (finishedAt && (!existing.finishedAt || Date.parse(finishedAt) > Date.parse(existing.finishedAt))) {
                 existing.finishedAt = finishedAt;
             }
         }
@@ -1239,7 +1243,7 @@ function PodInfoRow({ pod }: { pod: PodInfo }) {
                                 Containers
                             </div>
                             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: 10 }}>
-                                {pod.containers.map((container, idx) => {
+                                {pod.containers.map((container) => {
                                     const lastStateReason = getLastStateReason(container);
                                     const lastFinishedAt = container.last_state?.finished_at;
                                     const hasLastStateIssue = lastStateReason != null || (
@@ -1250,7 +1254,7 @@ function PodInfoRow({ pod }: { pod: PodInfo }) {
                                     const runningSince = container.state?.state_type === 'running' ? container.state.started_at : undefined;
                                     return (
                                         <div
-                                            key={idx}
+                                            key={container.name}
                                             style={{
                                                 fontSize: 12,
                                                 padding: 10,
@@ -1346,11 +1350,11 @@ function PodInfoRow({ pod }: { pod: PodInfo }) {
                                 Conditions
                             </div>
                             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                                {pod.conditions.map((condition, idx) => {
+                                {pod.conditions.map((condition) => {
                                     const ok = condition.status === 'True';
                                     return (
                                         <span
-                                            key={idx}
+                                            key={condition.type}
                                             className={`r-status ${ok ? 'ok' : 'bad'}`}
                                             title={condition.message || condition.reason || undefined}
                                         >
@@ -1363,8 +1367,8 @@ function PodInfoRow({ pod }: { pod: PodInfo }) {
                                     );
                                 })}
                             </div>
-                            {pod.conditions.filter(c => c.status !== 'True' && (c.reason || c.message)).map((condition, idx) => (
-                                <div key={`detail-${idx}`} style={{ fontSize: 12, color: 'var(--err)', marginTop: 6, paddingLeft: 2 }}>
+                            {pod.conditions.filter(c => c.status !== 'True' && (c.reason || c.message)).map((condition) => (
+                                <div key={`detail-${condition.type}`} style={{ fontSize: 12, color: 'var(--err)', marginTop: 6, paddingLeft: 2 }}>
                                     <span style={{ fontWeight: 600 }}>{condition.type}</span>
                                     {condition.reason && <span> · {condition.reason}</span>}
                                     {condition.message && <div className="mono" style={{ color: 'var(--text-muted)', marginTop: 2 }}>{condition.message}</div>}
@@ -1405,6 +1409,24 @@ function PodInfoRow({ pod }: { pod: PodInfo }) {
     );
 }
 
+// Scoped 1s ticker for the "Updated Xs ago" indicator so re-renders stay
+// inside this tiny component instead of triggering the whole pod panel.
+function UpdatedAgo({ timestamp }: { timestamp: string }) {
+    const [, setTick] = useState(0);
+    useEffect(() => {
+        const id = setInterval(() => setTick(t => t + 1), 1000);
+        return () => clearInterval(id);
+    }, []);
+    return (
+        <span
+            style={{ fontSize: 11.5, color: 'var(--text-soft)', whiteSpace: 'nowrap' }}
+            title={formatISO8601(timestamp)}
+        >
+            Updated {formatRelativeTimeRounded(timestamp)}
+        </span>
+    );
+}
+
 function PodStatusSection({ podStatus }: { podStatus: PodStatus }) {
     const activePods = podStatus.pods?.filter(p => !p.terminating && !p.terminated) || [];
     const inactivePods = podStatus.pods?.filter(p => p.terminating || p.terminated) || [];
@@ -1436,25 +1458,13 @@ function PodStatusSection({ podStatus }: { podStatus: PodStatus }) {
         </div>
     );
 
-    // Tick once per second so "Updated Xs ago" stays current between the 5s deployment poll.
-    const [, setTick] = useState(0);
-    useEffect(() => {
-        const id = setInterval(() => setTick(t => t + 1), 1000);
-        return () => clearInterval(id);
-    }, []);
-
     return (
         <Panel>
             <PanelHead
                 title="Pod status"
                 right={
                     <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                        <span
-                            style={{ fontSize: 11.5, color: 'var(--text-soft)', whiteSpace: 'nowrap' }}
-                            title={formatISO8601(podStatus.last_checked)}
-                        >
-                            Updated {formatRelativeTimeRounded(podStatus.last_checked)}
-                        </span>
+                        <UpdatedAgo timestamp={podStatus.last_checked} />
                         <span className={`r-status ${replicaTone === 'ok' ? 'running' : replicaTone === 'warn' ? 'warn' : 'failed'}`}>
                             <span className="dot" />
                             <span>{podStatus.ready_replicas}/{podStatus.desired_replicas} ready</span>
