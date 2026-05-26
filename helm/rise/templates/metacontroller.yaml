@@ -14,6 +14,11 @@ spec:
     apiVersion: rise.dev/v1alpha1
     resource: riseprojects
     ignoreStatusChanges: true
+    {{- with .Values.metacontroller.controllerClass }}
+    labelSelector:
+      matchLabels:
+        rise.dev/controller-class: {{ . | quote }}
+    {{- end }}
   childResources:
     - apiVersion: v1
       resource: namespaces

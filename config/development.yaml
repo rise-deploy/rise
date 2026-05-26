@@ -81,6 +81,11 @@ deployment_controller:
   type: "kubernetes"
   pod_security_enabled: false
   metacontroller_webhook_port: 3001
+  # Must match `metacontroller.controllerClass` in the helm chart; otherwise
+  # RiseProject CR labels and the CompositeController labelSelector drift and
+  # Metacontroller stops reconciling. Default value of the field is the same,
+  # set here explicitly so the alignment is visible.
+  controller_class_name: "kubernetes.rise.dev/default"
   # metacontroller_pod_namespace is intentionally absent in development:
   # Rise runs on the host (outside the cluster), so source-IP validation is skipped.
   production_ingress_url_template: "{project_name}.rise.local"

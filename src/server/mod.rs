@@ -109,10 +109,18 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         encryption_provider: state.encryption_provider.clone(),
     };
 
-    // Backfill missing RiseProject CRDs (upgrade migration + recovery)
+    // Reconcile RiseProject CRDs (upgrade migration, recovery, and label
+    // backfill — see `backfill_rise_projects` doc for the full set of
+    // scenarios).
     #[cfg(feature = "backend")]
     if let Some(ref kube_client) = state.kube_client {
-        if let Err(e) = deployment::crd::backfill_rise_projects(kube_client, &state.db_pool).await {
+        if let Err(e) = deployment::crd::backfill_rise_projects(
+            kube_client,
+            &state.db_pool,
+            state.deployment_controller_class_name.as_deref(),
+        )
+        .await
+        {
             tracing::warn!("Failed to backfill RiseProject CRDs: {:?}", e);
         }
     }

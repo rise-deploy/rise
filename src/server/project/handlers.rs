@@ -254,11 +254,20 @@ pub async fn create_project(
         .await
         .internal_err("Failed to commit transaction")?;
 
-    // Create RiseProject CRD for Metacontroller (best-effort)
+    // Create RiseProject CRD for Metacontroller (best-effort). In PR5 every
+    // project links to the default Organization whose `deploymentControllerClass`
+    // equals this controller's own class, so the controller's configured
+    // class is the correct label value. Once orgs can carry different
+    // controller classes, this should look up the project's org's class
+    // from the resource store instead.
     #[cfg(feature = "backend")]
     if let Some(ref kube_client) = state.kube_client {
-        if let Err(e) =
-            crate::server::deployment::crd::ensure_rise_project(kube_client, &project.name).await
+        if let Err(e) = crate::server::deployment::crd::ensure_rise_project(
+            kube_client,
+            &project.name,
+            state.deployment_controller_class_name.as_deref(),
+        )
+        .await
         {
             tracing::warn!(
                 project = %project.name,

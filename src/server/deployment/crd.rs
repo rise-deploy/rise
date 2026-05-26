@@ -39,12 +39,38 @@ pub struct RiseProjectStatus {
 /// which Metacontroller detects and triggers a sync webhook call.
 const TRIGGER_ANNOTATION: &str = "rise.dev/trigger";
 
+/// Label key recording which deployment controller's class owns a
+/// `RiseProject` CR. The value is the project's Organization's
+/// `spec.deploymentControllerClass` (in PR5 this is always the configured
+/// controller's own class, because every project links to the default
+/// Organization). The label exists so that a future multi-controller install
+/// can switch its Metacontroller `CompositeController.parentResource` to a
+/// `labelSelector` filtering on this key — at that point each controller
+/// only sees its own CRs and they stop fighting over each other's children.
+/// Today the webhook still enforces the same filter via
+/// `enforce_controller_class`; the label is the forward-compatible carrier.
+pub const CONTROLLER_CLASS_LABEL: &str = "rise.dev/controller-class";
+
 /// Create or update a `RiseProject` CRD for the given project.
-/// Called when a project is created.
-pub async fn ensure_rise_project(client: &Client, project_name: &str) -> anyhow::Result<()> {
+///
+/// `controller_class` is stamped as the `rise.dev/controller-class` label
+/// when present. `None` means "no Kubernetes deployment controller is
+/// configured for this install", which is unusual but supported.
+pub async fn ensure_rise_project(
+    client: &Client,
+    project_name: &str,
+    controller_class: Option<&str>,
+) -> anyhow::Result<()> {
     let api: Api<RiseProject> = Api::all(client.clone());
 
-    let rise_project = RiseProject::new(project_name, RiseProjectSpec {});
+    let mut rise_project = RiseProject::new(project_name, RiseProjectSpec {});
+    if let Some(class) = controller_class {
+        rise_project
+            .metadata
+            .labels
+            .get_or_insert_with(std::collections::BTreeMap::new)
+            .insert(CONTROLLER_CLASS_LABEL.to_string(), class.to_string());
+    }
 
     api.patch(
         project_name,
@@ -121,51 +147,68 @@ pub async fn trigger_resync(client: &Client, project_name: &str) -> anyhow::Resu
     Ok(())
 }
 
-/// Backfill missing `RiseProject` CRDs for all active projects in the database.
+/// Reconcile `RiseProject` CRDs for every active project in the database.
 ///
-/// This handles two scenarios:
-/// 1. **Upgrade**: When migrating to Metacontroller, no RiseProject CRDs exist yet.
-/// 2. **Recovery**: If a RiseProject CRD is accidentally deleted, it gets recreated.
+/// Handles three scenarios in one pass:
+/// 1. **Upgrade**: When migrating to Metacontroller, no RiseProject CRDs exist yet — they're created.
+/// 2. **Recovery**: An accidentally deleted CRD is recreated.
+/// 3. **Relabel**: An existing CRD missing the `rise.dev/controller-class`
+///    label (created before that label existed) is patched with it.
 ///
-/// Runs once at server startup. Failures for individual projects are logged as
-/// warnings but do not block startup or affect other projects.
-pub async fn backfill_rise_projects(client: &Client, db_pool: &PgPool) -> anyhow::Result<()> {
-    // 1. List all RiseProject CRDs currently in the cluster
+/// Calls `ensure_rise_project` unconditionally for every active project;
+/// server-side apply is a no-op when the resulting object would not change,
+/// so re-applying on every startup is safe.
+///
+/// Runs once at server startup. Per-project failures are logged as warnings
+/// and do not block startup or other projects.
+pub async fn backfill_rise_projects(
+    client: &Client,
+    db_pool: &PgPool,
+    controller_class: Option<&str>,
+) -> anyhow::Result<()> {
     let api: Api<RiseProject> = Api::all(client.clone());
     let existing_crds = api.list(&ListParams::default()).await?;
     let existing_names: HashSet<String> =
         existing_crds.items.iter().map(|r| r.name_any()).collect();
 
-    // 2. List all active (non-Deleting, non-Terminated) projects from the database
     let active_projects = crate::db::projects::list_active(db_pool).await?;
 
-    // 3. Create missing CRDs
     let mut created = 0u32;
+    let mut reconciled = 0u32;
+    let mut failed = 0u32;
     for project in &active_projects {
-        if !existing_names.contains(&project.name) {
-            if let Err(e) = ensure_rise_project(client, &project.name).await {
+        match ensure_rise_project(client, &project.name, controller_class).await {
+            Ok(()) => {
+                if existing_names.contains(&project.name) {
+                    reconciled += 1;
+                } else {
+                    created += 1;
+                }
+            }
+            Err(e) => {
                 warn!(
                     project = %project.name,
-                    "Failed to backfill RiseProject CRD: {:?}", e
+                    "Failed to reconcile RiseProject CRD: {:?}", e
                 );
-                continue;
+                failed += 1;
             }
-            created += 1;
         }
     }
 
-    if created > 0 {
+    if created > 0 || failed > 0 {
         info!(
-            "Backfilled {} RiseProject CRD(s) ({} active projects, {} already existed)",
+            "RiseProject backfill: {} created, {} reconciled, {} failed \
+             ({} active projects, {} pre-existing CRDs)",
             created,
+            reconciled,
+            failed,
             active_projects.len(),
             existing_names.len()
         );
     } else {
         debug!(
-            "No RiseProject CRDs to backfill ({} active projects, {} CRDs present)",
-            active_projects.len(),
-            existing_names.len()
+            "RiseProject backfill: {} reconciled, no creates/failures",
+            reconciled
         );
     }
 
