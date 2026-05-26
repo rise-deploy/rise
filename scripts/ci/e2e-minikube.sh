@@ -189,7 +189,6 @@ fi
 echo "Installing chart with CI image ${IMAGE_REPOSITORY}:${IMAGE_TAG}"
 echo "Using CI values from helm/rise/values-ci.yaml"
 cat helm/rise/values-ci.yaml
-helm dependency build helm/rise
 
 helm_args=(
   --namespace "${NAMESPACE}"

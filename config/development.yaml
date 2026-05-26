@@ -50,6 +50,11 @@ registry:
   namespace: "rise-apps"
   client_registry_url: "rise-registry:5000" # Client-facing URL for CLI push operations
 
+deployment_logs:
+  type: "loki"
+  url: "${RISE_LOKI_URL:-http://localhost:3100}"
+  retention_hint: "168h"
+
 # JFrog Artifactory registry (via Vault):
 # registry:
 #   type: "jfrog"

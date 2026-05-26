@@ -26,9 +26,6 @@ static/assets/app.css
 # Helm packages
 .helm-packages/
 
-# Helm chart dependencies (downloaded by helm dependency build)
-helm/*/charts/
-
 # Cargo chef recipe (generated during Docker builds)
 **/recipe.json
 todo.txt

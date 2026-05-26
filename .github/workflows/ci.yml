@@ -218,8 +218,21 @@ jobs:
       - name: Install mise tools
         run: mise use -g helm
 
-      - name: Build chart dependencies
-        run: helm dependency build helm/rise
+      - name: Verify vendored chart dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          helm_repo_state=$(mktemp -d)
+          trap 'rm -rf "$helm_repo_state"' EXIT
+          mkdir -p "$helm_repo_state/cache"
+          printf 'repositories: []\n' > "$helm_repo_state/repositories.yaml"
+          helm repo add rise-grafana https://grafana.github.io/helm-charts \
+            --repository-config "$helm_repo_state/repositories.yaml" \
+            --repository-cache "$helm_repo_state/cache"
+          helm dependency build helm/rise \
+            --repository-config "$helm_repo_state/repositories.yaml" \
+            --repository-cache "$helm_repo_state/cache"
+          git diff --exit-code -- helm/rise/Chart.lock helm/rise/charts
 
       - name: Set up chart-testing
         uses: helm/chart-testing-action@v2.8.0
@@ -327,9 +340,6 @@ jobs:
           sed -i "s/^version: .*/version: ${ci_version}/" helm/rise/Chart.yaml
           sed -i "s/^appVersion: .*/appVersion: \"${image_tag}\"/" helm/rise/Chart.yaml
           cat helm/rise/Chart.yaml
-
-      - name: Build chart dependencies
-        run: helm dependency build helm/rise
 
       - name: Package chart
         run: |

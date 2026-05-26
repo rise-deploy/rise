@@ -182,6 +182,10 @@ loki:
     enabled: false
   resultsCache:
     enabled: false
+  test:
+    enabled: false
+  lokiCanary:
+    enabled: false
   gateway:
     enabled: false
   read:

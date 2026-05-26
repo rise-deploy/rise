@@ -4,6 +4,14 @@ replicaCount: 0
 metacontroller:
   webhookBaseUrl: "http://host.minikube.internal:3001"
 
+logs:
+  backend: loki
+  loki:
+    enabled: true
+    retentionHint: 168h
+  alloy:
+    enabled: true
+
 postgresql:
   enabled: false
 dex:
