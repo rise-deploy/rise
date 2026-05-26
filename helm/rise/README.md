@@ -141,6 +141,11 @@ The following table lists the configurable parameters of the Rise chart and thei
 | `image.tag` | Image tag | `""` (uses Chart appVersion) |
 | `image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `config` | Rise configuration in YAML format | See values.yaml |
+| `logs.backend` | Runtime log backend (`kubernetes` or `loki`) | `kubernetes` |
+| `logs.loki.enabled` | Install bundled Grafana Loki subchart | `false` |
+| `logs.loki.externalUrl` | External Loki URL when not using bundled Loki | `""` |
+| `logs.loki.retentionHint` | Display-only retention hint for empty log states | `""` |
+| `logs.alloy.enabled` | Install bundled Grafana Alloy subchart for Pod log shipping | `false` |
 | `env` | Additional environment variables as key-value pairs | `[]` |
 | `envFrom` | List of sources to populate environment variables (ConfigMaps/Secrets) | `[]` |
 | `ingress.enabled` | Enable ingress | `false` |

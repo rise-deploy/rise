@@ -1482,6 +1482,7 @@ pub async fn get_logs(
     // Stream response bytes
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
+    let mut event_type = String::from("message");
 
     loop {
         tokio::select! {
@@ -1502,12 +1503,22 @@ pub async fn get_logs(
                             let line = buffer.drain(..=newline_pos).collect::<String>();
                             let line = line.trim_end();
 
+                            if let Some(event) = line.strip_prefix("event: ") {
+                                event_type = event.to_string();
+                                continue;
+                            }
+
                             // Parse SSE format: lines starting with "data: "
                             if let Some(data) = line.strip_prefix("data: ") {
-                                // Only print non-empty data lines
                                 if !data.is_empty() {
-                                    println!("{}", data);
+                                    if event_type == "status" {
+                                        print_log_status(data);
+                                    } else {
+                                        println!("{}", data);
+                                    }
                                 }
+                            } else if line.is_empty() {
+                                event_type = String::from("message");
                             } else if !line.is_empty() && !line.starts_with(':') {
                                 // SSE comments start with ':', skip them
                                 // Print other non-empty lines (in case format changes)
@@ -1542,6 +1553,37 @@ pub async fn get_logs(
     }
 
     Ok(())
+}
+
+fn print_log_status(data: &str) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+        return;
+    };
+
+    let reason = value
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("no_logs_found");
+    let retention_hint = value.get("retention_hint").and_then(|v| v.as_str());
+
+    match reason {
+        "retention_expired_possible" => {
+            if let Some(hint) = retention_hint {
+                println!(
+                    "No logs found. Runtime logs are retained for {}, so this deployment's logs may no longer be available.",
+                    hint
+                );
+            } else {
+                println!("No logs found. They may have expired based on the log backend retention policy.");
+            }
+        }
+        "historical_backend_not_configured" => println!(
+            "No active deployment pod was found and historical logs are not configured."
+        ),
+        "deployment_not_ready" => println!("Deployment logs are not ready yet."),
+        "backend_unavailable" => println!("The log backend is unavailable."),
+        _ => println!("No logs found."),
+    }
 }
 
 /// Parse duration string (e.g., "5m", "1h", "30s") into seconds
@@ -1599,6 +1641,7 @@ impl std::fmt::Debug for LogStreamError {
 pub(super) struct LogStream {
     stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, reqwest::Error>>,
     buffer: String,
+    event_type: String,
 }
 
 impl LogStream {
@@ -1613,14 +1656,19 @@ impl LogStream {
                 let line: String = self.buffer.drain(..=newline_pos).collect();
                 let line = line.trim_end();
 
-                // Parse SSE format: "data: ..." lines contain log content
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if !data.is_empty() {
+                if let Some(event) = line.strip_prefix("event: ") {
+                    self.event_type = event.to_string();
+                    continue;
+                } else if let Some(data) = line.strip_prefix("data: ") {
+                    if !data.is_empty() && self.event_type != "status" {
                         return Some(Ok(data.to_string()));
                     }
                     continue;
                 } else if line.is_empty() || line.starts_with(':') {
                     // SSE comment or empty line, skip
+                    if line.is_empty() {
+                        self.event_type = String::from("message");
+                    }
                     continue;
                 } else {
                     return Some(Ok(line.to_string()));
@@ -1704,6 +1752,7 @@ pub(super) async fn open_log_stream(
     Ok(LogStream {
         stream: response.bytes_stream().boxed(),
         buffer: String::new(),
+        event_type: String::from("message"),
     })
 }
 

@@ -83,6 +83,69 @@ Pod status: ImagePullBackOff
 - Verify application listens on configured HTTP port
 - Check resource limits and node capacity
 
+## Historical Runtime Logs
+
+Rise has two runtime log backends:
+
+```yaml
+deployment_logs:
+  type: kubernetes
+```
+
+The Kubernetes backend streams `pods/log` and can only serve logs while the deployment Pod still exists.
+
+```yaml
+deployment_logs:
+  type: loki
+  url: "http://rise-loki:3100"
+  tenant_id: "tenant-a"              # optional X-Scope-OrgID
+  bearer_token_env: "RISE_LOKI_TOKEN" # optional backend-only token
+  retention_hint: "7d"               # optional display-only hint
+```
+
+The Loki backend keeps Loki backend-only: clients still call the Rise API, and Rise enforces project authorization before querying Loki. Retention is configured in Loki; `retention_hint` is only used to explain empty log results in the UI and CLI.
+
+The Helm chart can install Grafana Loki and Grafana Alloy as optional subcharts:
+
+```yaml
+logs:
+  backend: loki
+  loki:
+    enabled: true
+    retentionHint: 7d
+  alloy:
+    enabled: true
+```
+
+For operator-managed Loki, leave the Loki subchart disabled and point Rise and Alloy at the external endpoint:
+
+```yaml
+logs:
+  backend: loki
+  loki:
+    enabled: false
+    externalUrl: "https://loki.example.internal"
+    tenantId: "rise"
+    bearerTokenSecret:
+      name: loki-token
+      key: token
+  alloy:
+    enabled: true
+```
+
+When the external Loki requires a bearer token, `logs.loki.bearerTokenSecret` injects the token into the Rise backend. Alloy must also receive the same environment variable through the Alloy subchart values:
+
+```yaml
+alloy:
+  alloy:
+    extraEnv:
+      - name: RISE_LOKI_BEARER_TOKEN
+        valueFrom:
+          secretKeyRef:
+            name: loki-token
+            key: token
+```
+
 ## Webhook Security
 
 The Metacontroller sync/finalize webhooks are served on a **separate internal port** (default: 3001). Authentication uses two independent layers — no shared secret is required.

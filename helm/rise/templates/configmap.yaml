@@ -8,4 +8,22 @@ data:
   # A "production.yaml" already exists in the Rise image, so we use "local.yaml" only to override production
   # defaults.
   local.yaml: |
-{{ .Values.config | toYaml | nindent 4 }}
+{{- $config := deepCopy .Values.config }}
+{{- if eq .Values.logs.backend "loki" }}
+{{- $lokiUrl := .Values.logs.loki.externalUrl | default (printf "http://%s-loki:3100" .Release.Name) }}
+{{- $deploymentLogs := dict "type" "loki" "url" $lokiUrl }}
+{{- with .Values.logs.loki.tenantId }}
+{{- $_ := set $deploymentLogs "tenant_id" . }}
+{{- end }}
+{{- if .Values.logs.loki.bearerTokenSecret.name }}
+{{- $_ := set $deploymentLogs "bearer_token_env" "RISE_LOKI_BEARER_TOKEN" }}
+{{- end }}
+{{- with (.Values.logs.loki.retentionHint | default .Values.loki.loki.limits_config.retention_period) }}
+{{- $_ := set $deploymentLogs "retention_hint" . }}
+{{- end }}
+{{- $_ := set $deploymentLogs "timeout_secs" (.Values.logs.loki.timeoutSeconds | int) }}
+{{- $_ := set $config "deployment_logs" $deploymentLogs }}
+{{- else }}
+{{- $_ := set $config "deployment_logs" (dict "type" "kubernetes") }}
+{{- end }}
+{{ $config | toYaml | nindent 4 }}

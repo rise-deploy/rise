@@ -1,0 +1,83 @@
+{{- if .Values.logs.alloy.enabled }}
+{{- if and .Values.logs.loki.bearerTokenSecret.name (empty .Values.alloy.alloy.extraEnv) }}
+{{- fail "logs.loki.bearerTokenSecret is set, but Alloy also needs alloy.alloy.extraEnv to expose RISE_LOKI_BEARER_TOKEN from the same Secret" }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.alloy.alloy.configMap.name | quote }}
+  labels:
+    {{- include "rise.labels" . | nindent 4 }}
+data:
+  {{ .Values.alloy.alloy.configMap.key }}: |
+    discovery.kubernetes "pods" {
+      role = "pod"
+    }
+
+    discovery.relabel "rise_pods" {
+      targets = discovery.kubernetes.pods.targets
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_managed_by"]
+        regex = "rise"
+        action = "keep"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_label_rise_dev_project"]
+        target_label = "rise_project"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_label_rise_dev_environment"]
+        target_label = "rise_environment"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_label_rise_dev_deployment_group"]
+        target_label = "rise_deployment_group"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_label_rise_dev_deployment_id"]
+        target_label = "rise_deployment_id"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_label_rise_dev_deployment_uuid"]
+        target_label = "rise_deployment_uuid"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_namespace"]
+        target_label = "namespace"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_name"]
+        target_label = "pod"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_container_name"]
+        target_label = "container"
+      }
+    }
+
+    loki.source.kubernetes "rise_pods" {
+      targets    = discovery.relabel.rise_pods.output
+      forward_to = [loki.write.rise.receiver]
+    }
+
+    loki.write "rise" {
+      endpoint {
+        url = {{ printf "%s/loki/api/v1/push" (.Values.logs.loki.externalUrl | default (printf "http://%s-loki:3100" .Release.Name)) | quote }}
+        {{- with .Values.logs.loki.tenantId }}
+        tenant_id = {{ . | quote }}
+        {{- end }}
+        {{- if .Values.logs.loki.bearerTokenSecret.name }}
+        bearer_token = sys.env("RISE_LOKI_BEARER_TOKEN")
+        {{- end }}
+      }
+    }
+{{- end }}

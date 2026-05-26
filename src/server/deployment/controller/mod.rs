@@ -65,16 +65,4 @@ pub trait DeploymentBackend: Send + Sync {
         Ok(())
     }
 
-    /// Stream logs from a deployment
-    ///
-    /// Returns a stream of log bytes from the deployment's runtime (pod/container).
-    async fn stream_logs(
-        &self,
-        deployment: &Deployment,
-        project: &Project,
-        follow: bool,
-        tail_lines: Option<i64>,
-        timestamps: bool,
-        since_seconds: Option<i64>,
-    ) -> anyhow::Result<futures::stream::BoxStream<'static, Result<bytes::Bytes, anyhow::Error>>>;
 }

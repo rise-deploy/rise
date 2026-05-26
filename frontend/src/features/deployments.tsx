@@ -714,6 +714,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
     const [logs, setLogs] = useState([]);
     const [streaming, setStreaming] = useState(false);
     const [error, setError] = useState(null);
+    const [logStatus, setLogStatus] = useState(null);
     const [autoScroll, setAutoScroll] = useState(true);
     const [tailLines, setTailLines] = useState(isActiveDeployment ? 1 : 1000);
     const [tailInputValue, setTailInputValue] = useState(isActiveDeployment ? '1' : '1000');
@@ -722,7 +723,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
 
     const isLoggable = (status) => {
         // Can view logs for deployments that are running or have run
-        return ['Deploying', 'Healthy', 'Unhealthy', 'Stopped', 'Failed', 'Superseded'].includes(status);
+        return ['Deploying', 'Healthy', 'Unhealthy', 'Cancelled', 'Stopped', 'Failed', 'Superseded', 'Expired'].includes(status);
     };
 
     // Scroll the log container itself (not scrollIntoView, which would also
@@ -747,6 +748,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
         // Clear existing logs when starting a new stream
         setLogs([]);
         setError(null);
+        setLogStatus(null);
         setStreaming(true);
 
         const baseUrl = window.API_BASE_URL || '';
@@ -772,6 +774,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
             const reader = response.body.getReader();
             const decoder = new TextDecoder();
             let buffer = '';
+            let eventType = 'message';
 
             const processStream = () => {
                 reader.read().then(({ done, value }) => {
@@ -785,11 +788,21 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                     buffer = lines.pop(); // Keep incomplete line in buffer
 
                     lines.forEach(line => {
-                        if (line.startsWith('data: ')) {
+                        if (line.startsWith('event: ')) {
+                            eventType = line.substring(7);
+                        } else if (line.startsWith('data: ')) {
                             const logLine = line.substring(6); // Remove 'data: ' prefix
-                            if (logLine.trim()) {
+                            if (eventType === 'status') {
+                                try {
+                                    setLogStatus(JSON.parse(logLine));
+                                } catch {
+                                    setLogStatus({ reason: 'backend_unavailable' });
+                                }
+                            } else if (logLine.trim()) {
                                 setLogs(prevLogs => [...prevLogs, logLine]);
                             }
+                        } else if (line === '') {
+                            eventType = 'message';
                         }
                     });
 
@@ -845,7 +858,9 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
             const reader = response.body.getReader();
             const decoder = new TextDecoder();
             let buffer = '';
+            let eventType = 'message';
             const newLogs = [];
+            let status = null;
 
             while (true) {
                 const { done, value } = await reader.read();
@@ -856,16 +871,27 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                 buffer = lines.pop();
 
                 lines.forEach(line => {
-                    if (line.startsWith('data: ')) {
+                    if (line.startsWith('event: ')) {
+                        eventType = line.substring(7);
+                    } else if (line.startsWith('data: ')) {
                         const logLine = line.substring(6);
-                        if (logLine.trim()) {
+                        if (eventType === 'status') {
+                            try {
+                                status = JSON.parse(logLine);
+                            } catch {
+                                status = { reason: 'backend_unavailable' };
+                            }
+                        } else if (logLine.trim()) {
                             newLogs.push(logLine);
                         }
+                    } else if (line === '') {
+                        eventType = 'message';
                     }
                 });
             }
 
             setLogs(newLogs);
+            setLogStatus(status);
         } catch (err) {
             console.error('Failed to load logs:', err);
             setError(err.message);
@@ -891,6 +917,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
 
     const clearLogs = () => {
         setLogs([]);
+        setLogStatus(null);
     };
 
     const handleTailLinesChange = (e) => {
@@ -947,6 +974,25 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
         }
     };
 
+    const renderLogStatus = () => {
+        if (!logStatus) return null;
+        if (logStatus.reason === 'retention_expired_possible') {
+            return logStatus.retention_hint
+                ? `No logs found. Runtime logs are retained for ${logStatus.retention_hint}, so this deployment's logs may no longer be available.`
+                : 'No logs found. They may have expired based on the log backend retention policy.';
+        }
+        if (logStatus.reason === 'historical_backend_not_configured') {
+            return 'No active deployment pod was found and historical logs are not configured.';
+        }
+        if (logStatus.reason === 'deployment_not_ready') {
+            return 'Deployment logs are not ready yet.';
+        }
+        if (logStatus.reason === 'backend_unavailable') {
+            return 'The log backend is unavailable.';
+        }
+        return 'No logs found.';
+    };
+
     return (
         <Panel style={{ display: 'flex', flexDirection: 'column' }}>
             <div className="r-panel-head r-logs-head">
@@ -998,7 +1044,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                     {visibleLogs.length === 0 ? (
                         <div style={{ textAlign: 'center', padding: '32px 0', color: 'oklch(0.55 0.005 80)' }}>
                             {logs.length === 0
-                                ? (streaming ? 'Waiting for logs...' : 'No logs yet. Click "Load" or "Follow" to view.')
+                                ? (renderLogStatus() || (streaming ? 'Waiting for logs...' : 'No logs yet. Click "Load" or "Follow" to view.'))
                                 : 'No log lines match this filter.'}
                         </div>
                     ) : (

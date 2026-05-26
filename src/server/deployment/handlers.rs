@@ -2331,73 +2331,43 @@ pub async fn stream_deployment_logs(
         ))
     })?;
 
-    // Check if deployment is in a state where logs make sense
-    if state_machine::is_terminal(&deployment.status) {
-        return Err(ServerError::gone(
-            "Deployment is no longer running - logs may not be available",
-        ));
-    }
-
-    // Don't allow streaming logs from deployments that haven't reached Deploying yet
-    if matches!(
-        deployment.status,
-        DbDeploymentStatus::Pending
-            | DbDeploymentStatus::Building
-            | DbDeploymentStatus::Pushing
-            | DbDeploymentStatus::Pushed
-    ) {
-        return Err(ServerError::service_unavailable(
-            "Deployment not ready yet - no logs available. Try again when deployment is running.",
-        )
-        .expected());
-    }
-
-    // Get log stream from deployment backend
-    // Default to last 1000 lines if tail not specified
+    // Get log stream from configured runtime log backend.
+    // Default to last 1000 lines if tail not specified.
     let tail = params.tail.or(Some(1000));
 
     let log_stream = state
-        .deployment_backend
+        .runtime_log_backend
         .stream_logs(
             &deployment,
             &project,
-            params.follow,
-            tail,
-            params.timestamps,
-            params.since,
+            crate::server::deployment::logs::LogQuery {
+                follow: params.follow,
+                tail_lines: tail,
+                timestamps: params.timestamps,
+                since_seconds: params.since,
+            },
         )
         .await
         .map_err(|e| {
             let error_msg = e.to_string();
-            if error_msg.contains("Pod not found")
-                || error_msg.contains("not ready yet")
-                || error_msg.contains("waiting to start")
-                || error_msg.contains("ContainerCreating")
-                || error_msg.contains("PodInitializing")
-            {
-                ServerError::service_unavailable(
-                    "Deployment pod not ready yet. Please try again in a moment.",
-                )
-                .expected()
+            if error_msg.contains("not ready yet") || error_msg.contains("waiting to start") {
+                ServerError::service_unavailable("Deployment logs are not ready yet.").expected()
             } else {
                 ServerError::internal_anyhow(e, "Failed to stream logs")
             }
         })?;
 
-    // Convert log stream to SSE events
-    // We need to flatten the stream since each chunk may contain multiple lines
+    // Convert typed log events to SSE events.
     use futures::stream;
     let sse_stream = log_stream.flat_map(|result| match result {
-        Ok(bytes) => {
-            // Convert bytes to string (log lines)
-            let log_text = String::from_utf8_lossy(&bytes).to_string();
-            // Split into individual lines and create an event for each
-            let events: Vec<Result<Event, anyhow::Error>> = log_text
-                .lines()
-                .filter(|line| !line.is_empty())
-                .map(|line| Ok(Event::default().data(line)))
-                .collect();
-            stream::iter(events)
+        Ok(crate::server::deployment::logs::LogEvent::Line(line)) => {
+            stream::iter(vec![Ok(Event::default().event("log").data(line))])
+        }
+        Ok(crate::server::deployment::logs::LogEvent::Status(status)) => {
+            stream::iter(vec![Event::default()
+                .event("status")
+                .json_data(status)
+                .map_err(anyhow::Error::from)])
         }
         Err(e) => {
             // Send error as SSE event

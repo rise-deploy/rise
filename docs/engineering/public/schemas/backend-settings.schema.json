@@ -509,6 +509,65 @@
       },
       "type": "object"
     },
+    "DeploymentLogsSettings": {
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "const": "kubernetes",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "bearer_token_env": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "retention_hint": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tenant_id": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "timeout_secs": {
+              "default": 10,
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "loki",
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "EncryptionSettings": {
       "description": "Encryption provider configuration",
       "oneOf": [
@@ -1649,6 +1708,9 @@
           "type": "null"
         }
       ]
+    },
+    "deployment_logs": {
+      "$ref": "#/$defs/DeploymentLogsSettings"
     },
     "encryption": {
       "anyOf": [

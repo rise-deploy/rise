@@ -126,6 +126,80 @@ metacontroller:
   # Disable this if Metacontroller is already installed in the cluster.
   install: true
 
+# Runtime deployment logs.
+# The Rise API always enforces authorization and proxies log access; Loki is only
+# contacted by the backend and by Alloy.
+logs:
+  # kubernetes: stream directly from active Pods only.
+  # loki: query historical logs from Loki.
+  backend: kubernetes
+  loki:
+    # Installs the Grafana Loki subchart when true. Set false with externalUrl
+    # to connect Rise to an operator-managed Loki.
+    enabled: false
+    externalUrl: ""
+    tenantId: ""
+    timeoutSeconds: 10
+    # Display-only hint used by Rise when no logs are found. Retention is still
+    # enforced by Loki itself.
+    retentionHint: ""
+    bearerTokenSecret:
+      name: ""
+      key: token
+  alloy:
+    # Installs the Grafana Alloy subchart when true. Alloy ships pod logs to
+    # Loki and preserves Rise deployment labels for historical lookup.
+    enabled: false
+
+# Grafana Loki subchart values. These defaults are intentionally small and
+# PVC-backed for simple installs; production operators should tune or provide
+# their own Loki.
+loki:
+  deploymentMode: SingleBinary
+  singleBinary:
+    replicas: 1
+    persistence:
+      enabled: true
+      size: 10Gi
+  loki:
+    auth_enabled: false
+    commonConfig:
+      replication_factor: 1
+    storage:
+      type: filesystem
+    schemaConfig:
+      configs:
+        - from: "2024-04-01"
+          store: tsdb
+          object_store: filesystem
+          schema: v13
+          index:
+            prefix: rise_loki_index_
+            period: 24h
+    limits_config:
+      retention_period: 168h
+  chunksCache:
+    enabled: false
+  resultsCache:
+    enabled: false
+  gateway:
+    enabled: false
+  read:
+    replicas: 0
+  write:
+    replicas: 0
+  backend:
+    replicas: 0
+
+# Grafana Alloy subchart values. The configMap name is fixed so this chart can
+# provide templated Alloy configuration while still using the upstream subchart.
+alloy:
+  alloy:
+    configMap:
+      create: false
+      name: rise-alloy-config
+      key: config.alloy
+
 # Rise backend configuration overrides
 # Converted to YAML and mounted as /etc/rise/local.yaml
 # The backend supports both TOML and YAML - this chart outputs YAML by default

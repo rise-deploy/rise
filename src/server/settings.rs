@@ -14,6 +14,8 @@ pub struct Settings {
     #[serde(default)]
     pub deployment_controller: Option<DeploymentControllerSettings>,
     #[serde(default)]
+    pub deployment_logs: DeploymentLogsSettings,
+    #[serde(default)]
     pub encryption: Option<EncryptionSettings>,
     #[serde(default)]
     pub extensions: Option<ExtensionsSettings>,
@@ -24,6 +26,33 @@ pub struct Settings {
     /// always on when the `backend` feature is enabled.
     #[serde(default)]
     pub resource_gc: Option<ResourceGcSettings>,
+}
+
+fn default_loki_timeout_secs() -> u64 {
+    10
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum DeploymentLogsSettings {
+    Kubernetes,
+    Loki {
+        url: String,
+        #[serde(default)]
+        tenant_id: Option<String>,
+        #[serde(default)]
+        bearer_token_env: Option<String>,
+        #[serde(default = "default_loki_timeout_secs")]
+        timeout_secs: u64,
+        #[serde(default)]
+        retention_hint: Option<String>,
+    },
+}
+
+impl Default for DeploymentLogsSettings {
+    fn default() -> Self {
+        Self::Kubernetes
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, JsonSchema)]

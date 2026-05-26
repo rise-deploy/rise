@@ -193,8 +193,7 @@ rise deployment logs -p my-app 20241205-1234 --since 5m
 rise deployment logs -p my-app 20241205-1234 --timestamps
 ```
 
-Note that logs are currently only available for active deployments (`Healthy` or `Unhealthy`) and can not be accessed
-for past deployments.
+When Rise is configured with the Kubernetes log backend, runtime logs are available only while deployment Pods still exist. When Rise is configured with the Loki log backend, runtime logs can also be shown for past deployments until the Loki retention policy removes them. If no historical logs are found, Rise will indicate whether they may have expired based on the operator-configured retention hint.
 
 ## Rollback
 
