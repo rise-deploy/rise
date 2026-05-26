@@ -1,14 +1,15 @@
 // @ts-nocheck
-import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
-import { copyToClipboard, formatDate, formatISO8601, formatRelativeTimeRounded, formatTimeRemaining, isSafeUrl } from '../lib/utils';
+import { copyToClipboard, formatDate, formatISO8601, formatRelativeTimeRounded, formatTimeRemaining, isSafeUrl, stripUrlScheme } from '../lib/utils';
+import { usePolling } from '../lib/polling';
 import { useToast } from '../components/toast';
-import { Button, ConfirmDialog, ENV_COLOR_STYLES, EnvironmentColorDot, Modal, ModalActions, ModalSection, SourceLinkGroup, SourceLinkGroupAction, StatusBadge } from '../components/ui';
 import { MonoSortButton, MonoTable, MonoTableBody, MonoTableEmptyRow, MonoTableFrame, MonoTableHead, MonoTableRow, MonoTd, MonoTh } from '../components/table';
+import { Button as RButton, Combobox, ConfirmDialog, ENV_COLOR_STYLES, Empty, EnvPill, EnvironmentColorDot, GroupPill, KV, KVRow, Modal, Panel, PanelBody, PanelHead, Pill, SearchInput, Segmented, SourceLinkGroup, SourceLinkGroupAction, Status, Tabs } from '../components/r-ui';
+import { Icon } from '../components/icon';
 import { EnvVarsList } from './resources';
 import { EmptyState, ErrorState, LoadingState } from '../components/states';
-import { useRowKeyboardNavigation, useSortableData } from '../lib/table';
 
 const STATUS_TONES = {
     Healthy: 'ok',
@@ -92,14 +93,14 @@ export function ActiveDeploymentsSummary({ projectName }) {
         }
     }, [projectName]);
 
+    // Auto-refresh every 5 seconds, paused when the tab is hidden.
+    usePolling(loadSummary, 5000);
+
     useEffect(() => {
-        loadSummary();
         api.getProjectEnvironments(projectName)
             .then(data => setEnvironments(data || []))
             .catch(() => {});
-        const interval = setInterval(loadSummary, 5000);
-        return () => clearInterval(interval);
-    }, [loadSummary]);
+    }, [projectName]);
 
     if (loading) return <LoadingState label="Loading active deployments..." />;
     if (error) return <ErrorState message={`Error loading active deployments: ${error}`} onRetry={loadSummary} />;
@@ -193,7 +194,7 @@ export function ActiveDeploymentsSummary({ projectName }) {
                             <div className="flex justify-between items-center mb-4">
                                 <h5 className="text-lg font-semibold">{group}</h5>
                                 <div className="flex items-center gap-3">
-                                    <StatusBadge status={deployment.status} />
+                                    <Status status={deployment.status} />
                                     <SourceLinkGroup jobUrl={deployment.job_url} prUrl={deployment.pull_request_url} onClick={(e) => e.stopPropagation()}>
                                         {canStop && (
                                             <SourceLinkGroupAction
@@ -217,7 +218,11 @@ export function ActiveDeploymentsSummary({ projectName }) {
                             </div>
                             <div>
                                 <dt className="text-gray-600 dark:text-gray-400">URL</dt>
-                                <dd>{deployment.primary_url ? <a href={deployment.primary_url} target="_blank" rel="noopener noreferrer" className="text-indigo-600 dark:text-indigo-400 hover:text-indigo-700 dark:hover:text-indigo-300">{deployment.primary_url}</a> : '-'}</dd>
+                                <dd>{deployment.primary_url
+                                    ? (isSafeUrl(deployment.primary_url)
+                                        ? <a href={deployment.primary_url} target="_blank" rel="noopener noreferrer" className="text-indigo-600 dark:text-indigo-400 hover:text-indigo-700 dark:hover:text-indigo-300">{deployment.primary_url}</a>
+                                        : <span className="text-gray-900 dark:text-gray-200">{deployment.primary_url}</span>)
+                                    : '-'}</dd>
                             </div>
                             <div>
                                 <dt className="text-gray-600 dark:text-gray-400">Created</dt>
@@ -228,7 +233,7 @@ export function ActiveDeploymentsSummary({ projectName }) {
                             {deployment.environment && (
                                 <div>
                                     <dt className="text-gray-600 dark:text-gray-400">Environment</dt>
-                                    <dd className="text-gray-900 dark:text-gray-200 flex items-center gap-2"><EnvironmentColorDot color={deployment.environment_color} />{deployment.environment}</dd>
+                                    <dd><EnvPill env={deployment.environment} color={deployment.environment_color} /></dd>
                                 </div>
                             )}
                             {deployment.expires_at && (
@@ -263,7 +268,7 @@ export function ActiveDeploymentsSummary({ projectName }) {
                 title="Stop Deployment"
                 message={`Are you sure you want to stop deployment ${deploymentToStop?.deployment_id}? Impact: traffic for group "${deploymentToStop?.deployment_group || 'default'}" may terminate.`}
                 confirmText="Stop Deployment"
-                variant="danger"
+                confirmTone="danger"
                 loading={stopping}
             />
         </>
@@ -281,6 +286,8 @@ export function DeploymentsList({ projectName }) {
     const [deploymentGroups, setDeploymentGroups] = useState([]);
     const [environments, setEnvironments] = useState([]);
     const [envFilter, setEnvFilter] = useState('');
+    const [statusFilter, setStatusFilter] = useState('active');
+    const [search, setSearch] = useState('');
     const [confirmDialogOpen, setConfirmDialogOpen] = useState(false);
     const [deploymentToStop, setDeploymentToStop] = useState(null);
     const [stopping, setStopping] = useState(false);
@@ -290,14 +297,18 @@ export function DeploymentsList({ projectName }) {
     const [actionStatus, setActionStatus] = useState('');
     const { showToast } = useToast();
     const pageSize = 10;
-    const { sortedItems: sortedDeployments, sortKey, sortDirection, requestSort } = useSortableData(deployments, 'created', 'desc');
-    const { activeIndex, setActiveIndex, onKeyDown } = useRowKeyboardNavigation(
-        (idx) => {
-            const deployment = sortedDeployments[idx];
-            if (deployment) navigate(`/deployment/${projectName}/${deployment.deployment_id}`);
-        },
-        sortedDeployments.length
-    );
+    // Sort deployments by created desc — the new r-table doesn't expose
+    // sort headers, so we keep the default ordering only.
+    const sortedDeployments = useMemo(() => {
+        return [...deployments].sort((a, b) => {
+            const av = a?.created;
+            const bv = b?.created;
+            if (av == null && bv == null) return 0;
+            if (av == null) return 1;
+            if (bv == null) return -1;
+            return String(bv).localeCompare(String(av), undefined, { numeric: true, sensitivity: 'base' });
+        });
+    }, [deployments]);
 
     // Load deployment groups and environments
     useEffect(() => {
@@ -333,21 +344,8 @@ export function DeploymentsList({ projectName }) {
         }
     }, [projectName, page, groupFilter]);
 
-    useEffect(() => {
-        loadDeployments();
-        const interval = setInterval(loadDeployments, 5000);
-        return () => clearInterval(interval);
-    }, [loadDeployments]);
-
-    const handleGroupChange = (e) => {
-        setGroupFilter(e.target.value);
-        setPage(0);
-    };
-
-    const handleEnvFilterChange = (e) => {
-        setEnvFilter(e.target.value);
-        setPage(0);
-    };
+    // Auto-refresh every 5 seconds, paused when the tab is hidden.
+    usePolling(loadDeployments, 5000);
 
     const isTerminal = (status) => {
         return ['Cancelled', 'Stopped', 'Superseded', 'Failed', 'Expired'].includes(status);
@@ -414,176 +412,193 @@ export function DeploymentsList({ projectName }) {
     if (error) return <ErrorState message={`Error loading deployments: ${error}`} onRetry={loadDeployments} />;
 
     // Client-side environment filter
-    const filteredDeployments = envFilter
+    const envFilteredDeployments = envFilter
         ? sortedDeployments.filter(d => d.environment === envFilter)
         : sortedDeployments;
 
-    // Find the most recent deployment in the default group (only non-terminal)
-    const mostRecentDefault = filteredDeployments.find(d => d.deployment_group === 'default' && !isTerminal(d.status));
+    // Status filter — "Active" = not in a terminal state; the rest match a
+    // specific status; "All" shows everything.
+    const matchesStatus = (d) => {
+        switch (statusFilter) {
+            case 'active': return !isTerminal(d.status);
+            case 'healthy': return d.status === 'Healthy';
+            case 'unhealthy': return d.status === 'Unhealthy';
+            case 'failed': return d.status === 'Failed';
+            default: return true;
+        }
+    };
+    const statusFilteredDeployments = envFilteredDeployments.filter(matchesStatus);
+
+    // Client-side text search over the loaded page (deployment id / image / author)
+    const q = search.trim().toLowerCase();
+    const filteredDeployments = q
+        ? statusFilteredDeployments.filter(d => {
+            const haystack = `${d.deployment_id || ''} ${d.image || ''} ${d.created_by_email || ''}`.toLowerCase();
+            return haystack.includes(q);
+        })
+        : statusFilteredDeployments;
+
+    const envOptions = [
+        { value: '', label: 'All envs' },
+        ...environments.map(env => ({ value: env.name, label: env.name })),
+    ];
 
     return (
         <div>
-            <div className="mb-4 flex items-center gap-4">
-                <label htmlFor="deployment-group-filter" className="flex items-center gap-2">
-                    <span className="text-sm text-gray-600 dark:text-gray-400 whitespace-nowrap">Group:</span>
-                    <select
-                        id="deployment-group-filter"
-                        value={groupFilter}
-                        onChange={handleGroupChange}
-                        className="mono-select text-sm"
-                    >
-                        <option value="">All groups</option>
-                        {deploymentGroups.map(group => (
-                            <option key={group} value={group}>{group}</option>
-                        ))}
-                    </select>
-                </label>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 14 }}>
+                <SearchInput
+                    value={search}
+                    onChange={setSearch}
+                    placeholder="Filter deployments…"
+                    style={{ flex: 1, maxWidth: 280 }}
+                />
+                <Segmented<string>
+                    value={statusFilter}
+                    options={[
+                        { value: 'active', label: 'Active' },
+                        { value: 'healthy', label: 'Healthy' },
+                        { value: 'unhealthy', label: 'Unhealthy' },
+                        { value: 'failed', label: 'Failed' },
+                        { value: 'all', label: 'All' },
+                    ]}
+                    onChange={setStatusFilter}
+                />
                 {environments.length > 0 && (
-                    <label htmlFor="deployment-env-filter" className="flex items-center gap-2">
-                        <span className="text-sm text-gray-600 dark:text-gray-400 whitespace-nowrap">Environment:</span>
-                        <select
-                            id="deployment-env-filter"
-                            value={envFilter}
-                            onChange={handleEnvFilterChange}
-                            className="mono-select text-sm"
-                        >
-                            <option value="">All environments</option>
-                            {environments.map(env => (
-                                <option key={env.name} value={env.name}>{env.name}</option>
-                            ))}
-                        </select>
-                    </label>
+                    <Segmented<string>
+                        value={envFilter}
+                        options={envOptions}
+                        onChange={(v) => { setEnvFilter(v); setPage(0); }}
+                        capitalize
+                    />
                 )}
+                {deploymentGroups.length > 0 && (
+                    <div style={{ width: 200 }}>
+                        <Combobox
+                            value={groupFilter}
+                            onChange={(v) => { setGroupFilter(v); setPage(0); }}
+                            options={[
+                                { value: '', label: 'All groups' },
+                                ...deploymentGroups.map(group => ({ value: group, label: group })),
+                            ]}
+                            placeholder="All groups"
+                        />
+                    </div>
+                )}
+                <div style={{ marginLeft: 'auto', fontSize: 12.5, color: 'var(--text-soft)' }}>
+                    {filteredDeployments.length} of {deployments.length}
+                </div>
             </div>
-            {actionStatus && <p className="mono-inline-status mb-3">{actionStatus}</p>}
+            {actionStatus && (
+                <div className="r-alert info" style={{ marginBottom: 14, fontSize: 12.5 }}>
+                    <Icon name="info" size={14} />
+                    <div style={{ flex: 1 }}>{actionStatus}</div>
+                </div>
+            )}
 
-            <MonoTableFrame>
-                <MonoTable className="mono-sticky-table mono-table--sticky" onKeyDown={onKeyDown}>
-                    <MonoTableHead>
-                        <tr>
-                            <MonoTh stickyCol className="px-6 py-3 text-left">
-                                <MonoSortButton label="ID" active={sortKey === 'deployment_id'} direction={sortDirection} onClick={() => requestSort('deployment_id')} />
-                            </MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">
-                                <MonoSortButton label="Status" active={sortKey === 'status'} direction={sortDirection} onClick={() => requestSort('status')} />
-                            </MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">Created by</MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">Image</MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">Group</MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">Environment</MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">URL</MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">Expires</MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">
-                                <MonoSortButton label="Created" active={sortKey === 'created'} direction={sortDirection} onClick={() => requestSort('created')} />
-                            </MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">Actions</MonoTh>
-                        </tr>
-                    </MonoTableHead>
-                    <MonoTableBody>
-                        {filteredDeployments.length === 0 ? (
-                            <MonoTableEmptyRow colSpan={10}>
-                                <EmptyState message="No deployments found." />
-                            </MonoTableEmptyRow>
-                        ) : (
-                            filteredDeployments.map((d, idx) => {
-                                    const isHighlighted = mostRecentDefault && d.id === mostRecentDefault.id;
-                                    return (
-                                    <MonoTableRow
-                                        key={d.id}
-                                        onClick={() => navigate(`/deployment/${projectName}/${d.deployment_id}`)}
-                                        onFocus={() => setActiveIndex(idx)}
-                                        tabIndex={0}
-                                        aria-label={`Deployment ${d.deployment_id}`}
-                                        interactive
-                                        active={activeIndex === idx}
-                                        highlight={Boolean(isHighlighted)}
-                                        className="transition-colors"
-                                    >
-                                        <MonoTd stickyCol mono className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-gray-200">{d.deployment_id}</MonoTd>
-                                        <MonoTd className="px-6 py-4 whitespace-nowrap text-sm"><StatusBadge status={d.status} /></MonoTd>
-                                        <MonoTd className="px-6 py-4 whitespace-nowrap text-sm text-gray-700 dark:text-gray-300">{d.created_by_email || '-'}</MonoTd>
-                                        <MonoTd mono className="px-6 py-4 whitespace-nowrap text-xs text-gray-700 dark:text-gray-300">{d.image ? d.image.split('/').pop() : '-'}</MonoTd>
-                                        <MonoTd className="px-6 py-4 whitespace-nowrap text-sm text-gray-700 dark:text-gray-300">{d.deployment_group}</MonoTd>
-                                        <MonoTd className="px-6 py-4 whitespace-nowrap text-sm text-gray-700 dark:text-gray-300">{d.environment ? <span className="inline-flex items-center gap-2"><EnvironmentColorDot color={d.environment_color} />{d.environment}</span> : '-'}</MonoTd>
-                                        <MonoTd className="px-6 py-4 whitespace-nowrap text-sm">
-                                            {d.primary_url ? (
-                                                <a
-                                                    href={d.primary_url}
-                                                    target="_blank"
-                                                    rel="noopener noreferrer"
-                                                    className="text-indigo-600 dark:text-indigo-400 hover:text-indigo-700 dark:hover:text-indigo-300"
-                                                    onClick={(e) => e.stopPropagation()}
+            <Panel>
+                {filteredDeployments.length === 0 ? (
+                    <div style={{ padding: 36, textAlign: 'center', color: 'var(--text-muted)' }}>
+                        No deployments found.
+                    </div>
+                ) : (
+                    <table className="r-table">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Status</th>
+                                <th>Env</th>
+                                <th>Group</th>
+                                <th>Image</th>
+                                <th>Created by</th>
+                                <th>Duration</th>
+                                <th>Age</th>
+                                <th style={{ textAlign: 'right' }}>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {filteredDeployments.map(d => (
+                                <tr
+                                    key={d.id}
+                                    className="click"
+                                    onClick={() => navigate(`/deployment/${projectName}/${d.deployment_id}`)}
+                                >
+                                    <td className="mono" style={{ fontSize: 12.25 }}>{d.deployment_id}</td>
+                                    <td><Status status={d.status} /></td>
+                                    <td>
+                                        {d.environment ? (
+                                            <EnvPill env={d.environment} color={d.environment_color} />
+                                        ) : <span style={{ color: 'var(--text-soft)' }}>—</span>}
+                                    </td>
+                                    <td>{d.deployment_group ? (() => {
+                                        const env = environments.find((e) => e.name === d.environment);
+                                        return <GroupPill group={d.deployment_group} primary={!!env && env.primary_deployment_group === d.deployment_group} />;
+                                    })() : null}</td>
+                                    <td className="mono" style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                                        {d.image ? d.image.split('/').pop() : '—'}
+                                    </td>
+                                    <td>{d.created_by_email || <span style={{ color: 'var(--text-soft)' }}>—</span>}</td>
+                                    <td className="mono" style={{ fontSize: 12.25, color: 'var(--text-muted)' }}>
+                                        {d.completed_at ? formatDurationDelta(d.created, d.completed_at) : '—'}
+                                    </td>
+                                    <td style={{ color: 'var(--text-muted)' }} title={formatISO8601(d.created)}>
+                                        {formatRelativeTimeRounded(d.created)}
+                                    </td>
+                                    <td style={{ textAlign: 'right' }}>
+                                        <div className="row-actions" style={{ display: 'inline-flex', gap: 6, justifyContent: 'flex-end' }}>
+                                            {isRollbackable(d) && (
+                                                <RButton
+                                                    size="sm"
+                                                    onClick={(e) => {
+                                                        e.stopPropagation();
+                                                        handleRollbackClick(d);
+                                                    }}
                                                 >
-                                                    Link
-                                                </a>
-                                            ) : '-'}
-                                        </MonoTd>
-                                        <MonoTd className="px-6 py-4 whitespace-nowrap text-sm text-gray-700 dark:text-gray-300">
-                                            {d.expires_at ? (
-                                                <span>
-                                                    {formatTimeRemaining(d.expires_at)}
-                                                    <br />
-                                                    <span className="text-gray-600 dark:text-gray-500 text-xs">({formatDate(d.expires_at)})</span>
-                                                </span>
-                                            ) : '-'}
-                                        </MonoTd>
-                                        <MonoTd className="px-6 py-4 whitespace-nowrap text-sm text-gray-700 dark:text-gray-300" title={formatISO8601(d.created)}>
-                                            {formatRelativeTimeRounded(d.created)}
-                                        </MonoTd>
-                                        <MonoTd className="px-6 py-4 whitespace-nowrap text-sm">
-                                            <div className="mono-table-action-slot">
-                                                {isRollbackable(d) && (
-                                                    <Button
-                                                        variant="primary"
-                                                        size="sm"
-                                                        onClick={(e) => {
-                                                            e.stopPropagation();
-                                                            handleRollbackClick(d);
-                                                        }}
-                                                    >
-                                                        {d.is_active ? 'Redeploy' : 'Rollback'}
-                                                    </Button>
-                                                )}
-                                                {!isTerminal(d.status) && (
-                                                    <Button
-                                                        variant="danger"
-                                                        size="sm"
-                                                        onClick={(e) => {
-                                                            e.stopPropagation();
-                                                            handleStopClick(d);
-                                                        }}
-                                                    >
-                                                        Stop
-                                                    </Button>
-                                                )}
-                                            </div>
-                                        </MonoTd>
-                                    </MonoTableRow>
-                                    );
-                                })
-                        )}
-                    </MonoTableBody>
-                </MonoTable>
-            </MonoTableFrame>
+                                                    {d.is_active ? 'Redeploy' : 'Rollback'}
+                                                </RButton>
+                                            )}
+                                            {!isTerminal(d.status) && (
+                                                <RButton
+                                                    size="sm"
+                                                    variant="danger"
+                                                    onClick={(e) => {
+                                                        e.stopPropagation();
+                                                        handleStopClick(d);
+                                                    }}
+                                                >
+                                                    Stop
+                                                </RButton>
+                                            )}
+                                        </div>
+                                    </td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                )}
+            </Panel>
 
-            <div className="mt-4 flex justify-between items-center">
-                <button
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 14 }}>
+                <RButton
+                    size="sm"
                     onClick={() => setPage(p => p - 1)}
                     disabled={page === 0}
-                    className="bg-gray-700 hover:bg-gray-600 disabled:bg-gray-100 dark:bg-gray-800 disabled:text-gray-600 text-white px-4 py-2 rounded text-sm transition-colors"
+                    icon="chevl"
                 >
                     Previous
-                </button>
-                <span className="text-sm text-gray-600 dark:text-gray-400">
-                    Page {page + 1} (showing {deployments.length} deployments)
+                </RButton>
+                <span style={{ fontSize: 12.5, color: 'var(--text-muted)' }}>
+                    Page {page + 1} · showing{' '}
+                    {filteredDeployments.length === deployments.length
+                        ? `${deployments.length} deployment${deployments.length === 1 ? '' : 's'}`
+                        : `${filteredDeployments.length} of ${deployments.length} deployment${deployments.length === 1 ? '' : 's'}`}
                 </span>
-                <button
+                <RButton
+                    size="sm"
                     onClick={() => setPage(p => p + 1)}
                     disabled={!hasMore}
-                    className="bg-gray-700 hover:bg-gray-600 disabled:bg-gray-100 dark:bg-gray-800 disabled:text-gray-600 text-white px-4 py-2 rounded text-sm transition-colors"
                 >
                     Next
-                </button>
+                </RButton>
             </div>
 
             <ConfirmDialog
@@ -596,7 +611,7 @@ export function DeploymentsList({ projectName }) {
                 title="Stop Deployment"
                 message={`Are you sure you want to stop deployment ${deploymentToStop?.deployment_id}? Impact: traffic for group "${deploymentToStop?.deployment_group || 'default'}" may terminate.`}
                 confirmText="Stop Deployment"
-                variant="danger"
+                confirmTone="danger"
                 loading={stopping}
             />
 
@@ -608,38 +623,9 @@ export function DeploymentsList({ projectName }) {
                     setUseSourceEnvVars(false);
                 }}
                 title={deploymentToRollback?.is_active ? 'Redeploy' : 'Rollback to Deployment'}
-            >
-                <ModalSection>
-                    <p className="text-gray-700 dark:text-gray-300">
-                        {deploymentToRollback?.is_active
-                            ? `Are you sure you want to redeploy ${deploymentToRollback?.deployment_id}? This will create a new deployment with the same image.`
-                            : `Are you sure you want to rollback to deployment ${deploymentToRollback?.deployment_id}? This will create a new deployment with the same image.`}
-                    </p>
-                    
-                    <div className="bg-gray-50 dark:bg-gray-800 p-4 rounded-lg">
-                        <label className="flex items-start gap-3 cursor-pointer">
-                            <input
-                                type="checkbox"
-                                checked={useSourceEnvVars}
-                                onChange={(e) => setUseSourceEnvVars(e.target.checked)}
-                                className="mt-1 w-4 h-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500"
-                            />
-                            <div className="flex-1">
-                                <div className="text-sm font-medium text-gray-900 dark:text-gray-100">
-                                    Use source deployment's environment variables
-                                </div>
-                                <div className="text-xs text-gray-600 dark:text-gray-400 mt-1">
-                                    {useSourceEnvVars 
-                                        ? "Will copy environment variables from the source deployment" 
-                                        : "Will use the current project's environment variables (default)"}
-                                </div>
-                            </div>
-                        </label>
-                    </div>
-
-                    <ModalActions>
-                        <Button
-                            variant="secondary"
+                footer={
+                    <>
+                        <RButton
                             onClick={() => {
                                 setRollbackDialogOpen(false);
                                 setDeploymentToRollback(null);
@@ -648,31 +634,90 @@ export function DeploymentsList({ projectName }) {
                             disabled={rollingBack}
                         >
                             Cancel
-                        </Button>
-                        <Button
+                        </RButton>
+                        <RButton
                             variant="primary"
                             onClick={handleRollbackConfirm}
                             loading={rollingBack}
                             disabled={rollingBack}
                         >
                             {deploymentToRollback?.is_active ? 'Redeploy' : 'Rollback'}
-                        </Button>
-                    </ModalActions>
-                </ModalSection>
+                        </RButton>
+                    </>
+                }
+            >
+                <p style={{ fontSize: 13, color: 'var(--text-muted)', margin: 0, lineHeight: 1.6 }}>
+                    {deploymentToRollback?.is_active
+                        ? `Are you sure you want to redeploy ${deploymentToRollback?.deployment_id}? This will create a new deployment with the same image.`
+                        : `Are you sure you want to rollback to deployment ${deploymentToRollback?.deployment_id}? This will create a new deployment with the same image.`}
+                </p>
+
+                <div style={{ background: 'var(--surface-2)', border: '1px solid var(--border-faint)', borderRadius: 'var(--radius-sm)', padding: 14 }}>
+                    <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer' }}>
+                        <input
+                            type="checkbox"
+                            checked={useSourceEnvVars}
+                            onChange={(e) => setUseSourceEnvVars(e.target.checked)}
+                            style={{ marginTop: 2 }}
+                        />
+                        <div style={{ flex: 1 }}>
+                            <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text)' }}>
+                                Use source deployment's environment variables
+                            </div>
+                            <div style={{ fontSize: 12, color: 'var(--text-soft)', marginTop: 4 }}>
+                                {useSourceEnvVars
+                                    ? 'Will copy environment variables from the source deployment'
+                                    : "Will use the current project's environment variables (default)"}
+                            </div>
+                        </div>
+                    </label>
+                </div>
             </Modal>
+        </div>
+    );
+}
+
+// Split button used in the logs header: left half toggles live streaming on/off
+// (pulsing dot when active), right half independently toggles auto-scroll.
+function StreamToggle({ streaming, autoScroll, onToggleStream, onToggleAutoScroll }) {
+    return (
+        <div className="r-split-btn">
+            <button
+                type="button"
+                className={`r-split-btn-main${streaming ? ' active' : ''}`}
+                onClick={onToggleStream}
+                aria-pressed={streaming}
+                title={streaming ? 'Stop streaming' : 'Stream logs'}
+            >
+                <span className="dot" />
+                <span>{streaming ? 'Live streaming' : 'Stream'}</span>
+            </button>
+            <button
+                type="button"
+                className={`r-split-btn-side${autoScroll ? ' active' : ''}`}
+                onClick={onToggleAutoScroll}
+                aria-pressed={autoScroll}
+                aria-label="Toggle auto-scroll"
+                title={autoScroll ? 'Auto-scroll on' : 'Auto-scroll off'}
+            >
+                <Icon name="chevd" size={12} />
+            </button>
         </div>
     );
 }
 
 // Deployment Logs Component with SSE streaming
 function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
+    // Active deployments auto-follow live logs starting from just the most
+    // recent line; terminal deployments load a larger backlog on demand.
+    const isActiveDeployment = ['Deploying', 'Healthy', 'Unhealthy'].includes(deploymentStatus);
     const [logs, setLogs] = useState([]);
     const [streaming, setStreaming] = useState(false);
     const [error, setError] = useState(null);
     const [autoScroll, setAutoScroll] = useState(true);
-    const [tailLines, setTailLines] = useState(1000);
-    const [tailInputValue, setTailInputValue] = useState('1000');
-    const logsEndRef = useRef(null);
+    const [tailLines, setTailLines] = useState(isActiveDeployment ? 1 : 1000);
+    const [tailInputValue, setTailInputValue] = useState(isActiveDeployment ? '1' : '1000');
+    const logBoxRef = useRef(null);
     const abortControllerRef = useRef(null);
 
     const isLoggable = (status) => {
@@ -680,9 +725,11 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
         return ['Deploying', 'Healthy', 'Unhealthy', 'Stopped', 'Failed', 'Superseded'].includes(status);
     };
 
+    // Scroll the log container itself (not scrollIntoView, which would also
+    // scroll the whole page window).
     const scrollToBottom = () => {
-        if (autoScroll && logsEndRef.current) {
-            logsEndRef.current.scrollIntoView({ behavior: 'smooth' });
+        if (autoScroll && logBoxRef.current) {
+            logBoxRef.current.scrollTop = logBoxRef.current.scrollHeight;
         }
     };
 
@@ -825,6 +872,23 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
         }
     }, [projectName, deploymentId, tailLines]);
 
+    // On open, automatically show logs: live-follow active deployments (from
+    // the most recent line) or load the backlog for terminal ones. Runs once
+    // per deployment; the cleanup stops the stream on unmount. Written so it
+    // survives React StrictMode's mount/unmount/remount cycle.
+    useEffect(() => {
+        if (isLoggable(deploymentStatus)) {
+            const terminal = ['Cancelled', 'Stopped', 'Superseded', 'Failed', 'Expired'].includes(deploymentStatus);
+            if (terminal) {
+                loadInitialLogs();
+            } else {
+                startStreaming();
+            }
+        }
+        return () => stopStreaming();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [deploymentId]);
+
     const clearLogs = () => {
         setLogs([]);
     };
@@ -852,28 +916,52 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
     // Effect to restart streaming when tailLines changes and we're currently streaming
     useEffect(() => {
         if (streaming) {
-            console.log('Tail lines changed to', tailLines, ', restarting stream...');
             startStreaming();
         }
     }, [tailLines]); // Only depend on tailLines, not streaming or startStreaming to avoid loops
 
-    useEffect(() => {
-        return () => {
-            stopStreaming();
-        };
-    }, [stopStreaming]);
+    const [levelFilter, setLevelFilter] = useState('all');
+
+    // Heuristic log-level detection for styling + filtering. Raw log lines have
+    // no structured level, so we infer it from the message text.
+    const detectLevel = (line) => {
+        const l = line.toLowerCase();
+        if (/\b(error|err|fatal|panic|exception|failed)\b/.test(l)) return 'error';
+        if (/\b(warn|warning)\b/.test(l)) return 'warn';
+        return 'info';
+    };
 
     if (!isLoggable(deploymentStatus)) {
         return null;
     }
 
+    const visibleLogs = logs
+        .map((log, idx) => ({ log, idx, level: detectLevel(log) }))
+        .filter((entry) => levelFilter === 'all' || entry.level === levelFilter);
+
+    const handleCopyLogs = async () => {
+        try {
+            await copyToClipboard(logs.join('\n'));
+        } catch {
+            /* noop */
+        }
+    };
+
     return (
-        <div className="mb-6">
-            <div className="flex justify-between items-center mb-3">
-                <h3 className="text-xl font-bold">Runtime Logs</h3>
-                <div className="flex gap-2 items-center">
-                    <label className="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-400">
-                        <span>Tail lines:</span>
+        <Panel style={{ display: 'flex', flexDirection: 'column' }}>
+            <div className="r-panel-head r-logs-head">
+                <div className="r-logs-head-left">
+                    <div className="r-panel-title">Runtime logs</div>
+                    <Segmented
+                        value={levelFilter}
+                        options={['all', 'info', 'warn', 'error']}
+                        onChange={setLevelFilter}
+                        capitalize
+                    />
+                </div>
+                <div className="r-logs-head-right">
+                    <label className="r-logs-tail">
+                        <span>Tail</span>
                         <input
                             type="number"
                             value={tailInputValue}
@@ -881,90 +969,52 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                             onBlur={handleTailLinesBlur}
                             onKeyPress={handleTailLinesKeyPress}
                             min="1"
-                            className="w-20 bg-gray-100 dark:bg-gray-800 border border-gray-600 rounded px-2 py-1 text-sm text-gray-900 dark:text-gray-100 focus:outline-none focus:border-indigo-500"
+                            className="r-field"
                         />
                     </label>
-                    <label className="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-400">
-                        <input
-                            type="checkbox"
-                            checked={autoScroll}
-                            onChange={(e) => setAutoScroll(e.target.checked)}
-                            className="rounded border-gray-600 bg-gray-100 dark:bg-gray-800 text-indigo-600 focus:ring-indigo-500"
-                        />
-                        Auto-scroll
-                    </label>
-                    <Button
-                        variant="secondary"
-                        size="sm"
-                        onClick={clearLogs}
-                        disabled={logs.length === 0}
-                    >
-                        Clear
-                    </Button>
-                    {!streaming ? (
-                        <>
-                            <Button
-                                variant="secondary"
-                                size="sm"
-                                onClick={loadInitialLogs}
-                            >
-                                Load Logs
-                            </Button>
-                            <Button
-                                variant="primary"
-                                size="sm"
-                                onClick={startStreaming}
-                            >
-                                Follow Logs
-                            </Button>
-                        </>
-                    ) : (
-                        <Button
-                            variant="secondary"
-                            size="sm"
-                            onClick={stopStreaming}
-                        >
-                            Stop
-                        </Button>
+                    <StreamToggle
+                        streaming={streaming}
+                        autoScroll={autoScroll}
+                        onToggleStream={() => (streaming ? stopStreaming() : startStreaming())}
+                        onToggleAutoScroll={() => setAutoScroll((v) => !v)}
+                    />
+                    {!streaming && (
+                        <RButton size="sm" onClick={loadInitialLogs}>Load</RButton>
                     )}
+                    <RButton size="sm" onClick={clearLogs} disabled={logs.length === 0}>Clear</RButton>
+                    <RButton size="sm" onClick={handleCopyLogs} disabled={logs.length === 0} title="Copy logs">
+                        <Icon name="copy" size={11} />
+                    </RButton>
                 </div>
             </div>
-
-            {error && (
-                <div className="mb-3 p-3 bg-red-900/20 border border-red-800 rounded text-red-600 dark:text-red-400 text-sm">
-                    Error: {error}
-                </div>
-            )}
-
-            <div className="bg-gray-950 border border-gray-200 dark:border-gray-800 rounded-lg overflow-hidden">
-                <div
-                    className="p-4 overflow-y-auto font-mono text-xs text-gray-700 dark:text-gray-300"
-                    style={{ height: '400px' }}
-                >
-                    {logs.length === 0 ? (
-                        <div className="text-gray-600 dark:text-gray-500 text-center py-8">
-                            {streaming ? 'Waiting for logs...' : 'No logs yet. Click "Load Logs" or "Follow Logs" to view.'}
+            <PanelBody style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                {error && (
+                    <div className="r-alert err" style={{ fontSize: 12.5 }}>
+                        <Icon name="info" size={14} />
+                        <div style={{ flex: 1 }}>Error: {error}</div>
+                    </div>
+                )}
+                <div ref={logBoxRef} className="r-logs" style={{ height: 'calc(100vh - 340px)', minHeight: 360, flex: 'none' }}>
+                    {visibleLogs.length === 0 ? (
+                        <div style={{ textAlign: 'center', padding: '32px 0', color: 'oklch(0.55 0.005 80)' }}>
+                            {logs.length === 0
+                                ? (streaming ? 'Waiting for logs...' : 'No logs yet. Click "Load" or "Follow" to view.')
+                                : 'No log lines match this filter.'}
                         </div>
                     ) : (
-                        <>
-                            {logs.map((log, idx) => (
-                                <div key={idx} className="whitespace-pre-wrap break-all">
-                                    {log}
-                                </div>
-                            ))}
-                            <div ref={logsEndRef} />
-                        </>
+                        visibleLogs.map((entry) => (
+                            <div
+                                key={entry.idx}
+                                className={`lv-${entry.level}`}
+                                style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}
+                            >
+                                {entry.log}
+                            </div>
+                        ))
                     )}
                 </div>
-            </div>
-
-            {streaming && (
-                <div className="mt-2 flex items-center gap-2 text-sm text-gray-600 dark:text-gray-400">
-                    <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
-                    Live streaming logs...
-                </div>
-            )}
-        </div>
+            </PanelBody>
+        </Panel>
     );
 }
 
@@ -1096,94 +1146,94 @@ function PodInfoRow({ pod }: { pod: PodInfo }) {
                       pod.containers?.some(c => !c.ready || c.restart_count > 0) ||
                       pod.conditions?.some(c => c.status === 'False'));
 
-    const phaseTone = {
-        Running: '#b7ffce',
-        Pending: '#ffe3a8',
-        Failed: '#ffc0c0',
-        Succeeded: '#b7ffce',
-        Unknown: '#888',
+    const phaseStatus = {
+        Running: 'running',
+        Pending: 'pending',
+        Failed: 'failed',
+        Succeeded: 'succeeded',
+        Unknown: 'stopped',
     };
 
     const displayPhase = pod.terminated ? 'Terminated' : pod.terminating ? 'Terminating' : pod.phase;
-    const displayColor = isGone ? '#888' : (phaseTone[pod.phase] || '#888');
-
-    // Use appropriate border color based on issues
-    const borderColor = hasIssues ? '#7d4b4b' : 'var(--mono-line)';
+    const statusKey = isGone ? 'stopped' : (phaseStatus[pod.phase] || 'stopped');
 
     return (
-        <div className="border-b" style={{ borderColor, opacity: isGone ? 0.5 : 1 }}>
+        <div
+            style={{
+                borderBottom: '1px solid var(--border-faint)',
+                opacity: isGone ? 0.6 : 1,
+            }}
+        >
             <button
                 type="button"
-                className="w-full p-3 text-left cursor-pointer"
                 onClick={() => setExpanded(!expanded)}
                 aria-expanded={expanded}
                 aria-controls={detailsId}
+                style={{
+                    all: 'unset',
+                    cursor: 'pointer',
+                    display: 'block',
+                    width: '100%',
+                    padding: '12px 16px',
+                    boxSizing: 'border-box',
+                }}
             >
-                <div className="flex items-center justify-between gap-2">
-                    <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2 mb-1">
-                            <span className="text-xs font-mono font-semibold" style={{ color: '#e8e8e8' }}>
-                                {pod.name}
-                            </span>
-                            <span className="text-xs px-1.5 py-0.5" style={{
-                                color: displayColor,
-                                border: `1px solid ${displayColor}`,
-                                background: 'rgba(0, 0, 0, 0.3)'
-                            }}>
-                                {displayPhase}
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4, flexWrap: 'wrap' }}>
+                            <span className="mono" style={{ fontSize: 12, fontWeight: 600 }}>{pod.name}</span>
+                            <span className={`r-status ${statusKey}`}>
+                                <span className="dot" />
+                                <span>{displayPhase}</span>
                             </span>
                             {hasIssues && (
-                                <span className="text-xs" style={{ color: '#ffc0c0' }}>
-                                    ⚠
-                                </span>
+                                <span style={{ color: 'var(--err)', fontSize: 12 }} title="Pod has issues">⚠</span>
                             )}
                         </div>
-                        <div className="text-xs" style={{ color: 'var(--mono-muted)' }}>
+                        <div style={{ fontSize: 11.5, color: 'var(--text-soft)' }}>
                             {pod.containers?.length || 0} container(s) •{' '}
                             {pod.containers?.filter(c => c.ready).length || 0} ready
                         </div>
                     </div>
-                    <span className="text-xs" style={{ color: 'var(--mono-muted)' }} aria-hidden="true">
-                        {expanded ? '▼' : '▶'}
-                    </span>
+                    <Icon name="chev" size={12} className="chev" style={{ transform: expanded ? 'rotate(90deg)' : 'none', transition: 'transform .15s', color: 'var(--text-soft)' }} />
                 </div>
             </button>
 
             {expanded && (
-                <div id={detailsId} className="p-3 pt-0" style={{ background: '#0a0a0a' }}>
+                <div id={detailsId} style={{ padding: '0 16px 14px', background: 'var(--surface-2)' }}>
                     {/* Container statuses */}
                     {pod.containers && pod.containers.length > 0 && (
-                        <div className="mb-3">
-                            <h6 className="text-xs font-semibold mb-2" style={{ color: 'var(--mono-muted)' }}>
+                        <div style={{ marginBottom: 12, paddingTop: 12 }}>
+                            <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-soft)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
                                 Containers
-                            </h6>
-                            <div className="space-y-2">
+                            </div>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                                 {pod.containers.map((container, idx) => (
-                                    <div key={idx} className="text-xs p-2" style={{ background: '#0f0f0f', border: '1px solid var(--mono-line)' }}>
-                                        <div className="flex items-center justify-between mb-1">
-                                            <span className="font-mono" style={{ color: '#e8e8e8' }}>{container.name}</span>
-                                            <span style={{ color: container.ready ? '#b7ffce' : '#ffc0c0' }}>
+                                    <div key={idx} style={{ fontSize: 12, padding: 10, background: 'var(--surface)', border: '1px solid var(--border-faint)', borderRadius: 'var(--radius-sm)' }}>
+                                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                                            <span className="mono">{container.name}</span>
+                                            <span style={{ color: container.ready ? 'var(--ok)' : 'var(--err)', fontWeight: 500 }}>
                                                 {container.ready ? '✓ Ready' : '✗ Not ready'}
                                             </span>
                                         </div>
                                         {container.restart_count > 0 && (
-                                            <div style={{ color: 'var(--mono-warn)' }}>
+                                            <div style={{ color: 'var(--warn)' }}>
                                                 Restarts: {container.restart_count}
                                             </div>
                                         )}
                                         {container.state && (
-                                            <div style={{ color: 'var(--mono-muted)' }}>
+                                            <div style={{ color: 'var(--text-muted)' }}>
                                                 State: {container.state.state_type}
                                                 {container.state.reason && ` (${container.state.reason})`}
                                             </div>
                                         )}
                                         {container.state?.message && (
-                                            <div className="mt-1 font-mono" style={{ color: '#ffc0c0' }}>
+                                            <div className="mono" style={{ marginTop: 4, color: 'var(--err)' }}>
                                                 {container.state.message}
                                             </div>
                                         )}
                                         {container.state?.exit_code !== undefined && (
-                                            <div style={{ color: 'var(--mono-muted)' }}>
+                                            <div style={{ color: 'var(--text-muted)' }}>
                                                 Exit code: {container.state.exit_code}
                                             </div>
                                         )}
@@ -1195,15 +1245,15 @@ function PodInfoRow({ pod }: { pod: PodInfo }) {
 
                     {/* Pod conditions */}
                     {pod.conditions && pod.conditions.length > 0 && (
-                        <div className="mb-3">
-                            <h6 className="text-xs font-semibold mb-2" style={{ color: 'var(--mono-muted)' }}>
+                        <div style={{ marginBottom: 12 }}>
+                            <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-soft)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
                                 Conditions
-                            </h6>
-                            <div className="space-y-1">
+                            </div>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                                 {pod.conditions.map((condition, idx) => (
-                                    <div key={idx} className="text-xs flex items-center justify-between">
-                                        <span style={{ color: '#e8e8e8' }}>{condition.type}</span>
-                                        <span style={{ color: condition.status === 'True' ? '#b7ffce' : '#ffc0c0' }}>
+                                    <div key={idx} style={{ fontSize: 12, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                                        <span>{condition.type}</span>
+                                        <span style={{ color: condition.status === 'True' ? 'var(--ok)' : 'var(--err)', fontWeight: 500 }}>
                                             {condition.status}
                                         </span>
                                     </div>
@@ -1215,27 +1265,24 @@ function PodInfoRow({ pod }: { pod: PodInfo }) {
                     {/* Recent events */}
                     {pod.events && pod.events.length > 0 && (
                         <div>
-                            <h6 className="text-xs font-semibold mb-2" style={{ color: 'var(--mono-muted)' }}>
+                            <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-soft)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
                                 Recent Events
-                            </h6>
-                            <div className="space-y-2">
+                            </div>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                                 {pod.events.map((event, idx) => (
-                                    <div key={idx} className="text-xs p-2" style={{
-                                        background: event.type === 'Error' ? 'rgba(125, 75, 75, 0.24)' : 'rgba(139, 112, 57, 0.22)',
-                                        border: `1px solid ${event.type === 'Error' ? '#7d4b4b' : '#7b6333'}`
-                                    }}>
-                                        <div className="flex items-center justify-between mb-1">
-                                            <span className="font-semibold" style={{ color: event.type === 'Error' ? '#ffc0c0' : 'var(--mono-warn)' }}>
-                                                {event.reason}
-                                            </span>
-                                            <span style={{ color: 'var(--mono-muted)' }}>
+                                    <div
+                                        key={idx}
+                                        className={`r-alert ${event.type === 'Error' ? 'err' : 'warn'}`}
+                                        style={{ fontSize: 12, display: 'block' }}
+                                    >
+                                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                                            <span style={{ fontWeight: 600 }}>{event.reason}</span>
+                                            <span style={{ color: 'var(--text-muted)' }}>
                                                 {event.count > 1 && `${event.count}× `}
                                                 {formatRelativeTimeRounded(event.last_timestamp)}
                                             </span>
                                         </div>
-                                        <div className="font-mono" style={{ color: '#e8e8e8' }}>
-                                            {event.message}
-                                        </div>
+                                        <div className="mono">{event.message}</div>
                                     </div>
                                 ))}
                             </div>
@@ -1262,119 +1309,126 @@ function PodStatusSection({ podStatus }: { podStatus: PodStatus }) {
     const hasIssues = replicasMismatch || hasPodIssues;
 
     // Determine tone based on replica counts and pod-level issues
-    let tone = 'ok';
+    let replicaTone = 'ok';
     if (podStatus.ready_replicas === 0) {
-        tone = 'bad';
+        replicaTone = 'bad';
     } else if (replicasMismatch || hasPodIssues) {
-        tone = 'warn';
+        replicaTone = 'warn';
     }
 
-    const toneColors = {
-        ok: { color: '#b7ffce', borderColor: '#2e6c44', background: 'rgba(44, 105, 66, 0.2)' },
-        warn: { color: '#ffe3a8', borderColor: '#7b6333', background: 'rgba(139, 112, 57, 0.22)' },
-        bad: { color: '#ffc0c0', borderColor: '#7d4b4b', background: 'rgba(125, 75, 75, 0.24)' },
-    };
-
-    const borderColors = {
-        ok: '#2e6c44',
-        warn: '#7b6333',
-        bad: '#7d4b4b',
-    };
-
-    const headerColors = {
-        ok: '#b7ffce',
-        warn: '#ffe3a8',
-        bad: '#ffc0c0',
-    };
+    const sectionHeading = (label: string) => (
+        <div
+            className="r-group-bar"
+            style={{ fontWeight: 600, color: 'var(--text)', textTransform: 'uppercase', letterSpacing: '0.06em', fontSize: 11 }}
+        >
+            <span>{label}</span>
+        </div>
+    );
 
     return (
-        <div className="mb-6">
-            <h4 className="text-sm font-semibold mb-2" style={{ color: 'var(--mono-muted)' }}>
-                Pod Status
-            </h4>
-
-            {/* Replica summary */}
-            <div className="mono-inline-status mb-3" style={toneColors[tone]}>
-                <div className="flex items-center justify-between">
-                    <span>Pods: {podStatus.ready_replicas}/{podStatus.desired_replicas} ready</span>
-                    <span className="text-xs" style={{ color: 'var(--mono-muted)' }}>
-                        {activePods.length} active{inactivePods.length > 0 && ` (+${inactivePods.length} previous)`}
+        <Panel>
+            <PanelHead
+                title="Pod status"
+                right={
+                    <span className={`r-status ${replicaTone === 'ok' ? 'running' : replicaTone === 'warn' ? 'warn' : 'failed'}`}>
+                        <span className="dot" />
+                        <span>{podStatus.ready_replicas}/{podStatus.desired_replicas} ready</span>
                     </span>
-                </div>
-            </div>
+                }
+            />
+            <PanelBody style={{ padding: 0 }}>
+                {hasIssues && (
+                    <div className="r-alert warn" style={{ margin: 16, fontSize: 12.5 }}>
+                        <Icon name="info" size={14} />
+                        <div style={{ flex: 1 }}>
+                            {activePods.length} active{inactivePods.length > 0 && ` · ${inactivePods.length} previous`} ·
+                            {replicasMismatch ? ' replica count below desired' : ' pod-level issues detected'}.
+                        </div>
+                    </div>
+                )}
 
-            {/* Active pods */}
-            {activePods.length > 0 && (
-                <div className="border border-solid" style={{ borderColor: borderColors[tone], background: tone === 'ok' ? '#0a1210' : '#1a1212' }}>
-                    <div className="p-3" style={{ borderBottom: `1px solid ${borderColors[tone]}` }}>
-                        <h5 className="text-xs font-semibold" style={{ color: headerColors[tone] }}>
-                            Active ({activePods.length})
-                        </h5>
-                    </div>
-                    <div>
-                        {activePods.map((pod, idx) => (
-                            <PodInfoRow key={pod.name || `pod-${idx}`} pod={pod} />
-                        ))}
-                    </div>
-                </div>
-            )}
+                {/* Active pods */}
+                {activePods.length > 0 && (
+                    <>
+                        {sectionHeading(`Active (${activePods.length})`)}
+                        <div>
+                            {activePods.map((pod, idx) => (
+                                <PodInfoRow key={pod.name || `pod-${idx}`} pod={pod} />
+                            ))}
+                        </div>
+                    </>
+                )}
 
-            {/* Terminating / terminated pods */}
-            {inactivePods.length > 0 && (
-                <div className="border border-solid mt-3" style={{ borderColor: 'var(--mono-line)', background: '#0f0f0f' }}>
-                    <div className="p-3" style={{ borderBottom: '1px solid var(--mono-line)' }}>
-                        <h5 className="text-xs font-semibold" style={{ color: 'var(--mono-muted)' }}>
-                            Previous ({inactivePods.length})
-                        </h5>
-                    </div>
-                    <div>
-                        {inactivePods.map((pod, idx) => (
-                            <PodInfoRow key={pod.name || `prev-${idx}`} pod={pod} />
-                        ))}
-                    </div>
-                </div>
-            )}
+                {/* Terminating / terminated pods */}
+                {inactivePods.length > 0 && (
+                    <>
+                        {sectionHeading(`Previous (${inactivePods.length})`)}
+                        <div>
+                            {inactivePods.map((pod, idx) => (
+                                <PodInfoRow key={pod.name || `prev-${idx}`} pod={pod} />
+                            ))}
+                        </div>
+                    </>
+                )}
 
-            <p className="text-xs mt-2" style={{ color: 'var(--mono-muted)' }}>
-                Last checked: {formatRelativeTimeRounded(podStatus.last_checked)}
-            </p>
-        </div>
+                <div style={{ padding: '10px 16px', fontSize: 11.5, color: 'var(--text-soft)' }}>
+                    Last checked: {formatRelativeTimeRounded(podStatus.last_checked)}
+                </div>
+            </PanelBody>
+        </Panel>
     );
 }
 
-export function EnvironmentDeploymentView({ projectName, environmentName }) {
+// Resolves a stable URL — the active deployment of an environment (via its
+// primary deployment group) or of an explicit deployment group — to the
+// concrete deployment, then renders the deployment detail.
+export function EnvironmentDeploymentView({ projectName, environmentName, groupName }) {
     const [activeDeploymentId, setActiveDeploymentId] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
 
     useEffect(() => {
-        async function findActiveDeployment() {
+        let cancelled = false;
+        async function resolve() {
             try {
+                let group = groupName || null;
+                if (!group) {
+                    // Environment URL: resolve the environment's primary group.
+                    const envs = await api.getProjectEnvironments(projectName);
+                    group = (envs || []).find((e) => e.name === environmentName)?.primary_deployment_group || null;
+                }
                 const deployments = await api.getProjectDeployments(projectName, { limit: 100 });
                 const active = deployments.find(
-                    (d) => d.environment === environmentName && d.is_active
+                    (d) => d.environment === environmentName
+                        && d.is_active
+                        && (!group || (d.deployment_group || 'default') === group)
                 );
-                setActiveDeploymentId(active ? active.deployment_id : null);
-                setLoading(false);
+                if (!cancelled) {
+                    setActiveDeploymentId(active ? active.deployment_id : null);
+                    setLoading(false);
+                }
             } catch (err) {
-                setError(err.message);
-                setLoading(false);
+                if (!cancelled) { setError(err.message); setLoading(false); }
             }
         }
-        findActiveDeployment();
-    }, [projectName, environmentName]);
+        resolve();
+        return () => { cancelled = true; };
+    }, [projectName, environmentName, groupName]);
 
-    if (loading) return <LoadingState label="Loading environment deployment..." />;
+    if (loading) return <LoadingState label="Loading deployment…" />;
     if (error) return <ErrorState message={`Error: ${error}`} />;
     if (!activeDeploymentId) {
+        const scope = groupName
+            ? <>the <strong>{groupName}</strong> group of <strong>{environmentName}</strong></>
+            : <>the <strong>{environmentName}</strong> environment</>;
         return (
             <div>
-                <p className="text-gray-600 dark:text-gray-400 mb-4">
-                    No active deployment in the <strong>{environmentName}</strong> environment.
+                <p style={{ color: 'var(--text-muted)', marginBottom: 16 }}>
+                    No active deployment in {scope}.
                 </p>
-                <Button variant="secondary" size="sm" onClick={() => navigate(`/project/${projectName}/environments`)}>
+                <RButton variant="default" size="sm" onClick={() => navigate(`/project/${projectName}/environments`)}>
                     Back to Environments
-                </Button>
+                </RButton>
             </div>
         );
     }
@@ -1384,6 +1438,7 @@ export function EnvironmentDeploymentView({ projectName, environmentName }) {
 
 export function DeploymentDetail({ projectName, deploymentId }) {
     const [deployment, setDeployment] = useState(null);
+    const [environments, setEnvironments] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
     const [rollbackDialogOpen, setRollbackDialogOpen] = useState(false);
@@ -1392,6 +1447,7 @@ export function DeploymentDetail({ projectName, deploymentId }) {
     const [stopDialogOpen, setStopDialogOpen] = useState(false);
     const [stopping, setStopping] = useState(false);
     const [detailActionStatus, setDetailActionStatus] = useState('');
+    const [activeTab, setActiveTab] = useState('logs');
     const { showToast } = useToast();
     const handleCopy = useCallback(async (value, label) => {
         if (!value || value === '-') return;
@@ -1463,6 +1519,16 @@ export function DeploymentDetail({ projectName, deploymentId }) {
         loadDeployment();
     }, [loadDeployment]);
 
+    // Best-effort fetch of environments so we can flag the group pill as
+    // primary when the deployment's group matches the env's primary group.
+    useEffect(() => {
+        let cancelled = false;
+        api.getProjectEnvironments(projectName)
+            .then((envs) => { if (!cancelled) setEnvironments(Array.isArray(envs) ? envs : []); })
+            .catch(() => {});
+        return () => { cancelled = true; };
+    }, [projectName]);
+
     // Auto-refresh only if deployment is not in a terminal state
     useEffect(() => {
         if (deployment && !isTerminal(deployment.status)) {
@@ -1481,212 +1547,290 @@ export function DeploymentDetail({ projectName, deploymentId }) {
         .map((phase) => ({ phase, events: timeline.filter((e) => e.phase === phase) }))
         .filter((group) => group.events.length > 0);
 
-    return (
-        <section>
-            <div className="flex justify-end items-center gap-2 mb-4">
-                {deployment.can_rollback && (
-                    <Button
-                        variant="secondary"
-                        size="sm"
-                        onClick={handleRollbackClick}
-                    >
-                        {deployment.is_active ? 'Redeploy' : 'Rollback'}
-                    </Button>
-                )}
-                {!isTerminal(deployment.status) && (
-                    <Button
-                        variant="danger"
-                        size="sm"
-                        onClick={() => setStopDialogOpen(true)}
-                    >
-                        Stop
-                    </Button>
-                )}
-            </div>
+    const podStatus = deployment.controller_metadata?.pod_status;
+    const allDomains = [
+        deployment.primary_url,
+        ...(deployment.custom_domain_urls || []),
+    ].filter(Boolean);
 
-            {detailActionStatus && <p className="mono-inline-status mb-4">{detailActionStatus}</p>}
+    const tabs = [
+        { id: 'logs', label: 'Logs' },
+        { id: 'timeline', label: 'Timeline', count: timeline.length },
+        ...(podStatus ? [{ id: 'pods', label: 'Pods', count: podStatus.pods?.length || 0 }] : []),
+        ...(deployment.build_logs ? [{ id: 'build', label: 'Build output' }] : []),
+        { id: 'env', label: 'Environment' },
+    ];
 
-            <div className="mono-status-strip mono-status-strip-normalcase mb-6">
-                <div className={`mono-status-card mono-status-card-${getStatusTone(deployment.status)}`}>
-                    <span>status</span>
-                    <strong>{deployment.status}</strong>
-                </div>
-                <div>
-                    <span>deployment</span>
-                    <strong className="mono-copyable-value">
-                        <span>{deployment.deployment_id}</span>
-                        <button
-                            type="button"
-                            className="mono-copy-button"
-                            title="Copy deployment ID"
-                            aria-label="Copy deployment ID"
-                            onClick={() => handleCopy(deployment.deployment_id, 'Deployment ID')}
-                        >
-                            <span
-                                className="mono-copy-icon svg-mask"
-                                style={{ maskImage: 'url(/assets/copy.svg)', WebkitMaskImage: 'url(/assets/copy.svg)' }}
-                            />
-                        </button>
-                    </strong>
-                </div>
-                <div><span>group</span><strong>{deployment.deployment_group}</strong></div>
-                {deployment.environment && (
-                    <div><span>environment</span><strong className="inline-flex items-center gap-2"><EnvironmentColorDot color={deployment.environment_color} />{deployment.environment}</strong></div>
-                )}
-                <div>
-                    <span>created</span>
-                    <strong className="mono-copyable-value" title={formatISO8601(deployment.created)}>
-                        <span>{formatRelativeTimeRounded(deployment.created)}</span>
-                        <button
-                            type="button"
-                            className="mono-copy-button"
-                            title="Copy created timestamp (ISO8601)"
-                            aria-label="Copy created timestamp (ISO8601)"
-                            onClick={() => handleCopy(formatISO8601(deployment.created), 'Created timestamp')}
-                        >
-                            <span
-                                className="mono-copy-icon svg-mask"
-                                style={{ maskImage: 'url(/assets/copy.svg)', WebkitMaskImage: 'url(/assets/copy.svg)' }}
-                            />
-                        </button>
-                    </strong>
-                </div>
-                <div><span>project</span><strong>{projectName}</strong></div>
-                <div><span>created_by</span><strong>{deployment.created_by_email || '-'}</strong></div>
-                <div>
-                    <span>image</span>
-                    <strong className="mono-copyable-value">
-                        <span>{deployment.image || '-'}</span>
-                        {deployment.image && (
-                            <button
-                                type="button"
-                                className="mono-copy-button"
-                                title="Copy image"
-                                aria-label="Copy image"
-                                onClick={() => handleCopy(deployment.image, 'Image')}
-                            >
-                                <span
-                                    className="mono-copy-icon svg-mask"
-                                    style={{ maskImage: 'url(/assets/copy.svg)', WebkitMaskImage: 'url(/assets/copy.svg)' }}
-                                />
-                            </button>
-                        )}
-                    </strong>
-                </div>
-                <div><span>digest</span><strong>{deployment.image_digest || '-'}</strong></div>
-                <div>
-                    <span>primary_url</span>
-                    <strong className="mono-copyable-value">
-                        <span>
-                            {deployment.primary_url ? (
-                                <a href={deployment.primary_url} target="_blank" rel="noopener noreferrer" className="underline">
-                                    {deployment.primary_url}
-                                </a>
-                            ) : '-'}
-                        </span>
-                        {deployment.primary_url && (
-                            <button
-                                type="button"
-                                className="mono-copy-button"
-                                title="Copy primary URL"
-                                aria-label="Copy primary URL"
-                                onClick={() => handleCopy(deployment.primary_url, 'Primary URL')}
-                            >
-                                <span
-                                    className="mono-copy-icon svg-mask"
-                                    style={{ maskImage: 'url(/assets/copy.svg)', WebkitMaskImage: 'url(/assets/copy.svg)' }}
-                                />
-                            </button>
-                        )}
-                    </strong>
-                </div>
-                <div>
-                    <span>custom_urls</span>
-                    <strong>
-                        {deployment.custom_domain_urls && deployment.custom_domain_urls.length > 0
-                            ? deployment.custom_domain_urls.map((url, idx) => (
-                                <Fragment key={url}>
-                                    {idx > 0 ? ', ' : ''}
-                                    <a href={url} target="_blank" rel="noopener noreferrer" className="underline">
-                                        {url}
-                                    </a>
-                                </Fragment>
-                            ))
-                            : '-'}
-                    </strong>
-                </div>
-                {(deployment.job_url || deployment.pull_request_url) && (
-                    <div>
-                        <span>source</span>
-                        <strong>
+    const buildKv = (
+        <Panel>
+            <PanelHead title="Deploy" />
+            <PanelBody>
+                <KV>
+                    <KVRow k="Image">
+                        <span className="mono" style={{ fontSize: 12, wordBreak: 'break-all' }}>{deployment.image || '-'}</span>
+                    </KVRow>
+                    {deployment.image_digest && (
+                        <KVRow k="Digest">
+                            <span className="mono" style={{ fontSize: 12, wordBreak: 'break-all' }}>{deployment.image_digest}</span>
+                        </KVRow>
+                    )}
+                    {deployment.http_port ? (
+                        <KVRow k="HTTP port">
+                            <span className="mono" style={{ fontSize: 12 }}>{deployment.http_port}</span>
+                        </KVRow>
+                    ) : null}
+                    <KVRow k="Created by">{deployment.created_by_email || '-'}</KVRow>
+                    <KVRow k="Started">
+                        <span title={formatISO8601(deployment.created)}>{formatRelativeTimeRounded(deployment.created)}</span>
+                    </KVRow>
+                    <KVRow k="Completed">{deployment.completed_at ? formatDate(deployment.completed_at) : '-'}</KVRow>
+                    {deployment.expires_at && (
+                        <KVRow k="Expires">{formatTimeRemaining(deployment.expires_at)}</KVRow>
+                    )}
+                    {(deployment.job_url || deployment.pull_request_url) && (
+                        <KVRow k="Source">
                             <SourceLinkGroup jobUrl={deployment.job_url} prUrl={deployment.pull_request_url} />
-                        </strong>
-                    </div>
-                )}
-                {deployment.git_repository_url && (
-                    <div>
-                        <span>repository</span>
-                        <strong>
+                        </KVRow>
+                    )}
+                    {deployment.git_repository_url && (
+                        <KVRow k="Repository">
                             {isSafeUrl(deployment.git_repository_url) ? (
-                                <a href={deployment.git_repository_url} target="_blank" rel="noopener noreferrer" className="underline">
-                                    {deployment.git_repository_url}
+                                <a
+                                    className="r-link mono"
+                                    style={{ fontSize: 12.5, wordBreak: 'break-all' }}
+                                    href={deployment.git_repository_url}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                >
+                                    {stripUrlScheme(deployment.git_repository_url)}
                                 </a>
                             ) : (
-                                <span>{deployment.git_repository_url}</span>
+                                <span className="mono" style={{ fontSize: 12.5, wordBreak: 'break-all' }}>
+                                    {deployment.git_repository_url}
+                                </span>
                             )}
-                        </strong>
-                    </div>
+                        </KVRow>
+                    )}
+                </KV>
+            </PanelBody>
+        </Panel>
+    );
+
+    const runtimeKv = (
+        <Panel>
+            <PanelHead title="Resources" />
+            <PanelBody>
+                <KV>
+                    <KVRow k="Replicas">{deployment.replicas}</KVRow>
+                    <KVRow k="CPU">{deployment.cpu}</KVRow>
+                    <KVRow k="Memory">{deployment.memory}</KVRow>
+                </KV>
+            </PanelBody>
+        </Panel>
+    );
+
+    const routingPanel = (
+        <Panel>
+            <PanelHead title="Routing" />
+            <PanelBody style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                {allDomains.length > 0 ? (
+                    allDomains.map((url) => (
+                        isSafeUrl(url) ? (
+                            <a
+                                key={url}
+                                href={url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="r-link mono"
+                                style={{ fontSize: 12.5, wordBreak: 'break-all' }}
+                            >
+                                {url.replace(/^https?:\/\//, '')}
+                            </a>
+                        ) : (
+                            <span
+                                key={url}
+                                className="mono"
+                                style={{ fontSize: 12.5, wordBreak: 'break-all' }}
+                            >
+                                {url.replace(/^https?:\/\//, '')}
+                            </span>
+                        )
+                    ))
+                ) : (
+                    <span style={{ fontSize: 12.5, color: 'var(--text-soft)' }}>No domains configured.</span>
                 )}
-                <div><span>completed</span><strong>{deployment.completed_at ? formatDate(deployment.completed_at) : '-'}</strong></div>
-                <div><span>expires</span><strong>{deployment.expires_at ? formatTimeRemaining(deployment.expires_at) : '-'}</strong></div>
-                <div><span>replicas</span><strong>{deployment.replicas}</strong></div>
-                <div><span>cpu</span><strong>{deployment.cpu}</strong></div>
-                <div><span>memory</span><strong>{deployment.memory}</strong></div>
+            </PanelBody>
+        </Panel>
+    );
+
+    return (
+        <section>
+            <div className="r-page-head">
+                <div className="title-stack">
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+                        <h1 className="r-page-title mono" style={{ fontSize: 20 }}>{deployment.deployment_id}</h1>
+                        <Status status={deployment.status} tooltip={`Deployment status: ${deployment.status}`} />
+                        {deployment.environment ? (
+                            <EnvPill
+                                env={deployment.environment}
+                                color={deployment.environment_color}
+                                tooltip={
+                                    <>
+                                        <div>Environment: <span className="mono">{deployment.environment}</span></div>
+                                        <div>
+                                            Deployment Group: <span className="mono">{deployment.deployment_group}</span>
+                                            {deployment.deployment_group === 'default' && ' (primary group)'}
+                                        </div>
+                                    </>
+                                }
+                            />
+                        ) : null}
+                        {deployment.deployment_group && (() => {
+                            const env = environments.find((e) => e.name === deployment.environment);
+                            const isPrimaryGroup = !!env && env.primary_deployment_group === deployment.deployment_group;
+                            return (
+                                <GroupPill
+                                    group={deployment.deployment_group}
+                                    primary={isPrimaryGroup}
+                                    tooltip={
+                                        <>
+                                            <div>Deployment group: <span className="mono">{deployment.deployment_group}</span></div>
+                                            {isPrimaryGroup && <div>Primary group for the {deployment.environment} environment.</div>}
+                                        </>
+                                    }
+                                />
+                            );
+                        })()}
+                    </div>
+                    <div className="r-meta-bar" style={{ marginTop: 8 }}>
+                        <span>{projectName}</span>
+                        <span className="dot-sep" />
+                        <span>by {deployment.created_by_email || 'unknown'}</span>
+                        <span className="dot-sep" />
+                        <span title={formatISO8601(deployment.created)}>{formatRelativeTimeRounded(deployment.created)}</span>
+                        {deployment.completed_at && (
+                            <>
+                                <span className="dot-sep" />
+                                <span>completed {formatDate(deployment.completed_at)}</span>
+                            </>
+                        )}
+                    </div>
+                </div>
+                <RButton icon="copy" onClick={() => handleCopy(deployment.deployment_id, 'Deployment ID')}>
+                    Copy ID
+                </RButton>
+                {deployment.can_rollback && (
+                    <RButton icon="refresh" onClick={handleRollbackClick}>
+                        {deployment.is_active ? 'Redeploy' : 'Rollback'}
+                    </RButton>
+                )}
+                {!isTerminal(deployment.status) && (
+                    <RButton variant="danger" icon="stop" onClick={() => setStopDialogOpen(true)}>
+                        Stop
+                    </RButton>
+                )}
             </div>
+
+            {detailActionStatus && (
+                <div className="r-alert info" style={{ marginBottom: 18, fontSize: 12.5 }}>
+                    <Icon name="info" size={14} />
+                    <div style={{ flex: 1 }}>{detailActionStatus}</div>
+                </div>
+            )}
 
             {deployment.error_message && (
-                <div className="mono-inline-status mb-6" style={{ color: '#ffc0c0', borderColor: '#7d4b4b', background: '#1a1212' }}>
-                    Error: {deployment.error_message}
+                <div className="r-alert err" style={{ marginBottom: 18, fontSize: 12.5 }}>
+                    <Icon name="info" size={14} />
+                    <div style={{ flex: 1 }}>Error: {deployment.error_message}</div>
                 </div>
             )}
 
-            {deployment.controller_metadata?.pod_status && (
-                <PodStatusSection podStatus={deployment.controller_metadata.pod_status} />
+            <Tabs tabs={tabs} active={activeTab} onChange={setActiveTab} />
+
+            {activeTab === 'logs' && (
+                <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 320px', gap: 18, alignItems: 'start' }}>
+                    <DeploymentLogs projectName={projectName} deploymentId={deploymentId} deploymentStatus={deployment.status} />
+                    <div className="r-stack">
+                        {buildKv}
+                        {runtimeKv}
+                        {routingPanel}
+                    </div>
+                </div>
             )}
 
-            {deployment.build_logs && (
-                <details className="mb-6">
-                    <summary className="cursor-pointer text-indigo-600 dark:text-indigo-400 hover:text-indigo-700 dark:hover:text-indigo-300 font-semibold">Build Logs</summary>
-                    <pre className="mt-2 bg-gray-950 border border-gray-200 dark:border-gray-800 rounded p-4 overflow-x-auto text-xs">
-                        <code className="text-gray-700 dark:text-gray-300">{deployment.build_logs}</code>
-                    </pre>
-                </details>
-            )}
-
-            <div className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 rounded-lg p-6 mb-6">
-                <h3 className="text-xl font-bold mb-4">Deployment Timeline</h3>
-                <div className="space-y-4">
-                    {groupedTimeline.map((group) => (
-                        <div key={group.phase} className="mono-timeline-group">
-                            <h4 className="mono-timeline-phase">{group.phase}</h4>
-                            <div className="mono-timeline-list">
-                                {group.events.map((event, idx) => (
-                                    <div key={`${group.phase}-${idx}`} className="mono-timeline-item">
-                                        <span>{formatDate(event.ts || '')}</span>
-                                        <span>{event.label}</span>
-                                        <span>+{event.delta}</span>
+            {activeTab === 'timeline' && (
+                <Panel>
+                    <PanelHead title="Deployment timeline" />
+                    <PanelBody style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
+                        {groupedTimeline.length === 0 ? (
+                            <Empty>No timeline events recorded.</Empty>
+                        ) : (
+                            groupedTimeline.map((group) => (
+                                <div key={group.phase}>
+                                    <div
+                                        style={{
+                                            fontSize: 11,
+                                            fontWeight: 600,
+                                            color: 'var(--text-soft)',
+                                            textTransform: 'uppercase',
+                                            letterSpacing: '0.06em',
+                                            marginBottom: 8,
+                                        }}
+                                    >
+                                        {group.phase}
                                     </div>
-                                ))}
-                            </div>
+                                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                                        {group.events.map((event, idx) => (
+                                            <div
+                                                key={`${group.phase}-${idx}`}
+                                                style={{
+                                                    display: 'flex',
+                                                    alignItems: 'baseline',
+                                                    gap: 14,
+                                                    fontSize: 12.5,
+                                                    padding: '6px 0',
+                                                }}
+                                            >
+                                                <span className="mono" style={{ color: 'var(--text-soft)', flex: '0 0 170px' }}>
+                                                    {formatDate(event.ts || '')}
+                                                </span>
+                                                <span style={{ flex: 1 }}>{event.label}</span>
+                                                <span className="mono" style={{ color: 'var(--text-muted)' }}>+{event.delta}</span>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            ))
+                        )}
+                    </PanelBody>
+                </Panel>
+            )}
+
+            {activeTab === 'pods' && podStatus && (
+                <PodStatusSection podStatus={podStatus} />
+            )}
+
+            {activeTab === 'build' && deployment.build_logs && (
+                <Panel>
+                    <PanelHead title="Build output" />
+                    <PanelBody>
+                        <div className="r-logs" style={{ maxHeight: 480 }}>
+                            {deployment.build_logs.split('\n').map((line, idx) => (
+                                <div key={idx} style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>{line}</div>
+                            ))}
                         </div>
-                    ))}
-                </div>
-            </div>
+                    </PanelBody>
+                </Panel>
+            )}
 
-            <DeploymentLogs projectName={projectName} deploymentId={deploymentId} deploymentStatus={deployment.status} />
-
-            <h3 className="text-xl font-bold mb-4">Environment Variables</h3>
-            <EnvVarsList projectName={projectName} deploymentId={deploymentId} />
+            {activeTab === 'env' && (
+                <Panel>
+                    <PanelHead title="Environment variables" sub="Snapshot captured for this deployment" />
+                    <PanelBody>
+                        <EnvVarsList projectName={projectName} deploymentId={deploymentId} />
+                    </PanelBody>
+                </Panel>
+            )}
 
             <Modal
                 isOpen={rollbackDialogOpen}
@@ -1695,38 +1839,9 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                     setUseSourceEnvVars(false);
                 }}
                 title={deployment?.is_active ? 'Redeploy' : 'Rollback to Deployment'}
-            >
-                <ModalSection>
-                    <p className="text-gray-700 dark:text-gray-300">
-                        {deployment?.is_active
-                            ? `Are you sure you want to redeploy ${deploymentId}? This will create a new deployment with the same image.`
-                            : `Are you sure you want to rollback to deployment ${deploymentId}? This will create a new deployment with the same image.`}
-                    </p>
-                    
-                    <div className="bg-gray-50 dark:bg-gray-800 p-4 rounded-lg">
-                        <label className="flex items-start gap-3 cursor-pointer">
-                            <input
-                                type="checkbox"
-                                checked={useSourceEnvVars}
-                                onChange={(e) => setUseSourceEnvVars(e.target.checked)}
-                                className="mt-1 w-4 h-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500"
-                            />
-                            <div className="flex-1">
-                                <div className="text-sm font-medium text-gray-900 dark:text-gray-100">
-                                    Use source deployment's environment variables
-                                </div>
-                                <div className="text-xs text-gray-600 dark:text-gray-400 mt-1">
-                                    {useSourceEnvVars 
-                                        ? "Will copy environment variables from the source deployment" 
-                                        : "Will use the current project's environment variables (default)"}
-                                </div>
-                            </div>
-                        </label>
-                    </div>
-
-                    <ModalActions>
-                        <Button
-                            variant="secondary"
+                footer={
+                    <>
+                        <RButton
                             onClick={() => {
                                 setRollbackDialogOpen(false);
                                 setUseSourceEnvVars(false);
@@ -1734,17 +1849,44 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                             disabled={rolling}
                         >
                             Cancel
-                        </Button>
-                        <Button
+                        </RButton>
+                        <RButton
                             variant="primary"
                             onClick={handleRollback}
                             loading={rolling}
                             disabled={rolling}
                         >
                             {deployment?.is_active ? 'Redeploy' : 'Rollback'}
-                        </Button>
-                    </ModalActions>
-                </ModalSection>
+                        </RButton>
+                    </>
+                }
+            >
+                <p style={{ fontSize: 13, color: 'var(--text-muted)', margin: 0, lineHeight: 1.6 }}>
+                    {deployment?.is_active
+                        ? `Are you sure you want to redeploy ${deploymentId}? This will create a new deployment with the same image.`
+                        : `Are you sure you want to rollback to deployment ${deploymentId}? This will create a new deployment with the same image.`}
+                </p>
+
+                <div style={{ background: 'var(--surface-2)', border: '1px solid var(--border-faint)', borderRadius: 'var(--radius-sm)', padding: 14 }}>
+                    <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer' }}>
+                        <input
+                            type="checkbox"
+                            checked={useSourceEnvVars}
+                            onChange={(e) => setUseSourceEnvVars(e.target.checked)}
+                            style={{ marginTop: 2 }}
+                        />
+                        <div style={{ flex: 1 }}>
+                            <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text)' }}>
+                                Use source deployment's environment variables
+                            </div>
+                            <div style={{ fontSize: 12, color: 'var(--text-soft)', marginTop: 4 }}>
+                                {useSourceEnvVars
+                                    ? 'Will copy environment variables from the source deployment'
+                                    : "Will use the current project's environment variables (default)"}
+                            </div>
+                        </div>
+                    </label>
+                </div>
             </Modal>
 
             <ConfirmDialog
@@ -1754,7 +1896,7 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                 title="Stop Deployment"
                 message={`Are you sure you want to stop deployment ${deploymentId}? Impact: traffic for group "${deployment?.deployment_group || 'default'}" may terminate.`}
                 confirmText="Stop Deployment"
-                variant="danger"
+                confirmTone="danger"
                 loading={stopping}
             />
         </section>

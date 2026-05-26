@@ -1,196 +1,88 @@
 // @ts-nocheck
-import { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { logout, login } from './lib/auth';
 import { api } from './lib/api';
 import { CONFIG } from './lib/config';
 import { maybeMigrateLegacyHashRoute, navigate, usePathLocation } from './lib/navigation';
-import { Footer } from './components/ui';
 import { useToast } from './components/toast';
-import { PlatformAccessDenied } from './components/states';
+import { PlatformAccessDenied, LoadingState } from './components/states';
+import { CommandPalette } from './components/command-palette';
+import { Shell } from './components/shell';
+import { Button } from './components/r-ui';
+import { Icon } from './components/icon';
+import { Home } from './features/home';
+import { Profile } from './features/profile';
+import { ProjectsList } from './features/projects-list';
+import { ProjectDetail } from './features/project-detail';
 import { DeploymentDetail, EnvironmentDeploymentView } from './features/deployments';
-import { ProjectsList, ProjectDetail } from './features/projects';
 import { ExtensionDetailPage } from './features/resources';
 import { TeamDetail, TeamsList } from './features/teams';
-import { CommandPalette } from './components/command-palette';
+import { usePrefs } from './lib/prefs';
+import { ErrorBoundary } from './components/error-boundary';
 
-function Sidebar({ currentView, user, onLogout }) {
-    const isProjectsActive = currentView === 'projects' || currentView === 'project-detail' || currentView === 'deployment-detail' || currentView === 'environment-deployment' || currentView === 'extension-detail';
-    const isTeamsActive = currentView === 'teams' || currentView === 'team-detail';
+const TAB_LABELS = {
+    deployments: 'Deployments',
+    environments: 'Environments',
+    'env-vars': 'Env Vars',
+    domains: 'Domains',
+    extensions: 'Extensions',
+    access: 'Access',
+};
 
-    return (
-        <aside className="mono-sidebar">
-            <div className="mono-brand" onClick={() => navigate('/projects')}>
-                <div
-                    className="mono-brand-logo svg-mask"
-                    aria-hidden="true"
-                    style={{
-                        maskImage: 'url(/assets/logo.svg)',
-                        WebkitMaskImage: 'url(/assets/logo.svg)',
-                    }}
-                ></div>
-                <div>
-                    <strong>RISE</strong>
-                    <p>OPS TERMINAL</p>
-                </div>
-            </div>
-
-            <nav className="mono-nav" aria-label="Main">
-                <a
-                    href="/projects"
-                    onClick={(e) => {
-                        e.preventDefault();
-                        navigate('/projects');
-                    }}
-                    className={isProjectsActive ? 'active' : ''}
-                >
-                    <span className="w-4 h-4 svg-mask inline-block flex-shrink-0" aria-hidden="true" style={{ maskImage: 'url(/assets/lightning.svg)', WebkitMaskImage: 'url(/assets/lightning.svg)' }}></span>
-                    Projects
-                </a>
-                <a
-                    href="/teams"
-                    onClick={(e) => {
-                        e.preventDefault();
-                        navigate('/teams');
-                    }}
-                    className={isTeamsActive ? 'active' : ''}
-                >
-                    <span className="w-4 h-4 svg-mask inline-block flex-shrink-0" aria-hidden="true" style={{ maskImage: 'url(/assets/user.svg)', WebkitMaskImage: 'url(/assets/user.svg)' }}></span>
-                    Teams
-                </a>
-            </nav>
-
-            <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-                <nav className="mono-nav" aria-label="Secondary">
-                    <a href="/docs/">
-                        <span className="w-4 h-4 svg-mask inline-block flex-shrink-0" aria-hidden="true" style={{ maskImage: 'url(/assets/file.svg)', WebkitMaskImage: 'url(/assets/file.svg)' }}></span>
-                        Docs
-                    </a>
-                    <div className="mono-nav-static" style={{ minWidth: 0 }}>
-                        <span
-                            className="w-4 h-4 svg-mask inline-block flex-shrink-0"
-                            aria-hidden="true"
-                            style={{
-                                maskImage: 'url(/assets/user.svg)',
-                                WebkitMaskImage: 'url(/assets/user.svg)',
-                            }}
-                        ></span>
-                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
-                            {user?.email}
-                        </span>
-                        <span className="mono-nav-vsep" aria-hidden="true"></span>
-                        <button
-                            onClick={onLogout}
-                            className="mono-icon-button"
-                            aria-label="Logout"
-                            title="Logout"
-                        >
-                            <span
-                                className="w-4 h-4 svg-mask inline-block"
-                                aria-hidden="true"
-                                style={{
-                                    maskImage: 'url(/assets/logout.svg)',
-                                    WebkitMaskImage: 'url(/assets/logout.svg)',
-                                }}
-                            ></span>
-                        </button>
-                    </div>
-                </nav>
-                <div className="mono-shortcut-hint" aria-label="Command palette shortcut">
-                    <span>Command palette</span>
-                    <code>Ctrl/Cmd + K</code>
-                </div>
-            </div>
-        </aside>
-    );
-}
-
-function TopBar({ breadcrumbs = [] }) {
-    return (
-        <header className="mono-topbar">
-            <div>
-                <p className="mono-kicker">context</p>
-                <div className="mono-breadcrumbs">
-                    {breadcrumbs.map((crumb, idx) => {
-                        const isLast = idx === breadcrumbs.length - 1;
-                        return (
-                            <span key={`${crumb.label}-${idx}`} className="mono-breadcrumb-item">
-                                {crumb.href && !isLast ? (
-                                    <a
-                                        href={crumb.href}
-                                        onClick={(e) => {
-                                            e.preventDefault();
-                                            navigate(crumb.href);
-                                        }}
-                                    >
-                                        {crumb.label}
-                                    </a>
-                                ) : (
-                                    <strong>{crumb.label}</strong>
-                                )}
-                                {!isLast && <span className="mono-breadcrumb-sep">/</span>}
-                            </span>
-                        );
-                    })}
-                </div>
-            </div>
-        </header>
-    );
+function normalizeProjectTab(tab?: string) {
+    return tab === 'service-accounts' ? 'access' : (tab || 'overview');
 }
 
 function LoginPage() {
     const [status, setStatus] = useState('');
     const [loading, setLoading] = useState(false);
-
-    const handleLogin = async () => {
-        setStatus('Redirecting to login...');
-        setLoading(true);
-        try {
-            await login();
-        } catch (error) {
-            setStatus(`Error: ${error.message}`);
-            setLoading(false);
-        }
-    };
-
     return (
-        <div className="mono-login-wrap">
-            <div className="mono-login-card">
-                <div className="text-center mb-8">
-                    <div
-                        className="mono-login-logo svg-mask mx-auto mb-4"
-                        aria-hidden="true"
-                        style={{
-                            maskImage: 'url(/assets/logo.svg)',
-                            WebkitMaskImage: 'url(/assets/logo.svg)',
-                        }}
-                    ></div>
-                    <h1 className="mono-login-title">RISE</h1>
-                    <p className="mono-login-subtitle">Container deployment platform</p>
+        <div className="r-login-wrap">
+            <div className="r-login-card">
+                <div className="r-login-logo">R</div>
+                <div>
+                    <div style={{ fontSize: 20, fontWeight: 600, letterSpacing: '-0.02em' }}>Welcome to Rise</div>
+                    <div style={{ color: 'var(--text-muted)', fontSize: 13.5, marginTop: 6 }}>
+                        Sign in to deploy and manage your apps.
+                    </div>
                 </div>
-
                 {loading ? (
-                    <div className="flex flex-col items-center gap-4 py-8">
-                        <div className="w-12 h-12 border-2 border-gray-300 border-t-transparent rounded-full animate-spin"></div>
-                        <p className="text-gray-300">{status}</p>
+                    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12, padding: '12px 0' }}>
+                        <span className="r-spinner lg" />
+                        <p style={{ color: 'var(--text-muted)', fontSize: 13, margin: 0 }}>{status}</p>
                     </div>
                 ) : (
                     <>
-                        <button onClick={handleLogin} className="mono-login-button">
-                            login_with_oauth
-                        </button>
-                        {status && <p className="text-center text-sm text-red-300 mt-3">{status}</p>}
+                        <Button
+                            variant="primary"
+                            icon="lock"
+                            style={{ width: '100%', justifyContent: 'center', padding: '10px 14px' }}
+                            onClick={async () => {
+                                setStatus('Redirecting to login…');
+                                setLoading(true);
+                                try { await login(); } catch (e) { setStatus(`Error: ${e.message}`); setLoading(false); }
+                            }}
+                        >
+                            Continue with SSO
+                        </Button>
+                        {status && <p style={{ color: 'var(--err)', fontSize: 12, margin: 0 }}>{status}</p>}
                     </>
                 )}
+                <div style={{ color: 'var(--text-soft)', fontSize: 11.5 }}>
+                    By continuing you agree to your organization's terms of use.
+                </div>
             </div>
         </div>
     );
 }
 
 export function App() {
+    // Initialize prefs hook so it applies defaults to the DOM on first render.
+    usePrefs();
+
     const [user, setUser] = useState(null);
     const [authChecked, setAuthChecked] = useState(false);
     const [platformAccessDenied, setPlatformAccessDenied] = useState(false);
-    const [version, setVersion] = useState(null);
     const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
     const [paletteProjects, setPaletteProjects] = useState([]);
     const [paletteTeams, setPaletteTeams] = useState([]);
@@ -204,36 +96,22 @@ export function App() {
             const fragment = window.location.hash.substring(1);
             const params = new URLSearchParams(fragment);
             const returnPath = sessionStorage.getItem('oauth_return_path');
-
             const error = params.get('error');
             const errorDescription = params.get('error_description');
             const accessToken = params.get('access_token');
-
             if (error) {
-                const message = errorDescription || `OAuth flow failed: ${error}`;
-                showToast(message, 'error');
+                showToast(errorDescription || `OAuth flow failed: ${error}`, 'error');
             } else if (accessToken) {
                 const expiresIn = params.get('expires_in');
                 const expiresAt = params.get('expires_at');
-
                 let expiresAtDate;
-                if (expiresAt) {
-                    expiresAtDate = new Date(expiresAt);
-                } else if (expiresIn) {
-                    expiresAtDate = new Date(Date.now() + parseInt(expiresIn) * 1000);
-                }
-
-                const message = `OAuth flow successful! Token expires ${expiresAtDate ? expiresAtDate.toLocaleString() : 'soon'}`;
-                showToast(message, 'success');
+                if (expiresAt) expiresAtDate = new Date(expiresAt);
+                else if (expiresIn) expiresAtDate = new Date(Date.now() + parseInt(expiresIn) * 1000);
+                showToast(`OAuth flow successful! Token expires ${expiresAtDate ? expiresAtDate.toLocaleString() : 'soon'}`, 'success');
             }
-
             sessionStorage.removeItem('oauth_return_path');
-
-            if (returnPath) {
-                navigate(returnPath);
-            } else {
-                navigate('/projects');
-            }
+            if (returnPath) navigate(returnPath);
+            else navigate('/home');
         }
 
         async function loadUser() {
@@ -254,35 +132,18 @@ export function App() {
         const handler = (e) => {
             const isModifierK = (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k';
             if (!isModifierK) return;
-
             const target = e.target;
             const isTypingTarget =
                 target instanceof HTMLInputElement ||
                 target instanceof HTMLTextAreaElement ||
                 target?.isContentEditable;
-            const modalOpen = Boolean(document.querySelector('.modal-backdrop'));
-
+            const modalOpen = Boolean(document.querySelector('.r-modal-mask, .modal-backdrop, .r-cmdp-mask'));
             if (isTypingTarget && !modalOpen) return;
-
             e.preventDefault();
             setCommandPaletteOpen(true);
         };
-
         window.addEventListener('keydown', handler);
         return () => window.removeEventListener('keydown', handler);
-    }, []);
-
-    useEffect(() => {
-        async function fetchVersion() {
-            try {
-                const response = await fetch(`${CONFIG.backendUrl}/api/v1/version`);
-                const data = await response.json();
-                setVersion(data);
-            } catch (err) {
-                console.error('Failed to fetch version:', err);
-            }
-        }
-        fetchVersion();
     }, []);
 
     useEffect(() => {
@@ -291,86 +152,68 @@ export function App() {
             setPaletteTeams([]);
             return;
         }
-
+        let cancelled = false;
         async function loadPaletteTargets() {
             try {
                 const [projects, teams] = await Promise.all([api.getProjects(), api.getTeams()]);
+                if (cancelled) return;
                 setPaletteProjects(projects || []);
                 setPaletteTeams(teams || []);
             } catch (err) {
-                // Check if this is a platform access denial
-                if (err.isPlatformAccessDenied) {
-                    setPlatformAccessDenied(true);
-                    return;
-                }
+                if (err.isPlatformAccessDenied) { setPlatformAccessDenied(true); return; }
                 console.error('Failed to load command palette targets:', err);
             }
         }
-
         loadPaletteTargets();
+        window.addEventListener('rise:mutation', loadPaletteTargets);
+        return () => {
+            cancelled = true;
+            window.removeEventListener('rise:mutation', loadPaletteTargets);
+        };
     }, [user?.id]);
-
-    const handleLogout = () => {
-        logout();
-    };
 
     if (!authChecked) {
         return (
-            <div className="mono-login-wrap">
-                <div className="w-8 h-8 border-2 border-gray-300 border-t-transparent rounded-full animate-spin"></div>
+            <div className="r-login-wrap">
+                <span className="r-spinner lg" />
             </div>
         );
     }
+    if (!user) return <LoginPage />;
+    if (platformAccessDenied) return <PlatformAccessDenied userEmail={user.email} onLogout={logout} />;
 
-    if (!user) {
-        return <LoginPage />;
-    }
-
-    if (platformAccessDenied) {
-        return <PlatformAccessDenied userEmail={user.email} onLogout={handleLogout} />;
-    }
-
-    let view = 'projects';
-    let params = {};
+    // ----- Route parsing -----
+    let view = 'home';
+    const params: any = {};
     const route = pathname.replace(/^\//, '');
 
-    if (route.startsWith('project/')) {
+    if (route === '' || route === 'home') {
+        view = 'home';
+    } else if (route === 'profile') {
+        view = 'profile';
+    } else if (route === 'projects') {
+        view = 'projects';
+    } else if (route === 'teams') {
+        view = 'teams';
+    } else if (route.startsWith('project/')) {
         const parts = route.split('/');
         if (parts[2] === 'environment' && parts[3]) {
             view = 'environment-deployment';
             params.projectName = parts[1];
             params.environmentName = parts[3];
+            if (parts[4] === 'group' && parts[5]) params.groupName = parts[5];
         } else if (parts[2] === 'extensions') {
-            if (parts.length === 3) {
-                view = 'project-detail';
-                params.projectName = parts[1];
-                params.tab = 'extensions';
-            } else if (parts.length === 4 && parts[3] === '@new') {
-                view = 'extension-create';
-                params.projectName = parts[1];
-                params.extensionType = null;
-            } else if (parts.length === 5 && parts[3]) {
-                if (parts[4] === '@new') {
-                    view = 'extension-detail';
-                    params.projectName = parts[1];
-                    params.extensionType = parts[3];
-                    params.extensionInstance = null;
-                } else {
-                    view = 'extension-detail';
-                    params.projectName = parts[1];
-                    params.extensionType = parts[3];
-                    params.extensionInstance = parts[4];
-                }
+            if (parts.length === 3) { view = 'project-detail'; params.projectName = parts[1]; params.tab = 'extensions'; }
+            else if (parts.length === 5 && parts[3]) {
+                if (parts[4] === '@new') { view = 'extension-detail'; params.projectName = parts[1]; params.extensionType = parts[3]; params.extensionInstance = null; }
+                else { view = 'extension-detail'; params.projectName = parts[1]; params.extensionType = parts[3]; params.extensionInstance = parts[4]; }
             } else if (parts.length === 4 && parts[3]) {
-                view = 'extension-detail';
-                params.projectName = parts[1];
-                params.extensionType = parts[3];
-                params.extensionInstance = null;
+                view = 'extension-detail'; params.projectName = parts[1]; params.extensionType = parts[3]; params.extensionInstance = null;
             }
         } else {
             view = 'project-detail';
             params.projectName = parts[1];
-            params.tab = parts[2] || 'overview';
+            params.tab = normalizeProjectTab(parts[2]);
         }
     } else if (route.startsWith('team/')) {
         view = 'team-detail';
@@ -380,152 +223,95 @@ export function App() {
         const parts = route.split('/');
         params.projectName = parts[1];
         params.deploymentId = parts[2];
-    } else if (route === 'teams') {
-        view = 'teams';
     } else {
-        view = 'projects';
+        view = 'home';
     }
 
-    const projectTabLabelMap = {
-        deployments: 'Deployments',
-        environments: 'Environments',
-        'service-accounts': 'Service Accounts',
-        'env-vars': 'Environment Variables',
-        domains: 'Domains',
-        extensions: 'Extensions',
-        access: 'Access',
-    };
-    const breadcrumbs =
-        view === 'projects'
-            ? [{ label: 'Projects' }]
-            : view === 'teams'
-            ? [{ label: 'Teams' }]
-            : view === 'project-detail'
-            ? [
-                  { label: 'Projects', href: '/projects' },
-                  { label: `Project: ${params.projectName}` },
-                  ...(params.tab && params.tab !== 'overview'
-                      ? [{ label: projectTabLabelMap[params.tab] || params.tab }]
-                      : []),
-              ]
-            : view === 'team-detail'
-            ? [
-                  { label: 'Teams', href: '/teams' },
-                  { label: `Team: ${params.teamName}` },
-              ]
-            : view === 'environment-deployment'
-            ? [
-                  { label: 'Projects', href: '/projects' },
-                  { label: `Project: ${params.projectName}`, href: `/project/${params.projectName}` },
-                  { label: 'Environments', href: `/project/${params.projectName}/environments` },
-                  { label: `Environment: ${params.environmentName}` },
-              ]
-            : view === 'deployment-detail'
-            ? [
-                  { label: 'Projects', href: '/projects' },
-                  { label: `Project: ${params.projectName}`, href: `/project/${params.projectName}` },
-                  { label: `Deployment: ${params.deploymentId}` },
-              ]
-            : view === 'extension-detail' || view === 'extension-create'
-            ? [
-                  { label: 'Projects', href: '/projects' },
-                  { label: `Project: ${params.projectName}`, href: `/project/${params.projectName}` },
-                  { label: 'Extensions', href: `/project/${params.projectName}/extensions` },
-                  {
-                      label: params.extensionInstance
-                          ? `Extension: ${params.extensionInstance}`
-                          : params.extensionType
-                          ? `Extension: ${params.extensionType}`
-                          : 'Extension',
-                  },
-              ]
-            : [{ label: 'Projects' }];
+    // ----- Breadcrumbs -----
+    let breadcrumbs: { label: string; href?: string }[];
+    switch (view) {
+        case 'home':              breadcrumbs = [{ label: 'Home' }]; break;
+        case 'profile':           breadcrumbs = [{ label: 'Profile' }]; break;
+        case 'projects':          breadcrumbs = [{ label: 'Projects' }]; break;
+        case 'teams':             breadcrumbs = [{ label: 'Teams' }]; break;
+        case 'project-detail':    breadcrumbs = [
+            { label: 'Projects', href: '/projects' },
+            { label: params.projectName, href: `/project/${params.projectName}` },
+            ...(params.tab && params.tab !== 'overview' ? [{ label: TAB_LABELS[params.tab] || params.tab }] : []),
+        ]; break;
+        case 'team-detail':       breadcrumbs = [
+            { label: 'Teams', href: '/teams' },
+            { label: params.teamName },
+        ]; break;
+        case 'environment-deployment': breadcrumbs = [
+            { label: 'Projects', href: '/projects' },
+            { label: params.projectName, href: `/project/${params.projectName}` },
+            { label: 'Environments', href: `/project/${params.projectName}/environments` },
+            { label: params.environmentName + (params.groupName ? ` / ${params.groupName}` : '') },
+        ]; break;
+        case 'deployment-detail': breadcrumbs = [
+            { label: 'Projects', href: '/projects' },
+            { label: params.projectName, href: `/project/${params.projectName}` },
+            { label: params.deploymentId },
+        ]; break;
+        case 'extension-detail':  breadcrumbs = [
+            { label: 'Projects', href: '/projects' },
+            { label: params.projectName, href: `/project/${params.projectName}` },
+            { label: 'Extensions', href: `/project/${params.projectName}/extensions` },
+            { label: params.extensionInstance || params.extensionType || 'Extension' },
+        ]; break;
+        default:                  breadcrumbs = [{ label: 'Home' }]; break;
+    }
 
+    // ----- Command palette items -----
     const commandItems = [
-        {
-            id: 'go-projects',
-            label: 'Navigate: Projects',
-            keywords: ['projects', 'navigation', 'list'],
-            run: () => navigate('/projects'),
-        },
-        {
-            id: 'go-teams',
-            label: 'Navigate: Teams',
-            keywords: ['teams', 'navigation', 'list'],
-            run: () => navigate('/teams'),
-        },
-        {
-            id: 'create-project',
-            label: 'Action: Create project',
-            keywords: ['project', 'create', 'new'],
-            run: () => navigate('/projects?create=project'),
-        },
-        {
-            id: 'create-team',
-            label: 'Action: Create team',
-            keywords: ['team', 'create', 'new'],
-            run: () => navigate('/teams?create=team'),
-        },
-        {
-            id: 'open-docs',
-            label: 'Open: Docs',
-            keywords: ['help', 'docs', 'onboarding'],
-            run: () => {
-                window.location.href = '/docs/';
-            },
-        },
+        { id: 'go-home', group: 'Navigate', label: 'Home', keywords: ['home', 'overview'], run: () => navigate('/home') },
+        { id: 'go-projects', group: 'Navigate', label: 'Projects', keywords: ['projects'], run: () => navigate('/projects') },
+        { id: 'go-teams', group: 'Navigate', label: 'Teams', keywords: ['teams'], run: () => navigate('/teams') },
+        { id: 'go-profile', group: 'Navigate', label: 'Profile', keywords: ['profile', 'preferences', 'theme', 'density'], run: () => navigate('/profile') },
+        { id: 'create-project', group: 'Action', label: 'Create project', hint: 'new', keywords: ['project', 'create', 'new'], run: () => navigate('/projects?create=project') },
+        { id: 'create-team', group: 'Action', label: 'Create team', hint: 'new', keywords: ['team', 'create', 'new'], run: () => navigate('/teams?create=team') },
+        { id: 'open-docs', group: 'Open', label: 'Documentation', hint: 'docs', keywords: ['help', 'docs'], run: () => { window.location.href = '/docs/'; } },
     ];
-
-    if (view === 'project-detail' && params?.projectName) {
-        commandItems.unshift({
-            id: 'go-project-overview',
-            label: `Navigate: Project ${params.projectName}`,
-            keywords: ['project', 'detail', params.projectName],
-            run: () => navigate(`/project/${params.projectName}`),
-        });
-    }
-
-    const projectCommands = paletteProjects.map((project) => ({
-        id: `project-${project.id || project.name}`,
-        label: `Project: ${project.name}`,
-        keywords: ['project', project.name, project.owner_team_name, project.owner_user_email].filter(Boolean),
-        run: () => navigate(`/project/${project.name}`),
+    paletteProjects.forEach(p => commandItems.push({
+        id: `project-${p.id || p.name}`,
+        group: 'Projects',
+        label: p.name,
+        hint: p.owner?.email || p.owner?.name || '',
+        keywords: ['project', p.name, p.owner?.email, p.owner?.name].filter(Boolean) as string[],
+        run: () => navigate(`/project/${p.name}`),
     }));
-
-    const teamCommands = paletteTeams.map((team) => ({
-        id: `team-${team.id || team.name}`,
-        label: `Team: ${team.name}`,
-        keywords: ['team', team.name],
-        run: () => navigate(`/team/${team.name}`),
+    paletteTeams.forEach(t => commandItems.push({
+        id: `team-${t.id || t.name}`,
+        group: 'Teams',
+        label: t.name,
+        hint: `${t.members?.length || 0} members`,
+        keywords: ['team', t.name],
+        run: () => navigate(`/team/${t.name}`),
     }));
-
-    commandItems.push(...projectCommands, ...teamCommands);
 
     const createIntent = new URLSearchParams(window.location.search).get('create');
 
     return (
-        <div className="mono-app">
-            <div className="mono-shell">
-                <Sidebar currentView={view} user={user} onLogout={handleLogout} />
-                <div className="mono-main-shell">
-                    <TopBar breadcrumbs={breadcrumbs} />
-                    <main className="mono-main">
-                        {view === 'projects' && <ProjectsList openCreate={createIntent === 'project'} />}
-                        {view === 'teams' && <TeamsList currentUser={user} openCreate={createIntent === 'team'} />}
-                        {view === 'project-detail' && <ProjectDetail projectName={params.projectName} initialTab={params.tab} />}
-                        {view === 'team-detail' && <TeamDetail teamName={params.teamName} currentUser={user} />}
-                        {view === 'environment-deployment' && <EnvironmentDeploymentView projectName={params.projectName} environmentName={params.environmentName} />}
-                        {view === 'deployment-detail' && <DeploymentDetail projectName={params.projectName} deploymentId={params.deploymentId} />}
-                        {view === 'extension-detail' && <ExtensionDetailPage projectName={params.projectName} extensionType={params.extensionType} extensionInstance={params.extensionInstance} />}
-                    </main>
-                    <Footer version={version} />
-                </div>
-            </div>
+        <>
+            <Shell route={pathname} breadcrumbs={breadcrumbs} user={user} onLogout={logout} onOpenPalette={() => setCommandPaletteOpen(true)}>
+                <ErrorBoundary key={pathname}>
+                    {view === 'home' && <Home user={user} />}
+                    {view === 'profile' && <Profile user={user} />}
+                    {view === 'projects' && <ProjectsList openCreate={createIntent === 'project'} />}
+                    {view === 'teams' && <TeamsList currentUser={user} openCreate={createIntent === 'team'} />}
+                    {view === 'project-detail' && <ProjectDetail projectName={params.projectName} initialTab={params.tab} />}
+                    {view === 'team-detail' && <TeamDetail teamName={params.teamName} currentUser={user} />}
+                    {view === 'environment-deployment' && <EnvironmentDeploymentView projectName={params.projectName} environmentName={params.environmentName} groupName={params.groupName} />}
+                    {view === 'deployment-detail' && <DeploymentDetail projectName={params.projectName} deploymentId={params.deploymentId} />}
+                    {view === 'extension-detail' && <ExtensionDetailPage projectName={params.projectName} extensionType={params.extensionType} extensionInstance={params.extensionInstance} />}
+                </ErrorBoundary>
+            </Shell>
             <CommandPalette
                 isOpen={commandPaletteOpen}
                 onClose={() => setCommandPaletteOpen(false)}
                 items={commandItems}
             />
-        </div>
+        </>
     );
 }

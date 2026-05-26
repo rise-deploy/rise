@@ -3,114 +3,89 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{% if success %}CLI Authentication Successful{% else %}CLI Authentication Failed{% endif %} - Rise</title>
+    <title>{% if success %}CLI authentication successful{% else %}CLI authentication failed{% endif %} - Rise</title>
     <link rel="icon" type="image/x-icon" href="/assets/favicon.ico">
     <link rel="icon" type="image/png" sizes="16x16" href="/assets/favicon-16x16.png">
     <link rel="icon" type="image/png" sizes="32x32" href="/assets/favicon-32x32.png">
     <style>
-        :root {
-            --bg: #111111;
-            --panel: #141414;
-            --line: #3a3a3a;
-            --text: #ececec;
-            --muted: #b8b8b8;
-            --ok: #b7ffce;
-            --bad: #ffc0c0;
-        }
+        {% include "_auth-tokens.css.tera" %}
         * { box-sizing: border-box; }
         body {
-            margin: 0;
-            min-height: 100vh;
-            font-family: "IBM Plex Mono", ui-monospace, monospace;
-            color: var(--text);
-            background: radial-gradient(circle at 0 0, #202020 0%, #101010 40%), var(--bg);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 1rem;
+            margin: 0; min-height: 100vh;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+            color: var(--text); background: var(--bg);
+            display: flex; align-items: center; justify-content: center;
+            padding: 24px; letter-spacing: -0.005em;
+            -webkit-font-smoothing: antialiased;
         }
         .card {
-            width: 100%;
-            max-width: 48rem;
-            background: var(--panel);
-            border: 1px solid var(--line);
-            padding: 1.2rem;
-            text-align: center;
+            width: 100%; max-width: 440px;
+            background: var(--surface);
+            border: 1px solid var(--border-faint);
+            border-radius: 14px;
+            box-shadow: 0 4px 18px rgba(20, 20, 15, .05), 0 1px 2px rgba(20, 20, 15, .04);
+            padding: 36px 32px; text-align: center;
         }
         .logo {
-            width: 2rem;
-            height: 2rem;
-            margin: 0 auto 0.75rem;
-            background-color: currentColor;
-            mask-size: contain;
-            mask-repeat: no-repeat;
-            mask-position: center;
-            -webkit-mask-size: contain;
-            -webkit-mask-repeat: no-repeat;
-            -webkit-mask-position: center;
-            mask-image: url(/assets/logo.svg);
-            -webkit-mask-image: url(/assets/logo.svg);
+            width: 48px; height: 48px; margin: 0 auto;
+            border-radius: 12px;
+            background: linear-gradient(135deg, var(--accent), oklch(0.62 0.18 245));
+            display: grid; place-items: center;
+            color: #fff; font-weight: 700; font-size: 22px;
         }
-        .state-ok { color: var(--ok); font-size: 2rem; margin-bottom: 0.4rem; }
-        .state-bad { color: var(--bad); font-size: 2rem; margin-bottom: 0.4rem; }
-        h2 { margin: 0.2rem 0 0.8rem; font-size: 1.2rem; }
-        p { color: var(--muted); }
-        .mono-box {
-            border: 1px solid var(--line);
-            background: #1a1a1a;
-            text-align: left;
-            padding: 0.75rem;
-            margin-top: 0.9rem;
+        .badge {
+            width: 44px; height: 44px; border-radius: 50%;
+            display: grid; place-items: center; margin: 18px auto 0;
+            font-size: 22px; font-weight: 700;
         }
-        .mono-code {
-            color: var(--text);
-            background: #111;
-            border: 1px solid var(--line);
-            padding: 0.1rem 0.35rem;
-            font-size: 0.82rem;
+        .badge.ok { background: var(--ok-bg); color: var(--ok); }
+        .badge.bad { background: var(--err-bg); color: var(--err); }
+        h1 { font-size: 20px; font-weight: 600; letter-spacing: -0.02em; margin: 14px 0 0; }
+        p { color: var(--muted); font-size: 13.5px; line-height: 1.55; margin: 10px 0 0; }
+        .mono {
+            font-family: 'JetBrains Mono', ui-monospace, monospace;
+            background: var(--surface-2); border: 1px solid var(--border-faint);
+            border-radius: 5px; padding: 1px 6px; font-size: 12px; color: var(--text);
         }
+        .steps {
+            text-align: left; background: var(--surface-2);
+            border: 1px solid var(--border-faint); border-radius: 8px;
+            padding: 12px 14px; margin-top: 18px; font-size: 13px; color: var(--muted);
+        }
+        .steps p { margin: 0 0 6px; color: var(--text); font-weight: 500; }
+        .steps ul { margin: 0; padding-left: 18px; }
+        .steps li { margin: 4px 0; }
         .errbox {
-            border: 1px solid #7d4b4b;
-            color: var(--bad);
-            background: #1a1212;
-            padding: 0.6rem;
-            margin: 0.8rem 0;
+            background: var(--err-bg); color: oklch(0.40 0.14 25);
+            border: 1px solid color-mix(in oklch, var(--err) 30%, transparent);
+            border-radius: 7px; padding: 10px 12px; font-size: 12.5px;
+            margin: 14px 0 0; text-align: left;
         }
     </style>
 </head>
 <body>
     <div class="card">
         {% if success %}
-        <div>
-            <div class="logo" aria-hidden="true"></div>
-            <div class="state-ok">[ok]</div>
-            <h2>CLI Authentication Successful</h2>
-
-            <p>You have been successfully authenticated with the Rise CLI.</p>
-            <p>You can now close this window and return to your terminal.</p>
-
-            <div class="mono-box">
-                <p style="margin-top:0;">Next steps:</p>
-                <ul style="margin:0 0 0 1rem; color: var(--muted);">
-                    <li>Run <code class="mono-code">rise project list</code> to see your projects</li>
-                    <li>Run <code class="mono-code">rise deploy</code> to deploy an application</li>
-                </ul>
-            </div>
+        <div class="logo" aria-hidden="true">R</div>
+        <div class="badge ok" aria-hidden="true">&check;</div>
+        <h1>CLI authentication successful</h1>
+        <p>You're signed in to the Rise CLI. You can close this window and return to your terminal.</p>
+        <div class="steps">
+            <p>Next steps</p>
+            <ul>
+                <li>Run <code class="mono">rise project list</code> to see your projects</li>
+                <li>Run <code class="mono">rise deploy</code> to deploy an application</li>
+            </ul>
         </div>
         {% else %}
-        <div>
-            <div class="logo" aria-hidden="true"></div>
-            <div class="state-bad">[error]</div>
-            <h2>CLI Authentication Failed</h2>
-
-            <p>Failed to authenticate with the Rise CLI.</p>
-
-            {% if error_message %}
-            <p class="errbox">{{ error_message }}</p>
-            {% endif %}
-
-            <p>Please try running <code class="mono-code">rise login</code> again.</p>
-        </div>
+        <div class="logo" aria-hidden="true">R</div>
+        <div class="badge bad" aria-hidden="true">!</div>
+        <h1>CLI authentication failed</h1>
+        <p>Failed to authenticate with the Rise CLI.</p>
+        {% if error_message %}
+        <div class="errbox">{{ error_message }}</div>
+        {% endif %}
+        <p>Please run <code class="mono">rise login</code> again.</p>
         {% endif %}
     </div>
 </body>

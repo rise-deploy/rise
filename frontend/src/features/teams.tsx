@@ -1,19 +1,21 @@
 // @ts-nocheck
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
 import { formatDate } from '../lib/utils';
 import { useToast } from '../components/toast';
-import { AutocompleteInput, Button, Modal, FormField, ConfirmDialog, ModalActions, ModalSection } from '../components/ui';
+import { AutocompleteInput } from '../components/r-ui';
 import { ProjectTable } from '../components/project-table';
-import { MonoSortButton, MonoTable, MonoTableBody, MonoTableEmptyRow, MonoTableFrame, MonoTableHead, MonoTableRow, MonoTd, MonoTh } from '../components/table';
 import { EmptyState, ErrorState, LoadingState } from '../components/states';
-import { useRowKeyboardNavigation, useSortableData } from '../lib/table';
+import { Alert, ConfirmDialog as RConfirmDialog, Panel, PanelBody, PanelHead, Button as RButton, Empty, Field as RField, Input as RInput, Modal as RModal, Pill, Tooltip, colorFor } from '../components/r-ui';
+import { AddMenu, Menu, RosterTable } from '../components/roster-table';
+import { Icon } from '../components/icon';
 
 
 // Teams List Component
 export function TeamsList({ currentUser, openCreate = false }) {
     const [teams, setTeams] = useState([]);
+    const [projects, setProjects] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
     const [isModalOpen, setIsModalOpen] = useState(false);
@@ -21,13 +23,13 @@ export function TeamsList({ currentUser, openCreate = false }) {
     const [saving, setSaving] = useState(false);
     const [actionStatus, setActionStatus] = useState('');
     const { showToast } = useToast();
-    const { sortedItems: sortedTeams, sortKey, sortDirection, requestSort } = useSortableData(teams, 'name');
-    const { activeIndex, setActiveIndex, onKeyDown } = useRowKeyboardNavigation(
-        (idx) => {
-            const team = sortedTeams[idx];
-            if (team) navigate(`/team/${team.name}`);
-        },
-        sortedTeams.length
+    // Sort by team name (case-insensitive, numeric-aware) — matches the
+    // previous useSortableData default behaviour.
+    const sortedTeams = useMemo(
+        () => [...teams].sort((a, b) =>
+            String(a.name ?? '').localeCompare(String(b.name ?? ''), undefined, { numeric: true, sensitivity: 'base' })
+        ),
+        [teams]
     );
 
     const loadTeams = useCallback(async () => {
@@ -43,6 +45,7 @@ export function TeamsList({ currentUser, openCreate = false }) {
 
     useEffect(() => {
         loadTeams();
+        api.getProjects().then(setProjects).catch(() => {});
     }, [loadTeams]);
 
     const handleCreateClick = () => {
@@ -105,6 +108,7 @@ export function TeamsList({ currentUser, openCreate = false }) {
             setActionStatus(`Created team ${formData.name}.`);
             setIsModalOpen(false);
             loadTeams();
+            window.dispatchEvent(new Event('rise:mutation'));
         } catch (err) {
             showToast(`Failed to create team: ${err.message}`, 'error');
             setActionStatus(`Failed to create team ${formData.name}.`);
@@ -118,132 +122,177 @@ export function TeamsList({ currentUser, openCreate = false }) {
 
     return (
         <section>
-            {currentUser?.can_create_teams && (
-                <div className="flex justify-end items-center mb-6">
-                    <Button variant="primary" size="sm" onClick={handleCreateClick}>
-                        Create Team
-                    </Button>
+            <div className="r-page-head">
+                <div className="title-stack">
+                    <h1 className="r-page-title">Teams</h1>
+                    <div className="r-page-sub">
+                        {sortedTeams.length} team{sortedTeams.length === 1 ? '' : 's'} ·{' '}
+                        {sortedTeams.reduce((n, t) => n + (t.members?.length || 0), 0)} members total
+                    </div>
+                </div>
+                {currentUser?.can_create_teams && (
+                    <RButton variant="primary" icon="plus" onClick={handleCreateClick}>
+                        New team
+                    </RButton>
+                )}
+            </div>
+            {actionStatus && <p className="mono-inline-status mb-3">{actionStatus}</p>}
+            {sortedTeams.length === 0 ? (
+                <Empty title="No teams yet">Create a team to share project ownership across people.</Empty>
+            ) : (
+                <div className="r-grid-2">
+                    {sortedTeams.map(t => (
+                        <TeamCard
+                            key={t.id}
+                            team={t}
+                            projectCount={countProjectsForTeam(projects, t)}
+                            isOwner={!!currentUser && (t.owners || []).some(o => o.email === currentUser.email)}
+                            onOpen={() => navigate(`/team/${t.name}`)}
+                        />
+                    ))}
                 </div>
             )}
-            {actionStatus && <p className="mono-inline-status mb-3">{actionStatus}</p>}
-            <MonoTableFrame>
-                <MonoTable className="mono-sticky-table mono-table--sticky" onKeyDown={onKeyDown}>
-                    <MonoTableHead>
-                        <tr>
-                            <MonoTh stickyCol className="px-6 py-3 text-left">
-                                <MonoSortButton label="Name" active={sortKey === 'name'} direction={sortDirection} onClick={() => requestSort('name')} />
-                            </MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">Members</MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">Owners</MonoTh>
-                            <MonoTh className="px-6 py-3 text-left">
-                                <MonoSortButton label="Created" active={sortKey === 'created'} direction={sortDirection} onClick={() => requestSort('created')} />
-                            </MonoTh>
-                        </tr>
-                    </MonoTableHead>
-                    <MonoTableBody>
-                        {sortedTeams.length === 0 ? (
-                            <MonoTableEmptyRow colSpan={4}>No teams.</MonoTableEmptyRow>
-                        ) : (
-                            sortedTeams.map((t, idx) => (
-                                <MonoTableRow
-                                    key={t.id}
-                                    onClick={() => navigate(`/team/${t.name}`)}
-                                    onFocus={() => setActiveIndex(idx)}
-                                    tabIndex={0}
-                                    aria-label={`Team ${t.name}`}
-                                    interactive
-                                    active={activeIndex === idx}
-                                    className={activeIndex === idx ? 'mono-row-active transition-colors' : 'transition-colors'}
-                                >
-                                    <MonoTd stickyCol className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-gray-100">
-                                        <div className="flex items-center gap-2">
-                                            {t.name}
-                                            {t.idp_managed && (
-                                                <span className="text-xs bg-purple-600 text-white px-2 py-0.5 rounded">IDP</span>
-                                            )}
-                                        </div>
-                                    </MonoTd>
-                                    <MonoTd className="px-6 py-4 whitespace-nowrap text-sm text-gray-700 dark:text-gray-300">{t.members.length}</MonoTd>
-                                    <MonoTd className="px-6 py-4 whitespace-nowrap text-sm text-gray-700 dark:text-gray-300">{t.owners.length}</MonoTd>
-                                    <MonoTd className="px-6 py-4 whitespace-nowrap text-sm text-gray-700 dark:text-gray-300">{formatDate(t.created)}</MonoTd>
-                                </MonoTableRow>
-                            ))
-                        )}
-                    </MonoTableBody>
-                </MonoTable>
-            </MonoTableFrame>
 
-            <Modal
+            <RModal
                 isOpen={isModalOpen}
                 onClose={() => setIsModalOpen(false)}
                 title="Create Team"
+                footer={
+                    <>
+                        <RButton onClick={() => setIsModalOpen(false)} disabled={saving}>
+                            Cancel
+                        </RButton>
+                        <RButton variant="primary" onClick={handleCreate} loading={saving}>
+                            Create
+                        </RButton>
+                    </>
+                }
             >
-                <ModalSection>
-                    <FormField
-                        label="Team Name"
+                <RField label="Team Name">
+                    <RInput
                         id="team-name"
                         value={formData.name}
                         onChange={(e) => setFormData({ ...formData, name: e.target.value })}
                         placeholder="engineering"
-                        required
+                        autoFocus
                     />
+                </RField>
 
-                    <div className="form-field">
-                        <label htmlFor="team-owners" className="mono-label">
-                            Owners (emails, comma-separated)
-                            <span className="text-red-300 ml-1">*</span>
-                        </label>
-                        <AutocompleteInput
-                            id="team-owners"
-                            type="email"
-                            value={formData.owners}
-                            onChange={(next) => setFormData({ ...formData, owners: next })}
-                            options={currentUser?.email ? [currentUser.email] : []}
-                            placeholder="alice@example.com, bob@example.com"
-                            multiValue
-                        />
-                    </div>
-                    <p className="text-sm text-gray-600 dark:text-gray-500 -mt-2">
-                        Owners can manage the team. At least one owner is required.
-                    </p>
+                <RField
+                    label="Owners (emails, comma-separated)"
+                    hint="Owners can manage the team. At least one owner is required."
+                >
+                    <AutocompleteInput
+                        id="team-owners"
+                        type="email"
+                        value={formData.owners}
+                        onChange={(next) => setFormData({ ...formData, owners: next })}
+                        options={currentUser?.email ? [currentUser.email] : []}
+                        placeholder="alice@example.com, bob@example.com"
+                        multiValue
+                    />
+                </RField>
 
-                    <div className="form-field">
-                        <label htmlFor="team-members" className="mono-label">
-                            Members (emails, comma-separated)
-                        </label>
-                        <AutocompleteInput
-                            id="team-members"
-                            type="email"
-                            value={formData.members}
-                            onChange={(next) => setFormData({ ...formData, members: next })}
-                            options={currentUser?.email ? [currentUser.email] : []}
-                            placeholder="charlie@example.com, dana@example.com"
-                            multiValue
-                        />
-                    </div>
-                    <p className="text-sm text-gray-600 dark:text-gray-500 -mt-2">
-                        Members can use the team for project ownership.
-                    </p>
-
-                    <ModalActions>
-                        <Button
-                            variant="secondary"
-                            onClick={() => setIsModalOpen(false)}
-                            disabled={saving}
-                        >
-                            Cancel
-                        </Button>
-                        <Button
-                            variant="primary"
-                            onClick={handleCreate}
-                            loading={saving}
-                        >
-                            Create
-                        </Button>
-                    </ModalActions>
-                </ModalSection>
-            </Modal>
+                <RField
+                    label="Members (emails, comma-separated)"
+                    hint="Members can use the team for project ownership."
+                >
+                    <AutocompleteInput
+                        id="team-members"
+                        type="email"
+                        value={formData.members}
+                        onChange={(next) => setFormData({ ...formData, members: next })}
+                        options={currentUser?.email ? [currentUser.email] : []}
+                        placeholder="charlie@example.com, dana@example.com"
+                        multiValue
+                    />
+                </RField>
+            </RModal>
         </section>
+    );
+}
+
+// Counts projects owned by a given team across the project list. We match by
+// id when available (preferred), then fall back to comparing names so that
+// callers with a partially populated project list (no owner.id) still work.
+function countProjectsForTeam(projects, team) {
+    if (!Array.isArray(projects) || projects.length === 0) return 0;
+    return projects.filter(p => {
+        const owner = p.owner;
+        if (!owner) return false;
+        if (owner.id && team.id) return owner.id === team.id;
+        if (owner.name && team.name) return owner.name === team.name;
+        return false;
+    }).length;
+}
+
+// A labelled, overlapping stack of user avatars; each avatar shows the user's
+// email on hover.
+function AvatarGroup({ label, users }) {
+    const visible = users.slice(0, 8);
+    const overflow = Math.max(0, users.length - visible.length);
+    return (
+        <div className="r-meta-bar" style={{ marginBottom: 0 }}>
+            <span style={{ color: 'var(--text-soft)' }}>{label}</span>
+            <span className="dot-sep" />
+            {users.length === 0 ? (
+                <span style={{ color: 'var(--text-soft)' }}>None</span>
+            ) : (
+                <div className="r-member-stack">
+                    {visible.map(u => {
+                        const email = u.email || u.name || '?';
+                        return (
+                            <Tooltip key={u.id || email} content={email}>
+                                <span
+                                    className="r-ava-sm"
+                                    style={{ background: colorFor(email), width: 22, height: 22, fontSize: 10 }}
+                                >
+                                    {email.trim()[0]?.toUpperCase() || '?'}
+                                </span>
+                            </Tooltip>
+                        );
+                    })}
+                    {overflow > 0 && (
+                        <span
+                            className="r-ava-sm"
+                            style={{ background: 'var(--surface-2)', color: 'var(--text-muted)', width: 22, height: 22, fontSize: 10 }}
+                        >
+                            +{overflow}
+                        </span>
+                    )}
+                </div>
+            )}
+        </div>
+    );
+}
+
+function TeamCard({ team, projectCount, onOpen, isOwner }) {
+    const members = team.members || [];
+    const owners = team.owners || [];
+
+    return (
+        <Panel onClick={onOpen} className={isOwner ? 'r-panel-own' : undefined}>
+            <PanelHead>
+                <div style={{ minWidth: 0 }}>
+                    <div className="r-panel-title" style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                        <span>{team.name}</span>
+                        {team.idp_managed && (
+                            <span className="r-pill accent" style={{ fontSize: 10.5, padding: '1px 6px' }}>IDP</span>
+                        )}
+                    </div>
+                    <div className="r-panel-sub">
+                        {members.length} member{members.length === 1 ? '' : 's'}
+                        {' · '}{projectCount} project{projectCount === 1 ? '' : 's'}
+                    </div>
+                </div>
+            </PanelHead>
+            <PanelBody>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                    <AvatarGroup label="Owners" users={owners} />
+                    <AvatarGroup label="Members" users={members} />
+                </div>
+            </PanelBody>
+        </Panel>
     );
 }
 
@@ -255,24 +304,23 @@ export function TeamDetail({ teamName, currentUser }) {
     const [error, setError] = useState(null);
     const [newOwnerEmail, setNewOwnerEmail] = useState('');
     const [newMemberEmail, setNewMemberEmail] = useState('');
+    const [addOwnerOpen, setAddOwnerOpen] = useState(false);
+    const [addMemberOpen, setAddMemberOpen] = useState(false);
+    const [addingOwner, setAddingOwner] = useState(false);
+    const [addingMember, setAddingMember] = useState(false);
+    const [roleFilter, setRoleFilter] = useState('all');
     const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
     const [deleting, setDeleting] = useState(false);
-    const [detailActionStatus, setDetailActionStatus] = useState('');
     const { showToast } = useToast();
 
     const loadTeam = useCallback(async () => {
         try {
             const [data, projects] = await Promise.all([
                 api.getTeam(teamName),
-                api.getProjects(),
+                api.getTeamProjects(teamName),
             ]);
             setTeam(data);
-            const ownedProjects = (projects || []).filter((p) => {
-                if (p.owner?.name && p.owner.name === data.name) return true;
-                if (p.owner?.id && data.id && p.owner.id === data.id) return true;
-                return false;
-            });
-            setTeamProjects(ownedProjects);
+            setTeamProjects(projects || []);
         } catch (err) {
             setError(err.message);
         } finally {
@@ -299,8 +347,8 @@ export function TeamDetail({ teamName, currentUser }) {
             return;
         }
 
+        setAddingOwner(true);
         try {
-            setDetailActionStatus(`Adding owner ${newOwnerEmail}...`);
             // Look up user ID by email
             const lookupResult = await api.lookupUsers([newOwnerEmail.trim()]);
             if (!lookupResult.users || lookupResult.users.length === 0) {
@@ -315,18 +363,18 @@ export function TeamDetail({ teamName, currentUser }) {
                 owners: [...currentOwnerIds, newOwnerId]
             });
             showToast(`Added ${newOwnerEmail} as owner`, 'success');
-            setDetailActionStatus(`Added owner ${newOwnerEmail}.`);
             setNewOwnerEmail('');
+            setAddOwnerOpen(false);
             await loadTeam();
         } catch (err) {
             showToast(`Failed to add owner: ${err.message}`, 'error');
-            setDetailActionStatus(`Failed to add owner ${newOwnerEmail}.`);
+        } finally {
+            setAddingOwner(false);
         }
     };
 
     const handleRemoveOwner = async (ownerId, email) => {
         try {
-            setDetailActionStatus(`Removing owner ${email}...`);
             const currentOwnerIds = team.owners?.map(o => o.id) || [];
             const updatedOwnerIds = currentOwnerIds.filter(id => id !== ownerId);
 
@@ -337,11 +385,9 @@ export function TeamDetail({ teamName, currentUser }) {
 
             await api.updateTeam(team.id, { owners: updatedOwnerIds });
             showToast(`Removed ${email} from owners`, 'success');
-            setDetailActionStatus(`Removed owner ${email}.`);
             await loadTeam();
         } catch (err) {
             showToast(`Failed to remove owner: ${err.message}`, 'error');
-            setDetailActionStatus(`Failed to remove owner ${email}.`);
         }
     };
 
@@ -351,8 +397,8 @@ export function TeamDetail({ teamName, currentUser }) {
             return;
         }
 
+        setAddingMember(true);
         try {
-            setDetailActionStatus(`Adding member ${newMemberEmail}...`);
             // Look up user ID by email
             const lookupResult = await api.lookupUsers([newMemberEmail.trim()]);
             if (!lookupResult.users || lookupResult.users.length === 0) {
@@ -367,41 +413,37 @@ export function TeamDetail({ teamName, currentUser }) {
                 members: [...currentMemberIds, newMemberId]
             });
             showToast(`Added ${newMemberEmail} as member`, 'success');
-            setDetailActionStatus(`Added member ${newMemberEmail}.`);
             setNewMemberEmail('');
+            setAddMemberOpen(false);
             await loadTeam();
         } catch (err) {
             showToast(`Failed to add member: ${err.message}`, 'error');
-            setDetailActionStatus(`Failed to add member ${newMemberEmail}.`);
+        } finally {
+            setAddingMember(false);
         }
     };
 
     const handleRemoveMember = async (memberId, email) => {
         try {
-            setDetailActionStatus(`Removing member ${email}...`);
             const currentMemberIds = team.members?.map(m => m.id) || [];
             const updatedMemberIds = currentMemberIds.filter(id => id !== memberId);
             await api.updateTeam(team.id, { members: updatedMemberIds });
             showToast(`Removed ${email} from members`, 'success');
-            setDetailActionStatus(`Removed member ${email}.`);
             await loadTeam();
         } catch (err) {
             showToast(`Failed to remove member: ${err.message}`, 'error');
-            setDetailActionStatus(`Failed to remove member ${email}.`);
         }
     };
 
     const handleDeleteTeam = async () => {
         setDeleting(true);
-        setDetailActionStatus(`Deleting team ${team.name}...`);
         try {
             await api.deleteTeam(team.id);
             showToast(`Team ${team.name} deleted successfully`, 'success');
-            setDetailActionStatus(`Deleted team ${team.name}.`);
+            window.dispatchEvent(new Event('rise:mutation'));
             navigate('/teams');
         } catch (err) {
             showToast(`Failed to delete team: ${err.message}`, 'error');
-            setDetailActionStatus(`Failed to delete team ${team.name}.`);
             setDeleting(false);
         }
     };
@@ -410,180 +452,206 @@ export function TeamDetail({ teamName, currentUser }) {
     if (error) return <ErrorState message={`Error loading team: ${error}`} onRetry={loadTeam} />;
     if (!team) return <EmptyState message="Team not found." />;
 
-    return (
-        <section>
-            <div className="flex items-center justify-between mb-4">
-                <div>
-                    {team.idp_managed && (
-                        <span className="text-xs bg-purple-600 text-white px-2 py-1 rounded">IDP</span>
-                    )}
-                </div>
-                {canEdit && (
-                    <Button
+    // --- Unified members roster ---
+    // A user can be both an owner and a member; collapse those into one row.
+    const owners = team.owners || [];
+    const members = team.members || [];
+    const peopleMap = new Map();
+    const keyOf = (u) => u.id || u.email;
+    for (const o of owners) {
+        const k = keyOf(o);
+        if (!peopleMap.has(k)) peopleMap.set(k, { ...o, isOwner: false, isMember: false });
+        peopleMap.get(k).isOwner = true;
+    }
+    for (const m of members) {
+        const k = keyOf(m);
+        if (!peopleMap.has(k)) peopleMap.set(k, { ...m, isOwner: false, isMember: false });
+        peopleMap.get(k).isMember = true;
+    }
+    const visiblePeople = [...peopleMap.values()].filter(p => {
+        if (roleFilter === 'owners') return p.isOwner;
+        if (roleFilter === 'members') return p.isMember;
+        return true;
+    });
+    const rosterRows = visiblePeople.map(p => {
+        const kinds = [];
+        if (p.isOwner) kinds.push('Owner');
+        if (p.isMember) kinds.push('Member');
+        let actions = null;
+        if (canEdit) {
+            if (p.isOwner && p.isMember) {
+                actions = (
+                    <Menu
+                        items={[
+                            { label: 'Remove as owner', icon: 'trash', onClick: () => handleRemoveOwner(p.id, p.email) },
+                            { label: 'Remove as member', icon: 'trash', onClick: () => handleRemoveMember(p.id, p.email) },
+                        ]}
+                        trigger={({ toggle }) => (
+                            <RButton variant="danger" size="sm" icon="trash" onClick={toggle}>
+                                Remove<Icon name="chevd" size={12} />
+                            </RButton>
+                        )}
+                    />
+                );
+            } else {
+                const removeRole = p.isOwner ? 'owner' : 'member';
+                actions = (
+                    <RButton
                         variant="danger"
                         size="sm"
-                        onClick={() => setDeleteDialogOpen(true)}
+                        icon="trash"
+                        onClick={() => removeRole === 'owner'
+                            ? handleRemoveOwner(p.id, p.email)
+                            : handleRemoveMember(p.id, p.email)}
                     >
-                        Delete Team
-                    </Button>
+                        Remove
+                    </RButton>
+                );
+            }
+        }
+        return {
+            key: `person-${keyOf(p)}`,
+            icon: 'user',
+            name: <span style={{ fontWeight: 500 }}>{p.email}</span>,
+            kindLabel: kinds,
+            actions,
+        };
+    });
+
+    const isTeamOwnedProject = (project) => {
+        const owner = project.owner;
+        if (!owner) return false;
+        if (team.id && owner.id) return owner.id === team.id;
+        return !owner.email && owner.name === team.name;
+    };
+
+    return (
+        <section>
+            <div className="r-page-head">
+                <div className="title-stack">
+                    <h1 className="r-page-title" style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                        <span>{team.name}</span>
+                        {team.idp_managed && <Pill kind="accent">IDP</Pill>}
+                    </h1>
+                    <div className="r-page-sub">Updated {formatDate(team.updated)}</div>
+                </div>
+                {canEdit && (
+                    <RButton variant="danger" onClick={() => setDeleteDialogOpen(true)}>
+                        Delete
+                    </RButton>
                 )}
             </div>
 
-            <div className="mono-status-strip mb-4">
-                <div><span>team</span><strong>{team.name}</strong></div>
-                <div><span>updated</span><strong>{formatDate(team.updated)}</strong></div>
-            </div>
-
-            {detailActionStatus && <p className="mono-inline-status mb-4">{detailActionStatus}</p>}
-
             {team.idp_managed && !currentUser?.is_admin && (
-                <div className="mb-6 p-3 bg-purple-900/20 border border-purple-700 rounded text-sm text-purple-300">
-                    This team is managed by your identity provider and can only be modified by administrators.
+                <div style={{ marginBottom: 20 }}>
+                    <Alert tone="info" icon="info">
+                        This team is managed by your identity provider and can only be modified by administrators.
+                    </Alert>
                 </div>
             )}
 
-            <div className="mb-6">
-                <div className="flex justify-between items-center mb-4">
-                    <h4 className="text-lg font-bold">Projects ({teamProjects.length})</h4>
-                </div>
-                {teamProjects.length > 0 ? (
+            <div className="r-stack">
+                <RosterTable
+                    title="People"
+                    sub="Owners can manage the team. Members can use it for project ownership."
+                    addControl={canEdit ? (
+                        <AddMenu
+                            items={[
+                                { label: 'Add owner', icon: 'user', onClick: () => { setNewOwnerEmail(''); setAddOwnerOpen(true); } },
+                                { label: 'Add member', icon: 'user', onClick: () => { setNewMemberEmail(''); setAddMemberOpen(true); } },
+                            ]}
+                        />
+                    ) : undefined}
+                    filter={{
+                        value: roleFilter,
+                        options: [
+                            { value: 'all', label: 'All' },
+                            { value: 'owners', label: 'Owners' },
+                            { value: 'members', label: 'Members' },
+                        ],
+                        onChange: setRoleFilter,
+                    }}
+                    rows={rosterRows}
+                    emptyText="No people in this team"
+                />
+
+                <div>
+                    <div style={{ marginBottom: 14 }}>
+                        <div className="r-section-title">Projects ({teamProjects.length})</div>
+                        {teamProjects.length > 0 && (
+                            <div className="r-section-sub">
+                                Highlighted rows are owned by this team. The rest are shared with it via project access.
+                            </div>
+                        )}
+                    </div>
                     <ProjectTable
                         projects={teamProjects.slice().sort((a, b) => a.name.localeCompare(b.name))}
                         onRowClick={(project) => navigate(`/project/${project.name}`)}
+                        emptyText="No projects owned by or shared with this team"
+                        isOwnRow={isTeamOwnedProject}
                     />
-                ) : (
-                    <p className="text-gray-600 dark:text-gray-400">No projects owned by this team.</p>
-                )}
-            </div>
-
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
-                <div>
-                    <div className="flex justify-between items-center mb-4">
-                        <h4 className="text-lg font-bold">Owners ({team.owners?.length || 0})</h4>
-                    </div>
-                    {team.owners && team.owners.length > 0 ? (
-                        <MonoTableFrame className="mb-4">
-                            <MonoTable>
-                                <MonoTableHead>
-                                    <tr>
-                                        <MonoTh className="px-6 py-3 text-left">Email</MonoTh>
-                                        {canEdit && <MonoTh className="px-6 py-3 text-right">Actions</MonoTh>}
-                                    </tr>
-                                </MonoTableHead>
-                                <MonoTableBody>
-                                    {team.owners.map(owner => (
-                                        <MonoTableRow key={owner.id} interactive className="transition-colors">
-                                            <MonoTd className="px-6 py-4 text-sm text-gray-900 dark:text-gray-200">{owner.email}</MonoTd>
-                                            {canEdit && (
-                                                <MonoTd className="px-6 py-4">
-                                                    <div className="flex justify-end">
-                                                        <Button
-                                                            variant="danger"
-                                                            size="sm"
-                                                            onClick={() => handleRemoveOwner(owner.id, owner.email)}
-                                                        >
-                                                            Remove
-                                                        </Button>
-                                                    </div>
-                                                </MonoTd>
-                                            )}
-                                        </MonoTableRow>
-                                    ))}
-                                </MonoTableBody>
-                            </MonoTable>
-                        </MonoTableFrame>
-                    ) : (
-                        <p className="text-gray-600 dark:text-gray-400 mb-4">No owners</p>
-                    )}
-                    {canEdit && (
-                        <div className="flex justify-end">
-                            <div className="flex gap-2">
-                                <AutocompleteInput
-                                    type="email"
-                                    value={newOwnerEmail}
-                                    onChange={setNewOwnerEmail}
-                                    options={currentUser?.email ? [currentUser.email] : []}
-                                    placeholder="owner@example.com"
-                                    className="w-64"
-                                    onEnter={handleAddOwner}
-                                />
-                                <Button variant="primary" size="sm" onClick={handleAddOwner}>
-                                    Add
-                                </Button>
-                            </div>
-                        </div>
-                    )}
-                </div>
-
-                <div>
-                    <div className="flex justify-between items-center mb-4">
-                        <h4 className="text-lg font-bold">Members ({team.members?.length || 0})</h4>
-                    </div>
-                    {team.members && team.members.length > 0 ? (
-                        <MonoTableFrame className="mb-4">
-                            <MonoTable>
-                                <MonoTableHead>
-                                    <tr>
-                                        <MonoTh className="px-6 py-3 text-left">Email</MonoTh>
-                                        {canEdit && <MonoTh className="px-6 py-3 text-right">Actions</MonoTh>}
-                                    </tr>
-                                </MonoTableHead>
-                                <MonoTableBody>
-                                    {team.members.map(member => (
-                                        <MonoTableRow key={member.id} interactive className="transition-colors">
-                                            <MonoTd className="px-6 py-4 text-sm text-gray-900 dark:text-gray-200">{member.email}</MonoTd>
-                                            {canEdit && (
-                                                <MonoTd className="px-6 py-4">
-                                                    <div className="flex justify-end">
-                                                        <Button
-                                                            variant="danger"
-                                                            size="sm"
-                                                            onClick={() => handleRemoveMember(member.id, member.email)}
-                                                        >
-                                                            Remove
-                                                        </Button>
-                                                    </div>
-                                                </MonoTd>
-                                            )}
-                                        </MonoTableRow>
-                                    ))}
-                                </MonoTableBody>
-                            </MonoTable>
-                        </MonoTableFrame>
-                    ) : (
-                        <p className="text-gray-600 dark:text-gray-400 mb-4">No members</p>
-                    )}
-                    {canEdit && (
-                        <div className="flex justify-end">
-                            <div className="flex gap-2">
-                                <AutocompleteInput
-                                    type="email"
-                                    value={newMemberEmail}
-                                    onChange={setNewMemberEmail}
-                                    options={currentUser?.email ? [currentUser.email] : []}
-                                    placeholder="member@example.com"
-                                    className="w-64"
-                                    onEnter={handleAddMember}
-                                />
-                                <Button variant="primary" size="sm" onClick={handleAddMember}>
-                                    Add
-                                </Button>
-                            </div>
-                        </div>
-                    )}
                 </div>
             </div>
 
-            <ConfirmDialog
+            <RModal
+                isOpen={addOwnerOpen}
+                onClose={() => setAddOwnerOpen(false)}
+                title="Add owner"
+                sub="Owners can manage this team."
+                footer={
+                    <>
+                        <RButton onClick={() => setAddOwnerOpen(false)} disabled={addingOwner}>Cancel</RButton>
+                        <RButton variant="primary" onClick={handleAddOwner} loading={addingOwner}>Add owner</RButton>
+                    </>
+                }
+            >
+                <RField label="Owner email">
+                    <AutocompleteInput
+                        type="email"
+                        id="add-owner-email"
+                        value={newOwnerEmail}
+                        onChange={setNewOwnerEmail}
+                        options={currentUser?.email ? [currentUser.email] : []}
+                        placeholder="owner@example.com"
+                        onEnter={handleAddOwner}
+                    />
+                </RField>
+            </RModal>
+
+            <RModal
+                isOpen={addMemberOpen}
+                onClose={() => setAddMemberOpen(false)}
+                title="Add member"
+                sub="Members can use this team for project ownership."
+                footer={
+                    <>
+                        <RButton onClick={() => setAddMemberOpen(false)} disabled={addingMember}>Cancel</RButton>
+                        <RButton variant="primary" onClick={handleAddMember} loading={addingMember}>Add member</RButton>
+                    </>
+                }
+            >
+                <RField label="Member email">
+                    <AutocompleteInput
+                        type="email"
+                        id="add-member-email"
+                        value={newMemberEmail}
+                        onChange={setNewMemberEmail}
+                        options={currentUser?.email ? [currentUser.email] : []}
+                        placeholder="member@example.com"
+                        onEnter={handleAddMember}
+                    />
+                </RField>
+            </RModal>
+
+            <RConfirmDialog
                 isOpen={deleteDialogOpen}
                 onClose={() => setDeleteDialogOpen(false)}
                 onConfirm={handleDeleteTeam}
                 title="Delete Team"
                 message={`Delete team "${team.name}"? Impact: projects owned by this team may lose expected ownership workflows.`}
                 confirmText="Delete Team"
-                variant="danger"
-                requireConfirmation={true}
-                confirmationText={team.name}
+                confirmTone="danger"
+                requireText={team.name}
                 loading={deleting}
             />
         </section>

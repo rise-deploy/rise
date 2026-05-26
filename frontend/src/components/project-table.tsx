@@ -1,114 +1,135 @@
-// @ts-nocheck
-import { EmptyState } from './states';
-import { StatusBadge } from './ui';
-import { MonoSortButton, MonoTable, MonoTableBody, MonoTableEmptyRow, MonoTableFrame, MonoTableHead, MonoTableRow, MonoTd, MonoTh } from './table';
+import { Icon } from './icon';
+import { Panel, Status } from './r-ui';
+import { formatRelativeTimeRounded, stripUrlScheme } from '../lib/utils';
 
-function OwnerCell({ project }) {
-    const owner = project.owner;
-    const ownerType = owner?.email ? 'user' : owner?.name ? 'team' : null;
-    const ownerLabel = owner?.email || owner?.name || '-';
+export interface ProjectOwner {
+    id?: string;
+    email?: string;
+    name?: string;
+}
 
+export interface ProjectRow {
+    id?: string;
+    name: string;
+    status?: string;
+    primary_url?: string;
+    access_class?: string;
+    owner?: ProjectOwner;
+    created?: string;
+    updated?: string;
+    updated_at?: string;
+}
+
+export interface AccessClassOption {
+    id: string;
+    display_name?: string;
+    description?: string;
+}
+
+interface OwnerCellProps {
+    owner?: ProjectOwner;
+}
+
+function OwnerCell({ owner }: OwnerCellProps) {
+    if (!owner || (!owner.email && !owner.name)) {
+        return <span style={{ color: 'var(--text-soft)' }}>—</span>;
+    }
+    const isTeam = !owner.email && !!owner.name;
     return (
-        <span className="inline-flex items-center gap-2">
-            {ownerType === 'user' && (
-                <span
-                    className="w-3 h-3 svg-mask inline-block"
-                    aria-hidden="true"
-                    style={{
-                        maskImage: 'url(/assets/user.svg)',
-                        WebkitMaskImage: 'url(/assets/user.svg)',
-                    }}
-                />
-            )}
-            {ownerType === 'team' && (
-                <svg className="w-3 h-3" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
-                    <path d="M7 10a3 3 0 1 0-3-3 3 3 0 0 0 3 3Zm6 0a3 3 0 1 0-3-3 3 3 0 0 0 3 3ZM1.5 16.5a5.5 5.5 0 0 1 11 0v.5h-11Zm12 0a5.5 5.5 0 0 1 5-5.48 5.53 5.53 0 0 1 .5.02V17h-5.5Z" />
-                </svg>
-            )}
-            <span>{ownerLabel}</span>
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+            <Icon name={isTeam ? 'users' : 'user'} size={13} />
+            <span>{owner.email || owner.name}</span>
         </span>
     );
 }
 
+export interface ProjectTableProps {
+    projects: ProjectRow[];
+    accessClasses?: AccessClassOption[];
+    onRowClick: (project: ProjectRow) => void;
+    emptyText?: string;
+    isOwnRow?: (project: ProjectRow) => boolean;
+}
+
+// Shared project listing table (r-* design system). Renders inside a Panel and
+// owns its empty state. Used by the Projects page and the team detail page.
+//
+// isOwnRow: optional predicate; matching rows get an accent highlight.
 export function ProjectTable({
     projects,
-    sortKey,
-    sortDirection,
-    requestSort,
+    accessClasses = [],
     onRowClick,
-    onKeyDown,
-    activeIndex,
-    setActiveIndex,
-    emptyMessage = 'No projects found.',
-    emptyActionLabel,
-    onEmptyAction,
-}) {
-    const sortableHeader = (label, key) => (
-        requestSort ? (
-            <MonoSortButton
-                label={label}
-                active={sortKey === key}
-                direction={sortDirection}
-                onClick={() => requestSort(key)}
-            />
-        ) : label
-    );
-
+    emptyText = 'No projects found.',
+    isOwnRow,
+}: ProjectTableProps) {
     return (
-        <MonoTableFrame>
-            <MonoTable className="mono-sticky-table mono-table--sticky" onKeyDown={onKeyDown}>
-                <MonoTableHead>
-                    <tr>
-                        <MonoTh stickyCol className="px-6 py-3 text-left">{sortableHeader('Name', 'name')}</MonoTh>
-                        <MonoTh className="px-6 py-3 text-left">{sortableHeader('Status', 'status')}</MonoTh>
-                        <MonoTh className="px-6 py-3 text-left">Owner</MonoTh>
-                        <MonoTh className="px-6 py-3 text-left">Access Class</MonoTh>
-                        <MonoTh className="px-6 py-3 text-left">URL</MonoTh>
-                    </tr>
-                </MonoTableHead>
-                <MonoTableBody>
-                    {projects.length === 0 ? (
-                        <MonoTableEmptyRow colSpan={5}>
-                            {emptyActionLabel && onEmptyAction ? (
-                                <EmptyState message={emptyMessage} actionLabel={emptyActionLabel} onAction={onEmptyAction} />
-                            ) : (
-                                emptyMessage
-                            )}
-                        </MonoTableEmptyRow>
-                    ) : (
-                        projects.map((project, idx) => (
-                            <MonoTableRow
-                                key={project.id}
-                                onClick={() => onRowClick(project)}
-                                onFocus={() => setActiveIndex?.(idx)}
-                                tabIndex={0}
-                                aria-label={`Project ${project.name}`}
-                                interactive
-                                active={activeIndex === idx}
-                                className={activeIndex === idx ? 'mono-row-active transition-colors' : 'transition-colors'}
-                            >
-                                <MonoTd stickyCol className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-gray-100">{project.name}</MonoTd>
-                                <MonoTd className="px-6 py-4 whitespace-nowrap text-sm"><StatusBadge status={project.status} /></MonoTd>
-                                <MonoTd className="px-6 py-4 whitespace-nowrap text-sm text-gray-700 dark:text-gray-300"><OwnerCell project={project} /></MonoTd>
-                                <MonoTd className="px-6 py-4 whitespace-nowrap text-sm text-gray-700 dark:text-gray-300">{project.access_class || '-'}</MonoTd>
-                                <MonoTd className="px-6 py-4 whitespace-nowrap text-sm">
-                                    {project.primary_url ? (
-                                        <a
-                                            href={project.primary_url}
-                                            target="_blank"
-                                            rel="noopener noreferrer"
-                                            className="text-indigo-600 dark:text-indigo-400 hover:text-indigo-700 dark:hover:text-indigo-300"
-                                            onClick={(e) => e.stopPropagation()}
-                                        >
-                                            {project.primary_url}
-                                        </a>
-                                    ) : '-'}
-                                </MonoTd>
-                            </MonoTableRow>
-                        ))
-                    )}
-                </MonoTableBody>
-            </MonoTable>
-        </MonoTableFrame>
+        <Panel>
+            {projects.length === 0 ? (
+                <div style={{ padding: 36, textAlign: 'center', color: 'var(--text-muted)' }}>
+                    {emptyText}
+                </div>
+            ) : (
+                <table className="r-table">
+                    <thead>
+                        <tr>
+                            <th>Project</th>
+                            <th>Status</th>
+                            <th>Primary URL</th>
+                            <th>Owner</th>
+                            <th>Access</th>
+                            <th style={{ textAlign: 'right' }}>Updated</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {projects.map(project => {
+                            const updated = project.updated || project.updated_at || project.created;
+                            // When isOwnRow is provided, mark every row: an accent
+                            // bar for owned projects, a gray bar for shared ones.
+                            const ownClass = isOwnRow
+                                ? (isOwnRow(project) ? ' r-row-own' : ' r-row-shared')
+                                : '';
+                            return (
+                                <tr
+                                    key={project.id || project.name}
+                                    className={`click${ownClass}`}
+                                    onClick={() => onRowClick(project)}
+                                >
+                                    <td style={{ maxWidth: 280 }}>
+                                        <div style={{ fontWeight: 500, fontSize: 13.5 }}>{project.name}</div>
+                                    </td>
+                                    <td><Status status={project.status || 'Unknown'} /></td>
+                                    <td style={{ maxWidth: 300 }}>
+                                        {project.primary_url ? (
+                                            <a
+                                                className="r-link mono"
+                                                style={{ fontSize: 12.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'inline-block', maxWidth: '100%' }}
+                                                href={project.primary_url}
+                                                target="_blank"
+                                                rel="noopener noreferrer"
+                                                onClick={(e) => e.stopPropagation()}
+                                            >
+                                                {stripUrlScheme(project.primary_url)}
+                                            </a>
+                                        ) : (
+                                            <span style={{ color: 'var(--text-soft)' }}>—</span>
+                                        )}
+                                    </td>
+                                    <td><OwnerCell owner={project.owner} /></td>
+                                    <td>
+                                        <span className="r-pill">
+                                            {accessClasses.find(a => a.id === project.access_class)?.display_name
+                                                || project.access_class || '—'}
+                                        </span>
+                                    </td>
+                                    <td style={{ textAlign: 'right', color: 'var(--text-muted)' }}>
+                                        {updated ? formatRelativeTimeRounded(updated) : '—'}
+                                    </td>
+                                </tr>
+                            );
+                        })}
+                    </tbody>
+                </table>
+            )}
+        </Panel>
     );
 }

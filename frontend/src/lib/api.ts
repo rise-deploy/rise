@@ -86,6 +86,11 @@ class RiseAPI {
         });
     }
 
+    // Projects a team owns or has been granted access to view
+    async getTeamProjects(idOrName) {
+        return this.request(`/teams/${idOrName}/projects`);
+    }
+
     // Project endpoints
     async getProjects() {
         return this.request('/projects');
@@ -154,7 +159,6 @@ class RiseAPI {
                 from_deployment: sourceDeploymentId,
                 use_source_env_vars: useSourceEnvVars,
                 group: sourceDeployment.deployment_group || 'default',
-                http_port: sourceDeployment.controller_metadata?.http_port || 8080,
             })
         });
     }

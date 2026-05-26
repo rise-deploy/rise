@@ -184,14 +184,16 @@ For user-facing documentation, see the [`/docs`](./docs) directory. Key topics i
 
 ### Tag/Badge Design Language
 
-The frontend uses two tiers of tag-like components. Prefer these reusable components over inline Tailwind for any tag-like UI.
+The frontend exposes a small set of reusable tag-like components from `frontend/src/components/r-ui.tsx`. Prefer these over inline Tailwind / ad-hoc spans for any tag-like UI.
 
 | Component | Style | Purpose |
 |---|---|---|
-| **`StatusBadge`** | Bordered, colored bg | Deployment/project lifecycle status (Running, Failed, Stopped...) |
-| **`MonoStatusPill`** | Bordered, colored bg | Extension status or other state indicators (Configured, Error, Not Enabled...) |
-| **`EnvironmentColorDot`** | Colored circle | Placed next to environment names to indicate color |
-| **`MonoTag`** | Borderless, translucent colored bg, square | Kind/category/property labels (env var types, boolean flags, scope tags...) |
+| **`Status`** (from `r-ui`) | Dot + label | Deployment/project lifecycle status (Running, Failed, Stopped, …) |
+| **`Pill`** (from `r-ui`) | Bordered, colored bg | Accent labels via `kind="accent"`, env labels via `kind="env-*"` |
+| **`BasePill`** (from `r-ui`) | Icon + name pill | Generic two-cell pill — building block for `EnvPill` / `GroupPill` |
+| **`EnvPill`** (from `r-ui`) | Color dot + env name | Environment chip; pairs with `EnvironmentColorDot` |
+| **`GroupPill`** (from `r-ui`) | Layer glyph + group name | Group chip |
+| **`EnvironmentColorDot`** (from `r-ui`) | Tinted layer glyph | Placed next to environment names to indicate color |
 
 ### Before Commit & Push
 

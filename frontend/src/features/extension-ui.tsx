@@ -4,24 +4,77 @@ import { api } from '../lib/api';
 import { CONFIG } from '../lib/config';
 import { copyToClipboard, formatDate } from '../lib/utils';
 import { useToast } from '../components/toast';
-import { Button, FormField, Modal, ModalTabs, MonoCodeBlock, MonoNotice, MonoStatusPill, MonoTabButton, MonoTag } from '../components/ui';
-import { MonoTable, MonoTableBody, MonoTableHead, MonoTableRow, MonoTd, MonoTh } from '../components/table';
+import { Icon } from '../components/icon';
+import {
+    Alert,
+    Button,
+    Combobox,
+    Empty,
+    Field,
+    Input,
+    KV,
+    KVRow,
+    Modal,
+    Panel,
+    PanelBody,
+    PanelHead,
+    Pill,
+    Status,
+    Tabs,
+    Textarea,
+} from '../components/r-ui';
 
-function statusToneFromState(state) {
-    if (!state) return 'muted';
-    const normalized = String(state).toLowerCase();
-
-    if (['available', 'configured', 'running'].includes(normalized)) return 'ok';
-    if (['creating', 'pending', 'testingconnection', 'creatingintegration', 'retrievingcredentials', 'creatingoauthextension', 'waiting for auth', 'deploying', 'building', 'pushing'].includes(normalized)) return 'warn';
-    if (['failed', 'error', 'terminating'].includes(normalized)) return 'bad';
-    if (['deletion_blocked'].includes(normalized)) return 'warn';
-    return 'muted';
+// Mono-style code block matching the new design system: subtle border, surface-2
+// background, small monospace text. Used for JSON specs and example snippets.
+function CodeBlock({ children, style }: { children: React.ReactNode; style?: React.CSSProperties }) {
+    return (
+        <pre
+            className="mono"
+            style={{
+                fontSize: 12,
+                lineHeight: 1.55,
+                overflow: 'auto',
+                margin: 0,
+                padding: '10px 12px',
+                background: 'var(--surface-2)',
+                border: '1px solid var(--border)',
+                borderRadius: 'var(--radius-sm)',
+                color: 'var(--text)',
+                whiteSpace: 'pre',
+            }}
+        >
+            {children}
+        </pre>
+    );
 }
 
-function renderStatePill(label, forceTone) {
+// Inline copy icon button used in env-var tables.
+function CopyButton({ onClick, title }: { onClick: () => void; title?: string }) {
+    return (
+        <button
+            type="button"
+            onClick={onClick}
+            title={title || 'Copy to clipboard'}
+            style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                padding: 4,
+                background: 'transparent',
+                border: 'none',
+                borderRadius: 'var(--radius-sm)',
+                color: 'var(--text-muted)',
+                cursor: 'pointer',
+            }}
+        >
+            <Icon name="copy" size={14} />
+        </button>
+    );
+}
+
+function renderStatePill(label) {
     if (!label) return null;
-    const tone = forceTone || statusToneFromState(label);
-    return <MonoStatusPill tone={tone}>{label}</MonoStatusPill>;
+    return <Status status={String(label)} />;
 }
 
 
@@ -65,67 +118,66 @@ export function AwsRdsExtensionUI({ spec, schema, onChange }) {
     }, [engine, engineVersion, databaseIsolation, databaseUrlEnvVar, injectPgVars]);
 
     return (
-        <div className="space-y-6">
-            <div className="space-y-4">
-                <FormField
-                    label="Database Engine"
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+            <Field label="Database Engine">
+                <Combobox
                     id="rds-engine"
-                    type="select"
                     value={engine}
-                    onChange={(e) => setEngine(e.target.value)}
-                    required
-                >
-                    <option value="postgres">PostgreSQL</option>
-                </FormField>
+                    onChange={setEngine}
+                    options={[{ value: 'postgres', label: 'PostgreSQL' }]}
+                />
+            </Field>
 
-                <FormField
-                    label="Engine Version (Optional)"
+            <Field label="Engine Version (Optional)">
+                <Input
                     id="rds-engine-version"
                     value={engineVersion}
                     onChange={(e) => setEngineVersion(e.target.value)}
-                    placeholder={defaultEngineVersion || "e.g., 16.2"}
+                    placeholder={defaultEngineVersion || 'e.g., 16.2'}
                 />
+            </Field>
 
-                <FormField
-                    label="Database Isolation"
+            <Field label="Database Isolation">
+                <Combobox
                     id="rds-database-isolation"
-                    type="select"
                     value={databaseIsolation}
-                    onChange={(e) => setDatabaseIsolation(e.target.value)}
-                    required
-                >
-                    <option value="shared">Shared (All deployment groups use same database)</option>
-                    <option value="isolated">Isolated (Each deployment group gets own database)</option>
-                </FormField>
+                    onChange={setDatabaseIsolation}
+                    options={[
+                        { value: 'shared', label: 'Shared (All deployment groups use same database)' },
+                        { value: 'isolated', label: 'Isolated (Each deployment group gets own database)' },
+                    ]}
+                />
+            </Field>
 
-                <div className="space-y-3">
-                    <h4 className="text-sm font-semibold text-gray-700 dark:text-gray-300">Environment Variables</h4>
-                    <FormField
-                        label="Database URL Environment Variable"
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <div className="r-section-title">Environment Variables</div>
+                <Field
+                    label="Database URL Environment Variable"
+                    hint="Environment variable name for the database connection string (e.g., DATABASE_URL, POSTGRES_URL). Leave empty to disable."
+                >
+                    <Input
                         id="rds-database-url-env-var"
                         value={databaseUrlEnvVar}
                         onChange={(e) => setDatabaseUrlEnvVar(e.target.value)}
                         placeholder="DATABASE_URL"
-                        helperText="Environment variable name for the database connection string (e.g., DATABASE_URL, POSTGRES_URL). Leave empty to disable."
                     />
-                    <label className="flex items-center space-x-3">
-                        <input
-                            type="checkbox"
-                            checked={injectPgVars}
-                            onChange={(e) => setInjectPgVars(e.target.checked)}
-                            className="mono-checkbox"
-                        />
-                        <span className="text-sm text-gray-700 dark:text-gray-300">
-                            Inject <code className="mono-token-accent">PG*</code> variables
-                        </span>
-                    </label>
-                </div>
-
-                <MonoNotice tone="muted" title="Isolation Modes">
-                    <p><strong>Shared:</strong> all deployment groups (default, staging, etc.) use the same database.</p>
-                    <p><strong>Isolated:</strong> each deployment group gets its own database.</p>
-                </MonoNotice>
+                </Field>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--text)', cursor: 'pointer' }}>
+                    <input
+                        type="checkbox"
+                        checked={injectPgVars}
+                        onChange={(e) => setInjectPgVars(e.target.checked)}
+                    />
+                    <span>
+                        Inject <code className="mono" style={{ color: 'var(--accent)' }}>PG*</code> variables
+                    </span>
+                </label>
             </div>
+
+            <Alert tone="info" icon="info">
+                <strong>Isolation modes.</strong> <strong>Shared:</strong> all deployment groups (default, staging, etc.) use the same database.{' '}
+                <strong>Isolated:</strong> each deployment group gets its own database.
+            </Alert>
         </div>
     );
 }
@@ -319,37 +371,52 @@ export function OAuthExtensionUI({ spec, schema, onChange, projectName, instance
     };
 
     return (
-        <div className="space-y-6">
-            <ModalTabs className="px-2">
-                <MonoTabButton active={setupStep === 1} onClick={() => setSetupStep(1)}>
-                    1. Upstream Provider Setup
-                </MonoTabButton>
-                <MonoTabButton active={setupStep === 2} onClick={() => setSetupStep(2)}>
-                    2. Configuration Inputs
-                </MonoTabButton>
-            </ModalTabs>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+            <Tabs
+                tabs={[
+                    { id: '1', label: '1. Upstream Provider Setup' },
+                    { id: '2', label: '2. Configuration Inputs' },
+                ]}
+                active={String(setupStep)}
+                onChange={(id) => setSetupStep(Number(id))}
+            />
 
             {setupStep === 1 && (
-                <div className="space-y-6">
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
                     <section>
-                        <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-200 mb-3">Setup the Upstream OAuth / OIDC Provider</h2>
-                        <ol className="text-sm list-decimal list-inside space-y-2">
+                        <div className="r-section-title" style={{ marginBottom: 8 }}>Set up the upstream OAuth / OIDC provider</div>
+                        <ol style={{ fontSize: 13, color: 'var(--text-muted)', paddingLeft: 18, display: 'flex', flexDirection: 'column', gap: 6, margin: 0 }}>
                             <li>Register an OAuth app with your provider and collect client credentials.</li>
                             <li>Configure the redirect URI below as an allowed callback in your provider.</li>
                             <li>Return here and continue to enter the configuration inputs.</li>
                         </ol>
-                        <p className="text-xs mt-3 text-gray-600 dark:text-gray-400">
-                            For local development, you can redirect to localhost via the <code className="bg-gray-100 dark:bg-gray-800 px-1 rounded">redirect_uri</code> query parameter even if the provider only allows the Rise callback URL.
+                        <p style={{ fontSize: 12, marginTop: 10, color: 'var(--text-soft)' }}>
+                            For local development, you can redirect to localhost via the{' '}
+                            <code className="mono" style={{ color: 'var(--text)' }}>redirect_uri</code> query parameter even if the provider only allows the Rise callback URL.
                         </p>
                     </section>
 
                     <section>
-                        <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-200 mb-3">Redirect URI</h2>
-                        <div className="mono-uri-field">
-                            <code className="flex-1 px-3 py-2 text-xs break-all font-mono">
+                        <div className="r-section-title" style={{ marginBottom: 8 }}>Redirect URI</div>
+                        <div style={{ display: 'flex', gap: 8, alignItems: 'stretch' }}>
+                            <code
+                                className="mono"
+                                style={{
+                                    flex: 1,
+                                    padding: '8px 10px',
+                                    fontSize: 12,
+                                    wordBreak: 'break-all',
+                                    background: 'var(--surface-2)',
+                                    border: '1px solid var(--border)',
+                                    borderRadius: 'var(--radius-sm)',
+                                    color: 'var(--text)',
+                                }}
+                            >
                                 {redirectUri}
                             </code>
                             <Button
+                                size="sm"
+                                icon="copy"
                                 onClick={async () => {
                                     try {
                                         await copyToClipboard(redirectUri);
@@ -358,9 +425,6 @@ export function OAuthExtensionUI({ spec, schema, onChange, projectName, instance
                                         showToast(`Failed to copy: ${err.message}`, 'error');
                                     }
                                 }}
-                                className="whitespace-nowrap"
-                                size="sm"
-                                variant="secondary"
                             >
                                 Copy
                             </Button>
@@ -368,172 +432,201 @@ export function OAuthExtensionUI({ spec, schema, onChange, projectName, instance
                     </section>
 
                     <section>
-                        <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-200 mb-3">Example Configurations</h2>
-                        <div className="space-y-2">
+                        <div className="r-section-title" style={{ marginBottom: 8 }}>Example Configurations</div>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                             {Object.entries(exampleConfigs).map(([key, example]) => (
-                                <details key={example.title} className="mono-table-wrap p-3">
-                                    <summary className="cursor-pointer text-sm font-semibold text-gray-900 dark:text-gray-200 flex items-center gap-2">
-                                        <span className="flex-1">{example.title}</span>
-                                        <Button
-                                            size="sm"
-                                            variant="secondary"
-                                            onClick={(e) => {
-                                                e.preventDefault();
-                                                e.stopPropagation();
-                                                applyExampleConfig(key);
-                                            }}
-                                        >
-                                            Apply
-                                        </Button>
-                                    </summary>
-                                    <MonoCodeBlock className="mt-3 text-xs mono-code-block-dotted">
-{example.spec}
-                                    </MonoCodeBlock>
-                                </details>
+                                <Panel key={example.title}>
+                                    <PanelHead>
+                                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%' }}>
+                                            <div className="r-panel-title">{example.title}</div>
+                                            <Button size="sm" onClick={() => applyExampleConfig(key)}>Apply</Button>
+                                        </div>
+                                    </PanelHead>
+                                    <PanelBody>
+                                        <CodeBlock>{example.spec}</CodeBlock>
+                                    </PanelBody>
+                                </Panel>
                             ))}
                         </div>
                     </section>
 
-                    <div className="flex justify-end">
-                        <Button onClick={() => setSetupStep(2)} size="md">
-                            Next &gt;
-                        </Button>
+                    <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                        <Button variant="primary" onClick={() => setSetupStep(2)}>Next</Button>
                     </div>
                 </div>
             )}
 
             {setupStep === 2 && (
-                <div className="space-y-4">
-                        <FormField
-                            label="Provider Name"
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+                    <Field label="Provider Name" hint="Display name for this OAuth provider">
+                        <Input
                             id="oauth-provider-name"
                             value={providerName}
                             onChange={(e) => setProviderName(e.target.value)}
                             placeholder="e.g., Snowflake Production"
-                            required
-                            helperText="Display name for this OAuth provider"
                         />
+                    </Field>
 
-                        <FormField
-                            label="Description (Optional)"
+                    <Field label="Description (Optional)" hint="Human-readable description of this OAuth configuration">
+                        <Input
                             id="oauth-description"
                             value={description}
                             onChange={(e) => setDescription(e.target.value)}
                             placeholder="e.g., OAuth authentication for analytics access"
-                            helperText="Human-readable description of this OAuth configuration"
                         />
+                    </Field>
 
-                        <FormField
-                            label="Client ID"
+                    <Field label="Client ID" hint="OAuth client identifier from your provider">
+                        <Input
                             id="oauth-client-id"
                             value={clientId}
                             onChange={(e) => setClientId(e.target.value)}
                             placeholder="e.g., ABC123XYZ..."
-                            required
-                            helperText="OAuth client identifier from your provider"
                         />
+                    </Field>
 
-                        <div className="space-y-2">
-                            <label className="mono-label">
-                                Client Secret <span className="text-red-500">*</span> {hasExistingSecret && !clientSecretPlaintext && <span className="text-gray-500 dark:text-gray-400">(configured)</span>}
-                                {clientSecretPlaintext && <span className="text-blue-600 dark:text-blue-400">(will be updated)</span>}
-                            </label>
-                            <div className="flex gap-2">
-                                <div className="flex-1 relative">
-                                    <input
-                                        type={showSecret ? "text" : "password"}
-                                        id="oauth-client-secret"
-                                        value={clientSecretPlaintext}
-                                        onChange={(e) => setClientSecretPlaintext(e.target.value)}
-                                        placeholder={clientSecretEncrypted ? "••••••••" : "Enter client secret"}
-                                        disabled={isEncrypting}
-                                        className="mono-input pr-16 disabled:opacity-50"
-                                    />
-                                    <button
-                                        type="button"
-                                        onClick={() => setShowSecret(!showSecret)}
-                                        className="absolute right-2 top-1/2 transform -translate-y-1/2 text-xs text-gray-500 hover:text-gray-300"
-                                    >
-                                        {showSecret ? 'Hide' : 'Show'}
-                                    </button>
-                                </div>
-                                <Button
-                                    onClick={handleEncryptSecret}
-                                    disabled={!clientSecretPlaintext || clientSecretPlaintext.trim() === '' || isEncrypting}
-                                    variant="secondary"
-                                    size="md"
+                    <Field
+                        label={
+                            <>
+                                Client Secret{' '}
+                                {hasExistingSecret && !clientSecretPlaintext && (
+                                    <span style={{ color: 'var(--text-soft)' }}>(configured)</span>
+                                )}
+                                {clientSecretPlaintext && (
+                                    <span style={{ color: 'var(--accent)' }}>(will be updated)</span>
+                                )}
+                            </>
+                        }
+                        hint={
+                            hasExistingSecret
+                                ? 'Secret is configured. Leave blank to keep current secret, or enter a new value and click Encrypt to update it.'
+                                : 'Enter the OAuth client secret from your provider and click Encrypt to securely store it.'
+                        }
+                    >
+                        <div style={{ display: 'flex', gap: 8 }}>
+                            <div style={{ flex: 1, position: 'relative' }}>
+                                <Input
+                                    type={showSecret ? 'text' : 'password'}
+                                    id="oauth-client-secret"
+                                    value={clientSecretPlaintext}
+                                    onChange={(e) => setClientSecretPlaintext(e.target.value)}
+                                    placeholder={clientSecretEncrypted ? '••••••••' : 'Enter client secret'}
+                                    disabled={isEncrypting}
+                                    style={{ paddingRight: 52 }}
+                                />
+                                <button
+                                    type="button"
+                                    onClick={() => setShowSecret(!showSecret)}
+                                    style={{
+                                        position: 'absolute',
+                                        right: 8,
+                                        top: '50%',
+                                        transform: 'translateY(-50%)',
+                                        fontSize: 11.5,
+                                        background: 'transparent',
+                                        border: 'none',
+                                        color: 'var(--text-muted)',
+                                        cursor: 'pointer',
+                                    }}
                                 >
-                                    {isEncrypting ? 'Encrypting...' : 'Encrypt'}
-                                </Button>
+                                    {showSecret ? 'Hide' : 'Show'}
+                                </button>
                             </div>
-                            <p className="text-sm text-gray-600 dark:text-gray-400">
-                                {hasExistingSecret
-                                    ? "Secret is configured. Leave blank to keep current secret, or enter a new value and click Encrypt to update it."
-                                    : "Enter the OAuth client secret from your provider and click Encrypt to securely store it"}
-                            </p>
+                            <Button
+                                onClick={handleEncryptSecret}
+                                disabled={!clientSecretPlaintext || clientSecretPlaintext.trim() === '' || isEncrypting}
+                                loading={isEncrypting}
+                            >
+                                {isEncrypting ? 'Encrypting…' : 'Encrypt'}
+                            </Button>
                         </div>
+                    </Field>
 
-                        <FormField
-                            label="Issuer URL"
+                    <Field
+                        label="Issuer URL"
+                        hint="OIDC issuer URL. For OIDC-compliant providers, endpoints are auto-discovered. For non-OIDC providers (GitHub), also set endpoints below."
+                    >
+                        <Input
                             id="oauth-issuer-url"
                             value={issuerUrl}
                             onChange={(e) => setIssuerUrl(e.target.value)}
                             placeholder="https://accounts.google.com"
-                            required
-                            helperText="OIDC issuer URL. For OIDC-compliant providers, endpoints are auto-discovered. For non-OIDC providers (GitHub), also set endpoints below."
                         />
+                    </Field>
 
-                        <FormField
-                            label="Scopes"
+                    <Field label="Scopes" hint="Comma-separated list of OAuth scopes to request">
+                        <Input
                             id="oauth-scopes"
                             value={scopes}
                             onChange={(e) => setScopes(e.target.value)}
                             placeholder="openid, email, profile"
-                            required
-                            helperText="Comma-separated list of OAuth scopes to request"
                         />
+                    </Field>
 
-                        <div className="border-t border-gray-300 dark:border-gray-700 pt-4 mt-4">
-                            <button
-                                type="button"
-                                onClick={() => setShowAdvanced(!showAdvanced)}
-                                className="flex items-center text-sm font-medium text-gray-700 dark:text-gray-300 hover:text-indigo-600 dark:hover:text-indigo-400"
+                    <div style={{ borderTop: '1px solid var(--border)', paddingTop: 14 }}>
+                        <button
+                            type="button"
+                            onClick={() => setShowAdvanced(!showAdvanced)}
+                            style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: 6,
+                                fontSize: 13,
+                                fontWeight: 500,
+                                background: 'transparent',
+                                border: 'none',
+                                color: 'var(--text)',
+                                cursor: 'pointer',
+                                padding: 0,
+                            }}
+                        >
+                            <Icon name="chev" size={12} style={{ transform: showAdvanced ? 'rotate(90deg)' : 'none' }} />
+                            Advanced: Manual Endpoint Overrides
+                        </button>
+                        <p style={{ fontSize: 12, color: 'var(--text-soft)', marginTop: 4 }}>
+                            Only needed for non-OIDC providers (GitHub) or if OIDC discovery fails.
+                        </p>
+                    </div>
+
+                    {showAdvanced && (
+                        <div
+                            style={{
+                                display: 'flex',
+                                flexDirection: 'column',
+                                gap: 16,
+                                paddingLeft: 14,
+                                borderLeft: '2px solid var(--border)',
+                            }}
+                        >
+                            <Field
+                                label="Authorization Endpoint (Optional)"
+                                hint="Override authorization URL (leave empty to use OIDC discovery)"
                             >
-                                <span className="mr-2">{showAdvanced ? '▼' : '▶'}</span>
-                                Advanced: Manual Endpoint Overrides
-                            </button>
-                            <p className="text-xs text-gray-600 dark:text-gray-500 mt-1">
-                                Only needed for non-OIDC providers (GitHub) or if OIDC discovery fails
-                            </p>
-                        </div>
-
-                        {showAdvanced && (
-                            <div className="space-y-4 pl-4 border-l-2 border-gray-300 dark:border-gray-700">
-                                <FormField
-                                    label="Authorization Endpoint (Optional)"
+                                <Input
                                     id="oauth-authorization-endpoint"
                                     value={authorizationEndpoint}
                                     onChange={(e) => setAuthorizationEndpoint(e.target.value)}
                                     placeholder="https://github.com/login/oauth/authorize"
-                                    helperText="Override authorization URL (leave empty to use OIDC discovery)"
                                 />
+                            </Field>
 
-                                <FormField
-                                    label="Token Endpoint (Optional)"
+                            <Field
+                                label="Token Endpoint (Optional)"
+                                hint="Override token URL (leave empty to use OIDC discovery)"
+                            >
+                                <Input
                                     id="oauth-token-endpoint"
                                     value={tokenEndpoint}
                                     onChange={(e) => setTokenEndpoint(e.target.value)}
                                     placeholder="https://github.com/login/oauth/access_token"
-                                    helperText="Override token URL (leave empty to use OIDC discovery)"
                                 />
-                            </div>
-                        )}
-
-                        <div className="pt-2">
-                            <Button onClick={() => setSetupStep(1)} variant="secondary" size="sm">
-                                &lt; Previous
-                            </Button>
+                            </Field>
                         </div>
+                    )}
+
+                    <div>
+                        <Button onClick={() => setSetupStep(1)} size="sm">Previous</Button>
+                    </div>
                 </div>
             )}
         </div>
@@ -547,18 +640,17 @@ const OAuthExtensionAPI = {
         const status = extension.status || {};
 
         if (status.error) {
-            return <MonoStatusPill tone="bad">Error</MonoStatusPill>;
+            return <Status status="Error" />;
         }
 
         if (status.configured_at) {
             if (status.auth_verified) {
-                return <MonoStatusPill tone="ok">Configured</MonoStatusPill>;
-            } else {
-                return <MonoStatusPill tone="warn">Waiting For Auth</MonoStatusPill>;
+                return <Status status="Configured" />;
             }
+            return <Status status="Waiting for auth" />;
         }
 
-        return <MonoStatusPill tone="muted">Not Configured</MonoStatusPill>;
+        return <Status status="Not configured" />;
     },
 
     renderOverviewTab(extension, projectName) {
@@ -579,40 +671,41 @@ function IntegrationGuideModal({ isOpen, onClose, projectName, extensionName }) 
     const callbackUrl = `${backendUrl}/oidc/${projectName}/${extensionName}/callback`;
     const tokenUrl = `${backendUrl}/oidc/${projectName}/${extensionName}/token`;
 
+    const codeLabelStyle: React.CSSProperties = { fontSize: 13, fontWeight: 600, color: 'var(--text)', margin: '0 0 6px' };
+    const paraStyle: React.CSSProperties = { fontSize: 13, color: 'var(--text-muted)', margin: 0, lineHeight: 1.6 };
+
     return (
-        <Modal isOpen={isOpen} onClose={onClose} title="Integration Guide" maxWidth="max-w-4xl" bodyClassName="mono-modal-body--flush">
-                <ModalTabs className="px-6">
-                    <MonoTabButton onClick={() => setActiveTab('fragment')} active={activeTab === 'fragment'}>
-                        PKCE Flow (SPAs)
-                    </MonoTabButton>
-                    <MonoTabButton onClick={() => setActiveTab('backend')} active={activeTab === 'backend'}>
-                        Token Endpoint (Backend)
-                    </MonoTabButton>
-                    <MonoTabButton onClick={() => setActiveTab('local')} active={activeTab === 'local'}>
-                        Local Development
-                    </MonoTabButton>
-                </ModalTabs>
+        <Modal isOpen={isOpen} onClose={onClose} title="Integration Guide" width="wide">
+                <Tabs
+                    tabs={[
+                        { id: 'fragment', label: 'PKCE Flow (SPAs)' },
+                        { id: 'backend', label: 'Token Endpoint (Backend)' },
+                        { id: 'local', label: 'Local Development' },
+                    ]}
+                    active={activeTab}
+                    onChange={setActiveTab}
+                />
 
                 {/* Modal Content */}
-                <div className="p-6 overflow-y-auto max-h-[calc(90vh-140px)]">
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 16, marginTop: 16 }}>
                     {activeTab === 'fragment' && (
-                        <div className="space-y-4">
-                            <p className="text-sm text-gray-700 dark:text-gray-300">
-                                <strong>Fragment Flow</strong> is the default and recommended approach for single-page applications (SPAs).
-                                Tokens are returned in the URL fragment (<code className="bg-white dark:bg-gray-900 px-1 rounded">#access_token=...</code>),
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+                            <p style={paraStyle}>
+                                <strong style={{ color: 'var(--text)' }}>Fragment Flow</strong> is the default and recommended approach for single-page applications (SPAs).
+                                Tokens are returned in the URL fragment (<code className="mono" style={{ color: 'var(--text)' }}>#access_token=...</code>),
                                 which never reaches the server.
                             </p>
 
                             <div>
-                                <p className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">Authorization URL:</p>
-                                <MonoCodeBlock as="code" className="block break-all">
+                                <p style={codeLabelStyle}>Authorization URL:</p>
+                                <CodeBlock style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
                                     {authorizeUrl}
-                                </MonoCodeBlock>
+                                </CodeBlock>
                             </div>
 
                             <div>
-                                <p className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">Example Code:</p>
-                                <MonoCodeBlock>
+                                <p style={codeLabelStyle}>Example Code:</p>
+                                <CodeBlock>
 {`// Initiate OAuth login (fragment flow is default)
 function login() {
   const authUrl = '${authorizeUrl}';
@@ -645,35 +738,35 @@ function handleCallback() {
 
 // Call on page load
 handleCallback();`}
-                                </MonoCodeBlock>
+                                </CodeBlock>
                             </div>
                         </div>
                     )}
 
                     {activeTab === 'backend' && (
-                        <div className="space-y-4">
-                            <p className="text-sm text-gray-700 dark:text-gray-300">
-                                <strong>Token Endpoint Flow</strong> is designed for server-rendered applications (confidential clients). Your backend receives an
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+                            <p style={paraStyle}>
+                                <strong style={{ color: 'var(--text)' }}>Token Endpoint Flow</strong> is designed for server-rendered applications (confidential clients). Your backend receives an
                                 authorization code as a query parameter, which it exchanges for OAuth tokens via the RFC 6749-compliant token endpoint using client credentials.
                             </p>
 
                             <div>
-                                <p className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">Authorization URL:</p>
-                                <MonoCodeBlock as="code" className="block break-all">
+                                <p style={codeLabelStyle}>Authorization URL:</p>
+                                <CodeBlock style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
                                     {authorizeUrl}
-                                </MonoCodeBlock>
+                                </CodeBlock>
                             </div>
 
                             <div>
-                                <p className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">Token Endpoint:</p>
-                                <MonoCodeBlock as="code" className="block break-all">
+                                <p style={codeLabelStyle}>Token Endpoint:</p>
+                                <CodeBlock style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
                                     POST {tokenUrl}
-                                </MonoCodeBlock>
+                                </CodeBlock>
                             </div>
 
                             <div>
-                                <p className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">Example Code (Node.js/Express):</p>
-                                <MonoCodeBlock>
+                                <p style={codeLabelStyle}>Example Code (Node.js/Express):</p>
+                                <CodeBlock>
 {`// Initiate OAuth login
 app.get('/login', (req, res) => {
   const authUrl = '${authorizeUrl}';
@@ -719,21 +812,21 @@ app.get('/oauth/callback', async (req, res) => {
     res.status(500).send('Authentication failed');
   }
 });`}
-                                </MonoCodeBlock>
+                                </CodeBlock>
                             </div>
                         </div>
                     )}
 
                     {activeTab === 'local' && (
-                        <div className="space-y-4">
-                            <p className="text-sm text-gray-700 dark:text-gray-300">
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+                            <p style={paraStyle}>
                                 For local development, you can override the redirect URI to point to your local development server.
                                 Rise always handles the OAuth provider callback, so you don't need to register localhost URLs with your OAuth provider.
                             </p>
 
                             <div>
-                                <p className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">PKCE Flow (localhost):</p>
-                                <MonoCodeBlock>
+                                <p style={codeLabelStyle}>PKCE Flow (localhost):</p>
+                                <CodeBlock>
 {`// Override redirect URI for local development
 const authUrl = '${authorizeUrl}?redirect_uri=' +
   encodeURIComponent('http://localhost:3000/callback');
@@ -747,12 +840,12 @@ function handleCallback() {
   const accessToken = params.get('access_token');
   // ... use the token
 }`}
-                                </MonoCodeBlock>
+                                </CodeBlock>
                             </div>
 
                             <div>
-                                <p className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">Token Endpoint Flow (localhost):</p>
-                                <MonoCodeBlock>
+                                <p style={codeLabelStyle}>Token Endpoint Flow (localhost):</p>
+                                <CodeBlock>
 {`// Override redirect URI for local development
 app.get('/login', (req, res) => {
   const authUrl = '${authorizeUrl}?redirect_uri=' +
@@ -765,15 +858,14 @@ app.get('/oauth/callback', async (req, res) => {
   const code = req.query.code;
   // ... same token exchange logic as production
 });`}
-                                </MonoCodeBlock>
+                                </CodeBlock>
                             </div>
 
-                            <MonoNotice tone="info" title="How It Works">
-                                <p className="text-xs">
-                                    The OAuth provider only redirects to <code className="bg-gray-100 dark:bg-gray-800 px-1 rounded">{callbackUrl}</code> (Rise's callback URL).
-                                    Rise then redirects to your app's redirect_uri with the authorization code. You don't need to configure localhost URLs in your OAuth provider.
-                                </p>
-                            </MonoNotice>
+                            <Alert tone="info" icon="info">
+                                <strong>How It Works.</strong>{' '}
+                                The OAuth provider only redirects to <code className="mono" style={{ color: 'var(--text)' }}>{callbackUrl}</code> (Rise's callback URL).
+                                Rise then redirects to your app's redirect_uri with the authorization code. You don't need to configure localhost URLs in your OAuth provider.
+                            </Alert>
                         </div>
                     )}
                 </div>
@@ -810,267 +902,190 @@ export function OAuthDetailView({ extension, projectName }) {
             />
 
             {/* Two-column layout */}
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 2fr) minmax(0, 1fr)', gap: 20, alignItems: 'start' }}>
                 {/* Left column - Main content */}
-                <div className="lg:col-span-2 space-y-6">
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 20, minWidth: 0 }}>
                     {/* Upstream OAuth Provider Configuration */}
-                    <section>
-                        <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-200 mb-3">Upstream OAuth Provider</h2>
-                        <div className="bg-white dark:bg-gray-900 rounded p-4 space-y-4">
-                            {/* Provider info */}
-                            <div className="space-y-3">
-                                <div>
-                                    <p className="text-sm text-gray-600 dark:text-gray-500">Provider Name</p>
-                                    <p className="text-gray-700 dark:text-gray-300 font-semibold">{spec.provider_name || 'N/A'}</p>
-                                </div>
-                                {spec.description && (
-                                    <div>
-                                        <p className="text-sm text-gray-600 dark:text-gray-500">Description</p>
-                                        <p className="text-gray-700 dark:text-gray-300">{spec.description}</p>
-                                    </div>
-                                )}
-                                <div>
-                                    <p className="text-sm text-gray-600 dark:text-gray-500">Client ID</p>
-                                    <p className="text-gray-700 dark:text-gray-300 font-mono text-sm">{spec.client_id || 'N/A'}</p>
-                                </div>
-                            </div>
-
-                            {/* Divider */}
-                            <div className="border-t border-gray-200 dark:border-gray-700"></div>
-
-                            {/* Endpoints */}
-                            <div className="space-y-3">
-                                <div>
-                                    <p className="text-sm text-gray-600 dark:text-gray-500">Issuer URL</p>
-                                    <p className="text-gray-700 dark:text-gray-300 font-mono text-xs break-all">{spec.issuer_url || 'N/A'}</p>
-                                </div>
+                    <Panel>
+                        <PanelHead title="Upstream OAuth Provider" />
+                        <PanelBody>
+                            <KV>
+                                <KVRow k="Provider Name">{spec.provider_name || 'N/A'}</KVRow>
+                                {spec.description && <KVRow k="Description">{spec.description}</KVRow>}
+                                <KVRow k="Client ID"><span className="mono">{spec.client_id || 'N/A'}</span></KVRow>
+                                <KVRow k="Issuer URL">
+                                    <span className="mono" style={{ wordBreak: 'break-all' }}>{spec.issuer_url || 'N/A'}</span>
+                                </KVRow>
                                 {spec.authorization_endpoint && (
-                                    <div>
-                                        <p className="text-sm text-gray-600 dark:text-gray-500">Authorization Endpoint <span className="text-xs text-gray-500">(override)</span></p>
-                                        <p className="text-gray-700 dark:text-gray-300 font-mono text-xs break-all">{spec.authorization_endpoint}</p>
-                                    </div>
+                                    <KVRow k={<>Authorization Endpoint <span style={{ color: 'var(--text-soft)' }}>(override)</span></>}>
+                                        <span className="mono" style={{ wordBreak: 'break-all' }}>{spec.authorization_endpoint}</span>
+                                    </KVRow>
                                 )}
                                 {spec.token_endpoint && (
-                                    <div>
-                                        <p className="text-sm text-gray-600 dark:text-gray-500">Token Endpoint <span className="text-xs text-gray-500">(override)</span></p>
-                                        <p className="text-gray-700 dark:text-gray-300 font-mono text-xs break-all">{spec.token_endpoint}</p>
-                                    </div>
+                                    <KVRow k={<>Token Endpoint <span style={{ color: 'var(--text-soft)' }}>(override)</span></>}>
+                                        <span className="mono" style={{ wordBreak: 'break-all' }}>{spec.token_endpoint}</span>
+                                    </KVRow>
                                 )}
-                                {!spec.authorization_endpoint && !spec.token_endpoint && (
-                                    <p className="text-xs text-gray-500 dark:text-gray-500 italic">
-                                        Endpoints auto-discovered via OIDC discovery
-                                    </p>
-                                )}
-                            </div>
-
-                            {/* Divider */}
-                            <div className="border-t border-gray-200 dark:border-gray-700"></div>
-
-                            {/* Scopes */}
-                            <div>
-                                <p className="text-sm text-gray-600 dark:text-gray-500 mb-2">Scopes ({scopesArray.length})</p>
-                                {scopesArray.length === 0 ? (
-                                    <p className="text-gray-600 dark:text-gray-400 text-sm italic">No scopes configured</p>
-                                ) : (
-                                    <div className="flex flex-wrap gap-2">
-                                        {scopesArray.map((scope, idx) => (
-                                            <MonoTag key={idx} color="indigo">
-                                                {scope}
-                                            </MonoTag>
-                                        ))}
-                                    </div>
-                                )}
-                            </div>
-                        </div>
-                    </section>
+                                <KVRow k={`Scopes (${scopesArray.length})`}>
+                                    {scopesArray.length === 0 ? (
+                                        <span style={{ color: 'var(--text-soft)', fontStyle: 'italic' }}>No scopes configured</span>
+                                    ) : (
+                                        <span style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                                            {scopesArray.map((scope, idx) => (
+                                                <Pill key={idx} kind="accent">{scope}</Pill>
+                                            ))}
+                                        </span>
+                                    )}
+                                </KVRow>
+                            </KV>
+                            {!spec.authorization_endpoint && !spec.token_endpoint && (
+                                <p style={{ fontSize: 12, color: 'var(--text-soft)', fontStyle: 'italic', marginTop: 10 }}>
+                                    Endpoints auto-discovered via OIDC discovery
+                                </p>
+                            )}
+                        </PanelBody>
+                    </Panel>
                 </div>
 
                 {/* Right column - Actions */}
-                <div className="lg:col-span-1 space-y-6">
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 20, minWidth: 0 }}>
                     {/* Configuration Status */}
-                    <section>
-                        <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-200 mb-3">Status</h2>
-                        <div className="mono-table-wrap p-4">
+                    <Panel>
+                        <PanelHead title="Status" />
+                        <PanelBody>
                             {status.error ? (
-                                <MonoNotice tone="error">
-                                    <p className="text-sm">
-                                        <strong>Error:</strong> {status.error}
-                                    </p>
-                                </MonoNotice>
+                                <Alert tone="err" icon="info">
+                                    <strong>Error:</strong> {status.error}
+                                </Alert>
                             ) : status.configured_at ? (
                                 status.auth_verified ? (
-                                    <MonoNotice tone="success">
-                                        <p className="text-sm">Configured</p>
-                                        <p className="text-xs mt-1">
-                                            {formatDate(status.configured_at)}
-                                        </p>
-                                    </MonoNotice>
+                                    <Alert tone="info" icon="check">
+                                        <strong>Configured</strong>
+                                        <div style={{ fontSize: 12, marginTop: 2 }}>{formatDate(status.configured_at)}</div>
+                                    </Alert>
                                 ) : (
-                                    <MonoNotice tone="warn">
-                                        <p className="text-sm">Waiting For Auth</p>
-                                        <p className="text-xs mt-1">
-                                            Complete OAuth flow to verify configuration
-                                        </p>
-                                    </MonoNotice>
+                                    <Alert tone="warn" icon="info">
+                                        <strong>Waiting For Auth</strong>
+                                        <div style={{ fontSize: 12, marginTop: 2 }}>Complete OAuth flow to verify configuration</div>
+                                    </Alert>
                                 )
                             ) : (
-                                <MonoNotice tone="muted">
-                                    <p className="text-sm">
-                                        Configuration pending...
-                                    </p>
-                                </MonoNotice>
+                                <Alert tone="info" icon="info">Configuration pending…</Alert>
                             )}
-                        </div>
-                    </section>
+                        </PanelBody>
+                    </Panel>
 
                     {/* Test OAuth Flow */}
-                    <section>
-                        <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-200 mb-3">Test</h2>
-                        <Button
-                            onClick={handleTestOAuth}
-                            className="w-full"
-                            size="lg"
-                        >
-                            Test OAuth Flow
-                        </Button>
-                        <p className="text-xs text-gray-600 dark:text-gray-500 mt-2">
-                            Test the OAuth flow and return to this page with a notification.
-                        </p>
-                    </section>
+                    <Panel>
+                        <PanelHead title="Test" />
+                        <PanelBody>
+                            <Button onClick={handleTestOAuth} variant="primary" style={{ width: '100%' }}>
+                                Test OAuth Flow
+                            </Button>
+                            <p style={{ fontSize: 12, color: 'var(--text-soft)', marginTop: 8 }}>
+                                Test the OAuth flow and return to this page with a notification.
+                            </p>
+                        </PanelBody>
+                    </Panel>
 
                     {/* Integration Guide Button */}
-                    <section>
-                        <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-200 mb-3">Integration</h2>
-                        <Button
-                            onClick={() => setShowGuideModal(true)}
-                            className="w-full"
-                            size="lg"
-                            variant="secondary"
-                        >
-                            Integration Guide
-                        </Button>
-                        <p className="text-xs text-gray-600 dark:text-gray-500 mt-2">
-                            View code examples for PKCE Flow, Token Endpoint Flow, and local development.
-                        </p>
-                    </section>
+                    <Panel>
+                        <PanelHead title="Integration" />
+                        <PanelBody>
+                            <Button onClick={() => setShowGuideModal(true)} style={{ width: '100%' }}>
+                                Integration Guide
+                            </Button>
+                            <p style={{ fontSize: 12, color: 'var(--text-soft)', marginTop: 8 }}>
+                                View code examples for PKCE Flow, Token Endpoint Flow, and local development.
+                            </p>
+                        </PanelBody>
+                    </Panel>
                 </div>
             </div>
 
             {/* Injected Environment Variables - Full width below the grid */}
-            <section className="mt-6">
-                <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-200 mb-3">Injected Environment Variables</h2>
-                <div className="mono-table-wrap p-4">
-                    <p className="text-sm text-gray-600 dark:text-gray-400 mb-3">
-                        These environment variables are injected into your deployed application:
-                    </p>
-                    <div className="overflow-x-auto">
-                        <MonoTable className="text-sm">
-                            <MonoTableHead>
-                                <tr className="border-b border-gray-300 dark:border-gray-700">
-                                    <th className="text-left py-2 px-3 text-gray-600 dark:text-gray-400 font-medium">Variable</th>
-                                    <th className="text-left py-2 px-3 text-gray-600 dark:text-gray-400 font-medium">Value</th>
-                                    <th className="py-2 px-3 w-10"></th>
-                                </tr>
-                            </MonoTableHead>
-                            <MonoTableBody className="font-mono text-xs">
-                                <tr className="border-b border-gray-200 dark:border-gray-800">
-                                    <td className="py-3 px-3 text-gray-700 dark:text-gray-300 whitespace-nowrap">
-                                        {extensionName.toUpperCase().replace(/-/g, '_')}_CLIENT_ID
-                                    </td>
-                                    <td className="py-3 px-3 text-gray-900 dark:text-gray-200 break-all">
-                                        {status?.rise_client_id || `${projectName}-${extensionName}`}
-                                    </td>
-                                    <td className="py-3 px-3">
-                                        <button
-                                            type="button"
+            <Panel style={{ marginTop: 20 }}>
+                <PanelHead title="Injected Environment Variables" sub="These environment variables are injected into your deployed application." />
+                <PanelBody>
+                    <table className="r-table" style={{ width: '100%' }}>
+                        <thead>
+                            <tr>
+                                <th style={{ textAlign: 'left' }}>Variable</th>
+                                <th style={{ textAlign: 'left' }}>Value</th>
+                                <th style={{ width: 40 }}></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><span className="mono" style={{ whiteSpace: 'nowrap' }}>{extensionName.toUpperCase().replace(/-/g, '_')}_CLIENT_ID</span></td>
+                                <td><span className="mono" style={{ wordBreak: 'break-all' }}>{status?.rise_client_id || `${projectName}-${extensionName}`}</span></td>
+                                <td>
+                                    <CopyButton
+                                        title="Copy Client ID"
+                                        onClick={async () => {
+                                            try {
+                                                await copyToClipboard(status?.rise_client_id || `${projectName}-${extensionName}`);
+                                                showToast('Client ID copied', 'success');
+                                            } catch (err) {
+                                                showToast(`Failed to copy: ${err.message}`, 'error');
+                                            }
+                                        }}
+                                    />
+                                </td>
+                            </tr>
+                            <tr>
+                                <td><span className="mono" style={{ whiteSpace: 'nowrap' }}>{extensionName.toUpperCase().replace(/-/g, '_')}_CLIENT_SECRET</span></td>
+                                <td><span className="mono" style={{ color: 'var(--text-soft)' }}>••••••••</span></td>
+                                <td>
+                                    {status?.rise_client_secret && (
+                                        <CopyButton
+                                            title="Copy Client Secret"
                                             onClick={async () => {
                                                 try {
-                                                    await copyToClipboard(status?.rise_client_id || `${projectName}-${extensionName}`);
-                                                    showToast('Client ID copied', 'success');
+                                                    await copyToClipboard(status.rise_client_secret);
+                                                    showToast('Client secret copied', 'success');
                                                 } catch (err) {
                                                     showToast(`Failed to copy: ${err.message}`, 'error');
                                                 }
                                             }}
-                                            className="p-1 hover:bg-gray-200 dark:hover:bg-gray-700 rounded transition-colors"
-                                            title="Copy to clipboard"
-                                        >
-                                            <svg className="w-4 h-4 text-gray-500 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
-                                            </svg>
-                                        </button>
-                                    </td>
-                                </tr>
-                                <tr className="border-b border-gray-200 dark:border-gray-800">
-                                    <td className="py-3 px-3 text-gray-700 dark:text-gray-300 whitespace-nowrap">
-                                        {extensionName.toUpperCase().replace(/-/g, '_')}_CLIENT_SECRET
-                                    </td>
-                                    <td className="py-3 px-3 text-gray-500 dark:text-gray-500">
-                                        ••••••••
-                                    </td>
-                                    <td className="py-3 px-3">
-                                        {status?.rise_client_secret && (
-                                            <button
-                                                type="button"
-                                                onClick={async () => {
-                                                    try {
-                                                        await copyToClipboard(status.rise_client_secret);
-                                                        showToast('Client secret copied', 'success');
-                                                    } catch (err) {
-                                                        showToast(`Failed to copy: ${err.message}`, 'error');
-                                                    }
-                                                }}
-                                                className="p-1 hover:bg-gray-200 dark:hover:bg-gray-700 rounded transition-colors"
-                                                title="Copy to clipboard"
-                                            >
-                                                <svg className="w-4 h-4 text-gray-500 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
-                                                </svg>
-                                            </button>
-                                        )}
-                                    </td>
-                                </tr>
-                                <tr className="border-b border-gray-200 dark:border-gray-800">
-                                    <td className="py-3 px-3 text-gray-700 dark:text-gray-300 whitespace-nowrap">
-                                        {extensionName.toUpperCase().replace(/-/g, '_')}_ISSUER
-                                    </td>
-                                    <td className="py-3 px-3 text-gray-900 dark:text-gray-200 break-all">
-                                        <a
-                                            href={`${backendUrl}/oidc/${projectName}/${extensionName}/.well-known/openid-configuration`}
-                                            target="_blank"
-                                            rel="noopener noreferrer"
-                                            className="text-indigo-600 dark:text-indigo-400 hover:underline"
-                                        >
-                                            {`${backendUrl}/oidc/${projectName}/${extensionName}`}
-                                        </a>
-                                    </td>
-                                    <td className="py-3 px-3">
-                                        <button
-                                            type="button"
-                                            onClick={async () => {
-                                                try {
-                                                    await copyToClipboard(`${backendUrl}/oidc/${projectName}/${extensionName}`);
-                                                    showToast('Issuer URL copied', 'success');
-                                                } catch (err) {
-                                                    showToast(`Failed to copy: ${err.message}`, 'error');
-                                                }
-                                            }}
-                                            className="p-1 hover:bg-gray-200 dark:hover:bg-gray-700 rounded transition-colors"
-                                            title="Copy to clipboard"
-                                        >
-                                            <svg className="w-4 h-4 text-gray-500 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
-                                            </svg>
-                                        </button>
-                                    </td>
-                                </tr>
-                            </MonoTableBody>
-                        </MonoTable>
-                    </div>
-                    <p className="text-xs text-gray-500 dark:text-gray-500 mt-3">
+                                        />
+                                    )}
+                                </td>
+                            </tr>
+                            <tr>
+                                <td><span className="mono" style={{ whiteSpace: 'nowrap' }}>{extensionName.toUpperCase().replace(/-/g, '_')}_ISSUER</span></td>
+                                <td>
+                                    <a
+                                        className="r-link mono"
+                                        style={{ wordBreak: 'break-all' }}
+                                        href={`${backendUrl}/oidc/${projectName}/${extensionName}/.well-known/openid-configuration`}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                    >
+                                        {`${backendUrl}/oidc/${projectName}/${extensionName}`}
+                                    </a>
+                                </td>
+                                <td>
+                                    <CopyButton
+                                        title="Copy Issuer URL"
+                                        onClick={async () => {
+                                            try {
+                                                await copyToClipboard(`${backendUrl}/oidc/${projectName}/${extensionName}`);
+                                                showToast('Issuer URL copied', 'success');
+                                            } catch (err) {
+                                                showToast(`Failed to copy: ${err.message}`, 'error');
+                                            }
+                                        }}
+                                    />
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                    <p style={{ fontSize: 12, color: 'var(--text-soft)', marginTop: 12 }}>
                         Click the issuer URL to view the OIDC discovery document.
                     </p>
-                </div>
-            </section>
+                </PanelBody>
+            </Panel>
         </>
     );
 }
@@ -1097,34 +1112,36 @@ export function SnowflakeOAuthExtensionUI({ spec, schema, onChange }) {
     }, [blockedRoles, scopes]);
 
     return (
-        <div className="space-y-6">
-            <div className="space-y-4">
-                <FormField
-                    label="Additional Blocked Roles"
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+            <Field
+                label="Additional Blocked Roles"
+                hint="Comma-separated list added to backend blocked-role defaults."
+            >
+                <Textarea
                     id="snowflake-blocked-roles"
-                    type="textarea"
+                    rows={2}
                     value={blockedRoles}
                     onChange={(e) => setBlockedRoles(e.target.value)}
                     placeholder="SYSADMIN, USERADMIN"
-                    helperText="Comma-separated list added to backend blocked-role defaults."
                 />
+            </Field>
 
-                <FormField
-                    label="Additional OAuth Scopes"
+            <Field
+                label="Additional OAuth Scopes"
+                hint="Comma-separated scopes added to backend defaults."
+            >
+                <Textarea
                     id="snowflake-scopes"
-                    type="textarea"
+                    rows={2}
                     value={scopes}
                     onChange={(e) => setScopes(e.target.value)}
                     placeholder="session:role:ANALYST, session:role:DEVELOPER"
-                    helperText="Comma-separated scopes added to backend defaults."
                 />
+            </Field>
 
-                <MonoNotice tone="success" title="Secondary Roles">
-                    <p>
-                        Secondary roles are enabled by default (OAUTH_USE_SECONDARY_ROLES = IMPLICIT).
-                    </p>
-                </MonoNotice>
-            </div>
+            <Alert tone="info" icon="info">
+                <strong>Secondary Roles.</strong> Secondary roles are enabled by default (OAUTH_USE_SECONDARY_ROLES = IMPLICIT).
+            </Alert>
         </div>
     );
 }
@@ -1140,167 +1157,119 @@ export function SnowflakeOAuthDetailView({ extension, projectName }) {
     };
 
     return (
-        <>
-            <section className="mb-6 space-y-3">
-                <div className="flex items-center space-x-3">
-                    <h2 className="text-xl font-semibold text-gray-900 dark:text-gray-100">Snowflake OAuth Provisioner</h2>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+            <section style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                    <div className="r-section-title">Snowflake OAuth Provisioner</div>
                     {getStateBadge()}
                 </div>
-                <p className="text-sm text-gray-600 dark:text-gray-400">
+                <p style={{ fontSize: 13, color: 'var(--text-muted)', margin: 0 }}>
                     Automatically provisions Snowflake SECURITY INTEGRATIONs and a linked OAuth extension.
                 </p>
                 {status.state === 'Available' && status.oauth_extension_name ? (
-                    <MonoNotice tone="success" title="Next Action">
-                        <p>Provisioning completed. Continue by reviewing or testing the linked OAuth extension.</p>
-                        <div className="mt-2">
-                            <a
-                                href={`/project/${projectName}/extensions/oauth/${status.oauth_extension_name}`}
-                                className="mono-btn mono-btn-primary mono-btn-sm inline-flex"
-                            >
+                    <Alert tone="info" icon="check">
+                        <strong>Next Action.</strong> Provisioning completed. Continue by reviewing or testing the linked OAuth extension.
+                        <div style={{ marginTop: 8 }}>
+                            <a href={`/project/${projectName}/extensions/oauth/${status.oauth_extension_name}`} className="r-btn primary small">
                                 Open Linked OAuth Extension
                             </a>
                         </div>
-                    </MonoNotice>
+                    </Alert>
                 ) : (
-                    <MonoNotice tone="warn" title="Current State">
-                        <p>
-                            This extension is still progressing through provisioning states. Use the status sections below to track readiness and errors.
-                        </p>
-                    </MonoNotice>
+                    <Alert tone="warn" icon="info">
+                        <strong>Current State.</strong> This extension is still progressing through provisioning states. Use the status sections below to track readiness and errors.
+                    </Alert>
                 )}
             </section>
 
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 20 }}>
                 {/* Snowflake Integration Details */}
-                <section className="bg-gray-100 dark:bg-gray-800 rounded-lg p-4">
-                    <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-200 mb-4">Snowflake Integration Status</h3>
-
-                    <div className="space-y-3 text-sm">
-                        {status.integration_name && (
-                            <div>
-                                <span className="text-gray-600 dark:text-gray-500">Integration Name:</span>
-                                <span className="text-gray-700 dark:text-gray-300 ml-2 font-mono">{status.integration_name}</span>
+                <Panel>
+                    <PanelHead title="Snowflake Integration Status" />
+                    <PanelBody>
+                        <KV>
+                            {status.integration_name && <KVRow k="Integration Name"><span className="mono">{status.integration_name}</span></KVRow>}
+                            {status.oauth_client_id && <KVRow k="OAuth Client ID"><span className="mono">{status.oauth_client_id}</span></KVRow>}
+                            {status.redirect_uri && <KVRow k="Redirect URI"><span className="mono" style={{ wordBreak: 'break-all' }}>{status.redirect_uri}</span></KVRow>}
+                            {status.created_at && <KVRow k="Created">{formatDate(status.created_at)}</KVRow>}
+                        </KV>
+                        {status.state === 'Available' && (
+                            <div style={{ marginTop: 12 }}>
+                                <Alert tone="info" icon="check">Snowflake integration is active and configured.</Alert>
                             </div>
                         )}
-
-                        {status.oauth_client_id && (
-                            <div>
-                                <span className="text-gray-600 dark:text-gray-500">OAuth Client ID:</span>
-                                <span className="text-gray-700 dark:text-gray-300 ml-2 font-mono text-xs">{status.oauth_client_id}</span>
+                        {status.error && (
+                            <div style={{ marginTop: 12 }}>
+                                <Alert tone="err" icon="info"><strong>Error:</strong> {status.error}</Alert>
                             </div>
                         )}
-
-                        {status.redirect_uri && (
-                            <div>
-                                <span className="text-gray-600 dark:text-gray-500">Redirect URI:</span>
-                                <span className="text-gray-700 dark:text-gray-300 ml-2 font-mono text-xs">{status.redirect_uri}</span>
-                            </div>
-                        )}
-
-                        {status.created_at && (
-                            <div>
-                                <span className="text-gray-600 dark:text-gray-500">Created:</span>
-                                <span className="text-gray-700 dark:text-gray-300 ml-2">{formatDate(status.created_at)}</span>
-                            </div>
-                        )}
-                    </div>
-
-                    {status.state === 'Available' && (
-                        <MonoNotice className="mt-4" tone="success">
-                            <p className="text-xs">Snowflake integration is active and configured.</p>
-                        </MonoNotice>
-                    )}
-
-                    {status.error && (
-                        <MonoNotice className="mt-4" tone="error">
-                            <p className="text-xs">
-                                <strong>Error:</strong> {status.error}
-                            </p>
-                        </MonoNotice>
-                    )}
-                </section>
+                    </PanelBody>
+                </Panel>
 
                 {/* OAuth Extension Details */}
-                <section className="bg-gray-100 dark:bg-gray-800 rounded-lg p-4">
-                    <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-200 mb-4">Linked OAuth Extension</h3>
-
-                    {status.oauth_extension_name ? (
-                        <div className="space-y-3">
-                            <div className="text-sm">
-                                <span className="text-gray-600 dark:text-gray-500">Extension Name:</span>
-                                <span className="text-gray-700 dark:text-gray-300 ml-2 font-mono">{status.oauth_extension_name}</span>
-                            </div>
-
-                            {status.state === 'Available' && (
-                                <div className="mt-4">
-                                    <a
-                                        href={`/project/${projectName}/extensions/oauth/${status.oauth_extension_name}`}
-                                        className="mono-btn mono-btn-primary mono-btn-sm inline-flex"
-                                    >
-                                        View OAuth Extension
-                                    </a>
-                                </div>
-                            )}
-
-                            <MonoNotice className="mt-4" tone="info">
-                                <p className="text-xs">
+                <Panel>
+                    <PanelHead title="Linked OAuth Extension" />
+                    <PanelBody>
+                        {status.oauth_extension_name ? (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                                <KV>
+                                    <KVRow k="Extension Name"><span className="mono">{status.oauth_extension_name}</span></KVRow>
+                                </KV>
+                                {status.state === 'Available' && (
+                                    <div>
+                                        <a href={`/project/${projectName}/extensions/oauth/${status.oauth_extension_name}`} className="r-btn primary small">
+                                            View OAuth Extension
+                                        </a>
+                                    </div>
+                                )}
+                                <Alert tone="info" icon="info">
                                     The OAuth extension is automatically created and managed by this provisioner.
                                     Users can authenticate using their Snowflake credentials.
-                                </p>
-                            </MonoNotice>
-                        </div>
-                    ) : (
-                        <div className="text-sm text-gray-600 dark:text-gray-400">
-                            OAuth extension will be created during provisioning
-                        </div>
-                    )}
-                </section>
+                                </Alert>
+                            </div>
+                        ) : (
+                            <p style={{ fontSize: 13, color: 'var(--text-muted)', margin: 0 }}>
+                                OAuth extension will be created during provisioning
+                            </p>
+                        )}
+                    </PanelBody>
+                </Panel>
 
-                {/* Configuration Summary */}
-                <section className="bg-gray-100 dark:bg-gray-800 rounded-lg p-4 lg:col-span-2">
-                    <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-200 mb-4">Configuration</h3>
-
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                        <div>
-                            <h4 className="text-sm font-semibold text-gray-600 dark:text-gray-400 mb-2">Blocked Roles</h4>
-                            {spec.blocked_roles && spec.blocked_roles.length > 0 ? (
-                                <div className="flex flex-wrap gap-2">
-                                    {spec.blocked_roles.map((role, idx) => (
-                                        <MonoTag key={idx} color="red">
-                                            {role}
-                                        </MonoTag>
-                                    ))}
-                                </div>
-                            ) : (
-                                <p className="text-xs text-gray-600 dark:text-gray-500">Using backend defaults only</p>
-                            )}
-                        </div>
-
-                        <div>
-                            <h4 className="text-sm font-semibold text-gray-600 dark:text-gray-400 mb-2">OAuth Scopes</h4>
-                            {spec.scopes && spec.scopes.length > 0 ? (
-                                <div className="flex flex-wrap gap-2">
-                                    {spec.scopes.map((scope, idx) => (
-                                        <MonoTag key={idx} color="blue">
-                                            {scope}
-                                        </MonoTag>
-                                    ))}
-                                </div>
-                            ) : (
-                                <p className="text-xs text-gray-600 dark:text-gray-500">Using backend defaults only</p>
-                            )}
-                        </div>
-                    </div>
-
-                    <MonoNotice className="mt-4" tone="warn">
-                        <p className="text-xs">
-                            <strong>Note:</strong> Additional roles and scopes are combined with backend defaults
-                            (not replaced). ACCOUNTADMIN, ORGADMIN, and SECURITYADMIN are always blocked.
-                        </p>
-                    </MonoNotice>
-                </section>
+                {/* Injected Environment Variables */}
+                {status.oauth_extension_name && (
+                    <Panel style={{ gridColumn: '1 / -1' }}>
+                        <PanelHead
+                            title="Injected Environment Variables"
+                            sub="The linked OAuth extension injects these environment variables into your deployed application."
+                        />
+                        <PanelBody>
+                            <table className="r-table" style={{ width: '100%' }}>
+                                <thead>
+                                    <tr>
+                                        <th style={{ textAlign: 'left' }}>Variable</th>
+                                        <th style={{ textAlign: 'left' }}>Source</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr>
+                                        <td><span className="mono" style={{ whiteSpace: 'nowrap' }}>{status.oauth_extension_name.toUpperCase().replace(/-/g, '_')}_CLIENT_ID</span></td>
+                                        <td><span style={{ color: 'var(--text-muted)' }}>OAuth client ID</span></td>
+                                    </tr>
+                                    <tr>
+                                        <td><span className="mono" style={{ whiteSpace: 'nowrap' }}>{status.oauth_extension_name.toUpperCase().replace(/-/g, '_')}_CLIENT_SECRET</span></td>
+                                        <td><Pill>protected</Pill></td>
+                                    </tr>
+                                    <tr>
+                                        <td><span className="mono" style={{ whiteSpace: 'nowrap' }}>{status.oauth_extension_name.toUpperCase().replace(/-/g, '_')}_ISSUER</span></td>
+                                        <td><span style={{ color: 'var(--text-muted)' }}>OIDC issuer URL</span></td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </PanelBody>
+                    </Panel>
+                )}
             </div>
-        </>
+        </div>
     );
 }
 
@@ -1330,20 +1299,21 @@ export function AwsS3ExtensionUI({ spec, schema, onChange }) {
     useEffect(() => { onChangeRef.current = onChange; }, [onChange]);
     useEffect(() => { onChangeRef.current({}); }, []);
 
+    const envVarStyle: React.CSSProperties = { color: 'var(--accent)' };
     return (
-        <div className="space-y-4">
-            <MonoNotice tone="info" title="Fixed Environment Variables">
-                <p>This extension automatically injects the following environment variables into every deployment. No configuration is required.</p>
-                <div className="mt-3 space-y-1 font-mono text-xs">
-                    <div><span className="text-blue-600 dark:text-blue-400">S3_BUCKET_NAME</span> — the name of the provisioned S3 bucket</div>
-                    <div><span className="text-blue-600 dark:text-blue-400">AWS_ACCESS_KEY_ID</span> — IAM access key ID</div>
-                    <div><span className="text-blue-600 dark:text-blue-400">AWS_SECRET_ACCESS_KEY</span> — IAM secret access key</div>
-                    <div><span className="text-blue-600 dark:text-blue-400">AWS_REGION</span> — AWS region of the bucket</div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+            <Alert tone="info" icon="info">
+                <strong>Fixed Environment Variables.</strong> This extension automatically injects the following environment variables into every deployment. No configuration is required.
+                <div className="mono" style={{ marginTop: 10, fontSize: 12, display: 'flex', flexDirection: 'column', gap: 3 }}>
+                    <div><span style={envVarStyle}>S3_BUCKET_NAME</span> — the name of the provisioned S3 bucket</div>
+                    <div><span style={envVarStyle}>AWS_ACCESS_KEY_ID</span> — IAM access key ID</div>
+                    <div><span style={envVarStyle}>AWS_SECRET_ACCESS_KEY</span> — IAM secret access key</div>
+                    <div><span style={envVarStyle}>AWS_REGION</span> — AWS region of the bucket</div>
                 </div>
-            </MonoNotice>
-            <MonoNotice tone="muted" title="Bucket Deletion">
-                <p>When you delete this extension, the IAM user and access key are removed immediately. The S3 bucket is only deleted if it is empty — non-empty buckets block deletion until you choose to empty them.</p>
-            </MonoNotice>
+            </Alert>
+            <Alert tone="info" icon="info">
+                <strong>Bucket Deletion.</strong> When you delete this extension, the IAM user and access key are removed immediately. The S3 bucket is only deleted if it is empty — non-empty buckets block deletion until you choose to empty them.
+            </Alert>
         </div>
     );
 }
@@ -1371,95 +1341,84 @@ export function AwsS3DetailView({ extension, projectName }) {
     };
 
     return (
-        <div className="space-y-6">
-            <section className="space-y-3">
-                <div className="flex items-center gap-3">
-                    <h2 className="text-xl font-semibold text-gray-900 dark:text-gray-100">AWS S3 Bucket</h2>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+            <section style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                    <div className="r-section-title">AWS S3 Bucket</div>
                     {renderStatePill(status.state)}
                 </div>
                 {isAvailable ? (
-                    <MonoNotice tone="success" title="Current State">
-                        <p>S3 bucket is provisioned and credentials are ready. Deploy your project to inject the environment variables.</p>
-                    </MonoNotice>
+                    <Alert tone="info" icon="check">
+                        <strong>Current State.</strong> S3 bucket is provisioned and credentials are ready. Deploy your project to inject the environment variables.
+                    </Alert>
                 ) : isFailed ? (
-                    <MonoNotice tone="bad" title="Provisioning Failed">
-                        <p>{status.error || 'An error occurred during provisioning. The reconciler will retry automatically.'}</p>
-                    </MonoNotice>
+                    <Alert tone="err" icon="info">
+                        <strong>Provisioning Failed.</strong> {status.error || 'An error occurred during provisioning. The reconciler will retry automatically.'}
+                    </Alert>
                 ) : isDeletionBlocked ? (
-                    <MonoNotice tone="warn" title="Deletion Blocked">
-                        <p>{status.error || 'The S3 bucket could not be deleted because it is not empty.'}</p>
-                        <div className="mt-3">
-                            <Button variant="danger" size="sm" onClick={handleForceEmpty} disabled={forceEmptying}>
-                                {forceEmptying ? 'Enabling...' : 'Empty bucket and delete'}
+                    <Alert tone="warn" icon="info">
+                        <strong>Deletion Blocked.</strong> {status.error || 'The S3 bucket could not be deleted because it is not empty.'}
+                        <div style={{ marginTop: 10 }}>
+                            <Button variant="danger" size="sm" onClick={handleForceEmpty} disabled={forceEmptying} loading={forceEmptying}>
+                                {forceEmptying ? 'Enabling…' : 'Empty bucket and delete'}
                             </Button>
                         </div>
-                    </MonoNotice>
+                    </Alert>
                 ) : isDeleting ? (
-                    <MonoNotice tone="muted" title="Deleting">
-                        <p>{status.error || 'The extension is being cleaned up. IAM user and S3 bucket will be removed.'}</p>
-                    </MonoNotice>
+                    <Alert tone="info" icon="info">
+                        <strong>Deleting.</strong> {status.error || 'The extension is being cleaned up. IAM user and S3 bucket will be removed.'}
+                    </Alert>
                 ) : (
-                    <MonoNotice tone="warn" title="Current State">
-                        <p>Provisioning is in progress. Deployments will fail until the bucket is available.</p>
-                    </MonoNotice>
+                    <Alert tone="warn" icon="info">
+                        <strong>Current State.</strong> Provisioning is in progress. Deployments will fail until the bucket is available.
+                    </Alert>
                 )}
             </section>
 
-            <section>
-                <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-200 mb-3">Bucket Details</h2>
-                <div className="bg-white dark:bg-gray-900 rounded p-4 grid grid-cols-2 gap-4">
-                    <div>
-                        <p className="text-sm text-gray-600 dark:text-gray-500">State</p>
-                        <div className="mt-1">{renderStatePill(status.state)}</div>
-                    </div>
-                    <div>
-                        <p className="text-sm text-gray-600 dark:text-gray-500">Bucket Name</p>
-                        <p className="text-gray-700 dark:text-gray-300 font-mono text-sm">{status.bucket_name || '—'}</p>
-                    </div>
-                    <div>
-                        <p className="text-sm text-gray-600 dark:text-gray-500">IAM User</p>
-                        <p className="text-gray-700 dark:text-gray-300 font-mono text-sm">{status.iam_user_name || '—'}</p>
-                    </div>
-                    <div>
-                        <p className="text-sm text-gray-600 dark:text-gray-500">Access Key ID</p>
-                        <p className="text-gray-700 dark:text-gray-300 font-mono text-sm">{status.iam_access_key_id || '—'}</p>
-                    </div>
-                    <div>
-                        <p className="text-sm text-gray-600 dark:text-gray-500">Region</p>
-                        <p className="text-gray-700 dark:text-gray-300 font-mono text-sm">{status.region || '—'}</p>
-                    </div>
-                </div>
-            </section>
+            <Panel>
+                <PanelHead title="Bucket Details" />
+                <PanelBody>
+                    <KV>
+                        <KVRow k="State">{renderStatePill(status.state)}</KVRow>
+                        <KVRow k="Bucket Name"><span className="mono">{status.bucket_name || '—'}</span></KVRow>
+                        <KVRow k="IAM User"><span className="mono">{status.iam_user_name || '—'}</span></KVRow>
+                        <KVRow k="Access Key ID"><span className="mono">{status.iam_access_key_id || '—'}</span></KVRow>
+                        <KVRow k="Region"><span className="mono">{status.region || '—'}</span></KVRow>
+                    </KV>
+                </PanelBody>
+            </Panel>
 
-            <section>
-                <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-200 mb-3">Injected Environment Variables</h2>
-                <MonoTable>
-                    <MonoTableHead>
-                        <MonoTableRow>
-                            <MonoTh>Variable</MonoTh>
-                            <MonoTh>Value</MonoTh>
-                        </MonoTableRow>
-                    </MonoTableHead>
-                    <MonoTableBody>
-                        <MonoTableRow>
-                            <MonoTd><span className="font-mono text-sm">S3_BUCKET_NAME</span></MonoTd>
-                            <MonoTd><span className="font-mono text-sm text-gray-600 dark:text-gray-400">{status.bucket_name || '(pending)'}</span></MonoTd>
-                        </MonoTableRow>
-                        <MonoTableRow>
-                            <MonoTd><span className="font-mono text-sm">AWS_ACCESS_KEY_ID</span></MonoTd>
-                            <MonoTd><span className="font-mono text-sm text-gray-600 dark:text-gray-400">{status.iam_access_key_id || '(pending)'}</span></MonoTd>
-                        </MonoTableRow>
-                        <MonoTableRow>
-                            <MonoTd><span className="font-mono text-sm">AWS_SECRET_ACCESS_KEY</span></MonoTd>
-                            <MonoTd><MonoTag color="muted">protected</MonoTag></MonoTd>
-                        </MonoTableRow>
-                        <MonoTableRow>
-                            <MonoTd><span className="font-mono text-sm">AWS_REGION</span></MonoTd>
-                            <MonoTd><span className="font-mono text-sm text-gray-600 dark:text-gray-400">{status.region || '(pending)'}</span></MonoTd>
-                        </MonoTableRow>
-                    </MonoTableBody>
-                </MonoTable>
-            </section>
+            <Panel>
+                <PanelHead title="Injected Environment Variables" />
+                <PanelBody>
+                    <table className="r-table" style={{ width: '100%' }}>
+                        <thead>
+                            <tr>
+                                <th style={{ textAlign: 'left' }}>Variable</th>
+                                <th style={{ textAlign: 'left' }}>Value</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><span className="mono">S3_BUCKET_NAME</span></td>
+                                <td><span className="mono" style={{ color: 'var(--text-muted)' }}>{status.bucket_name || '(pending)'}</span></td>
+                            </tr>
+                            <tr>
+                                <td><span className="mono">AWS_ACCESS_KEY_ID</span></td>
+                                <td><span className="mono" style={{ color: 'var(--text-muted)' }}>{status.iam_access_key_id || '(pending)'}</span></td>
+                            </tr>
+                            <tr>
+                                <td><span className="mono">AWS_SECRET_ACCESS_KEY</span></td>
+                                <td><Pill>protected</Pill></td>
+                            </tr>
+                            <tr>
+                                <td><span className="mono">AWS_REGION</span></td>
+                                <td><span className="mono" style={{ color: 'var(--text-muted)' }}>{status.region || '(pending)'}</span></td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </PanelBody>
+            </Panel>
         </div>
     );
 }
@@ -1504,78 +1463,53 @@ export function AwsRdsDetailView({ extension, projectName }) {
     };
 
     return (
-        <div className="space-y-6">
-            <section className="space-y-3">
-                <div className="flex items-center gap-3">
-                    <h2 className="text-xl font-semibold text-gray-900 dark:text-gray-100">AWS RDS Provisioner</h2>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+            <section style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                    <div className="r-section-title">AWS RDS Provisioner</div>
                     {getInstanceStateBadge()}
                 </div>
                 {String(status.state || '').toLowerCase() === 'available' ? (
-                    <MonoNotice tone="success" title="Current State">
-                        <p>Database infrastructure is available. Review endpoint and environment variable settings below before deploying.</p>
-                    </MonoNotice>
+                    <Alert tone="info" icon="check">
+                        <strong>Current State.</strong> Database infrastructure is available. Review endpoint and environment variable settings below before deploying.
+                    </Alert>
                 ) : (
-                    <MonoNotice tone="warn" title="Current State">
-                        <p>Provisioning is in progress or requires attention. New dependent deployments may be blocked until the instance is available.</p>
-                    </MonoNotice>
+                    <Alert tone="warn" icon="info">
+                        <strong>Current State.</strong> Provisioning is in progress or requires attention. New dependent deployments may be blocked until the instance is available.
+                    </Alert>
                 )}
             </section>
 
             {/* Instance Information */}
-            <section>
-                <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-200 mb-3">RDS Instance Status</h2>
-                <div className="bg-white dark:bg-gray-900 rounded p-4 grid grid-cols-2 gap-4">
-                    <div>
-                        <p className="text-sm text-gray-600 dark:text-gray-500">State</p>
-                        <div className="mt-1">{getInstanceStateBadge()}</div>
-                    </div>
-                    <div>
-                        <p className="text-sm text-gray-600 dark:text-gray-500">Instance ID</p>
-                        <p className="text-gray-700 dark:text-gray-300">{status.instance_id || 'N/A'}</p>
-                    </div>
-                    <div>
-                        <p className="text-sm text-gray-600 dark:text-gray-500">Instance Size</p>
-                        <p className="text-gray-700 dark:text-gray-300">{status.instance_size || 'N/A'}</p>
-                    </div>
-                    <div>
-                        <p className="text-sm text-gray-600 dark:text-gray-500">Engine</p>
-                        <p className="text-gray-700 dark:text-gray-300">{spec.engine || 'postgres'} {spec.engine_version || ''}</p>
-                    </div>
-                    <div>
-                        <p className="text-sm text-gray-600 dark:text-gray-500">Endpoint</p>
-                        <p className="text-gray-700 dark:text-gray-300 font-mono text-xs">{status.endpoint || 'Pending...'}</p>
-                    </div>
-                    <div>
-                        <p className="text-sm text-gray-600 dark:text-gray-500">Database Isolation</p>
-                        <p className="text-gray-700 dark:text-gray-300 capitalize">{spec.database_isolation || 'shared'}</p>
-                    </div>
-                    <div>
-                        <p className="text-sm text-gray-600 dark:text-gray-500">Master Username</p>
-                        <p className="text-gray-700 dark:text-gray-300">{status.master_username || 'N/A'}</p>
-                    </div>
-                </div>
-
-                {status.error && (
-                    <MonoNotice className="mt-3" tone="error">
-                        <p className="text-sm">
-                            <strong>Error:</strong> {status.error}
-                        </p>
-                    </MonoNotice>
-                )}
-            </section>
+            <Panel>
+                <PanelHead title="RDS Instance Status" />
+                <PanelBody>
+                    <KV>
+                        <KVRow k="State">{getInstanceStateBadge()}</KVRow>
+                        <KVRow k="Instance ID">{status.instance_id || 'N/A'}</KVRow>
+                        <KVRow k="Instance Size">{status.instance_size || 'N/A'}</KVRow>
+                        <KVRow k="Engine">{spec.engine || 'postgres'} {spec.engine_version || ''}</KVRow>
+                        <KVRow k="Endpoint"><span className="mono">{status.endpoint || 'Pending…'}</span></KVRow>
+                        <KVRow k="Database Isolation"><span style={{ textTransform: 'capitalize' }}>{spec.database_isolation || 'shared'}</span></KVRow>
+                        <KVRow k="Master Username">{status.master_username || 'N/A'}</KVRow>
+                    </KV>
+                    {status.error && (
+                        <div style={{ marginTop: 12 }}>
+                            <Alert tone="err" icon="info"><strong>Error:</strong> {status.error}</Alert>
+                        </div>
+                    )}
+                </PanelBody>
+            </Panel>
 
             {/* Databases */}
             <section>
-                <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-200 mb-3">
+                <div className="r-section-title" style={{ marginBottom: 12 }}>
                     Databases ({Object.keys(databases).length})
-                </h2>
-
+                </div>
                 {Object.keys(databases).length === 0 ? (
-                    <div className="bg-white dark:bg-gray-900 rounded p-4 text-gray-600 dark:text-gray-400 text-center">
-                        No databases provisioned yet
-                    </div>
+                    <Empty title="No databases provisioned yet" />
                 ) : (
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 16 }}>
                         {Object.entries(databases).map(([dbName, dbStatus]) => (
                             <DatabaseCard
                                 key={dbName}
@@ -1587,55 +1521,68 @@ export function AwsRdsDetailView({ extension, projectName }) {
                 )}
             </section>
 
-            {/* Configuration */}
-            <section>
-                <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-200 mb-3">Environment Variables</h2>
-                <div className="bg-white dark:bg-gray-900 rounded p-4 space-y-3">
-                    <div>
-                        <span className="text-gray-600 dark:text-gray-400 text-sm">Database URL Variable:</span>
-                        <code className="ml-2 bg-gray-100 dark:bg-gray-800 px-2 py-1 rounded text-gray-900 dark:text-gray-200 text-sm">
-                            {spec.database_url_env_var || 'DATABASE_URL'}
-                        </code>
-                    </div>
-                    <label className="flex items-center space-x-2">
-                        <input
-                            type="checkbox"
-                            checked={spec.inject_pg_vars !== false}
-                            disabled
-                            className="rounded"
-                        />
-                        <span className="text-gray-700 dark:text-gray-300 text-sm">
-                            Inject <code className="mono-token-accent">PG*</code> variables
-                        </span>
-                    </label>
-                </div>
-            </section>
+            {/* Injected Environment Variables */}
+            <Panel>
+                <PanelHead title="Injected Environment Variables" sub="These environment variables are injected into your deployed application." />
+                <PanelBody>
+                    <table className="r-table" style={{ width: '100%' }}>
+                        <thead>
+                            <tr>
+                                <th style={{ textAlign: 'left' }}>Variable</th>
+                                <th style={{ textAlign: 'left' }}>Source</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><span className="mono" style={{ whiteSpace: 'nowrap' }}>{spec.database_url_env_var || 'DATABASE_URL'}</span></td>
+                                <td><span style={{ color: 'var(--text-muted)' }}>Full PostgreSQL connection string</span></td>
+                            </tr>
+                            {spec.inject_pg_vars !== false && (
+                                <>
+                                    <tr>
+                                        <td><span className="mono">PGHOST</span></td>
+                                        <td><span className="mono" style={{ color: 'var(--text-muted)' }}>{status.endpoint || '(pending)'}</span></td>
+                                    </tr>
+                                    <tr>
+                                        <td><span className="mono">PGPORT</span></td>
+                                        <td><span style={{ color: 'var(--text-muted)' }}>Database port</span></td>
+                                    </tr>
+                                    <tr>
+                                        <td><span className="mono">PGUSER</span></td>
+                                        <td><span style={{ color: 'var(--text-muted)' }}>Database user</span></td>
+                                    </tr>
+                                    <tr>
+                                        <td><span className="mono">PGPASSWORD</span></td>
+                                        <td><Pill>protected</Pill></td>
+                                    </tr>
+                                    <tr>
+                                        <td><span className="mono">PGDATABASE</span></td>
+                                        <td><span style={{ color: 'var(--text-muted)' }}>Database name</span></td>
+                                    </tr>
+                                </>
+                            )}
+                        </tbody>
+                    </table>
+                </PanelBody>
+            </Panel>
         </div>
     );
 }
 
 // Database Card Component
 function DatabaseCard({ name, status }) {
-    // Determine status badge tone/label
-    let badgeTone = 'muted';
+    // Determine status badge label
     let statusText = status.status || 'Unknown';
     const state = (status.status || '').toLowerCase();
 
     switch (state) {
-        case 'available':
-            badgeTone = 'ok';
-            break;
         case 'pending':
         case 'creatingdatabase':
         case 'creatinguser':
-            badgeTone = 'warn';
             statusText = 'Provisioning';
             break;
-        case 'terminating':
-            badgeTone = 'bad';
-            break;
         default:
-            badgeTone = 'muted';
+            break;
     }
 
     const isScheduledForCleanup = status.cleanup_scheduled_at != null;
@@ -1647,38 +1594,33 @@ function DatabaseCard({ name, status }) {
         : null;
 
     return (
-        <div className="bg-white dark:bg-gray-900 rounded-lg p-4 border border-gray-300 dark:border-gray-700">
-            <div className="flex items-center justify-between mb-3">
-                <h3 className="text-gray-900 dark:text-white font-semibold">{name}</h3>
-                <MonoStatusPill tone={badgeTone}>{statusText}</MonoStatusPill>
-            </div>
-
-            <div className="space-y-2 text-sm">
-                <div>
-                    <span className="text-gray-600 dark:text-gray-500">User:</span>
-                    <span className="text-gray-700 dark:text-gray-300 ml-2 font-mono">{status.user}</span>
+        <Panel>
+            <PanelHead>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%' }}>
+                    <div className="r-panel-title">{name}</div>
+                    <Status status={statusText} />
                 </div>
+            </PanelHead>
+            <PanelBody>
+                <KV>
+                    <KVRow k="User"><span className="mono">{status.user}</span></KVRow>
+                </KV>
 
                 {isScheduledForCleanup && cleanupTime && (
-                    <MonoNotice className="mt-3" tone="warn">
-                        <p className="text-xs">
-                            <strong>Cleanup Scheduled</strong>
-                        </p>
-                        <p className="text-xs mt-1">
-                            Will be deleted at {formatDate(cleanupTime.toISOString())}
-                        </p>
-                    </MonoNotice>
+                    <div style={{ marginTop: 12 }}>
+                        <Alert tone="warn" icon="info">
+                            <strong>Cleanup Scheduled.</strong> Will be deleted at {formatDate(cleanupTime.toISOString())}
+                        </Alert>
+                    </div>
                 )}
 
                 {status.status === 'Available' && !isScheduledForCleanup && (
-                    <MonoNotice className="mt-3" tone="success">
-                        <p className="text-xs">
-                            Database is active and ready.
-                        </p>
-                    </MonoNotice>
+                    <div style={{ marginTop: 12 }}>
+                        <Alert tone="info" icon="check">Database is active and ready.</Alert>
+                    </div>
                 )}
-            </div>
-        </div>
+            </PanelBody>
+        </Panel>
     );
 }
 
