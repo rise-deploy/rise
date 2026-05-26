@@ -310,7 +310,6 @@ async fn heartbeat_loop(
                 tracing::warn!(
                     lease = %name,
                     %expired_at,
-                    %now,
                     lag_ms = (now - expired_at).num_milliseconds(),
                     "leader lease expired before renewal (likely runtime stall); stepping down"
                 );

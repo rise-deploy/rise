@@ -48,6 +48,10 @@ pub async fn find_by_id(
 /// Used directly by tests; production code paths must go through
 /// [`find_or_create_with_default_organization`] so the user is stamped with
 /// a default-Organization membership in the same transaction.
+///
+/// Idempotent on the unique `email` constraint: concurrent inserts of the
+/// same email return the existing row instead of erroring, so the
+/// `find_by_email`-then-`create` pattern in `find_or_create*` is race-safe.
 #[allow(dead_code)]
 pub async fn create(pool: &PgPool, email: &str) -> Result<User> {
     let user = sqlx::query_as!(
@@ -55,6 +59,7 @@ pub async fn create(pool: &PgPool, email: &str) -> Result<User> {
         r#"
         INSERT INTO users (email)
         VALUES ($1)
+        ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
         RETURNING id, email, created_at, updated_at
         "#,
         email

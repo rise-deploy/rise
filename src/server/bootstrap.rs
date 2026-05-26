@@ -228,6 +228,11 @@ async fn upsert_default_organization(
     // are preserved, so every typed row's `organization_resource_uid`
     // linkage remains valid.
     let row = if row.name != default_org.name {
+        // Fires only via the single-Org-world fallback (exactly one Organization
+        // exists and its name differs from the configured one); once multi-Org is
+        // reachable this heuristic stops firing, so this is not a general
+        // "Organization renamed" event — general rename visibility needs a
+        // separate mechanism (e.g. an audit-log entry from `ResourceStore::rename`).
         info!(
             old_name = %row.name,
             new_name = %default_org.name,
@@ -399,7 +404,7 @@ impl DefaultOrganizationView {
 
 /// Apply the `org-{discriminator}-` fallback when no namespace-prefix
 /// annotation is configured. Extracted so the per-request multi-org path
-/// (`webhook::load_org_namespace_prefix`) and the bootstrap-time
+/// (`webhook::load_org_view`) and the bootstrap-time
 /// `DefaultOrganizationView::resolved_namespace_prefix` agree by
 /// construction.
 pub fn resolve_namespace_prefix_fallback(discriminator: &str) -> String {
@@ -686,6 +691,73 @@ mod tests {
         assert_eq!(
             again.default_organization_uid,
             first.default_organization_uid
+        );
+    }
+
+    /// Rename path must preserve any operator-supplied annotations on the
+    /// existing row. Bootstrap merges its managed annotations on top of the
+    /// existing set rather than overwriting them.
+    #[sqlx::test]
+    async fn bootstrap_rename_preserves_non_default_annotations(pool: sqlx::PgPool) {
+        rise_resource_store::run_migrations(&pool)
+            .await
+            .expect("resource store migrations");
+        let store: Arc<dyn ResourceStore> =
+            Arc::new(rise_resource_store::PgResourceStore::new(pool.clone()));
+
+        // First boot mints the Org under the configured name.
+        let first = run(&pool, &store, &test_settings_with_org_name("default"))
+            .await
+            .expect("first run");
+        let uid = first.default_organization_uid;
+
+        // Stamp an unrelated operator annotation directly on the row, mirroring
+        // the kind of state a human admin would set out-of-band.
+        let row = store
+            .get(uid)
+            .await
+            .expect("get post-bootstrap")
+            .expect("row exists");
+        let mut annotations = annotations_from_metadata(&row.metadata);
+        annotations.insert("custom-key".to_string(), "custom-value".to_string());
+        store
+            .update(
+                uid,
+                UpdateResourceParams {
+                    api_version: None,
+                    revision: row.revision,
+                    annotations,
+                    finalizers: row.finalizers.clone(),
+                    spec: row.spec.clone(),
+                    validator: Some(Arc::new(OrganizationValidator)),
+                },
+            )
+            .await
+            .expect("stamp custom annotation");
+
+        // Second boot with a different name takes the single-Org-world rename
+        // path. The UID must be preserved.
+        let renamed = run(&pool, &store, &test_settings_with_org_name("acme"))
+            .await
+            .expect("second run after rename");
+        assert_eq!(
+            renamed.default_organization_uid, uid,
+            "rename must preserve the Organization UID"
+        );
+
+        // The operator-supplied annotation must survive the rename. Bootstrap
+        // may have added managed annotations of its own, so assert containment
+        // rather than equality to stay robust against future managed keys.
+        let row = store
+            .get(uid)
+            .await
+            .expect("get post-rename")
+            .expect("row exists");
+        let annotations = annotations_from_metadata(&row.metadata);
+        assert_eq!(
+            annotations.get("custom-key").map(String::as_str),
+            Some("custom-value"),
+            "operator-supplied annotation must survive the rename"
         );
     }
 

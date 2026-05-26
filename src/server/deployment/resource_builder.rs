@@ -124,9 +124,9 @@ impl ResourceBuilder {
 
     /// Compute the Kubernetes namespace for a project, given the per-Org
     /// `namespace_prefix` resolved by the caller. The prefix is resolved
-    /// per-request (see `webhook::load_org_namespace_prefix`) rather than
-    /// baked into the builder so a project in any Organization can be
-    /// namespaced without rebuilding the controller's `ResourceBuilder`.
+    /// per-request (see `webhook::load_org_view`) rather than baked into
+    /// the builder so a project in any Organization can be namespaced
+    /// without rebuilding the controller's `ResourceBuilder`.
     pub fn namespace_name(project: &Project, namespace_prefix: &str) -> String {
         format!("{namespace_prefix}{}", project.name)
     }

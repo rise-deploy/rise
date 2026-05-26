@@ -2358,11 +2358,18 @@ pub async fn stream_deployment_logs(
 
     // Resolve the project's Org-scoped namespace prefix; the backend
     // doesn't have access to `AppState`'s cache, so the caller threads
-    // the prefix in (same pattern as the Metacontroller webhook).
-    let namespace_prefix =
-        crate::server::deployment::webhook::resolve_project_namespace_prefix(&state, &project)
+    // the prefix in (same pattern as the Metacontroller webhook). The
+    // Organization UID is resolved once and threaded through so the
+    // missing-linkage error message is consistent with the webhook path.
+    let org_uid =
+        crate::server::deployment::webhook::resolve_project_organization_uid(&state, &project)
             .await
-            .internal_err("Failed to resolve project namespace prefix")?;
+            .internal_err("Failed to resolve project organization linkage")?;
+    let namespace_prefix = crate::server::deployment::webhook::resolve_project_namespace_prefix(
+        &state, &project, org_uid,
+    )
+    .await
+    .internal_err("Failed to resolve project namespace prefix")?;
 
     let log_stream = state
         .deployment_backend

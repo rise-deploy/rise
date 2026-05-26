@@ -240,7 +240,13 @@ async fn process_sync(
         }
     };
 
-    // 1b. Verify the project's Organization is assigned to this controller.
+    // 1b. Resolve the project's Organization UID once and thread it
+    // through the controller-class check and the namespace-prefix
+    // lookup. Both of those used to re-read `project_organizations`
+    // independently — one DB hit per sync now serves both.
+    let org_uid = resolve_project_organization_uid(state, &project).await?;
+
+    // 1c. Verify the project's Organization is assigned to this controller.
     //
     // The Kubernetes controller filters strictly by the configured
     // `controller_class_name`. Projects whose Organization carries a
@@ -248,13 +254,13 @@ async fn process_sync(
     // different controller — return `SyncError::WrongController` so the
     // handler answers 400 (not 200 with empty children, which would let
     // Metacontroller GC resources owned by another controller).
-    enforce_controller_class(state, &project).await?;
+    enforce_controller_class(state, &project, org_uid).await?;
 
-    // 1c. Resolve the project's Org-scoped namespace prefix once. Every
+    // 1d. Resolve the project's Org-scoped namespace prefix once. Every
     // helper below that names a namespace borrows this string, so the
     // miss-loader runs at most once per sync (the cache hits the second
     // and subsequent times within the 30s TTL).
-    let namespace_prefix = resolve_project_namespace_prefix(state, &project).await?;
+    let namespace_prefix = resolve_project_namespace_prefix(state, &project, org_uid).await?;
 
     // 2. Load non-terminal deployments for this project (avoids loading full history)
     let non_terminal_deployments =
@@ -353,15 +359,31 @@ fn check_controller_class(configured: Option<&str>, org_class: Option<&str>) -> 
     }
 }
 
-/// Resolve `spec.deploymentControllerClass` from the resource store for the
-/// given Organization UID. Used as the cache miss-loader behind
-/// `AppState::org_controller_class_cache`. Missing Organizations surface as
-/// `Err`, which prevents the cache from memoising a transient "not found"
-/// (the cache only retains successful loads).
-async fn load_org_controller_class(
+/// Snapshot of the per-Organization fields the Metacontroller webhook
+/// reads on every sync. Cached behind `AppState::org_view_cache` so the
+/// controller hits the resource store at most once per Org per 30s
+/// window — the previous design had two independent caches (one per
+/// field) and re-read the same row twice.
+#[derive(Debug, Clone)]
+pub struct CachedOrganizationView {
+    /// Value of `spec.deploymentControllerClass`. `None` when the
+    /// Organization exists but does not set the field.
+    pub controller_class: Option<String>,
+    /// Resolved Kubernetes namespace prefix
+    /// (`kubernetes.rise.dev/namespace-prefix` annotation, or
+    /// `org-{discriminator}-` fallback).
+    pub namespace_prefix: String,
+}
+
+/// Cache miss-loader for `AppState::org_view_cache`. Reads the
+/// Organization row once and projects both fields the webhook needs.
+/// Missing Organizations surface as `Err`, which prevents the cache from
+/// memoising a transient "not found" (`try_get_with` only retains
+/// successful loads).
+async fn load_org_view(
     store: std::sync::Arc<dyn rise_resource_store::ResourceStore>,
     uid: uuid::Uuid,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<CachedOrganizationView> {
     let row = store
         .get(uid)
         .await
@@ -369,130 +391,100 @@ async fn load_org_controller_class(
         .ok_or_else(|| anyhow::anyhow!("Organization {uid} is missing"))?;
     let spec: rise_resource_api::OrganizationSpec = serde_json::from_value(row.spec.clone())
         .map_err(|e| anyhow::anyhow!("Organization {uid} has malformed spec: {e}"))?;
-    Ok(spec.deployment_controller_class)
-}
-
-/// Resolve the per-Organization Kubernetes namespace prefix from the
-/// resource store. Used as the cache miss-loader behind
-/// `AppState::org_namespace_prefix_cache`. Reads the
-/// `kubernetes.rise.dev/namespace-prefix` annotation when present and
-/// otherwise synthesizes the `org-{discriminator}-` fallback via the
-/// shared `bootstrap::resolve_namespace_prefix` helper. Missing
-/// Organizations surface as `Err` and are not cached.
-async fn load_org_namespace_prefix(
-    store: std::sync::Arc<dyn rise_resource_store::ResourceStore>,
-    uid: uuid::Uuid,
-) -> anyhow::Result<String> {
-    let row = store
-        .get(uid)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to load Organization {uid}: {e}"))?
-        .ok_or_else(|| anyhow::anyhow!("Organization {uid} is missing"))?;
     let annotations: BTreeMap<String, String> =
         serde_json::from_value(row.metadata.clone()).unwrap_or_default();
-    Ok(crate::server::bootstrap::resolve_namespace_prefix(
-        &annotations,
-        &row.discriminator,
-    ))
+    let namespace_prefix =
+        crate::server::bootstrap::resolve_namespace_prefix(&annotations, &row.discriminator);
+    Ok(CachedOrganizationView {
+        controller_class: spec.deployment_controller_class,
+        namespace_prefix,
+    })
 }
 
-/// Resolve the project's Organization UID and look up its namespace
-/// prefix through `AppState::org_namespace_prefix_cache`. Called once per
-/// sync (and per log-stream request from `handlers::stream_deployment_logs`);
-/// this is what makes per-Org namespacing per-request instead of baked
-/// into the controller's `ResourceBuilder`.
-pub async fn resolve_project_namespace_prefix(
+/// Resolve the project's Organization UID, surfacing the "missing
+/// linkage" invariant as a structured error. Bootstrap validation
+/// refuses to start the server with unlinked projects, so a `None` here
+/// is a programmer error — logged at `error!` rather than letting the
+/// `None` propagate silently.
+pub async fn resolve_project_organization_uid(
     state: &AppState,
     project: &Project,
-) -> anyhow::Result<String> {
-    let project_org_uid = crate::db::organization_links::organization_uid_for_project(
-        &state.db_pool,
-        project.id,
-    )
-    .await?
-    .ok_or_else(|| {
-        // Same invariant as `enforce_controller_class`: bootstrap
-        // validation refuses to start the server with unlinked
-        // projects, so a `None` here is a programmer error.
-        error!(
-            project = %project.name,
-            "Project has no organization linkage — bootstrap validation should have caught this"
-        );
-        anyhow::anyhow!(
-            "project '{}' is missing organization_resource_uid; bootstrap must backfill before reconciliation",
-            project.name,
-        )
-    })?;
-
-    state
-        .org_namespace_prefix_cache
-        .try_get_with(
-            project_org_uid,
-            load_org_namespace_prefix(state.resource_store.clone(), project_org_uid),
-        )
-        .await
-        .map_err(|e| {
+) -> anyhow::Result<uuid::Uuid> {
+    crate::db::organization_links::organization_uid_for_project(&state.db_pool, project.id)
+        .await?
+        .ok_or_else(|| {
+            error!(
+                project = %project.name,
+                "Project has no organization linkage — bootstrap validation should have caught this; refusing to reconcile"
+            );
             anyhow::anyhow!(
-                "Failed to load namespace prefix for Organization {project_org_uid} (project '{}'): {e}",
+                "project '{}' is missing organization_resource_uid; bootstrap must backfill before reconciliation",
                 project.name,
             )
         })
 }
 
+/// Look up the project's Org-scoped namespace prefix through
+/// `AppState::org_view_cache`. The caller resolves the Organization UID
+/// once per request (via `resolve_project_organization_uid`) and threads
+/// it through so the controller-class check and this lookup share a
+/// single DB and cache read.
+pub async fn resolve_project_namespace_prefix(
+    state: &AppState,
+    project: &Project,
+    org_uid: uuid::Uuid,
+) -> anyhow::Result<String> {
+    let view = state
+        .org_view_cache
+        .try_get_with(
+            org_uid,
+            load_org_view(state.resource_store.clone(), org_uid),
+        )
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to load Organization {org_uid} for project '{}': {e}",
+                project.name,
+            )
+        })?;
+    Ok(view.namespace_prefix)
+}
+
 /// Reject reconciliation when the project's Organization's
 /// `spec.deploymentControllerClass` does not match the controller's
-/// configured `controller_class_name`. Reads the Org's class through a
-/// short-TTL cache so a steady stream of resyncs does not hit the store on
-/// every tick. When the controller has no configured class (legacy
-/// installs), this is a no-op.
-async fn enforce_controller_class(state: &AppState, project: &Project) -> Result<(), SyncError> {
+/// configured `controller_class_name`. Reads the Org through a short-TTL
+/// cache so a steady stream of resyncs does not hit the store on every
+/// tick. When the controller has no configured class (legacy installs),
+/// this is a no-op.
+async fn enforce_controller_class(
+    state: &AppState,
+    project: &Project,
+    org_uid: uuid::Uuid,
+) -> Result<(), SyncError> {
     let Some(configured) = state.deployment_controller_class_name.as_deref() else {
         return Ok(());
     };
 
-    let project_org_uid = match crate::db::organization_links::organization_uid_for_project(
-        &state.db_pool,
-        project.id,
-    )
-    .await?
-    {
-        Some(uid) => uid,
-        None => {
-            // Strictly impossible after a successful bootstrap (validation
-            // refuses to start the server with any unlinked project), so
-            // hitting this branch is a programmer error — log at error level
-            // so it pages rather than disappearing into the warn stream.
-            error!(
-                project = %project.name,
-                "Project has no organization linkage — bootstrap validation should have caught this; refusing to reconcile"
-            );
-            return Err(SyncError::Internal(anyhow::anyhow!(
-                "project '{}' is missing organization_resource_uid; bootstrap must backfill before reconciliation",
-                project.name,
-            )));
-        }
-    };
-
-    let org_class = state
-        .org_controller_class_cache
+    let view = state
+        .org_view_cache
         .try_get_with(
-            project_org_uid,
-            load_org_controller_class(state.resource_store.clone(), project_org_uid),
+            org_uid,
+            load_org_view(state.resource_store.clone(), org_uid),
         )
         .await
         .map_err(|e| {
             SyncError::Internal(anyhow::anyhow!(
-                "Failed to load Organization {project_org_uid} for project '{}': {e}",
+                "Failed to load Organization {org_uid} for project '{}': {e}",
                 project.name,
             ))
         })?;
 
-    match check_controller_class(Some(configured), org_class.as_deref()) {
+    match check_controller_class(Some(configured), view.controller_class.as_deref()) {
         Ok(()) => Ok(()),
         Err(()) => Err(SyncError::WrongController {
             project: project.name.clone(),
             configured: configured.to_string(),
-            org_class,
+            org_class: view.controller_class,
         }),
     }
 }

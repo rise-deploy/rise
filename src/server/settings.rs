@@ -1253,6 +1253,7 @@ impl Settings {
             ref environment_ingress_url_template,
             ref access_classes,
             ref extra_service_token_audiences,
+            ref controller_class_name,
             ..
         }) = settings.deployment_controller
         {
@@ -1260,6 +1261,11 @@ impl Settings {
                 production_ingress_url_template,
                 "production_ingress_url_template",
                 "{project_name}",
+            )?;
+
+            Self::validate_label_value(
+                controller_class_name,
+                "deployment_controller.controller_class_name",
             )?;
 
             if let Some(ref staging_template) = staging_ingress_url_template {
@@ -1345,6 +1351,50 @@ impl Settings {
                 field_name, required_placeholder, format_str
             )));
         }
+        Ok(())
+    }
+
+    /// Validate that a string is a valid Kubernetes label value.
+    ///
+    /// Kubernetes label values must match the regex
+    /// `^[A-Za-z0-9]([A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$`, i.e. they must be
+    /// 1-63 characters long, start and end with an alphanumeric character, and
+    /// only contain alphanumerics, '-', '_', and '.'. Notably, '/' is not
+    /// permitted — stamping a value with '/' onto a label causes the API
+    /// server to reject the object with `FieldValueInvalid`.
+    fn validate_label_value(value: &str, field_name: &str) -> Result<(), ConfigError> {
+        let label_value_re = regex::Regex::new(r"^[A-Za-z0-9]([A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$")
+            .map_err(|e| {
+                ConfigError::Message(format!("Failed to compile label value regex: {}", e))
+            })?;
+
+        if value.is_empty() {
+            return Err(ConfigError::Message(format!(
+                "'{}' must be a valid Kubernetes label value (length 1-63); got empty string. \
+                 Note: '/' is not permitted in label values.",
+                field_name
+            )));
+        }
+
+        if value.len() > 63 {
+            return Err(ConfigError::Message(format!(
+                "'{}' must be a valid Kubernetes label value (length 1-63); got '{}' ({} chars). \
+                 Note: '/' is not permitted in label values.",
+                field_name,
+                value,
+                value.len()
+            )));
+        }
+
+        if !label_value_re.is_match(value) {
+            return Err(ConfigError::Message(format!(
+                "'{}' must be a valid Kubernetes label value matching \
+                 '^[A-Za-z0-9]([A-Za-z0-9_.-]{{0,61}}[A-Za-z0-9])?$'; got '{}'. \
+                 Note: '/' is not permitted in label values.",
+                field_name, value
+            )));
+        }
+
         Ok(())
     }
 }
@@ -1488,6 +1538,64 @@ unknown_top_level: "also unknown"
         assert!(error
             .to_string()
             .contains("extra_service_token_audiences token name 'vault/token' is invalid"));
+    }
+
+    #[test]
+    fn controller_class_name_default_is_valid() {
+        // The literal default value used when no override is configured must pass
+        // the label-value validation. Keep this in sync with
+        // `default_controller_class_name`.
+        let default_value = default_controller_class_name();
+        Settings::validate_label_value(
+            &default_value,
+            "deployment_controller.controller_class_name",
+        )
+        .expect("default controller_class_name must be a valid Kubernetes label value");
+    }
+
+    #[test]
+    fn controller_class_name_with_slash_rejects() {
+        let error = Settings::validate_label_value(
+            "my/class",
+            "deployment_controller.controller_class_name",
+        )
+        .expect_err("controller_class_name with '/' must be rejected");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("deployment_controller.controller_class_name"),
+            "error message should name the field, got: {}",
+            message
+        );
+        assert!(
+            message.contains("my/class"),
+            "error message should include the invalid value, got: {}",
+            message
+        );
+        assert!(
+            message.contains("'/'"),
+            "error message should mention that '/' is not permitted, got: {}",
+            message
+        );
+    }
+
+    #[test]
+    fn controller_class_name_empty_rejects() {
+        let error =
+            Settings::validate_label_value("", "deployment_controller.controller_class_name")
+                .expect_err("empty controller_class_name must be rejected");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("deployment_controller.controller_class_name"),
+            "error message should name the field, got: {}",
+            message
+        );
+        assert!(
+            message.contains("empty") || message.contains("1-63"),
+            "error message should mention length/empty, got: {}",
+            message
+        );
     }
 
     #[test]

@@ -71,25 +71,15 @@ pub struct AppState {
     /// Kubernetes deployment controller is configured.
     #[cfg(feature = "backend")]
     pub deployment_controller_class_name: Option<String>,
-    /// Short-TTL cache for `Organization.spec.deploymentControllerClass`
-    /// keyed by Organization UID. Backs the per-sync controller-class check
-    /// in the Metacontroller webhook so it does not re-read the
-    /// Organization row from the store on every reconcile of every project.
-    /// `Some(class)` / `None` distinguishes "Org found, class unset". TTL is
-    /// short (30s) so a controller-class change on the Org propagates within
-    /// roughly a single resync window. Org-missing is treated as an error
-    /// and is never cached.
+    /// Short-TTL cache of the per-Org fields the webhook reads on every
+    /// sync (`spec.deploymentControllerClass`, resolved namespace prefix).
+    /// 30s TTL means a change to either propagates within roughly one
+    /// resync window. Org-missing is treated as an error and is never
+    /// cached (`try_get_with` won't memoise an Err).
     #[cfg(feature = "backend")]
-    pub org_controller_class_cache: Arc<moka::future::Cache<uuid::Uuid, Option<String>>>,
-    /// Short-TTL cache for an Organization's resolved namespace prefix
-    /// (`kubernetes.rise.dev/namespace-prefix` annotation, or
-    /// `org-{discriminator}-` fallback), keyed by Organization UID. Used
-    /// by the Metacontroller webhook to format per-project namespaces
-    /// without re-reading the Org resource on every sync. Mirrors
-    /// `org_controller_class_cache` exactly (30s TTL, 1024-entry cap);
-    /// Org-missing surfaces as `Err` and is not cached.
-    #[cfg(feature = "backend")]
-    pub org_namespace_prefix_cache: Arc<moka::future::Cache<uuid::Uuid, String>>,
+    pub org_view_cache: Arc<
+        moka::future::Cache<uuid::Uuid, crate::server::deployment::webhook::CachedOrganizationView>,
+    >,
     pub auth_settings: Arc<AuthSettings>,
     pub server_settings: Arc<ServerSettings>,
     pub token_store: Arc<dyn TokenStore>,
@@ -1041,25 +1031,14 @@ impl AppState {
         );
         tracing::info!("Initialized encrypt endpoint rate limiter (100 req/hour per user)");
 
-        // Cache for Organization.spec.deploymentControllerClass keyed by Org UID.
-        // 30s TTL so an operator's controller_class change propagates within a
-        // few resync windows; 1024-entry cap is well above any realistic Org
-        // count and bounds memory if abused.
+        // Combined per-Org view cache keyed by Org UID. Holds the fields
+        // the webhook reads on every sync (`spec.deploymentControllerClass`,
+        // resolved namespace prefix) so the controller hits the resource
+        // store at most once per Org per 30s window. 1024-entry cap is
+        // well above any realistic Org count and bounds memory if abused.
+        // Org-missing surfaces as `Err` and is not cached.
         #[cfg(feature = "backend")]
-        let org_controller_class_cache = Arc::new(
-            moka::future::Cache::builder()
-                .time_to_live(Duration::from_secs(30))
-                .max_capacity(1024)
-                .build(),
-        );
-
-        // Cache for the per-Organization resolved namespace prefix
-        // (annotation or `org-{discriminator}-` fallback) keyed by Org
-        // UID. Mirrors `org_controller_class_cache` exactly — a change to
-        // the annotation propagates within ~30s without any manual
-        // invalidation. Org-missing is treated as an error and not cached.
-        #[cfg(feature = "backend")]
-        let org_namespace_prefix_cache = Arc::new(
+        let org_view_cache = Arc::new(
             moka::future::Cache::builder()
                 .time_to_live(Duration::from_secs(30))
                 .max_capacity(1024)
@@ -1137,9 +1116,7 @@ impl AppState {
             #[cfg(feature = "backend")]
             deployment_controller_class_name,
             #[cfg(feature = "backend")]
-            org_controller_class_cache,
-            #[cfg(feature = "backend")]
-            org_namespace_prefix_cache,
+            org_view_cache,
             auth_settings,
             server_settings,
             token_store,

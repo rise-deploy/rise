@@ -2133,6 +2133,117 @@ mod dispatch_tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    #[sqlx::test]
+    async fn delete_organization_with_only_membership_yields_409(pool: sqlx::PgPool) {
+        // Regression guard for commit 15a9144: an Organization whose only
+        // typed-table child is a `user_organization_memberships` row (no team,
+        // no project) must still surface 409. Without it, deleting the Org
+        // would orphan the membership row (no FK back to
+        // `resource_store.resources`).
+
+        let ctx = ctx(pool.clone()).await;
+
+        // Create an Organization through the store (operator-only API,
+        // bypassing the typed `delete_resource` path until we exercise it).
+        let org_spec = json!({
+            "displayName": "Membership Guard Test",
+        });
+        let org = ctx
+            .store
+            .create(CreateResourceParams {
+                api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
+                kind: rise_resource_api::ORGANIZATION_KIND.to_string(),
+                name: "membership-guard-test".to_string(),
+                parent_uid: None,
+                annotations: BTreeMap::new(),
+                finalizers: vec![],
+                spec: org_spec,
+                validator: Some(Arc::new(rise_resource_store::OrganizationValidator)),
+            })
+            .await
+            .expect("create organization");
+
+        // Seed a user, then link it to the Organization via the memberships
+        // join table. No team or project rows reference this Organization.
+        let user_id =
+            sqlx::query_scalar::<_, Uuid>("INSERT INTO users (email) VALUES ($1) RETURNING id")
+                .bind(format!("membership-{}@example.com", Uuid::new_v4()))
+                .fetch_one(&pool)
+                .await
+                .expect("seed user");
+        sqlx::query(
+            "INSERT INTO user_organization_memberships (user_id, organization_resource_uid) \
+             VALUES ($1, $2)",
+        )
+        .bind(user_id)
+        .bind(org.uid)
+        .execute(&pool)
+        .await
+        .expect("seed membership");
+
+        // Attempt to delete the Organization — the guard must surface 409.
+        let err = dispatch_delete_inner(
+            &ctx,
+            format!(
+                "{}/{}/{}/{}",
+                rise_resource_api::API_VERSION_V1ALPHA1
+                    .split_once('/')
+                    .unwrap()
+                    .0,
+                rise_resource_api::API_VERSION_V1ALPHA1
+                    .split_once('/')
+                    .unwrap()
+                    .1,
+                rise_resource_api::ORGANIZATION_COLLECTION,
+                org.name,
+            ),
+            auth(OPERATOR),
+        )
+        .await
+        .expect_err("organization with only-membership children must be 409");
+        assert_eq!(err.status, StatusCode::CONFLICT);
+
+        // Verify the row is still there.
+        assert!(ctx.store.get(org.uid).await.unwrap().is_some());
+
+        // Cleanup the linkage. After clearing it, the delete should succeed.
+        sqlx::query(
+            "DELETE FROM user_organization_memberships \
+             WHERE user_id = $1 AND organization_resource_uid = $2",
+        )
+        .bind(user_id)
+        .bind(org.uid)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let resp = dispatch_delete_inner(
+            &ctx,
+            format!(
+                "{}/{}/{}/{}",
+                rise_resource_api::API_VERSION_V1ALPHA1
+                    .split_once('/')
+                    .unwrap()
+                    .0,
+                rise_resource_api::API_VERSION_V1ALPHA1
+                    .split_once('/')
+                    .unwrap()
+                    .1,
+                rise_resource_api::ORGANIZATION_COLLECTION,
+                org.name,
+            ),
+            auth(OPERATOR),
+        )
+        .await
+        .expect("delete must succeed once the membership is gone");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     // -------------------------------------------------------------------------
     // Body / type-identity validation
     // -------------------------------------------------------------------------
