@@ -414,12 +414,9 @@ mod tests {
 
     #[test]
     fn build_organization_spec_includes_controller_class() {
-        let spec = build_organization_spec("Default", Some("kubernetes.rise.dev/default"));
+        let spec = build_organization_spec("Default", Some("default"));
         assert_eq!(spec.display_name, "Default");
-        assert_eq!(
-            spec.deployment_controller_class.as_deref(),
-            Some("kubernetes.rise.dev/default")
-        );
+        assert_eq!(spec.deployment_controller_class.as_deref(), Some("default"));
     }
 
     #[test]

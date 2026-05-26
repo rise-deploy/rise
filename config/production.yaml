@@ -57,7 +57,7 @@ deployment_controller:
   # Must match `metacontroller.controllerClass` in the helm chart; otherwise
   # RiseProject CR labels and the CompositeController labelSelector drift and
   # Metacontroller stops reconciling.
-  controller_class_name: "${RISE_CONTROLLER_CLASS_NAME:-kubernetes.rise.dev/default}"
+  controller_class_name: "${RISE_CONTROLLER_CLASS_NAME:-default}"
   auth_backend_url: "${RISE_AUTH_BACKEND_URL}"
   auth_signin_url: "${PUBLIC_URL}"
   # Optional extra projected service account tokens mounted in every app pod at

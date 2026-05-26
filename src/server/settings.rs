@@ -371,7 +371,7 @@ fn default_namespace_format() -> String {
 }
 
 fn default_controller_class_name() -> String {
-    "kubernetes.rise.dev/default".to_string()
+    "default".to_string()
 }
 
 fn default_default_organization_name() -> String {
@@ -736,8 +736,10 @@ pub enum DeploymentControllerSettings {
         /// default Organization's `spec.deploymentControllerClass` at startup.
         /// The Kubernetes controller only reconciles projects whose
         /// Organization's `spec.deploymentControllerClass` matches this value.
-        /// Defaults to `kubernetes.rise.dev/default` to keep existing installs
-        /// working without explicit configuration.
+        /// Stamped as a value of the `rise.dev/controller-class` label on
+        /// each `RiseProject` CR, so it must be a valid Kubernetes label
+        /// value (alphanumeric / `-` / `_` / `.`, no `/`). Defaults to
+        /// `default`.
         #[serde(default = "default_controller_class_name")]
         controller_class_name: String,
 

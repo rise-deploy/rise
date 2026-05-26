@@ -313,8 +313,8 @@
               "type": "string"
             },
             "controller_class_name": {
-              "default": "kubernetes.rise.dev/default",
-              "description": "Stable identifier for this deployment controller, written to the\ndefault Organization's `spec.deploymentControllerClass` at startup.\nThe Kubernetes controller only reconciles projects whose\nOrganization's `spec.deploymentControllerClass` matches this value.\nDefaults to `kubernetes.rise.dev/default` to keep existing installs\nworking without explicit configuration.",
+              "default": "default",
+              "description": "Stable identifier for this deployment controller, written to the\ndefault Organization's `spec.deploymentControllerClass` at startup.\nThe Kubernetes controller only reconciles projects whose\nOrganization's `spec.deploymentControllerClass` matches this value.\nStamped as a value of the `rise.dev/controller-class` label on\neach `RiseProject` CR, so it must be a valid Kubernetes label\nvalue (alphanumeric / `-` / `_` / `.`, no `/`). Defaults to\n`default`.",
               "type": "string"
             },
             "custom_domain_ingress_annotations": {

@@ -92,7 +92,7 @@ deployment_controller:
   # RiseProject CR labels and the CompositeController labelSelector drift and
   # Metacontroller stops reconciling. Default value of the field is the same,
   # set here explicitly so the alignment is visible.
-  controller_class_name: "kubernetes.rise.dev/default"
+  controller_class_name: "default"
   # metacontroller_pod_namespace is intentionally absent in development:
   # Rise runs on the host (outside the cluster), so source-IP validation is skipped.
   production_ingress_url_template: "{project_name}.rise.local"
