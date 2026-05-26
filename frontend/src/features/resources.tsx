@@ -873,12 +873,17 @@ export function DomainsList({ projectName, defaultUrl = null }) {
                             </div>
                         </REmpty>
                     ) : (
-                        <table className="r-table">
+                        <table className="r-table r-table-fixed">
+                            <colgroup>
+                                <col />
+                                <col style={{ width: 130 }} />
+                                <col style={{ width: 320 }} />
+                            </colgroup>
                             <thead>
                                 <tr>
                                     <th>Domain</th>
                                     <th>Created</th>
-                                    <th style={{ textAlign: 'right' }}>Actions</th>
+                                    <th></th>
                                 </tr>
                             </thead>
                             <tbody>
