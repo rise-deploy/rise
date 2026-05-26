@@ -1,4 +1,6 @@
-use super::models::{AddCustomDomainRequest, CustomDomainResponse, CustomDomainsResponse};
+use super::models::{
+    AddCustomDomainRequest, CustomDomainResponse, CustomDomainsResponse, UpdateCustomDomainRequest,
+};
 use super::validation;
 use crate::db::models::{CustomDomain, Environment};
 use crate::db::{
@@ -307,6 +309,71 @@ pub async fn delete_custom_domain(
     }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Reassign a custom domain to a different environment.
+pub async fn update_custom_domain(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path((project_id_or_name, domain)): Path<(String, String)>,
+    Json(payload): Json<UpdateCustomDomainRequest>,
+) -> Result<Json<CustomDomainResponse>, ServerError> {
+    let project = if let Ok(uuid) = project_id_or_name.parse() {
+        projects::find_by_id(&state.db_pool, uuid)
+            .await
+            .internal_err("Failed to get project")?
+    } else {
+        projects::find_by_name(&state.db_pool, &project_id_or_name)
+            .await
+            .internal_err("Failed to get project")?
+    }
+    .ok_or_else(|| ServerError::not_found("Project not found"))?;
+
+    let user = auth.user()?;
+    ensure_project_access_or_admin(&state, user, &project).await?;
+
+    let existing = db_custom_domains::get_custom_domain(&state.db_pool, project.id, &domain)
+        .await
+        .internal_err("Failed to look up custom domain")?
+        .ok_or_else(|| ServerError::not_found("Custom domain not found"))?;
+
+    let new_env = resolve_environment(
+        &state.db_pool,
+        project.id,
+        Some(payload.environment.as_str()),
+    )
+    .await?;
+
+    // No-op when the domain already lives on the requested env.
+    if existing.environment_id == new_env.id {
+        return Ok(Json(CustomDomainResponse::from_db_model(
+            &existing,
+            &new_env.name,
+        )));
+    }
+
+    let old_env = env_for_domain(&state.db_pool, &existing).await;
+
+    let updated = db_custom_domains::update_custom_domain_environment(
+        &state.db_pool,
+        project.id,
+        &domain,
+        new_env.id,
+    )
+    .await
+    .internal_err("Failed to move custom domain to new environment")?;
+
+    // Reconcile both the source and the destination so the domain disappears
+    // from the old group's ingress and appears on the new one.
+    if let Some(env) = old_env {
+        reconcile_for_environment(&state, &project.name, &env).await;
+    }
+    reconcile_for_environment(&state, &project.name, &new_env).await;
+
+    Ok(Json(CustomDomainResponse::from_db_model(
+        &updated,
+        &new_env.name,
+    )))
 }
 
 /// Set a custom domain as primary for a project

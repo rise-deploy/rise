@@ -144,6 +144,36 @@ pub async fn get_custom_domains_batch(
     Ok(map)
 }
 
+/// Reassign a custom domain to a different environment. The domain's
+/// `is_primary` flag is cleared as part of the move so the new environment
+/// keeps its own primary intact and the partial unique index doesn't block the
+/// update.
+pub async fn update_custom_domain_environment(
+    pool: &PgPool,
+    project_id: Uuid,
+    domain: &str,
+    new_environment_id: Uuid,
+) -> Result<CustomDomain> {
+    let domain = sqlx::query_as!(
+        CustomDomain,
+        r#"
+        UPDATE project_custom_domains
+        SET environment_id = $3,
+            is_primary = false
+        WHERE project_id = $1 AND domain = $2
+        RETURNING id, project_id, environment_id, domain, is_primary, created_at, updated_at
+        "#,
+        project_id,
+        domain,
+        new_environment_id
+    )
+    .fetch_one(pool)
+    .await
+    .context("Failed to update custom domain environment")?;
+
+    Ok(domain)
+}
+
 /// Set a custom domain as primary within its environment.
 /// Unsets any existing primary domain in the same environment.
 pub async fn set_primary_domain(

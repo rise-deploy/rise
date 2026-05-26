@@ -10,6 +10,14 @@ pub struct AddCustomDomainRequest {
     pub environment: Option<String>,
 }
 
+/// Request to update a custom domain's environment assignment. The domain
+/// itself isn't editable (it's the natural identity within a project).
+#[derive(Debug, Deserialize)]
+pub struct UpdateCustomDomainRequest {
+    /// New environment name. Required.
+    pub environment: String,
+}
+
 /// API response for a single custom domain
 #[derive(Debug, Serialize)]
 pub struct CustomDomainResponse {

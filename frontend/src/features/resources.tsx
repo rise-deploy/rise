@@ -635,6 +635,9 @@ export function DomainsList({ projectName, defaultUrl = null }) {
     const [isModalOpen, setIsModalOpen] = useState(false);
     const productionEnvName = environments.find(e => e.is_production)?.name || 'production';
     const [formData, setFormData] = useState({ domain: '', environment: productionEnvName });
+    const [editingDomain, setEditingDomain] = useState(null);
+    const [editEnvironment, setEditEnvironment] = useState('');
+    const [editSaving, setEditSaving] = useState(false);
     const [confirmDialogOpen, setConfirmDialogOpen] = useState(false);
     const [domainToDelete, setDomainToDelete] = useState(null);
     const [deleting, setDeleting] = useState(false);
@@ -649,10 +652,10 @@ export function DomainsList({ projectName, defaultUrl = null }) {
         try {
             const [domainsResp, envsResp] = await Promise.all([
                 api.getProjectDomains(projectName),
-                api.getProjectEnvironments(projectName).catch(() => ({ environments: [] })),
+                api.getProjectEnvironments(projectName).catch(() => []),
             ]);
             setDomains(domainsResp.domains || []);
-            setEnvironments(envsResp.environments || []);
+            setEnvironments(Array.isArray(envsResp) ? envsResp : (envsResp?.environments || []));
             setLoading(false);
         } catch (err) {
             setError(err.message);
@@ -672,6 +675,30 @@ export function DomainsList({ projectName, defaultUrl = null }) {
     const handleDeleteClick = (domain) => {
         setDomainToDelete(domain);
         setConfirmDialogOpen(true);
+    };
+
+    const handleEditClick = (domain) => {
+        setEditingDomain(domain);
+        setEditEnvironment(domain.environment || productionEnvName);
+    };
+
+    const handleEditSave = async () => {
+        if (!editingDomain || !editEnvironment) return;
+        if (editEnvironment === editingDomain.environment) {
+            setEditingDomain(null);
+            return;
+        }
+        setEditSaving(true);
+        try {
+            await api.updateCustomDomainEnvironment(projectName, editingDomain.domain, editEnvironment);
+            showToast(`Moved ${editingDomain.domain} to ${editEnvironment}`, 'success');
+            setEditingDomain(null);
+            loadDomains();
+        } catch (err) {
+            showToast(`Failed to move domain: ${err.message}`, 'error');
+        } finally {
+            setEditSaving(false);
+        }
     };
 
     const handleSave = async () => {
@@ -843,6 +870,14 @@ export function DomainsList({ projectName, defaultUrl = null }) {
                                             >
                                                 {domain.is_primary ? 'Unset primary' : 'Set primary'}
                                             </RButton>
+                                            <RButton
+                                                size="sm"
+                                                icon="edit"
+                                                onClick={() => handleEditClick(domain)}
+                                                disabled={environments.length === 0}
+                                            >
+                                                Edit
+                                            </RButton>
                                             <RButton size="sm" variant="danger" icon="trash" onClick={() => handleDeleteClick(domain)}>
                                                 Delete
                                             </RButton>
@@ -892,6 +927,37 @@ export function DomainsList({ projectName, defaultUrl = null }) {
                 <p className="text-sm text-gray-600 dark:text-gray-500">
                     <strong>Note:</strong> Make sure to configure your DNS to point this domain to your Rise deployment before adding it.
                     The domain rides on the ingress for whichever deployment group is primary for the selected environment.
+                </p>
+            </RModal>
+
+            <RModal
+                isOpen={editingDomain !== null}
+                onClose={() => setEditingDomain(null)}
+                title={editingDomain ? `Edit ${editingDomain.domain}` : 'Edit domain'}
+                footer={
+                    <>
+                        <RButton onClick={() => setEditingDomain(null)} disabled={editSaving}>Cancel</RButton>
+                        <RButton variant="primary" onClick={handleEditSave} loading={editSaving}>
+                            Save
+                        </RButton>
+                    </>
+                }
+            >
+                <RField label="Environment">
+                    <RCombobox
+                        value={editEnvironment}
+                        onChange={(v) => setEditEnvironment(v)}
+                        options={environments.map(env => ({
+                            value: env.name,
+                            label: env.name,
+                            icon: <EnvironmentColorDot color={env.color} size="0.7rem" />,
+                        }))}
+                        placeholder="Select environment"
+                    />
+                </RField>
+                <p className="text-sm text-gray-600 dark:text-gray-500">
+                    Moving a domain to a different environment reassigns it to that environment's primary deployment group.
+                    The primary flag is cleared on move — re-set it from the new environment if needed.
                 </p>
             </RModal>
 

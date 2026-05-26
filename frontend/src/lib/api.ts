@@ -292,6 +292,13 @@ class RiseAPI {
         });
     }
 
+    async updateCustomDomainEnvironment(projectName, domain, environment) {
+        return this.request(`/projects/${projectName}/domains/${encodeURIComponent(domain)}`, {
+            method: 'PATCH',
+            body: JSON.stringify({ environment })
+        });
+    }
+
     async setCustomDomainPrimary(projectName, domain) {
         return this.request(`/projects/${projectName}/domains/${encodeURIComponent(domain)}/primary`, {
             method: 'PUT'
