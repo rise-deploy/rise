@@ -707,7 +707,7 @@ async fn check_pod_errors_via_kube(
                     } else if let Some(running) = &state.running {
                         Some(serde_json::json!({
                             "state_type": "running",
-                            "reason": running.started_at.as_ref().map(|t| t.0.to_string()),
+                            "started_at": running.started_at.as_ref().map(|t| t.0.to_string()),
                         }))
                     } else if let Some(terminated) = &state.terminated {
                         // Check terminated with too many restarts (skip for terminating pods)
@@ -730,6 +730,8 @@ async fn check_pod_errors_via_kube(
                             "reason": terminated.reason,
                             "message": terminated.message,
                             "exit_code": terminated.exit_code,
+                            "started_at": terminated.started_at.as_ref().map(|t| t.0.to_string()),
+                            "finished_at": terminated.finished_at.as_ref().map(|t| t.0.to_string()),
                         }))
                     } else {
                         None
@@ -762,6 +764,8 @@ async fn check_pod_errors_via_kube(
                             "reason": terminated.reason,
                             "message": terminated.message,
                             "exit_code": terminated.exit_code,
+                            "started_at": terminated.started_at.as_ref().map(|t| t.0.to_string()),
+                            "finished_at": terminated.finished_at.as_ref().map(|t| t.0.to_string()),
                         }))
                     } else if let Some(waiting) = &last_state.waiting {
                         Some(serde_json::json!({

@@ -1100,6 +1100,8 @@ interface ContainerState {
     reason?: string;
     message?: string;
     exit_code?: number;
+    started_at?: string;
+    finished_at?: string;
 }
 
 interface ContainerStatusInfo {
@@ -1149,26 +1151,22 @@ function PodInfoRow({ pod }: { pod: PodInfo }) {
 
     const isGone = pod.terminating || pod.terminated;
 
-    // Collect unique notable last_state reasons across all containers (e.g. OOMKilled)
-    const lastStateReasons: string[] = [];
+    // One badge per unique last_state reason across containers (e.g. OOMKilled).
+    // Keep the most-recent finished_at so the pill can show how long ago it happened.
+    const lastStateBadges: { reason: string; finishedAt?: string }[] = [];
     if (!isGone && pod.containers) {
         for (const c of pod.containers) {
             const reason = getLastStateReason(c);
-            if (reason && !lastStateReasons.includes(reason)) {
-                lastStateReasons.push(reason);
+            if (!reason) continue;
+            const finishedAt = c.last_state?.finished_at;
+            const existing = lastStateBadges.find(b => b.reason === reason);
+            if (!existing) {
+                lastStateBadges.push({ reason, finishedAt });
+            } else if (finishedAt && (!existing.finishedAt || finishedAt > existing.finishedAt)) {
+                existing.finishedAt = finishedAt;
             }
         }
     }
-
-    // Terminating/terminated pods: suppress issue indicators (not-ready is expected)
-    const hasIssues = !isGone && (
-                      pod.events?.length > 0 ||
-                      pod.containers?.some(c =>
-                          !c.ready ||
-                          c.restart_count > 0 ||
-                          (c.last_state?.state_type === 'terminated' && (c.last_state.reason || (c.last_state.exit_code !== undefined && c.last_state.exit_code !== 0)))
-                      ) ||
-                      pod.conditions?.some(c => c.status === 'False'));
 
     const phaseStatus = {
         Running: 'running',
@@ -1202,30 +1200,33 @@ function PodInfoRow({ pod }: { pod: PodInfo }) {
                     boxSizing: 'border-box',
                 }}
             >
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4, flexWrap: 'wrap' }}>
-                            <span className="mono" style={{ fontSize: 12, fontWeight: 600 }}>{pod.name}</span>
-                            <span className={`r-status ${statusKey}`}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+                    <div style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                        <span className="mono" style={{ fontSize: 12, fontWeight: 600 }}>{pod.name}</span>
+                        <span className={`r-status ${statusKey}`}>
+                            <span className="dot" />
+                            <span>{displayPhase}</span>
+                        </span>
+                        {lastStateBadges.map(({ reason, finishedAt }) => (
+                            <span
+                                key={reason}
+                                className="r-status bad"
+                                title={finishedAt ? formatISO8601(finishedAt) : undefined}
+                            >
                                 <span className="dot" />
-                                <span>{displayPhase}</span>
-                            </span>
-                            {hasIssues && (
-                                <span style={{ color: 'var(--err)', fontSize: 12 }} title="Pod has issues">⚠</span>
-                            )}
-                            {lastStateReasons.map((reason) => (
-                                <span key={reason} className="r-status bad">
-                                    <span className="dot" />
-                                    <span>{reason}</span>
+                                <span>
+                                    {reason}
+                                    {finishedAt && ` · ${formatRelativeTimeRounded(finishedAt)}`}
                                 </span>
-                            ))}
-                        </div>
-                        <div style={{ fontSize: 11.5, color: 'var(--text-soft)' }}>
-                            {pod.containers?.length || 0} container(s) •{' '}
-                            {pod.containers?.filter(c => c.ready).length || 0} ready
-                        </div>
+                            </span>
+                        ))}
                     </div>
-                    <Icon name="chev" size={12} className="chev" style={{ transform: expanded ? 'rotate(90deg)' : 'none', transition: 'transform .15s', color: 'var(--text-soft)' }} />
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexShrink: 0 }}>
+                        <div style={{ fontSize: 11.5, color: 'var(--text-soft)', whiteSpace: 'nowrap' }}>
+                            {pod.containers?.filter(c => c.ready).length || 0}/{pod.containers?.length || 0} ready
+                        </div>
+                        <Icon name="chev" size={12} className="chev" style={{ transform: expanded ? 'rotate(90deg)' : 'none', transition: 'transform .15s', color: 'var(--text-soft)' }} />
+                    </div>
                 </div>
             </button>
 
@@ -1237,14 +1238,16 @@ function PodInfoRow({ pod }: { pod: PodInfo }) {
                             <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-soft)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
                                 Containers
                             </div>
-                            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: 10 }}>
                                 {pod.containers.map((container, idx) => {
                                     const lastStateReason = getLastStateReason(container);
+                                    const lastFinishedAt = container.last_state?.finished_at;
                                     const hasLastStateIssue = lastStateReason != null || (
                                         container.last_state?.state_type === 'terminated' &&
                                         container.last_state.exit_code !== undefined &&
                                         container.last_state.exit_code !== 0
                                     );
+                                    const runningSince = container.state?.state_type === 'running' ? container.state.started_at : undefined;
                                     return (
                                         <div
                                             key={idx}
@@ -1260,9 +1263,15 @@ function PodInfoRow({ pod }: { pod: PodInfo }) {
                                                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', minWidth: 0 }}>
                                                     <span className="mono">{container.name}</span>
                                                     {lastStateReason && (
-                                                        <span className="r-status bad">
+                                                        <span
+                                                            className="r-status bad"
+                                                            title={lastFinishedAt ? formatISO8601(lastFinishedAt) : undefined}
+                                                        >
                                                             <span className="dot" />
-                                                            <span>{lastStateReason}</span>
+                                                            <span>
+                                                                {lastStateReason}
+                                                                {lastFinishedAt && ` · ${formatRelativeTimeRounded(lastFinishedAt)}`}
+                                                            </span>
                                                         </span>
                                                     )}
                                                 </div>
@@ -1279,6 +1288,11 @@ function PodInfoRow({ pod }: { pod: PodInfo }) {
                                                 <div style={{ color: 'var(--text-muted)' }}>
                                                     State: {container.state.state_type}
                                                     {container.state.reason && ` (${container.state.reason})`}
+                                                </div>
+                                            )}
+                                            {runningSince && (
+                                                <div style={{ color: 'var(--text-muted)' }} title={formatISO8601(runningSince)}>
+                                                    Started {formatRelativeTimeRounded(runningSince)}
                                                 </div>
                                             )}
                                             {container.state?.message && (
@@ -1300,6 +1314,11 @@ function PodInfoRow({ pod }: { pod: PodInfo }) {
                                                         {container.last_state.state_type}
                                                         {container.last_state.reason && ` (${container.last_state.reason})`}
                                                     </div>
+                                                    {lastFinishedAt && (
+                                                        <div style={{ color: 'var(--text-muted)' }} title={formatISO8601(lastFinishedAt)}>
+                                                            Ended {formatRelativeTimeRounded(lastFinishedAt)}
+                                                        </div>
+                                                    )}
                                                     {container.last_state.exit_code !== undefined && (
                                                         <div style={{ color: 'var(--text-muted)' }}>
                                                             Exit code: {container.last_state.exit_code}
@@ -1319,22 +1338,38 @@ function PodInfoRow({ pod }: { pod: PodInfo }) {
                         </div>
                     )}
 
-                    {/* Pod conditions */}
+                    {/* Pod conditions: one pill per condition (green=True, red=False),
+                        with reason/message expanded below for any False condition. */}
                     {pod.conditions && pod.conditions.length > 0 && (
                         <div style={{ marginBottom: 12 }}>
                             <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-soft)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
                                 Conditions
                             </div>
-                            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                                {pod.conditions.map((condition, idx) => (
-                                    <div key={idx} style={{ fontSize: 12, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                                        <span>{condition.type}</span>
-                                        <span style={{ color: condition.status === 'True' ? 'var(--ok)' : 'var(--err)', fontWeight: 500 }}>
-                                            {condition.status}
+                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                                {pod.conditions.map((condition, idx) => {
+                                    const ok = condition.status === 'True';
+                                    return (
+                                        <span
+                                            key={idx}
+                                            className={`r-status ${ok ? 'ok' : 'bad'}`}
+                                            title={condition.message || condition.reason || undefined}
+                                        >
+                                            <span className="dot" />
+                                            <span>
+                                                {condition.type}
+                                                {!ok && ` (${condition.status})`}
+                                            </span>
                                         </span>
-                                    </div>
-                                ))}
+                                    );
+                                })}
                             </div>
+                            {pod.conditions.filter(c => c.status !== 'True' && (c.reason || c.message)).map((condition, idx) => (
+                                <div key={`detail-${idx}`} style={{ fontSize: 12, color: 'var(--err)', marginTop: 6, paddingLeft: 2 }}>
+                                    <span style={{ fontWeight: 600 }}>{condition.type}</span>
+                                    {condition.reason && <span> · {condition.reason}</span>}
+                                    {condition.message && <div className="mono" style={{ color: 'var(--text-muted)', marginTop: 2 }}>{condition.message}</div>}
+                                </div>
+                            ))}
                         </div>
                     )}
 
@@ -1401,15 +1436,30 @@ function PodStatusSection({ podStatus }: { podStatus: PodStatus }) {
         </div>
     );
 
+    // Tick once per second so "Updated Xs ago" stays current between the 5s deployment poll.
+    const [, setTick] = useState(0);
+    useEffect(() => {
+        const id = setInterval(() => setTick(t => t + 1), 1000);
+        return () => clearInterval(id);
+    }, []);
+
     return (
         <Panel>
             <PanelHead
                 title="Pod status"
                 right={
-                    <span className={`r-status ${replicaTone === 'ok' ? 'running' : replicaTone === 'warn' ? 'warn' : 'failed'}`}>
-                        <span className="dot" />
-                        <span>{podStatus.ready_replicas}/{podStatus.desired_replicas} ready</span>
-                    </span>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                        <span
+                            style={{ fontSize: 11.5, color: 'var(--text-soft)', whiteSpace: 'nowrap' }}
+                            title={formatISO8601(podStatus.last_checked)}
+                        >
+                            Updated {formatRelativeTimeRounded(podStatus.last_checked)}
+                        </span>
+                        <span className={`r-status ${replicaTone === 'ok' ? 'running' : replicaTone === 'warn' ? 'warn' : 'failed'}`}>
+                            <span className="dot" />
+                            <span>{podStatus.ready_replicas}/{podStatus.desired_replicas} ready</span>
+                        </span>
+                    </div>
                 }
             />
             <PanelBody style={{ padding: 0 }}>
@@ -1446,10 +1496,6 @@ function PodStatusSection({ podStatus }: { podStatus: PodStatus }) {
                         </div>
                     </>
                 )}
-
-                <div style={{ padding: '10px 16px', fontSize: 11.5, color: 'var(--text-soft)' }}>
-                    Last checked: {formatRelativeTimeRounded(podStatus.last_checked)}
-                </div>
             </PanelBody>
         </Panel>
     );
