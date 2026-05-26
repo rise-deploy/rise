@@ -85,7 +85,7 @@ deployment_controller:
   # Rise runs on the host (outside the cluster), so source-IP validation is skipped.
   production_ingress_url_template: "{project_name}.rise.local"
   staging_ingress_url_template: "{deployment_group}--{project_name}.preview.rise.local"
-  environment_ingress_url_template: "{environment}--{project_name}.preview.rise.local"
+  environment_ingress_url_template: "{environment}--{project_name}.env.rise.local"
   namespace_format: "rise-{project_name}"
   auth_backend_url: "${RISE_AUTH_BACKEND_URL:-http://host.minikube.internal:3000}" # URL for Nginx auth subrequests, must be reachable from ingress-nginx pods
   auth_signin_url: "http://rise.local:3000" # Domain for user-facing OAuth redirects, must be resolvable by users' browsers

@@ -13,7 +13,9 @@ pub fn routes() -> Router<AppState> {
         )
         .route(
             "/projects/{project_id_or_name}/domains/{domain}",
-            get(handlers::get_custom_domain).delete(handlers::delete_custom_domain),
+            get(handlers::get_custom_domain)
+                .patch(handlers::update_custom_domain)
+                .delete(handlers::delete_custom_domain),
         )
         .route(
             "/projects/{project_id_or_name}/domains/{domain}/primary",

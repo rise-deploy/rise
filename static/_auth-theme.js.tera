@@ -1,0 +1,26 @@
+(function () {
+    var root = document.documentElement;
+    var prefs = {};
+    var palettes = ["mint", "indigo", "ember", "slate"];
+    var themes = ["system", "light", "dark"];
+
+    try {
+        var raw = window.localStorage && window.localStorage.getItem("rise.prefs.v1");
+        prefs = raw ? JSON.parse(raw) : {};
+    } catch (_) {
+        prefs = {};
+    }
+
+    var palette = palettes.indexOf(prefs.palette) >= 0 ? prefs.palette : "indigo";
+    var theme = themes.indexOf(prefs.theme) >= 0 ? prefs.theme : "system";
+    var resolvedTheme = theme;
+
+    if (theme === "system") {
+        resolvedTheme = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches
+            ? "dark"
+            : "light";
+    }
+
+    root.dataset.palette = palette;
+    root.classList.toggle("dark", resolvedTheme === "dark");
+})();

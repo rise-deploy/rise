@@ -64,6 +64,12 @@ impl DeploymentBackend for KubernetesBackend {
             None
         };
 
+        // All envs are needed so `compute_deployment_urls` can suppress a DG URL
+        // whose host would collide with another env's URL (see
+        // `host_conflicts_with_other_env`).
+        let all_environments =
+            crate::db::environments::list_for_project(&self.db_pool, project.id).await?;
+
         // Load custom domains for the project
         let custom_domains =
             crate::db::custom_domains::list_project_custom_domains(&self.db_pool, project.id)
@@ -73,6 +79,7 @@ impl DeploymentBackend for KubernetesBackend {
             project,
             deployment,
             environment.as_ref(),
+            &all_environments,
             &custom_domains,
         ))
     }

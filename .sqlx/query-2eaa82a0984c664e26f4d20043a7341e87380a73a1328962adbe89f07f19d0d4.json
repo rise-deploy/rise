@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE project_custom_domains\n        SET is_primary = false\n        WHERE environment_id = $1 AND is_primary = true\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2eaa82a0984c664e26f4d20043a7341e87380a73a1328962adbe89f07f19d0d4"
+}
