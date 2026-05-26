@@ -3,6 +3,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use thiserror::Error;
 use tokio::task::JoinHandle;
@@ -298,11 +299,36 @@ async fn heartbeat_loop(
     loop {
         ticker.tick().await;
         match renew(pool, name, holder_id, lease_duration).await {
-            Ok(true) => {
+            Ok(RenewOutcome::Renewed) => {
                 publish_horizon(lease_valid_until_ms, lease_duration);
             }
-            Ok(false) => {
-                tracing::warn!(lease = %name, "leader lease stolen; stepping down");
+            Ok(RenewOutcome::Expired { expired_at, now }) => {
+                // Our row is still ours but `expires_at` slipped into the
+                // past — typically because the runtime was paused (laptop
+                // sleep, long blocking task) for longer than the lease TTL.
+                // The next acquire attempt will re-take the row.
+                tracing::warn!(
+                    lease = %name,
+                    %expired_at,
+                    %now,
+                    lag_ms = (now - expired_at).num_milliseconds(),
+                    "leader lease expired before renewal (likely runtime stall); stepping down"
+                );
+                break;
+            }
+            Ok(RenewOutcome::TakenByPeer { peer_id }) => {
+                tracing::warn!(
+                    lease = %name,
+                    %peer_id,
+                    "leader lease taken by peer; stepping down"
+                );
+                break;
+            }
+            Ok(RenewOutcome::RowMissing) => {
+                tracing::warn!(
+                    lease = %name,
+                    "leader lease row missing (released externally?); stepping down"
+                );
                 break;
             }
             Err(error) => {
@@ -363,24 +389,69 @@ async fn try_acquire(
     Ok(result == Some(holder_id))
 }
 
+/// Why a renewal attempt finished the way it did. The non-`Renewed` variants
+/// all cause the heartbeat loop to step down, but they describe different
+/// underlying events — see the per-variant docs.
+enum RenewOutcome {
+    /// The UPDATE matched our row and bumped `expires_at`.
+    Renewed,
+    /// Our row is still ours, but `expires_at` was already in the past when
+    /// we tried to renew. Almost always a paused runtime (laptop sleep, long
+    /// blocking task) rather than a peer — no one else has acted yet.
+    Expired {
+        expired_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    },
+    /// The row exists but `holder_id` is now someone else's — a peer
+    /// genuinely took over.
+    TakenByPeer { peer_id: Uuid },
+    /// The row no longer exists. Either we called `release()` or someone
+    /// removed it out-of-band.
+    RowMissing,
+}
+
 async fn renew(
     pool: &PgPool,
     name: &str,
     holder_id: Uuid,
     lease_duration: Duration,
-) -> Result<bool> {
+) -> Result<RenewOutcome> {
     let lease_secs = lease_duration.as_secs_f64();
-    let result = sqlx::query!(
+    let updated = sqlx::query_scalar!(
         "UPDATE leader_leases
          SET heartbeat_at = NOW(), expires_at = NOW() + ($3 * INTERVAL '1 second')
-         WHERE name = $1 AND holder_id = $2 AND expires_at > NOW()",
+         WHERE name = $1 AND holder_id = $2 AND expires_at > NOW()
+         RETURNING holder_id",
         name,
         holder_id,
         lease_secs,
     )
-    .execute(pool)
+    .fetch_optional(pool)
     .await?;
-    Ok(result.rows_affected() == 1)
+    if updated == Some(holder_id) {
+        return Ok(RenewOutcome::Renewed);
+    }
+
+    // Renewal failed — one extra round-trip to determine why so the log line
+    // is accurate. This path is rare (only on stepdown), so the cost is fine.
+    let current = sqlx::query!(
+        r#"SELECT holder_id, expires_at, NOW() AS "now!" FROM leader_leases WHERE name = $1"#,
+        name,
+    )
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = current else {
+        return Ok(RenewOutcome::RowMissing);
+    };
+    if row.holder_id != holder_id {
+        return Ok(RenewOutcome::TakenByPeer {
+            peer_id: row.holder_id,
+        });
+    }
+    Ok(RenewOutcome::Expired {
+        expired_at: row.expires_at,
+        now: row.now,
+    })
 }
 
 async fn is_held_db_raw(pool: &PgPool, name: &str, holder_id: Uuid) -> Result<bool, sqlx::Error> {
