@@ -15,6 +15,13 @@ server:
 database:
   url: "${DATABASE_URL}"
 
+# Default Organization bootstrapped on startup. `rise-` matches the historic
+# namespace naming every known install uses; clearing this would make the
+# controller fall back to `org-{discriminator}-` and orphan existing
+# namespaces on the first reconciliation.
+default_organization:
+  kubernetes_namespace_prefix: "rise-"
+
 auth:
   issuer: "${OIDC_ISSUER}"
   client_id: "${OIDC_CLIENT_ID:-rise-backend}"

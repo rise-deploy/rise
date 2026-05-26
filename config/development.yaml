@@ -18,6 +18,13 @@ server:
 database:
   url: "${DATABASE_URL}"
 
+# Default Organization bootstrapped on startup. Setting
+# `kubernetes_namespace_prefix: "rise-"` explicitly so dev namespaces keep
+# the historic `rise-{project}` naming; otherwise the controller would fall
+# back to `org-{discriminator}-{project}` and orphan any existing namespaces.
+default_organization:
+  kubernetes_namespace_prefix: "rise-"
+
 encryption:
   type: "aes-gcm-256"
   key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" # Generate with: openssl rand -base64 32

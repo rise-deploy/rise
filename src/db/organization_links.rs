@@ -31,29 +31,6 @@ pub async fn ensure_user_membership(
     Ok(())
 }
 
-/// Check whether the given user is a member of the given organization.
-#[allow(dead_code)]
-pub async fn is_user_member(
-    conn: &mut PgConnection,
-    user_id: Uuid,
-    organization_resource_uid: Uuid,
-) -> Result<bool> {
-    let row = sqlx::query!(
-        r#"
-        SELECT EXISTS(
-            SELECT 1 FROM user_organization_memberships
-            WHERE user_id = $1 AND organization_resource_uid = $2
-        ) as "exists!"
-        "#,
-        user_id,
-        organization_resource_uid
-    )
-    .fetch_one(&mut *conn)
-    .await
-    .context("Failed to look up user organization membership")?;
-    Ok(row.exists)
-}
-
 /// Backfill `organization_resource_uid` on every team that does not have one.
 /// Returns the number of rows updated.
 pub async fn backfill_teams_organization(

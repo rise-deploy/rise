@@ -717,11 +717,17 @@ impl AppState {
                 // Always derive the namespace format from the default Organization's
                 // resolved namespace prefix. `resolved_namespace_prefix()` reads the
                 // `kubernetes.rise.dev/namespace-prefix` annotation when present and
-                // falls back to `org-{discriminator}-` otherwise — the legacy
-                // `namespace_format` setting is no longer consulted in the multi-org
-                // world. The configured `namespace_format` is still surfaced in the
-                // log line below for operators investigating naming changes during
-                // the rollout.
+                // otherwise synthesizes `org-{discriminator}-` for the org. The
+                // legacy `namespace_format` setting is no longer consulted; it's
+                // still surfaced in the log line below for operators investigating
+                // naming changes during the rollout.
+                //
+                // Upgrade note: single-org installs that previously named
+                // namespaces `rise-{project_name}` must set
+                // `default_organization.kubernetes_namespace_prefix = "rise-"` so
+                // bootstrap stamps the annotation; otherwise this resolves to
+                // `org-{discriminator}-{project_name}` and orphans the legacy
+                // namespaces on the first reconciliation.
                 let resolved_namespace_format = {
                     let prefix = default_organization_view.resolved_namespace_prefix();
                     let format = format!("{prefix}{{project_name}}");

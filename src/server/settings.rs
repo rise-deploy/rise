@@ -57,10 +57,17 @@ pub struct DefaultOrganizationSettings {
     /// with the same key set here.
     #[serde(default)]
     pub annotations: std::collections::BTreeMap<String, String>,
-    /// Value for the `kubernetes.rise.dev/namespace-prefix` annotation. When
-    /// `None`, the default (`rise-`) is used to preserve the existing
-    /// `rise-{project_name}` namespace naming for installs that previously
-    /// relied on the historic default.
+    /// Value for the `kubernetes.rise.dev/namespace-prefix` annotation on the
+    /// default Organization. When set, bootstrap stamps the annotation with
+    /// this value; when `None`, the annotation is left unset and the
+    /// Kubernetes controller falls back to `org-{discriminator}-` (see
+    /// [`crate::server::bootstrap::DefaultOrganizationView::resolved_namespace_prefix`]).
+    ///
+    /// Upgrade note: installs that previously relied on the historic
+    /// `rise-{project_name}` namespace naming must set this to `"rise-"`
+    /// explicitly before deploying — otherwise the controller will switch
+    /// to `org-{discriminator}-{project_name}` and orphan the legacy
+    /// namespaces.
     #[serde(default)]
     pub kubernetes_namespace_prefix: Option<String>,
 }
@@ -73,18 +80,6 @@ impl Default for DefaultOrganizationSettings {
             annotations: std::collections::BTreeMap::new(),
             kubernetes_namespace_prefix: None,
         }
-    }
-}
-
-impl DefaultOrganizationSettings {
-    /// Resolve the namespace prefix that should appear on the Organization's
-    /// `kubernetes.rise.dev/namespace-prefix` annotation. Falls back to the
-    /// historic default (`rise-`) when nothing is configured so existing
-    /// installs keep their namespace names.
-    pub fn resolved_namespace_prefix(&self) -> String {
-        self.kubernetes_namespace_prefix
-            .clone()
-            .unwrap_or_else(default_default_organization_namespace_prefix)
     }
 }
 
@@ -385,10 +380,6 @@ fn default_default_organization_name() -> String {
 
 fn default_default_organization_display_name() -> String {
     "Default".to_string()
-}
-
-pub(crate) fn default_default_organization_namespace_prefix() -> String {
-    "rise-".to_string()
 }
 
 fn default_node_selector() -> std::collections::HashMap<String, String> {

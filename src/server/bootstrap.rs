@@ -34,8 +34,7 @@ use tracing::{info, warn};
 use crate::db::global_lock::GlobalLock;
 use crate::db::organization_links;
 use crate::server::settings::{
-    default_default_organization_namespace_prefix, DefaultOrganizationSettings,
-    DeploymentControllerSettings, Settings,
+    DefaultOrganizationSettings, DeploymentControllerSettings, Settings,
 };
 
 /// Annotation key on the default Organization that the Kubernetes controller
@@ -178,14 +177,16 @@ async fn upsert_default_organization(
     default_org: &DefaultOrganizationSettings,
     controller_class_name: Option<&str>,
 ) -> Result<ResourceRow> {
-    let namespace_prefix = default_org.resolved_namespace_prefix();
     let mut desired_annotations = default_org.annotations.clone();
-    // Configured `kubernetes_namespace_prefix` always wins over any
-    // collision in the `annotations` map.
-    desired_annotations.insert(
-        NAMESPACE_PREFIX_ANNOTATION.to_string(),
-        namespace_prefix.clone(),
-    );
+    // Stamp the namespace-prefix annotation only when explicitly configured.
+    // Leaving it unset is the signal to the controller-side fallback
+    // (`DefaultOrganizationView::resolved_namespace_prefix`) that it should
+    // synthesize `org-{discriminator}-` for this org. When configured,
+    // `kubernetes_namespace_prefix` always wins over any collision in the
+    // freeform `annotations` map.
+    if let Some(prefix) = default_org.kubernetes_namespace_prefix.as_ref() {
+        desired_annotations.insert(NAMESPACE_PREFIX_ANNOTATION.to_string(), prefix.clone());
+    }
 
     let existing = store
         .get_by_name(
@@ -312,14 +313,19 @@ pub struct DefaultOrganizationView {
 
 impl DefaultOrganizationView {
     /// Namespace prefix to apply to projects in this Organization.
-    /// Falls back to the historic default (`rise-`) when no annotation is
-    /// set, matching [`DefaultOrganizationSettings::resolved_namespace_prefix`]
-    /// so existing installs keep their namespace names even if the
-    /// annotation is externally cleared.
+    /// Returns the `kubernetes.rise.dev/namespace-prefix` annotation when
+    /// present; otherwise synthesizes `org-{discriminator}-` so each Org
+    /// gets a unique-by-construction prefix without any operator config.
+    ///
+    /// Upgrade callers (single-org installs that previously named
+    /// namespaces `rise-{project_name}`) must set
+    /// `default_organization.kubernetes_namespace_prefix = "rise-"` so
+    /// bootstrap stamps the annotation; otherwise the discriminator
+    /// fallback will rename the namespaces and orphan the legacy ones.
     pub fn resolved_namespace_prefix(&self) -> String {
         self.namespace_prefix
             .clone()
-            .unwrap_or_else(default_default_organization_namespace_prefix)
+            .unwrap_or_else(|| format!("org-{}-", self.discriminator))
     }
 }
 

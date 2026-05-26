@@ -230,7 +230,7 @@
         },
         "kubernetes_namespace_prefix": {
           "default": null,
-          "description": "Value for the `kubernetes.rise.dev/namespace-prefix` annotation. When\n`None`, the default (`rise-`) is used to preserve the existing\n`rise-{project_name}` namespace naming for installs that previously\nrelied on the historic default.",
+          "description": "Value for the `kubernetes.rise.dev/namespace-prefix` annotation on the\ndefault Organization. When set, bootstrap stamps the annotation with\nthis value; when `None`, the annotation is left unset and the\nKubernetes controller falls back to `org-{discriminator}-` (see\n[`crate::server::bootstrap::DefaultOrganizationView::resolved_namespace_prefix`]).\n\nUpgrade note: installs that previously relied on the historic\n`rise-{project_name}` namespace naming must set this to `\"rise-\"`\nexplicitly before deploying — otherwise the controller will switch\nto `org-{discriminator}-{project_name}` and orphan the legacy\nnamespaces.",
           "type": [
             "string",
             "null"
