@@ -42,6 +42,17 @@ ok()   { printf '\033[1;32m OK\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m  !\033[0m %s\n' "$*" >&2; }
 err()  { printf '\033[1;31m  x\033[0m %s\n' "$*" >&2; }
 ask()  { local p=$1 d=${2:-} a; read -r -p "$p${d:+ [$d]}: " a; echo "${a:-$d}"; }
+ask_required() {
+  local p=$1 a
+  while true; do
+    read -r -p "$p: " a
+    if [[ -n "$a" ]]; then
+      echo "$a"
+      return 0
+    fi
+    warn "Please choose an action."
+  done
+}
 
 require_cmd() {
   local missing=()
@@ -398,6 +409,26 @@ helm_install_rise_dev() {
 
 # ---- Minikube --------------------------------------------------------------
 
+minikube_reachable() {
+  command -v kubectl >/dev/null 2>&1 || return 1
+  kubectl --context=minikube --request-timeout=5s get nodes >/dev/null 2>&1
+}
+
+minikube_profile_exists() {
+  command -v minikube >/dev/null 2>&1 || return 1
+  minikube profile list 2>/dev/null | awk '{print $2}' | grep -qx 'minikube'
+}
+
+minikube_state() {
+  if minikube_reachable; then
+    echo "running"
+  elif minikube_profile_exists; then
+    echo "existing"
+  else
+    echo "missing"
+  fi
+}
+
 setup_minikube() {
   require_cmd docker minikube kubectl helm
   cd "$REPO_ROOT"
@@ -409,17 +440,22 @@ setup_minikube() {
   local reg_dir="/etc/containerd/certs.d/localhost:5000"
   local jfrog_dir="/etc/containerd/certs.d/rise-jfrog:8082"
 
-  # Start minikube only if it's not already reachable. Recreating wastes
-  # 30-60s and nukes state the developer may want to keep — `minikube delete`
-  # explicitly when a fresh cluster is wanted.
+  # Start minikube only if it's not already reachable. If a profile exists but
+  # is stopped or unreachable, `minikube start` resumes it without deleting
+  # developer state. Use `minikube delete` explicitly when a fresh cluster is
+  # wanted.
   #
   # `minikube status` parses container IPs and breaks when minikube has more
   # than one network attached (which our setup intentionally does). Use
   # kubectl reachability against the minikube context as the source of truth.
-  if kubectl --context=minikube get nodes >/dev/null 2>&1; then
+  if minikube_reachable; then
     ok "minikube cluster already reachable; skipping 'minikube start'"
   else
-    log "Starting minikube"
+    if minikube_profile_exists; then
+      log "Starting existing minikube profile"
+    else
+      log "Creating minikube profile"
+    fi
     minikube start --driver=docker \
       --insecure-registry="${reg_name}:5000" \
       --insecure-registry="rise-jfrog:8082" \
@@ -560,8 +596,7 @@ down_minikube() {
   # Match the setup probe (kubectl reachability) — `minikube profile list` can
   # disagree with kubectl when the profile metadata is stale or wiped while
   # the cluster container is still running, leaving junk behind.
-  if kubectl --context=minikube get nodes >/dev/null 2>&1 \
-     || minikube profile list 2>/dev/null | awk '{print $2}' | grep -qx 'minikube'; then
+  if minikube_reachable || minikube_profile_exists; then
     log "Deleting minikube cluster"
     minikube delete >/dev/null 2>&1 || warn "minikube delete reported an error"
     ok "minikube cluster deleted"
@@ -687,22 +722,32 @@ cmd_all() {
   setup_docker
 
   local action
-  if kubectl --context=minikube get nodes >/dev/null 2>&1; then
+  case "$(minikube_state)" in
+  running)
     if [[ "$OS" == "Linux" ]]; then
       action=$(ask "minikube already running. Action? [keep/recreate/k3s/skip]" "keep")
     else
       action=$(ask "minikube already running. Action? [keep/recreate/skip]" "keep")
     fi
-  else
+    ;;
+  existing)
+    if [[ "$OS" == "Linux" ]]; then
+      action=$(ask_required "minikube exists but is not running/reachable. Action? [start/recreate/k3s/skip]")
+    else
+      action=$(ask_required "minikube exists but is not running/reachable. Action? [start/recreate/skip]")
+    fi
+    ;;
+  missing)
     if [[ "$OS" == "Linux" ]]; then
       action=$(ask "Bring up which cluster? [minikube/k3s/skip]" "minikube")
     else
       action=$(ask "Bring up minikube now? [minikube/skip]" "minikube")
     fi
-  fi
+    ;;
+  esac
 
   case "$action" in
-    keep|minikube)
+    keep|minikube|start)
       setup_minikube
       ;;
     recreate)
