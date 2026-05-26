@@ -14,6 +14,7 @@ import {
     Empty as REmpty,
     EnvironmentColorDot,
     EnvironmentColorPicker,
+    EnvPill as REnvPill,
     Field as RField,
     GroupBar as RGroupBar,
     GroupPill as RGroupPill,
@@ -30,6 +31,7 @@ import {
     Status as RStatus,
     Tabs as RTabs,
     Textarea as RTextarea,
+    Tooltip as RTooltip,
 } from '../components/r-ui';
 import { validateJson } from '../lib/json-validate';
 import { MonoTable, MonoTableBody, MonoTableEmptyRow, MonoTableFrame, MonoTableHead, MonoTableRow, MonoTd, MonoTh } from '../components/table';
@@ -850,12 +852,22 @@ export function DomainsList({ projectName, defaultUrl = null }) {
                                         </span>
                                     </td>
                                     <td>
-                                        {domain.environment ? (
-                                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                                                <EnvironmentColorDot color={environments.find(e => e.name === domain.environment)?.color} size="0.7rem" />
-                                                <span style={{ fontSize: 13 }}>{domain.environment}</span>
-                                            </span>
-                                        ) : (
+                                        {domain.environment ? (() => {
+                                            const env = environments.find(e => e.name === domain.environment);
+                                            const orphaned = env && !env.primary_deployment_group;
+                                            return (
+                                                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                                                    <REnvPill env={domain.environment} color={env?.color} />
+                                                    {orphaned && (
+                                                        <RTooltip content={`Environment '${domain.environment}' has no primary deployment group, so this domain is not attached to any ingress. Set a primary group on the environment to publish it.`}>
+                                                            <span style={{ display: 'inline-flex', color: 'var(--accent-warning, #fbbf24)', lineHeight: 0 }} aria-label="No primary deployment group">
+                                                                <Icon name="info" size={14} />
+                                                            </span>
+                                                        </RTooltip>
+                                                    )}
+                                                </span>
+                                            );
+                                        })() : (
                                             <span style={{ color: 'var(--text-soft)' }}>—</span>
                                         )}
                                     </td>
@@ -924,6 +936,15 @@ export function DomainsList({ projectName, defaultUrl = null }) {
                         />
                     </RField>
                 )}
+                {(() => {
+                    const env = environments.find(e => e.name === formData.environment);
+                    if (!env || env.primary_deployment_group) return null;
+                    return (
+                        <RAlert tone="warn" icon="info">
+                            <strong>{env.name}</strong> has no primary deployment group, so this domain won't be attached to any ingress until you set one on the environment.
+                        </RAlert>
+                    );
+                })()}
                 <p className="text-sm text-gray-600 dark:text-gray-500">
                     <strong>Note:</strong> Make sure to configure your DNS to point this domain to your Rise deployment before adding it.
                     The domain rides on the ingress for whichever deployment group is primary for the selected environment.
@@ -955,6 +976,15 @@ export function DomainsList({ projectName, defaultUrl = null }) {
                         placeholder="Select environment"
                     />
                 </RField>
+                {(() => {
+                    const env = environments.find(e => e.name === editEnvironment);
+                    if (!env || env.primary_deployment_group) return null;
+                    return (
+                        <RAlert tone="warn" icon="info">
+                            <strong>{env.name}</strong> has no primary deployment group, so this domain won't be attached to any ingress until you set one on the environment.
+                        </RAlert>
+                    );
+                })()}
                 <p className="text-sm text-gray-600 dark:text-gray-500">
                     Moving a domain to a different environment reassigns it to that environment's primary deployment group.
                     The primary flag is cleared on move — re-set it from the new environment if needed.
