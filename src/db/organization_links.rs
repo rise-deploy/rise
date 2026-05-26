@@ -163,10 +163,11 @@ pub async fn count_projects_missing_organization(pool: &PgPool) -> Result<i64> {
     Ok(row.count)
 }
 
-/// Count teams and projects linked to the given Organization. Used by the
-/// application-level guard that blocks deletion of an Organization with typed
-/// children — these rows are not in the `resources` table, so the generic
-/// child-detection check doesn't cover them.
+/// Count rows linked to the given Organization across `user_organization_memberships`,
+/// `teams`, and `projects`. Used by the application-level guard that blocks
+/// deletion of an Organization with typed children — these rows are not in the
+/// `resources` table (and `user_organization_memberships` has no FK back to
+/// `resources`), so the generic child-detection check doesn't cover them.
 pub async fn count_typed_children_for_organization(
     pool: &PgPool,
     organization_resource_uid: Uuid,
@@ -174,7 +175,8 @@ pub async fn count_typed_children_for_organization(
     let row = sqlx::query!(
         r#"
         SELECT
-            (SELECT COUNT(*) FROM teams WHERE organization_resource_uid = $1)
+            (SELECT COUNT(*) FROM user_organization_memberships WHERE organization_resource_uid = $1)
+            + (SELECT COUNT(*) FROM teams WHERE organization_resource_uid = $1)
             + (SELECT COUNT(*) FROM projects WHERE organization_resource_uid = $1)
             AS "count!"
         "#,

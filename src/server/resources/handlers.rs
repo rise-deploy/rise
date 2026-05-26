@@ -53,11 +53,11 @@ pub(crate) struct ResourceApiCtx {
     store: Arc<dyn ResourceStore>,
     operator_users: Arc<Vec<String>>,
     /// DB pool used by application-layer guards (e.g. blocking Organization
-    /// deletion while typed children — teams/projects — still reference it
-    /// via `organization_resource_uid`). Optional so the resource-API tests
-    /// (which run without a typed-table schema) can keep using a stripped-
-    /// down context; production handlers always have it set.
-    db_pool: Option<sqlx::PgPool>,
+    /// deletion while typed children — users-via-memberships, teams, projects —
+    /// still reference it via `organization_resource_uid`). Required: the
+    /// delete-guard must run on every dispatch, so dropping the pool would
+    /// silently bypass it.
+    db_pool: sqlx::PgPool,
 }
 
 impl ResourceApiCtx {
@@ -65,7 +65,7 @@ impl ResourceApiCtx {
         Self {
             store: state.resource_store.clone(),
             operator_users: state.operator_users.clone(),
-            db_pool: Some(state.db_pool.clone()),
+            db_pool: state.db_pool.clone(),
         }
     }
 
@@ -1009,26 +1009,23 @@ async fn delete_resource(
     // by API version, so the guard must apply to every served version of
     // the Organization kind.
     if row.kind == rise_resource_api::ORGANIZATION_KIND {
-        if let Some(pool) = ctx.db_pool.as_ref() {
-            let count =
-                crate::db::organization_links::count_typed_children_for_organization(pool, row.uid)
-                    .await
-                    .map_err(|e| {
-                        ServerError::internal_anyhow(
-                            e,
-                            "Failed to count typed children for organization",
-                        )
-                    })?;
-            if count > 0 {
-                return Err(ServerError::new(
-                    StatusCode::CONFLICT,
-                    format!(
-                        "Organization '{}' has {count} typed child(ren) (teams or projects); \
-                         delete or reassign them before deleting the organization",
-                        row.name,
-                    ),
-                ));
-            }
+        let count = crate::db::organization_links::count_typed_children_for_organization(
+            &ctx.db_pool,
+            row.uid,
+        )
+        .await
+        .map_err(|e| {
+            ServerError::internal_anyhow(e, "Failed to count typed children for organization")
+        })?;
+        if count > 0 {
+            return Err(ServerError::new(
+                StatusCode::CONFLICT,
+                format!(
+                    "Organization '{}' has {count} typed child(ren) (users-via-memberships, teams, projects); \
+                     delete or reassign them before deleting the organization",
+                    row.name,
+                ),
+            ));
         }
     }
 
@@ -1279,7 +1276,7 @@ mod dispatch_tests {
         ResourceApiCtx {
             store: Arc::new(PgResourceStore::new(pool.clone())),
             operator_users: Arc::new(vec![OPERATOR.into()]),
-            db_pool: Some(pool),
+            db_pool: pool,
         }
     }
 

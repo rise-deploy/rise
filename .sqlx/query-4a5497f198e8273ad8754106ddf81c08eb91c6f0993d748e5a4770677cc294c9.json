@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            (SELECT COUNT(*) FROM user_organization_memberships WHERE organization_resource_uid = $1)\n            + (SELECT COUNT(*) FROM teams WHERE organization_resource_uid = $1)\n            + (SELECT COUNT(*) FROM projects WHERE organization_resource_uid = $1)\n            AS \"count!\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "4a5497f198e8273ad8754106ddf81c08eb91c6f0993d748e5a4770677cc294c9"
+}
