@@ -1745,6 +1745,11 @@ async fn add_backend_resources(
 }
 
 /// Apply backend Endpoints directly via kube-rs server-side apply.
+///
+/// On the first sync for a new project the namespace returned in this sync's
+/// children list has not yet been applied by Metacontroller, so the apply
+/// 404s. That's expected and self-heals on the next resync, so the 404 is
+/// logged at debug instead of warning.
 async fn apply_backend_endpoints(
     state: &AppState,
     endpoints: &k8s_openapi::api::core::v1::Endpoints,
@@ -1757,14 +1762,23 @@ async fn apply_backend_endpoints(
         kube::Api::namespaced(kube_client.clone(), namespace);
     let name = endpoints.metadata.name.as_deref().unwrap_or("rise-backend");
     let params = kube::api::PatchParams::apply("rise-controller").force();
-    if let Err(e) = api
+    match api
         .patch(name, &params, &kube::api::Patch::Apply(endpoints))
         .await
     {
-        warn!(
-            namespace = %namespace,
-            "Failed to apply backend Endpoints: {:?}", e
-        );
+        Ok(_) => {}
+        Err(kube::Error::Api(err)) if err.code == 404 => {
+            debug!(
+                namespace = %namespace,
+                "Backend Endpoints apply deferred: namespace not yet created (will retry on next resync)"
+            );
+        }
+        Err(e) => {
+            warn!(
+                namespace = %namespace,
+                "Failed to apply backend Endpoints: {:?}", e
+            );
+        }
     }
 }
 
