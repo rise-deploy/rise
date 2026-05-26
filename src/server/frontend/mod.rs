@@ -7,7 +7,7 @@ use tera::Tera;
 
 /// Names of shared Tera partials that should be registered alongside any
 /// auth-page template so `{% include %}` statements resolve.
-const AUTH_TEMPLATE_PARTIALS: &[&str] = &["_auth-tokens.css.tera"];
+const AUTH_TEMPLATE_PARTIALS: &[&str] = &["_auth-tokens.css.tera", "_auth-theme.js.tera"];
 
 /// Load a static file from the configured static_dir, with path traversal protection.
 pub async fn load_static_file(static_dir: &str, rel_path: &str) -> Option<Vec<u8>> {
@@ -26,8 +26,8 @@ pub async fn load_static_file(static_dir: &str, rel_path: &str) -> Option<Vec<u8
 /// shared partials in `AUTH_TEMPLATE_PARTIALS` — into a fresh `Tera` instance.
 ///
 /// This is the canonical way to render the auth-page templates: each template
-/// uses `{% include "_auth-tokens.css.tera" %}` to share its design tokens, so
-/// the partial must be registered alongside.
+/// uses shared `{% include %}` partials for auth-page styling and scripts, so
+/// those partials must be registered alongside.
 pub async fn load_auth_template(
     static_dir: &str,
     template_name: &str,

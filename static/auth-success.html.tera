@@ -7,6 +7,7 @@
     <link rel="icon" type="image/x-icon" href="/assets/favicon.ico">
     <link rel="icon" type="image/png" sizes="16x16" href="/assets/favicon-16x16.png">
     <link rel="icon" type="image/png" sizes="32x32" href="/assets/favicon-32x32.png">
+    <script>{% include "_auth-theme.js.tera" %}</script>
     <style>
         {% include "_auth-tokens.css.tera" %}
         * { box-sizing: border-box; }
@@ -23,7 +24,7 @@
             background: var(--surface);
             border: 1px solid var(--border-faint);
             border-radius: 14px;
-            box-shadow: 0 4px 18px rgba(20, 20, 15, .05), 0 1px 2px rgba(20, 20, 15, .04);
+            box-shadow: var(--shadow-md);
             padding: 36px 32px; text-align: center;
         }
         .logo {
@@ -55,7 +56,7 @@
         .progress > div { height: 100%; width: 0%; background: var(--accent); border-radius: 999px; transition: width 1000ms; }
         .btn {
             display: inline-block; text-align: center;
-            background: var(--accent); color: #fff;
+            background: var(--accent); color: var(--accent-fg);
             border: none; border-radius: 7px;
             padding: 10px 16px; margin-top: 20px;
             font-size: 13px; font-weight: 500; text-decoration: none;
@@ -63,7 +64,7 @@
         }
         .btn:hover { filter: brightness(1.06); }
         .errbox {
-            background: var(--err-bg); color: oklch(0.40 0.14 25);
+            background: var(--err-bg); color: var(--err);
             border: 1px solid color-mix(in oklch, var(--err) 30%, transparent);
             border-radius: 7px; padding: 10px 12px; font-size: 12.5px;
             margin: 14px 0 0; text-align: left;
