@@ -1,8 +1,11 @@
 use super::models::{AddCustomDomainRequest, CustomDomainResponse, CustomDomainsResponse};
 use super::validation;
-use crate::db::{custom_domains as db_custom_domains, deployments as db_deployments, projects};
+use crate::db::models::{CustomDomain, Environment};
+use crate::db::{
+    custom_domains as db_custom_domains, deployments as db_deployments,
+    environments as db_environments, projects,
+};
 use crate::server::auth::context::AuthContext;
-use crate::server::deployment::models::DEFAULT_DEPLOYMENT_GROUP;
 use crate::server::error::{ServerError, ServerErrorExt};
 use crate::server::project::handlers::ensure_project_access_or_admin;
 use crate::server::state::AppState;
@@ -11,7 +14,93 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use sqlx::PgPool;
 use tracing::info;
+use uuid::Uuid;
+
+/// Resolve an environment name to its db row.
+///
+/// `None` resolves to the project's production environment. Returns `Err` with
+/// a `bad_request` if the name was provided but doesn't exist.
+async fn resolve_environment(
+    pool: &PgPool,
+    project_id: Uuid,
+    env_name: Option<&str>,
+) -> Result<Environment, ServerError> {
+    match env_name {
+        Some(name) => db_environments::find_by_name(pool, project_id, name)
+            .await
+            .internal_err("Failed to look up environment")?
+            .ok_or_else(|| ServerError::bad_request(format!("Environment '{}' not found", name))),
+        None => db_environments::find_production(pool, project_id)
+            .await
+            .internal_err("Failed to look up production environment")?
+            .ok_or_else(|| ServerError::bad_request("Project has no production environment")),
+    }
+}
+
+/// Look up the environment for a custom domain (the row's environment_id) and
+/// return its name. Falls back to `?` for orphaned rows so we never error out
+/// of a list response over data consistency.
+async fn environment_name_for(pool: &PgPool, env_id: Uuid) -> String {
+    db_environments::find_by_id(pool, env_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|env| env.name)
+        .unwrap_or_else(|| "?".to_string())
+}
+
+/// Mark the active deployment in `env`'s primary deployment group for
+/// reconciliation so the new domain takes effect. Best-effort: errors are
+/// logged but not propagated.
+async fn reconcile_for_environment(state: &AppState, project_name: &str, env: &Environment) {
+    let group = match env.primary_deployment_group.as_deref() {
+        Some(g) => g,
+        None => {
+            info!(
+                "Environment '{}' for project '{}' has no primary deployment group; skipping reconcile",
+                env.name, project_name
+            );
+            return;
+        }
+    };
+    match db_deployments::find_active_for_project_and_group(&state.db_pool, env.project_id, group)
+        .await
+    {
+        Ok(Some(active_deployment)) => {
+            if let Err(e) =
+                db_deployments::mark_needs_reconcile(&state.db_pool, active_deployment.id).await
+            {
+                info!(
+                    "Failed to mark deployment {} for reconcile after custom-domain change: {:?}",
+                    active_deployment.deployment_id, e
+                );
+            }
+        }
+        Ok(None) => {
+            info!(
+                "No active deployment in group '{}' for project '{}' — domain change recorded but nothing to reconcile",
+                group, project_name
+            );
+        }
+        Err(e) => {
+            info!(
+                "Failed to find active deployment for project '{}' group '{}': {:?}",
+                project_name, group, e
+            );
+        }
+    }
+}
+
+/// Resolve and load the environment row that owns `domain` so we can reconcile
+/// the right deployment group when the domain changes.
+async fn env_for_domain(pool: &PgPool, domain: &CustomDomain) -> Option<Environment> {
+    db_environments::find_by_id(pool, domain.environment_id)
+        .await
+        .ok()
+        .flatten()
+}
 
 /// Add a custom domain to a project
 pub async fn add_custom_domain(
@@ -41,76 +130,42 @@ pub async fn add_custom_domain(
             &payload.domain,
             production_template,
             state.staging_ingress_url_template.as_deref(),
+            state.environment_ingress_url_template.as_deref(),
             Some(&state.public_url),
         ) {
             return Err(ServerError::bad_request(reason));
         }
     }
 
-    // Add the custom domain
-    let domain = db_custom_domains::add_custom_domain(&state.db_pool, project.id, &payload.domain)
-        .await
-        .map_err(|e| {
-            // Check if it's a duplicate key error or validation error
-            let error_message = e.to_string();
-            if error_message.contains("duplicate key")
-                || error_message.contains("unique constraint")
-            {
-                ServerError::conflict(format!("Domain '{}' is already in use", payload.domain))
-            } else if error_message.contains("check constraint") {
-                ServerError::bad_request(format!("Invalid domain format: {}", payload.domain))
-            } else {
-                ServerError::internal_anyhow(e, "Failed to add custom domain")
-            }
-        })?;
+    let environment =
+        resolve_environment(&state.db_pool, project.id, payload.environment.as_deref()).await?;
 
-    // Trigger reconciliation of the active deployment in the default group
-    // Custom domains are only applied to the default deployment group
-    match db_deployments::find_active_for_project_and_group(
+    let domain = db_custom_domains::add_custom_domain(
         &state.db_pool,
         project.id,
-        DEFAULT_DEPLOYMENT_GROUP,
+        environment.id,
+        &payload.domain,
     )
     .await
-    {
-        Ok(Some(active_deployment)) => {
-            info!(
-                "Found active deployment {} in default group for project '{}', marking for reconciliation",
-                active_deployment.deployment_id, project.name
-            );
+    .map_err(|e| {
+        let error_message = e.to_string();
+        if error_message.contains("duplicate key") || error_message.contains("unique constraint") {
+            ServerError::conflict(format!("Domain '{}' is already in use", payload.domain))
+        } else if error_message.contains("check constraint") {
+            ServerError::bad_request(format!("Invalid domain format: {}", payload.domain))
+        } else {
+            ServerError::internal_anyhow(e, "Failed to add custom domain")
+        }
+    })?;
 
-            if let Err(e) =
-                db_deployments::mark_needs_reconcile(&state.db_pool, active_deployment.id).await
-            {
-                // Log the error but don't fail the request - the domain was added successfully
-                info!(
-                    "Failed to trigger reconciliation for deployment {} after adding domain: {}",
-                    active_deployment.deployment_id, e
-                );
-            } else {
-                info!(
-                    "Successfully marked deployment {} for reconciliation after adding custom domain '{}'",
-                    active_deployment.deployment_id, payload.domain
-                );
-            }
-        }
-        Ok(None) => {
-            info!(
-                "No active deployment found in default group for project '{}', custom domain added but no reconciliation needed",
-                project.name
-            );
-        }
-        Err(e) => {
-            info!(
-                "Failed to find active deployment for project '{}': {}",
-                project.name, e
-            );
-        }
-    }
+    reconcile_for_environment(&state, &project.name, &environment).await;
 
     Ok((
         StatusCode::CREATED,
-        Json(CustomDomainResponse::from_db_model(&domain)),
+        Json(CustomDomainResponse::from_db_model(
+            &domain,
+            &environment.name,
+        )),
     ))
 }
 
@@ -143,15 +198,29 @@ pub async fn list_custom_domains(
             }
         })?;
 
-    // Get all custom domains for the project
+    // Get all custom domains for the project plus the envs they belong to.
     let domains = db_custom_domains::list_project_custom_domains(&state.db_pool, project.id)
         .await
         .internal_err("Failed to list custom domains")?;
+    let environments: std::collections::HashMap<Uuid, Environment> =
+        db_environments::list_for_project(&state.db_pool, project.id)
+            .await
+            .internal_err("Failed to load environments")?
+            .into_iter()
+            .map(|e| (e.id, e))
+            .collect();
 
+    let unknown_env = String::from("?");
     Ok(Json(CustomDomainsResponse {
         domains: domains
             .iter()
-            .map(CustomDomainResponse::from_db_model)
+            .map(|d| {
+                let env_name = environments
+                    .get(&d.environment_id)
+                    .map(|e| e.name.as_str())
+                    .unwrap_or(&unknown_env);
+                CustomDomainResponse::from_db_model(d, env_name)
+            })
             .collect(),
     }))
 }
@@ -190,8 +259,11 @@ pub async fn get_custom_domain(
         .await
         .internal_err("Failed to get custom domain")?
         .ok_or_else(|| ServerError::not_found("Custom domain not found"))?;
+    let env_name = environment_name_for(&state.db_pool, domain.environment_id).await;
 
-    Ok(Json(CustomDomainResponse::from_db_model(&domain)))
+    Ok(Json(CustomDomainResponse::from_db_model(
+        &domain, &env_name,
+    )))
 }
 
 /// Delete a custom domain
@@ -215,7 +287,13 @@ pub async fn delete_custom_domain(
     let user = auth.user()?;
     ensure_project_access_or_admin(&state, user, &project).await?;
 
-    // Delete the custom domain
+    // Look up the domain first so we know which environment to reconcile after deletion.
+    let existing = db_custom_domains::get_custom_domain(&state.db_pool, project.id, &domain)
+        .await
+        .internal_err("Failed to look up custom domain")?
+        .ok_or_else(|| ServerError::not_found("Custom domain not found"))?;
+    let env_for_reconcile = env_for_domain(&state.db_pool, &existing).await;
+
     let deleted = db_custom_domains::delete_custom_domain(&state.db_pool, project.id, &domain)
         .await
         .internal_err("Failed to delete custom domain")?;
@@ -224,48 +302,8 @@ pub async fn delete_custom_domain(
         return Err(ServerError::not_found("Custom domain not found"));
     }
 
-    // Trigger reconciliation of the active deployment in the default group
-    // Custom domains are only applied to the default deployment group
-    match db_deployments::find_active_for_project_and_group(
-        &state.db_pool,
-        project.id,
-        DEFAULT_DEPLOYMENT_GROUP,
-    )
-    .await
-    {
-        Ok(Some(active_deployment)) => {
-            info!(
-                "Found active deployment {} in default group for project '{}', marking for reconciliation",
-                active_deployment.deployment_id, project.name
-            );
-
-            if let Err(e) =
-                db_deployments::mark_needs_reconcile(&state.db_pool, active_deployment.id).await
-            {
-                // Log the error but don't fail the request - the domain was deleted successfully
-                info!(
-                    "Failed to trigger reconciliation for deployment {} after deleting domain: {}",
-                    active_deployment.deployment_id, e
-                );
-            } else {
-                info!(
-                    "Successfully marked deployment {} for reconciliation after deleting custom domain '{}'",
-                    active_deployment.deployment_id, domain
-                );
-            }
-        }
-        Ok(None) => {
-            info!(
-                "No active deployment found in default group for project '{}', custom domain deleted but no reconciliation needed",
-                project.name
-            );
-        }
-        Err(e) => {
-            info!(
-                "Failed to find active deployment for project '{}': {}",
-                project.name, e
-            );
-        }
+    if let Some(env) = env_for_reconcile {
+        reconcile_for_environment(&state, &project.name, &env).await;
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -304,49 +342,17 @@ pub async fn set_primary_domain(
             }
         })?;
 
-    // Trigger reconciliation of the active deployment in the default group
-    match db_deployments::find_active_for_project_and_group(
-        &state.db_pool,
-        project.id,
-        DEFAULT_DEPLOYMENT_GROUP,
-    )
-    .await
-    {
-        Ok(Some(active_deployment)) => {
-            info!(
-                "Found active deployment {} in default group for project '{}', marking for reconciliation",
-                active_deployment.deployment_id, project.name
-            );
+    let env_name = if let Some(env) = env_for_domain(&state.db_pool, &updated_domain).await {
+        reconcile_for_environment(&state, &project.name, &env).await;
+        env.name
+    } else {
+        "?".to_string()
+    };
 
-            if let Err(e) =
-                db_deployments::mark_needs_reconcile(&state.db_pool, active_deployment.id).await
-            {
-                info!(
-                    "Failed to trigger reconciliation for deployment {} after setting primary domain: {}",
-                    active_deployment.deployment_id, e
-                );
-            } else {
-                info!(
-                    "Successfully marked deployment {} for reconciliation after setting primary domain '{}'",
-                    active_deployment.deployment_id, domain
-                );
-            }
-        }
-        Ok(None) => {
-            info!(
-                "No active deployment found in default group for project '{}', primary domain set but no reconciliation needed",
-                project.name
-            );
-        }
-        Err(e) => {
-            info!(
-                "Failed to find active deployment for project '{}': {}",
-                project.name, e
-            );
-        }
-    }
-
-    Ok(Json(CustomDomainResponse::from_db_model(&updated_domain)))
+    Ok(Json(CustomDomainResponse::from_db_model(
+        &updated_domain,
+        &env_name,
+    )))
 }
 
 /// Unset the primary status of a custom domain
@@ -370,7 +376,13 @@ pub async fn unset_primary_domain(
     let user = auth.user()?;
     ensure_project_access_or_admin(&state, user, &project).await?;
 
-    // Unset the primary status
+    // Look up the domain first to know which environment owns it.
+    let existing = db_custom_domains::get_custom_domain(&state.db_pool, project.id, &domain)
+        .await
+        .internal_err("Failed to look up custom domain")?
+        .ok_or_else(|| ServerError::not_found("Custom domain not found"))?;
+    let env_for_reconcile = env_for_domain(&state.db_pool, &existing).await;
+
     let unset = db_custom_domains::unset_primary_domain(&state.db_pool, project.id, &domain)
         .await
         .internal_err("Failed to unset primary domain")?;
@@ -381,46 +393,8 @@ pub async fn unset_primary_domain(
         ));
     }
 
-    // Trigger reconciliation of the active deployment in the default group
-    match db_deployments::find_active_for_project_and_group(
-        &state.db_pool,
-        project.id,
-        DEFAULT_DEPLOYMENT_GROUP,
-    )
-    .await
-    {
-        Ok(Some(active_deployment)) => {
-            info!(
-                "Found active deployment {} in default group for project '{}', marking for reconciliation",
-                active_deployment.deployment_id, project.name
-            );
-
-            if let Err(e) =
-                db_deployments::mark_needs_reconcile(&state.db_pool, active_deployment.id).await
-            {
-                info!(
-                    "Failed to trigger reconciliation for deployment {} after unsetting primary domain: {}",
-                    active_deployment.deployment_id, e
-                );
-            } else {
-                info!(
-                    "Successfully marked deployment {} for reconciliation after unsetting primary domain '{}'",
-                    active_deployment.deployment_id, domain
-                );
-            }
-        }
-        Ok(None) => {
-            info!(
-                "No active deployment found in default group for project '{}', primary domain unset but no reconciliation needed",
-                project.name
-            );
-        }
-        Err(e) => {
-            info!(
-                "Failed to find active deployment for project '{}': {}",
-                project.name, e
-            );
-        }
+    if let Some(env) = env_for_reconcile {
+        reconcile_for_environment(&state, &project.name, &env).await;
     }
 
     Ok(StatusCode::NO_CONTENT)

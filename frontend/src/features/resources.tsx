@@ -788,10 +788,12 @@ export function ServiceAccountsList({ projectName }) {
 // Custom Domains Component
 export function DomainsList({ projectName, defaultUrl = null }) {
     const [domains, setDomains] = useState([]);
+    const [environments, setEnvironments] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
     const [isModalOpen, setIsModalOpen] = useState(false);
-    const [formData, setFormData] = useState({ domain: '' });
+    const productionEnvName = environments.find(e => e.is_production)?.name || 'production';
+    const [formData, setFormData] = useState({ domain: '', environment: productionEnvName });
     const [confirmDialogOpen, setConfirmDialogOpen] = useState(false);
     const [domainToDelete, setDomainToDelete] = useState(null);
     const [deleting, setDeleting] = useState(false);
@@ -804,8 +806,12 @@ export function DomainsList({ projectName, defaultUrl = null }) {
 
     const loadDomains = useCallback(async () => {
         try {
-            const response = await api.getProjectDomains(projectName);
-            setDomains(response.domains || []);
+            const [domainsResp, envsResp] = await Promise.all([
+                api.getProjectDomains(projectName),
+                api.getProjectEnvironments(projectName).catch(() => ({ environments: [] })),
+            ]);
+            setDomains(domainsResp.domains || []);
+            setEnvironments(envsResp.environments || []);
             setLoading(false);
         } catch (err) {
             setError(err.message);
@@ -818,7 +824,7 @@ export function DomainsList({ projectName, defaultUrl = null }) {
     }, [loadDomains]);
 
     const handleAddClick = () => {
-        setFormData({ domain: '' });
+        setFormData({ domain: '', environment: productionEnvName });
         setIsModalOpen(true);
     };
 
@@ -835,7 +841,7 @@ export function DomainsList({ projectName, defaultUrl = null }) {
 
         setSaving(true);
         try {
-            await api.addCustomDomain(projectName, formData.domain);
+            await api.addCustomDomain(projectName, formData.domain, formData.environment);
             showToast(`Custom domain ${formData.domain} added successfully`, 'success');
             setIsModalOpen(false);
             loadDomains();
@@ -914,6 +920,7 @@ export function DomainsList({ projectName, defaultUrl = null }) {
                     <MonoTableHead>
                         <tr>
                             <MonoTh className="px-6 py-3 text-left">Domain</MonoTh>
+                            <MonoTh className="px-6 py-3 text-left">Environment</MonoTh>
                             <MonoTh className="px-6 py-3 text-left">Primary</MonoTh>
                             <MonoTh className="px-6 py-3 text-left">Created</MonoTh>
                             <MonoTh className="px-6 py-3 text-left">Actions</MonoTh>
@@ -931,6 +938,7 @@ export function DomainsList({ projectName, defaultUrl = null }) {
                                         <MonoTag color="yellow" className="ml-1">primary</MonoTag>
                                     )}
                                 </MonoTd>
+                                <MonoTd className="px-6 py-4 text-sm text-gray-700 dark:text-gray-300">-</MonoTd>
                                 <MonoTd className="px-6 py-4 text-sm">
                                     <button
                                         onClick={handleStarDefault}
@@ -964,6 +972,14 @@ export function DomainsList({ projectName, defaultUrl = null }) {
                                     {domain.domain}
                                     {domain.is_primary && (
                                         <MonoTag color="yellow" className="ml-2">primary</MonoTag>
+                                    )}
+                                </MonoTd>
+                                <MonoTd className="px-6 py-4 text-sm text-gray-900 dark:text-gray-200">
+                                    {domain.environment && (
+                                        <span className="inline-flex items-center gap-2">
+                                            <EnvironmentColorDot color={environments.find(e => e.name === domain.environment)?.color} />
+                                            {domain.environment}
+                                        </span>
                                     )}
                                 </MonoTd>
                                 <MonoTd className="px-6 py-4 text-sm">
@@ -1002,7 +1018,7 @@ export function DomainsList({ projectName, defaultUrl = null }) {
                             </MonoTableRow>
                         ))}
                         {!defaultUrl && domains.length === 0 && (
-                            <MonoTableEmptyRow colSpan={4}>No domains configured.</MonoTableEmptyRow>
+                            <MonoTableEmptyRow colSpan={5}>No domains configured.</MonoTableEmptyRow>
                         )}
                     </MonoTableBody>
                 </MonoTable>
@@ -1022,9 +1038,19 @@ export function DomainsList({ projectName, defaultUrl = null }) {
                         placeholder="example.com"
                         required
                     />
+                    {environments.length > 0 && (
+                        <div>
+                            <span className="mono-label">Environment</span>
+                            <EnvironmentDropdown
+                                environments={environments}
+                                value={formData.environment}
+                                onChange={(env) => setFormData({ ...formData, environment: env })}
+                            />
+                        </div>
+                    )}
                     <p className="text-sm text-gray-600 dark:text-gray-500">
                         <strong>Note:</strong> Make sure to configure your DNS to point this domain to your Rise deployment before adding it.
-                        The domain will be added to the ingress for the default deployment group only.
+                        The domain rides on the ingress for whichever deployment group is primary for the selected environment.
                     </p>
 
                     <ModalActions>

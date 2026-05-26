@@ -17,6 +17,11 @@ pub struct DeploymentUrls {
     pub primary_url: String,
     /// Additional URLs for custom domains
     pub custom_domain_urls: Vec<String>,
+    /// Full ordered list of every URL the deployment is reachable at — deployment-group
+    /// URL, environment URL, production URL, and any custom domains. Older clients can
+    /// ignore this; new code prefers it over the narrower fields above.
+    #[serde(default)]
+    pub all_urls: Vec<String>,
 }
 
 /// Trait that all deployment backends must implement

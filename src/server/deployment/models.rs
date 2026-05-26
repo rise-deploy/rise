@@ -175,9 +175,14 @@ pub fn rise_system_env_vars(
     deployment_urls: &DeploymentUrls,
     environment_name: Option<&str>,
 ) -> Vec<(String, String)> {
-    let mut all_urls = vec![deployment_urls.default_url.clone()];
-    all_urls.extend(deployment_urls.custom_domain_urls.clone());
-    let app_urls_json = serde_json::to_string(&all_urls).unwrap_or_else(|_| "[]".to_string());
+    let urls_for_env: Vec<String> = if deployment_urls.all_urls.is_empty() {
+        let mut combined = vec![deployment_urls.default_url.clone()];
+        combined.extend(deployment_urls.custom_domain_urls.clone());
+        combined
+    } else {
+        deployment_urls.all_urls.clone()
+    };
+    let app_urls_json = serde_json::to_string(&urls_for_env).unwrap_or_else(|_| "[]".to_string());
 
     let mut vars = vec![
         ("RISE_ISSUER".to_string(), public_url.to_string()),
@@ -332,6 +337,7 @@ mod tests {
             default_url: "https://myapp.rise.dev".to_string(),
             primary_url: "https://myapp.rise.dev".to_string(),
             custom_domain_urls: vec![],
+            all_urls: vec!["https://myapp.rise.dev".to_string()],
         };
 
         let vars = rise_system_env_vars("https://rise.dev", "default", &urls, None);
@@ -350,6 +356,10 @@ mod tests {
             default_url: "https://myapp-mr--42.rise.dev".to_string(),
             primary_url: "https://custom.example.com".to_string(),
             custom_domain_urls: vec!["https://custom.example.com".to_string()],
+            all_urls: vec![
+                "https://myapp-mr--42.rise.dev".to_string(),
+                "https://custom.example.com".to_string(),
+            ],
         };
 
         let vars = rise_system_env_vars("https://rise.dev", "mr/42", &urls, None);

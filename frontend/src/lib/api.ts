@@ -273,10 +273,12 @@ class RiseAPI {
         return this.request(`/projects/${projectName}/domains`);
     }
 
-    async addCustomDomain(projectName, domain) {
+    async addCustomDomain(projectName, domain, environment) {
+        const body = { domain };
+        if (environment) body.environment = environment;
         return this.request(`/projects/${projectName}/domains`, {
             method: 'POST',
-            body: JSON.stringify({ domain })
+            body: JSON.stringify(body)
         });
     }
 
