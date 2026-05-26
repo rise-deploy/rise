@@ -707,7 +707,7 @@ async fn check_pod_errors_via_kube(
                     } else if let Some(running) = &state.running {
                         Some(serde_json::json!({
                             "state_type": "running",
-                            "reason": running.started_at.as_ref().map(|t| t.0.to_string()),
+                            "started_at": running.started_at.as_ref().map(|t| t.0.to_string()),
                         }))
                     } else if let Some(terminated) = &state.terminated {
                         // Check terminated with too many restarts (skip for terminating pods)
@@ -730,9 +730,56 @@ async fn check_pod_errors_via_kube(
                             "reason": terminated.reason,
                             "message": terminated.message,
                             "exit_code": terminated.exit_code,
+                            "started_at": terminated.started_at.as_ref().map(|t| t.0.to_string()),
+                            "finished_at": terminated.finished_at.as_ref().map(|t| t.0.to_string()),
                         }))
                     } else {
                         None
+                    }
+                } else {
+                    None
+                };
+
+                // Collect last_state info (the previous terminated state, e.g. OOMKilled)
+                let last_state_info = if let Some(last_state) = &cs.last_state {
+                    if let Some(terminated) = &last_state.terminated {
+                        // Surface OOMKilled or other bad exit in last_state as an error
+                        // when restarts are high and the current state didn't already trigger one.
+                        if !is_terminating
+                            && !has_error
+                            && (terminated.reason.as_deref() == Some("OOMKilled")
+                                || (terminated.exit_code != 0 && cs.restart_count >= 3))
+                        {
+                            has_error = true;
+                            let reason = terminated.reason.as_deref().unwrap_or("ContainerFailed");
+                            let default_msg = format!("Exit code: {}", terminated.exit_code);
+                            let message = terminated.message.as_deref().unwrap_or(&default_msg);
+                            error_message = Some(format!(
+                                "{}: {} (restarts: {})",
+                                reason, message, cs.restart_count
+                            ));
+                        }
+                        Some(serde_json::json!({
+                            "state_type": "terminated",
+                            "reason": terminated.reason,
+                            "message": terminated.message,
+                            "exit_code": terminated.exit_code,
+                            "started_at": terminated.started_at.as_ref().map(|t| t.0.to_string()),
+                            "finished_at": terminated.finished_at.as_ref().map(|t| t.0.to_string()),
+                        }))
+                    } else if let Some(waiting) = &last_state.waiting {
+                        Some(serde_json::json!({
+                            "state_type": "waiting",
+                            "reason": waiting.reason,
+                            "message": waiting.message,
+                        }))
+                    } else {
+                        last_state.running.as_ref().map(|running| {
+                            serde_json::json!({
+                                "state_type": "running",
+                                "started_at": running.started_at.as_ref().map(|t| t.0.to_string()),
+                            })
+                        })
                     }
                 } else {
                     None
@@ -743,6 +790,7 @@ async fn check_pod_errors_via_kube(
                     "ready": cs.ready,
                     "restart_count": cs.restart_count,
                     "state": state_info,
+                    "last_state": last_state_info,
                 }));
             }
         }
