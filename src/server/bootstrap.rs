@@ -34,7 +34,8 @@ use tracing::{info, warn};
 use crate::db::global_lock::GlobalLock;
 use crate::db::organization_links;
 use crate::server::settings::{
-    DefaultOrganizationSettings, DeploymentControllerSettings, Settings,
+    default_default_organization_namespace_prefix, DefaultOrganizationSettings,
+    DeploymentControllerSettings, Settings,
 };
 
 /// Annotation key on the default Organization that the Kubernetes controller
@@ -160,12 +161,10 @@ async fn run_inner(
 /// controller manages this org's deployments").
 pub fn controller_class_name_for_bootstrap(settings: &Settings) -> Option<&str> {
     match &settings.deployment_controller {
-        #[cfg(feature = "backend")]
         Some(DeploymentControllerSettings::Kubernetes {
             controller_class_name,
             ..
         }) => Some(controller_class_name.as_str()),
-        #[allow(unreachable_patterns)]
         _ => None,
     }
 }
@@ -313,12 +312,14 @@ pub struct DefaultOrganizationView {
 
 impl DefaultOrganizationView {
     /// Namespace prefix to apply to projects in this Organization.
-    /// Falls back to `org-{discriminator}-` when no annotation is set, per
-    /// the plan.
+    /// Falls back to the historic default (`rise-`) when no annotation is
+    /// set, matching [`DefaultOrganizationSettings::resolved_namespace_prefix`]
+    /// so existing installs keep their namespace names even if the
+    /// annotation is externally cleared.
     pub fn resolved_namespace_prefix(&self) -> String {
         self.namespace_prefix
             .clone()
-            .unwrap_or_else(|| format!("org-{}-", self.discriminator))
+            .unwrap_or_else(default_default_organization_namespace_prefix)
     }
 }
 

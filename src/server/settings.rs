@@ -387,7 +387,7 @@ fn default_default_organization_display_name() -> String {
     "Default".to_string()
 }
 
-fn default_default_organization_namespace_prefix() -> String {
+pub(crate) fn default_default_organization_namespace_prefix() -> String {
     "rise-".to_string()
 }
 
