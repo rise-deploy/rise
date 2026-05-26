@@ -1173,6 +1173,11 @@ async fn compute_desired_children(
         .custom_domain_ingress_annotations
         .is_empty();
 
+    // Full env list for `create_primary_ingress` to do cross-ingress host
+    // collision checks (a DG URL that matches another env's URL is suppressed).
+    let all_environments: Vec<crate::db::models::Environment> =
+        environments.values().cloned().collect();
+
     for (group, active_deployment) in &active_by_group {
         let env_name = env_name_for(active_deployment);
         let env_for_group = env_by_primary_group.get(group.as_str()).copied();
@@ -1196,15 +1201,22 @@ async fn compute_desired_children(
         } else {
             &domains_for_group
         };
-        let ingress = resource_builder.create_primary_ingress(
+        if let Some(ingress) = resource_builder.create_primary_ingress(
             project,
             active_deployment,
             &namespace,
             env_for_group,
             inline_domains,
             env_name.as_deref(),
-        )?;
-        children.push(serde_json::to_value(&ingress)?);
+            &all_environments,
+        )? {
+            children.push(serde_json::to_value(&ingress)?);
+        }
+        // When `create_primary_ingress` returns `None`, every candidate host for
+        // this group collided with another env's URL (e.g. a deployment group
+        // named the same as an environment whose primary group is different).
+        // Skip the ingress so nginx admission doesn't reject it; the deployment
+        // still runs and a warning was logged in `create_primary_ingress`.
 
         // Sibling custom-domain ingress, only when carve-out annotations are set.
         if split_custom_domains && !domains_for_group.is_empty() {
