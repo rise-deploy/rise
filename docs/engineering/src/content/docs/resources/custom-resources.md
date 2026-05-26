@@ -103,6 +103,10 @@ Controllers can only manipulate finalizers whose name corresponds to a controlle
 
 There is no conversion webhook. Reads/lists project the response `apiVersion` to the URL-requested version but do not transform `spec`. Writes must use the storage version.
 
+:::note[Possible future extension: conversion webhooks]
+A Kubernetes-style conversion webhook could be added later: the store would call out to the owning controller on every read/list whose URL version differs from the row's stored version, and the controller would return a transformed `spec`. This would let clients pin to an older `apiVersion` indefinitely without the controller rewriting every row. Until that exists, the controller-driven migration steps below are the only supported path between versions.
+:::
+
 A controller that introduces a new version is therefore responsible for migration:
 
 1. Add the new version to the `ResourceDefinition` with `served: true`. Keep the old version `served: true` so existing clients can read it; keep the old version's row data intact.
