@@ -9,8 +9,11 @@ on:
 permissions:
   contents: read
 
+# Pages deploys must be serialized across this workflow, ci.yml's docs-deploy
+# and ci.yml's docs-preview — concurrent deploys race the atomic site swap
+# and the loser's content wipes the others' sibling subtrees.
 concurrency:
-  group: docs-preview-cleanup-${{ github.event.pull_request.number }}
+  group: pages-deploy
   cancel-in-progress: false
 
 jobs:
@@ -26,76 +29,21 @@ jobs:
       pages: write
       pull-requests: write
     steps:
-      - name: Seed docs-preview with current live site and drop this PR's preview
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Seed Pages site with current live state
+        uses: ./.github/actions/seed-pages-site
+        with:
+          output-dir: docs-preview
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Drop this PR's preview
         id: seed
         shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # Pages deployments are atomic full-site replacements, so to drop one
-        # PR's preview we have to re-upload the full site without it. Seed
-        # docs-preview/ with the latest live artifact (preserves other PRs'
-        # previews) and overlay the latest production artifact from the
-        # default branch so prod content survives even if live was clobbered.
         run: |
-          set -euxo pipefail
-          repo="${GITHUB_REPOSITORY}"
+          set -euo pipefail
           pr_number="${{ github.event.pull_request.number }}"
-
-          echo "::group::Diagnostics"
-          gh --version || echo "gh not found"
-          gh auth status 2>&1 || true
-          echo "Repository: ${repo}"
-          echo "PR number: ${pr_number}"
-          echo "Workspace: ${GITHUB_WORKSPACE:-<unset>}"
-          echo "::endgroup::"
-
-          mkdir -p docs-preview
-
-          fetch_artifact() {
-            local artifact_id="$1"
-            local label="$2"
-            if [[ -z "${artifact_id}" || "${artifact_id}" == "null" ]]; then
-              echo "No ${label} artifact found; skipping."
-              return 0
-            fi
-            echo "Seeding docs-preview with ${label} artifact ${artifact_id}"
-            local tmp
-            tmp="$(mktemp -d)"
-            if ! gh api "repos/${repo}/actions/artifacts/${artifact_id}/zip" > "${tmp}/artifact.zip"; then
-              echo "::error::Failed to download ${label} artifact ${artifact_id}"
-              rm -rf "${tmp}"
-              return 1
-            fi
-            unzip -q "${tmp}/artifact.zip" -d "${tmp}"
-            if [[ -f "${tmp}/artifact.tar" ]]; then
-              tar -xf "${tmp}/artifact.tar" -C docs-preview
-            else
-              echo "::warning::${label} artifact ${artifact_id} did not contain artifact.tar"
-            fi
-            rm -rf "${tmp}"
-          }
-
-          echo "Fetching default branch..."
-          default_branch="$(gh api "repos/${repo}" --jq '.default_branch')"
-          echo "Default branch: ${default_branch}"
-
-          echo "Listing github-pages artifacts..."
-          artifacts_json="$(gh api "repos/${repo}/actions/artifacts?name=github-pages&per_page=100")"
-          echo "Got artifacts JSON (${#artifacts_json} bytes)"
-
-          live_id="$(printf '%s' "${artifacts_json}" \
-            | jq -r '[.artifacts[] | select(.expired == false)] | .[0].id // empty')"
-          echo "Live artifact id: '${live_id}'"
-          fetch_artifact "${live_id}" "live"
-
-          prod_id="$(printf '%s' "${artifacts_json}" \
-            | jq -r --arg branch "${default_branch}" \
-              '[.artifacts[] | select(.expired == false and .workflow_run.head_branch == $branch)] | .[0].id // empty')"
-          echo "Prod artifact id: '${prod_id}'"
-          if [[ -n "${prod_id}" && "${prod_id}" != "${live_id}" ]]; then
-            fetch_artifact "${prod_id}" "production"
-          fi
-
           if [[ -d "docs-preview/preview/pr-${pr_number}" ]]; then
             echo "Removing docs-preview/preview/pr-${pr_number}"
             rm -rf "docs-preview/preview/pr-${pr_number}"

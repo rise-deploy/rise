@@ -1,0 +1,83 @@
+name: Seed Pages site
+description: |
+  Populate a directory with the current live GitHub Pages contents.
+  GitHub Pages deployments are atomic full-site replacements, so any job
+  that only produces a subtree (PR preview, prod docs, single-PR cleanup)
+  must seed the rest of the site from the latest live state or it will
+  wipe sibling content (other previews, prod docs, etc.).
+
+  Pulls the latest non-expired github-pages artifact ("live") and overlays
+  the latest default-branch artifact ("prod"), so prod content is restored
+  even if the live state was clobbered by an earlier deploy.
+inputs:
+  output-dir:
+    description: Directory to seed (created if missing).
+    required: true
+  github-token:
+    description: Token with actions:read on this repository.
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        OUTPUT_DIR: ${{ inputs.output-dir }}
+      run: |
+        set -euxo pipefail
+        repo="${GITHUB_REPOSITORY}"
+        out="${OUTPUT_DIR}"
+
+        echo "::group::Diagnostics"
+        gh --version || echo "gh not found"
+        gh auth status 2>&1 || true
+        echo "Repository: ${repo}"
+        echo "Output dir: ${out}"
+        echo "::endgroup::"
+
+        mkdir -p "${out}"
+
+        fetch_artifact() {
+          local artifact_id="$1"
+          local label="$2"
+          if [[ -z "${artifact_id}" || "${artifact_id}" == "null" ]]; then
+            echo "No ${label} artifact found; skipping."
+            return 0
+          fi
+          echo "Seeding ${out} with ${label} artifact ${artifact_id}"
+          local tmp
+          tmp="$(mktemp -d)"
+          if ! gh api "repos/${repo}/actions/artifacts/${artifact_id}/zip" > "${tmp}/artifact.zip"; then
+            echo "::error::Failed to download ${label} artifact ${artifact_id}"
+            rm -rf "${tmp}"
+            return 1
+          fi
+          unzip -q "${tmp}/artifact.zip" -d "${tmp}"
+          if [[ -f "${tmp}/artifact.tar" ]]; then
+            tar -xf "${tmp}/artifact.tar" -C "${out}"
+          else
+            echo "::warning::${label} artifact ${artifact_id} did not contain artifact.tar"
+          fi
+          rm -rf "${tmp}"
+        }
+
+        echo "Fetching default branch..."
+        default_branch="$(gh api "repos/${repo}" --jq '.default_branch')"
+        echo "Default branch: ${default_branch}"
+
+        echo "Listing github-pages artifacts..."
+        artifacts_json="$(gh api "repos/${repo}/actions/artifacts?name=github-pages&per_page=100")"
+        echo "Got artifacts JSON (${#artifacts_json} bytes)"
+
+        live_id="$(printf '%s' "${artifacts_json}" \
+          | jq -r '[.artifacts[] | select(.expired == false)] | .[0].id // empty')"
+        echo "Live artifact id: '${live_id}'"
+        fetch_artifact "${live_id}" "live"
+
+        prod_id="$(printf '%s' "${artifacts_json}" \
+          | jq -r --arg branch "${default_branch}" \
+            '[.artifacts[] | select(.expired == false and .workflow_run.head_branch == $branch)] | .[0].id // empty')"
+        echo "Prod artifact id: '${prod_id}'"
+        if [[ -n "${prod_id}" && "${prod_id}" != "${live_id}" ]]; then
+          fetch_artifact "${prod_id}" "production"
+        fi
