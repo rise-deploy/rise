@@ -86,6 +86,11 @@ class RiseAPI {
         });
     }
 
+    // Projects a team owns or has been granted access to view
+    async getTeamProjects(idOrName) {
+        return this.request(`/teams/${idOrName}/projects`);
+    }
+
     // Project endpoints
     async getProjects() {
         return this.request('/projects');
