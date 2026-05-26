@@ -38,6 +38,17 @@ pub(crate) enum OrganizationDeleteError {
 /// `ResourceStore::delete` calls on an Organization UID bypass this guard
 /// and will orphan rows in `user_organization_memberships`, `teams`, and
 /// `projects`.
+///
+/// TODO(multi-org): the count and the delete run in separate statements
+/// with no surrounding transaction, so a typed-row insert (team, project,
+/// or `user_organization_memberships`) that races between the two steps
+/// will be orphaned. Acceptable today because (a) the install is
+/// single-default-Org so any racing insert re-links on the next bootstrap
+/// pass, and (b) Org deletes are a rare admin action. Before a second Org
+/// can be created in production, serialize delete vs. typed insert by
+/// taking `pg_advisory_xact_lock` keyed on the Org UID in this function
+/// *and* in every `set_team_organization` / `set_project_organization` /
+/// `ensure_user_membership` call site.
 pub(crate) async fn delete_organization_guarded(
     store: &Arc<dyn ResourceStore>,
     pool: &PgPool,

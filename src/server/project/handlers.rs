@@ -159,20 +159,14 @@ pub async fn create_project(
             // the single-default-Org compatibility phase the only valid
             // Organization is the default one, so we compare the team's
             // linkage against `state.default_organization_uid`.
-            {
-                let mut conn =
-                    state.db_pool.acquire().await.internal_err(
-                        "Failed to acquire DB connection for team organization lookup",
-                    )?;
-                let team_org =
-                    crate::db::organization_links::organization_uid_for_team(&mut conn, uuid)
-                        .await
-                        .internal_err("Failed to look up team organization linkage")?;
-                if team_org != Some(state.default_organization_uid) {
-                    return Err(ServerError::forbidden(
-                        "This team is not assigned to the same Organization as the project",
-                    ));
-                }
+            let team_org =
+                crate::db::organization_links::organization_uid_for_team(&state.db_pool, uuid)
+                    .await
+                    .internal_err("Failed to look up team organization linkage")?;
+            if team_org != Some(state.default_organization_uid) {
+                return Err(ServerError::forbidden(
+                    "This team is not assigned to the same Organization as the project",
+                ));
             }
 
             (None, Some(uuid))

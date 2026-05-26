@@ -384,9 +384,13 @@ async fn enforce_controller_class(state: &AppState, project: &Project) -> Result
     {
         Some(uid) => uid,
         None => {
-            warn!(
+            // Strictly impossible after a successful bootstrap (validation
+            // refuses to start the server with any unlinked project), so
+            // hitting this branch is a programmer error — log at error level
+            // so it pages rather than disappearing into the warn stream.
+            error!(
                 project = %project.name,
-                "Project has no organization linkage — refusing to reconcile until bootstrap backfills it"
+                "Project has no organization linkage — bootstrap validation should have caught this; refusing to reconcile"
             );
             return Err(SyncError::Internal(anyhow::anyhow!(
                 "project '{}' is missing organization_resource_uid; bootstrap must backfill before reconciliation",

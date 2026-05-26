@@ -176,14 +176,14 @@ pub async fn count_typed_children_for_organization(
 // Live under feature="backend" (project handler); unused in CLI-only builds.
 #[cfg_attr(not(feature = "backend"), allow(dead_code))]
 pub async fn organization_uid_for_team(
-    conn: &mut PgConnection,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
     team_id: Uuid,
 ) -> Result<Option<Uuid>> {
     let row = sqlx::query!(
         r#"SELECT organization_resource_uid FROM teams WHERE id = $1"#,
         team_id
     )
-    .fetch_optional(&mut *conn)
+    .fetch_optional(executor)
     .await
     .context("Failed to look up team organization linkage")?;
     Ok(row.and_then(|r| r.organization_resource_uid))
@@ -194,21 +194,25 @@ pub async fn organization_uid_for_team(
 /// only happens for newly created rows where the typed API has not yet set
 /// the column).
 pub async fn organization_uid_for_project(
-    pool: &sqlx::PgPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
     project_id: Uuid,
 ) -> Result<Option<Uuid>> {
     let row = sqlx::query!(
         r#"SELECT organization_resource_uid FROM projects WHERE id = $1"#,
         project_id
     )
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
     .context("Failed to look up project organization linkage")?;
     Ok(row.and_then(|r| r.organization_resource_uid))
 }
 
-/// Stamp `organization_resource_uid` on a team. Used when creating a new team
-/// in the default-org bootstrap window.
+/// Stamp `organization_resource_uid` on a freshly created team. Only called
+/// from typed-API create paths and the Entra sync's new-team branch, so the
+/// helper deliberately does not bump `updated_at` — `created_at` was set to
+/// `NOW()` in the same transaction and the two should stay equal until a
+/// real mutation. Do not call this on an existing team to *change* its
+/// Organization linkage without also bumping `updated_at` explicitly.
 pub async fn set_team_organization(
     conn: &mut PgConnection,
     team_id: Uuid,
@@ -217,8 +221,7 @@ pub async fn set_team_organization(
     sqlx::query!(
         r#"
         UPDATE teams
-        SET organization_resource_uid = $2,
-            updated_at = NOW()
+        SET organization_resource_uid = $2
         WHERE id = $1
         "#,
         team_id,
@@ -230,8 +233,9 @@ pub async fn set_team_organization(
     Ok(())
 }
 
-/// Stamp `organization_resource_uid` on a project. Used when creating a new
-/// project in the default-org bootstrap window.
+/// Stamp `organization_resource_uid` on a freshly created project. See
+/// [`set_team_organization`] for why `updated_at` is intentionally not
+/// bumped.
 // Live under feature="backend" (project handler); unused in CLI-only builds.
 #[cfg_attr(not(feature = "backend"), allow(dead_code))]
 pub async fn set_project_organization(
@@ -242,8 +246,7 @@ pub async fn set_project_organization(
     sqlx::query!(
         r#"
         UPDATE projects
-        SET organization_resource_uid = $2,
-            updated_at = NOW()
+        SET organization_resource_uid = $2
         WHERE id = $1
         "#,
         project_id,
