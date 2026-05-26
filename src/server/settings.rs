@@ -29,7 +29,11 @@ pub struct Settings {
     /// Organization (under an advisory lock) before any backfill runs, so it
     /// is guaranteed to exist by the time controllers begin processing
     /// projects. Omitting the section accepts the documented defaults:
-    /// name="default", display name="Default", namespace prefix="rise-".
+    /// name="default", display name="Default", no namespace prefix
+    /// configured — the controller then synthesizes `org-{discriminator}-`
+    /// as the per-Org namespace prefix. Set
+    /// `default_organization.kubernetes_namespace_prefix` explicitly (e.g.
+    /// `"rise-"`) to preserve historic naming on existing installs.
     #[serde(default)]
     pub default_organization: DefaultOrganizationSettings,
 }

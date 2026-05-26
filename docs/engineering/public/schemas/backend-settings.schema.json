@@ -1674,7 +1674,7 @@
     },
     "default_organization": {
       "$ref": "#/$defs/DefaultOrganizationSettings",
-      "description": "Default Organization that owns existing typed data (users, teams,\nprojects) until org-aware multi-tenancy lands. Bootstrap creates this\nOrganization (under an advisory lock) before any backfill runs, so it\nis guaranteed to exist by the time controllers begin processing\nprojects. Omitting the section accepts the documented defaults:\nname=\"default\", display name=\"Default\", namespace prefix=\"rise-\"."
+      "description": "Default Organization that owns existing typed data (users, teams,\nprojects) until org-aware multi-tenancy lands. Bootstrap creates this\nOrganization (under an advisory lock) before any backfill runs, so it\nis guaranteed to exist by the time controllers begin processing\nprojects. Omitting the section accepts the documented defaults:\nname=\"default\", display name=\"Default\", no namespace prefix\nconfigured — the controller then synthesizes `org-{discriminator}-`\nas the per-Org namespace prefix. Set\n`default_organization.kubernetes_namespace_prefix` explicitly (e.g.\n`\"rise-\"`) to preserve historic naming on existing installs."
     },
     "deployment_controller": {
       "anyOf": [

@@ -105,14 +105,16 @@ impl GlobalLock {
     /// Release the lock and return the underlying connection to the pool.
     ///
     /// Always call this — see the module docs for why `Drop` can't substitute.
+    /// On unlock failure `released` stays `false` so `Drop` still emits the
+    /// safety log; the caller is expected to handle the returned `Err`.
     pub async fn release(mut self) -> Result<()> {
-        let result = sqlx::query("SELECT pg_advisory_unlock($1)")
+        sqlx::query("SELECT pg_advisory_unlock($1)")
             .bind(self.key)
             .execute(&mut *self.conn)
             .await
-            .with_context(|| format!("Failed to release GlobalLock '{}'", self.name));
+            .with_context(|| format!("Failed to release GlobalLock '{}'", self.name))?;
         self.released = true;
-        result.map(|_| ())
+        Ok(())
     }
 }
 
