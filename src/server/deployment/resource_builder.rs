@@ -85,9 +85,9 @@ enum ProbeType {
 
 /// Parsed ingress URL components
 #[derive(Debug, Clone)]
-struct IngressUrl {
-    host: String,
-    path_prefix: Option<String>,
+pub struct IngressUrl {
+    pub host: String,
+    pub path_prefix: Option<String>,
 }
 
 /// Holds configuration for building Kubernetes resource specs.
@@ -237,6 +237,50 @@ impl ResourceBuilder {
         }
     }
 
+    /// Resolve the deployment-group-specific host (the staging-template form).
+    ///
+    /// Always returns the templated DG host when `staging_ingress_url_template` is set,
+    /// even for the "default" group (yielding e.g. `myapp-default.preview.example.com`).
+    /// When no staging template is configured, returns the synthesized form for
+    /// non-default groups only — for the default group it returns `None` to avoid
+    /// colliding with the project's production hostname.
+    pub fn resolved_deployment_group_url(
+        &self,
+        project: &Project,
+        deployment_group: &str,
+    ) -> Option<String> {
+        if let Some(ref staging_template) = self.staging_ingress_url_template {
+            Some(
+                staging_template
+                    .replace("{project_name}", &project.name)
+                    .replace(
+                        "{deployment_group}",
+                        &Self::escaped_group_name(deployment_group),
+                    ),
+            )
+        } else if deployment_group != crate::server::deployment::models::DEFAULT_DEPLOYMENT_GROUP {
+            let base_url = self
+                .production_ingress_url_template
+                .replace("{project_name}", &project.name);
+            Some(if let Some(dot_pos) = base_url.find('.') {
+                format!(
+                    "{}-{}{}",
+                    &base_url[..dot_pos],
+                    Self::escaped_group_name(deployment_group),
+                    &base_url[dot_pos..]
+                )
+            } else {
+                format!(
+                    "{}-{}",
+                    base_url,
+                    Self::escaped_group_name(deployment_group)
+                )
+            })
+        } else {
+            None
+        }
+    }
+
     pub fn resolved_environment_url(
         &self,
         project: &Project,
@@ -281,6 +325,97 @@ impl ResourceBuilder {
         Self::parse_ingress_url(&url)
     }
 
+    /// Returns `true` if `host` would also be emitted as the env URL of some
+    /// environment whose `primary_deployment_group` is *not* `deployment_group`.
+    /// That's the cross-ingress collision case: a deployment-group's name
+    /// happens to match an environment name, so its DG URL would steal a host
+    /// that "belongs" to the env's primary group.
+    fn host_conflicts_with_other_env(
+        &self,
+        project: &Project,
+        deployment_group: &str,
+        host: &str,
+        all_environments: &[crate::db::models::Environment],
+    ) -> bool {
+        all_environments.iter().any(|env| {
+            if env.primary_deployment_group.as_deref() == Some(deployment_group) {
+                return false;
+            }
+            match self.resolved_environment_url(project, env) {
+                Some(env_url) => Self::parse_ingress_url(&env_url).host == host,
+                None => false,
+            }
+        })
+    }
+
+    /// Compute the ordered, deduplicated list of hosts that should appear on the
+    /// primary ingress for `(project, deployment_group)`.
+    ///
+    /// The list is built from:
+    /// 1. The deployment-group host (`resolved_deployment_group_url`), when one
+    ///    is configured for this group AND its host doesn't collide with the
+    ///    env URL of an environment whose primary group is a different group.
+    /// 2. The host of the environment whose `primary_deployment_group` matches
+    ///    this group, if any (production env contributes the production host).
+    /// 3. Each custom domain attached to that environment, when
+    ///    `include_custom_domains_inline` is true.
+    ///
+    /// `all_environments` is the full project env list used for the collision
+    /// check in (1). Callers without env context can pass an empty slice.
+    pub fn primary_ingress_hosts(
+        &self,
+        project: &Project,
+        deployment_group: &str,
+        environment_for_group: Option<&crate::db::models::Environment>,
+        custom_domains_for_env: &[CustomDomain],
+        include_custom_domains_inline: bool,
+        all_environments: &[crate::db::models::Environment],
+    ) -> Vec<IngressUrl> {
+        let mut hosts: Vec<IngressUrl> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        if let Some(dg_url) = self.resolved_deployment_group_url(project, deployment_group) {
+            let parsed = Self::parse_ingress_url(&dg_url);
+            if self.host_conflicts_with_other_env(
+                project,
+                deployment_group,
+                &parsed.host,
+                all_environments,
+            ) {
+                warn!(
+                    project = %project.name,
+                    deployment_group = %deployment_group,
+                    host = %parsed.host,
+                    "Suppressing deployment-group URL: collides with env URL of an environment whose primary deployment group is different"
+                );
+            } else if seen.insert(parsed.host.clone()) {
+                hosts.push(parsed);
+            }
+        }
+
+        if let Some(env) = environment_for_group {
+            if let Some(env_url) = self.resolved_environment_url(project, env) {
+                let parsed = Self::parse_ingress_url(&env_url);
+                if seen.insert(parsed.host.clone()) {
+                    hosts.push(parsed);
+                }
+            }
+        }
+
+        if include_custom_domains_inline {
+            for cd in custom_domains_for_env {
+                if seen.insert(cd.domain.clone()) {
+                    hosts.push(IngressUrl {
+                        host: cd.domain.clone(),
+                        path_prefix: None,
+                    });
+                }
+            }
+        }
+
+        hosts
+    }
+
     pub fn filter_valid_custom_domains(
         &self,
         custom_domains: &[CustomDomain],
@@ -294,6 +429,7 @@ impl ResourceBuilder {
                     &domain.domain,
                     &self.production_ingress_url_template,
                     self.staging_ingress_url_template.as_deref(),
+                    self.environment_ingress_url_template.as_deref(),
                     None,
                 ) {
                     Ok(()) => true,
@@ -315,77 +451,85 @@ impl ResourceBuilder {
 
     // ── Deployment URLs ────────────────────────────────────────────────
 
+    fn host_to_url(&self, host: &str) -> String {
+        let host_with_port = if let Some(port) = self.ingress_port {
+            format!("{}:{}", host, port)
+        } else {
+            host.to_string()
+        };
+        format!("{}://{}", self.ingress_schema, host_with_port)
+    }
+
     pub fn compute_deployment_urls(
         &self,
         project: &Project,
         deployment: &Deployment,
         environment: Option<&crate::db::models::Environment>,
+        all_environments: &[crate::db::models::Environment],
         custom_domains: &[CustomDomain],
     ) -> super::controller::DeploymentUrls {
         let default_url_host = self.full_ingress_url(project, deployment);
         let default_url = format!("{}://{}", self.ingress_schema, default_url_host);
 
-        let environment_url = environment
-            .filter(|env| {
-                env.primary_deployment_group.as_deref() == Some(&deployment.deployment_group)
+        let environment_for_group = environment.filter(|env| {
+            env.primary_deployment_group.as_deref() == Some(&deployment.deployment_group)
+        });
+
+        let environment_url = environment_for_group.and_then(|env| {
+            self.resolved_environment_url(project, env).map(|url_host| {
+                let full_host = self.full_ingress_url_from_host(&url_host);
+                format!("{}://{}", self.ingress_schema, full_host)
             })
-            .and_then(|env| {
-                self.resolved_environment_url(project, env).map(|url_host| {
-                    let full_host = self.full_ingress_url_from_host(&url_host);
-                    format!("{}://{}", self.ingress_schema, full_host)
-                })
-            });
+        });
 
-        let is_production_primary = environment
-            .map(|env| {
-                env.is_production
-                    && env.primary_deployment_group.as_deref() == Some(&deployment.deployment_group)
-            })
-            .unwrap_or(
-                deployment.deployment_group
-                    == crate::server::deployment::models::DEFAULT_DEPLOYMENT_GROUP,
-            );
+        let valid_custom_domains = self.filter_valid_custom_domains(custom_domains);
+        let env_id = environment_for_group.map(|e| e.id);
+        let domains_for_env: Vec<&CustomDomain> = valid_custom_domains
+            .iter()
+            .filter(|cd| env_id == Some(cd.environment_id))
+            .collect();
 
-        let custom_domains = self.filter_valid_custom_domains(custom_domains);
-
-        let (custom_domain_urls, primary_url) = if is_production_primary {
-            let starred = custom_domains.iter().find(|d| d.is_primary);
-            let primary = if let Some(starred) = starred {
-                let host = if let Some(port) = self.ingress_port {
-                    format!("{}:{}", starred.domain, port)
-                } else {
-                    starred.domain.clone()
-                };
-                format!("{}://{}", self.ingress_schema, host)
-            } else {
-                environment_url
-                    .clone()
-                    .unwrap_or_else(|| default_url.clone())
-            };
-
-            let urls: Vec<String> = custom_domains
-                .iter()
-                .map(|domain| {
-                    let url_host = if let Some(port) = self.ingress_port {
-                        format!("{}:{}", domain.domain, port)
-                    } else {
-                        domain.domain.clone()
-                    };
-                    format!("{}://{}", self.ingress_schema, url_host)
-                })
-                .collect();
-            (urls, primary)
+        let starred = domains_for_env.iter().find(|d| d.is_primary);
+        let primary_url = if let Some(starred) = starred {
+            self.host_to_url(&starred.domain)
         } else {
-            let primary = environment_url
+            environment_url
                 .clone()
-                .unwrap_or_else(|| default_url.clone());
-            (Vec::new(), primary)
+                .unwrap_or_else(|| default_url.clone())
         };
+
+        let custom_domain_urls: Vec<String> = domains_for_env
+            .iter()
+            .map(|d| self.host_to_url(&d.domain))
+            .collect();
+
+        let templated_hosts = self.primary_ingress_hosts(
+            project,
+            &deployment.deployment_group,
+            environment_for_group,
+            &[],
+            false,
+            all_environments,
+        );
+        let mut all_urls: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for host in &templated_hosts {
+            let url = self.host_to_url(&host.host);
+            if seen.insert(url.clone()) {
+                all_urls.push(url);
+            }
+        }
+        for url in &custom_domain_urls {
+            if seen.insert(url.clone()) {
+                all_urls.push(url.clone());
+            }
+        }
 
         super::controller::DeploymentUrls {
             default_url,
             primary_url,
             custom_domain_urls,
+            all_urls,
         }
     }
 
@@ -399,42 +543,43 @@ impl ResourceBuilder {
         let full_host = self.full_ingress_url_from_host(&url_host);
         let default_url = format!("{}://{}", self.ingress_schema, full_host);
 
-        let custom_domains = self.filter_valid_custom_domains(custom_domains);
+        let valid_custom_domains = self.filter_valid_custom_domains(custom_domains);
 
+        // No environment context here — keep the historical "default group hosts custom
+        // domains" rule to preserve preview-URL semantics for callers that haven't yet
+        // adopted the env-aware path.
         let (custom_domain_urls, primary_url) =
             if deployment_group == crate::server::deployment::models::DEFAULT_DEPLOYMENT_GROUP {
-                let starred = custom_domains.iter().find(|d| d.is_primary);
+                let starred = valid_custom_domains.iter().find(|d| d.is_primary);
                 let primary = if let Some(starred) = starred {
-                    let host = if let Some(port) = self.ingress_port {
-                        format!("{}:{}", starred.domain, port)
-                    } else {
-                        starred.domain.clone()
-                    };
-                    format!("{}://{}", self.ingress_schema, host)
+                    self.host_to_url(&starred.domain)
                 } else {
                     default_url.clone()
                 };
 
-                let urls: Vec<String> = custom_domains
+                let urls: Vec<String> = valid_custom_domains
                     .iter()
-                    .map(|domain| {
-                        let url_host = if let Some(port) = self.ingress_port {
-                            format!("{}:{}", domain.domain, port)
-                        } else {
-                            domain.domain.clone()
-                        };
-                        format!("{}://{}", self.ingress_schema, url_host)
-                    })
+                    .map(|d| self.host_to_url(&d.domain))
                     .collect();
                 (urls, primary)
             } else {
                 (Vec::new(), default_url.clone())
             };
 
+        let mut all_urls = vec![default_url.clone()];
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        seen.insert(default_url.clone());
+        for url in &custom_domain_urls {
+            if seen.insert(url.clone()) {
+                all_urls.push(url.clone());
+            }
+        }
+
         super::controller::DeploymentUrls {
             default_url,
             primary_url,
             custom_domain_urls,
+            all_urls,
         }
     }
 
@@ -1310,18 +1455,65 @@ impl ResourceBuilder {
         paths
     }
 
+    /// Build the primary ingress resource for an active deployment in a group.
+    ///
+    /// `environment_for_group` is the environment whose `primary_deployment_group`
+    /// equals this deployment's group (None when no env is mapped to the group).
+    /// `inline_custom_domains` are folded into this ingress when non-empty; when
+    /// `custom_domain_ingress_annotations` is configured, callers should pass an
+    /// empty slice here and use `create_custom_domain_ingress` separately so the
+    /// custom annotations only apply to those domains.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_primary_ingress(
         &self,
         project: &Project,
         deployment: &Deployment,
         namespace: &str,
+        environment_for_group: Option<&crate::db::models::Environment>,
+        inline_custom_domains: &[CustomDomain],
         environment_name: Option<&str>,
-    ) -> anyhow::Result<Ingress> {
-        let url_components = self.ingress_url_components(project, deployment);
+        all_environments: &[crate::db::models::Environment],
+    ) -> anyhow::Result<Option<Ingress>> {
+        let mut hosts = self.primary_ingress_hosts(
+            project,
+            &deployment.deployment_group,
+            environment_for_group,
+            inline_custom_domains,
+            !inline_custom_domains.is_empty(),
+            all_environments,
+        );
+
+        // Historical fallback: when neither a DG host nor an env host applies
+        // (e.g. the default group with no staging template and no production
+        // env mapping), use the single-host computation so the deployment is
+        // still reachable. Skip this fallback when the resulting host would
+        // collide with another env's URL — nginx would reject it and we'd
+        // rather emit no ingress than spin on admission failures.
+        if hosts.is_empty() {
+            let fallback = self.ingress_url_components(project, deployment);
+            if self.host_conflicts_with_other_env(
+                project,
+                &deployment.deployment_group,
+                &fallback.host,
+                all_environments,
+            ) {
+                warn!(
+                    project = %project.name,
+                    deployment_group = %deployment.deployment_group,
+                    host = %fallback.host,
+                    "Skipping ingress: all candidate hosts collide with another env's URL"
+                );
+                return Ok(None);
+            }
+            hosts.push(fallback);
+        }
 
         let mut annotations = self.build_ingress_annotations(project)?;
 
-        if let Some(ref path) = url_components.path_prefix {
+        // Annotations are per-ingress: if the DG host (first templated host) is
+        // path-based, apply the rewrite-target annotation. Mixed strategies on
+        // the same ingress are not supported by nginx-ingress today.
+        if let Some(ref path) = hosts[0].path_prefix {
             annotations.insert(
                 "nginx.ingress.kubernetes.io/rewrite-target".to_string(),
                 "/$2".to_string(),
@@ -1332,26 +1524,36 @@ impl ResourceBuilder {
             );
         }
 
-        let (ingress_path, path_type) = if let Some(ref path) = url_components.path_prefix {
-            let pattern = format!("{}(/|$)(.*)", path.trim_end_matches('/'));
-            (pattern, "ImplementationSpecific")
-        } else {
-            ("/".to_string(), "Prefix")
-        };
-
         let service_name = Self::service_name(project, deployment);
-        let primary_paths = self.build_ingress_paths(&service_name, &ingress_path, path_type);
 
-        let rules = vec![IngressRule {
-            host: Some(url_components.host.clone()),
-            http: Some(HTTPIngressRuleValue {
-                paths: primary_paths,
-            }),
-        }];
+        let rules: Vec<IngressRule> = hosts
+            .iter()
+            .map(|host| {
+                let (path, path_type) = if let Some(ref prefix) = host.path_prefix {
+                    (
+                        format!("{}(/|$)(.*)", prefix.trim_end_matches('/')),
+                        "ImplementationSpecific",
+                    )
+                } else {
+                    ("/".to_string(), "Prefix")
+                };
+                let paths = self.build_ingress_paths(&service_name, &path, path_type);
+                IngressRule {
+                    host: Some(host.host.clone()),
+                    http: Some(HTTPIngressRuleValue { paths }),
+                }
+            })
+            .collect();
 
-        let tls = self.build_primary_tls_config(&url_components.host);
+        let templated_hosts: Vec<String> = hosts
+            .iter()
+            .filter(|h| !inline_custom_domains.iter().any(|cd| cd.domain == h.host))
+            .map(|h| h.host.clone())
+            .collect();
 
-        Ok(Ingress {
+        let tls = self.build_primary_tls_config(&templated_hosts, inline_custom_domains);
+
+        Ok(Some(Ingress {
             metadata: ObjectMeta {
                 name: Some(Self::ingress_name(project, deployment)),
                 namespace: Some(namespace.to_string()),
@@ -1366,7 +1568,7 @@ impl ResourceBuilder {
                 ..Default::default()
             }),
             ..Default::default()
-        })
+        }))
     }
 
     pub fn create_custom_domain_ingress(
@@ -1416,13 +1618,31 @@ impl ResourceBuilder {
 
     fn build_primary_tls_config(
         &self,
-        primary_host: &str,
+        templated_hosts: &[String],
+        inline_custom_domains: &[CustomDomain],
     ) -> Option<Vec<k8s_openapi::api::networking::v1::IngressTLS>> {
-        let shared_secret = self.ingress_tls_secret_name.as_ref()?;
-        Some(vec![k8s_openapi::api::networking::v1::IngressTLS {
-            hosts: Some(vec![primary_host.to_string()]),
-            secret_name: Some(shared_secret.clone()),
-        }])
+        let mut entries: Vec<k8s_openapi::api::networking::v1::IngressTLS> = Vec::new();
+
+        if !templated_hosts.is_empty() {
+            if let Some(shared_secret) = self.ingress_tls_secret_name.as_ref() {
+                entries.push(k8s_openapi::api::networking::v1::IngressTLS {
+                    hosts: Some(templated_hosts.to_vec()),
+                    secret_name: Some(shared_secret.clone()),
+                });
+            }
+        }
+
+        if !inline_custom_domains.is_empty() {
+            if let Some(custom) = self.build_custom_domain_tls_config(inline_custom_domains) {
+                entries.extend(custom);
+            }
+        }
+
+        if entries.is_empty() {
+            None
+        } else {
+            Some(entries)
+        }
     }
 
     fn build_custom_domain_tls_config(
@@ -1918,6 +2138,297 @@ mod tests {
         let d = make_deployment(None, false);
         let secrets = &pod_spec_from_deployment(&d).image_pull_secrets;
         assert!(secrets.is_none());
+    }
+
+    // ── Multi-host ingress tests ────────────────────────────────────────────
+
+    fn test_environment(
+        name: &str,
+        is_production: bool,
+        primary_group: &str,
+    ) -> crate::db::models::Environment {
+        crate::db::models::Environment {
+            id: uuid::Uuid::nil(),
+            project_id: uuid::Uuid::nil(),
+            name: name.to_string(),
+            primary_deployment_group: Some(primary_group.to_string()),
+            is_production,
+            color: "green".to_string(),
+            min_replicas: None,
+            max_replicas: None,
+            min_cpu: None,
+            max_cpu: None,
+            min_memory: None,
+            max_memory: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn test_custom_domain(domain: &str, is_primary: bool) -> CustomDomain {
+        CustomDomain {
+            id: uuid::Uuid::new_v4(),
+            project_id: uuid::Uuid::nil(),
+            environment_id: uuid::Uuid::nil(),
+            domain: domain.to_string(),
+            is_primary,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn dg_host_omitted_for_default_group_without_staging_template() {
+        let builder = test_resource_builder();
+        let project = test_project();
+        assert_eq!(
+            builder.resolved_deployment_group_url(&project, "default"),
+            None
+        );
+    }
+
+    #[test]
+    fn dg_host_synthesized_for_non_default_without_staging_template() {
+        let builder = test_resource_builder();
+        let project = test_project();
+        assert_eq!(
+            builder.resolved_deployment_group_url(&project, "mr-42"),
+            Some("demo-mr-42.example.test".to_string())
+        );
+    }
+
+    #[test]
+    fn dg_host_uses_staging_template_when_set() {
+        let mut builder = test_resource_builder();
+        builder.staging_ingress_url_template =
+            Some("{project_name}-{deployment_group}.preview.example.test".to_string());
+        let project = test_project();
+        assert_eq!(
+            builder.resolved_deployment_group_url(&project, "default"),
+            Some("demo-default.preview.example.test".to_string())
+        );
+        assert_eq!(
+            builder.resolved_deployment_group_url(&project, "mr/42"),
+            Some("demo-mr--42.preview.example.test".to_string())
+        );
+    }
+
+    #[test]
+    fn primary_hosts_default_group_prod_env_includes_production_and_custom() {
+        let mut builder = test_resource_builder();
+        builder.staging_ingress_url_template =
+            Some("{project_name}-{deployment_group}.preview.example.test".to_string());
+        let project = test_project();
+        let prod_env = test_environment("production", true, "default");
+        let domains = vec![test_custom_domain("api.example.com", true)];
+
+        let hosts = builder.primary_ingress_hosts(
+            &project,
+            "default",
+            Some(&prod_env),
+            &domains,
+            true,
+            &[],
+        );
+        let host_strs: Vec<&str> = hosts.iter().map(|h| h.host.as_str()).collect();
+
+        assert!(host_strs.contains(&"demo-default.preview.example.test"));
+        assert!(host_strs.contains(&"demo.example.test"));
+        assert!(host_strs.contains(&"api.example.com"));
+    }
+
+    #[test]
+    fn primary_hosts_non_default_group_with_staging_env() {
+        let mut builder = test_resource_builder();
+        builder.staging_ingress_url_template =
+            Some("{project_name}-{deployment_group}.preview.example.test".to_string());
+        builder.environment_ingress_url_template =
+            Some("{environment}.{project_name}.example.test".to_string());
+        let project = test_project();
+        let staging_env = test_environment("staging", false, "mr-42");
+
+        let hosts =
+            builder.primary_ingress_hosts(&project, "mr-42", Some(&staging_env), &[], false, &[]);
+        let host_strs: Vec<&str> = hosts.iter().map(|h| h.host.as_str()).collect();
+
+        assert_eq!(
+            host_strs,
+            vec![
+                "demo-mr-42.preview.example.test",
+                "staging.demo.example.test"
+            ]
+        );
+    }
+
+    #[test]
+    fn primary_hosts_dedup_when_dg_and_env_collide() {
+        // For the default group with no staging template, no DG host is emitted —
+        // the env host (production) is the only templated host.
+        let builder = test_resource_builder();
+        let project = test_project();
+        let prod_env = test_environment("production", true, "default");
+
+        let hosts =
+            builder.primary_ingress_hosts(&project, "default", Some(&prod_env), &[], false, &[]);
+        let host_strs: Vec<&str> = hosts.iter().map(|h| h.host.as_str()).collect();
+        assert_eq!(host_strs, vec!["demo.example.test"]);
+    }
+
+    #[test]
+    fn primary_hosts_no_env_returns_only_dg_host() {
+        let mut builder = test_resource_builder();
+        builder.staging_ingress_url_template =
+            Some("{project_name}-{deployment_group}.preview.example.test".to_string());
+        let project = test_project();
+
+        let hosts = builder.primary_ingress_hosts(&project, "mr-42", None, &[], false, &[]);
+        let host_strs: Vec<&str> = hosts.iter().map(|h| h.host.as_str()).collect();
+        assert_eq!(host_strs, vec!["demo-mr-42.preview.example.test"]);
+    }
+
+    #[test]
+    fn primary_hosts_suppress_dg_when_it_collides_with_other_env_url() {
+        // Reproduces the convertx case: a deployment group named "staging"
+        // would emit DG host "staging--demo.preview.example.test", which
+        // collides with the env URL of the "staging" environment whose
+        // primary deployment group is "staging-grp".
+        let mut builder = test_resource_builder();
+        builder.staging_ingress_url_template =
+            Some("{deployment_group}--{project_name}.preview.example.test".to_string());
+        builder.environment_ingress_url_template =
+            Some("{environment}--{project_name}.preview.example.test".to_string());
+        let project = test_project();
+        let staging_env = test_environment("staging", false, "staging-grp");
+
+        // Group "staging" has no env_for_group (no env's primary_dg == "staging")
+        // and its DG URL collides with staging-env's URL. Hosts must be empty.
+        let hosts = builder.primary_ingress_hosts(
+            &project,
+            "staging",
+            None,
+            &[],
+            false,
+            std::slice::from_ref(&staging_env),
+        );
+        assert!(
+            hosts.is_empty(),
+            "DG URL for 'staging' group should be suppressed; got {:?}",
+            hosts
+        );
+
+        // Group "staging-grp" emits both its DG URL and the staging env URL.
+        let hosts = builder.primary_ingress_hosts(
+            &project,
+            "staging-grp",
+            Some(&staging_env),
+            &[],
+            false,
+            std::slice::from_ref(&staging_env),
+        );
+        let host_strs: Vec<&str> = hosts.iter().map(|h| h.host.as_str()).collect();
+        assert_eq!(
+            host_strs,
+            vec![
+                "staging-grp--demo.preview.example.test",
+                "staging--demo.preview.example.test"
+            ]
+        );
+    }
+
+    #[test]
+    fn create_primary_ingress_emits_multiple_rules_and_tls_entries() {
+        let mut builder = test_resource_builder();
+        builder.staging_ingress_url_template =
+            Some("{project_name}-{deployment_group}.preview.example.test".to_string());
+        builder.ingress_tls_secret_name = Some("shared-wildcard".to_string());
+        builder.access_classes.insert(
+            "default".to_string(),
+            crate::server::settings::AccessClass {
+                display_name: "Public".to_string(),
+                description: "Public access".to_string(),
+                ingress_class: "nginx".to_string(),
+                access_requirement: crate::server::settings::AccessRequirement::None,
+                custom_annotations: std::collections::HashMap::new(),
+            },
+        );
+        let project = test_project();
+        let mut deployment = test_deployment();
+        deployment.deployment_group = "default".to_string();
+        let prod_env = test_environment("production", true, "default");
+        let domains = vec![test_custom_domain("api.example.com", true)];
+
+        let ingress = builder
+            .create_primary_ingress(
+                &project,
+                &deployment,
+                "demo",
+                Some(&prod_env),
+                &domains,
+                Some("production"),
+                &[],
+            )
+            .expect("primary ingress")
+            .expect("ingress should be emitted");
+
+        let spec = ingress.spec.expect("spec");
+        let rules = spec.rules.expect("rules");
+        let hosts: Vec<String> = rules.iter().filter_map(|r| r.host.clone()).collect();
+        assert!(hosts.contains(&"demo-default.preview.example.test".to_string()));
+        assert!(hosts.contains(&"demo.example.test".to_string()));
+        assert!(hosts.contains(&"api.example.com".to_string()));
+
+        let tls = spec.tls.expect("tls");
+        // One entry for templated hosts (shared cert) + one per custom domain (PerDomain mode)
+        assert!(tls
+            .iter()
+            .any(|t| t.secret_name.as_deref() == Some("shared-wildcard")));
+        assert!(tls
+            .iter()
+            .any(|t| t.secret_name.as_deref() == Some("tls-api.example.com")));
+    }
+
+    #[test]
+    fn create_primary_ingress_returns_none_when_all_hosts_collide() {
+        // The "staging" deployment group has no env that names it as primary,
+        // and its DG URL collides with the staging env's URL (whose primary is
+        // a different group). With no other host to fall back to, the ingress
+        // is suppressed entirely.
+        let mut builder = test_resource_builder();
+        builder.staging_ingress_url_template =
+            Some("{deployment_group}--{project_name}.preview.example.test".to_string());
+        builder.environment_ingress_url_template =
+            Some("{environment}--{project_name}.preview.example.test".to_string());
+        builder.access_classes.insert(
+            "default".to_string(),
+            crate::server::settings::AccessClass {
+                display_name: "Public".to_string(),
+                description: "Public access".to_string(),
+                ingress_class: "nginx".to_string(),
+                access_requirement: crate::server::settings::AccessRequirement::None,
+                custom_annotations: std::collections::HashMap::new(),
+            },
+        );
+        let project = test_project();
+        let mut deployment = test_deployment();
+        deployment.deployment_group = "staging".to_string();
+        let staging_env = test_environment("staging", false, "staging-grp");
+
+        let result = builder
+            .create_primary_ingress(
+                &project,
+                &deployment,
+                "demo",
+                None,
+                &[],
+                Some("staging"),
+                std::slice::from_ref(&staging_env),
+            )
+            .expect("call ok");
+
+        assert!(
+            result.is_none(),
+            "expected no ingress when all candidate hosts collide"
+        );
     }
 }
 

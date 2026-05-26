@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 struct CustomDomainResponse {
     id: String,
     domain: String,
+    #[serde(default)]
+    environment: String,
+    #[serde(default)]
+    is_primary: bool,
     created_at: String,
     updated_at: String,
 }
@@ -20,6 +24,8 @@ struct CustomDomainsResponse {
 #[derive(Debug, Serialize)]
 struct AddCustomDomainRequest {
     domain: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    environment: Option<String>,
 }
 
 /// Add a custom domain to a project
@@ -29,11 +35,13 @@ pub async fn add_domain(
     token: &str,
     project: &str,
     domain: &str,
+    environment: Option<&str>,
 ) -> Result<()> {
     let url = format!("{}/api/v1/projects/{}/domains", backend_url, project);
 
     let payload = AddCustomDomainRequest {
         domain: domain.to_string(),
+        environment: environment.map(str::to_string),
     };
 
     let response = http_client
@@ -56,10 +64,16 @@ pub async fn add_domain(
         );
     }
 
-    println!(
-        "✓ Added custom domain '{}' to project '{}'",
-        domain, project
-    );
+    match environment {
+        Some(env) => println!(
+            "✓ Added custom domain '{}' to project '{}' (environment: {})",
+            domain, project, env
+        ),
+        None => println!(
+            "✓ Added custom domain '{}' to project '{}'",
+            domain, project
+        ),
+    }
 
     Ok(())
 }
@@ -107,11 +121,18 @@ pub async fn list_domains(
     table
         .load_preset(UTF8_FULL)
         .apply_modifier(UTF8_ROUND_CORNERS)
-        .set_header(vec![Cell::new("DOMAIN"), Cell::new("CREATED AT")]);
+        .set_header(vec![
+            Cell::new("DOMAIN"),
+            Cell::new("ENVIRONMENT"),
+            Cell::new("PRIMARY"),
+            Cell::new("CREATED AT"),
+        ]);
 
     for domain in &domains_response.domains {
         table.add_row(vec![
             Cell::new(&domain.domain),
+            Cell::new(&domain.environment),
+            Cell::new(if domain.is_primary { "★" } else { "" }),
             Cell::new(&domain.created_at),
         ]);
     }

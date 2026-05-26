@@ -119,6 +119,7 @@ fn extract_hostname_from_url(url: &str) -> Option<String> {
 /// * `domain` - The custom domain to validate
 /// * `production_template` - The production ingress URL template
 /// * `staging_template` - The optional staging ingress URL template
+/// * `environment_template` - The optional environment ingress URL template
 /// * `rise_public_url` - The optional Rise public URL to prevent conflicts
 ///
 /// # Returns
@@ -128,6 +129,7 @@ pub fn validate_custom_domain(
     domain: &str,
     production_template: &str,
     staging_template: Option<&str>,
+    environment_template: Option<&str>,
     rise_public_url: Option<&str>,
 ) -> Result<(), String> {
     // Check against Rise's own public URL
@@ -158,6 +160,18 @@ pub fn validate_custom_domain(
             if regex.is_match(domain) {
                 return Err(format!(
                     "Custom domain '{}' conflicts with the staging deployment domain pattern",
+                    domain
+                ));
+            }
+        }
+    }
+
+    // Check against environment template if provided
+    if let Some(environment_template) = environment_template {
+        if let Some(regex) = template_to_regex(environment_template) {
+            if regex.is_match(domain) {
+                return Err(format!(
+                    "Custom domain '{}' conflicts with the environment deployment domain pattern",
                     domain
                 ));
             }
@@ -241,6 +255,7 @@ mod tests {
             "{project_name}.apps.example.com",
             None,
             None,
+            None,
         );
         assert!(result.is_err());
         assert!(result
@@ -255,14 +270,20 @@ mod tests {
             "{project_name}.apps.example.com",
             None,
             None,
+            None,
         );
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_validate_custom_domain_path_based_conflict() {
-        let result =
-            validate_custom_domain("example.com", "example.com/{project_name}", None, None);
+        let result = validate_custom_domain(
+            "example.com",
+            "example.com/{project_name}",
+            None,
+            None,
+            None,
+        );
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -271,7 +292,8 @@ mod tests {
 
     #[test]
     fn test_validate_custom_domain_path_based_ok() {
-        let result = validate_custom_domain("other.com", "example.com/{project_name}", None, None);
+        let result =
+            validate_custom_domain("other.com", "example.com/{project_name}", None, None, None);
         assert!(result.is_ok());
     }
 
@@ -282,6 +304,7 @@ mod tests {
             "{project_name}.apps.example.com",
             Some("{project_name}-{deployment_group}.preview.example.com"),
             None,
+            None,
         );
         assert!(result.is_err());
         assert!(result
@@ -290,11 +313,27 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_custom_domain_environment_conflict() {
+        let result = validate_custom_domain(
+            "staging.myapp.apps.example.com",
+            "{project_name}.apps.example.com",
+            None,
+            Some("{environment}.{project_name}.apps.example.com"),
+            None,
+        );
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("environment deployment domain pattern"));
+    }
+
+    #[test]
     fn test_validate_custom_domain_multiple_levels() {
         // Should not match domains with too many subdomain levels
         let result = validate_custom_domain(
             "foo.bar.apps.example.com",
             "{project_name}.apps.example.com",
+            None,
             None,
             None,
         );
@@ -306,6 +345,7 @@ mod tests {
         let result = validate_custom_domain(
             "rise.example.com",
             "{project_name}.apps.example.com",
+            None,
             None,
             Some("https://rise.example.com"),
         );
@@ -321,6 +361,7 @@ mod tests {
             "mycustomdomain.com",
             "{project_name}.apps.example.com",
             None,
+            None,
             Some("https://rise.example.com"),
         );
         assert!(result.is_ok());
@@ -332,6 +373,7 @@ mod tests {
         let result = validate_custom_domain(
             "foo.example.com",
             "{project_name}.example.com/{deployment_group}",
+            None,
             None,
             None,
         );

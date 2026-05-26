@@ -78,6 +78,8 @@ pub struct AppState {
     pub production_ingress_url_template: Option<String>,
     /// Staging ingress URL template (for custom domain validation)
     pub staging_ingress_url_template: Option<String>,
+    /// Environment ingress URL template (for custom domain validation)
+    pub environment_ingress_url_template: Option<String>,
     /// Ingress URL scheme (e.g., "https" or "http")
     pub ingress_schema: String,
     /// Optional ingress port (for development environments)
@@ -1010,12 +1012,14 @@ impl AppState {
             access_classes,
             production_ingress_url_template,
             staging_ingress_url_template,
+            environment_ingress_url_template,
             ingress_schema,
             ingress_port,
         ) = if let Some(crate::server::settings::DeploymentControllerSettings::Kubernetes {
             access_classes,
             production_ingress_url_template,
             staging_ingress_url_template,
+            environment_ingress_url_template,
             ingress_schema,
             ingress_port,
             ..
@@ -1029,12 +1033,14 @@ impl AppState {
                 Arc::new(filtered),
                 Some(production_ingress_url_template.clone()),
                 staging_ingress_url_template.clone(),
+                environment_ingress_url_template.clone(),
                 ingress_schema.clone(),
                 *ingress_port,
             )
         } else {
             (
                 Arc::new(std::collections::HashMap::new()),
+                None,
                 None,
                 None,
                 "https".to_string(),
@@ -1068,6 +1074,7 @@ impl AppState {
             access_classes,
             production_ingress_url_template,
             staging_ingress_url_template,
+            environment_ingress_url_template,
             ingress_schema,
             ingress_port,
             #[cfg(feature = "backend")]

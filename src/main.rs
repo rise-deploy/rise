@@ -805,6 +805,9 @@ enum DomainCommands {
         path: String,
         /// Domain name (e.g., example.com)
         domain: String,
+        /// Environment to attach the domain to. Defaults to the project's production environment.
+        #[arg(long, short = 'e')]
+        environment: Option<String>,
     },
     /// List custom domains for a project
     #[command(visible_alias = "ls")]
@@ -1731,10 +1734,18 @@ async fn main() -> Result<()> {
                     project,
                     path,
                     domain,
+                    environment,
                 } => {
                     let project_name = resolve_project_name(project.clone(), path)?;
-                    domain::add_domain(&http_client, &backend_url, &token, &project_name, domain)
-                        .await?;
+                    domain::add_domain(
+                        &http_client,
+                        &backend_url,
+                        &token,
+                        &project_name,
+                        domain,
+                        environment.as_deref(),
+                    )
+                    .await?;
                 }
                 DomainCommands::List { project, path } => {
                     let project_name = resolve_project_name(project.clone(), path)?;

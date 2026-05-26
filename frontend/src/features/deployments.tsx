@@ -1680,10 +1680,15 @@ export function DeploymentDetail({ projectName, deploymentId }) {
         .filter((group) => group.events.length > 0);
 
     const podStatus = deployment.controller_metadata?.pod_status;
-    const allDomains = [
-        deployment.primary_url,
-        ...(deployment.custom_domain_urls || []),
-    ].filter(Boolean);
+    // Prefer the backend-deduplicated all_urls (deployment-group URL, env URL,
+    // production URL, custom domains). Fall back to the older fields for stale
+    // payloads; dedupe so a custom domain set as primary isn't shown twice.
+    const allDomains = (deployment.all_urls && deployment.all_urls.length > 0)
+        ? deployment.all_urls
+        : Array.from(new Set([
+              deployment.primary_url,
+              ...(deployment.custom_domain_urls || []),
+          ].filter(Boolean)));
 
     const tabs = [
         { id: 'logs', label: 'Logs' },

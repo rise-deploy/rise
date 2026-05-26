@@ -940,11 +940,6 @@ async fn handle_deployment_became_healthy(
     )
     .await?;
 
-    // Clear needs_reconcile if set
-    if deployment.needs_reconcile {
-        db_deployments::clear_needs_reconcile(&state.db_pool, deployment.id).await?;
-    }
-
     db_projects::update_calculated_status(&state.db_pool, project.id).await?;
 
     Ok(())
@@ -1199,8 +1194,44 @@ async fn compute_desired_children(
         crate::db::custom_domains::list_project_custom_domains(&state.db_pool, project.id).await?;
     let valid_custom_domains = resource_builder.filter_valid_custom_domains(&custom_domains);
 
+    // Index custom domains by environment_id.
+    let mut domains_by_env: HashMap<uuid::Uuid, Vec<crate::db::models::CustomDomain>> =
+        HashMap::new();
+    for cd in &valid_custom_domains {
+        domains_by_env
+            .entry(cd.environment_id)
+            .or_default()
+            .push(cd.clone());
+    }
+
+    // Index environments by the deployment group they're primary for. The schema
+    // enforces (project_id, primary_deployment_group) uniqueness, so at most one
+    // env per group.
+    let mut env_by_primary_group: HashMap<String, &crate::db::models::Environment> = HashMap::new();
+    for env in environments.values() {
+        if let Some(group) = env.primary_deployment_group.as_deref() {
+            env_by_primary_group.insert(group.to_string(), env);
+        }
+    }
+
+    // If the operator configured custom_domain_ingress_annotations, custom domains
+    // continue to ride on a sibling ingress so those annotations only apply there.
+    // Otherwise we fold them into the primary ingress.
+    let split_custom_domains = !resource_builder
+        .custom_domain_ingress_annotations
+        .is_empty();
+
+    // Full env list for `create_primary_ingress` to do cross-ingress host
+    // collision checks (a DG URL that matches another env's URL is suppressed).
+    let all_environments: Vec<crate::db::models::Environment> =
+        environments.values().cloned().collect();
+
     for (group, active_deployment) in &active_by_group {
         let env_name = env_name_for(active_deployment);
+        let env_for_group = env_by_primary_group.get(group.as_str()).copied();
+        let domains_for_group: Vec<crate::db::models::CustomDomain> = env_for_group
+            .and_then(|env| domains_by_env.get(&env.id).cloned())
+            .unwrap_or_default();
 
         // Service (selector points to the active deployment)
         let service = resource_builder.create_service(
@@ -1213,31 +1244,35 @@ async fn compute_desired_children(
         children.push(serde_json::to_value(&service)?);
 
         // Primary Ingress
-        let ingress = resource_builder.create_primary_ingress(
+        let inline_domains: &[crate::db::models::CustomDomain] = if split_custom_domains {
+            &[]
+        } else {
+            &domains_for_group
+        };
+        if let Some(ingress) = resource_builder.create_primary_ingress(
             project,
             active_deployment,
             &namespace,
+            env_for_group,
+            inline_domains,
             env_name.as_deref(),
-        )?;
-        children.push(serde_json::to_value(&ingress)?);
+            &all_environments,
+        )? {
+            children.push(serde_json::to_value(&ingress)?);
+        }
+        // When `create_primary_ingress` returns `None`, every candidate host for
+        // this group collided with another env's URL (e.g. a deployment group
+        // named the same as an environment whose primary group is different).
+        // Skip the ingress so nginx admission doesn't reject it; the deployment
+        // still runs and a warning was logged in `create_primary_ingress`.
 
-        // Custom domain Ingress (only for production primary group)
-        let environment = active_deployment
-            .environment_id
-            .and_then(|id| environments.get(&id));
-
-        let is_production_primary = environment
-            .map(|env| {
-                env.is_production && env.primary_deployment_group.as_deref() == Some(group.as_str())
-            })
-            .unwrap_or(*group == crate::server::deployment::models::DEFAULT_DEPLOYMENT_GROUP);
-
-        if is_production_primary && !valid_custom_domains.is_empty() {
+        // Sibling custom-domain ingress, only when carve-out annotations are set.
+        if split_custom_domains && !domains_for_group.is_empty() {
             let custom_ingress = resource_builder.create_custom_domain_ingress(
                 project,
                 active_deployment,
                 &namespace,
-                &valid_custom_domains,
+                &domains_for_group,
                 env_name.as_deref(),
             )?;
             children.push(serde_json::to_value(&custom_ingress)?);
