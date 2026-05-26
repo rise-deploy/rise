@@ -31,6 +31,7 @@ use rise_resource_store::{
 use sqlx::PgPool;
 use tracing::{info, warn};
 
+use crate::db::global_lock::GlobalLock;
 use crate::db::organization_links;
 use crate::server::settings::{
     DefaultOrganizationSettings, DeploymentControllerSettings, Settings,
@@ -40,10 +41,10 @@ use crate::server::settings::{
 /// reads to determine its per-project namespace prefix.
 pub const NAMESPACE_PREFIX_ANNOTATION: &str = "kubernetes.rise.dev/namespace-prefix";
 
-/// Stable, install-wide identifier for the advisory lock that gates the
-/// bootstrap pass. Chosen arbitrarily; the only requirement is that no other
-/// caller uses the same value.
-const BOOTSTRAP_ADVISORY_LOCK_KEY: i64 = 0x7269_7365_0001_0001u64 as i64;
+/// Name of the install-wide [`GlobalLock`] that serializes the bootstrap pass
+/// across replicas. Scoped string ("subsystem/purpose") to avoid colliding
+/// with other `GlobalLock` callers.
+const BOOTSTRAP_LOCK_NAME: &str = "bootstrap/default-organization";
 
 /// Result of the bootstrap pass — surfaced for tests and so the rest of the
 /// startup path has access to the default Organization's resource UID.
@@ -76,34 +77,15 @@ pub async fn run(
 ) -> Result<BootstrapOutcome> {
     info!("Running default-Organization bootstrap");
 
-    // Acquire the advisory lock for the duration of this connection so
-    // concurrent replicas serialize their bootstrap passes. The lock is
-    // released automatically when the connection is returned to the pool.
-    let mut conn = pool
-        .acquire()
-        .await
-        .context("Failed to acquire DB connection for bootstrap")?;
-    sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(BOOTSTRAP_ADVISORY_LOCK_KEY)
-        .execute(&mut *conn)
-        .await
-        .context("Failed to acquire bootstrap advisory lock")?;
-
-    // The `RAII` style for `pg_advisory_lock` isn't worth a custom guard:
-    // the connection is dropped on every code path below (`?` returns,
-    // success), and that automatically releases the session-scoped lock.
+    // Serialize bootstrap across replicas via a session-scoped advisory lock.
+    // Bind the outcome before releasing so a failure in `run_inner` still
+    // hits the explicit release path — see `GlobalLock` docs for why Drop
+    // alone is not sufficient.
+    let lock = GlobalLock::acquire(pool, BOOTSTRAP_LOCK_NAME).await?;
     let outcome = run_inner(pool, store, settings).await;
-
-    // Best-effort release before returning — failures here are harmless
-    // because the lock is also released when the connection drops.
-    if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(BOOTSTRAP_ADVISORY_LOCK_KEY)
-        .execute(&mut *conn)
-        .await
-    {
-        warn!("Failed to release bootstrap advisory lock: {:?}", e);
+    if let Err(e) = lock.release().await {
+        warn!("Failed to release bootstrap GlobalLock: {:?}", e);
     }
-
     outcome
 }
 

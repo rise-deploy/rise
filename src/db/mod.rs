@@ -3,6 +3,7 @@ pub mod deployments;
 pub mod env_vars;
 pub mod environments;
 pub mod extensions;
+pub mod global_lock;
 pub mod leader_leases;
 pub mod leader_schedules;
 pub mod models;
