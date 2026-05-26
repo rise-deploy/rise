@@ -2,11 +2,8 @@ use super::models::{
     AddCustomDomainRequest, CustomDomainResponse, CustomDomainsResponse, UpdateCustomDomainRequest,
 };
 use super::validation;
-use crate::db::models::{CustomDomain, Environment};
-use crate::db::{
-    custom_domains as db_custom_domains, deployments as db_deployments,
-    environments as db_environments, projects,
-};
+use crate::db::models::Environment;
+use crate::db::{custom_domains as db_custom_domains, environments as db_environments, projects};
 use crate::server::auth::context::AuthContext;
 use crate::server::error::{ServerError, ServerErrorExt};
 use crate::server::project::handlers::ensure_project_access_or_admin;
@@ -17,7 +14,7 @@ use axum::{
     Json,
 };
 use sqlx::PgPool;
-use tracing::info;
+use tracing::warn;
 use uuid::Uuid;
 
 /// Resolve an environment name to its db row.
@@ -53,55 +50,22 @@ async fn environment_name_for(pool: &PgPool, env_id: Uuid) -> String {
         .unwrap_or_else(|| "?".to_string())
 }
 
-/// Mark the active deployment in `env`'s primary deployment group for
-/// reconciliation so the new domain takes effect. Best-effort: errors are
-/// logged but not propagated.
-async fn reconcile_for_environment(state: &AppState, project_name: &str, env: &Environment) {
-    let group = match env.primary_deployment_group.as_deref() {
-        Some(g) => g,
-        None => {
-            info!(
-                "Environment '{}' for project '{}' has no primary deployment group; skipping reconcile",
-                env.name, project_name
-            );
-            return;
-        }
+/// Force Metacontroller to re-run the sync webhook for `project_name` so the
+/// updated set of custom domains is reflected in the K8s ingresses. Best-effort:
+/// errors are logged but not propagated, mirroring the pattern in
+/// `project/handlers.rs` and `deployment/handlers.rs`. No-op when the server is
+/// running without a Kubernetes client configured (local dev / tests).
+async fn trigger_project_resync(state: &AppState, project_name: &str) {
+    let Some(kube_client) = state.kube_client.as_ref() else {
+        return;
     };
-    match db_deployments::find_active_for_project_and_group(&state.db_pool, env.project_id, group)
-        .await
+    if let Err(e) = crate::server::deployment::crd::trigger_resync(kube_client, project_name).await
     {
-        Ok(Some(active_deployment)) => {
-            if let Err(e) =
-                db_deployments::mark_needs_reconcile(&state.db_pool, active_deployment.id).await
-            {
-                info!(
-                    "Failed to mark deployment {} for reconcile after custom-domain change: {:?}",
-                    active_deployment.deployment_id, e
-                );
-            }
-        }
-        Ok(None) => {
-            info!(
-                "No active deployment in group '{}' for project '{}' — domain change recorded but nothing to reconcile",
-                group, project_name
-            );
-        }
-        Err(e) => {
-            info!(
-                "Failed to find active deployment for project '{}' group '{}': {:?}",
-                project_name, group, e
-            );
-        }
+        warn!(
+            project = %project_name,
+            "Failed to trigger CRD resync after custom-domain change: {:?}", e
+        );
     }
-}
-
-/// Resolve and load the environment row that owns `domain` so we can reconcile
-/// the right deployment group when the domain changes.
-async fn env_for_domain(pool: &PgPool, domain: &CustomDomain) -> Option<Environment> {
-    db_environments::find_by_id(pool, domain.environment_id)
-        .await
-        .ok()
-        .flatten()
 }
 
 /// Add a custom domain to a project
@@ -160,7 +124,7 @@ pub async fn add_custom_domain(
         }
     })?;
 
-    reconcile_for_environment(&state, &project.name, &environment).await;
+    trigger_project_resync(&state, &project.name).await;
 
     Ok((
         StatusCode::CREATED,
@@ -289,13 +253,6 @@ pub async fn delete_custom_domain(
     let user = auth.user()?;
     ensure_project_access_or_admin(&state, user, &project).await?;
 
-    // Look up the domain first so we know which environment to reconcile after deletion.
-    let existing = db_custom_domains::get_custom_domain(&state.db_pool, project.id, &domain)
-        .await
-        .internal_err("Failed to look up custom domain")?
-        .ok_or_else(|| ServerError::not_found("Custom domain not found"))?;
-    let env_for_reconcile = env_for_domain(&state.db_pool, &existing).await;
-
     let deleted = db_custom_domains::delete_custom_domain(&state.db_pool, project.id, &domain)
         .await
         .internal_err("Failed to delete custom domain")?;
@@ -304,9 +261,7 @@ pub async fn delete_custom_domain(
         return Err(ServerError::not_found("Custom domain not found"));
     }
 
-    if let Some(env) = env_for_reconcile {
-        reconcile_for_environment(&state, &project.name, &env).await;
-    }
+    trigger_project_resync(&state, &project.name).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -352,8 +307,6 @@ pub async fn update_custom_domain(
         )));
     }
 
-    let old_env = env_for_domain(&state.db_pool, &existing).await;
-
     let updated = db_custom_domains::update_custom_domain_environment(
         &state.db_pool,
         project.id,
@@ -363,12 +316,9 @@ pub async fn update_custom_domain(
     .await
     .internal_err("Failed to move custom domain to new environment")?;
 
-    // Reconcile both the source and the destination so the domain disappears
-    // from the old group's ingress and appears on the new one.
-    if let Some(env) = old_env {
-        reconcile_for_environment(&state, &project.name, &env).await;
-    }
-    reconcile_for_environment(&state, &project.name, &new_env).await;
+    // A single project-wide resync regenerates ingresses for both the old and
+    // the new primary deployment group in one pass.
+    trigger_project_resync(&state, &project.name).await;
 
     Ok(Json(CustomDomainResponse::from_db_model(
         &updated,
@@ -409,12 +359,9 @@ pub async fn set_primary_domain(
             }
         })?;
 
-    let env_name = if let Some(env) = env_for_domain(&state.db_pool, &updated_domain).await {
-        reconcile_for_environment(&state, &project.name, &env).await;
-        env.name
-    } else {
-        "?".to_string()
-    };
+    trigger_project_resync(&state, &project.name).await;
+
+    let env_name = environment_name_for(&state.db_pool, updated_domain.environment_id).await;
 
     Ok(Json(CustomDomainResponse::from_db_model(
         &updated_domain,
@@ -443,13 +390,6 @@ pub async fn unset_primary_domain(
     let user = auth.user()?;
     ensure_project_access_or_admin(&state, user, &project).await?;
 
-    // Look up the domain first to know which environment owns it.
-    let existing = db_custom_domains::get_custom_domain(&state.db_pool, project.id, &domain)
-        .await
-        .internal_err("Failed to look up custom domain")?
-        .ok_or_else(|| ServerError::not_found("Custom domain not found"))?;
-    let env_for_reconcile = env_for_domain(&state.db_pool, &existing).await;
-
     let unset = db_custom_domains::unset_primary_domain(&state.db_pool, project.id, &domain)
         .await
         .internal_err("Failed to unset primary domain")?;
@@ -460,9 +400,7 @@ pub async fn unset_primary_domain(
         ));
     }
 
-    if let Some(env) = env_for_reconcile {
-        reconcile_for_environment(&state, &project.name, &env).await;
-    }
+    trigger_project_resync(&state, &project.name).await;
 
     Ok(StatusCode::NO_CONTENT)
 }

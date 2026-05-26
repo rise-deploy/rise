@@ -805,22 +805,6 @@ pub async fn mark_cancelling(pool: &PgPool, id: Uuid) -> Result<Deployment> {
     Ok(deployment)
 }
 
-/// Mark a deployment as needing reconciliation
-///
-/// Used when configuration changes (custom domains, env vars) require updating
-/// infrastructure for an already-deployed application without creating a new deployment.
-pub async fn mark_needs_reconcile(pool: &PgPool, id: Uuid) -> Result<()> {
-    sqlx::query!(
-        "UPDATE deployments SET needs_reconcile = TRUE, updated_at = NOW() WHERE id = $1",
-        id
-    )
-    .execute(pool)
-    .await
-    .context("Failed to mark deployment as needing reconciliation")?;
-
-    Ok(())
-}
-
 /// Clear the needs_reconcile flag for a deployment
 ///
 /// Called after successfully reconciling a deployment
