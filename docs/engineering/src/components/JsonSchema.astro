@@ -35,7 +35,23 @@ interface Props {
 
 const { file, title } = Astro.props;
 
-const schemaPath = path.resolve(process.cwd(), 'public', 'schemas', file);
+// Defensive validation: `file` is a build-time author input but the
+// component is reusable, so reject anything that could break out of the
+// schemas directory (path separators or parent-dir traversal). We also
+// pin the resolved path to the schemas dir as a belt-and-braces check.
+if (!/^[A-Za-z0-9._-]+$/.test(file)) {
+  throw new Error(
+    `JsonSchema: invalid \`file\` prop ${JSON.stringify(file)} — must be a bare filename ` +
+      `under public/schemas/ (alphanumerics, dot, dash, underscore only).`,
+  );
+}
+const schemasDir = path.resolve(process.cwd(), 'public', 'schemas');
+const schemaPath = path.resolve(schemasDir, file);
+if (!schemaPath.startsWith(schemasDir + path.sep)) {
+  throw new Error(
+    `JsonSchema: \`file\` prop ${JSON.stringify(file)} resolves outside public/schemas/.`,
+  );
+}
 const raw = fs.readFileSync(schemaPath, 'utf8');
 const schema: any = JSON.parse(raw);
 

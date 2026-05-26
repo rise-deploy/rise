@@ -46,9 +46,13 @@ pub struct SchemaFile {
 /// of which fields were touched first during schema generation.
 fn render_sorted_json(value: &serde_json::Value) -> String {
     let sorted = sort_keys(value);
-    // Always end with a trailing newline so the file plays well with
-    // text-editor conventions and `git diff`.
-    format!("{}\n", serde_json::to_string_pretty(&sorted).unwrap())
+    // `expect` is infallible by construction: `sorted` is a `serde_json::Value`
+    // produced by `sort_keys`, which is always serializable. Trailing newline
+    // is for editor conventions and clean `git diff`.
+    format!(
+        "{}\n",
+        serde_json::to_string_pretty(&sorted).expect("sorted JSON value is always serializable")
+    )
 }
 
 fn sort_keys(value: &serde_json::Value) -> serde_json::Value {
@@ -80,41 +84,48 @@ fn sort_keys(value: &serde_json::Value) -> serde_json::Value {
 /// and the resulting filesystem state is fully determined.
 pub fn generate_schemas() -> Vec<SchemaFile> {
     vec![
-        SchemaFile {
-            file_name: "resource-envelope.schema.json",
-            contents: render_sorted_json(&serde_json::to_value(schema_for!(Resource)).unwrap()),
-        },
-        SchemaFile {
-            file_name: "resource-metadata.schema.json",
-            contents: render_sorted_json(
-                &serde_json::to_value(schema_for!(ResourceMetadata)).unwrap(),
-            ),
-        },
-        SchemaFile {
-            file_name: "controller-status-map.schema.json",
-            contents: render_sorted_json(
-                &serde_json::to_value(schema_for!(ControllerStatusMap)).unwrap(),
-            ),
-        },
-        SchemaFile {
-            file_name: "organization.schema.json",
-            contents: render_sorted_json(
-                &serde_json::to_value(schema_for!(OrganizationResource)).unwrap(),
-            ),
-        },
-        SchemaFile {
-            file_name: "resource-definition.schema.json",
-            contents: render_sorted_json(
-                &serde_json::to_value(schema_for!(ResourceDefinitionResource)).unwrap(),
-            ),
-        },
+        schema_file("resource-envelope.schema.json", schema_for!(Resource)),
+        schema_file(
+            "resource-metadata.schema.json",
+            schema_for!(ResourceMetadata),
+        ),
+        schema_file(
+            "controller-status-map.schema.json",
+            schema_for!(ControllerStatusMap),
+        ),
+        schema_file(
+            "organization.schema.json",
+            schema_for!(OrganizationResource),
+        ),
+        schema_file(
+            "resource-definition.schema.json",
+            schema_for!(ResourceDefinitionResource),
+        ),
     ]
+}
+
+/// Build one `SchemaFile` from a `schemars`-produced `Schema`.
+///
+/// `serde_json::to_value` on a `schemars::Schema` is infallible by construction
+/// — the schema is built from a `serde_json::Value` internally and has no
+/// non-serializable shapes (no non-finite floats, no non-string map keys).
+/// The `.expect` documents the invariant rather than papering over a real
+/// fallible operation.
+fn schema_file(file_name: &'static str, schema: schemars::Schema) -> SchemaFile {
+    let value = serde_json::to_value(schema)
+        .expect("schemars-produced Schema is always serializable to serde_json::Value");
+    SchemaFile {
+        file_name,
+        contents: render_sorted_json(&value),
+    }
 }
 
 /// Write each generated schema into `out_dir`. Creates `out_dir` if missing.
 ///
-/// Returns the absolute path of each file written. Output is byte-identical
-/// across runs, so this is safe to call repeatedly (idempotent).
+/// Returns the path of each file written (`out_dir.join(<file_name>)`,
+/// resolved relative to the caller's working directory if `out_dir` itself
+/// is relative). Output is byte-identical across runs, so this is safe to
+/// call repeatedly (idempotent).
 pub fn write_to_dir(out_dir: &Path) -> Result<Vec<PathBuf>> {
     fs::create_dir_all(out_dir)
         .with_context(|| format!("creating output directory {}", out_dir.display()))?;
