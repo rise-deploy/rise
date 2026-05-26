@@ -368,7 +368,7 @@ mod tests {
             },
             spec: OrganizationSpec {
                 display_name: "Default".to_string(),
-                deployment_controller_class: Some("kubernetes.rise.dev/default".to_string()),
+                deployment_controller_class: Some("default".to_string()),
             },
             status: OrganizationStatus::default(),
         };

@@ -66,8 +66,17 @@ pub async fn create_team(
         .collect::<Result<Vec<_>, _>>()
         .server_err(StatusCode::BAD_REQUEST, "Invalid member ID")?;
 
-    // Create the team
-    let team = db_teams::create(&state.db_pool, &payload.name)
+    // Create the team, stamp the default Organization linkage, and add
+    // owners/members in a single transaction. The stamp keeps the
+    // post-bootstrap invariant ("every team row carries an
+    // organization_resource_uid") holding from this PR forward.
+    let mut tx = state
+        .db_pool
+        .begin()
+        .await
+        .internal_err("Failed to start transaction for team create")?;
+
+    let team = db_teams::create(&mut *tx, &payload.name)
         .await
         .map_err(|e| {
             if e.to_string().contains("duplicate key")
@@ -79,9 +88,17 @@ pub async fn create_team(
             }
         })?;
 
+    crate::db::organization_links::set_team_organization(
+        &mut tx,
+        team.id,
+        state.default_organization_uid,
+    )
+    .await
+    .internal_err("Failed to stamp default Organization on new team")?;
+
     // Add owners
     for owner_id in owner_ids {
-        db_teams::add_member(&state.db_pool, team.id, owner_id, TeamRole::Owner)
+        db_teams::add_member(&mut *tx, team.id, owner_id, TeamRole::Owner)
             .await
             .internal_err("Failed to add owner")?;
     }
@@ -89,10 +106,14 @@ pub async fn create_team(
     // Add members.
     // A user can intentionally be both owner and member (dual roles are supported by schema).
     for member_id in member_ids {
-        db_teams::add_member(&state.db_pool, team.id, member_id, TeamRole::Member)
+        db_teams::add_member(&mut *tx, team.id, member_id, TeamRole::Member)
             .await
             .internal_err("Failed to add member")?;
     }
+
+    tx.commit()
+        .await
+        .internal_err("Failed to commit team create transaction")?;
 
     // Fetch members/owners with email info for response
     let members = db_teams::get_members(&state.db_pool, team.id)

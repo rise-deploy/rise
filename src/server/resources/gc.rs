@@ -915,6 +915,10 @@ mod tests {
             self.inner.update(uid, params).await
         }
 
+        async fn rename(&self, uid: Uuid, new_name: &str) -> Result<ResourceRow, StoreError> {
+            self.inner.rename(uid, new_name).await
+        }
+
         async fn delete(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError> {
             self.inner.delete(uid).await
         }
@@ -1085,6 +1089,10 @@ mod tests {
             params: UpdateResourceParams,
         ) -> Result<ResourceRow, StoreError> {
             self.inner.update(uid, params).await
+        }
+
+        async fn rename(&self, uid: Uuid, new_name: &str) -> Result<ResourceRow, StoreError> {
+            self.inner.rename(uid, new_name).await
         }
 
         async fn delete(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError> {

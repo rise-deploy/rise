@@ -282,7 +282,7 @@ high-cardinality or end-user-owned kinds onto the resource store:
 - Add `controller_class_name` to the Kubernetes deployment controller backend config.
   - This value is the controller class identifier written to the default Organization's `spec.deploymentControllerClass`.
   - The Kubernetes controller reconciles only Organizations whose `spec.deploymentControllerClass` matches its configured `controller_class_name`.
-  - Default to a stable value for existing installs if omitted, e.g. `kubernetes.rise.dev/default`.
+  - Default to a stable value for existing installs if omitted, e.g. `default`. Must be a valid Kubernetes label value (no `/`) because it's stamped on each `RiseProject` CR as a label.
 - Startup bootstrap after migrations:
   - upsert default Organization
   - populate namespace-prefix annotation from config

@@ -212,6 +212,38 @@
       },
       "type": "object"
     },
+    "DefaultOrganizationSettings": {
+      "description": "Configuration for the bootstrapped default Organization resource.\n\nThe `name` and `display_name` fields populate the Organization's metadata\nand spec respectively. `kubernetes_namespace_prefix`, when set, is written\nto the `kubernetes.rise.dev/namespace-prefix` annotation. Unrelated\nannotations on an existing default Organization are preserved across\nbootstrap runs.",
+      "properties": {
+        "annotations": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Extra annotations to apply to the Organization's metadata. The\n`kubernetes.rise.dev/namespace-prefix` annotation is managed\nseparately by `kubernetes_namespace_prefix` and overrides any entry\nwith the same key set here.",
+          "type": "object"
+        },
+        "display_name": {
+          "default": "Default",
+          "description": "Human-readable display name stored in `spec.displayName`. Default:\n`Default`.",
+          "type": "string"
+        },
+        "kubernetes_namespace_prefix": {
+          "default": null,
+          "description": "Value for the `kubernetes.rise.dev/namespace-prefix` annotation on the\ndefault Organization. When set, bootstrap stamps the annotation with\nthis value; when `None`, the annotation is left unset and the\nKubernetes controller falls back to `org-{discriminator}-` (see\n[`crate::server::bootstrap::DefaultOrganizationView::resolved_namespace_prefix`]).\n\nUpgrade note: installs that previously relied on the historic\n`rise-{project_name}` namespace naming must set this to `\"rise-\"`\nexplicitly before deploying — otherwise the controller will switch\nto `org-{discriminator}-{project_name}` and orphan the legacy\nnamespaces.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "default": "default",
+          "description": "Resource name of the default Organization (DNS-label form). Default:\n`default`.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
     "DeploymentConstraints": {
       "description": "Platform-level constraints for deployment resources.\nPer-environment overrides (stored in the database) can narrow these ranges.",
       "properties": {
@@ -278,6 +310,11 @@
             },
             "auth_signin_url": {
               "description": "Public backend URL for browser redirects during authentication\nExample: \"https://rise.dev\"\nThis must be the public URL where the backend is accessible via Ingress.\nThe domain should share a parent with app domains for cookie sharing (see struct docs).",
+              "type": "string"
+            },
+            "controller_class_name": {
+              "default": "default",
+              "description": "Stable identifier for this deployment controller, written to the\ndefault Organization's `spec.deploymentControllerClass` at startup.\nThe Kubernetes controller only reconciles projects whose\nOrganization's `spec.deploymentControllerClass` matches this value.\nStamped as a value of the `rise.dev/controller-class` label on\neach `RiseProject` CR, so it must be a valid Kubernetes label\nvalue (alphanumeric / `-` / `_` / `.`, no `/`). Defaults to\n`default`.",
               "type": "string"
             },
             "custom_domain_ingress_annotations": {
@@ -419,11 +456,6 @@
               "default": {},
               "description": "Annotations to apply to all managed namespaces\nExample: {\"company.com/team\": \"platform\", \"cost-center\": \"engineering\"}",
               "type": "object"
-            },
-            "namespace_format": {
-              "default": "rise-{project_name}",
-              "description": "Namespace format template for deployed applications\nTemplate variables: {project_name}\nExample: \"rise-{project_name}\" → namespace \"rise-myapp\" for project \"myapp\"\nDefaults to \"rise-{project_name}\"",
-              "type": "string"
             },
             "namespace_labels": {
               "additionalProperties": {
@@ -1639,6 +1671,10 @@
     },
     "database": {
       "$ref": "#/$defs/DatabaseSettings"
+    },
+    "default_organization": {
+      "$ref": "#/$defs/DefaultOrganizationSettings",
+      "description": "Default Organization that owns existing typed data (users, teams,\nprojects) until org-aware multi-tenancy lands. Bootstrap creates this\nOrganization (under an advisory lock) before any backfill runs, so it\nis guaranteed to exist by the time controllers begin processing\nprojects. Omitting the section accepts the documented defaults:\nname=\"default\", display name=\"Default\", no namespace prefix\nconfigured — the controller then synthesizes `org-{discriminator}-`\nas the per-Org namespace prefix. Set\n`default_organization.kubernetes_namespace_prefix` explicitly (e.g.\n`\"rise-\"`) to preserve historic naming on existing installs."
     },
     "deployment_controller": {
       "anyOf": [

@@ -123,13 +123,14 @@ impl DeploymentBackend for KubernetesBackend {
         tail_lines: Option<i64>,
         timestamps: bool,
         since_seconds: Option<i64>,
+        namespace_prefix: &str,
     ) -> Result<futures::stream::BoxStream<'static, Result<bytes::Bytes, anyhow::Error>>> {
         use futures::StreamExt;
         use k8s_openapi::api::core::v1::Pod;
         use kube::api::{Api, ListParams, LogParams};
 
-        // Derive namespace from project name
-        let namespace = self.resource_builder.namespace_name(project);
+        // Derive namespace from project name + per-Org prefix
+        let namespace = ResourceBuilder::namespace_name(project, namespace_prefix);
 
         // Find pod using label selector
         let pod_api: Api<Pod> = Api::namespaced(self.kube_client.clone(), &namespace);

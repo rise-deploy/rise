@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE teams\n        SET organization_resource_uid = $1\n        WHERE organization_resource_uid IS NULL\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "fd7d8ab5a52a38ff949e27bf9f8197734f939ed1ec0a9892d47a3e430d16f9e2"
+}

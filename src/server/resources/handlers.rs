@@ -52,6 +52,12 @@ use crate::server::state::AppState;
 pub(crate) struct ResourceApiCtx {
     store: Arc<dyn ResourceStore>,
     operator_users: Arc<Vec<String>>,
+    /// DB pool used by application-layer guards (e.g. blocking Organization
+    /// deletion while typed children — users-via-memberships, teams, projects —
+    /// still reference it via `organization_resource_uid`). Required: the
+    /// delete-guard must run on every dispatch, so dropping the pool would
+    /// silently bypass it.
+    db_pool: sqlx::PgPool,
 }
 
 impl ResourceApiCtx {
@@ -59,6 +65,7 @@ impl ResourceApiCtx {
         Self {
             store: state.resource_store.clone(),
             operator_users: state.operator_users.clone(),
+            db_pool: state.db_pool.clone(),
         }
     }
 
@@ -993,11 +1000,39 @@ async fn delete_resource(
     user: &User,
     response_api_version: &str,
 ) -> Result<Response, ServerError> {
-    let outcome = ctx
-        .store
-        .delete(row.uid)
-        .await
-        .map_err(store_error_to_server_error)?;
+    // Organization deletes route through the canonical guard so the typed
+    // soft-links (users via `user_organization_memberships`, teams, projects)
+    // are never orphaned. See `super::organization` module docs.
+    let outcome = if row.kind == rise_resource_api::ORGANIZATION_KIND {
+        use super::organization::{delete_organization_guarded, OrganizationDeleteError};
+        match delete_organization_guarded(&ctx.store, &ctx.db_pool, row.uid).await {
+            Ok(outcome) => outcome,
+            Err(OrganizationDeleteError::HasChildren { count }) => {
+                return Err(ServerError::new(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "Organization '{}' has {count} typed child(ren) (users-via-memberships, teams, projects); \
+                         delete or reassign them before deleting the organization",
+                        row.name,
+                    ),
+                ));
+            }
+            Err(OrganizationDeleteError::Db(e)) => {
+                return Err(ServerError::internal_anyhow(
+                    e,
+                    "Failed to count typed children for organization",
+                ));
+            }
+            Err(OrganizationDeleteError::Store(e)) => {
+                return Err(store_error_to_server_error(e));
+            }
+        }
+    } else {
+        ctx.store
+            .delete(row.uid)
+            .await
+            .map_err(store_error_to_server_error)?
+    };
 
     // A single static event message keeps this audit log consistent with
     // `resource.created` / `resource.updated`.
@@ -1238,8 +1273,9 @@ mod dispatch_tests {
             .await
             .expect("resource store migrations");
         ResourceApiCtx {
-            store: Arc::new(PgResourceStore::new(pool)),
+            store: Arc::new(PgResourceStore::new(pool.clone())),
             operator_users: Arc::new(vec![OPERATOR.into()]),
+            db_pool: pool,
         }
     }
 
@@ -1987,6 +2023,225 @@ mod dispatch_tests {
         .await
         .expect_err("deleted resource must be gone");
         assert_eq!(err.status, StatusCode::NOT_FOUND);
+    }
+
+    // -------------------------------------------------------------------------
+    // Application-layer guards for typed-table linkage
+    // -------------------------------------------------------------------------
+
+    #[sqlx::test]
+    async fn delete_organization_with_linked_team_yields_409(pool: sqlx::PgPool) {
+        // PR5 guard: an Organization with typed children (teams/projects via
+        // `organization_resource_uid`) cannot be deleted. Those rows do not
+        // live in the `resources` table, so the generic child check cannot
+        // catch them — we enforce it at the application layer.
+
+        let ctx = ctx(pool.clone()).await;
+
+        // Create an Organization through the store (operator-only API,
+        // bypassing the typed `delete_resource` path until we exercise it).
+        let org_spec = json!({
+            "displayName": "Multi-Tenancy Test",
+        });
+        let org = ctx
+            .store
+            .create(CreateResourceParams {
+                api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
+                kind: rise_resource_api::ORGANIZATION_KIND.to_string(),
+                name: "guard-test".to_string(),
+                parent_uid: None,
+                annotations: BTreeMap::new(),
+                finalizers: vec![],
+                spec: org_spec,
+                validator: Some(Arc::new(rise_resource_store::OrganizationValidator)),
+            })
+            .await
+            .expect("create organization");
+
+        // Seed a team in the typed table that points at this Organization.
+        let user_id =
+            sqlx::query_scalar::<_, Uuid>("INSERT INTO users (email) VALUES ($1) RETURNING id")
+                .bind(format!("guard-{}@example.com", Uuid::new_v4()))
+                .fetch_one(&pool)
+                .await
+                .expect("seed user");
+        let team_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO teams (name, organization_resource_uid) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(format!("guard-team-{}", Uuid::new_v4().simple()))
+        .bind(org.uid)
+        .fetch_one(&pool)
+        .await
+        .expect("seed team");
+
+        // Attempt to delete the Organization — the guard must surface 409.
+        let err = dispatch_delete_inner(
+            &ctx,
+            format!(
+                "{}/{}/{}/{}",
+                rise_resource_api::API_VERSION_V1ALPHA1
+                    .split_once('/')
+                    .unwrap()
+                    .0,
+                rise_resource_api::API_VERSION_V1ALPHA1
+                    .split_once('/')
+                    .unwrap()
+                    .1,
+                rise_resource_api::ORGANIZATION_COLLECTION,
+                org.name,
+            ),
+            auth(OPERATOR),
+        )
+        .await
+        .expect_err("organization with typed children must be 409");
+        assert_eq!(err.status, StatusCode::CONFLICT);
+
+        // Verify the row is still there.
+        assert!(ctx.store.get(org.uid).await.unwrap().is_some());
+
+        // Cleanup the linkage. After clearing it, the delete should succeed.
+        sqlx::query("DELETE FROM teams WHERE id = $1")
+            .bind(team_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let resp = dispatch_delete_inner(
+            &ctx,
+            format!(
+                "{}/{}/{}/{}",
+                rise_resource_api::API_VERSION_V1ALPHA1
+                    .split_once('/')
+                    .unwrap()
+                    .0,
+                rise_resource_api::API_VERSION_V1ALPHA1
+                    .split_once('/')
+                    .unwrap()
+                    .1,
+                rise_resource_api::ORGANIZATION_COLLECTION,
+                org.name,
+            ),
+            auth(OPERATOR),
+        )
+        .await
+        .expect("delete must succeed once the linked team is gone");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[sqlx::test]
+    async fn delete_organization_with_only_membership_yields_409(pool: sqlx::PgPool) {
+        // Regression guard for commit 15a9144: an Organization whose only
+        // typed-table child is a `user_organization_memberships` row (no team,
+        // no project) must still surface 409. Without it, deleting the Org
+        // would orphan the membership row (no FK back to
+        // `resource_store.resources`).
+
+        let ctx = ctx(pool.clone()).await;
+
+        // Create an Organization through the store (operator-only API,
+        // bypassing the typed `delete_resource` path until we exercise it).
+        let org_spec = json!({
+            "displayName": "Membership Guard Test",
+        });
+        let org = ctx
+            .store
+            .create(CreateResourceParams {
+                api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
+                kind: rise_resource_api::ORGANIZATION_KIND.to_string(),
+                name: "membership-guard-test".to_string(),
+                parent_uid: None,
+                annotations: BTreeMap::new(),
+                finalizers: vec![],
+                spec: org_spec,
+                validator: Some(Arc::new(rise_resource_store::OrganizationValidator)),
+            })
+            .await
+            .expect("create organization");
+
+        // Seed a user, then link it to the Organization via the memberships
+        // join table. No team or project rows reference this Organization.
+        let user_id =
+            sqlx::query_scalar::<_, Uuid>("INSERT INTO users (email) VALUES ($1) RETURNING id")
+                .bind(format!("membership-{}@example.com", Uuid::new_v4()))
+                .fetch_one(&pool)
+                .await
+                .expect("seed user");
+        sqlx::query(
+            "INSERT INTO user_organization_memberships (user_id, organization_resource_uid) \
+             VALUES ($1, $2)",
+        )
+        .bind(user_id)
+        .bind(org.uid)
+        .execute(&pool)
+        .await
+        .expect("seed membership");
+
+        // Attempt to delete the Organization — the guard must surface 409.
+        let err = dispatch_delete_inner(
+            &ctx,
+            format!(
+                "{}/{}/{}/{}",
+                rise_resource_api::API_VERSION_V1ALPHA1
+                    .split_once('/')
+                    .unwrap()
+                    .0,
+                rise_resource_api::API_VERSION_V1ALPHA1
+                    .split_once('/')
+                    .unwrap()
+                    .1,
+                rise_resource_api::ORGANIZATION_COLLECTION,
+                org.name,
+            ),
+            auth(OPERATOR),
+        )
+        .await
+        .expect_err("organization with only-membership children must be 409");
+        assert_eq!(err.status, StatusCode::CONFLICT);
+
+        // Verify the row is still there.
+        assert!(ctx.store.get(org.uid).await.unwrap().is_some());
+
+        // Cleanup the linkage. After clearing it, the delete should succeed.
+        sqlx::query(
+            "DELETE FROM user_organization_memberships \
+             WHERE user_id = $1 AND organization_resource_uid = $2",
+        )
+        .bind(user_id)
+        .bind(org.uid)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let resp = dispatch_delete_inner(
+            &ctx,
+            format!(
+                "{}/{}/{}/{}",
+                rise_resource_api::API_VERSION_V1ALPHA1
+                    .split_once('/')
+                    .unwrap()
+                    .0,
+                rise_resource_api::API_VERSION_V1ALPHA1
+                    .split_once('/')
+                    .unwrap()
+                    .1,
+                rise_resource_api::ORGANIZATION_COLLECTION,
+                org.name,
+            ),
+            auth(OPERATOR),
+        )
+        .await
+        .expect("delete must succeed once the membership is gone");
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     // -------------------------------------------------------------------------

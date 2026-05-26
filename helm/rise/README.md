@@ -51,7 +51,12 @@ config:
     staging_ingress_url_template: "{project_name}-{deployment_group}.preview.example.com"
     auth_backend_url: "http://rise.default.svc.cluster.local:3000"
     auth_signin_url: "https://rise.example.com"
-    namespace_format: "rise-{project_name}"
+
+  # Optional: preserve historic namespace naming (otherwise namespaces are
+  # synthesized as "org-{discriminator}-{project_name}" from the bootstrapped
+  # default Organization).
+  default_organization:
+    kubernetes_namespace_prefix: "rise-"
 
 ingress:
   enabled: true
@@ -227,7 +232,7 @@ When Kubernetes deployment is configured (via `config.kubernetes`), Rise require
 1. **Namespace Isolation**: Kubernetes RBAC does not support wildcard patterns for namespace names in ClusterRoles. Rise requires cluster-wide permissions to manage namespaces dynamically.
 
 2. **Recommended Practices**:
-   - Configure `namespace_format` with a consistent prefix (e.g., `rise-{project_name}`)
+   - Configure `default_organization.kubernetes_namespace_prefix` (e.g., `rise-`) so namespaces follow a consistent prefix
    - Use admission controllers (OPA/Gatekeeper) to enforce namespace naming policies
    - Implement network policies to isolate Rise-managed namespaces
    - Enable audit logging to monitor namespace creation and resource access
@@ -251,7 +256,7 @@ When Kubernetes deployment is configured (via `config.kubernetes`), Rise require
            allowedRegex: "^rise$"
    ```
 
-4. **Namespace Format Configuration**: Always align your `namespace_format` configuration in the Rise config with your organization's namespace policies.
+4. **Namespace Format Configuration**: Always align `default_organization.kubernetes_namespace_prefix` in the Rise config with your organization's namespace policies.
 
 ## Configuration Format
 

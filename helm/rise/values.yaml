@@ -125,6 +125,15 @@ metacontroller:
   # Install the Metacontroller operator itself as a subchart dependency.
   # Disable this if Metacontroller is already installed in the cluster.
   install: true
+  # Controller-class identifier for this Kubernetes deployment controller.
+  # The generated CompositeController only matches RiseProject CRs whose
+  # `rise.dev/controller-class` label equals this value, so multiple Rise
+  # controllers (e.g. K8s + a future Lambda backend) can coexist without
+  # fighting over each other's CRs. Must match the backend's
+  # `deployment_controller.controller_class_name` config (same default).
+  # Set to an empty string to disable label-based filtering and match every
+  # RiseProject CR (the legacy single-controller behaviour).
+  controllerClass: "default"
 
 # Rise backend configuration overrides
 # Converted to YAML and mounted as /etc/rise/local.yaml
@@ -174,9 +183,11 @@ config:
     # auto_remove: false
 
   # Optional: Kubernetes deployment controller configuration
-  # IMPORTANT: namespace_format should use a consistent prefix for security.
-  # Metacontroller manages namespaces (and other child resources) on Rise's behalf.
-  # Use a consistent prefix (e.g., "rise-") and enforce it with admission controllers or policies.
+  # Namespaces are named "{default_organization.kubernetes_namespace_prefix}{project_name}".
+  # Configure the prefix under `default_organization.kubernetes_namespace_prefix`
+  # (set explicitly to "rise-" to preserve the historic naming).
+  # Metacontroller manages those namespaces on Rise's behalf — pair with
+  # admission controllers or policies to enforce the prefix.
   # kubernetes:
   #   kubeconfig: ""  # Optional: Path to kubeconfig (defaults to in-cluster config)
   #   ingress_class: "nginx"
@@ -187,7 +198,6 @@ config:
   #   # staging_ingress_url_template: "rise.dev/{project_name}/{deployment_group}"
   #   auth_backend_url: "http://rise-backend.default.svc.cluster.local:3000"  # Internal cluster URL for Nginx auth
   #   auth_signin_url: "https://rise.dev"  # Public URL for browser redirects
-  #   namespace_format: "rise-{project_name}"  # Must use consistent prefix and contain {project_name}
   #   namespace_labels: {}  # Optional: Labels for managed namespaces
   #   namespace_annotations: {}  # Optional: Annotations for managed namespaces
   #   ingress_annotations: {}  # Optional: Additional annotations (e.g., cert-manager)
