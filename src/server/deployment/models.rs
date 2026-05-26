@@ -80,6 +80,12 @@ pub struct Deployment {
     pub primary_url: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub custom_domain_urls: Vec<String>,
+    /// Full ordered list of every URL the deployment is reachable at — deployment-group
+    /// URL, environment URL, production URL, and any custom domains, deduplicated. New
+    /// frontend code prefers this over the narrower `primary_url`/`custom_domain_urls`
+    /// pair, which double-counts when `primary_url` is itself a custom domain.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub all_urls: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
