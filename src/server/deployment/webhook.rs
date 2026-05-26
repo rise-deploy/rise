@@ -892,11 +892,6 @@ async fn handle_deployment_became_healthy(
     )
     .await?;
 
-    // Clear needs_reconcile if set
-    if deployment.needs_reconcile {
-        db_deployments::clear_needs_reconcile(&state.db_pool, deployment.id).await?;
-    }
-
     db_projects::update_calculated_status(&state.db_pool, project.id).await?;
 
     Ok(())

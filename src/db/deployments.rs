@@ -805,21 +805,6 @@ pub async fn mark_cancelling(pool: &PgPool, id: Uuid) -> Result<Deployment> {
     Ok(deployment)
 }
 
-/// Clear the needs_reconcile flag for a deployment
-///
-/// Called after successfully reconciling a deployment
-pub async fn clear_needs_reconcile(pool: &PgPool, id: Uuid) -> Result<()> {
-    sqlx::query!(
-        "UPDATE deployments SET needs_reconcile = FALSE, updated_at = NOW() WHERE id = $1",
-        id
-    )
-    .execute(pool)
-    .await
-    .context("Failed to clear needs_reconcile flag")?;
-
-    Ok(())
-}
-
 /// Find a deployment by its workload-identity bootstrap credential hash.
 ///
 /// **Security note**: the caller MUST filter the result through

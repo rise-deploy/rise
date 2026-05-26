@@ -152,6 +152,11 @@ pub struct Deployment {
     pub image_digest: Option<String>,
     pub rolled_back_from_deployment_id: Option<Uuid>,
     pub http_port: i32,
+    /// Deprecated: nothing reads or writes this anymore — domain/config
+    /// changes now trigger a `RiseProject` CRD resync (see
+    /// `crd::trigger_resync`) instead of flipping a row-level flag. The
+    /// column is still selected here because it's still on the table; drop
+    /// both in a follow-up migration.
     pub needs_reconcile: bool,
     pub is_active: bool,
     pub deploying_started_at: Option<DateTime<Utc>>,
