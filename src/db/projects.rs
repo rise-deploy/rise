@@ -86,6 +86,67 @@ pub async fn list_accessible_by_user(pool: &PgPool, user_id: Uuid) -> Result<Vec
     Ok(projects)
 }
 
+/// List the IDs of projects a user owns directly or via team membership.
+///
+/// Unlike [`list_accessible_by_user`], this excludes service-account access:
+/// it reflects project ownership only. Currently exercised by the
+/// `test_list_owned_excludes_service_account_only_access` sqlx test, which
+/// pins the ownership-vs-service-account boundary that team-projects
+/// authorization relies on at the handler layer.
+#[allow(dead_code)]
+pub async fn list_owned_project_ids_by_user(pool: &PgPool, user_id: Uuid) -> Result<Vec<Uuid>> {
+    let ids = sqlx::query_scalar!(
+        r#"
+        SELECT DISTINCT p.id
+        FROM projects p
+        WHERE
+            p.owner_user_id = $1
+            OR EXISTS(
+                SELECT 1 FROM team_members tm
+                WHERE tm.team_id = p.owner_team_id
+                AND tm.user_id = $1
+            )
+        "#,
+        user_id
+    )
+    .fetch_all(pool)
+    .await
+    .context("Failed to list project IDs owned by user")?;
+
+    Ok(ids)
+}
+
+/// List all projects a team can access (owned by the team, or granted view access)
+pub async fn list_accessible_by_team(pool: &PgPool, team_id: Uuid) -> Result<Vec<Project>> {
+    let projects = sqlx::query_as!(
+        Project,
+        r#"
+        SELECT DISTINCT
+            p.id, p.name,
+            p.status as "status: ProjectStatus",
+            p.access_class,
+            p.owner_user_id, p.owner_team_id,
+            p.finalizers, p.source_url,
+            p.created_at, p.updated_at
+        FROM projects p
+        WHERE
+            p.owner_team_id = $1
+            OR EXISTS(
+                SELECT 1 FROM project_app_teams pat
+                WHERE pat.project_id = p.id
+                AND pat.team_id = $1
+            )
+        ORDER BY p.created_at DESC
+        "#,
+        team_id
+    )
+    .fetch_all(pool)
+    .await
+    .context("Failed to list projects accessible by team")?;
+
+    Ok(projects)
+}
+
 /// Find project by name
 pub async fn find_by_name(pool: &PgPool, name: &str) -> Result<Option<Project>> {
     let project = sqlx::query_as!(
@@ -837,6 +898,91 @@ mod tests {
             .expect("Failed to clear source_url");
 
         assert!(project.source_url.is_none(), "source_url should be cleared");
+    }
+
+    /// Test that `list_owned_project_ids_by_user` excludes projects reachable only
+    /// via service-account access, while `list_accessible_by_user` includes them.
+    ///
+    /// This is the permission boundary that backs the team-projects endpoint's
+    /// non-admin filter (`GET /teams/{id_or_name}/projects`).
+    #[sqlx::test]
+    async fn test_list_owned_excludes_service_account_only_access(pool: PgPool) {
+        use crate::db::models::TeamRole;
+        use crate::db::{service_accounts, teams};
+        use std::collections::HashMap;
+
+        // Create the team
+        let team = teams::create(&pool, "devops")
+            .await
+            .expect("Failed to create team");
+
+        // Create user A (will be a team member)
+        let user_a = crate::db::users::create(&pool, "user-a@example.com")
+            .await
+            .expect("Failed to create user A");
+
+        // Make user A a team member
+        teams::add_member(&pool, team.id, user_a.id, TeamRole::Member)
+            .await
+            .expect("Failed to add user A to team");
+
+        // Create a project owned by the team
+        let project = create(
+            &pool,
+            "team-owned-project",
+            ProjectStatus::Stopped,
+            "default".to_string(),
+            None,
+            Some(team.id),
+            None,
+        )
+        .await
+        .expect("Failed to create team-owned project");
+
+        // Create a service account on the project. This creates a synthetic user
+        // attached to the project via the `service_accounts.user_id` link, which
+        // is the "service-account-only" user we want to test against — they have
+        // no team membership and no direct ownership of the project.
+        let claims = HashMap::new();
+        let sa = service_accounts::create(&pool, project.id, "https://gitlab.com", &claims)
+            .await
+            .expect("Failed to create service account");
+
+        // `list_accessible_by_user` SHOULD return the project for the SA user,
+        // since service-account access counts as accessible.
+        let accessible_for_sa = list_accessible_by_user(&pool, sa.user_id)
+            .await
+            .expect("Failed to list accessible projects for SA user");
+        assert_eq!(
+            accessible_for_sa.len(),
+            1,
+            "SA user should see the project via list_accessible_by_user"
+        );
+        assert_eq!(accessible_for_sa[0].id, project.id);
+
+        // `list_owned_project_ids_by_user` MUST NOT return the project for the
+        // SA user, because they only have service-account access (no ownership
+        // or team membership).
+        let owned_for_sa = list_owned_project_ids_by_user(&pool, sa.user_id)
+            .await
+            .expect("Failed to list owned project IDs for SA user");
+        assert!(
+            owned_for_sa.is_empty(),
+            "SA user must not appear as an owner via list_owned_project_ids_by_user, \
+             got {:?}",
+            owned_for_sa
+        );
+
+        // Bonus: user A (a team member) SHOULD be listed as an owner via
+        // team membership.
+        let owned_for_user_a = list_owned_project_ids_by_user(&pool, user_a.id)
+            .await
+            .expect("Failed to list owned project IDs for user A");
+        assert_eq!(
+            owned_for_user_a,
+            vec![project.id],
+            "team member user A should own the team's project via team membership"
+        );
     }
 
     /// Test that project status is Stopped when no active deployment but has failed deployment

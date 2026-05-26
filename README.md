@@ -1,9 +1,14 @@
 # Rise <img src="static/assets/favicon-32x32.png" height="32px" align="right"/> 
 
+<p align="center">Rise is a Kubernetes-based platform for deploying containerized apps via a simple CLI and web dashboard.</p>
+<p align="center"><small><em>DISCLAIMER: Rise is an early work-in-progress project that mostly uses AI-generated code.</em></small></p>
+
 <p align="center">
-    <p align="center">Rise is a Kubernetes-based platform for deploying containerized apps.</p>
-    <p align="center"><small><em>DISCLAIMER: Rise is an early work-in-progress project that mostly uses AI-generated code.</em></small></p>
-    <img src="./screenshot.png" alt="Rise Web Dashboard Screenshot"/>
+  <img src="docs/screenshots/dashboard-projects.png" width="100%" alt="Projects dashboard"/>
+</p>
+<p align="center">
+  <img src="docs/screenshots/dashboard-project-detail.png" width="49%" alt="Project detail view"/>
+  <img src="docs/screenshots/dashboard-teams.png" width="49%" alt="Teams view"/>
 </p>
 
 [Go to Documentation → ](https://niklasrosenstein.github.io/rise/)
