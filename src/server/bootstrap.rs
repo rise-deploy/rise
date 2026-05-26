@@ -226,13 +226,14 @@ async fn upsert_default_organization(
             let existing_annotations = annotations_from_metadata(&row.metadata);
             let merged_annotations = merge_annotations(existing_annotations, &desired_annotations);
 
-            // Skip the write when nothing changes — keeps the row's revision
-            // stable across no-op restarts.
+            // Skip the write when nothing bootstrap-owned changes — keeps the
+            // row's revision stable across no-op restarts. Finalizers are
+            // controller-owned and preserved verbatim by the update path below,
+            // so their presence must not force a rewrite here.
             let spec_value =
                 serde_json::to_value(&spec).context("Failed to serialize Organization spec")?;
             if row.spec == spec_value
                 && annotations_from_metadata(&row.metadata) == merged_annotations
-                && row.finalizers.is_empty()
             {
                 return Ok(row);
             }

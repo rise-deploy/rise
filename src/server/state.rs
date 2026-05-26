@@ -712,11 +712,14 @@ impl AppState {
                     .filter_map(|(k, v)| v.as_ref().map(|ac| (k.clone(), ac.clone())))
                     .collect();
 
-                // Prefer the default Organization's `kubernetes.rise.dev/namespace-prefix`
-                // annotation over the historical static `namespace_format`. The
-                // namespace_format setting is treated as a legacy fallback for now: when
-                // the annotation is set, we synthesise `{prefix}{project_name}` so the
-                // builder still uses a format string but the prefix is authoritative.
+                // Always derive the namespace format from the default Organization's
+                // resolved namespace prefix. `resolved_namespace_prefix()` reads the
+                // `kubernetes.rise.dev/namespace-prefix` annotation when present and
+                // falls back to `org-{discriminator}-` otherwise — the legacy
+                // `namespace_format` setting is no longer consulted in the multi-org
+                // world. The configured `namespace_format` is still surfaced in the
+                // log line below for operators investigating naming changes during
+                // the rollout.
                 let resolved_namespace_format = {
                     let prefix = default_organization_view.resolved_namespace_prefix();
                     let format = format!("{prefix}{{project_name}}");

@@ -1004,9 +1004,11 @@ async fn delete_resource(
     // owns typed children (teams/projects via `organization_resource_uid`).
     // Those rows are not in the `resources` table, so the store's generic
     // child-detection (which scans `resources.parent_uid`) cannot see them.
-    if row.api_version == rise_resource_api::API_VERSION_V1ALPHA1
-        && row.kind == rise_resource_api::ORGANIZATION_KIND
-    {
+    //
+    // Keyed off `kind` only — typed children link by Organization UID, not
+    // by API version, so the guard must apply to every served version of
+    // the Organization kind.
+    if row.kind == rise_resource_api::ORGANIZATION_KIND {
         if let Some(pool) = ctx.db_pool.as_ref() {
             let count =
                 crate::db::organization_links::count_typed_children_for_organization(pool, row.uid)
