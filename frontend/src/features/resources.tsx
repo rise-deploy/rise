@@ -647,8 +647,11 @@ export function DomainsList({ projectName, defaultUrl = null }) {
     const [updatingPrimaryDomain, setUpdatingPrimaryDomain] = useState(null);
     const { showToast } = useToast();
 
-    const hasStarredCustomDomain = domains.some(d => d.is_primary);
-    const isDefaultPrimary = !hasStarredCustomDomain;
+    const productionEnv = environments.find(e => e.is_production);
+    const hasProductionStarredDomain = productionEnv
+        ? domains.some(d => d.environment === productionEnv.name && d.is_primary)
+        : false;
+    const isDefaultPrimary = !hasProductionStarredDomain;
 
     const loadDomains = useCallback(async () => {
         try {
@@ -759,10 +762,13 @@ export function DomainsList({ projectName, defaultUrl = null }) {
         }
     };
 
-    // Starring the default URL row = unstarring the currently starred custom domain
+    // Starring the production default-URL row = unstarring whichever production
+    // custom domain is currently primary. Other envs are left alone — primary
+    // is scoped per-env.
     const handleStarDefault = async () => {
-        const starredDomain = domains.find(d => d.is_primary);
-        if (!starredDomain) return; // Already default primary
+        if (!productionEnv) return;
+        const starredDomain = domains.find(d => d.environment === productionEnv.name && d.is_primary);
+        if (!starredDomain) return;
         setUpdatingPrimaryDomain('__default__');
         try {
             await api.unsetCustomDomainPrimary(projectName, starredDomain.domain);
@@ -783,124 +789,159 @@ export function DomainsList({ projectName, defaultUrl = null }) {
         try { return new URL(defaultUrl).hostname; } catch { return defaultUrl; }
     })();
 
+    // Production first, then alphabetical. Sections render in this order.
+    const sortedEnvs = [...environments].sort((a, b) => {
+        if (a.is_production && !b.is_production) return -1;
+        if (!a.is_production && b.is_production) return 1;
+        return a.name.localeCompare(b.name);
+    });
+
+    const domainsByEnv = new Map();
+    for (const d of domains) {
+        const list = domainsByEnv.get(d.environment) || [];
+        list.push(d);
+        domainsByEnv.set(d.environment, list);
+    }
+
+    const renderDomainRow = (domain) => (
+        <tr key={domain.id}>
+            <td>
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                    <Icon name="globe" size={14} />
+                    <span className="mono" style={{ fontSize: 13 }}>{domain.domain}</span>
+                    {domain.is_primary && <RPill kind="accent">primary</RPill>}
+                </span>
+            </td>
+            <td style={{ color: 'var(--text-muted)' }}>{formatDate(domain.created_at)}</td>
+            <td>
+                <div className="row-actions" style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
+                    <RButton
+                        size="sm"
+                        icon="check"
+                        onClick={() => handleTogglePrimary(domain)}
+                        loading={updatingPrimaryDomain === domain.domain}
+                    >
+                        {domain.is_primary ? 'Unset primary' : 'Set primary'}
+                    </RButton>
+                    <RButton
+                        size="sm"
+                        icon="edit"
+                        onClick={() => handleEditClick(domain)}
+                        disabled={environments.length === 0}
+                    >
+                        Edit
+                    </RButton>
+                    <RButton size="sm" variant="danger" icon="trash" onClick={() => handleDeleteClick(domain)}>
+                        Delete
+                    </RButton>
+                </div>
+            </td>
+        </tr>
+    );
+
+    const renderEnvSection = (env) => {
+        const envDomains = domainsByEnv.get(env.name) || [];
+        const isProd = env.is_production;
+        const orphaned = !env.primary_deployment_group;
+        // The default URL is the production rise.dev URL — it conceptually
+        // lives in the production env section. Other envs only show explicit
+        // custom domains here (their templated URLs surface via deployments).
+        const includeDefaultRow = isProd && defaultUrl;
+        const isEmpty = envDomains.length === 0 && !includeDefaultRow;
+        // Skip non-production envs that have no custom domains assigned — no
+        // reason to render an empty section. Production always renders (it owns
+        // the default URL row).
+        if (!isProd && envDomains.length === 0) return null;
+
+        return (
+            <div key={env.id} style={{ marginBottom: 20 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '0 0 8px 4px' }}>
+                    <REnvPill env={env.name} color={env.color} />
+                    {orphaned && (
+                        <RTooltip content={`Environment '${env.name}' has no primary deployment group, so domains here aren't attached to any ingress. Set a primary group on the environment to publish them.`}>
+                            <span style={{ display: 'inline-flex', color: 'var(--accent-warning, #fbbf24)', lineHeight: 0 }} aria-label="No primary deployment group">
+                                <Icon name="info" size={14} />
+                            </span>
+                        </RTooltip>
+                    )}
+                </div>
+                <RPanel>
+                    {isEmpty ? (
+                        <REmpty title="No custom domains">
+                            <div style={{ color: 'var(--text-soft)', fontSize: 13 }}>
+                                No custom domains in this environment yet.
+                            </div>
+                        </REmpty>
+                    ) : (
+                        <table className="r-table">
+                            <thead>
+                                <tr>
+                                    <th>Domain</th>
+                                    <th>Created</th>
+                                    <th style={{ textAlign: 'right' }}>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {includeDefaultRow && (
+                                    <tr>
+                                        <td>
+                                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                                                <Icon name="globe" size={14} />
+                                                <a className="r-link mono" style={{ fontSize: 13 }} href={defaultUrl} target="_blank" rel="noopener noreferrer">
+                                                    {defaultHost}
+                                                </a>
+                                                <RPill>default</RPill>
+                                                {isDefaultPrimary && <RPill kind="accent">primary</RPill>}
+                                            </span>
+                                        </td>
+                                        <td style={{ color: 'var(--text-soft)' }}>—</td>
+                                        <td>
+                                            <div className="row-actions" style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
+                                                <RButton
+                                                    size="sm"
+                                                    icon="check"
+                                                    onClick={handleStarDefault}
+                                                    loading={updatingPrimaryDomain === '__default__'}
+                                                    disabled={isDefaultPrimary}
+                                                >
+                                                    {isDefaultPrimary ? 'Primary' : 'Set primary'}
+                                                </RButton>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                )}
+                                {envDomains.map(renderDomainRow)}
+                            </tbody>
+                        </table>
+                    )}
+                </RPanel>
+            </div>
+        );
+    };
+
     return (
         <div>
             <div className="r-section-head">
                 <div>
                     <div className="r-section-title">Custom domains</div>
-                    <div className="r-section-sub">Point your own domains at this project. The primary domain is used as the default URL.</div>
+                    <div className="r-section-sub">Point your own domains at this project. Each environment has its own primary domain.</div>
                 </div>
                 <RButton variant="primary" icon="plus" onClick={handleAddClick}>
                     Add domain
                 </RButton>
             </div>
 
-            <RPanel>
-                {!defaultUrl && domains.length === 0 ? (
-                    <REmpty title="No custom domains">
+            {sortedEnvs.length === 0 ? (
+                <RPanel>
+                    <REmpty title="No environments">
                         <div style={{ color: 'var(--text-soft)', fontSize: 13 }}>
-                            No custom domains configured. Add one to serve this project from your own domain.
+                            Create an environment first — custom domains are attached to environments.
                         </div>
                     </REmpty>
-                ) : (
-                    <table className="r-table">
-                        <thead>
-                            <tr>
-                                <th>Domain</th>
-                                <th>Environment</th>
-                                <th>Created</th>
-                                <th style={{ textAlign: 'right' }}>Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {defaultUrl && (
-                                <tr>
-                                    <td>
-                                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                                            <Icon name="globe" size={14} />
-                                            <a className="r-link mono" style={{ fontSize: 13 }} href={defaultUrl} target="_blank" rel="noopener noreferrer">
-                                                {defaultHost}
-                                            </a>
-                                            <RPill>default</RPill>
-                                            {isDefaultPrimary && <RPill kind="accent">primary</RPill>}
-                                        </span>
-                                    </td>
-                                    <td style={{ color: 'var(--text-soft)' }}>—</td>
-                                    <td style={{ color: 'var(--text-soft)' }}>—</td>
-                                    <td>
-                                        <div className="row-actions" style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
-                                            <RButton
-                                                size="sm"
-                                                icon="check"
-                                                onClick={handleStarDefault}
-                                                loading={updatingPrimaryDomain === '__default__'}
-                                                disabled={isDefaultPrimary}
-                                            >
-                                                {isDefaultPrimary ? 'Primary' : 'Set primary'}
-                                            </RButton>
-                                        </div>
-                                    </td>
-                                </tr>
-                            )}
-                            {domains.map(domain => (
-                                <tr key={domain.id}>
-                                    <td>
-                                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                                            <Icon name="globe" size={14} />
-                                            <span className="mono" style={{ fontSize: 13 }}>{domain.domain}</span>
-                                            {domain.is_primary && <RPill kind="accent">primary</RPill>}
-                                        </span>
-                                    </td>
-                                    <td>
-                                        {domain.environment ? (() => {
-                                            const env = environments.find(e => e.name === domain.environment);
-                                            const orphaned = env && !env.primary_deployment_group;
-                                            return (
-                                                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                                                    <REnvPill env={domain.environment} color={env?.color} />
-                                                    {orphaned && (
-                                                        <RTooltip content={`Environment '${domain.environment}' has no primary deployment group, so this domain is not attached to any ingress. Set a primary group on the environment to publish it.`}>
-                                                            <span style={{ display: 'inline-flex', color: 'var(--accent-warning, #fbbf24)', lineHeight: 0 }} aria-label="No primary deployment group">
-                                                                <Icon name="info" size={14} />
-                                                            </span>
-                                                        </RTooltip>
-                                                    )}
-                                                </span>
-                                            );
-                                        })() : (
-                                            <span style={{ color: 'var(--text-soft)' }}>—</span>
-                                        )}
-                                    </td>
-                                    <td style={{ color: 'var(--text-muted)' }}>{formatDate(domain.created_at)}</td>
-                                    <td>
-                                        <div className="row-actions" style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
-                                            <RButton
-                                                size="sm"
-                                                icon="check"
-                                                onClick={() => handleTogglePrimary(domain)}
-                                                loading={updatingPrimaryDomain === domain.domain}
-                                            >
-                                                {domain.is_primary ? 'Unset primary' : 'Set primary'}
-                                            </RButton>
-                                            <RButton
-                                                size="sm"
-                                                icon="edit"
-                                                onClick={() => handleEditClick(domain)}
-                                                disabled={environments.length === 0}
-                                            >
-                                                Edit
-                                            </RButton>
-                                            <RButton size="sm" variant="danger" icon="trash" onClick={() => handleDeleteClick(domain)}>
-                                                Delete
-                                            </RButton>
-                                        </div>
-                                    </td>
-                                </tr>
-                            ))}
-                        </tbody>
-                    </table>
-                )}
-            </RPanel>
+                </RPanel>
+            ) : (
+                sortedEnvs.map(renderEnvSection)
+            )}
 
             <RModal
                 isOpen={isModalOpen}
