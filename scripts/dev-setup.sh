@@ -411,7 +411,7 @@ helm_install_rise_dev() {
 
 minikube_reachable() {
   command -v kubectl >/dev/null 2>&1 || return 1
-  kubectl --context=minikube get nodes >/dev/null 2>&1
+  kubectl --context=minikube --request-timeout=5s get nodes >/dev/null 2>&1
 }
 
 minikube_profile_exists() {
