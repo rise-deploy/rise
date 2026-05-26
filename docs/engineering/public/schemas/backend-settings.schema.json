@@ -457,11 +457,6 @@
               "description": "Annotations to apply to all managed namespaces\nExample: {\"company.com/team\": \"platform\", \"cost-center\": \"engineering\"}",
               "type": "object"
             },
-            "namespace_format": {
-              "default": "rise-{project_name}",
-              "description": "Namespace format template for deployed applications\nTemplate variables: {project_name}\nExample: \"rise-{project_name}\" → namespace \"rise-myapp\" for project \"myapp\"\nDefaults to \"rise-{project_name}\"",
-              "type": "string"
-            },
             "namespace_labels": {
               "additionalProperties": {
                 "type": "string"

@@ -366,10 +366,6 @@ fn default_ingress_schema() -> String {
     "https".to_string()
 }
 
-fn default_namespace_format() -> String {
-    "rise-{project_name}".to_string()
-}
-
 fn default_controller_class_name() -> String {
     "default".to_string()
 }
@@ -724,13 +720,6 @@ pub enum DeploymentControllerSettings {
         /// This must be the public URL where the backend is accessible via Ingress.
         /// The domain should share a parent with app domains for cookie sharing (see struct docs).
         auth_signin_url: String,
-
-        /// Namespace format template for deployed applications
-        /// Template variables: {project_name}
-        /// Example: "rise-{project_name}" → namespace "rise-myapp" for project "myapp"
-        /// Defaults to "rise-{project_name}"
-        #[serde(default = "default_namespace_format")]
-        namespace_format: String,
 
         /// Stable identifier for this deployment controller, written to the
         /// default Organization's `spec.deploymentControllerClass` at startup.
@@ -1255,7 +1244,6 @@ impl Settings {
 
         // Validate deployment controller settings if configured
         if let Some(DeploymentControllerSettings::Kubernetes {
-            ref namespace_format,
             ref production_ingress_url_template,
             ref staging_ingress_url_template,
             ref environment_ingress_url_template,
@@ -1264,7 +1252,6 @@ impl Settings {
             ..
         }) = settings.deployment_controller
         {
-            Self::validate_format_string(namespace_format, "namespace_format", "{project_name}")?;
             Self::validate_format_string(
                 production_ingress_url_template,
                 "production_ingress_url_template",
@@ -1443,7 +1430,6 @@ deployment_controller:
   type: "kubernetes"
   ingress_class: "nginx"
   production_ingress_url_template: "{project_name}.test.local"
-  namespace_format: "rise-{project_name}"
   auth_backend_url: "http://localhost:3000"
   auth_signin_url: "http://localhost:3000"
   metacontroller_pod_namespace: "metacontroller"
@@ -1528,7 +1514,6 @@ auth:
 deployment_controller:
   type: "kubernetes"
   production_ingress_url_template: "{project_name}.test.local"
-  namespace_format: "rise-{project_name}"
   auth_backend_url: "http://localhost:3000"
   auth_signin_url: "http://localhost:3000"
   metacontroller_pod_namespace: "metacontroller"

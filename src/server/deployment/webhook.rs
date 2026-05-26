@@ -168,7 +168,36 @@ pub async fn handle_sync(
 
     match process_sync(&state, &project_name, &request.children).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
-        Err(e) => {
+        Err(SyncError::WrongController {
+            project,
+            configured,
+            org_class,
+        }) => {
+            // Expected steady state: the project belongs to a different
+            // deployment controller. The CompositeController `labelSelector`
+            // should already filter most of these out — log at warn (not
+            // error) so the operator sees one if the label and the
+            // Organization linkage have drifted. 4xx prevents Metacontroller
+            // from applying the empty children list (no GC).
+            warn!(
+                project = %project,
+                configured = %configured,
+                org_class = ?org_class,
+                "Refusing to reconcile — project Organization's deploymentControllerClass does not match"
+            );
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "controller-class mismatch",
+                    "project": project,
+                    "configured": configured,
+                    "org_class": org_class,
+                    "lastSyncTime": Utc::now().to_rfc3339(),
+                })),
+            )
+                .into_response()
+        }
+        Err(SyncError::Internal(e)) => {
             error!(project = %project_name, "Sync webhook error: {:?}", e);
             // Return 500 so Metacontroller treats this as a failed sync and does NOT
             // apply the (empty) children list, which would garbage-collect all resources.
@@ -188,7 +217,7 @@ async fn process_sync(
     state: &AppState,
     project_name: &str,
     observed: &ObservedChildren,
-) -> anyhow::Result<SyncResponse> {
+) -> Result<SyncResponse, SyncError> {
     // 1. Load project from DB
     let project = match db_projects::find_by_name(&state.db_pool, project_name).await? {
         Some(p) => p,
@@ -216,10 +245,9 @@ async fn process_sync(
     // The Kubernetes controller filters strictly by the configured
     // `controller_class_name`. Projects whose Organization carries a
     // different (or unset) `spec.deploymentControllerClass` belong to a
-    // different controller — surface that as an error so Metacontroller
-    // does not garbage-collect children it doesn't own. We deliberately
-    // bail (HTTP 500) instead of returning an empty children list, mirroring
-    // the existing "no resource builder" path.
+    // different controller — return `SyncError::WrongController` so the
+    // handler answers 400 (not 200 with empty children, which would let
+    // Metacontroller GC resources owned by another controller).
     enforce_controller_class(state, &project).await?;
 
     // 2. Load non-terminal deployments for this project (avoids loading full history)
@@ -254,7 +282,9 @@ async fn process_sync(
     let resource_builder = match &state.resource_builder {
         Some(rb) => rb,
         None => {
-            anyhow::bail!("No resource builder configured — cannot compute desired children");
+            return Err(SyncError::Internal(anyhow::anyhow!(
+                "No resource builder configured — cannot compute desired children"
+            )));
         }
     };
 
@@ -277,14 +307,71 @@ async fn process_sync(
     })
 }
 
+/// Errors that bubble out of [`process_sync`]. `WrongController` is a
+/// steady-state expected outcome (this controller doesn't own the project)
+/// and is mapped to HTTP 400 + `warn!` by the handler; `Internal` covers
+/// genuine failures and maps to 500 + `error!`. Both prevent Metacontroller
+/// from applying the (empty) children list, so neither GCs resources.
+#[derive(Debug)]
+enum SyncError {
+    /// The project's Organization's `spec.deploymentControllerClass` does not
+    /// match this controller's configured `controller_class_name`. Logged
+    /// once at warn level.
+    WrongController {
+        project: String,
+        configured: String,
+        org_class: Option<String>,
+    },
+    /// Anything else — DB error, store error, malformed Org, missing linkage.
+    Internal(anyhow::Error),
+}
+
+impl From<anyhow::Error> for SyncError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Internal(e)
+    }
+}
+
+/// Pure comparison of the configured controller class against the
+/// Organization's `spec.deploymentControllerClass`. Returns `Ok(())` when
+/// reconciliation should proceed (legacy `configured = None`, or both match)
+/// and `Err(())` when the controller should refuse this project.
+fn check_controller_class(configured: Option<&str>, org_class: Option<&str>) -> Result<(), ()> {
+    match configured {
+        None => Ok(()),
+        Some(c) => match org_class {
+            Some(o) if o == c => Ok(()),
+            _ => Err(()),
+        },
+    }
+}
+
+/// Resolve `spec.deploymentControllerClass` from the resource store for the
+/// given Organization UID. Used as the cache miss-loader behind
+/// `AppState::org_controller_class_cache`. Missing Organizations surface as
+/// `Err`, which prevents the cache from memoising a transient "not found"
+/// (the cache only retains successful loads).
+async fn load_org_controller_class(
+    store: std::sync::Arc<dyn rise_resource_store::ResourceStore>,
+    uid: uuid::Uuid,
+) -> anyhow::Result<Option<String>> {
+    let row = store
+        .get(uid)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to load Organization {uid}: {e}"))?
+        .ok_or_else(|| anyhow::anyhow!("Organization {uid} is missing"))?;
+    let spec: rise_resource_api::OrganizationSpec = serde_json::from_value(row.spec.clone())
+        .map_err(|e| anyhow::anyhow!("Organization {uid} has malformed spec: {e}"))?;
+    Ok(spec.deployment_controller_class)
+}
+
 /// Reject reconciliation when the project's Organization's
 /// `spec.deploymentControllerClass` does not match the controller's
-/// configured `controller_class_name`. The function bails (`Err`) on a
-/// mismatch so the HTTP layer returns 500 — that prevents Metacontroller
-/// from applying an empty children list, which would otherwise garbage-collect
-/// children owned by another controller. When the controller has no
-/// configured class (legacy installs), this is a no-op.
-async fn enforce_controller_class(state: &AppState, project: &Project) -> anyhow::Result<()> {
+/// configured `controller_class_name`. Reads the Org's class through a
+/// short-TTL cache so a steady stream of resyncs does not hit the store on
+/// every tick. When the controller has no configured class (legacy
+/// installs), this is a no-op.
+async fn enforce_controller_class(state: &AppState, project: &Project) -> Result<(), SyncError> {
     let Some(configured) = state.deployment_controller_class_name.as_deref() else {
         return Ok(());
     };
@@ -301,55 +388,34 @@ async fn enforce_controller_class(state: &AppState, project: &Project) -> anyhow
                 project = %project.name,
                 "Project has no organization linkage — refusing to reconcile until bootstrap backfills it"
             );
-            anyhow::bail!(
+            return Err(SyncError::Internal(anyhow::anyhow!(
                 "project '{}' is missing organization_resource_uid; bootstrap must backfill before reconciliation",
                 project.name,
-            );
+            )));
         }
     };
 
-    let row = state
-        .resource_store
-        .get(project_org_uid)
+    let org_class = state
+        .org_controller_class_cache
+        .try_get_with(
+            project_org_uid,
+            load_org_controller_class(state.resource_store.clone(), project_org_uid),
+        )
         .await
         .map_err(|e| {
-            anyhow::anyhow!(
+            SyncError::Internal(anyhow::anyhow!(
                 "Failed to load Organization {project_org_uid} for project '{}': {e}",
                 project.name,
-            )
-        })?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Organization {project_org_uid} for project '{}' is missing — refusing to reconcile",
-                project.name,
-            )
+            ))
         })?;
 
-    let spec: rise_resource_api::OrganizationSpec = serde_json::from_value(row.spec.clone())
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Organization {project_org_uid} for project '{}' has malformed spec: {e}",
-                project.name,
-            )
-        })?;
-
-    match spec.deployment_controller_class.as_deref() {
-        Some(class) if class == configured => Ok(()),
-        other => {
-            debug!(
-                project = %project.name,
-                configured = %configured,
-                org_class = ?other,
-                "Refusing to reconcile — project Organization's deploymentControllerClass does not match"
-            );
-            anyhow::bail!(
-                "project '{}' belongs to an Organization with deploymentControllerClass={:?}; \
-                 this controller is configured as '{}'",
-                project.name,
-                other,
-                configured,
-            )
-        }
+    match check_controller_class(Some(configured), org_class.as_deref()) {
+        Ok(()) => Ok(()),
+        Err(()) => Err(SyncError::WrongController {
+            project: project.name.clone(),
+            configured: configured.to_string(),
+            org_class,
+        }),
     }
 }
 
@@ -2346,5 +2412,44 @@ mod tests {
             !resolved.secret_env_vars.contains_key(" SECRET_KEY"),
             "untrimmed key should not be present"
         );
+    }
+
+    // -----------------------------------------------------------------------------
+    // check_controller_class
+    // -----------------------------------------------------------------------------
+
+    #[test]
+    fn check_controller_class_unconfigured_always_passes() {
+        // Legacy installs (no controller class configured) reconcile every
+        // project regardless of what the Organization carries.
+        assert!(check_controller_class(None, None).is_ok());
+        assert!(check_controller_class(None, Some("kubernetes.rise.dev/default")).is_ok());
+        assert!(check_controller_class(None, Some("something-else")).is_ok());
+    }
+
+    #[test]
+    fn check_controller_class_matching_passes() {
+        assert!(check_controller_class(
+            Some("kubernetes.rise.dev/default"),
+            Some("kubernetes.rise.dev/default"),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn check_controller_class_mismatched_rejects() {
+        assert!(check_controller_class(
+            Some("kubernetes.rise.dev/default"),
+            Some("kubernetes.rise.dev/other"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn check_controller_class_unset_on_org_rejects() {
+        // An Org that has no `spec.deploymentControllerClass` is not owned by
+        // this (or any) controller, even when the controller has a class
+        // configured. Refuse to reconcile.
+        assert!(check_controller_class(Some("kubernetes.rise.dev/default"), None).is_err());
     }
 }

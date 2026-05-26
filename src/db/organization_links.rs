@@ -145,6 +145,11 @@ pub async fn count_projects_missing_organization(pool: &PgPool) -> Result<i64> {
 /// deletion of an Organization with typed children — these rows are not in the
 /// `resources` table (and `user_organization_memberships` has no FK back to
 /// `resources`), so the generic child-detection check doesn't cover them.
+///
+/// Code that wants to delete an Organization must go through
+/// `crate::server::resources::organization::delete_organization_guarded`.
+/// Calling `ResourceStore::delete` directly on an Organization UID is unsafe
+/// and will orphan typed rows.
 pub async fn count_typed_children_for_organization(
     pool: &PgPool,
     organization_resource_uid: Uuid,
@@ -168,7 +173,8 @@ pub async fn count_typed_children_for_organization(
 /// Look up the organization linkage UID for a team by team_id. Returns `None`
 /// when the team does not exist or when the column has not yet been
 /// backfilled.
-#[allow(dead_code)]
+// Live under feature="backend" (project handler); unused in CLI-only builds.
+#[cfg_attr(not(feature = "backend"), allow(dead_code))]
 pub async fn organization_uid_for_team(
     conn: &mut PgConnection,
     team_id: Uuid,
@@ -226,7 +232,8 @@ pub async fn set_team_organization(
 
 /// Stamp `organization_resource_uid` on a project. Used when creating a new
 /// project in the default-org bootstrap window.
-#[allow(dead_code)]
+// Live under feature="backend" (project handler); unused in CLI-only builds.
+#[cfg_attr(not(feature = "backend"), allow(dead_code))]
 pub async fn set_project_organization(
     conn: &mut PgConnection,
     project_id: Uuid,

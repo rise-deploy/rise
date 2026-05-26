@@ -24,9 +24,6 @@ kubernetes:
   # production_ingress_url_template: "rise.local/{project_name}"
   # staging_ingress_url_template: "rise.local/{project_name}/{deployment_group}"
 
-  # Namespace format (must contain {project_name})
-  namespace_format: "rise-{project_name}"
-
   # Custom domain TLS mode
   # - "per-domain": Each custom domain gets its own tls-{domain} secret (for cert-manager)
   # - "shared": All custom domains share ingress_tls_secret_name

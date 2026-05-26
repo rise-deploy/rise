@@ -1000,40 +1000,39 @@ async fn delete_resource(
     user: &User,
     response_api_version: &str,
 ) -> Result<Response, ServerError> {
-    // Application-layer guard: refuse to delete an Organization that still
-    // owns typed children (teams/projects via `organization_resource_uid`).
-    // Those rows are not in the `resources` table, so the store's generic
-    // child-detection (which scans `resources.parent_uid`) cannot see them.
-    //
-    // Keyed off `kind` only — typed children link by Organization UID, not
-    // by API version, so the guard must apply to every served version of
-    // the Organization kind.
-    if row.kind == rise_resource_api::ORGANIZATION_KIND {
-        let count = crate::db::organization_links::count_typed_children_for_organization(
-            &ctx.db_pool,
-            row.uid,
-        )
-        .await
-        .map_err(|e| {
-            ServerError::internal_anyhow(e, "Failed to count typed children for organization")
-        })?;
-        if count > 0 {
-            return Err(ServerError::new(
-                StatusCode::CONFLICT,
-                format!(
-                    "Organization '{}' has {count} typed child(ren) (users-via-memberships, teams, projects); \
-                     delete or reassign them before deleting the organization",
-                    row.name,
-                ),
-            ));
+    // Organization deletes route through the canonical guard so the typed
+    // soft-links (users via `user_organization_memberships`, teams, projects)
+    // are never orphaned. See `super::organization` module docs.
+    let outcome = if row.kind == rise_resource_api::ORGANIZATION_KIND {
+        use super::organization::{delete_organization_guarded, OrganizationDeleteError};
+        match delete_organization_guarded(&ctx.store, &ctx.db_pool, row.uid).await {
+            Ok(outcome) => outcome,
+            Err(OrganizationDeleteError::HasChildren { count }) => {
+                return Err(ServerError::new(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "Organization '{}' has {count} typed child(ren) (users-via-memberships, teams, projects); \
+                         delete or reassign them before deleting the organization",
+                        row.name,
+                    ),
+                ));
+            }
+            Err(OrganizationDeleteError::Db(e)) => {
+                return Err(ServerError::internal_anyhow(
+                    e,
+                    "Failed to count typed children for organization",
+                ));
+            }
+            Err(OrganizationDeleteError::Store(e)) => {
+                return Err(store_error_to_server_error(e));
+            }
         }
-    }
-
-    let outcome = ctx
-        .store
-        .delete(row.uid)
-        .await
-        .map_err(store_error_to_server_error)?;
+    } else {
+        ctx.store
+            .delete(row.uid)
+            .await
+            .map_err(store_error_to_server_error)?
+    };
 
     // A single static event message keeps this audit log consistent with
     // `resource.created` / `resource.updated`.

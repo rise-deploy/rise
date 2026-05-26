@@ -71,6 +71,16 @@ pub struct AppState {
     /// Kubernetes deployment controller is configured.
     #[cfg(feature = "backend")]
     pub deployment_controller_class_name: Option<String>,
+    /// Short-TTL cache for `Organization.spec.deploymentControllerClass`
+    /// keyed by Organization UID. Backs the per-sync controller-class check
+    /// in the Metacontroller webhook so it does not re-read the
+    /// Organization row from the store on every reconcile of every project.
+    /// `Some(class)` / `None` distinguishes "Org found, class unset". TTL is
+    /// short (30s) so a controller-class change on the Org propagates within
+    /// roughly a single resync window. Org-missing is treated as an error
+    /// and is never cached.
+    #[cfg(feature = "backend")]
+    pub org_controller_class_cache: Arc<moka::future::Cache<uuid::Uuid, Option<String>>>,
     pub auth_settings: Arc<AuthSettings>,
     pub server_settings: Arc<ServerSettings>,
     pub token_store: Arc<dyn TokenStore>,
@@ -682,7 +692,6 @@ impl AppState {
                 metacontroller_webhook_port,
                 metacontroller_pod_namespace,
                 metacontroller_pod_label_selector,
-                namespace_format,
                 controller_class_name,
                 identity_token_ttl_seconds,
                 ..
@@ -714,13 +723,10 @@ impl AppState {
                     .filter_map(|(k, v)| v.as_ref().map(|ac| (k.clone(), ac.clone())))
                     .collect();
 
-                // Always derive the namespace format from the default Organization's
+                // Derive the namespace format from the default Organization's
                 // resolved namespace prefix. `resolved_namespace_prefix()` reads the
                 // `kubernetes.rise.dev/namespace-prefix` annotation when present and
-                // otherwise synthesizes `org-{discriminator}-` for the org. The
-                // legacy `namespace_format` setting is no longer consulted; it's
-                // still surfaced in the log line below for operators investigating
-                // naming changes during the rollout.
+                // otherwise synthesizes `org-{discriminator}-` for the org.
                 //
                 // Upgrade note: single-org installs that previously named
                 // namespaces `rise-{project_name}` must set
@@ -730,15 +736,7 @@ impl AppState {
                 // namespaces on the first reconciliation.
                 let resolved_namespace_format = {
                     let prefix = default_organization_view.resolved_namespace_prefix();
-                    let format = format!("{prefix}{{project_name}}");
-                    if format != *namespace_format {
-                        tracing::info!(
-                            org_prefix = %prefix,
-                            configured_format = %namespace_format,
-                            "Using namespace format derived from default Organization annotation"
-                        );
-                    }
-                    format
+                    format!("{prefix}{{project_name}}")
                 };
 
                 let rb = ResourceBuilder {
@@ -1066,6 +1064,18 @@ impl AppState {
         );
         tracing::info!("Initialized encrypt endpoint rate limiter (100 req/hour per user)");
 
+        // Cache for Organization.spec.deploymentControllerClass keyed by Org UID.
+        // 30s TTL so an operator's controller_class change propagates within a
+        // few resync windows; 1024-entry cap is well above any realistic Org
+        // count and bounds memory if abused.
+        #[cfg(feature = "backend")]
+        let org_controller_class_cache = Arc::new(
+            moka::future::Cache::builder()
+                .time_to_live(Duration::from_secs(30))
+                .max_capacity(1024)
+                .build(),
+        );
+
         // Initialize OAuth endpoint rate limiter
         let rl = &settings.server.oauth_rate_limit;
         let oauth_rate_limiter = Arc::new(crate::server::rate_limit::OAuthRateLimiter::new(rl));
@@ -1136,6 +1146,8 @@ impl AppState {
             default_organization_uid,
             #[cfg(feature = "backend")]
             deployment_controller_class_name,
+            #[cfg(feature = "backend")]
+            org_controller_class_cache,
             auth_settings,
             server_settings,
             token_store,

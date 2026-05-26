@@ -53,7 +53,6 @@ deployment_controller:
   production_ingress_url_template: "${RISE_PRODUCTION_INGRESS_URL_TEMPLATE:-{project_name}.apps.rise.dev}"
   staging_ingress_url_template: "${RISE_STAGING_INGRESS_URL_TEMPLATE:-{project_name}-{deployment_group}.preview.rise.dev}"
   environment_ingress_url_template: "${RISE_ENVIRONMENT_INGRESS_URL_TEMPLATE:-{project_name}-{environment}.preview.rise.dev}"
-  namespace_format: "${RISE_NAMESPACE_FORMAT:-rise-{project_name}}"
   # Must match `metacontroller.controllerClass` in the helm chart; otherwise
   # RiseProject CR labels and the CompositeController labelSelector drift and
   # Metacontroller stops reconciling.

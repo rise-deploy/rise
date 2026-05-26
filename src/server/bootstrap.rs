@@ -158,7 +158,7 @@ async fn run_inner(
 /// backends are treated as having no controller class (the Organization's
 /// `spec.deploymentControllerClass` is left unset, which means "no
 /// controller manages this org's deployments").
-pub fn controller_class_name_for_bootstrap(settings: &Settings) -> Option<&str> {
+fn controller_class_name_for_bootstrap(settings: &Settings) -> Option<&str> {
     match &settings.deployment_controller {
         Some(DeploymentControllerSettings::Kubernetes {
             controller_class_name,
@@ -423,5 +423,112 @@ mod tests {
     fn build_organization_spec_without_controller_class() {
         let spec = build_organization_spec("Default", None);
         assert!(spec.deployment_controller_class.is_none());
+    }
+
+    /// Construct a minimal `Settings` for tests. Only `default_organization`
+    /// matters to `bootstrap::run`; the other required fields exist purely
+    /// to satisfy `serde`.
+    fn test_settings() -> Settings {
+        let json = serde_json::json!({
+            "server": {
+                "host": "0.0.0.0",
+                "port": 3000,
+                "public_url": "http://test.local",
+                "jwt_signing_secret": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            },
+            "auth": {
+                "issuer": "http://test.local",
+                "client_id": "test",
+                "client_secret": "test",
+            },
+        });
+        serde_json::from_value(json).expect("test settings")
+    }
+
+    #[sqlx::test]
+    async fn bootstrap_is_idempotent(pool: sqlx::PgPool) {
+        // Layer the resource-store schema on top of the root migrations that
+        // `#[sqlx::test]` already ran.
+        rise_resource_store::run_migrations(&pool)
+            .await
+            .expect("resource store migrations");
+        let store: Arc<dyn ResourceStore> =
+            Arc::new(rise_resource_store::PgResourceStore::new(pool.clone()));
+
+        let settings = test_settings();
+
+        // 1. First run: creates the default Organization. No typed rows
+        //    exist yet, so all backfill counts are zero.
+        let first = run(&pool, &store, &settings).await.expect("first run");
+        assert_eq!(first.memberships_backfilled, 0);
+        assert_eq!(first.teams_backfilled, 0);
+        assert_eq!(first.projects_backfilled, 0);
+
+        // 2. Seed pre-PR5-style rows: a user (no membership), a team and a
+        //    project (both with NULL organization_resource_uid). The Entra
+        //    sync path inserts users via `users::create` so we mirror that.
+        let user = crate::db::users::create(&pool, "seed@example.com")
+            .await
+            .expect("seed user");
+        let team = crate::db::teams::create(&pool, "seed-team")
+            .await
+            .expect("seed team");
+        let project = crate::db::projects::create(
+            &pool,
+            "seed-project",
+            crate::db::models::ProjectStatus::Stopped,
+            "public".to_string(),
+            Some(user.id),
+            None,
+            None,
+        )
+        .await
+        .expect("seed project");
+
+        // Sanity: the seed rows have no organization linkage yet.
+        let team_org_pre: Option<uuid::Uuid> =
+            sqlx::query_scalar("SELECT organization_resource_uid FROM teams WHERE id = $1")
+                .bind(team.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(team_org_pre.is_none(), "team should start unlinked");
+        let project_org_pre: Option<uuid::Uuid> =
+            sqlx::query_scalar("SELECT organization_resource_uid FROM projects WHERE id = $1")
+                .bind(project.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(project_org_pre.is_none(), "project should start unlinked");
+
+        // 3. Second run: backfill picks up the seed rows. The Organization
+        //    UID must match the first run — no new Org is minted.
+        let second = run(&pool, &store, &settings).await.expect("second run");
+        assert_eq!(
+            first.default_organization_uid,
+            second.default_organization_uid
+        );
+        assert_eq!(second.memberships_backfilled, 1);
+        assert_eq!(second.teams_backfilled, 1);
+        assert_eq!(second.projects_backfilled, 1);
+
+        // Verify the linkage is actually persisted.
+        let team_org: Option<uuid::Uuid> =
+            sqlx::query_scalar("SELECT organization_resource_uid FROM teams WHERE id = $1")
+                .bind(team.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(team_org, Some(second.default_organization_uid));
+
+        // 4. Third run: nothing left to backfill, validation still passes.
+        let third = run(&pool, &store, &settings).await.expect("third run");
+        assert_eq!(
+            third.default_organization_uid,
+            second.default_organization_uid
+        );
+        assert_eq!(third.memberships_backfilled, 0);
+        assert_eq!(third.teams_backfilled, 0);
+        assert_eq!(third.projects_backfilled, 0);
     }
 }
