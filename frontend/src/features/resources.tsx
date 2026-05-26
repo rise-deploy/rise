@@ -635,8 +635,10 @@ export function DomainsList({ projectName, defaultUrl = null }) {
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
     const [isModalOpen, setIsModalOpen] = useState(false);
+    const [formData, setFormData] = useState({ domain: '', environment: '' });
+    // Resolved lazily — `environments` is empty on first render. Callers that open
+    // the modal or start an edit re-read this so they pick up the loaded list.
     const productionEnvName = environments.find(e => e.is_production)?.name || 'production';
-    const [formData, setFormData] = useState({ domain: '', environment: productionEnvName });
     const [editingDomain, setEditingDomain] = useState(null);
     const [editEnvironment, setEditEnvironment] = useState('');
     const [editSaving, setEditSaving] = useState(false);
