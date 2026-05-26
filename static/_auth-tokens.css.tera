@@ -1,18 +1,94 @@
 /* Shared design tokens for Tera-rendered auth pages.
-   Keep this in rough alignment with frontend/src/styles/rise.css (light mode).
-   Single source of truth for the palette on auth pages. */
+   Keep this in rough alignment with frontend/src/styles/rise.css. */
 :root {
-    --bg: oklch(0.985 0.009 270);
+    color-scheme: light;
+    --bg: oklch(0.985 0.004 80);
     --surface: #ffffff;
-    --surface-2: oklch(0.96 0.012 270);
-    --border-faint: oklch(0.94 0.006 270);
-    --border: oklch(0.91 0.008 270);
+    --surface-2: oklch(0.96 0.005 80);
+    --border-faint: oklch(0.88 0.005 80);
+    --border: oklch(0.84 0.005 80);
     --text: oklch(0.20 0.006 80);
     --muted: oklch(0.50 0.006 80);
     --soft: oklch(0.62 0.006 80);
     --accent: oklch(0.55 0.17 270);
+    --accent-fg: #ffffff;
+    --accent-soft: oklch(0.95 0.04 270);
     --ok: oklch(0.62 0.13 150);
     --ok-bg: oklch(0.96 0.04 150);
     --err: oklch(0.58 0.18 25);
     --err-bg: oklch(0.96 0.04 25);
+    --shadow-md: 0 4px 18px rgba(20, 20, 15, .05), 0 1px 2px rgba(20, 20, 15, .04);
+}
+
+:root.dark {
+    color-scheme: dark;
+    --bg: oklch(0.17 0.005 80);
+    --surface: oklch(0.20 0.005 80);
+    --surface-2: oklch(0.23 0.005 80);
+    --border-faint: oklch(0.23 0.005 80);
+    --border: oklch(0.27 0.005 80);
+    --text: oklch(0.96 0.004 80);
+    --muted: oklch(0.68 0.004 80);
+    --soft: oklch(0.55 0.004 80);
+    --accent: oklch(0.75 0.16 270);
+    --accent-fg: oklch(0.20 0.05 270);
+    --accent-soft: oklch(0.30 0.10 270);
+    --ok: oklch(0.78 0.13 150);
+    --ok-bg: oklch(0.28 0.06 150);
+    --err: oklch(0.72 0.16 25);
+    --err-bg: oklch(0.30 0.10 25);
+    --shadow-md: 0 4px 18px rgba(0, 0, 0, .4);
+}
+
+:root[data-palette="mint"]:not(.dark) {
+    --accent: oklch(0.55 0.10 165);
+    --accent-soft: oklch(0.95 0.04 165);
+    --bg: oklch(0.985 0.008 165);
+    --surface-2: oklch(0.96 0.011 165);
+    --border-faint: oklch(0.89 0.009 165);
+}
+:root[data-palette="mint"].dark {
+    --accent: oklch(0.78 0.13 165);
+    --accent-fg: oklch(0.20 0.04 165);
+    --accent-soft: oklch(0.30 0.08 165);
+}
+
+:root[data-palette="indigo"]:not(.dark) {
+    --accent: oklch(0.55 0.17 270);
+    --accent-soft: oklch(0.95 0.04 270);
+    --bg: oklch(0.985 0.009 270);
+    --surface-2: oklch(0.96 0.012 270);
+    --border-faint: oklch(0.89 0.01 270);
+}
+:root[data-palette="indigo"].dark {
+    --accent: oklch(0.78 0.14 270);
+    --accent-fg: oklch(0.20 0.05 270);
+    --accent-soft: oklch(0.30 0.10 270);
+}
+
+:root[data-palette="ember"]:not(.dark) {
+    --accent: oklch(0.62 0.16 40);
+    --accent-soft: oklch(0.95 0.05 40);
+    --bg: oklch(0.987 0.01 55);
+    --surface-2: oklch(0.965 0.013 55);
+    --border-faint: oklch(0.89 0.011 55);
+}
+:root[data-palette="ember"].dark {
+    --accent: oklch(0.78 0.15 40);
+    --accent-fg: oklch(0.22 0.06 40);
+    --accent-soft: oklch(0.32 0.10 40);
+}
+
+:root[data-palette="slate"]:not(.dark) {
+    --accent: oklch(0.32 0.012 250);
+    --accent-fg: #ffffff;
+    --accent-soft: oklch(0.92 0.006 250);
+    --bg: oklch(0.985 0.004 250);
+    --surface-2: oklch(0.96 0.005 250);
+    --border-faint: oklch(0.89 0.005 250);
+}
+:root[data-palette="slate"].dark {
+    --accent: oklch(0.88 0.005 250);
+    --accent-fg: oklch(0.18 0.005 250);
+    --accent-soft: oklch(0.30 0.06 250);
 }
