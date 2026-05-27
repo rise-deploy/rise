@@ -886,6 +886,12 @@ impl LogLine {
             .as_ref()
             .and_then(|m| m.get("detected_level"))
             .cloned();
+        // Loki stores log entries with the trailing newline that the container
+        // wrote to its log file. The Kubernetes backend doesn't see those
+        // newlines because `AsyncBufRead::lines()` strips them — match that
+        // behavior so renderers/SSE consumers don't end up with blank lines
+        // between entries.
+        let line = line.trim_end_matches(['\r', '\n']).to_string();
         Some(Self {
             timestamp_nanos,
             line,
@@ -1347,6 +1353,28 @@ fn parse_duration_hint(value: &str) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_loki_value_strips_trailing_newlines() {
+        // Loki preserves the trailing newline the container wrote; strip it
+        // so renderers/SSE consumers match the Kubernetes backend (whose
+        // BufReader::lines() already strips line endings) and don't emit a
+        // blank line between entries.
+        let cases = [
+            ("hello\n", "hello"),
+            ("hello\r\n", "hello"),
+            ("hello", "hello"),
+        ];
+        for (input, expected) in cases {
+            let value = LokiValue {
+                timestamp: "1000000000".to_string(),
+                line: input.to_string(),
+                structured_metadata: None,
+            };
+            let parsed = LogLine::from_loki_value(value).expect("valid loki value");
+            assert_eq!(parsed.line, expected, "input {input:?}");
+        }
+    }
 
     #[test]
     fn build_count_buckets_is_right_edged_and_closed_at_end() {
