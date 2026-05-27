@@ -353,7 +353,7 @@ fi
 # (Cannot wrap with `timeout`: rise_cli is a bash function and `timeout`
 # only invokes executables. If the server ever hangs the job-level
 # timeout still catches it.)
-lines="$(rise_cli logs --project "${PROJECT_NAME}" "${deployment_id}" --tail 20 | wc -l)"
+lines="$(rise_cli deployment logs --project "${PROJECT_NAME}" "${deployment_id}" --tail 20 | wc -l)"
 echo "rise logs returned ${lines} line(s)"
 if (( lines == 0 )); then
   echo "Expected 'rise logs' to print at least one line"
