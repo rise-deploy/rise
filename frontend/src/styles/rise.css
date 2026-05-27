@@ -1188,6 +1188,31 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
     width: 200px;
     font-size: 12px;
 }
+.r-logs-bucket-banner {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    align-self: flex-start;
+    padding: 4px 6px 4px 10px;
+    background: oklch(0.40 0.10 260 / 0.18);
+    border: 1px solid oklch(0.50 0.12 260 / 0.5);
+    border-radius: 999px;
+    font-size: 11.5px;
+    color: var(--text);
+}
+.r-logs-bucket-clear {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    background: transparent;
+    border: 0;
+    border-radius: 50%;
+    color: var(--text-soft);
+    cursor: pointer;
+}
+.r-logs-bucket-clear:hover { background: oklch(0.50 0.12 260 / 0.3); color: var(--text); }
 .r-logs-loader {
     padding: 8px 4px;
     text-align: center;

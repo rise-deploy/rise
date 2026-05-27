@@ -675,7 +675,8 @@ impl RuntimeLogBackend for LokiLogBackend {
         // the search filter onto each per-level sub-query and skip levels that
         // the user filtered out (their bars would always read zero).
         let search = query.search.as_deref();
-        let total_selector = append_search_filter(&base, search);
+        let total_selector = level_filtered_selector(&base, query.level);
+        let total_selector = append_search_filter(&total_selector, search);
         let total_query = format!("sum(count_over_time(({total_selector}){range}))");
         let build_segment = |level: LogLevelFilter| -> Option<String> {
             if query.level != LogLevelFilter::All && query.level != level {

@@ -104,14 +104,17 @@ export function EnvironmentIcon({ color, size = 11 }: { color?: string; size?: n
 
 // Resolved palette for the named env colors. Single source of truth for both
 // the `EnvironmentIcon` glyph and the bordered `EnvironmentColorDot`/picker.
+// Backgrounds are translucent tints of the foreground color so the icon cell
+// reads as a light shade of the env color in both light and dark mode (the old
+// values used a darker base tint that mostly disappeared on a white surface).
 export const ENV_COLOR_STYLES: Record<string, { color: string; borderColor: string; background: string }> = {
-    green:  { color: '#34d399', borderColor: '#2e6c44', background: 'rgba(44, 105, 66, 0.2)' },
-    blue:   { color: '#60a5fa', borderColor: '#2e5a8c', background: 'rgba(44, 80, 140, 0.2)' },
-    yellow: { color: '#fbbf24', borderColor: '#7b6333', background: 'rgba(139, 112, 57, 0.22)' },
-    red:    { color: '#f87171', borderColor: '#7d4b4b', background: 'rgba(125, 75, 75, 0.24)' },
-    purple: { color: '#a78bfa', borderColor: '#6b3fa0', background: 'rgba(107, 63, 160, 0.2)' },
-    orange: { color: '#fb923c', borderColor: '#8c5a2e', background: 'rgba(140, 90, 46, 0.22)' },
-    gray:   { color: '#9ca3af', borderColor: '#4a4a4a', background: 'rgba(74, 74, 74, 0.2)' },
+    green:  { color: '#34d399', borderColor: '#2e6c44', background: 'rgba(52, 211, 153, 0.18)' },
+    blue:   { color: '#60a5fa', borderColor: '#2e5a8c', background: 'rgba(96, 165, 250, 0.18)' },
+    yellow: { color: '#fbbf24', borderColor: '#7b6333', background: 'rgba(251, 191, 36, 0.22)' },
+    red:    { color: '#f87171', borderColor: '#7d4b4b', background: 'rgba(248, 113, 113, 0.22)' },
+    purple: { color: '#a78bfa', borderColor: '#6b3fa0', background: 'rgba(167, 139, 250, 0.20)' },
+    orange: { color: '#fb923c', borderColor: '#8c5a2e', background: 'rgba(251, 146, 60, 0.22)' },
+    gray:   { color: '#9ca3af', borderColor: '#4a4a4a', background: 'rgba(156, 163, 175, 0.20)' },
 };
 
 const ENV_COLORS = Object.keys(ENV_COLOR_STYLES);

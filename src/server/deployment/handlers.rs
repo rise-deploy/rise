@@ -2402,6 +2402,11 @@ pub async fn stream_deployment_logs(
             let error_msg = e.to_string();
             if error_msg.contains("not ready yet") || error_msg.contains("waiting to start") {
                 ServerError::service_unavailable("Deployment logs are not ready yet.").expected()
+            } else if error_msg.contains("exceeds the limit") {
+                ServerError::bad_request(
+                    "Selected time range is too large for the log backend. Pick a shorter range.",
+                )
+                .expected()
             } else {
                 ServerError::internal_anyhow(e, "Failed to stream logs")
             }
@@ -2507,7 +2512,17 @@ pub async fn count_deployment_logs(
             },
         )
         .await
-        .map_err(|e| ServerError::internal_anyhow(e, "Failed to fetch log counts"))?;
+        .map_err(|e| {
+            let error_msg = e.to_string();
+            if error_msg.contains("exceeds the limit") {
+                ServerError::bad_request(
+                    "Selected time range is too large for the log backend. Pick a shorter range.",
+                )
+                .expected()
+            } else {
+                ServerError::internal_anyhow(e, "Failed to fetch log counts")
+            }
+        })?;
 
     Ok(Json(counts))
 }
