@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::db::models::{Deployment, DeploymentStatus, Project};
 use crate::server::deployment::resource_builder::ResourceBuilder;
-use crate::server::settings::{DeploymentLogsSettings, LokiLabels};
+use crate::server::settings::{DeploymentLogsSettings, KubernetesLogBackendSettings, LokiLabels};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevelFilter {
@@ -139,9 +139,12 @@ pub async fn init_runtime_log_backend(
     kube_client: Option<kube::Client>,
 ) -> Result<Arc<dyn RuntimeLogBackend>> {
     match settings {
-        DeploymentLogsSettings::Kubernetes => {
+        DeploymentLogsSettings::Kubernetes { config } => {
             let kube_client = kube_client.context("Kubernetes log backend requires kube client")?;
-            Ok(Arc::new(KubernetesLogBackend { kube_client }))
+            Ok(Arc::new(KubernetesLogBackend {
+                kube_client,
+                config: config.clone(),
+            }))
         }
         DeploymentLogsSettings::Loki {
             url,
@@ -174,6 +177,7 @@ pub async fn init_runtime_log_backend(
 
 struct KubernetesLogBackend {
     kube_client: kube::Client,
+    config: KubernetesLogBackendSettings,
 }
 
 pub(crate) fn is_followable_status(status: &DeploymentStatus) -> bool {
@@ -250,9 +254,14 @@ impl RuntimeLogBackend for KubernetesLogBackend {
         // bumping `tail_lines` we widen the window backward and then drop
         // the trailing N qualifying lines (which the frontend already has).
         let skip_recent = query.skip_recent.unwrap_or(0).max(0);
+        // Cap the requested tail at the configured ceiling. Once the frontend
+        // hits this cap, paging stops yielding new lines and the user sees
+        // "Start of selected range" — the same outcome as when the kubelet's
+        // own ring buffer is exhausted.
+        let max_tail = self.config.max_tail_lines.max(1);
         let effective_tail = query
             .tail_lines
-            .map(|t| t.saturating_add(skip_recent).max(1));
+            .map(|t| t.saturating_add(skip_recent).clamp(1, max_tail));
 
         let mut log_params = LogParams {
             follow: query.follow && is_followable_status(&deployment.status),
@@ -449,7 +458,11 @@ impl LokiLogBackend {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_else(|_| "".into());
-            anyhow::bail!("Loki query failed ({}): {}", status, body);
+            anyhow::bail!(
+                "Loki query failed ({}): {}",
+                status,
+                truncate_for_error(body)
+            );
         }
 
         let body: LokiQueryResponse = response.json().await.context("Invalid Loki response")?;
@@ -586,29 +599,17 @@ impl LokiLogBackend {
         Ok(stream.boxed())
     }
 
-    async fn query_counts_or_empty(
-        &self,
-        query: Option<String>,
-        start_time: DateTime<Utc>,
-        end_time: DateTime<Utc>,
-        step_seconds: i64,
-    ) -> Result<BTreeMap<i64, u64>> {
-        match query {
-            Some(q) => {
-                self.query_counts_series(q, start_time, end_time, step_seconds)
-                    .await
-            }
-            None => Ok(BTreeMap::new()),
-        }
-    }
-
-    async fn query_counts_series(
+    /// Run a single `sum by (detected_level) (count_over_time(...))` query and
+    /// return one (level label, points) entry per series Loki returns. The
+    /// level label is the raw `detected_level` value (e.g. `"info"`, `"err"`,
+    /// `"unknown"`); callers map it to the chart's Info/Warn/Error buckets.
+    async fn query_counts_by_level(
         &self,
         query: String,
         start_time: DateTime<Utc>,
         end_time: DateTime<Utc>,
         step_seconds: i64,
-    ) -> Result<BTreeMap<i64, u64>> {
+    ) -> Result<Vec<(String, BTreeMap<i64, u64>)>> {
         let url = format!(
             "{}?query={}&start={}&end={}&step={}&direction=FORWARD",
             self.query_url,
@@ -627,7 +628,11 @@ impl LokiLogBackend {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_else(|_| "".into());
-            anyhow::bail!("Loki counts query failed ({}): {}", status, body);
+            anyhow::bail!(
+                "Loki counts query failed ({}): {}",
+                status,
+                truncate_for_error(body)
+            );
         }
 
         let body: LokiMetricQueryResponse = response
@@ -635,61 +640,86 @@ impl LokiLogBackend {
             .await
             .context("Invalid Loki counts response")?;
 
-        let mut counts = BTreeMap::new();
+        let mut out = Vec::with_capacity(body.data.result.len());
         for series in body.data.result {
+            let label = series
+                .metric
+                .get("detected_level")
+                .cloned()
+                .unwrap_or_default();
+            let mut points: BTreeMap<i64, u64> = BTreeMap::new();
             for point in series.points() {
-                counts
+                points
                     .entry(point.timestamp_nanos)
                     .and_modify(|count| *count += point.count)
                     .or_insert(point.count);
             }
+            out.push((label, points));
         }
-        Ok(counts)
+        Ok(out)
     }
 
     fn build_count_buckets(
-        total: BTreeMap<i64, u64>,
-        info: BTreeMap<i64, u64>,
-        warn: BTreeMap<i64, u64>,
-        error: BTreeMap<i64, u64>,
+        series_by_level: &[(String, BTreeMap<i64, u64>)],
         start_time: DateTime<Utc>,
         end_time: DateTime<Utc>,
         step_seconds: i64,
     ) -> Vec<LogCountBucket> {
-        // Emit a contiguous row of buckets spanning [start_time, end_time] at
-        // step_seconds intervals. For each bucket we sum counts whose timestamp
-        // falls in [bucket_start, bucket_start + step). Loki returns timestamps
-        // that are already aligned to the step boundary, so an exact-match lookup
-        // is sufficient when present, but we also accept any data point that
-        // falls inside the bucket window — defensive against slight drift.
+        // Emit a contiguous row of buckets at right-edged timestamps spanning
+        // (start_time, end_time] at step_seconds intervals — i.e. the first
+        // bucket is at start_time + step and the last is at end_time. This
+        // mirrors Loki's `count_over_time(...[Xs])` semantics, which at step
+        // `t` returns the count for the preceding window `(t - X, t]`. The
+        // frontend interprets each bucket the same way (see
+        // frontend/src/features/log-volume-chart.tsx).
+        //
+        // For each bucket at right-edge `T` we sum counts whose timestamp falls
+        // in `(T - step, T]`. Loki returns timestamps already aligned to the
+        // step boundary so the exact-match lookup is the common case; we also
+        // accept any data point within the bucket window as a defensive
+        // fallback against slight drift.
         let step = Duration::seconds(step_seconds.max(1));
         let step_nanos = step.num_nanoseconds().unwrap_or(i64::MAX);
 
-        let lookup = |source: &BTreeMap<i64, u64>, bucket_nanos: i64| -> u64 {
-            // Common case: Loki point lands exactly on the bucket boundary.
-            if let Some(v) = source.get(&bucket_nanos) {
-                return *v;
-            }
-            // Fallback: any point within [bucket, bucket + step).
-            source
-                .range(bucket_nanos..bucket_nanos.saturating_add(step_nanos))
-                .map(|(_, v)| *v)
-                .sum()
-        };
-
         let mut buckets = Vec::new();
-        let mut current = start_time;
-        // Half-open: each bucket represents [current, current + step), so we stop
-        // once `current` reaches the aligned end — including it would emit one
-        // extra empty bucket past the requested range.
-        while current < end_time {
-            let bucket_nanos = current.timestamp_nanos_opt().unwrap_or_default();
+        let mut current = start_time + step;
+        while current <= end_time {
+            let bucket_end = current.timestamp_nanos_opt().unwrap_or_default();
+            let bucket_start_exclusive = bucket_end.saturating_sub(step_nanos);
+
+            let mut total: u64 = 0;
+            let mut info: u64 = 0;
+            let mut warn: u64 = 0;
+            let mut error: u64 = 0;
+            for (level_label, points) in series_by_level {
+                // Common case: Loki point lands exactly on the right edge.
+                let exact = points.get(&bucket_end).copied().unwrap_or(0);
+                // Fallback: any point within (bucket_start, bucket_end]. The
+                // BTreeMap range is half-open at the low end so use +1 to make
+                // the lower bound exclusive, then include `bucket_end`.
+                let drift: u64 = points
+                    .range(bucket_start_exclusive.saturating_add(1)..bucket_end)
+                    .map(|(_, v)| *v)
+                    .sum();
+                let value = exact.saturating_add(drift);
+                if value == 0 {
+                    continue;
+                }
+                total = total.saturating_add(value);
+                match classify_detected_level(level_label) {
+                    ClassifiedLevel::Info => info = info.saturating_add(value),
+                    ClassifiedLevel::Warn => warn = warn.saturating_add(value),
+                    ClassifiedLevel::Error => error = error.saturating_add(value),
+                    ClassifiedLevel::Other => {}
+                }
+            }
+
             buckets.push(LogCountBucket {
                 timestamp: current.to_rfc3339(),
-                total: lookup(&total, bucket_nanos),
-                info: lookup(&info, bucket_nanos),
-                warn: lookup(&warn, bucket_nanos),
-                error: lookup(&error, bucket_nanos),
+                total,
+                info,
+                warn,
+                error,
             });
             current += step;
         }
@@ -778,41 +808,27 @@ impl RuntimeLogBackend for LokiLogBackend {
         let base = self.base_selector(deployment, project);
         let range = format!("[{step_seconds}s]");
         // The chart should reflect the same filters as the log list. We layer
-        // the search filter onto each per-level sub-query and skip levels that
-        // the user filtered out (their bars would always read zero).
+        // the search filter onto the selector and, when the user picked a
+        // specific level, push it through Loki's `detected_level` label so the
+        // single query returns only the relevant series.
         let search = query.search.as_deref();
-        let total_selector = level_filtered_selector(&base, query.level);
-        let total_selector = append_search_filter(&total_selector, search);
-        let total_query = format!("sum(count_over_time(({total_selector}){range}))");
-        let build_segment = |level: LogLevelFilter| -> Option<String> {
-            if query.level != LogLevelFilter::All && query.level != level {
-                return None;
-            }
-            let selector = level_filtered_selector(&base, level);
-            let selector = append_search_filter(&selector, search);
-            Some(format!("sum(count_over_time(({selector}){range}))"))
-        };
-        let warn_query = build_segment(LogLevelFilter::Warn);
-        let error_query = build_segment(LogLevelFilter::Error);
-        let info_query = build_segment(LogLevelFilter::Info);
+        let mut selector = append_search_filter(&base, search);
+        if let Some(pattern) = detected_level_regex_for_filter(query.level) {
+            selector = format!("{selector} | detected_level=~\"{pattern}\"");
+        }
+        // `sum by (detected_level)` collapses each detected_level value into a
+        // single series. The total reported in each bucket is the sum across
+        // all series — including `unknown`/unclassified — so unclassified
+        // lines still raise the bar height even though they don't paint a
+        // colored segment.
+        let count_query = format!("sum by (detected_level) (count_over_time(({selector}){range}))");
 
-        let (total, warn, error, info) = futures::try_join!(
-            self.query_counts_series(total_query, aligned_start, aligned_end, step_seconds,),
-            self.query_counts_or_empty(warn_query, aligned_start, aligned_end, step_seconds,),
-            self.query_counts_or_empty(error_query, aligned_start, aligned_end, step_seconds,),
-            self.query_counts_or_empty(info_query, aligned_start, aligned_end, step_seconds,),
-        )?;
+        let series = self
+            .query_counts_by_level(count_query, aligned_start, aligned_end, step_seconds)
+            .await?;
 
-        let is_empty = total.is_empty() && warn.is_empty() && error.is_empty() && info.is_empty();
-        let buckets = Self::build_count_buckets(
-            total,
-            info,
-            warn,
-            error,
-            aligned_start,
-            aligned_end,
-            step_seconds,
-        );
+        let is_empty = series.iter().all(|(_, points)| points.is_empty());
+        let buckets = Self::build_count_buckets(&series, aligned_start, aligned_end, step_seconds);
 
         Ok(LogCountsResponse {
             status: if is_empty {
@@ -887,6 +903,8 @@ struct LokiMetricQueryData {
 
 #[derive(Deserialize)]
 struct LokiMetricSeries {
+    #[serde(default)]
+    metric: std::collections::HashMap<String, String>,
     #[serde(default)]
     values: Vec<MetricSample>,
     #[serde(default)]
@@ -1012,6 +1030,26 @@ fn escape_logql_label_value(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// Cap an upstream response body before including it in an error message. Loki
+/// can return very large HTML/JSON error pages and we don't want those flooding
+/// the structured log line that surfaces the failure.
+fn truncate_for_error(s: String) -> String {
+    const MAX: usize = 1024;
+    if s.len() <= MAX {
+        return s;
+    }
+    // Truncate at a UTF-8 boundary at or before MAX so the resulting String is
+    // still valid. `floor_char_boundary` is unstable, so do it by hand.
+    let mut end = MAX;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut t = s;
+    t.truncate(end);
+    t.push_str("... (truncated)");
+    t
+}
+
 /// Reject Loki/Prometheus label names that wouldn't be valid identifiers.
 /// Prevents an operator-supplied override from producing malformed LogQL.
 fn validate_loki_label_name(role: &str, name: &str) -> Result<()> {
@@ -1047,6 +1085,42 @@ fn level_filtered_selector(base: &str, level: LogLevelFilter) -> String {
             format!("{base} |~ `{LEVEL_REGEX_WARN}` !~ `{LEVEL_REGEX_ERROR}`")
         }
         LogLevelFilter::Info => format!("{base} !~ `{LEVEL_REGEX_INFO_EXCLUDE}`"),
+    }
+}
+
+/// Classified `detected_level` value as used by the volume chart's three
+/// stacked buckets. Anything Loki tagged but Rise doesn't recognize (e.g.
+/// `unknown` or an empty label) is `Other` and contributes only to the bar's
+/// total height, not to any colored segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClassifiedLevel {
+    Info,
+    Warn,
+    Error,
+    Other,
+}
+
+/// Map a raw `detected_level` label to the Rise bucket. Matches the lowercase
+/// set most production log stacks emit (`info`, `warn`, `error`, plus common
+/// abbreviations like `err`, `crit`, `warning`).
+fn classify_detected_level(raw: &str) -> ClassifiedLevel {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "error" | "err" | "fatal" | "critical" | "crit" => ClassifiedLevel::Error,
+        "warn" | "warning" => ClassifiedLevel::Warn,
+        "info" | "debug" | "trace" | "notice" => ClassifiedLevel::Info,
+        _ => ClassifiedLevel::Other,
+    }
+}
+
+/// LogQL `detected_level=~"..."` alternation matching the same patterns as
+/// `classify_detected_level`. Used to push the user's level filter into the
+/// single `count_over_time` query.
+fn detected_level_regex_for_filter(level: LogLevelFilter) -> Option<&'static str> {
+    match level {
+        LogLevelFilter::All => None,
+        LogLevelFilter::Error => Some("error|err|fatal|critical|crit"),
+        LogLevelFilter::Warn => Some("warn|warning"),
+        LogLevelFilter::Info => Some("info|debug|trace|notice"),
     }
 }
 
@@ -1134,48 +1208,164 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_count_buckets_is_half_open_at_end() {
-        // [0s, 300s) at step=60s should yield exactly 5 buckets at 0, 60, 120,
-        // 180, 240 — not 6. The aligned-end bucket itself represents [300, 360)
-        // and would be empty by construction; emitting it pads every chart.
+    fn build_count_buckets_is_right_edged_and_closed_at_end() {
+        // Right-edged: each bucket at timestamp T represents (T - step, T], so
+        // for [0s, 300s] at step=60s we expect 5 buckets at 60, 120, 180, 240,
+        // 300 — NOT a bucket at 0 (that would cover (-60, 0], i.e. data from
+        // before the user's window) and the last bucket must include the
+        // aligned_end timestamp itself.
         let start = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
         let end = DateTime::<Utc>::from_timestamp(300, 0).unwrap();
-        let buckets = LokiLogBackend::build_count_buckets(
-            BTreeMap::new(),
-            BTreeMap::new(),
-            BTreeMap::new(),
-            BTreeMap::new(),
-            start,
-            end,
-            60,
-        );
+        let buckets = LokiLogBackend::build_count_buckets(&[], start, end, 60);
         assert_eq!(buckets.len(), 5);
+        // First bucket is at start + step, last bucket is at end.
+        assert_eq!(
+            buckets.first().map(|b| b.timestamp.as_str()),
+            Some("1970-01-01T00:01:00+00:00")
+        );
+        assert_eq!(
+            buckets.last().map(|b| b.timestamp.as_str()),
+            Some("1970-01-01T00:05:00+00:00")
+        );
     }
 
     #[test]
-    fn build_count_buckets_sums_samples_into_their_bucket() {
-        // A Loki point at the bucket boundary belongs to that bucket (exact-match
-        // path). A point inside the bucket window also counts; nothing should
-        // double-count into the next bucket.
+    fn build_count_buckets_places_point_at_aligned_end_into_last_bucket() {
+        // A single Loki point at the aligned_end timestamp must land in the
+        // LAST emitted bucket — confirming the (T - step, T] right-edged
+        // window. Before the alignment fix this point landed in the
+        // (non-existent) bucket past the end and was dropped.
         let step = 60;
         let start = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
-        let end = DateTime::<Utc>::from_timestamp(180, 0).unwrap();
-        let mut total = BTreeMap::new();
-        total.insert(0i64, 3);
-        total.insert(60i64 * 1_000_000_000, 7);
-        let buckets = LokiLogBackend::build_count_buckets(
-            total,
-            BTreeMap::new(),
-            BTreeMap::new(),
-            BTreeMap::new(),
-            start,
-            end,
-            step,
+        let end = DateTime::<Utc>::from_timestamp(300, 0).unwrap();
+        let mut info = BTreeMap::new();
+        info.insert(300i64 * 1_000_000_000, 42u64);
+        let series = vec![("info".to_string(), info)];
+        let buckets = LokiLogBackend::build_count_buckets(&series, start, end, step);
+        assert_eq!(buckets.len(), 5);
+        // Last bucket carries the value; earlier buckets are empty.
+        assert_eq!(buckets.last().unwrap().total, 42);
+        assert_eq!(buckets.last().unwrap().info, 42);
+        for b in &buckets[..buckets.len() - 1] {
+            assert_eq!(b.total, 0);
+            assert_eq!(b.info, 0);
+        }
+    }
+
+    #[test]
+    fn build_count_buckets_classifies_detected_level_per_bucket() {
+        // sum by (detected_level) returns one series per level value. Buckets
+        // should split into Info/Warn/Error bins by classify_detected_level
+        // while still summing into `total`, and unknown levels should land in
+        // `total` only.
+        let step = 60;
+        let start = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+        let end = DateTime::<Utc>::from_timestamp(60, 0).unwrap();
+        let bucket_ns = 60i64 * 1_000_000_000;
+        let series = vec![
+            (
+                "info".to_string(),
+                [(bucket_ns, 5u64)].into_iter().collect(),
+            ),
+            (
+                "warn".to_string(),
+                [(bucket_ns, 2u64)].into_iter().collect(),
+            ),
+            (
+                "ERROR".to_string(),
+                [(bucket_ns, 1u64)].into_iter().collect(),
+            ),
+            (
+                "unknown".to_string(),
+                [(bucket_ns, 9u64)].into_iter().collect(),
+            ),
+            ("".to_string(), [(bucket_ns, 4u64)].into_iter().collect()),
+        ];
+        let buckets = LokiLogBackend::build_count_buckets(&series, start, end, step);
+        assert_eq!(buckets.len(), 1);
+        let b = &buckets[0];
+        assert_eq!(b.info, 5);
+        assert_eq!(b.warn, 2);
+        assert_eq!(b.error, 1);
+        // total = info + warn + error + unknown + empty
+        assert_eq!(b.total, 5 + 2 + 1 + 9 + 4);
+    }
+
+    #[test]
+    fn build_count_buckets_drift_falls_into_correct_right_edged_bucket() {
+        // A point that doesn't land on the boundary should be assigned to the
+        // (T - step, T] window. A point at T - step (the bucket's lower edge)
+        // belongs to the PREVIOUS bucket, not this one.
+        let step = 60;
+        let start = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+        let end = DateTime::<Utc>::from_timestamp(120, 0).unwrap();
+        // 30s offset (mid-first-bucket) and 60s exact (right edge of first
+        // bucket).
+        let series = vec![(
+            "info".to_string(),
+            [
+                (30i64 * 1_000_000_000, 7u64),
+                (60i64 * 1_000_000_000, 11u64),
+            ]
+            .into_iter()
+            .collect::<BTreeMap<i64, u64>>(),
+        )];
+        let buckets = LokiLogBackend::build_count_buckets(&series, start, end, step);
+        assert_eq!(buckets.len(), 2);
+        // First bucket (timestamp=60) covers (0, 60] → 7 + 11 = 18.
+        assert_eq!(buckets[0].total, 18);
+        // Second bucket (timestamp=120) covers (60, 120] → nothing.
+        assert_eq!(buckets[1].total, 0);
+    }
+
+    #[test]
+    fn escape_logql_label_value_escapes_backslash_and_quote() {
+        // Plain name passes through unchanged.
+        assert_eq!(escape_logql_label_value("my-project"), "my-project");
+        // Backslash becomes \\
+        assert_eq!(
+            escape_logql_label_value(r"with\backslash"),
+            r"with\\backslash"
         );
-        assert_eq!(buckets.len(), 3);
-        assert_eq!(buckets[0].total, 3);
-        assert_eq!(buckets[1].total, 7);
-        assert_eq!(buckets[2].total, 0);
+        // Double quote becomes \"
+        assert_eq!(escape_logql_label_value(r#"with"quote"#), r#"with\"quote"#);
+        // Both at once — order doesn't double-escape the inserted backslashes.
+        // Input: with\and"both → expected: with\\and\"both
+        assert_eq!(
+            escape_logql_label_value(r#"with\and"both"#),
+            r#"with\\and\"both"#
+        );
+    }
+
+    #[test]
+    fn classify_detected_level_recognizes_common_labels() {
+        for v in ["error", "ERR", "Fatal", "critical", "CRIT"] {
+            assert_eq!(classify_detected_level(v), ClassifiedLevel::Error);
+        }
+        for v in ["warn", "Warning"] {
+            assert_eq!(classify_detected_level(v), ClassifiedLevel::Warn);
+        }
+        for v in ["info", "DEBUG", "trace", "notice"] {
+            assert_eq!(classify_detected_level(v), ClassifiedLevel::Info);
+        }
+        for v in ["", "unknown", "verbose"] {
+            assert_eq!(classify_detected_level(v), ClassifiedLevel::Other);
+        }
+    }
+
+    #[test]
+    fn truncate_for_error_keeps_short_strings_intact() {
+        let short = "boom".to_string();
+        assert_eq!(truncate_for_error(short.clone()), short);
+    }
+
+    #[test]
+    fn truncate_for_error_truncates_long_strings_at_utf8_boundary() {
+        let long: String = "a".repeat(2048);
+        let out = truncate_for_error(long);
+        assert!(out.ends_with("... (truncated)"));
+        // Total length: 1024 + len("... (truncated)").
+        assert_eq!(out.len(), 1024 + "... (truncated)".len());
     }
 
     #[test]
@@ -1265,6 +1455,56 @@ mod tests {
         let points = series.points();
         assert_eq!(points[0].count, 5);
         assert_eq!(points[1].count, 3);
+    }
+
+    #[test]
+    fn count_logs_pipeline_aligns_detected_level_series_to_right_edged_buckets() {
+        // End-to-end-ish: take a realistic `sum by (detected_level)` response,
+        // parse it the way `query_counts_by_level` does, and feed the result
+        // into `build_count_buckets`. The point at timestamp=aligned_end must
+        // land in the LAST bucket and split correctly across detected_level
+        // values. This guards against regressing both the alignment fix
+        // (task 1) and the detected_level migration (task 2).
+        let payload = r#"{
+          "status":"success",
+          "data":{
+            "resultType":"matrix",
+            "result":[
+              {"metric":{"detected_level":"info"},"values":[[60, "5"]]},
+              {"metric":{"detected_level":"warn"},"values":[[60, "3"]]},
+              {"metric":{"detected_level":"error"},"values":[[60, "2"]]},
+              {"metric":{"detected_level":"unknown"},"values":[[60, "4"]]}
+            ]
+          }
+        }"#;
+        let parsed: LokiMetricQueryResponse =
+            serde_json::from_str(payload).expect("response should parse");
+        let series: Vec<(String, BTreeMap<i64, u64>)> = parsed
+            .data
+            .result
+            .into_iter()
+            .map(|s| {
+                let label = s.metric.get("detected_level").cloned().unwrap_or_default();
+                let mut points: BTreeMap<i64, u64> = BTreeMap::new();
+                for p in s.points() {
+                    points.insert(p.timestamp_nanos, p.count);
+                }
+                (label, points)
+            })
+            .collect();
+
+        // [0, 60] @ step=60 → exactly one bucket at ts=60.
+        let start = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+        let end = DateTime::<Utc>::from_timestamp(60, 0).unwrap();
+        let buckets = LokiLogBackend::build_count_buckets(&series, start, end, 60);
+        assert_eq!(buckets.len(), 1);
+        let b = &buckets[0];
+        assert_eq!(b.timestamp, "1970-01-01T00:01:00+00:00");
+        assert_eq!(b.info, 5);
+        assert_eq!(b.warn, 3);
+        assert_eq!(b.error, 2);
+        // total includes unknown → 5+3+2+4 = 14.
+        assert_eq!(b.total, 14);
     }
 
     #[test]

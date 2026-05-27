@@ -958,6 +958,20 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
     // collapsing the rangeWindow (which would lose the chart context). The
     // chart still renders the full range; we just override the log query.
     const [selectedBucket, setSelectedBucket] = useState(null);
+    // Auto-refresh interval in seconds (0 = off). Persisted to localStorage so
+    // the user's preference survives a reload; defaults to 30s on first use.
+    const [autoRefreshSeconds, setAutoRefreshSeconds] = useState(() => {
+        if (typeof window === 'undefined') return 30;
+        try {
+            const raw = window.localStorage.getItem('rise.deploymentLogs.autoRefreshSeconds');
+            if (raw === null) return 30;
+            const parsed = Number.parseInt(raw, 10);
+            if (Number.isNaN(parsed) || parsed < 0) return 30;
+            return parsed;
+        } catch {
+            return 30;
+        }
+    });
 
     const logBoxRef = useRef(null);
     const loadMoreRef = useRef(null);
@@ -1159,9 +1173,11 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                 level: levelFilter,
                 search: searchActive,
                 onLine: (line) => {
+                    if (gen !== streamGenRef.current) return;
                     collected.push(parseLogLine(line, seqRef.current++));
                 },
                 onStatus: (payload) => {
+                    if (gen !== streamGenRef.current) return;
                     try {
                         newStatus = JSON.parse(payload);
                     } catch {
@@ -1492,6 +1508,38 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
         }
     }, [streamable, rangeValue, selectedBucket, startStreaming, loadHistoricalLogs]);
 
+    // Persist the auto-refresh interval so the user's choice survives reloads.
+    useEffect(() => {
+        if (typeof window === 'undefined') return;
+        try {
+            window.localStorage.setItem(
+                'rise.deploymentLogs.autoRefreshSeconds',
+                String(autoRefreshSeconds),
+            );
+        } catch {
+            /* localStorage may be disabled — best effort only. */
+        }
+    }, [autoRefreshSeconds]);
+
+    // Mirror the latest `handleRefresh` in a ref so the interval effect below
+    // only resets when the user changes the cadence — not every time filters,
+    // range, or streaming-ness flip the callback identity.
+    const handleRefreshRef = useRef(handleRefresh);
+    useEffect(() => {
+        handleRefreshRef.current = handleRefresh;
+    }, [handleRefresh]);
+
+    // Auto-refresh tick. Skip when the tab is hidden so background tabs don't
+    // hammer the backend. Cleared on unmount and on cadence change.
+    useEffect(() => {
+        if (autoRefreshSeconds <= 0) return undefined;
+        const id = window.setInterval(() => {
+            if (typeof document !== 'undefined' && document.hidden) return;
+            handleRefreshRef.current();
+        }, autoRefreshSeconds * 1000);
+        return () => window.clearInterval(id);
+    }, [autoRefreshSeconds]);
+
     const handleCopyLogs = async () => {
         try {
             await copyToClipboard(entries.map((e) => e.iso ? `${e.iso} ${e.raw}` : e.raw).join('\n'));
@@ -1604,6 +1652,22 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                         {entries.length.toLocaleString()} {entries.length === 1 ? 'line' : 'lines'}
                     </span>
                     <RButton size="sm" onClick={handleRefresh}>Refresh</RButton>
+                    <div className="r-logs-autorefresh">
+                        <Combobox
+                            value={String(autoRefreshSeconds)}
+                            options={[
+                                { value: '0', label: 'Auto: Off' },
+                                { value: '10', label: 'Auto: 10s' },
+                                { value: '30', label: 'Auto: 30s' },
+                                { value: '60', label: 'Auto: 1m' },
+                                { value: '300', label: 'Auto: 5m' },
+                            ]}
+                            onChange={(v) => {
+                                const parsed = Number.parseInt(v, 10);
+                                setAutoRefreshSeconds(Number.isNaN(parsed) ? 0 : parsed);
+                            }}
+                        />
+                    </div>
                     <RButton size="sm" onClick={handleCopyLogs} disabled={entries.length === 0} title="Copy logs">
                         <Icon name="copy" size={11} />
                     </RButton>

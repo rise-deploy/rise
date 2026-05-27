@@ -93,6 +93,10 @@ fn default_loki_timeout_secs() -> u64 {
     10
 }
 
+fn default_kubernetes_max_tail_lines() -> i64 {
+    100_000
+}
+
 fn default_loki_project_label() -> String {
     "rise_project".to_string()
 }
@@ -122,11 +126,33 @@ impl Default for LokiLabels {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct KubernetesLogBackendSettings {
+    /// Upper bound on the number of lines the backend will ever request from
+    /// the kubelet in a single call. The frontend pages backward by widening
+    /// `tail_lines`; once `tail_lines + skip_recent` reaches this ceiling,
+    /// paging stops yielding new lines and the user sees "Start of selected
+    /// range" — the same outcome as when the kubelet's own ring buffer is
+    /// exhausted. Default: 100000.
+    #[serde(default = "default_kubernetes_max_tail_lines")]
+    pub max_tail_lines: i64,
+}
+
+impl Default for KubernetesLogBackendSettings {
+    fn default() -> Self {
+        Self {
+            max_tail_lines: default_kubernetes_max_tail_lines(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum DeploymentLogsSettings {
-    #[default]
-    Kubernetes,
+    Kubernetes {
+        #[serde(flatten)]
+        config: KubernetesLogBackendSettings,
+    },
     Loki {
         url: String,
         #[serde(default)]
@@ -143,6 +169,14 @@ pub enum DeploymentLogsSettings {
         #[serde(default)]
         labels: LokiLabels,
     },
+}
+
+impl Default for DeploymentLogsSettings {
+    fn default() -> Self {
+        Self::Kubernetes {
+            config: KubernetesLogBackendSettings::default(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, JsonSchema)]

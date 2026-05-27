@@ -545,6 +545,12 @@
       "oneOf": [
         {
           "properties": {
+            "max_tail_lines": {
+              "default": 100000,
+              "description": "Upper bound on the number of lines the backend will ever request from\nthe kubelet in a single call. The frontend pages backward by widening\n`tail_lines`; once `tail_lines + skip_recent` reaches this ceiling,\npaging stops yielding new lines and the user sees \"Start of selected\nrange\" — the same outcome as when the kubelet's own ring buffer is\nexhausted. Default: 100000.",
+              "format": "int64",
+              "type": "integer"
+            },
             "type": {
               "const": "kubernetes",
               "type": "string"
