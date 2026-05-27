@@ -2284,6 +2284,8 @@ pub struct LogStreamParams {
     /// Restrict to lines matching one of "info", "warn", "error". Anything
     /// else (or absent) returns all lines.
     pub level: Option<String>,
+    /// Case-insensitive substring filter applied to each line.
+    pub search: Option<String>,
 }
 
 /// Query parameters for log counts
@@ -2370,6 +2372,11 @@ pub async fn stream_deployment_logs(
     let follow = params.follow && followable;
 
     let level = crate::server::deployment::logs::LogLevelFilter::parse(params.level.as_deref());
+    let search = params
+        .search
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let log_stream = state
         .runtime_log_backend
         .stream_logs(
@@ -2383,6 +2390,7 @@ pub async fn stream_deployment_logs(
                 start_time,
                 end_time,
                 level,
+                search,
             },
         )
         .await

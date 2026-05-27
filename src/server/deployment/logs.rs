@@ -38,6 +38,9 @@ pub struct LogQuery {
     pub start_time: Option<DateTime<Utc>>,
     pub end_time: Option<DateTime<Utc>>,
     pub level: LogLevelFilter,
+    /// Optional case-insensitive substring users can type into the runtime
+    /// logs search box. Empty/whitespace means "no filter".
+    pub search: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -238,6 +241,7 @@ impl RuntimeLogBackend for KubernetesLogBackend {
 
         let mut log_stream = pod_api.log_stream(&pod_name, &log_params).await?;
         let level = query.level;
+        let search = query.search.clone();
         let stream = async_stream::stream! {
             let mut buffer = vec![0u8; 8192];
             loop {
@@ -247,6 +251,7 @@ impl RuntimeLogBackend for KubernetesLogBackend {
                         for line in String::from_utf8_lossy(&buffer[..n]).lines() {
                             if line.is_empty() { continue; }
                             if !line_matches_level(line, level) { continue; }
+                            if !line_matches_search(line, search.as_deref()) { continue; }
                             yield Ok(LogEvent::Line(line.to_string()));
                         }
                     }
@@ -337,9 +342,11 @@ impl LokiLogBackend {
         deployment: &Deployment,
         project: &Project,
         level: LogLevelFilter,
+        search: Option<&str>,
     ) -> String {
         let base = self.base_selector(deployment, project);
-        level_filtered_selector(&base, level)
+        let with_level = level_filtered_selector(&base, level);
+        append_search_filter(&with_level, search)
     }
 
     fn effective_start_time(&self, deployment: &Deployment, query: &LogQuery) -> DateTime<Utc> {
@@ -362,7 +369,7 @@ impl LokiLogBackend {
         project: &Project,
         query: &LogQuery,
     ) -> Result<Vec<LogLine>> {
-        let selector = self.selector(deployment, project, query.level);
+        let selector = self.selector(deployment, project, query.level, query.search.as_deref());
         let end = self.effective_end_time(query);
         let start = self.effective_start_time(deployment, query);
         let tail = if query.follow {
@@ -439,7 +446,7 @@ impl LokiLogBackend {
         query: LogQuery,
     ) -> Result<LogEventStream> {
         let initial = self.query_range(&deployment, &project, &query).await?;
-        let selector = self.selector(&deployment, &project, query.level);
+        let selector = self.selector(&deployment, &project, query.level, query.search.as_deref());
         let url = websocket_url(&self.tail_url, &selector);
         let tenant_id = self.tenant_id.clone();
         let bearer_token = self.bearer_token.clone();
@@ -826,6 +833,32 @@ fn level_filtered_selector(base: &str, level: LogLevelFilter) -> String {
         }
         LogLevelFilter::Info => format!("{base} !~ `{LEVEL_REGEX_INFO_EXCLUDE}`"),
     }
+}
+
+fn normalize_search(value: Option<&str>) -> Option<String> {
+    value
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+fn append_search_filter(selector: &str, search: Option<&str>) -> String {
+    let Some(text) = normalize_search(search) else {
+        return selector.to_string();
+    };
+    // Loki's `|~` accepts a regex. We escape user input so it behaves as a
+    // literal case-insensitive substring match.
+    let escaped = regex::escape(&text);
+    format!("{selector} |~ `(?i){escaped}`")
+}
+
+pub(crate) fn line_matches_search(line: &str, search: Option<&str>) -> bool {
+    let Some(text) = normalize_search(search) else {
+        return true;
+    };
+    let lower_line = line.to_lowercase();
+    let lower_text = text.to_lowercase();
+    lower_line.contains(&lower_text)
 }
 
 /// Match a raw log line against the same regex set used by the LogQL filters.

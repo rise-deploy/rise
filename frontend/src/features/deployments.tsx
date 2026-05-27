@@ -1138,6 +1138,8 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
     const [loadingMore, setLoadingMore] = useState(false);
     const [rangeDirty, setRangeDirty] = useState(false);
     const [expandedIds, setExpandedIds] = useState(() => new Set());
+    const [searchInput, setSearchInput] = useState('');
+    const [searchActive, setSearchActive] = useState('');
 
     const logBoxRef = useRef(null);
     const loadMoreRef = useRef(null);
@@ -1148,6 +1150,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
     const initialMountRef = useRef(true);
     const loadingMoreRef = useRef(false);
     const ignoreScrollRef = useRef(false);
+    const streamGenRef = useRef(0);
 
     const rangeWindow = useMemo(() => resolveLogWindow(rangeValue, customStart, customEnd), [rangeValue, customStart, customEnd]);
     const rangeLabel = useMemo(() => formatRangeLabel(rangeValue, rangeWindow), [rangeValue, rangeWindow]);
@@ -1215,7 +1218,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
     }, [deploymentId, projectName, rangeStepSeconds, rangeWindow]);
 
     // Cancellable SSE fetch. `onLine` receives raw (timestamped) lines.
-    const fetchLogFeed = useCallback(async ({ follow, start, end, tail, level, onLine, onStatus }) => {
+    const fetchLogFeed = useCallback(async ({ follow, start, end, tail, level, search, onLine, onStatus }) => {
         if (abortControllerRef.current) {
             abortControllerRef.current.abort();
             abortControllerRef.current = null;
@@ -1235,6 +1238,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
         if (start) params.set('start', start);
         if (end) params.set('end', end);
         if (level && level !== 'all') params.set('level', level);
+        if (search) params.set('search', search);
 
         const response = await fetch(
             `${baseUrl}/api/v1/projects/${projectName}/deployments/${deploymentId}/logs?${params.toString()}`,
@@ -1280,6 +1284,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                 end: rangeWindow.end.toISOString(),
                 tail: LOG_PAGE_SIZE,
                 level: levelFilter,
+                search: searchActive,
                 onLine: (line) => {
                     collected.push(parseLogLine(line, seqRef.current++));
                 },
@@ -1309,7 +1314,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                 abortControllerRef.current = null;
             }
         }
-    }, [fetchLogFeed, rangeWindow, levelFilter]);
+    }, [fetchLogFeed, rangeWindow, levelFilter, searchActive]);
 
     const loadOlder = useCallback(async () => {
         if (loadingMoreRef.current) return;
@@ -1329,6 +1334,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
             end: new Date(oldestMs).toISOString(),
         });
         if (levelFilter && levelFilter !== 'all') params.set('level', levelFilter);
+        if (searchActive) params.set('search', searchActive);
 
         try {
             const response = await fetch(
@@ -1367,9 +1373,10 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
             loadingMoreRef.current = false;
             setLoadingMore(false);
         }
-    }, [deploymentId, projectName, hasMore, rangeWindow, levelFilter]);
+    }, [deploymentId, projectName, hasMore, rangeWindow, levelFilter, searchActive]);
 
     const startStreaming = useCallback(async () => {
+        const gen = ++streamGenRef.current;
         setEntries([]);
         setExpandedIds(new Set());
         setError(null);
@@ -1384,7 +1391,9 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                 follow: true,
                 tail: 1,
                 level: levelFilter,
+                search: searchActive,
                 onLine: (line) => {
+                    if (streamGenRef.current !== gen) return;
                     const newEntry = parseLogLine(line, seqRef.current++);
                     setEntries((prev) => {
                         // Loki tail can deliver lines slightly out-of-order; keep
@@ -1405,6 +1414,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                     setHasMore(true);
                 },
                 onStatus: (payload) => {
+                    if (streamGenRef.current !== gen) return;
                     try {
                         setLogStatus(JSON.parse(payload));
                     } catch {
@@ -1415,14 +1425,17 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
         } catch (err) {
             if (err.name === 'AbortError') return;
             console.error('Failed to start log stream:', err);
-            setError(err.message);
+            if (streamGenRef.current === gen) setError(err.message);
         } finally {
-            if (abortControllerRef.current) {
+            // Only the most recent invocation may flip global stream state.
+            // Without this, a Refresh during streaming would see the previous
+            // call's `finally` block clobber `streaming` back to false.
+            if (streamGenRef.current === gen) {
                 abortControllerRef.current = null;
+                setStreaming(false);
             }
-            setStreaming(false);
         }
-    }, [fetchLogFeed, levelFilter]);
+    }, [fetchLogFeed, levelFilter, searchActive]);
 
     // Refresh the volume chart whenever the time range changes, independent
     // of whether the user has clicked Refresh / toggled streaming. A small
@@ -1459,7 +1472,13 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
             void loadHistoricalLogs();
         }
         return () => stopStreaming();
-    }, [deploymentId, deploymentStatus, levelFilter]);
+    }, [deploymentId, deploymentStatus, levelFilter, searchActive]);
+
+    // Debounce the search input so we don't reopen the SSE on every keystroke.
+    useEffect(() => {
+        const handle = window.setTimeout(() => setSearchActive(searchInput.trim()), 350);
+        return () => window.clearTimeout(handle);
+    }, [searchInput]);
 
     // Pin scroll to top when new entries arrive at the top and auto-scroll is on.
     useEffect(() => {
@@ -1495,15 +1514,6 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
     }, [hasMore, loadOlder, entries.length]);
 
     const isHistoricalUnavailable = countsStatus?.reason === 'historical_backend_not_configured';
-
-    const clearLogs = () => {
-        setEntries([]);
-        setExpandedIds(new Set());
-        setLogStatus(null);
-        setError(null);
-        setHasMore(false);
-        oldestLoadedMsRef.current = null;
-    };
 
     const handleRangeChange = (value) => {
         setRangeValue(value);
@@ -1596,6 +1606,17 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                         onChange={setLevelFilter}
                         capitalize
                     />
+                    <div className="r-logs-search">
+                        <Icon name="search" size={12} />
+                        <input
+                            type="search"
+                            placeholder="Search lines…"
+                            value={searchInput}
+                            onChange={(e) => setSearchInput(e.target.value)}
+                            className="r-field"
+                            aria-label="Search log lines"
+                        />
+                    </div>
                 </div>
                 <div className="r-logs-head-right">
                     <Segmented
@@ -1611,7 +1632,6 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                         />
                     )}
                     <RButton size="sm" onClick={handleRefresh}>Refresh</RButton>
-                    <RButton size="sm" onClick={clearLogs} disabled={entries.length === 0}>Clear</RButton>
                     <RButton size="sm" onClick={handleCopyLogs} disabled={entries.length === 0} title="Copy logs">
                         <Icon name="copy" size={11} />
                     </RButton>
@@ -1654,7 +1674,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                     {visibleEntries.length === 0 ? (
                         <div style={{ textAlign: 'center', padding: '32px 0', color: 'oklch(0.55 0.005 80)' }}>
                             {entries.length === 0
-                                ? (renderLogStatus() || (streaming ? 'Waiting for logs...' : 'No logs yet. Click "Refresh" or "Follow" to view.'))
+                                ? (renderLogStatus() || (streaming ? 'Waiting for logs…' : 'No logs in the selected range. Click Refresh to retry.'))
                                 : 'No log lines match this filter.'}
                         </div>
                     ) : (

@@ -1159,15 +1159,32 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
     display: inline-block;
 }
 .r-logs-row.is-expanded .r-logs-action {
-    position: static;
+    position: absolute;
+    top: 4px;
+    right: 4px;
     transform: none;
     display: inline-block;
-    margin-left: 12px;
-    top: auto;
+    margin-left: 0;
 }
 .r-logs-row .r-logs-action:hover {
     background: oklch(0.32 0.005 80);
     color: oklch(0.95 0.005 80);
+}
+.r-logs-search {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+}
+.r-logs-search > svg {
+    position: absolute;
+    left: 8px;
+    color: var(--text-soft);
+    pointer-events: none;
+}
+.r-logs-search input.r-field {
+    padding-left: 26px;
+    width: 200px;
+    font-size: 12px;
 }
 .r-logs-loader {
     padding: 8px 4px;
