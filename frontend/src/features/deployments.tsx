@@ -1728,6 +1728,9 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                             onChange={handleCustomRangeChange}
                         />
                     )}
+                    <span className="r-logs-count" aria-label="Loaded log lines">
+                        {entries.length.toLocaleString()} {entries.length === 1 ? 'line' : 'lines'}
+                    </span>
                     <RButton size="sm" onClick={handleRefresh}>Refresh</RButton>
                     <RButton size="sm" onClick={handleCopyLogs} disabled={entries.length === 0} title="Copy logs">
                         <Icon name="copy" size={11} />

@@ -498,6 +498,13 @@ a { color: inherit; }
 }
 .r-logs-level { width: 130px; }
 .r-logs-range { width: 150px; }
+.r-logs-count {
+    font-size: 11.5px;
+    color: var(--text-soft);
+    font-variant-numeric: tabular-nums;
+    padding: 0 4px;
+    user-select: none;
+}
 
 /* ---------- Inputs ---------- *
    All form fields share a single visual style: same border, padding, focus
