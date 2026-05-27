@@ -959,7 +959,7 @@ function ExpandedLogLine({ entry }) {
 }
 
 // Deployment Logs Component with SSE streaming + infinite scroll
-function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymentCompletedAt }) {
+function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymentCompletedAt, deploymentCreated }) {
     const streamable = STREAMABLE_LOG_STATUSES.has(deploymentStatus);
     const loggable = LOGGABLE_STATUSES.has(deploymentStatus);
     // For terminal deployments anchor preset ranges ("Last 6h") to the
@@ -1233,6 +1233,16 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
             return;
         }
 
+        // Cancel any in-flight pagination so a stale older-page response
+        // can't land after we wipe entries below and merge old-filter rows
+        // into the new window.
+        if (loadOlderAbortControllerRef.current) {
+            loadOlderAbortControllerRef.current.abort();
+            loadOlderAbortControllerRef.current = null;
+            loadingMoreRef.current = false;
+            setLoadingMore(false);
+        }
+
         setEntries([]);
         setExpandedIds(new Set());
         setError(null);
@@ -1390,6 +1400,15 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
 
     const startStreaming = useCallback(async () => {
         const gen = ++streamGenRef.current;
+        // Cancel any in-flight pagination — a stale older-page response that
+        // arrives after this resets the entry list would merge old-filter
+        // rows into the new window.
+        if (loadOlderAbortControllerRef.current) {
+            loadOlderAbortControllerRef.current.abort();
+            loadOlderAbortControllerRef.current = null;
+            loadingMoreRef.current = false;
+            setLoadingMore(false);
+        }
         setEntries([]);
         setExpandedIds(new Set());
         setError(null);
@@ -1520,7 +1539,18 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
         } else {
             void loadHistoricalLogs();
         }
-        return () => stopStreaming();
+        return () => {
+            stopStreaming();
+            // Abort any in-flight pagination tied to the previous filter/range;
+            // otherwise its delayed response would merge stale rows into the
+            // fresh list created by the next effect run.
+            if (loadOlderAbortControllerRef.current) {
+                loadOlderAbortControllerRef.current.abort();
+                loadOlderAbortControllerRef.current = null;
+                loadingMoreRef.current = false;
+                setLoadingMore(false);
+            }
+        };
     }, [deploymentId, deploymentStatus, levelFilter, searchActive, rangeValue, customStart, customEnd, selectedBucket]);
 
     // Debounce the search input so we don't reopen the SSE on every keystroke.
@@ -1601,11 +1631,16 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
         // in after page-load fall back inside the window.
         setRangeNowTick((t) => t + 1);
         if (streamable && rangeValue !== 'custom' && selectedBucket == null) {
+            // A live SSE on a preset range already delivers fresh lines; a
+            // restart here would wipe the user's paginated entries and reset
+            // scroll position every auto-refresh tick. Bumping rangeNowTick
+            // above is enough to slide the chart window forward.
+            if (streaming) return;
             void startStreaming();
         } else {
             void loadHistoricalLogs();
         }
-    }, [streamable, rangeValue, selectedBucket, startStreaming, loadHistoricalLogs]);
+    }, [streamable, streaming, rangeValue, selectedBucket, startStreaming, loadHistoricalLogs]);
 
     // Persist the auto-refresh interval so the user's choice survives reloads.
     useEffect(() => {
@@ -1734,6 +1769,15 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                                 start={customStart}
                                 end={customEnd}
                                 onChange={handleCustomRangeChange}
+                                // Don't allow picking dates outside the
+                                // deployment's lifetime: nothing before the
+                                // deployment was created could have logs, and
+                                // a future end-time would just truncate to
+                                // now anyway.
+                                disabled={[
+                                    ...(deploymentCreated ? [{ before: new Date(deploymentCreated) }] : []),
+                                    { after: new Date() },
+                                ]}
                             />
                         </Suspense>
                     )}
@@ -1826,7 +1870,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                     )}
                 </div>
                 {selectedBucket && (
-                    <div className="r-logs-bucket-banner">
+                    <div className="r-logs-bucket-banner" role="status">
                         <span>
                             Filtered to {formatHms(selectedBucket.startMs)}–{formatHms(selectedBucket.endMs)}
                         </span>
@@ -2811,6 +2855,7 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                         deploymentId={deploymentId}
                         deploymentStatus={deployment.status}
                         deploymentCompletedAt={deployment.completed_at}
+                        deploymentCreated={deployment.created}
                     />
                     <div className="r-stack">
                         {buildKv}

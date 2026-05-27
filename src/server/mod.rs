@@ -195,7 +195,6 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
     let public_routes = Router::new()
         .route("/health", axum::routing::get(health_check))
         .route("/version", axum::routing::get(version_info))
-        .route("/logs/capabilities", axum::routing::get(logs_capabilities))
         .route(
             "/schema/rise-toml/v1",
             axum::routing::get(rise_toml_schema_v1_redirect),
@@ -205,6 +204,7 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
 
     // Auth-only routes (require authentication but NOT platform access)
     let auth_only_routes = Router::new()
+        .route("/logs/capabilities", axum::routing::get(logs_capabilities))
         .merge(auth::routes::auth_only_routes())
         // Apply auth middleware only
         .route_layer(axum_middleware::from_fn_with_state(
@@ -401,6 +401,7 @@ async fn logs_capabilities(
         backend: backend.backend_kind(),
         levels: backend.levels(),
         supports_volume: backend.supports_volume(),
+        max_tail: backend.max_tail(),
     })
 }
 

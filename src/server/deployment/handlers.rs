@@ -2386,6 +2386,7 @@ pub async fn stream_deployment_logs(
         .or(Some(if params.follow && followable { 1 } else { 1000 }));
     let follow = params.follow && followable;
 
+    validate_log_levels(&params.level, state.runtime_log_backend.levels())?;
     let levels = params.level.clone();
     let search = params
         .search
@@ -2533,12 +2534,27 @@ pub async fn query_deployment_log_volume(
         ));
     }
 
+    validate_log_levels(&params.level, state.runtime_log_backend.levels())?;
     let levels = params.level.clone();
     let search = params
         .search
         .as_ref()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+
+    // Cap step + bucket count so a caller can't coerce `build_count_buckets`
+    // into emitting an arbitrarily long array. 86_400 = 1d (max meaningful
+    // bucket); 10_000 buckets keeps the volume response bounded regardless
+    // of the time range the caller picks.
+    let step_seconds = params.step_seconds.clamp(1, 86_400);
+    let range_secs = (end_time - start_time).num_seconds().max(0);
+    if range_secs / step_seconds > 10_000 {
+        return Err(ServerError::bad_request(
+            "Time range and step_seconds produce too many buckets (max 10000). \
+             Widen step_seconds or pick a shorter range.",
+        ));
+    }
+
     let volume = state
         .runtime_log_backend
         .query_volume(
@@ -2547,7 +2563,7 @@ pub async fn query_deployment_log_volume(
             crate::server::deployment::logs::LogVolumeQuery {
                 start_time,
                 end_time,
-                step_seconds: params.step_seconds.max(1),
+                step_seconds,
                 levels,
                 search,
             },
@@ -2566,6 +2582,24 @@ pub async fn query_deployment_log_volume(
         })?;
 
     Ok(Json(volume))
+}
+
+/// Validate caller-supplied `?level=` values against the configured backend's
+/// advertised level set. Returns a 400 with the accepted values as suggestions
+/// when an unknown level is passed so typos like `warning` (vs `warn`) surface
+/// loudly instead of silently returning empty results. An empty `levels` list
+/// means "no filter" and is accepted.
+fn validate_log_levels(levels: &[String], allowed: &[&'static str]) -> Result<(), ServerError> {
+    for level in levels {
+        if !allowed.iter().any(|a| a.eq_ignore_ascii_case(level)) {
+            return Err(ServerError::bad_request(format!(
+                "Unknown log level '{}'. See /api/v1/logs/capabilities for accepted values.",
+                level
+            ))
+            .with_suggestions(Some(allowed.iter().map(|s| (*s).to_string()).collect())));
+        }
+    }
+    Ok(())
 }
 
 fn parse_log_time(

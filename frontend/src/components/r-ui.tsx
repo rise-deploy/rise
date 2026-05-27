@@ -744,6 +744,7 @@ export function Combobox(props: ComboboxProps) {
                         id={listboxId}
                         className="r-cbox-pop"
                         role="listbox"
+                        aria-multiselectable={isMulti || undefined}
                         style={{ position: 'fixed', top: popRect.top, left: popRect.left, width: popRect.width }}
                     >
                         <div className="r-cbox-search">

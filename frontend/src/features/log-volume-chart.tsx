@@ -123,6 +123,8 @@ export default function LogVolumeChart({ counts, levels, loading, error, status,
         }
     };
 
+    const chartAriaLabel = `Log volume chart: ${totalSum.toLocaleString()} log lines across ${data.length} buckets, stacked by level`;
+
     return (
         <div className="rounded border border-[var(--border)] bg-[var(--panel)] px-2 py-1">
             {loading ? (
@@ -132,6 +134,7 @@ export default function LogVolumeChart({ counts, levels, loading, error, status,
             ) : !data.length || totalSum === 0 ? (
                 <div className="py-6 text-center text-xs text-[var(--text-soft)]">{statusMessage()}</div>
             ) : (
+                <div role="img" aria-label={chartAriaLabel}>
                 <ResponsiveContainer width="100%" height={96}>
                     <BarChart
                         data={data}
@@ -159,7 +162,7 @@ export default function LogVolumeChart({ counts, levels, loading, error, status,
                         />
                         <RechartsTooltip
                             content={<LogChartTooltip stepSeconds={stepSeconds} levels={stackLevels} />}
-                            cursor={{ fill: 'oklch(0.22 0.005 80 / 0.45)' }}
+                            cursor={{ fill: 'var(--r-logs-chart-cursor)' }}
                         />
                         {stackLevels.map((level) => (
                             <Bar
@@ -170,9 +173,12 @@ export default function LogVolumeChart({ counts, levels, loading, error, status,
                                 onClick={handleBucketClick}
                                 style={{ cursor: 'pointer' }}
                             >
-                                {data.map((d) => (
+                                {data.map((d, i) => (
+                                    // Bucket index is the stable key — guards
+                                    // against duplicate `ts` values from edge
+                                    // cases (e.g. step transitions).
                                     <Cell
-                                        key={`${level}-${d.ts}`}
+                                        key={`${level}-${i}`}
                                         fill={levelColor(level)}
                                         fillOpacity={selectedBucketTs == null || selectedBucketTs === d.ts ? 1 : 0.3}
                                     />
@@ -181,6 +187,7 @@ export default function LogVolumeChart({ counts, levels, loading, error, status,
                         ))}
                     </BarChart>
                 </ResponsiveContainer>
+                </div>
             )}
         </div>
     );

@@ -50,9 +50,29 @@ class RiseAPI {
     }
 
     // Server capabilities for the configured runtime log backend. Drives the
-    // level filter options + chart palette on the deployment logs page.
+    // level filter options + chart palette on the deployment logs page. The
+    // call sites carry `// @ts-nocheck`, so a defensive shape check here is
+    // the only thing standing between a backend schema change and a silently
+    // broken UI — warn and return a conservative default if either field is
+    // off-type.
     async getLogsCapabilities() {
-        return this.request('/logs/capabilities');
+        const safeDefault = { levels: [], supports_volume: false };
+        let payload;
+        try {
+            payload = await this.request('/logs/capabilities');
+        } catch (err) {
+            console.warn('getLogsCapabilities request failed; using safe default:', err);
+            return safeDefault;
+        }
+        if (!payload || typeof payload !== 'object') {
+            console.warn('getLogsCapabilities returned non-object payload; using safe default:', payload);
+            return safeDefault;
+        }
+        if (!Array.isArray(payload.levels) || typeof payload.supports_volume !== 'boolean') {
+            console.warn('getLogsCapabilities shape unexpected; using safe default:', payload);
+            return { ...safeDefault, ...payload, levels: [], supports_volume: false };
+        }
+        return payload;
     }
 
     async lookupUsers(emails) {

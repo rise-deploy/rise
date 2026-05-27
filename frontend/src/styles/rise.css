@@ -51,6 +51,9 @@
     --r-log-chart-debug: oklch(0.65 0.02 230);
     --r-log-chart-trace: oklch(0.70 0.02 230);
     --r-log-chart-unknown: oklch(0.72 0.005 80);
+    /* Recharts cursor (the hover highlight rectangle behind the active bar).
+       Themed so it doesn't look hard-coded-dark on light mode. */
+    --r-logs-chart-cursor: oklch(0.80 0.005 80 / 0.45);
 }
 
 .dark {
@@ -94,6 +97,7 @@
     --r-log-chart-debug: oklch(0.55 0.04 230);
     --r-log-chart-trace: oklch(0.62 0.04 230);
     --r-log-chart-unknown: oklch(0.50 0.005 80);
+    --r-logs-chart-cursor: oklch(0.22 0.005 80 / 0.45);
 }
 
 /* Palette: shifts the accent plus a subtle tint of the light-mode
@@ -1321,8 +1325,9 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
 }
 /* Recharts' tooltip-wrapper sometimes settles below opacity:1 during the
    show/hide animation; force it solid so our tooltip background is the
-   final word on visibility. */
-.recharts-tooltip-wrapper { opacity: 1 !important; }
+   final word on visibility. Scoped to the log-volume chart so it doesn't
+   override Recharts opacity behaviour for any future charts on the page. */
+.r-logs-chart .recharts-tooltip-wrapper { opacity: 1 !important; }
 .r-logs-chart-tip-title {
     font-weight: 600;
     margin-bottom: 6px;
@@ -1431,10 +1436,8 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
     font-variant-numeric: tabular-nums;
 }
 .r-date-range-popover {
-    position: absolute;
-    top: calc(100% + 6px);
-    left: 50%;
-    transform: translateX(-50%);
+    /* Inline `position`/`top`/`left` are set by JS via createPortal so the
+       popover escapes any ancestor overflow:hidden. */
     z-index: 60;
     background: var(--surface);
     border: 1px solid var(--border);

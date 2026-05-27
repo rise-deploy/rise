@@ -225,8 +225,32 @@ jobs:
           HELM_REPOSITORY_CACHE: ${{ runner.temp }}/helm-cache
         run: |
           set -euo pipefail
-          helm repo add rise-grafana https://grafana.github.io/helm-charts
+          helm repo add grafana https://grafana.github.io/helm-charts
           helm dependency build helm/rise
+          # Helm v4's Chart.lock only stores one aggregate digest over the
+          # dependencies block, not per-tarball bytes — `helm dependency
+          # build` would re-use a corrupted-but-correctly-named tarball
+          # already in helm/rise/charts/. Pin the bytes explicitly against
+          # helm/rise/charts.sha256.
+          if [ ! -f helm/rise/charts.sha256 ]; then
+            echo "ERROR: helm/rise/charts.sha256 is missing; cannot verify vendored tarballs." >&2
+            exit 1
+          fi
+          ( cd helm/rise/charts && shasum -a 256 -c ../charts.sha256 ) || {
+            echo "ERROR: vendored chart tarball digest mismatch against helm/rise/charts.sha256." >&2
+            echo "Either the tarball was tampered with, or the upstream chart was re-released." >&2
+            echo "If legitimate, regenerate the manifest:" >&2
+            echo "  (cd helm/rise/charts && shasum -a 256 *.tgz) > helm/rise/charts.sha256" >&2
+            exit 1
+          }
+          # Also check there are no extra/unexpected tarballs in charts/.
+          expected="$(awk '!/^#/ && NF>=2 {print $2}' helm/rise/charts.sha256 | sort)"
+          actual="$(cd helm/rise/charts && ls *.tgz 2>/dev/null | sort)"
+          if [ "${expected}" != "${actual}" ]; then
+            echo "ERROR: helm/rise/charts/ tarballs do not match helm/rise/charts.sha256 manifest." >&2
+            diff <(printf '%s\n' "${expected}") <(printf '%s\n' "${actual}") || true
+            exit 1
+          fi
           git diff --exit-code -- helm/rise/Chart.lock helm/rise/charts
 
       - name: Set up chart-testing

@@ -304,6 +304,13 @@ if [[ "${deployment_list}" != *"Healthy"* ]]; then
   exit 1
 fi
 
+# Give Alloy a small window to scrape kube-probe traffic before we tear the
+# pod down. Without this, the pod can disappear between Alloy poll cycles
+# and the post-removal /logs/volume assertion below flakes with total=0.
+# kube-probe pings produce reliable kubernetes-emitted log lines, so 5s
+# is comfortably above Alloy's default discovery/scrape interval.
+sleep 5
+
 echo "Smoke test: Loki retains deployment logs after the pod is gone"
 
 deployment_id="$(curl -sS -H "Authorization: Bearer ${RISE_TOKEN}" \

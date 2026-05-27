@@ -20,6 +20,10 @@ pub const LOKI_LEVELS: &[&str] = &[
 /// emit. Each line lands in exactly one of these.
 pub const KUBERNETES_LEVELS: &[&str] = &["info", "warn", "error"];
 
+/// Server-side cap on `?tail=` passed to Loki's `query_range`. Advertised via
+/// `LogsCapabilities::max_tail` so the frontend can mirror the limit.
+pub const LOKI_MAX_TAIL: i64 = 5000;
+
 #[derive(Debug, Clone, Default)]
 pub struct LogQuery {
     pub follow: bool,
@@ -132,6 +136,12 @@ pub struct LogsCapabilities {
     pub backend: &'static str,
     pub levels: &'static [&'static str],
     pub supports_volume: bool,
+    /// Server-side cap on `?tail=` for this backend, if any. Lets the frontend
+    /// surface the ceiling instead of silently truncating the requested count.
+    /// `None` means "no explicit advertised cap" (Kubernetes derives its cap
+    /// from per-backend config rather than a global constant).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tail: Option<i64>,
 }
 
 #[async_trait]
@@ -150,6 +160,14 @@ pub trait RuntimeLogBackend: Send + Sync {
     /// Kubernetes backend has no historical store, so this is `false` and
     /// the chart panel is hidden.
     fn supports_volume(&self) -> bool;
+
+    /// Optional advertised cap on `tail` (lines) accepted by this backend.
+    /// Returned via `/api/v1/logs/capabilities` so the frontend can constrain
+    /// its UI rather than letting the server silently clamp the request.
+    /// Default `None` = no advertised cap.
+    fn max_tail(&self) -> Option<i64> {
+        None
+    }
 
     async fn stream_logs(
         &self,
@@ -188,6 +206,9 @@ pub async fn init_runtime_log_backend(
         } => {
             validate_loki_label_name("project", &labels.project)?;
             validate_loki_label_name("deployment_id", &labels.deployment_id)?;
+            if let Some(tenant) = tenant_id.as_deref() {
+                validate_header_value("tenant_id", tenant)?;
+            }
             let bearer_token = bearer_token_env
                 .as_ref()
                 .map(|name| {
@@ -195,6 +216,9 @@ pub async fn init_runtime_log_backend(
                         .with_context(|| format!("Loki bearer_token_env '{}' is not set", name))
                 })
                 .transpose()?;
+            if let Some(token) = bearer_token.as_deref() {
+                validate_header_value("bearer_token", token)?;
+            }
             Ok(Arc::new(LokiLogBackend::new(
                 url.clone(),
                 tenant_id.clone(),
@@ -323,6 +347,19 @@ impl RuntimeLogBackend for KubernetesLogBackend {
             let delta = (Utc::now() - start_time).num_seconds();
             if delta > 0 {
                 log_params.since_seconds = Some(delta);
+            } else {
+                // Future-dated start_time: any kubelet response would predate
+                // the requested window. Return an explicit empty result rather
+                // than silently falling back to "all lines since container
+                // start" (which would dump the entire log buffer).
+                return Ok(status_stream(LogStatus {
+                    reason: LogStatusReason::NoLogsFound,
+                    message: Some(
+                        "Requested start time is in the future; no log lines fall in the range."
+                            .into(),
+                    ),
+                    retention_hint: None,
+                }));
             }
         }
 
@@ -486,7 +523,7 @@ impl LokiLogBackend {
         } else {
             query.tail_lines.unwrap_or(1000)
         };
-        let tail = tail.clamp(1, 5000);
+        let tail = tail.clamp(1, LOKI_MAX_TAIL);
 
         let url = format!(
             "{}?query={}&direction=BACKWARD&start={}&end={}&limit={}",
@@ -653,6 +690,13 @@ impl LokiLogBackend {
                     }
                 }
             }
+            // Symmetric shutdown: tell Loki we're done before dropping `write`
+            // so the server-side handler can release its end of the connection
+            // cleanly. Ignore the result — we're already exiting and Loki may
+            // have closed first.
+            let _ = write
+                .send(tokio_tungstenite::tungstenite::Message::Close(None))
+                .await;
         };
 
         Ok(stream.boxed())
@@ -798,6 +842,10 @@ impl RuntimeLogBackend for LokiLogBackend {
 
     fn supports_volume(&self) -> bool {
         true
+    }
+
+    fn max_tail(&self) -> Option<i64> {
+        Some(LOKI_MAX_TAIL)
     }
 
     async fn stream_logs(
@@ -1229,6 +1277,24 @@ fn truncate_for_error(s: String) -> String {
 
 /// Reject Loki/Prometheus label names that wouldn't be valid identifiers.
 /// Prevents an operator-supplied override from producing malformed LogQL.
+/// Validate a value that will be emitted as a (case-insensitive) HTTP header.
+/// `reqwest::header::HeaderValue::from_str` rejects control bytes and non-ASCII
+/// characters; doing the same check at backend init means an invalid Loki
+/// `tenant_id` or bearer token surfaces as a startup error instead of a per-
+/// request WS connect failure on every log stream.
+fn validate_header_value(role: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("Loki '{}' header value must not be empty", role);
+    }
+    if !value.bytes().all(|b| b == b'\t' || (32..=126).contains(&b)) {
+        anyhow::bail!(
+            "Loki '{}' header value contains control or non-ASCII characters",
+            role
+        );
+    }
+    Ok(())
+}
+
 fn validate_loki_label_name(role: &str, name: &str) -> Result<()> {
     let mut chars = name.chars();
     let valid = match chars.next() {
