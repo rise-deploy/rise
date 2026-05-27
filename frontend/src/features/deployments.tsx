@@ -1470,8 +1470,6 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
         return () => observer.disconnect();
     }, [hasMore, loadOlder]);
 
-    const isHistoricalUnavailable = countsStatus?.reason === 'historical_backend_not_configured';
-
     const handleRangeChange = (value) => {
         setRangeValue(value);
         if (selectedBucket) setSelectedBucket(null);
@@ -1709,11 +1707,6 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                         </Suspense>
                     )}
                 </div>
-                {isHistoricalUnavailable && (
-                    <div className="text-xs text-[var(--text-soft)]">
-                        Historical volume charts are not available for this log backend.
-                    </div>
-                )}
                 {selectedBucket && (
                     <div className="r-logs-bucket-banner">
                         <span>
