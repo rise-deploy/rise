@@ -47,6 +47,11 @@ pub struct LogQuery {
     /// already displayed. The Loki backend ignores this and uses its
     /// timestamp-windowed pagination instead.
     pub skip_recent: Option<i64>,
+    /// Per-Organization namespace prefix resolved by the caller (see
+    /// `resolve_project_namespace_prefix`). Used by the Kubernetes backend
+    /// to compute the Pod namespace; the Loki backend ignores this and
+    /// scopes its query by stream labels instead.
+    pub namespace_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -132,17 +137,11 @@ pub trait RuntimeLogBackend: Send + Sync {
 pub async fn init_runtime_log_backend(
     settings: &DeploymentLogsSettings,
     kube_client: Option<kube::Client>,
-    resource_builder: Option<Arc<ResourceBuilder>>,
 ) -> Result<Arc<dyn RuntimeLogBackend>> {
     match settings {
         DeploymentLogsSettings::Kubernetes => {
             let kube_client = kube_client.context("Kubernetes log backend requires kube client")?;
-            let resource_builder =
-                resource_builder.context("Kubernetes log backend requires resource builder")?;
-            Ok(Arc::new(KubernetesLogBackend {
-                kube_client,
-                resource_builder,
-            }))
+            Ok(Arc::new(KubernetesLogBackend { kube_client }))
         }
         DeploymentLogsSettings::Loki {
             url,
@@ -175,7 +174,6 @@ pub async fn init_runtime_log_backend(
 
 struct KubernetesLogBackend {
     kube_client: kube::Client,
-    resource_builder: Arc<ResourceBuilder>,
 }
 
 pub(crate) fn is_followable_status(status: &DeploymentStatus) -> bool {
@@ -216,7 +214,11 @@ impl RuntimeLogBackend for KubernetesLogBackend {
             }));
         }
 
-        let namespace = self.resource_builder.namespace_name(project);
+        let namespace_prefix = query
+            .namespace_prefix
+            .as_deref()
+            .context("Kubernetes log backend requires the project's namespace_prefix")?;
+        let namespace = ResourceBuilder::namespace_name(project, namespace_prefix);
         let pod_api: Api<Pod> = Api::namespaced(self.kube_client.clone(), &namespace);
         let pods = pod_api
             .list(&ListParams::default().labels(&format!(

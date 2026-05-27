@@ -2387,6 +2387,19 @@ pub async fn stream_deployment_logs(
         .as_ref()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    // Resolve the project's Org-scoped namespace prefix; the backend doesn't
+    // have access to `AppState`'s cache, so the caller threads the prefix in
+    // via LogQuery (same pattern as the Metacontroller webhook). Only the
+    // Kubernetes log backend uses it; Loki ignores it.
+    let org_uid =
+        crate::server::deployment::webhook::resolve_project_organization_uid(&state, &project)
+            .await
+            .internal_err("Failed to resolve project organization linkage")?;
+    let namespace_prefix = crate::server::deployment::webhook::resolve_project_namespace_prefix(
+        &state, &project, org_uid,
+    )
+    .await
+    .internal_err("Failed to resolve project namespace prefix")?;
     let log_stream = state
         .runtime_log_backend
         .stream_logs(
@@ -2402,6 +2415,7 @@ pub async fn stream_deployment_logs(
                 level,
                 search,
                 skip_recent: params.skip_recent.filter(|n| *n > 0),
+                namespace_prefix: Some(namespace_prefix),
             },
         )
         .await

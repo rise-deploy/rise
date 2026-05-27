@@ -18,6 +18,13 @@ server:
 database:
   url: "${DATABASE_URL}"
 
+# Default Organization bootstrapped on startup. Setting
+# `kubernetes_namespace_prefix: "rise-"` explicitly so dev namespaces keep
+# the historic `rise-{project}` naming; otherwise the controller would fall
+# back to `org-{discriminator}-{project}` and orphan any existing namespaces.
+default_organization:
+  kubernetes_namespace_prefix: "rise-"
+
 encryption:
   type: "aes-gcm-256"
   key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" # Generate with: openssl rand -base64 32
@@ -86,12 +93,16 @@ deployment_controller:
   type: "kubernetes"
   pod_security_enabled: false
   metacontroller_webhook_port: 3001
+  # Must match `metacontroller.controllerClass` in the helm chart; otherwise
+  # RiseProject CR labels and the CompositeController labelSelector drift and
+  # Metacontroller stops reconciling. Default value of the field is the same,
+  # set here explicitly so the alignment is visible.
+  controller_class_name: "default"
   # metacontroller_pod_namespace is intentionally absent in development:
   # Rise runs on the host (outside the cluster), so source-IP validation is skipped.
   production_ingress_url_template: "{project_name}.rise.local"
   staging_ingress_url_template: "{deployment_group}--{project_name}.preview.rise.local"
   environment_ingress_url_template: "{environment}--{project_name}.env.rise.local"
-  namespace_format: "rise-{project_name}"
   auth_backend_url: "${RISE_AUTH_BACKEND_URL:-http://host.minikube.internal:3000}" # URL for Nginx auth subrequests, must be reachable from ingress-nginx pods
   auth_signin_url: "http://rise.local:3000" # Domain for user-facing OAuth redirects, must be resolvable by users' browsers
   ingress_annotations:

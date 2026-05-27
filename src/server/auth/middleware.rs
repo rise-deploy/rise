@@ -158,15 +158,22 @@ pub async fn auth_middleware(
         let groups = claims.groups.clone();
         req.extensions_mut().insert(groups);
 
-        let user = users::find_or_create(&state.db_pool, email)
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to find/create user: {:#}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Database error".to_string(),
-                )
-            })?;
+        // CRITICAL: user creation and default-Organization membership must
+        // happen in a single transaction so bootstrap's validation pass
+        // never sees a user row without a membership.
+        let user = users::find_or_create_with_default_organization(
+            &state.db_pool,
+            email,
+            state.default_organization_uid,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to find/create user: {:#}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Database error".to_string(),
+            )
+        })?;
 
         tracing::debug!("User authenticated: {} ({})", user.email, user.id);
         req.extensions_mut().insert(user);
@@ -259,7 +266,14 @@ pub async fn optional_auth_middleware(
                                 state.jwt_signer.verify_user_jwt(&token, &state.public_url)
                             {
                                 let email = &rise_claims.email;
-                                if let Ok(user) = users::find_or_create(&state.db_pool, email).await
+                                // Mirror the strict auth path: never create a user
+                                // row without the matching default-Org membership.
+                                if let Ok(user) = users::find_or_create_with_default_organization(
+                                    &state.db_pool,
+                                    email,
+                                    state.default_organization_uid,
+                                )
+                                .await
                                 {
                                     req.extensions_mut().insert(user);
                                 }

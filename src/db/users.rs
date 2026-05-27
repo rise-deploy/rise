@@ -43,13 +43,23 @@ pub async fn find_by_id(
     Ok(user)
 }
 
-/// Create a new user
+/// Create a new user.
+///
+/// Used directly by tests; production code paths must go through
+/// [`find_or_create_with_default_organization`] so the user is stamped with
+/// a default-Organization membership in the same transaction.
+///
+/// Idempotent on the unique `email` constraint: concurrent inserts of the
+/// same email return the existing row instead of erroring, so the
+/// `find_by_email`-then-`create` pattern in `find_or_create*` is race-safe.
+#[allow(dead_code)]
 pub async fn create(pool: &PgPool, email: &str) -> Result<User> {
     let user = sqlx::query_as!(
         User,
         r#"
         INSERT INTO users (email)
         VALUES ($1)
+        ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
         RETURNING id, email, created_at, updated_at
         "#,
         email
@@ -61,7 +71,13 @@ pub async fn create(pool: &PgPool, email: &str) -> Result<User> {
     Ok(user)
 }
 
-/// Find user by email, or create if not exists
+/// Find user by email, or create if not exists.
+///
+/// Prefer [`find_or_create_with_default_organization`] for callers that have
+/// access to the default Organization UID: this version does not stamp the
+/// default-Organization membership, which means the new user row is in an
+/// inconsistent state until the next bootstrap or backfill pass.
+#[allow(dead_code)]
 pub async fn find_or_create(pool: &PgPool, email: &str) -> Result<User> {
     // Try to find existing user first
     if let Some(user) = find_by_email(pool, email).await? {
@@ -70,6 +86,30 @@ pub async fn find_or_create(pool: &PgPool, email: &str) -> Result<User> {
 
     // User doesn't exist, create new one
     create(pool, email).await
+}
+
+/// Idempotent find-or-create that runs the user insert AND the
+/// default-Organization membership insert inside a single transaction.
+///
+/// The auth middleware must call this rather than [`find_or_create`] so a
+/// user row never exists without the corresponding default-Organization
+/// membership: bootstrap validation refuses to start the server in that
+/// state.
+pub async fn find_or_create_with_default_organization(
+    pool: &PgPool,
+    email: &str,
+    default_organization_uid: Uuid,
+) -> Result<User> {
+    let mut tx = pool.begin().await.context("Failed to start transaction")?;
+    let user = find_or_create_with_executor(&mut tx, email).await?;
+    crate::db::organization_links::ensure_user_membership(
+        &mut tx,
+        user.id,
+        default_organization_uid,
+    )
+    .await?;
+    tx.commit().await.context("Failed to commit transaction")?;
+    Ok(user)
 }
 
 /// Find user by email, or create if not exists (using a mutable connection for transactions)

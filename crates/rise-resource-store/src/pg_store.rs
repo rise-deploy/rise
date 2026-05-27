@@ -631,6 +631,46 @@ impl ResourceStore for PgResourceStore {
         })
     }
 
+    async fn rename(&self, uid: Uuid, new_name: &str) -> Result<ResourceRow, StoreError> {
+        // Refuse to rename ResourceDefinitions: their name is structural
+        // (`{plural}.{group}`) and the projection table would desync.
+        let kind: Option<String> =
+            sqlx::query_scalar("SELECT kind FROM resource_store.resources WHERE uid = $1")
+                .bind(uid)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some(kind) = kind else {
+            return Err(StoreError::NotFound);
+        };
+        if kind == RESOURCE_DEFINITION_KIND {
+            return Err(StoreError::Validation(
+                "ResourceDefinitions cannot be renamed".to_string(),
+            ));
+        }
+
+        let updated = sqlx::query_as::<_, ResourceRow>(
+            r#"
+            UPDATE resource_store.resources
+            SET name       = $1,
+                revision   = revision + 1,
+                updated_at = NOW()
+            WHERE uid = $2
+            RETURNING *
+            "#,
+        )
+        .bind(new_name)
+        .bind(uid)
+        .fetch_optional(&self.pool)
+        .await;
+
+        match updated {
+            Ok(Some(row)) => Ok(row),
+            Ok(None) => Err(StoreError::NotFound),
+            Err(ref e) if Self::is_name_conflict(e) => Err(StoreError::NameConflict),
+            Err(e) => Err(StoreError::Database(e)),
+        }
+    }
+
     async fn delete(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError> {
         let mut tx = self.pool.begin().await?;
 

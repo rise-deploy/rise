@@ -1,4 +1,6 @@
 pub mod auth;
+#[cfg(feature = "backend")]
+pub mod bootstrap;
 pub mod custom_domains;
 pub mod deployment;
 #[cfg(feature = "backend")]
@@ -107,10 +109,18 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         encryption_provider: state.encryption_provider.clone(),
     };
 
-    // Backfill missing RiseProject CRDs (upgrade migration + recovery)
+    // Reconcile RiseProject CRDs (upgrade migration, recovery, and label
+    // backfill — see `backfill_rise_projects` doc for the full set of
+    // scenarios).
     #[cfg(feature = "backend")]
     if let Some(ref kube_client) = state.kube_client {
-        if let Err(e) = deployment::crd::backfill_rise_projects(kube_client, &state.db_pool).await {
+        if let Err(e) = deployment::crd::backfill_rise_projects(
+            kube_client,
+            &state.db_pool,
+            state.deployment_controller_class_name.as_deref(),
+        )
+        .await
+        {
             tracing::warn!("Failed to backfill RiseProject CRDs: {:?}", e);
         }
     }
@@ -173,8 +183,10 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         info!("Starting Entra ID active sync");
         let pool = state.db_pool.clone();
         let auth_settings = settings.auth.clone();
+        let default_organization_uid = state.default_organization_uid;
         let handle = tokio::spawn(async move {
-            auth::entra_sync::run_entra_sync_loop(pool, auth_settings).await;
+            auth::entra_sync::run_entra_sync_loop(pool, auth_settings, default_organization_uid)
+                .await;
         });
         controller_handles.push(handle);
     }

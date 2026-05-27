@@ -168,7 +168,36 @@ pub async fn handle_sync(
 
     match process_sync(&state, &project_name, &request.children).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
-        Err(e) => {
+        Err(SyncError::WrongController {
+            project,
+            configured,
+            org_class,
+        }) => {
+            // Expected steady state: the project belongs to a different
+            // deployment controller. The CompositeController `labelSelector`
+            // should already filter most of these out — log at warn (not
+            // error) so the operator sees one if the label and the
+            // Organization linkage have drifted. 4xx prevents Metacontroller
+            // from applying the empty children list (no GC).
+            warn!(
+                project = %project,
+                configured = %configured,
+                org_class = ?org_class,
+                "Refusing to reconcile — project Organization's deploymentControllerClass does not match"
+            );
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "controller-class mismatch",
+                    "project": project,
+                    "configured": configured,
+                    "org_class": org_class,
+                    "lastSyncTime": Utc::now().to_rfc3339(),
+                })),
+            )
+                .into_response()
+        }
+        Err(SyncError::Internal(e)) => {
             error!(project = %project_name, "Sync webhook error: {:?}", e);
             // Return 500 so Metacontroller treats this as a failed sync and does NOT
             // apply the (empty) children list, which would garbage-collect all resources.
@@ -188,7 +217,7 @@ async fn process_sync(
     state: &AppState,
     project_name: &str,
     observed: &ObservedChildren,
-) -> anyhow::Result<SyncResponse> {
+) -> Result<SyncResponse, SyncError> {
     // 1. Load project from DB
     let project = match db_projects::find_by_name(&state.db_pool, project_name).await? {
         Some(p) => p,
@@ -211,6 +240,28 @@ async fn process_sync(
         }
     };
 
+    // 1b. Resolve the project's Organization UID once and thread it
+    // through the controller-class check and the namespace-prefix
+    // lookup. Both of those used to re-read `project_organizations`
+    // independently — one DB hit per sync now serves both.
+    let org_uid = resolve_project_organization_uid(state, &project).await?;
+
+    // 1c. Verify the project's Organization is assigned to this controller.
+    //
+    // The Kubernetes controller filters strictly by the configured
+    // `controller_class_name`. Projects whose Organization carries a
+    // different (or unset) `spec.deploymentControllerClass` belong to a
+    // different controller — return `SyncError::WrongController` so the
+    // handler answers 400 (not 200 with empty children, which would let
+    // Metacontroller GC resources owned by another controller).
+    enforce_controller_class(state, &project, org_uid).await?;
+
+    // 1d. Resolve the project's Org-scoped namespace prefix once. Every
+    // helper below that names a namespace borrows this string, so the
+    // miss-loader runs at most once per sync (the cache hits the second
+    // and subsequent times within the 30s TTL).
+    let namespace_prefix = resolve_project_namespace_prefix(state, &project, org_uid).await?;
+
     // 2. Load non-terminal deployments for this project (avoids loading full history)
     let non_terminal_deployments =
         db_deployments::list_non_terminal_for_project(&state.db_pool, project.id).await?;
@@ -218,7 +269,7 @@ async fn process_sync(
     let non_terminal: Vec<&Deployment> = non_terminal_deployments.iter().collect();
 
     // 3. Perform status transitions based on observed K8s state
-    perform_status_transitions(state, &project, &non_terminal, observed).await?;
+    perform_status_transitions(state, &project, &non_terminal, observed, &namespace_prefix).await?;
 
     // 4. Re-load non-terminal deployments since statuses may have changed
     let all_deployments =
@@ -243,7 +294,9 @@ async fn process_sync(
     let resource_builder = match &state.resource_builder {
         Some(rb) => rb,
         None => {
-            anyhow::bail!("No resource builder configured — cannot compute desired children");
+            return Err(SyncError::Internal(anyhow::anyhow!(
+                "No resource builder configured — cannot compute desired children"
+            )));
         }
     };
 
@@ -254,6 +307,7 @@ async fn process_sync(
         &project,
         &all_deployments,
         observed,
+        &namespace_prefix,
     )
     .await?;
 
@@ -266,6 +320,175 @@ async fn process_sync(
     })
 }
 
+/// Errors that bubble out of [`process_sync`]. `WrongController` is a
+/// steady-state expected outcome (this controller doesn't own the project)
+/// and is mapped to HTTP 400 + `warn!` by the handler; `Internal` covers
+/// genuine failures and maps to 500 + `error!`. Both prevent Metacontroller
+/// from applying the (empty) children list, so neither GCs resources.
+#[derive(Debug)]
+enum SyncError {
+    /// The project's Organization's `spec.deploymentControllerClass` does not
+    /// match this controller's configured `controller_class_name`. Logged
+    /// once at warn level.
+    WrongController {
+        project: String,
+        configured: String,
+        org_class: Option<String>,
+    },
+    /// Anything else — DB error, store error, malformed Org, missing linkage.
+    Internal(anyhow::Error),
+}
+
+impl From<anyhow::Error> for SyncError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Internal(e)
+    }
+}
+
+/// Pure comparison of the configured controller class against the
+/// Organization's `spec.deploymentControllerClass`. Returns `Ok(())` when
+/// reconciliation should proceed (legacy `configured = None`, or both match)
+/// and `Err(())` when the controller should refuse this project.
+fn check_controller_class(configured: Option<&str>, org_class: Option<&str>) -> Result<(), ()> {
+    match configured {
+        None => Ok(()),
+        Some(c) => match org_class {
+            Some(o) if o == c => Ok(()),
+            _ => Err(()),
+        },
+    }
+}
+
+/// Snapshot of the per-Organization fields the Metacontroller webhook
+/// reads on every sync. Cached behind `AppState::org_view_cache` so the
+/// controller hits the resource store at most once per Org per 30s
+/// window — the previous design had two independent caches (one per
+/// field) and re-read the same row twice.
+#[derive(Debug, Clone)]
+pub struct CachedOrganizationView {
+    /// Value of `spec.deploymentControllerClass`. `None` when the
+    /// Organization exists but does not set the field.
+    pub controller_class: Option<String>,
+    /// Resolved Kubernetes namespace prefix
+    /// (`kubernetes.rise.dev/namespace-prefix` annotation, or
+    /// `org-{discriminator}-` fallback).
+    pub namespace_prefix: String,
+}
+
+/// Cache miss-loader for `AppState::org_view_cache`. Reads the
+/// Organization row once and projects both fields the webhook needs.
+/// Missing Organizations surface as `Err`, which prevents the cache from
+/// memoising a transient "not found" (`try_get_with` only retains
+/// successful loads).
+async fn load_org_view(
+    store: std::sync::Arc<dyn rise_resource_store::ResourceStore>,
+    uid: uuid::Uuid,
+) -> anyhow::Result<CachedOrganizationView> {
+    let row = store
+        .get(uid)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to load Organization {uid}: {e}"))?
+        .ok_or_else(|| anyhow::anyhow!("Organization {uid} is missing"))?;
+    let spec: rise_resource_api::OrganizationSpec = serde_json::from_value(row.spec.clone())
+        .map_err(|e| anyhow::anyhow!("Organization {uid} has malformed spec: {e}"))?;
+    let annotations: BTreeMap<String, String> =
+        serde_json::from_value(row.metadata.clone()).unwrap_or_default();
+    let namespace_prefix =
+        crate::server::bootstrap::resolve_namespace_prefix(&annotations, &row.discriminator);
+    Ok(CachedOrganizationView {
+        controller_class: spec.deployment_controller_class,
+        namespace_prefix,
+    })
+}
+
+/// Resolve the project's Organization UID, surfacing the "missing
+/// linkage" invariant as a structured error. Bootstrap validation
+/// refuses to start the server with unlinked projects, so a `None` here
+/// is a programmer error — logged at `error!` rather than letting the
+/// `None` propagate silently.
+pub async fn resolve_project_organization_uid(
+    state: &AppState,
+    project: &Project,
+) -> anyhow::Result<uuid::Uuid> {
+    crate::db::organization_links::organization_uid_for_project(&state.db_pool, project.id)
+        .await?
+        .ok_or_else(|| {
+            error!(
+                project = %project.name,
+                "Project has no organization linkage — bootstrap validation should have caught this; refusing to reconcile"
+            );
+            anyhow::anyhow!(
+                "project '{}' is missing organization_resource_uid; bootstrap must backfill before reconciliation",
+                project.name,
+            )
+        })
+}
+
+/// Look up the project's Org-scoped namespace prefix through
+/// `AppState::org_view_cache`. The caller resolves the Organization UID
+/// once per request (via `resolve_project_organization_uid`) and threads
+/// it through so the controller-class check and this lookup share a
+/// single DB and cache read.
+pub async fn resolve_project_namespace_prefix(
+    state: &AppState,
+    project: &Project,
+    org_uid: uuid::Uuid,
+) -> anyhow::Result<String> {
+    let view = state
+        .org_view_cache
+        .try_get_with(
+            org_uid,
+            load_org_view(state.resource_store.clone(), org_uid),
+        )
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to load Organization {org_uid} for project '{}': {e}",
+                project.name,
+            )
+        })?;
+    Ok(view.namespace_prefix)
+}
+
+/// Reject reconciliation when the project's Organization's
+/// `spec.deploymentControllerClass` does not match the controller's
+/// configured `controller_class_name`. Reads the Org through a short-TTL
+/// cache so a steady stream of resyncs does not hit the store on every
+/// tick. When the controller has no configured class (legacy installs),
+/// this is a no-op.
+async fn enforce_controller_class(
+    state: &AppState,
+    project: &Project,
+    org_uid: uuid::Uuid,
+) -> Result<(), SyncError> {
+    let Some(configured) = state.deployment_controller_class_name.as_deref() else {
+        return Ok(());
+    };
+
+    let view = state
+        .org_view_cache
+        .try_get_with(
+            org_uid,
+            load_org_view(state.resource_store.clone(), org_uid),
+        )
+        .await
+        .map_err(|e| {
+            SyncError::Internal(anyhow::anyhow!(
+                "Failed to load Organization {org_uid} for project '{}': {e}",
+                project.name,
+            ))
+        })?;
+
+    match check_controller_class(Some(configured), view.controller_class.as_deref()) {
+        Ok(()) => Ok(()),
+        Err(()) => Err(SyncError::WrongController {
+            project: project.name.clone(),
+            configured: configured.to_string(),
+            org_class: view.controller_class,
+        }),
+    }
+}
+
 /// Inspect the observed Kubernetes state for each non-terminal deployment and
 /// advance its status: Pushed → Deploying, Deploying → Healthy/Failed, timeouts,
 /// expiration, and cancellation.
@@ -274,6 +497,7 @@ async fn perform_status_transitions(
     project: &Project,
     non_terminal: &[&Deployment],
     observed: &ObservedChildren,
+    namespace_prefix: &str,
 ) -> anyhow::Result<()> {
     for deployment in non_terminal {
         // Skip pre-infrastructure deployments — the CLI drives those transitions
@@ -325,11 +549,25 @@ async fn perform_status_transitions(
 
             DeploymentStatus::Deploying => {
                 check_deploying_timeout(state, deployment, project).await?;
-                check_deployment_health_from_observed(state, deployment, project, observed).await?;
+                check_deployment_health_from_observed(
+                    state,
+                    deployment,
+                    project,
+                    observed,
+                    namespace_prefix,
+                )
+                .await?;
             }
 
             DeploymentStatus::Healthy | DeploymentStatus::Unhealthy => {
-                check_deployment_health_from_observed(state, deployment, project, observed).await?;
+                check_deployment_health_from_observed(
+                    state,
+                    deployment,
+                    project,
+                    observed,
+                    namespace_prefix,
+                )
+                .await?;
             }
 
             _ => {}
@@ -436,13 +674,10 @@ async fn check_deployment_health_from_observed(
     deployment: &Deployment,
     project: &Project,
     observed: &ObservedChildren,
+    namespace_prefix: &str,
 ) -> anyhow::Result<()> {
     // Metacontroller keys namespaced children of cluster-scoped parents as "namespace/name"
-    let resource_builder = match &state.resource_builder {
-        Some(rb) => rb,
-        None => return Ok(()),
-    };
-    let namespace = resource_builder.namespace_name(project);
+    let namespace = ResourceBuilder::namespace_name(project, namespace_prefix);
     let k8s_deploy_name = format!(
         "{}/{}-{}",
         namespace, project.name, deployment.deployment_id
@@ -483,6 +718,7 @@ async fn check_deployment_health_from_observed(
         desired_replicas,
         ready_replicas,
         &deployment.controller_metadata,
+        namespace_prefix,
     )
     .await;
 
@@ -590,6 +826,7 @@ async fn check_pod_errors_via_kube(
     desired_replicas: i32,
     ready_replicas: i32,
     prev_controller_metadata: &serde_json::Value,
+    namespace_prefix: &str,
 ) -> PodCheckResult {
     let kube_client = match &state.kube_client {
         Some(client) => client,
@@ -602,16 +839,7 @@ async fn check_pod_errors_via_kube(
         }
     };
 
-    let namespace = match &state.resource_builder {
-        Some(rb) => rb.namespace_name(project),
-        None => {
-            return PodCheckResult {
-                has_error: false,
-                error_message: None,
-                pod_status: None,
-            }
-        }
-    };
+    let namespace = ResourceBuilder::namespace_name(project, namespace_prefix);
     let pod_api: kube::Api<k8s_openapi::api::core::v1::Pod> =
         kube::Api::namespaced(kube_client.clone(), &namespace);
 
@@ -988,9 +1216,10 @@ async fn compute_desired_children(
     project: &Project,
     all_deployments: &[Deployment],
     observed: &ObservedChildren,
+    namespace_prefix: &str,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
     let mut children: Vec<serde_json::Value> = Vec::new();
-    let namespace = resource_builder.namespace_name(project);
+    let namespace = ResourceBuilder::namespace_name(project, namespace_prefix);
 
     // Preload all environments for this project to avoid per-deployment DB lookups
     let environments: HashMap<uuid::Uuid, crate::db::models::Environment> =
@@ -1001,7 +1230,7 @@ async fn compute_desired_children(
             .collect();
 
     // 1. Namespace (always)
-    let ns = resource_builder.create_namespace(project);
+    let ns = resource_builder.create_namespace(project, namespace_prefix);
     children.push(serde_json::to_value(&ns)?);
 
     // 2. Image pull secret (if needed)
@@ -1658,6 +1887,11 @@ async fn add_backend_resources(
 }
 
 /// Apply backend Endpoints directly via kube-rs server-side apply.
+///
+/// On the first sync for a new project the namespace returned in this sync's
+/// children list has not yet been applied by Metacontroller, so the apply
+/// 404s. That's expected and self-heals on the next resync, so the 404 is
+/// logged at debug instead of warning.
 async fn apply_backend_endpoints(
     state: &AppState,
     endpoints: &k8s_openapi::api::core::v1::Endpoints,
@@ -1670,14 +1904,23 @@ async fn apply_backend_endpoints(
         kube::Api::namespaced(kube_client.clone(), namespace);
     let name = endpoints.metadata.name.as_deref().unwrap_or("rise-backend");
     let params = kube::api::PatchParams::apply("rise-controller").force();
-    if let Err(e) = api
+    match api
         .patch(name, &params, &kube::api::Patch::Apply(endpoints))
         .await
     {
-        warn!(
-            namespace = %namespace,
-            "Failed to apply backend Endpoints: {:?}", e
-        );
+        Ok(_) => {}
+        Err(kube::Error::Api(err)) if err.code == 404 => {
+            debug!(
+                namespace = %namespace,
+                "Backend Endpoints apply deferred: namespace not yet created (will retry on next resync)"
+            );
+        }
+        Err(e) => {
+            warn!(
+                namespace = %namespace,
+                "Failed to apply backend Endpoints: {:?}", e
+            );
+        }
     }
 }
 
@@ -2113,7 +2356,6 @@ mod tests {
             },
             pod_security_enabled: true,
             health_probes: None,
-            namespace_format: "{project_name}".to_string(),
         }
     }
 
@@ -2245,5 +2487,44 @@ mod tests {
             !resolved.secret_env_vars.contains_key(" SECRET_KEY"),
             "untrimmed key should not be present"
         );
+    }
+
+    // -----------------------------------------------------------------------------
+    // check_controller_class
+    // -----------------------------------------------------------------------------
+
+    #[test]
+    fn check_controller_class_unconfigured_always_passes() {
+        // Legacy installs (no controller class configured) reconcile every
+        // project regardless of what the Organization carries.
+        assert!(check_controller_class(None, None).is_ok());
+        assert!(check_controller_class(None, Some("kubernetes.rise.dev/default")).is_ok());
+        assert!(check_controller_class(None, Some("something-else")).is_ok());
+    }
+
+    #[test]
+    fn check_controller_class_matching_passes() {
+        assert!(check_controller_class(
+            Some("kubernetes.rise.dev/default"),
+            Some("kubernetes.rise.dev/default"),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn check_controller_class_mismatched_rejects() {
+        assert!(check_controller_class(
+            Some("kubernetes.rise.dev/default"),
+            Some("kubernetes.rise.dev/other"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn check_controller_class_unset_on_org_rejects() {
+        // An Org that has no `spec.deploymentControllerClass` is not owned by
+        // this (or any) controller, even when the controller has a class
+        // configured. Refuse to reconcile.
+        assert!(check_controller_class(Some("kubernetes.rise.dev/default"), None).is_err());
     }
 }

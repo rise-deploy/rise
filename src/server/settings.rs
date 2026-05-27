@@ -26,6 +26,67 @@ pub struct Settings {
     /// always on when the `backend` feature is enabled.
     #[serde(default)]
     pub resource_gc: Option<ResourceGcSettings>,
+    /// Default Organization that owns existing typed data (users, teams,
+    /// projects) until org-aware multi-tenancy lands. Bootstrap creates this
+    /// Organization (under an advisory lock) before any backfill runs, so it
+    /// is guaranteed to exist by the time controllers begin processing
+    /// projects. Omitting the section accepts the documented defaults:
+    /// name="default", display name="Default", no namespace prefix
+    /// configured — the controller then synthesizes `org-{discriminator}-`
+    /// as the per-Org namespace prefix. Set
+    /// `default_organization.kubernetes_namespace_prefix` explicitly (e.g.
+    /// `"rise-"`) to preserve historic naming on existing installs.
+    #[serde(default)]
+    pub default_organization: DefaultOrganizationSettings,
+}
+
+/// Configuration for the bootstrapped default Organization resource.
+///
+/// The `name` and `display_name` fields populate the Organization's metadata
+/// and spec respectively. `kubernetes_namespace_prefix`, when set, is written
+/// to the `kubernetes.rise.dev/namespace-prefix` annotation. Unrelated
+/// annotations on an existing default Organization are preserved across
+/// bootstrap runs.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct DefaultOrganizationSettings {
+    /// Resource name of the default Organization (DNS-label form). Default:
+    /// `default`.
+    #[serde(default = "default_default_organization_name")]
+    pub name: String,
+    /// Human-readable display name stored in `spec.displayName`. Default:
+    /// `Default`.
+    #[serde(default = "default_default_organization_display_name")]
+    pub display_name: String,
+    /// Extra annotations to apply to the Organization's metadata. The
+    /// `kubernetes.rise.dev/namespace-prefix` annotation is managed
+    /// separately by `kubernetes_namespace_prefix` and overrides any entry
+    /// with the same key set here.
+    #[serde(default)]
+    pub annotations: std::collections::BTreeMap<String, String>,
+    /// Value for the `kubernetes.rise.dev/namespace-prefix` annotation on the
+    /// default Organization. When set, bootstrap stamps the annotation with
+    /// this value; when `None`, the annotation is left unset and the
+    /// Kubernetes controller falls back to `org-{discriminator}-` (see
+    /// [`crate::server::bootstrap::DefaultOrganizationView::resolved_namespace_prefix`]).
+    ///
+    /// Upgrade note: installs that previously relied on the historic
+    /// `rise-{project_name}` namespace naming must set this to `"rise-"`
+    /// explicitly before deploying — otherwise the controller will switch
+    /// to `org-{discriminator}-{project_name}` and orphan the legacy
+    /// namespaces.
+    #[serde(default)]
+    pub kubernetes_namespace_prefix: Option<String>,
+}
+
+impl Default for DefaultOrganizationSettings {
+    fn default() -> Self {
+        Self {
+            name: default_default_organization_name(),
+            display_name: default_default_organization_display_name(),
+            annotations: std::collections::BTreeMap::new(),
+            kubernetes_namespace_prefix: None,
+        }
+    }
 }
 
 fn default_loki_timeout_secs() -> u64 {
@@ -367,8 +428,16 @@ fn default_ingress_schema() -> String {
     "https".to_string()
 }
 
-fn default_namespace_format() -> String {
-    "rise-{project_name}".to_string()
+fn default_controller_class_name() -> String {
+    "default".to_string()
+}
+
+fn default_default_organization_name() -> String {
+    "default".to_string()
+}
+
+fn default_default_organization_display_name() -> String {
+    "Default".to_string()
 }
 
 fn default_node_selector() -> std::collections::HashMap<String, String> {
@@ -714,12 +783,16 @@ pub enum DeploymentControllerSettings {
         /// The domain should share a parent with app domains for cookie sharing (see struct docs).
         auth_signin_url: String,
 
-        /// Namespace format template for deployed applications
-        /// Template variables: {project_name}
-        /// Example: "rise-{project_name}" → namespace "rise-myapp" for project "myapp"
-        /// Defaults to "rise-{project_name}"
-        #[serde(default = "default_namespace_format")]
-        namespace_format: String,
+        /// Stable identifier for this deployment controller, written to the
+        /// default Organization's `spec.deploymentControllerClass` at startup.
+        /// The Kubernetes controller only reconciles projects whose
+        /// Organization's `spec.deploymentControllerClass` matches this value.
+        /// Stamped as a value of the `rise.dev/controller-class` label on
+        /// each `RiseProject` CR, so it must be a valid Kubernetes label
+        /// value (alphanumeric / `-` / `_` / `.`, no `/`). Defaults to
+        /// `default`.
+        #[serde(default = "default_controller_class_name")]
+        controller_class_name: String,
 
         /// Labels to apply to all managed namespaces
         /// Example: {"environment": "production", "team": "platform"}
@@ -1233,20 +1306,24 @@ impl Settings {
 
         // Validate deployment controller settings if configured
         if let Some(DeploymentControllerSettings::Kubernetes {
-            ref namespace_format,
             ref production_ingress_url_template,
             ref staging_ingress_url_template,
             ref environment_ingress_url_template,
             ref access_classes,
             ref extra_service_token_audiences,
+            ref controller_class_name,
             ..
         }) = settings.deployment_controller
         {
-            Self::validate_format_string(namespace_format, "namespace_format", "{project_name}")?;
             Self::validate_format_string(
                 production_ingress_url_template,
                 "production_ingress_url_template",
                 "{project_name}",
+            )?;
+
+            Self::validate_label_value(
+                controller_class_name,
+                "deployment_controller.controller_class_name",
             )?;
 
             if let Some(ref staging_template) = staging_ingress_url_template {
@@ -1332,6 +1409,50 @@ impl Settings {
                 field_name, required_placeholder, format_str
             )));
         }
+        Ok(())
+    }
+
+    /// Validate that a string is a valid Kubernetes label value.
+    ///
+    /// Kubernetes label values must match the regex
+    /// `^[A-Za-z0-9]([A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$`, i.e. they must be
+    /// 1-63 characters long, start and end with an alphanumeric character, and
+    /// only contain alphanumerics, '-', '_', and '.'. Notably, '/' is not
+    /// permitted — stamping a value with '/' onto a label causes the API
+    /// server to reject the object with `FieldValueInvalid`.
+    fn validate_label_value(value: &str, field_name: &str) -> Result<(), ConfigError> {
+        let label_value_re = regex::Regex::new(r"^[A-Za-z0-9]([A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$")
+            .map_err(|e| {
+                ConfigError::Message(format!("Failed to compile label value regex: {}", e))
+            })?;
+
+        if value.is_empty() {
+            return Err(ConfigError::Message(format!(
+                "'{}' must be a valid Kubernetes label value (length 1-63); got empty string. \
+                 Note: '/' is not permitted in label values.",
+                field_name
+            )));
+        }
+
+        if value.len() > 63 {
+            return Err(ConfigError::Message(format!(
+                "'{}' must be a valid Kubernetes label value (length 1-63); got '{}' ({} chars). \
+                 Note: '/' is not permitted in label values.",
+                field_name,
+                value,
+                value.len()
+            )));
+        }
+
+        if !label_value_re.is_match(value) {
+            return Err(ConfigError::Message(format!(
+                "'{}' must be a valid Kubernetes label value matching \
+                 '^[A-Za-z0-9]([A-Za-z0-9_.-]{{0,61}}[A-Za-z0-9])?$'; got '{}'. \
+                 Note: '/' is not permitted in label values.",
+                field_name, value
+            )));
+        }
+
         Ok(())
     }
 }
@@ -1421,7 +1542,6 @@ deployment_controller:
   type: "kubernetes"
   ingress_class: "nginx"
   production_ingress_url_template: "{project_name}.test.local"
-  namespace_format: "rise-{project_name}"
   auth_backend_url: "http://localhost:3000"
   auth_signin_url: "http://localhost:3000"
   metacontroller_pod_namespace: "metacontroller"
@@ -1479,6 +1599,64 @@ unknown_top_level: "also unknown"
     }
 
     #[test]
+    fn controller_class_name_default_is_valid() {
+        // The literal default value used when no override is configured must pass
+        // the label-value validation. Keep this in sync with
+        // `default_controller_class_name`.
+        let default_value = default_controller_class_name();
+        Settings::validate_label_value(
+            &default_value,
+            "deployment_controller.controller_class_name",
+        )
+        .expect("default controller_class_name must be a valid Kubernetes label value");
+    }
+
+    #[test]
+    fn controller_class_name_with_slash_rejects() {
+        let error = Settings::validate_label_value(
+            "my/class",
+            "deployment_controller.controller_class_name",
+        )
+        .expect_err("controller_class_name with '/' must be rejected");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("deployment_controller.controller_class_name"),
+            "error message should name the field, got: {}",
+            message
+        );
+        assert!(
+            message.contains("my/class"),
+            "error message should include the invalid value, got: {}",
+            message
+        );
+        assert!(
+            message.contains("'/'"),
+            "error message should mention that '/' is not permitted, got: {}",
+            message
+        );
+    }
+
+    #[test]
+    fn controller_class_name_empty_rejects() {
+        let error =
+            Settings::validate_label_value("", "deployment_controller.controller_class_name")
+                .expect_err("empty controller_class_name must be rejected");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("deployment_controller.controller_class_name"),
+            "error message should name the field, got: {}",
+            message
+        );
+        assert!(
+            message.contains("empty") || message.contains("1-63"),
+            "error message should mention length/empty, got: {}",
+            message
+        );
+    }
+
+    #[test]
     fn test_settings_load_with_extra_service_token_audiences() {
         use std::fs;
         use tempfile::TempDir;
@@ -1506,7 +1684,6 @@ auth:
 deployment_controller:
   type: "kubernetes"
   production_ingress_url_template: "{project_name}.test.local"
-  namespace_format: "rise-{project_name}"
   auth_backend_url: "http://localhost:3000"
   auth_signin_url: "http://localhost:3000"
   metacontroller_pod_namespace: "metacontroller"

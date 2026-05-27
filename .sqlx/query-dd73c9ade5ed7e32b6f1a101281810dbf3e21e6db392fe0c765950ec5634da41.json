@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE projects\n        SET organization_resource_uid = $1\n        WHERE organization_resource_uid IS NULL\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "dd73c9ade5ed7e32b6f1a101281810dbf3e21e6db392fe0c765950ec5634da41"
+}

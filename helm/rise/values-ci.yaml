@@ -37,7 +37,6 @@ config:
     production_ingress_url_template: "{project_name}.apps.rise.local"
     staging_ingress_url_template: "{project_name}-{deployment_group}.preview.rise.local"
     environment_ingress_url_template: "{project_name}-{environment}.preview.rise.local"
-    namespace_format: "rise-{project_name}"
     ingress_schema: http
     access_classes:
       public:

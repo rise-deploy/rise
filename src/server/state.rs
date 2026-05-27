@@ -60,6 +60,26 @@ pub struct AppState {
     /// without a network round-trip.
     #[cfg(feature = "backend")]
     pub resource_store: Arc<dyn rise_resource_store::ResourceStore>,
+    /// Resource UID of the default Organization. Populated by the bootstrap
+    /// pass at startup; typed APIs use this to stamp newly created
+    /// users/teams/projects with the configured default Organization.
+    #[cfg(feature = "backend")]
+    pub default_organization_uid: uuid::Uuid,
+    /// `controller_class_name` for the configured Kubernetes deployment
+    /// controller. The webhook only reconciles projects whose Organization's
+    /// `spec.deploymentControllerClass` matches this value. `None` when no
+    /// Kubernetes deployment controller is configured.
+    #[cfg(feature = "backend")]
+    pub deployment_controller_class_name: Option<String>,
+    /// Short-TTL cache of the per-Org fields the webhook reads on every
+    /// sync (`spec.deploymentControllerClass`, resolved namespace prefix).
+    /// 30s TTL means a change to either propagates within roughly one
+    /// resync window. Org-missing is treated as an error and is never
+    /// cached (`try_get_with` won't memoise an Err).
+    #[cfg(feature = "backend")]
+    pub org_view_cache: Arc<
+        moka::future::Cache<uuid::Uuid, crate::server::deployment::webhook::CachedOrganizationView>,
+    >,
     pub auth_settings: Arc<AuthSettings>,
     pub server_settings: Arc<ServerSettings>,
     pub token_store: Arc<dyn TokenStore>,
@@ -272,6 +292,16 @@ impl AppState {
         #[cfg(feature = "backend")]
         let resource_store: Arc<dyn rise_resource_store::ResourceStore> =
             Arc::new(rise_resource_store::PgResourceStore::new(db_pool.clone()));
+
+        // Run default-Organization bootstrap. Must complete before
+        // controllers begin processing typed projects, so we await it before
+        // the rest of AppState comes up.
+        #[cfg(feature = "backend")]
+        let bootstrap_outcome = crate::server::bootstrap::run(&db_pool, &resource_store, settings)
+            .await
+            .context("Default-Organization bootstrap failed")?;
+        #[cfg(feature = "backend")]
+        let default_organization_uid = bootstrap_outcome.default_organization_uid;
 
         // Initialize JWT validator (JWKS is fetched on-demand)
         let jwt_validator = Arc::new(JwtValidator::new(settings.server.ssrf.clone()));
@@ -609,6 +639,7 @@ impl AppState {
             deployment_defaults_opt,
             deployment_constraints_opt,
             identity_token_ttl_seconds,
+            deployment_controller_class_name,
         ) = {
             use crate::server::deployment::resource_builder::ResourceBuilder;
             use crate::server::settings::DeploymentControllerSettings;
@@ -642,7 +673,7 @@ impl AppState {
                 metacontroller_webhook_port,
                 metacontroller_pod_namespace,
                 metacontroller_pod_label_selector,
-                namespace_format,
+                controller_class_name,
                 identity_token_ttl_seconds,
                 ..
             }) = &settings.deployment_controller
@@ -673,6 +704,11 @@ impl AppState {
                     .filter_map(|(k, v)| v.as_ref().map(|ac| (k.clone(), ac.clone())))
                     .collect();
 
+                // Namespace prefix is resolved per-request by the
+                // webhook against the project's Organization, so
+                // `ResourceBuilder` no longer carries a baked format
+                // string.
+
                 let rb = ResourceBuilder {
                     production_ingress_url_template: production_ingress_url_template.clone(),
                     staging_ingress_url_template: staging_ingress_url_template.clone(),
@@ -699,7 +735,6 @@ impl AppState {
                     network_policy: network_policy.clone(),
                     pod_security_enabled: *pod_security_enabled,
                     health_probes: health_probes.clone(),
-                    namespace_format: namespace_format.clone(),
                 };
 
                 let run_mode =
@@ -736,9 +771,10 @@ impl AppState {
                     Some(deployment_defaults.clone()),
                     Some(_deployment_constraints.clone()),
                     *identity_token_ttl_seconds,
+                    Some(controller_class_name.clone()),
                 )
             } else {
-                (None, None, None, None, None, None, 3600)
+                (None, None, None, None, None, None, 3600, None)
             }
         };
 
@@ -758,7 +794,6 @@ impl AppState {
         let runtime_log_backend = crate::server::deployment::logs::init_runtime_log_backend(
             &settings.deployment_logs,
             webhook_kube_client.clone(),
-            resource_builder.clone(),
         )
         .await?;
 
@@ -1005,6 +1040,20 @@ impl AppState {
         );
         tracing::info!("Initialized encrypt endpoint rate limiter (100 req/hour per user)");
 
+        // Combined per-Org view cache keyed by Org UID. Holds the fields
+        // the webhook reads on every sync (`spec.deploymentControllerClass`,
+        // resolved namespace prefix) so the controller hits the resource
+        // store at most once per Org per 30s window. 1024-entry cap is
+        // well above any realistic Org count and bounds memory if abused.
+        // Org-missing surfaces as `Err` and is not cached.
+        #[cfg(feature = "backend")]
+        let org_view_cache = Arc::new(
+            moka::future::Cache::builder()
+                .time_to_live(Duration::from_secs(30))
+                .max_capacity(1024)
+                .build(),
+        );
+
         // Initialize OAuth endpoint rate limiter
         let rl = &settings.server.oauth_rate_limit;
         let oauth_rate_limiter = Arc::new(crate::server::rate_limit::OAuthRateLimiter::new(rl));
@@ -1071,6 +1120,12 @@ impl AppState {
             controllers_by_issuer,
             #[cfg(feature = "backend")]
             resource_store,
+            #[cfg(feature = "backend")]
+            default_organization_uid,
+            #[cfg(feature = "backend")]
+            deployment_controller_class_name,
+            #[cfg(feature = "backend")]
+            org_view_cache,
             auth_settings,
             server_settings,
             token_store,
