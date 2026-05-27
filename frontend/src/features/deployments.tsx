@@ -1089,7 +1089,7 @@ function LogCountsChart({ counts, loading, error, status, rangeLabel, rangeStart
                 : 'No log volume found. It may have expired based on the log backend retention policy.';
         }
         if (status.reason === 'historical_backend_not_configured') {
-            return 'Log volume charts are only available with Loki.';
+            return 'Log volume charts aren’t supported by the configured log backend.';
         }
         if (status.reason === 'deployment_not_ready') {
             return 'Deployment logs are not ready yet.';

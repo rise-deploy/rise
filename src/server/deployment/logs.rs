@@ -322,7 +322,7 @@ impl RuntimeLogBackend for KubernetesLogBackend {
             status: Some(LogStatus {
                 reason: LogStatusReason::HistoricalBackendNotConfigured,
                 message: Some(
-                    "Historical log counts require the Loki backend to be enabled.".into(),
+                    "Historical log counts aren't supported by the configured log backend.".into(),
                 ),
                 retention_hint: None,
             }),

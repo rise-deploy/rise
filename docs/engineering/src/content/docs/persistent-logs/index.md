@@ -38,8 +38,8 @@ Limitations:
   is no merged view across replicas (only a single Pod's lines are
   returned per request).
 - **No log volume chart.** The chart in the UI requires a metric-style
-  count query that Loki provides; the Kubernetes backend reports
-  "Log volume charts are only available with Loki."
+  count query that this backend can't serve; it reports "Log volume
+  charts aren't supported by the configured log backend."
 
 For any of the above, switch to the Loki backend.
 
