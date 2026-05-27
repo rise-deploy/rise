@@ -32,9 +32,10 @@ fn default_loki_timeout_secs() -> u64 {
     10
 }
 
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum DeploymentLogsSettings {
+    #[default]
     Kubernetes,
     Loki {
         url: String,
@@ -47,12 +48,6 @@ pub enum DeploymentLogsSettings {
         #[serde(default)]
         retention_hint: Option<String>,
     },
-}
-
-impl Default for DeploymentLogsSettings {
-    fn default() -> Self {
-        Self::Kubernetes
-    }
 }
 
 #[derive(Debug, Deserialize, Clone, JsonSchema)]

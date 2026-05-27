@@ -64,5 +64,4 @@ pub trait DeploymentBackend: Send + Sync {
         let _ = (project, environment_name);
         Ok(())
     }
-
 }

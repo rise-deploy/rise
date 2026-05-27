@@ -2277,6 +2277,25 @@ pub struct LogStreamParams {
     pub timestamps: bool,
     /// Show logs since this many seconds ago
     pub since: Option<i64>,
+    /// Start of an explicit time range in RFC3339 format
+    pub start: Option<String>,
+    /// End of an explicit time range in RFC3339 format
+    pub end: Option<String>,
+    /// Restrict to lines matching one of "info", "warn", "error". Anything
+    /// else (or absent) returns all lines.
+    pub level: Option<String>,
+}
+
+/// Query parameters for log counts
+#[derive(serde::Deserialize)]
+pub struct LogCountsParams {
+    /// Start of an explicit time range in RFC3339 format
+    pub start: String,
+    /// End of an explicit time range in RFC3339 format
+    pub end: String,
+    /// Bucket step in seconds
+    #[serde(default = "default_log_count_step_seconds")]
+    pub step_seconds: i64,
 }
 
 /// Stream logs from a deployment via Server-Sent Events
@@ -2331,20 +2350,39 @@ pub async fn stream_deployment_logs(
         ))
     })?;
 
-    // Get log stream from configured runtime log backend.
-    // Default to last 1000 lines if tail not specified.
-    let tail = params.tail.or(Some(1000));
+    let start_time = parse_log_time(params.start.as_deref())?;
+    let end_time = parse_log_time(params.end.as_deref())?;
+    let followable = crate::server::deployment::logs::is_followable_status(&deployment.status);
+    if let (Some(start_time), Some(end_time)) = (start_time, end_time) {
+        if start_time >= end_time {
+            return Err(ServerError::bad_request(
+                "Log range start must be before end",
+            ));
+        }
+    }
 
+    // Get log stream from configured runtime log backend.
+    // Follow defaults to 1 line so active deployments start at the most
+    // recent log entry, while non-follow requests keep the broader backlog.
+    let tail = params
+        .tail
+        .or(Some(if params.follow && followable { 1 } else { 1000 }));
+    let follow = params.follow && followable;
+
+    let level = crate::server::deployment::logs::LogLevelFilter::parse(params.level.as_deref());
     let log_stream = state
         .runtime_log_backend
         .stream_logs(
             &deployment,
             &project,
             crate::server::deployment::logs::LogQuery {
-                follow: params.follow,
+                follow,
                 tail_lines: tail,
                 timestamps: params.timestamps,
                 since_seconds: params.since,
+                start_time,
+                end_time,
+                level,
             },
         )
         .await
@@ -2377,6 +2415,99 @@ pub async fn stream_deployment_logs(
     });
 
     Ok(Sse::new(sse_stream).keep_alive(KeepAlive::default()))
+}
+
+/// Query log counts for a deployment.
+///
+/// GET /projects/{project_name}/deployments/{deployment_id}/logs/counts
+pub async fn count_deployment_logs(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path((project_name, deployment_id)): Path<(String, String)>,
+    Query(params): Query<LogCountsParams>,
+) -> Result<Json<crate::server::deployment::logs::LogCountsResponse>, ServerError> {
+    let project = projects::find_by_name(&state.db_pool, &project_name)
+        .await
+        .internal_err("Failed to fetch project")?
+        .ok_or_else(|| ServerError::not_found(format!("Project '{}' not found", project_name)))?;
+
+    let (_user, is_sa) = auth
+        .resolve_for_project(
+            &state.db_pool,
+            &project,
+            state.controllers_by_issuer.as_ref(),
+        )
+        .await
+        .map_err(|e| {
+            if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {
+                ServerError::not_found(format!("Project '{}' not found", project.name))
+            } else {
+                e
+            }
+        })?;
+
+    if !is_sa {
+        crate::server::project::handlers::ensure_project_access_or_admin(&state, &_user, &project)
+            .await?;
+    }
+
+    let deployment = db_deployments::find_by_project_and_deployment_id(
+        &state.db_pool,
+        project.id,
+        &deployment_id,
+    )
+    .await
+    .internal_err("Failed to fetch deployment")?
+    .ok_or_else(|| {
+        ServerError::not_found(format!(
+            "Deployment '{}' not found for project '{}'",
+            deployment_id, project_name
+        ))
+    })?;
+
+    let start_time = parse_log_time(Some(&params.start))?
+        .ok_or_else(|| ServerError::bad_request("Log range start is required"))?;
+    let end_time = parse_log_time(Some(&params.end))?
+        .ok_or_else(|| ServerError::bad_request("Log range end is required"))?;
+    if start_time >= end_time {
+        return Err(ServerError::bad_request(
+            "Log range start must be before end",
+        ));
+    }
+
+    let counts = state
+        .runtime_log_backend
+        .count_logs(
+            &deployment,
+            &project,
+            crate::server::deployment::logs::LogCountsQuery {
+                start_time,
+                end_time,
+                step_seconds: params.step_seconds.max(1),
+            },
+        )
+        .await
+        .map_err(|e| ServerError::internal_anyhow(e, "Failed to fetch log counts"))?;
+
+    Ok(Json(counts))
+}
+
+fn parse_log_time(
+    value: Option<&str>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, ServerError> {
+    match value {
+        Some(value) if !value.trim().is_empty() => {
+            let parsed = chrono::DateTime::parse_from_rfc3339(value).map_err(|_| {
+                ServerError::bad_request(format!("Invalid RFC3339 timestamp: {}", value))
+            })?;
+            Ok(Some(parsed.with_timezone(&chrono::Utc)))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn default_log_count_step_seconds() -> i64 {
+    60
 }
 
 #[cfg(test)]

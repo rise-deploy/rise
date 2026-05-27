@@ -1577,9 +1577,9 @@ fn print_log_status(data: &str) {
                 println!("No logs found. They may have expired based on the log backend retention policy.");
             }
         }
-        "historical_backend_not_configured" => println!(
-            "No active deployment pod was found and historical logs are not configured."
-        ),
+        "historical_backend_not_configured" => {
+            println!("No active deployment pod was found and historical logs are not configured.")
+        }
         "deployment_not_ready" => println!("Deployment logs are not ready yet."),
         "backend_unavailable" => println!("The log backend is unavailable."),
         _ => println!("No logs found."),

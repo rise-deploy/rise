@@ -1,5 +1,7 @@
 // @ts-nocheck
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip as RechartsTooltip, XAxis, YAxis } from 'recharts';
+import { DayPicker } from 'react-day-picker';
 import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
 import { copyToClipboard, formatDate, formatISO8601, formatRelativeTimeRounded, formatTimeRemaining, isSafeUrl, stripUrlScheme } from '../lib/utils';
@@ -706,130 +708,453 @@ function StreamToggle({ streaming, autoScroll, onToggleStream, onToggleAutoScrol
     );
 }
 
-// Deployment Logs Component with SSE streaming
+const STREAMABLE_LOG_STATUSES = new Set(['Deploying', 'Healthy', 'Unhealthy', 'Cancelling', 'Terminating']);
+const LOGGABLE_STATUSES = new Set(['Deploying', 'Healthy', 'Unhealthy', 'Cancelling', 'Terminating', 'Cancelled', 'Stopped', 'Failed', 'Superseded', 'Expired']);
+
+const LOG_RANGE_PRESETS = [
+    { value: '15m', label: '15m', minutes: 15 },
+    { value: '1h', label: '1h', minutes: 60 },
+    { value: '6h', label: '6h', minutes: 360 },
+    { value: '24h', label: '24h', minutes: 1440 },
+    { value: '7d', label: '7d', minutes: 10080 },
+    { value: 'custom', label: 'Custom', minutes: 0 },
+];
+
+function presetToMilliseconds(value) {
+    const preset = LOG_RANGE_PRESETS.find((option) => option.value === value);
+    return preset ? preset.minutes * 60 * 1000 : LOG_RANGE_PRESETS[2].minutes * 60 * 1000;
+}
+
+function resolveLogWindow(rangeValue, customStart, customEnd) {
+    const now = new Date();
+    if (rangeValue === 'custom') {
+        if (!customStart) return null;
+        const end = customEnd || now;
+        if (customStart >= end) return null;
+        return { start: customStart, end };
+    }
+    const durationMs = presetToMilliseconds(rangeValue);
+    return { start: new Date(now.getTime() - durationMs), end: now };
+}
+
+function formatDateTimeShort(date) {
+    if (!(date instanceof Date) || Number.isNaN(date.getTime())) return '';
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function formatTimeHm(date) {
+    if (!(date instanceof Date) || Number.isNaN(date.getTime())) return '00:00';
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function applyTimeOfDay(target, source) {
+    if (!(target instanceof Date)) return null;
+    const next = new Date(target);
+    if (source instanceof Date && !Number.isNaN(source.getTime())) {
+        next.setHours(source.getHours(), source.getMinutes(), 0, 0);
+    }
+    return next;
+}
+
+function applyTimeString(date, hhmm) {
+    if (!(date instanceof Date)) return date;
+    const match = /^(\d{1,2}):(\d{2})$/.exec(hhmm || '');
+    if (!match) return date;
+    const next = new Date(date);
+    next.setHours(Math.min(23, Number(match[1])), Math.min(59, Number(match[2])), 0, 0);
+    return next;
+}
+
+function DateRangePopover({ start, end, onChange }) {
+    const [open, setOpen] = useState(false);
+    const rootRef = useRef(null);
+
+    useEffect(() => {
+        if (!open) return undefined;
+        const onDocMouseDown = (e) => {
+            if (rootRef.current && !rootRef.current.contains(e.target)) setOpen(false);
+        };
+        const onKey = (e) => { if (e.key === 'Escape') setOpen(false); };
+        document.addEventListener('mousedown', onDocMouseDown);
+        document.addEventListener('keydown', onKey);
+        return () => {
+            document.removeEventListener('mousedown', onDocMouseDown);
+            document.removeEventListener('keydown', onKey);
+        };
+    }, [open]);
+
+    const label = start && end
+        ? `${formatDateTimeShort(start)} → ${formatDateTimeShort(end)}`
+        : 'Select range';
+
+    const handleSelect = (range) => {
+        const fromDate = range?.from ? applyTimeOfDay(range.from, start) : null;
+        const toDate = range?.to ? applyTimeOfDay(range.to, end) : null;
+        onChange(fromDate, toDate);
+    };
+
+    return (
+        <div ref={rootRef} className="r-date-range">
+            <button
+                type="button"
+                className="r-field r-date-range-trigger"
+                onClick={() => setOpen((v) => !v)}
+            >
+                {label}
+            </button>
+            {open && (
+                <div className="r-date-range-popover">
+                    <DayPicker
+                        mode="range"
+                        numberOfMonths={2}
+                        selected={{ from: start || undefined, to: end || undefined }}
+                        onSelect={handleSelect}
+                        defaultMonth={start || new Date()}
+                    />
+                    <div className="r-date-range-times">
+                        <label>
+                            <span>From</span>
+                            <input
+                                type="time"
+                                value={formatTimeHm(start)}
+                                onChange={(e) => onChange(applyTimeString(start, e.target.value), end)}
+                                className="r-field"
+                            />
+                        </label>
+                        <label>
+                            <span>To</span>
+                            <input
+                                type="time"
+                                value={formatTimeHm(end)}
+                                onChange={(e) => onChange(start, applyTimeString(end, e.target.value))}
+                                className="r-field"
+                            />
+                        </label>
+                        <RButton size="sm" onClick={() => setOpen(false)}>Done</RButton>
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+}
+
+function chooseCountStepSeconds(rangeMs) {
+    const rangeSeconds = Math.max(60, Math.floor(rangeMs / 1000));
+    if (rangeSeconds <= 3600) return 60;
+    if (rangeSeconds <= 6 * 3600) return 5 * 60;
+    if (rangeSeconds <= 24 * 3600) return 15 * 60;
+    if (rangeSeconds <= 7 * 24 * 3600) return 60 * 60;
+    return 6 * 60 * 60;
+}
+
+function formatRangeLabel(rangeValue, window) {
+    if (!window) return 'Select a valid time range';
+    if (rangeValue === 'custom') {
+        return `${formatDate(window.start.toISOString())} to ${formatDate(window.end.toISOString())}`;
+    }
+    const preset = LOG_RANGE_PRESETS.find((option) => option.value === rangeValue);
+    return preset ? `Last ${preset.label}` : 'Selected range';
+}
+
+async function readSseResponse(response, handlers) {
+    const reader = response.body?.getReader();
+    if (!reader) {
+        throw new Error('Log stream response did not include a body');
+    }
+
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let eventType = 'message';
+
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+
+        lines.forEach((line) => {
+            if (line.startsWith('event: ')) {
+                eventType = line.substring(7);
+            } else if (line.startsWith('data: ')) {
+                const payload = line.substring(6);
+                if (eventType === 'status') {
+                    handlers.onStatus?.(payload);
+                } else if (payload.trim()) {
+                    handlers.onLine?.(payload);
+                }
+            } else if (line === '') {
+                eventType = 'message';
+            }
+        });
+    }
+}
+
+const LOG_PAGE_SIZE = 200;
+const LOG_STREAM_CAP = 2000;
+const LOG_SCROLL_TOP_THRESHOLD = 8;
+const LOG_LONG_LINE_THRESHOLD = 120;
+
+function detectLogLevel(line) {
+    const l = line.toLowerCase();
+    if (/\b(error|err|fatal|panic|exception|failed)\b/.test(l)) return 'error';
+    if (/\b(warn|warning)\b/.test(l)) return 'warn';
+    return 'info';
+}
+
+function parseLogLine(line, seq) {
+    // Backend prepends "<RFC3339> " when timestamps=true.
+    const sp = line.indexOf(' ');
+    const isoCandidate = sp > 0 ? line.slice(0, sp) : '';
+    const date = isoCandidate ? new Date(isoCandidate) : null;
+    const hasTs = date && !Number.isNaN(date.getTime());
+    const timestampMs = hasTs ? date.getTime() : 0;
+    const iso = hasTs ? isoCandidate : '';
+    const raw = hasTs ? line.slice(sp + 1) : line;
+    const parsed = extractLogJson(raw);
+    return {
+        id: `${timestampMs}-${seq}`,
+        timestampMs,
+        iso,
+        raw,
+        level: detectLogLevel(raw),
+        isJson: parsed !== null,
+        parsed,
+    };
+}
+
+function formatHms(timestampMs) {
+    if (!timestampMs) return '--:--:--.---';
+    const d = new Date(timestampMs);
+    const pad2 = (n) => String(n).padStart(2, '0');
+    const pad3 = (n) => String(n).padStart(3, '0');
+    return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}.${pad3(d.getMilliseconds())}`;
+}
+
+function extractLogJson(raw) {
+    const s = raw.trim();
+    if (s.length < 2) return null;
+    const candidates = ['{', '['].map((c) => s.indexOf(c)).filter((i) => i >= 0);
+    if (candidates.length === 0) return null;
+    const idx = Math.min(...candidates);
+    try {
+        return JSON.parse(s.slice(idx));
+    } catch {
+        return null;
+    }
+}
+
+function highlightLogJson(value) {
+    const pretty = JSON.stringify(value, null, 2);
+    const re = /("(?:\\.|[^"\\])*"\s*:|"(?:\\.|[^"\\])*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|\b(?:true|false|null)\b)/g;
+    const out = [];
+    let last = 0;
+    let key = 0;
+    pretty.replace(re, (match, _g1, offset) => {
+        if (offset > last) out.push(pretty.slice(last, offset));
+        let cls = 'json-num';
+        if (match.startsWith('"')) cls = match.endsWith(':') ? 'json-key' : 'json-str';
+        else if (match === 'true' || match === 'false') cls = 'json-bool';
+        else if (match === 'null') cls = 'json-null';
+        out.push(<span key={key++} className={cls}>{match}</span>);
+        last = offset + match.length;
+        return match;
+    });
+    if (last < pretty.length) out.push(pretty.slice(last));
+    return <pre className="r-logs-json">{out}</pre>;
+}
+
+function ExpandedLogLine({ entry }) {
+    if (entry.isJson) return highlightLogJson(entry.parsed);
+    return <span>{entry.raw}</span>;
+}
+
+const LOG_CHART_COLOR_INFO = 'oklch(0.62 0.005 80)';
+const LOG_CHART_COLOR_WARN = 'oklch(0.78 0.13 85)';
+const LOG_CHART_COLOR_ERROR = 'oklch(0.62 0.16 25)';
+
+function formatTickLabel(ms, rangeMs) {
+    const d = new Date(ms);
+    const pad = (n) => String(n).padStart(2, '0');
+    if (rangeMs <= 24 * 3600 * 1000) {
+        return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    }
+    return `${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function LogChartTooltip({ active, payload, stepSeconds }) {
+    if (!active || !payload || payload.length === 0) return null;
+    const b = payload[0].payload;
+    const start = new Date(b.ts);
+    const end = new Date(b.ts + stepSeconds * 1000);
+    return (
+        <div className="r-logs-chart-tip">
+            <div className="r-logs-chart-tip-title">
+                {formatDate(start.toISOString())} – {formatTickLabel(end.getTime(), 0)}
+            </div>
+            <div className="r-logs-chart-tip-row">
+                <span className="dot" style={{ background: LOG_CHART_COLOR_ERROR }} />
+                <span className="lbl">Error</span>
+                <span className="val">{b.error || 0}</span>
+            </div>
+            <div className="r-logs-chart-tip-row">
+                <span className="dot" style={{ background: LOG_CHART_COLOR_WARN }} />
+                <span className="lbl">Warn</span>
+                <span className="val">{b.warn || 0}</span>
+            </div>
+            <div className="r-logs-chart-tip-row">
+                <span className="dot" style={{ background: LOG_CHART_COLOR_INFO }} />
+                <span className="lbl">Info</span>
+                <span className="val">{b.info || 0}</span>
+            </div>
+            <div className="r-logs-chart-tip-total">
+                <span className="lbl">Total</span>
+                <span className="val">{b.total || 0}</span>
+            </div>
+            <div className="r-logs-chart-tip-hint">Click to zoom</div>
+        </div>
+    );
+}
+
+function LogCountsChart({ counts, loading, error, status, rangeLabel, rangeStartMs, rangeEndMs, stepSeconds, onZoomToBucket }) {
+    const data = useMemo(
+        () =>
+            counts.map((b) => ({
+                ...b,
+                ts: new Date(b.timestamp).getTime(),
+            })),
+        [counts],
+    );
+    const totalSum = useMemo(() => data.reduce((sum, b) => sum + (b.total || 0), 0), [data]);
+    const rangeMs = (rangeEndMs || 0) - (rangeStartMs || 0);
+
+    const statusMessage = () => {
+        if (!status) return 'No log volume found for the selected range.';
+        if (status.reason === 'retention_expired_possible') {
+            return status.retention_hint
+                ? `No log volume found. Runtime logs are retained for ${status.retention_hint}, so this range may no longer be available.`
+                : 'No log volume found. It may have expired based on the log backend retention policy.';
+        }
+        if (status.reason === 'historical_backend_not_configured') {
+            return 'Log volume charts are only available with Loki.';
+        }
+        if (status.reason === 'deployment_not_ready') {
+            return 'Deployment logs are not ready yet.';
+        }
+        if (status.reason === 'backend_unavailable') {
+            return 'The log backend is unavailable.';
+        }
+        return 'No log volume found for the selected range.';
+    };
+
+    const handleChartClick = (chartEvent) => {
+        if (!onZoomToBucket) return;
+        const payload = chartEvent?.activePayload?.[0]?.payload;
+        if (!payload) return;
+        const start = new Date(payload.ts);
+        const end = new Date(payload.ts + stepSeconds * 1000);
+        onZoomToBucket(start, end);
+    };
+
+    return (
+        <div className="r-logs-chart" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <div className="flex items-center justify-between gap-3 text-xs text-[var(--text-soft)]">
+                <div className="font-medium text-[var(--text)]">Log volume</div>
+                <div>{rangeLabel}</div>
+            </div>
+            <div
+                className="rounded border border-[var(--border)] bg-[var(--panel)] px-3 py-2"
+                style={{ minHeight: 140 }}
+            >
+                {loading ? (
+                    <div className="py-8 text-center text-xs text-[var(--text-soft)]">Loading chart…</div>
+                ) : error ? (
+                    <div className="py-8 text-center text-xs text-[var(--err)]">{error}</div>
+                ) : !data.length || totalSum === 0 ? (
+                    <div className="py-8 text-center text-xs text-[var(--text-soft)]">{statusMessage()}</div>
+                ) : (
+                    <ResponsiveContainer width="100%" height={120}>
+                        <BarChart
+                            data={data}
+                            onClick={handleChartClick}
+                            margin={{ top: 4, right: 6, bottom: 4, left: -16 }}
+                            barCategoryGap={1}
+                        >
+                            <CartesianGrid stroke="var(--border)" strokeDasharray="2 3" vertical={false} />
+                            <XAxis
+                                dataKey="ts"
+                                type="number"
+                                scale="time"
+                                domain={['dataMin', 'dataMax']}
+                                tickFormatter={(ms) => formatTickLabel(ms, rangeMs)}
+                                tick={{ fontSize: 10, fill: 'var(--text-soft)' }}
+                                axisLine={{ stroke: 'var(--border)' }}
+                                tickLine={{ stroke: 'var(--border)' }}
+                                minTickGap={48}
+                            />
+                            <YAxis
+                                allowDecimals={false}
+                                tick={{ fontSize: 10, fill: 'var(--text-soft)' }}
+                                axisLine={{ stroke: 'var(--border)' }}
+                                tickLine={{ stroke: 'var(--border)' }}
+                                width={36}
+                            />
+                            <RechartsTooltip
+                                content={<LogChartTooltip stepSeconds={stepSeconds} />}
+                                cursor={{ fill: 'oklch(0.22 0.005 80 / 0.45)' }}
+                            />
+                            <Bar dataKey="info" stackId="a" fill={LOG_CHART_COLOR_INFO} isAnimationActive={false} />
+                            <Bar dataKey="warn" stackId="a" fill={LOG_CHART_COLOR_WARN} isAnimationActive={false} />
+                            <Bar dataKey="error" stackId="a" fill={LOG_CHART_COLOR_ERROR} isAnimationActive={false} />
+                        </BarChart>
+                    </ResponsiveContainer>
+                )}
+            </div>
+        </div>
+    );
+}
+
+// Deployment Logs Component with SSE streaming + infinite scroll
 function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
-    // Active deployments auto-follow live logs starting from just the most
-    // recent line; terminal deployments load a larger backlog on demand.
-    const isActiveDeployment = ['Deploying', 'Healthy', 'Unhealthy'].includes(deploymentStatus);
-    const [logs, setLogs] = useState([]);
+    const streamable = STREAMABLE_LOG_STATUSES.has(deploymentStatus);
+    const loggable = LOGGABLE_STATUSES.has(deploymentStatus);
+    const [entries, setEntries] = useState([]);
     const [streaming, setStreaming] = useState(false);
     const [error, setError] = useState(null);
     const [logStatus, setLogStatus] = useState(null);
+    const [counts, setCounts] = useState([]);
+    const [countsLoading, setCountsLoading] = useState(false);
+    const [countsError, setCountsError] = useState(null);
+    const [countsStatus, setCountsStatus] = useState(null);
     const [autoScroll, setAutoScroll] = useState(true);
-    const [tailLines, setTailLines] = useState(isActiveDeployment ? 1 : 1000);
-    const [tailInputValue, setTailInputValue] = useState(isActiveDeployment ? '1' : '1000');
+    const [levelFilter, setLevelFilter] = useState('all');
+    const [rangeValue, setRangeValue] = useState('6h');
+    const [customStart, setCustomStart] = useState(null);
+    const [customEnd, setCustomEnd] = useState(null);
+    const [hasMore, setHasMore] = useState(false);
+    const [loadingMore, setLoadingMore] = useState(false);
+    const [rangeDirty, setRangeDirty] = useState(false);
+    const [expandedIds, setExpandedIds] = useState(() => new Set());
+
     const logBoxRef = useRef(null);
+    const loadMoreRef = useRef(null);
     const abortControllerRef = useRef(null);
+    const countsRequestIdRef = useRef(0);
+    const seqRef = useRef(0);
+    const oldestLoadedMsRef = useRef(null);
+    const initialMountRef = useRef(true);
+    const loadingMoreRef = useRef(false);
+    const ignoreScrollRef = useRef(false);
 
-    const isLoggable = (status) => {
-        // Can view logs for deployments that are running or have run
-        return ['Deploying', 'Healthy', 'Unhealthy', 'Cancelled', 'Stopped', 'Failed', 'Superseded', 'Expired'].includes(status);
-    };
-
-    // Scroll the log container itself (not scrollIntoView, which would also
-    // scroll the whole page window).
-    const scrollToBottom = () => {
-        if (autoScroll && logBoxRef.current) {
-            logBoxRef.current.scrollTop = logBoxRef.current.scrollHeight;
-        }
-    };
-
-    useEffect(() => {
-        scrollToBottom();
-    }, [logs]);
-
-    const startStreaming = useCallback(() => {
-        // Stop any existing stream first
-        if (abortControllerRef.current) {
-            abortControllerRef.current.abort();
-            abortControllerRef.current = null;
-        }
-
-        // Clear existing logs when starting a new stream
-        setLogs([]);
-        setError(null);
-        setLogStatus(null);
-        setStreaming(true);
-
-        const baseUrl = window.API_BASE_URL || '';
-        const url = `${baseUrl}/api/v1/projects/${projectName}/deployments/${deploymentId}/logs?follow=true&tail=${tailLines}`;
-
-        // Create new AbortController for this stream
-        const abortController = new AbortController();
-        abortControllerRef.current = abortController;
-
-        // Use fetch for SSE with cookies
-        fetch(url, {
-            headers: {
-                'Accept': 'text/event-stream',
-            },
-            credentials: 'include',  // Include cookies (rise_jwt)
-            signal: abortController.signal,
-        })
-        .then(response => {
-            if (!response.ok) {
-                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-            }
-
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder();
-            let buffer = '';
-            let eventType = 'message';
-
-            const processStream = () => {
-                reader.read().then(({ done, value }) => {
-                    if (done) {
-                        setStreaming(false);
-                        return;
-                    }
-
-                    buffer += decoder.decode(value, { stream: true });
-                    const lines = buffer.split('\n');
-                    buffer = lines.pop(); // Keep incomplete line in buffer
-
-                    lines.forEach(line => {
-                        if (line.startsWith('event: ')) {
-                            eventType = line.substring(7);
-                        } else if (line.startsWith('data: ')) {
-                            const logLine = line.substring(6); // Remove 'data: ' prefix
-                            if (eventType === 'status') {
-                                try {
-                                    setLogStatus(JSON.parse(logLine));
-                                } catch {
-                                    setLogStatus({ reason: 'backend_unavailable' });
-                                }
-                            } else if (logLine.trim()) {
-                                setLogs(prevLogs => [...prevLogs, logLine]);
-                            }
-                        } else if (line === '') {
-                            eventType = 'message';
-                        }
-                    });
-
-                    processStream();
-                }).catch(err => {
-                    // Ignore abort errors
-                    if (err.name === 'AbortError') {
-                        return;
-                    }
-                    console.error('Stream error:', err);
-                    setError(err.message);
-                    setStreaming(false);
-                });
-            };
-
-            processStream();
-        })
-        .catch(err => {
-            // Ignore abort errors
-            if (err.name === 'AbortError') {
-                return;
-            }
-            console.error('Failed to start log stream:', err);
-            setError(err.message);
-            setStreaming(false);
-        });
-    }, [projectName, deploymentId, tailLines]);
+    const rangeWindow = useMemo(() => resolveLogWindow(rangeValue, customStart, customEnd), [rangeValue, customStart, customEnd]);
+    const rangeLabel = useMemo(() => formatRangeLabel(rangeValue, rangeWindow), [rangeValue, rangeWindow]);
+    const rangeStepSeconds = useMemo(() => {
+        if (!rangeWindow) return 60;
+        return chooseCountStepSeconds(rangeWindow.end.getTime() - rangeWindow.start.getTime());
+    }, [rangeWindow]);
 
     const stopStreaming = useCallback(() => {
         if (abortControllerRef.current) {
@@ -839,140 +1164,399 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
         setStreaming(false);
     }, []);
 
-    const loadInitialLogs = useCallback(async () => {
+    const refreshCounts = useCallback(async () => {
+        if (!rangeWindow) {
+            setCounts([]);
+            setCountsStatus(null);
+            setCountsError('Select a valid time range');
+            return;
+        }
+
+        const requestId = countsRequestIdRef.current + 1;
+        countsRequestIdRef.current = requestId;
+        setCountsLoading(true);
+        setCountsError(null);
+
         const baseUrl = window.API_BASE_URL || '';
-        const url = `${baseUrl}/api/v1/projects/${projectName}/deployments/${deploymentId}/logs?tail=${tailLines}`;
+        const params = new URLSearchParams({
+            start: rangeWindow.start.toISOString(),
+            end: rangeWindow.end.toISOString(),
+            step_seconds: String(rangeStepSeconds),
+        });
 
         try {
-            const response = await fetch(url, {
-                headers: {
-                    'Accept': 'text/event-stream',
+            const response = await fetch(
+                `${baseUrl}/api/v1/projects/${projectName}/deployments/${deploymentId}/logs/counts?${params.toString()}`,
+                {
+                    headers: { 'Accept': 'application/json' },
+                    credentials: 'include',
                 },
-                credentials: 'include',  // Include cookies (rise_jwt)
-            });
+            );
 
             if (!response.ok) {
                 throw new Error(`HTTP ${response.status}: ${response.statusText}`);
             }
 
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder();
-            let buffer = '';
-            let eventType = 'message';
-            const newLogs = [];
-            let status = null;
-
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-
-                buffer += decoder.decode(value, { stream: true });
-                const lines = buffer.split('\n');
-                buffer = lines.pop();
-
-                lines.forEach(line => {
-                    if (line.startsWith('event: ')) {
-                        eventType = line.substring(7);
-                    } else if (line.startsWith('data: ')) {
-                        const logLine = line.substring(6);
-                        if (eventType === 'status') {
-                            try {
-                                status = JSON.parse(logLine);
-                            } catch {
-                                status = { reason: 'backend_unavailable' };
-                            }
-                        } else if (logLine.trim()) {
-                            newLogs.push(logLine);
-                        }
-                    } else if (line === '') {
-                        eventType = 'message';
-                    }
-                });
-            }
-
-            setLogs(newLogs);
-            setLogStatus(status);
+            const data = await response.json();
+            if (countsRequestIdRef.current !== requestId) return;
+            setCounts(data.buckets || []);
+            setCountsStatus(data.status || null);
         } catch (err) {
+            if (countsRequestIdRef.current !== requestId) return;
+            console.error('Failed to load log counts:', err);
+            setCounts([]);
+            setCountsStatus(null);
+            setCountsError(err.message);
+        } finally {
+            if (countsRequestIdRef.current === requestId) {
+                setCountsLoading(false);
+            }
+        }
+    }, [deploymentId, projectName, rangeStepSeconds, rangeWindow]);
+
+    // Cancellable SSE fetch. `onLine` receives raw (timestamped) lines.
+    const fetchLogFeed = useCallback(async ({ follow, start, end, tail, level, onLine, onStatus }) => {
+        if (abortControllerRef.current) {
+            abortControllerRef.current.abort();
+            abortControllerRef.current = null;
+        }
+
+        const controller = new AbortController();
+        abortControllerRef.current = controller;
+
+        const baseUrl = window.API_BASE_URL || '';
+        const params = new URLSearchParams({
+            timestamps: 'true',
+            tail: String(tail),
+        });
+        if (follow) {
+            params.set('follow', 'true');
+        }
+        if (start) params.set('start', start);
+        if (end) params.set('end', end);
+        if (level && level !== 'all') params.set('level', level);
+
+        const response = await fetch(
+            `${baseUrl}/api/v1/projects/${projectName}/deployments/${deploymentId}/logs?${params.toString()}`,
+            {
+                headers: { 'Accept': 'text/event-stream' },
+                credentials: 'include',
+                signal: controller.signal,
+            },
+        );
+
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+
+        await readSseResponse(response, { onLine, onStatus });
+    }, [deploymentId, projectName]);
+
+    const loadHistoricalLogs = useCallback(async () => {
+        if (!rangeWindow) {
+            setError('Select a valid time range.');
+            setCounts([]);
+            setCountsStatus(null);
+            setCountsError('Select a valid time range.');
+            setCountsLoading(false);
+            return;
+        }
+
+        setEntries([]);
+        setExpandedIds(new Set());
+        setError(null);
+        setLogStatus(null);
+        setStreaming(false);
+        setHasMore(false);
+        oldestLoadedMsRef.current = null;
+
+        const collected = [];
+        let newStatus = null;
+
+        try {
+            await fetchLogFeed({
+                follow: false,
+                start: rangeWindow.start.toISOString(),
+                end: rangeWindow.end.toISOString(),
+                tail: LOG_PAGE_SIZE,
+                level: levelFilter,
+                onLine: (line) => {
+                    collected.push(parseLogLine(line, seqRef.current++));
+                },
+                onStatus: (payload) => {
+                    try {
+                        newStatus = JSON.parse(payload);
+                    } catch {
+                        newStatus = { reason: 'backend_unavailable' };
+                    }
+                },
+            });
+            // Backend sorts ascending; reverse so newest is on top.
+            const reversed = collected.slice().reverse();
+            setEntries(reversed);
+            setLogStatus(newStatus);
+            setRangeDirty(false);
+            if (reversed.length > 0) {
+                oldestLoadedMsRef.current = reversed[reversed.length - 1].timestampMs;
+            }
+            setHasMore(collected.length === LOG_PAGE_SIZE);
+        } catch (err) {
+            if (err.name === 'AbortError') return;
             console.error('Failed to load logs:', err);
             setError(err.message);
-        }
-    }, [projectName, deploymentId, tailLines]);
-
-    // On open, automatically show logs: live-follow active deployments (from
-    // the most recent line) or load the backlog for terminal ones. Runs once
-    // per deployment; the cleanup stops the stream on unmount. Written so it
-    // survives React StrictMode's mount/unmount/remount cycle.
-    useEffect(() => {
-        if (isLoggable(deploymentStatus)) {
-            const terminal = ['Cancelled', 'Stopped', 'Superseded', 'Failed', 'Expired'].includes(deploymentStatus);
-            if (terminal) {
-                loadInitialLogs();
-            } else {
-                startStreaming();
+        } finally {
+            if (abortControllerRef.current) {
+                abortControllerRef.current = null;
             }
         }
+    }, [fetchLogFeed, rangeWindow, levelFilter]);
+
+    const loadOlder = useCallback(async () => {
+        if (loadingMoreRef.current) return;
+        if (!hasMore) return;
+        if (!rangeWindow) return;
+        const oldestMs = oldestLoadedMsRef.current;
+        if (!oldestMs) return;
+
+        loadingMoreRef.current = true;
+        setLoadingMore(true);
+
+        const baseUrl = window.API_BASE_URL || '';
+        const params = new URLSearchParams({
+            timestamps: 'true',
+            tail: String(LOG_PAGE_SIZE),
+            start: rangeWindow.start.toISOString(),
+            end: new Date(oldestMs).toISOString(),
+        });
+        if (levelFilter && levelFilter !== 'all') params.set('level', levelFilter);
+
+        try {
+            const response = await fetch(
+                `${baseUrl}/api/v1/projects/${projectName}/deployments/${deploymentId}/logs?${params.toString()}`,
+                {
+                    headers: { 'Accept': 'text/event-stream' },
+                    credentials: 'include',
+                },
+            );
+
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+
+            const collected = [];
+            await readSseResponse(response, {
+                onLine: (line) => {
+                    collected.push(parseLogLine(line, seqRef.current++));
+                },
+            });
+
+            const reversed = collected.slice().reverse();
+            setEntries((prev) => {
+                const seen = new Set(prev.map((e) => e.id));
+                const filtered = reversed.filter((e) => !seen.has(e.id) && e.timestampMs < oldestMs);
+                if (filtered.length === 0) return prev;
+                return prev.concat(filtered);
+            });
+            if (reversed.length > 0) {
+                oldestLoadedMsRef.current = reversed[reversed.length - 1].timestampMs;
+            }
+            setHasMore(collected.length === LOG_PAGE_SIZE);
+        } catch (err) {
+            console.error('Failed to load older logs:', err);
+        } finally {
+            loadingMoreRef.current = false;
+            setLoadingMore(false);
+        }
+    }, [deploymentId, projectName, hasMore, rangeWindow, levelFilter]);
+
+    const startStreaming = useCallback(async () => {
+        setEntries([]);
+        setExpandedIds(new Set());
+        setError(null);
+        setLogStatus(null);
+        setStreaming(true);
+        setHasMore(false);
+        oldestLoadedMsRef.current = null;
+        setRangeDirty(false);
+
+        try {
+            await fetchLogFeed({
+                follow: true,
+                tail: 1,
+                level: levelFilter,
+                onLine: (line) => {
+                    const newEntry = parseLogLine(line, seqRef.current++);
+                    setEntries((prev) => {
+                        // Loki tail can deliver lines slightly out-of-order; keep
+                        // the array sorted descending by timestamp.
+                        let i = 0;
+                        while (i < prev.length && prev[i].timestampMs > newEntry.timestampMs) i++;
+                        if (i < prev.length && prev[i].id === newEntry.id) return prev;
+                        const next = prev.slice();
+                        next.splice(i, 0, newEntry);
+                        if (next.length > LOG_STREAM_CAP) next.length = LOG_STREAM_CAP;
+                        return next;
+                    });
+                    if (newEntry.timestampMs > 0
+                        && (oldestLoadedMsRef.current === null
+                            || newEntry.timestampMs < oldestLoadedMsRef.current)) {
+                        oldestLoadedMsRef.current = newEntry.timestampMs;
+                    }
+                    setHasMore(true);
+                },
+                onStatus: (payload) => {
+                    try {
+                        setLogStatus(JSON.parse(payload));
+                    } catch {
+                        setLogStatus({ reason: 'backend_unavailable' });
+                    }
+                },
+            });
+        } catch (err) {
+            if (err.name === 'AbortError') return;
+            console.error('Failed to start log stream:', err);
+            setError(err.message);
+        } finally {
+            if (abortControllerRef.current) {
+                abortControllerRef.current = null;
+            }
+            setStreaming(false);
+        }
+    }, [fetchLogFeed, levelFilter]);
+
+    // Refresh the volume chart whenever the time range changes, independent
+    // of whether the user has clicked Refresh / toggled streaming. A small
+    // debounce smooths out custom datetime-local edits.
+    useEffect(() => {
+        if (!loggable) return undefined;
+        if (!rangeWindow) return undefined;
+        const handle = window.setTimeout(() => { void refreshCounts(); }, 250);
+        return () => window.clearTimeout(handle);
+    }, [rangeWindow, loggable, refreshCounts]);
+
+    // Mark the range dirty when the user picks a different window after the
+    // initial load, so we can hint that the log list is stale until Refresh.
+    useEffect(() => {
+        if (initialMountRef.current) {
+            initialMountRef.current = false;
+            return;
+        }
+        setRangeDirty(true);
+    }, [rangeWindow]);
+
+    // Reload on deployment identity/status changes, and also when the user
+    // changes the level filter (so the backend can filter the stream/page
+    // queries themselves rather than us paginating until we trip the filter
+    // client-side).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    useEffect(() => {
+        if (!loggable) {
+            return undefined;
+        }
+        if (streamable) {
+            void startStreaming();
+        } else {
+            void loadHistoricalLogs();
+        }
         return () => stopStreaming();
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [deploymentId]);
+    }, [deploymentId, deploymentStatus, levelFilter]);
+
+    // Pin scroll to top when new entries arrive at the top and auto-scroll is on.
+    useEffect(() => {
+        if (!autoScroll) return;
+        const box = logBoxRef.current;
+        if (!box) return;
+        ignoreScrollRef.current = true;
+        box.scrollTop = 0;
+        // Release the guard on the next frame so any synthetic scroll event from
+        // the programmatic write doesn't toggle autoScroll off again.
+        const handle = window.requestAnimationFrame(() => {
+            ignoreScrollRef.current = false;
+        });
+        return () => window.cancelAnimationFrame(handle);
+    }, [entries, autoScroll]);
+
+    // IntersectionObserver for infinite scroll: when sentinel near the bottom
+    // becomes visible, load older logs.
+    useEffect(() => {
+        const sentinel = loadMoreRef.current;
+        if (!sentinel) return undefined;
+        if (!hasMore) return undefined;
+        const observer = new IntersectionObserver((records) => {
+            for (const record of records) {
+                if (record.isIntersecting) {
+                    void loadOlder();
+                    break;
+                }
+            }
+        }, { root: logBoxRef.current, rootMargin: '120px 0px' });
+        observer.observe(sentinel);
+        return () => observer.disconnect();
+    }, [hasMore, loadOlder, entries.length]);
+
+    const isHistoricalUnavailable = countsStatus?.reason === 'historical_backend_not_configured';
 
     const clearLogs = () => {
-        setLogs([]);
+        setEntries([]);
+        setExpandedIds(new Set());
         setLogStatus(null);
+        setError(null);
+        setHasMore(false);
+        oldestLoadedMsRef.current = null;
     };
 
-    const handleTailLinesChange = (e) => {
-        setTailInputValue(e.target.value);
+    const handleRangeChange = (value) => {
+        setRangeValue(value);
+        if (value === 'custom' && !customStart && !customEnd) {
+            const now = new Date();
+            setCustomEnd(now);
+            setCustomStart(new Date(now.getTime() - presetToMilliseconds('6h')));
+        }
     };
 
-    const handleTailLinesBlur = () => {
-        const newTail = parseInt(tailInputValue, 10);
-        if (!isNaN(newTail) && newTail > 0) {
-            setTailLines(newTail);
+    const handleCustomRangeChange = (newStart, newEnd) => {
+        setCustomStart(newStart);
+        setCustomEnd(newEnd);
+    };
+
+    const handleZoomToBucket = useCallback((start, end) => {
+        setRangeValue('custom');
+        setCustomStart(start);
+        setCustomEnd(end);
+    }, []);
+
+    const handleRefresh = useCallback(() => {
+        if (streamable) {
+            void startStreaming();
         } else {
-            // Reset to current value if invalid
-            setTailInputValue(tailLines.toString());
+            void loadHistoricalLogs();
         }
-    };
-
-    const handleTailLinesKeyPress = (e) => {
-        if (e.key === 'Enter') {
-            e.target.blur(); // Trigger blur which will handle the update
-        }
-    };
-
-    // Effect to restart streaming when tailLines changes and we're currently streaming
-    useEffect(() => {
-        if (streaming) {
-            startStreaming();
-        }
-    }, [tailLines]); // Only depend on tailLines, not streaming or startStreaming to avoid loops
-
-    const [levelFilter, setLevelFilter] = useState('all');
-
-    // Heuristic log-level detection for styling + filtering. Raw log lines have
-    // no structured level, so we infer it from the message text.
-    const detectLevel = (line) => {
-        const l = line.toLowerCase();
-        if (/\b(error|err|fatal|panic|exception|failed)\b/.test(l)) return 'error';
-        if (/\b(warn|warning)\b/.test(l)) return 'warn';
-        return 'info';
-    };
-
-    if (!isLoggable(deploymentStatus)) {
-        return null;
-    }
-
-    const visibleLogs = logs
-        .map((log, idx) => ({ log, idx, level: detectLevel(log) }))
-        .filter((entry) => levelFilter === 'all' || entry.level === levelFilter);
+    }, [streamable, startStreaming, loadHistoricalLogs]);
 
     const handleCopyLogs = async () => {
         try {
-            await copyToClipboard(logs.join('\n'));
+            await copyToClipboard(entries.map((e) => e.iso ? `${e.iso} ${e.raw}` : e.raw).join('\n'));
         } catch {
             /* noop */
         }
     };
+
+    const handleScroll = useCallback(() => {
+        if (ignoreScrollRef.current) return;
+        const box = logBoxRef.current;
+        if (!box) return;
+        const atTop = box.scrollTop <= LOG_SCROLL_TOP_THRESHOLD;
+        setAutoScroll((prev) => (prev === atTop ? prev : atTop));
+    }, []);
+
+    const toggleExpanded = useCallback((id) => {
+        setExpandedIds((prev) => {
+            const next = new Set(prev);
+            if (next.has(id)) next.delete(id);
+            else next.add(id);
+            return next;
+        });
+    }, []);
 
     const renderLogStatus = () => {
         if (!logStatus) return null;
@@ -993,6 +1577,14 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
         return 'No logs found.';
     };
 
+    if (!loggable) {
+        return null;
+    }
+
+    // Backend already applies the level filter, so the entries array contains
+    // only matching lines.
+    const visibleEntries = entries;
+
     return (
         <Panel style={{ display: 'flex', flexDirection: 'column' }}>
             <div className="r-panel-head r-logs-head">
@@ -1006,29 +1598,21 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                     />
                 </div>
                 <div className="r-logs-head-right">
-                    <label className="r-logs-tail">
-                        <span>Tail</span>
-                        <input
-                            type="number"
-                            value={tailInputValue}
-                            onChange={handleTailLinesChange}
-                            onBlur={handleTailLinesBlur}
-                            onKeyPress={handleTailLinesKeyPress}
-                            min="1"
-                            className="r-field"
-                        />
-                    </label>
-                    <StreamToggle
-                        streaming={streaming}
-                        autoScroll={autoScroll}
-                        onToggleStream={() => (streaming ? stopStreaming() : startStreaming())}
-                        onToggleAutoScroll={() => setAutoScroll((v) => !v)}
+                    <Segmented
+                        value={rangeValue}
+                        options={LOG_RANGE_PRESETS.map((option) => ({ value: option.value, label: option.label }))}
+                        onChange={handleRangeChange}
                     />
-                    {!streaming && (
-                        <RButton size="sm" onClick={loadInitialLogs}>Load</RButton>
+                    {rangeValue === 'custom' && (
+                        <DateRangePopover
+                            start={customStart}
+                            end={customEnd}
+                            onChange={handleCustomRangeChange}
+                        />
                     )}
-                    <RButton size="sm" onClick={clearLogs} disabled={logs.length === 0}>Clear</RButton>
-                    <RButton size="sm" onClick={handleCopyLogs} disabled={logs.length === 0} title="Copy logs">
+                    <RButton size="sm" onClick={handleRefresh}>Refresh</RButton>
+                    <RButton size="sm" onClick={clearLogs} disabled={entries.length === 0}>Clear</RButton>
+                    <RButton size="sm" onClick={handleCopyLogs} disabled={entries.length === 0} title="Copy logs">
                         <Icon name="copy" size={11} />
                     </RButton>
                 </div>
@@ -1040,23 +1624,92 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                         <div style={{ flex: 1 }}>Error: {error}</div>
                     </div>
                 )}
-                <div ref={logBoxRef} className="r-logs" style={{ height: 'calc(100vh - 340px)', minHeight: 360, flex: 'none' }}>
-                    {visibleLogs.length === 0 ? (
+                <LogCountsChart
+                    counts={counts}
+                    loading={countsLoading}
+                    error={countsError}
+                    status={countsStatus}
+                    rangeLabel={rangeLabel}
+                    rangeStartMs={rangeWindow?.start.getTime() || 0}
+                    rangeEndMs={rangeWindow?.end.getTime() || 0}
+                    stepSeconds={rangeStepSeconds}
+                    onZoomToBucket={handleZoomToBucket}
+                />
+                {isHistoricalUnavailable && (
+                    <div className="text-xs text-[var(--text-soft)]">
+                        Historical volume charts are not available for this log backend.
+                    </div>
+                )}
+                {rangeDirty && !streaming && (
+                    <div className="text-xs text-[var(--text-soft)]" style={{ padding: '4px 2px' }}>
+                        Range changed &mdash; click <strong>Refresh</strong> to reload logs.
+                    </div>
+                )}
+                <div
+                    ref={logBoxRef}
+                    className="r-logs"
+                    onScroll={handleScroll}
+                    style={{ height: 'calc(100vh - 380px)', minHeight: 360, flex: 'none' }}
+                >
+                    {visibleEntries.length === 0 ? (
                         <div style={{ textAlign: 'center', padding: '32px 0', color: 'oklch(0.55 0.005 80)' }}>
-                            {logs.length === 0
-                                ? (renderLogStatus() || (streaming ? 'Waiting for logs...' : 'No logs yet. Click "Load" or "Follow" to view.'))
+                            {entries.length === 0
+                                ? (renderLogStatus() || (streaming ? 'Waiting for logs...' : 'No logs yet. Click "Refresh" or "Follow" to view.'))
                                 : 'No log lines match this filter.'}
                         </div>
                     ) : (
-                        visibleLogs.map((entry) => (
-                            <div
-                                key={entry.idx}
-                                className={`lv-${entry.level}`}
-                                style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}
-                            >
-                                {entry.log}
-                            </div>
-                        ))
+                        <>
+                            {visibleEntries.map((entry) => {
+                                const expanded = expandedIds.has(entry.id);
+                                const canExpand = entry.isJson || entry.raw.length > LOG_LONG_LINE_THRESHOLD;
+                                const actionLabel = expanded
+                                    ? (entry.isJson ? 'Collapse JSON' : 'Show less')
+                                    : (entry.isJson ? 'Expand JSON' : 'Show more');
+                                const classes = `r-logs-row lv-${entry.level}`
+                                    + (canExpand ? ' is-expandable' : '')
+                                    + (expanded ? ' is-expanded' : '');
+                                return (
+                                    <div
+                                        key={entry.id}
+                                        role={canExpand ? 'button' : undefined}
+                                        tabIndex={canExpand ? 0 : undefined}
+                                        className={classes}
+                                        title={entry.iso}
+                                        onClick={canExpand ? () => toggleExpanded(entry.id) : undefined}
+                                        onKeyDown={canExpand ? (e) => {
+                                            if (e.key === 'Enter' || e.key === ' ') {
+                                                e.preventDefault();
+                                                toggleExpanded(entry.id);
+                                            }
+                                        } : undefined}
+                                    >
+                                        <span className="r-logs-ts">{formatHms(entry.timestampMs)}</span>
+                                        {expanded ? <ExpandedLogLine entry={entry} /> : <span>{entry.raw}</span>}
+                                        {canExpand && (
+                                            <button
+                                                type="button"
+                                                className="r-logs-action"
+                                                onClick={(e) => {
+                                                    e.stopPropagation();
+                                                    toggleExpanded(entry.id);
+                                                    e.currentTarget.blur();
+                                                }}
+                                            >
+                                                {actionLabel}
+                                            </button>
+                                        )}
+                                    </div>
+                                );
+                            })}
+                            {hasMore && (
+                                <div ref={loadMoreRef} className="r-logs-loader">
+                                    {loadingMore ? 'Loading older…' : ' '}
+                                </div>
+                            )}
+                            {!hasMore && entries.length > 0 && !streaming && (
+                                <div className="r-logs-loader" style={{ opacity: 0.6 }}>End of range</div>
+                            )}
+                        </>
                     )}
                 </div>
             </PanelBody>

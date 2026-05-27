@@ -13,6 +13,7 @@ import '@fontsource/inter/700.css';
 import '@fontsource/jetbrains-mono/400.css';
 import '@fontsource/jetbrains-mono/500.css';
 import '@fontsource/jetbrains-mono/600.css';
+import 'react-day-picker/style.css';
 import './styles/index.css';
 import './styles/rise.css';
 import './styles/legacy.css';

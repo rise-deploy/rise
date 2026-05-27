@@ -114,5 +114,4 @@ impl DeploymentBackend for KubernetesBackend {
         }
         Ok(())
     }
-
 }
