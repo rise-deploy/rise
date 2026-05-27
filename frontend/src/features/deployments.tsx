@@ -1488,10 +1488,14 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
         setLoadingMore(true);
 
         const baseUrl = CONFIG.backendUrl;
+        // Intentionally no `start` — let pagination extend past the user's
+        // selected range and surface whatever the backend still holds
+        // (kubelet buffer for K8s, configured retention for Loki, capped
+        // at deployment.created_at). The log list dims out-of-range
+        // timestamps so the user can see they're past the chart window.
         const params = new URLSearchParams({
             timestamps: 'true',
             tail: String(LOG_PAGE_SIZE),
-            start: logWindow.start.toISOString(),
             end: new Date(oldestMs).toISOString(),
         });
         if (levelFilter && levelFilter !== 'all') params.set('level', levelFilter);
@@ -1985,7 +1989,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                             )}
                             {!hasMore && entries.length > 0 && (
                                 <div className="r-logs-loader" style={{ opacity: 0.6 }}>
-                                    Start of selected range
+                                    End of log stream
                                 </div>
                             )}
                         </>
