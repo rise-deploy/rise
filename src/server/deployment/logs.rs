@@ -48,6 +48,8 @@ pub struct LogCountsQuery {
     pub start_time: DateTime<Utc>,
     pub end_time: DateTime<Utc>,
     pub step_seconds: i64,
+    pub level: LogLevelFilter,
+    pub search: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -499,6 +501,22 @@ impl LokiLogBackend {
         Ok(stream.boxed())
     }
 
+    async fn query_counts_or_empty(
+        &self,
+        query: Option<String>,
+        start_time: DateTime<Utc>,
+        end_time: DateTime<Utc>,
+        step_seconds: i64,
+    ) -> Result<BTreeMap<i64, u64>> {
+        match query {
+            Some(q) => {
+                self.query_counts_series(q, start_time, end_time, step_seconds)
+                    .await
+            }
+            None => Ok(BTreeMap::new()),
+        }
+    }
+
     async fn query_counts_series(
         &self,
         query: String,
@@ -653,13 +671,23 @@ impl RuntimeLogBackend for LokiLogBackend {
 
         let base = self.base_selector(deployment, project);
         let range = format!("[{}s]", query.step_seconds.max(1));
-        let total_query = format!("sum(count_over_time({base}{range}))");
-        let warn_selector = level_filtered_selector(&base, LogLevelFilter::Warn);
-        let error_selector = level_filtered_selector(&base, LogLevelFilter::Error);
-        let info_selector = level_filtered_selector(&base, LogLevelFilter::Info);
-        let warn_query = format!("sum(count_over_time(({warn_selector}){range}))");
-        let error_query = format!("sum(count_over_time(({error_selector}){range}))");
-        let info_query = format!("sum(count_over_time(({info_selector}){range}))");
+        // The chart should reflect the same filters as the log list. We layer
+        // the search filter onto each per-level sub-query and skip levels that
+        // the user filtered out (their bars would always read zero).
+        let search = query.search.as_deref();
+        let total_selector = append_search_filter(&base, search);
+        let total_query = format!("sum(count_over_time(({total_selector}){range}))");
+        let build_segment = |level: LogLevelFilter| -> Option<String> {
+            if query.level != LogLevelFilter::All && query.level != level {
+                return None;
+            }
+            let selector = level_filtered_selector(&base, level);
+            let selector = append_search_filter(&selector, search);
+            Some(format!("sum(count_over_time(({selector}){range}))"))
+        };
+        let warn_query = build_segment(LogLevelFilter::Warn);
+        let error_query = build_segment(LogLevelFilter::Error);
+        let info_query = build_segment(LogLevelFilter::Info);
 
         let (total, warn, error, info) = futures::try_join!(
             self.query_counts_series(
@@ -668,19 +696,19 @@ impl RuntimeLogBackend for LokiLogBackend {
                 query.end_time,
                 query.step_seconds,
             ),
-            self.query_counts_series(
+            self.query_counts_or_empty(
                 warn_query,
                 query.start_time,
                 query.end_time,
                 query.step_seconds,
             ),
-            self.query_counts_series(
+            self.query_counts_or_empty(
                 error_query,
                 query.start_time,
                 query.end_time,
                 query.step_seconds,
             ),
-            self.query_counts_series(
+            self.query_counts_or_empty(
                 info_query,
                 query.start_time,
                 query.end_time,

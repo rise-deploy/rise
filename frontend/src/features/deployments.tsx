@@ -1019,7 +1019,7 @@ function LogChartTooltip({ active, payload, stepSeconds }) {
     );
 }
 
-function LogCountsChart({ counts, loading, error, status, rangeLabel, rangeStartMs, rangeEndMs, stepSeconds, onZoomToBucket }) {
+function LogCountsChart({ counts, loading, error, status, rangeLabel, rangeStartMs, rangeEndMs, stepSeconds, onZoomToBucket, collapsed, onToggleCollapsed }) {
     const data = useMemo(
         () =>
             counts.map((b) => ({
@@ -1061,10 +1061,19 @@ function LogCountsChart({ counts, loading, error, status, rangeLabel, rangeStart
 
     return (
         <div className="r-logs-chart" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            <div className="flex items-center justify-between gap-3 text-xs text-[var(--text-soft)]">
-                <div className="font-medium text-[var(--text)]">Log volume</div>
-                <div>{rangeLabel}</div>
-            </div>
+            <button
+                type="button"
+                className="r-logs-chart-head"
+                onClick={onToggleCollapsed}
+                aria-expanded={!collapsed}
+            >
+                <span className="r-logs-chart-head-toggle">
+                    <Icon name={collapsed ? 'chev' : 'chevd'} size={12} />
+                </span>
+                <span className="r-logs-chart-head-title">Log volume</span>
+                <span className="r-logs-chart-head-range">{rangeLabel}</span>
+            </button>
+            {collapsed ? null : (
             <div
                 className="rounded border border-[var(--border)] bg-[var(--panel)] px-3 py-2"
                 style={{ minHeight: 140 }}
@@ -1080,7 +1089,7 @@ function LogCountsChart({ counts, loading, error, status, rangeLabel, rangeStart
                         <BarChart
                             data={data}
                             onClick={handleChartClick}
-                            margin={{ top: 4, right: 6, bottom: 4, left: -16 }}
+                            margin={{ top: 4, right: 6, bottom: 4, left: 4 }}
                             barCategoryGap={1}
                         >
                             <CartesianGrid stroke="var(--border)" strokeDasharray="2 3" vertical={false} />
@@ -1100,7 +1109,7 @@ function LogCountsChart({ counts, loading, error, status, rangeLabel, rangeStart
                                 tick={{ fontSize: 10, fill: 'var(--text-soft)' }}
                                 axisLine={{ stroke: 'var(--border)' }}
                                 tickLine={{ stroke: 'var(--border)' }}
-                                width={36}
+                                width={44}
                             />
                             <RechartsTooltip
                                 content={<LogChartTooltip stepSeconds={stepSeconds} />}
@@ -1113,6 +1122,7 @@ function LogCountsChart({ counts, loading, error, status, rangeLabel, rangeStart
                     </ResponsiveContainer>
                 )}
             </div>
+            )}
         </div>
     );
 }
@@ -1139,6 +1149,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
     const [expandedIds, setExpandedIds] = useState(() => new Set());
     const [searchInput, setSearchInput] = useState('');
     const [searchActive, setSearchActive] = useState('');
+    const [chartCollapsed, setChartCollapsed] = useState(true);
 
     const logBoxRef = useRef(null);
     const loadMoreRef = useRef(null);
@@ -1184,6 +1195,8 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
             end: rangeWindow.end.toISOString(),
             step_seconds: String(rangeStepSeconds),
         });
+        if (levelFilter && levelFilter !== 'all') params.set('level', levelFilter);
+        if (searchActive) params.set('search', searchActive);
 
         try {
             const response = await fetch(
@@ -1213,7 +1226,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                 setCountsLoading(false);
             }
         }
-    }, [deploymentId, projectName, rangeStepSeconds, rangeWindow]);
+    }, [deploymentId, projectName, rangeStepSeconds, rangeWindow, levelFilter, searchActive]);
 
     // Cancellable SSE fetch. `onLine` receives raw (timestamped) lines.
     const fetchLogFeed = useCallback(async ({ follow, start, end, tail, level, search, onLine, onStatus }) => {
@@ -1433,15 +1446,17 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
         }
     }, [fetchLogFeed, levelFilter, searchActive]);
 
-    // Refresh the volume chart whenever the time range changes, independent
-    // of whether the user has clicked Refresh / toggled streaming. A small
-    // debounce smooths out custom datetime-local edits.
+    // Refresh the volume chart whenever the time range or filters change. A
+    // small debounce smooths out custom datetime-local edits. Skip entirely
+    // while the chart is collapsed so we don't query Loki for data nobody is
+    // looking at.
     useEffect(() => {
         if (!loggable) return undefined;
         if (!rangeWindow) return undefined;
+        if (chartCollapsed) return undefined;
         const handle = window.setTimeout(() => { void refreshCounts(); }, 250);
         return () => window.clearTimeout(handle);
-    }, [rangeWindow, loggable, refreshCounts]);
+    }, [rangeWindow, loggable, refreshCounts, chartCollapsed]);
 
     // Reload on deployment identity/status changes, when the user changes the
     // level/search filters, and when the visible time range changes. A preset
@@ -1652,6 +1667,8 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                     rangeEndMs={rangeWindow?.end.getTime() || 0}
                     stepSeconds={rangeStepSeconds}
                     onZoomToBucket={handleZoomToBucket}
+                    collapsed={chartCollapsed}
+                    onToggleCollapsed={() => setChartCollapsed((v) => !v)}
                 />
                 {isHistoricalUnavailable && (
                     <div className="text-xs text-[var(--text-soft)]">

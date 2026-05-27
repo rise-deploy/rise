@@ -2298,6 +2298,10 @@ pub struct LogCountsParams {
     /// Bucket step in seconds
     #[serde(default = "default_log_count_step_seconds")]
     pub step_seconds: i64,
+    /// Restrict to lines matching one of "info", "warn", "error".
+    pub level: Option<String>,
+    /// Case-insensitive substring filter applied to each line.
+    pub search: Option<String>,
 }
 
 /// Stream logs from a deployment via Server-Sent Events
@@ -2483,6 +2487,12 @@ pub async fn count_deployment_logs(
         ));
     }
 
+    let level = crate::server::deployment::logs::LogLevelFilter::parse(params.level.as_deref());
+    let search = params
+        .search
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let counts = state
         .runtime_log_backend
         .count_logs(
@@ -2492,6 +2502,8 @@ pub async fn count_deployment_logs(
                 start_time,
                 end_time,
                 step_seconds: params.step_seconds.max(1),
+                level,
+                search,
             },
         )
         .await
