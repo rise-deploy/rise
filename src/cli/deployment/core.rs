@@ -1856,7 +1856,33 @@ pub(super) async fn open_log_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_git_url;
+    use super::{extract_log_event, normalize_git_url};
+
+    #[test]
+    fn extract_log_event_reads_line_and_level() {
+        let payload = r#"{"line":"2026-05-27T22:29:06+00:00 {\"level\":\"warn\",\"msg\":\"HTTP/2 skipped\"}","level":"warn"}"#;
+        let (line, level) = extract_log_event(payload);
+        assert_eq!(level, "warn");
+        assert!(line.contains("HTTP/2 skipped"));
+    }
+
+    #[test]
+    fn extract_log_event_handles_level_first_field() {
+        // serde_json::Value doesn't care about field order, but verify
+        // explicitly since the wire format isn't field-order-stable.
+        let payload = r#"{"level":"error","line":"boom"}"#;
+        let (line, level) = extract_log_event(payload);
+        assert_eq!(level, "error");
+        assert_eq!(line, "boom");
+    }
+
+    #[test]
+    fn extract_log_event_missing_level_yields_empty_string() {
+        let payload = r#"{"line":"plain"}"#;
+        let (line, level) = extract_log_event(payload);
+        assert_eq!(line, "plain");
+        assert_eq!(level, "");
+    }
 
     #[test]
     fn normalizes_scp_like_url() {
