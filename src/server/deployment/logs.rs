@@ -515,8 +515,11 @@ impl LokiLogBackend {
             .data
             .result
             .into_iter()
-            .flat_map(|stream| stream.values.into_iter())
-            .filter_map(LogLine::from_loki_value)
+            .flat_map(|stream| {
+                let level = stream.stream.get("detected_level").cloned();
+                stream.values.into_iter().map(move |v| (v, level.clone()))
+            })
+            .filter_map(|(value, level)| LogLine::from_loki_value(value, level.as_deref()))
             .collect::<Vec<_>>();
         lines.sort_by_key(|line| line.timestamp_nanos);
         Ok(lines)
@@ -622,8 +625,9 @@ impl LokiLogBackend {
                         let response: LokiTailResponse = serde_json::from_str(&payload)
                             .context("Invalid Loki tail payload")?;
                         for stream in response.streams {
+                            let stream_level = stream.stream.get("detected_level").cloned();
                             for value in stream.values {
-                                if let Some(line) = LogLine::from_loki_value(value) {
+                                if let Some(line) = LogLine::from_loki_value(value, stream_level.as_deref()) {
                                     let level = line.classified_level();
                                     yield LogEvent::Line {
                                         text: line.render(query.timestamps),
@@ -923,17 +927,23 @@ struct LogLine {
 }
 
 impl LogLine {
-    fn from_loki_value(value: LokiValue) -> Option<Self> {
+    fn from_loki_value(value: LokiValue, stream_level: Option<&str>) -> Option<Self> {
         let LokiValue {
             timestamp,
             line,
             structured_metadata,
         } = value;
         let timestamp_nanos = timestamp.parse().ok()?;
+        // Prefer per-entry structured metadata (Loki 3.x optional 3-tuple
+        // shape), then fall back to the stream-level label (the form Loki
+        // actually emits today). Either way, an empty string means "not
+        // classified".
         let detected_level = structured_metadata
             .as_ref()
             .and_then(|m| m.get("detected_level"))
-            .cloned();
+            .cloned()
+            .or_else(|| stream_level.map(str::to_string))
+            .filter(|s| !s.trim().is_empty());
         // Loki stores log entries with the trailing newline that the container
         // wrote to its log file. The Kubernetes backend doesn't see those
         // newlines because `AsyncBufRead::lines()` strips them — match that
@@ -1040,6 +1050,12 @@ struct LokiTailResponse {
 
 #[derive(Deserialize)]
 struct LokiStream {
+    /// Loki returns the stream's labels here. `detected_level` is the most
+    /// important one for us — Loki 3.x attaches it as a stream-level label
+    /// (not per-entry structured metadata), so reading it requires plucking
+    /// from this map. Empty when the response has no labels.
+    #[serde(default)]
+    stream: std::collections::HashMap<String, String>,
     values: Vec<LokiValue>,
 }
 
@@ -1334,6 +1350,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn from_loki_value_uses_stream_label_when_metadata_absent() {
+        // Loki 3.x attaches `detected_level` as a stream-level label, not as
+        // per-entry structured metadata. The 2-tuple `[ts, line]` is the
+        // common shape; we have to read the stream label to surface a level.
+        let value = LokiValue {
+            timestamp: "1000000000".to_string(),
+            line: "anything".to_string(),
+            structured_metadata: None,
+        };
+        let parsed = LogLine::from_loki_value(value, Some("warn")).expect("valid loki value");
+        assert_eq!(parsed.classified_level(), "warn");
+
+        // Whitespace/empty stream labels are treated as "no classification".
+        let value = LokiValue {
+            timestamp: "1000000000".to_string(),
+            line: "anything".to_string(),
+            structured_metadata: None,
+        };
+        let parsed = LogLine::from_loki_value(value, Some("  ")).expect("valid loki value");
+        assert_eq!(parsed.classified_level(), "unknown");
+
+        // Per-entry structured metadata wins over the stream-level label.
+        let mut md = std::collections::HashMap::new();
+        md.insert("detected_level".to_string(), "error".to_string());
+        let value = LokiValue {
+            timestamp: "1000000000".to_string(),
+            line: "anything".to_string(),
+            structured_metadata: Some(md),
+        };
+        let parsed = LogLine::from_loki_value(value, Some("warn")).expect("valid loki value");
+        assert_eq!(parsed.classified_level(), "error");
+    }
+
+    #[test]
     fn from_loki_value_strips_trailing_newlines() {
         // Loki preserves the trailing newline the container wrote; strip it
         // so renderers/SSE consumers match the Kubernetes backend (whose
@@ -1350,7 +1400,7 @@ mod tests {
                 line: input.to_string(),
                 structured_metadata: None,
             };
-            let parsed = LogLine::from_loki_value(value).expect("valid loki value");
+            let parsed = LogLine::from_loki_value(value, None).expect("valid loki value");
             assert_eq!(parsed.line, expected, "input {input:?}");
         }
     }

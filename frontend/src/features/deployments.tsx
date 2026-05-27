@@ -893,9 +893,10 @@ function parseLogLine(line, seq, level) {
     const iso = hasTs ? isoCandidate : '';
     const raw = hasTs ? line.slice(sp + 1) : line;
     const parsed = extractLogJson(raw);
-    // Backend classifies per-line; no CSS rule exists for `lv-unknown`,
-    // so collapse it into `info` for styling purposes.
-    const styleLevel = level === 'warn' || level === 'error' ? level : 'info';
+    // Backend classifies per-line; the level string drives the `.lv-<name>`
+    // class on the row, which the stylesheet maps to a colour. Anything the
+    // CSS doesn't recognise falls back to the default text colour.
+    const styleLevel = level && level.trim() ? level.trim() : 'unknown';
     return {
         id: `${timestampMs}-${seq}`,
         timestampMs,

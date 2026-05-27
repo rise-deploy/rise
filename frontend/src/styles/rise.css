@@ -1136,18 +1136,26 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
 .dark .r-logs { color: oklch(0.92 0.005 80); }
 .r-logs .ts { color: oklch(0.55 0.005 80); margin-right: 10px; }
 .r-logs .src { color: oklch(0.72 0.10 165); margin-right: 8px; }
+/* Per-line level colours. Bumped chroma vs. the chart bar palette so each
+   level is unambiguously distinct from the default text on a dark
+   background — the bars fill a region; text needs more saturation to read
+   the same way. Light-mode values stay slightly desaturated so they don't
+   shout. */
 .r-logs .lv-info,
-.r-logs .lv-notice { color: oklch(0.82 0.005 80); }
-.r-logs .lv-warn { color: oklch(0.80 0.11 85); }
-.r-logs .lv-error { color: oklch(0.68 0.14 25); }
-/* Loki-emitted level variants beyond info/warn/error. Match the palette
-   used by the chart's CSS variables semantically: error family in reds,
-   debug/trace/unknown in muted/dim greys. */
-.r-logs .lv-critical { color: oklch(0.62 0.18 25); }
-.r-logs .lv-fatal { color: oklch(0.58 0.20 20); }
+.r-logs .lv-notice { color: inherit; }
+.r-logs .lv-warn { color: oklch(0.72 0.18 85); }
+.r-logs .lv-error { color: oklch(0.62 0.20 25); }
+.r-logs .lv-critical { color: oklch(0.55 0.22 25); }
+.r-logs .lv-fatal { color: oklch(0.50 0.22 20); }
 .r-logs .lv-debug,
-.r-logs .lv-trace,
-.r-logs .lv-unknown { color: oklch(0.62 0.005 80); }
+.r-logs .lv-trace { color: oklch(0.58 0.06 230); }
+.r-logs .lv-unknown { color: inherit; }
+.dark .r-logs .lv-warn { color: oklch(0.85 0.20 85); }
+.dark .r-logs .lv-error { color: oklch(0.78 0.20 25); }
+.dark .r-logs .lv-critical { color: oklch(0.72 0.22 25); }
+.dark .r-logs .lv-fatal { color: oklch(0.68 0.22 20); }
+.dark .r-logs .lv-debug,
+.dark .r-logs .lv-trace { color: oklch(0.75 0.08 230); }
 .r-logs-row {
     position: relative;
     display: block;
