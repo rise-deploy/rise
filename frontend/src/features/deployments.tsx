@@ -1924,7 +1924,12 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                             })}
                             {hasMore && (
                                 <div ref={loadMoreRef} className="r-logs-loader">
-                                    {loadingMore ? 'Loading older…' : ' '}
+                                    {loadingMore ? (
+                                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                                            <span className="r-spinner" style={{ width: 12, height: 12, borderWidth: 1.5 }} />
+                                            Loading older…
+                                        </span>
+                                    ) : ' '}
                                 </div>
                             )}
                             {!hasMore && entries.length > 0 && (
