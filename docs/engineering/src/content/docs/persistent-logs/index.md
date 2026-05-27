@@ -45,5 +45,10 @@ For any of the above, switch to the Loki backend.
 
 ## Loki backend
 
+Requires Loki 3.0+ — Rise depends on the `detected_level` structured
+metadata for level classification and the log volume chart, and older
+versions return empty results (see [Loki backend](./loki/)). The bundled
+subchart already meets this; external-Loki operators should verify.
+
 See [Loki backend](./loki/) for setup with the bundled Helm subchart, an
 operator-managed external Loki, label overrides, and bearer-token wiring.

@@ -777,6 +777,8 @@ async function readHttpErrorMessage(response) {
     return `HTTP ${response.status}: ${response.statusText}`;
 }
 
+let warnedMalformedLogPayload = false;
+
 async function readSseResponse(response, handlers) {
     const reader = response.body?.getReader();
     if (!reader) {
@@ -805,7 +807,28 @@ async function readSseResponse(response, handlers) {
                 } else if (eventType === 'backlog_complete') {
                     handlers.onBacklogComplete?.(payload);
                 } else if (payload.trim()) {
-                    handlers.onLine?.(payload);
+                    // Backend wire format: {"line": "<raw line>", "level": "info"|"warn"|"error"|"unknown"}.
+                    // Be defensive: fall back to rendering the payload verbatim
+                    // with level=unknown if it doesn't parse as expected.
+                    let parsedLine = payload;
+                    let parsedLevel = 'unknown';
+                    try {
+                        const obj = JSON.parse(payload);
+                        if (obj && typeof obj.line === 'string') {
+                            parsedLine = obj.line;
+                            if (typeof obj.level === 'string') {
+                                parsedLevel = obj.level;
+                            }
+                        } else {
+                            throw new Error('missing line field');
+                        }
+                    } catch (err) {
+                        if (!warnedMalformedLogPayload) {
+                            warnedMalformedLogPayload = true;
+                            console.warn('Malformed log SSE payload; rendering raw line with level=unknown', err);
+                        }
+                    }
+                    handlers.onLine?.(parsedLine, parsedLevel);
                 }
             } else if (line === '') {
                 eventType = 'message';
@@ -824,14 +847,7 @@ const LOG_LONG_LINE_THRESHOLD = 120;
 // Without this, the default range can clip those trailing lines off-screen.
 const LOG_TERMINATED_END_CUSHION_MS = 10 * 60 * 1000;
 
-function detectLogLevel(line) {
-    const l = line.toLowerCase();
-    if (/\b(error|err|fatal|panic|exception|failed)\b/.test(l)) return 'error';
-    if (/\b(warn|warning)\b/.test(l)) return 'warn';
-    return 'info';
-}
-
-function parseLogLine(line, seq) {
+function parseLogLine(line, seq, level) {
     // Backend prepends "<RFC3339> " when timestamps=true.
     const sp = line.indexOf(' ');
     const isoCandidate = sp > 0 ? line.slice(0, sp) : '';
@@ -841,12 +857,15 @@ function parseLogLine(line, seq) {
     const iso = hasTs ? isoCandidate : '';
     const raw = hasTs ? line.slice(sp + 1) : line;
     const parsed = extractLogJson(raw);
+    // Backend classifies per-line; no CSS rule exists for `lv-unknown`,
+    // so collapse it into `info` for styling purposes.
+    const styleLevel = level === 'warn' || level === 'error' ? level : 'info';
     return {
         id: `${timestampMs}-${seq}`,
         timestampMs,
         iso,
         raw,
-        level: detectLogLevel(raw),
+        level: styleLevel,
         isJson: parsed !== null,
         parsed,
     };
@@ -1078,7 +1097,8 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
         }
     }, [deploymentId, projectName, rangeStepSeconds, rangeWindow, levelFilter, searchActive]);
 
-    // Cancellable SSE fetch. `onLine` receives raw (timestamped) lines.
+    // Cancellable SSE fetch. `onLine` receives raw (timestamped) lines along
+    // with the backend-provided per-line level classification.
     const fetchLogFeed = useCallback(async ({ follow, start, end, tail, level, search, onLine, onStatus, onBacklogComplete }: {
         follow: boolean;
         start?: string;
@@ -1086,7 +1106,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
         tail: number;
         level?: string;
         search?: string;
-        onLine: (line: string) => void;
+        onLine: (line: string, lineLevel: string) => void;
         onStatus?: (payload: string) => void;
         onBacklogComplete?: (payload: string) => void;
     }) => {
@@ -1158,9 +1178,9 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                 tail: LOG_PAGE_SIZE,
                 level: levelFilter,
                 search: searchActive,
-                onLine: (line) => {
+                onLine: (line, lineLevel) => {
                     if (gen !== streamGenRef.current) return;
-                    collected.push(parseLogLine(line, seqRef.current++));
+                    collected.push(parseLogLine(line, seqRef.current++, lineLevel));
                 },
                 onStatus: (payload) => {
                     if (gen !== streamGenRef.current) return;
@@ -1245,8 +1265,8 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
 
             const collected = [];
             await readSseResponse(response, {
-                onLine: (line) => {
-                    collected.push(parseLogLine(line, seqRef.current++));
+                onLine: (line, lineLevel) => {
+                    collected.push(parseLogLine(line, seqRef.current++, lineLevel));
                 },
             });
 
@@ -1313,9 +1333,9 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                 tail: LOG_PAGE_SIZE,
                 level: levelFilter,
                 search: searchActive,
-                onLine: (line) => {
+                onLine: (line, lineLevel) => {
                     if (streamGenRef.current !== gen) return;
-                    const newEntry = parseLogLine(line, seqRef.current++);
+                    const newEntry = parseLogLine(line, seqRef.current++, lineLevel);
                     setEntries((prev) => {
                         // Loki tail can deliver lines slightly out-of-order; keep
                         // the array sorted descending by timestamp.

@@ -8,6 +8,18 @@ authorization before issuing the query to Loki. Retention is configured
 in Loki itself; `retention_hint` is only used to explain empty results
 in the UI and CLI.
 
+:::caution[Requires Loki 3.0+]
+Rise relies on Loki's `detected_level` structured metadata (introduced
+in Loki 3.0) for per-line level classification and for the log volume
+chart's `sum by (detected_level) (count_over_time(...))` query. Older
+Loki versions don't surface this label and will silently return empty
+results — no `detected_level` classification, no volume chart, and any
+level-filtered queries will come back empty. The bundled Loki subchart
+already pins a 3.x release, so this only affects operators pointing
+Rise at an external Loki: verify your deployment runs Loki 3.0 or
+later.
+:::
+
 ## Backend configuration
 
 ```yaml

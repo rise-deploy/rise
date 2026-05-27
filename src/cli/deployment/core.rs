@@ -1514,7 +1514,11 @@ pub async fn get_logs(
                                     if event_type == "status" {
                                         print_log_status(data);
                                     } else {
-                                        println!("{}", data);
+                                        // `log` events are JSON-wrapped now:
+                                        // {"line": "...", "level": "..."}.
+                                        // Extract the line for printing so the
+                                        // CLI output stays identical to before.
+                                        println!("{}", extract_log_line(data));
                                     }
                                 }
                             } else if line.is_empty() {
@@ -1545,7 +1549,11 @@ pub async fn get_logs(
         if let Some(data) = line.strip_prefix("data: ") {
             // Only print non-empty data
             if !data.is_empty() {
-                println!("{}", data);
+                if event_type == "status" {
+                    print_log_status(data);
+                } else {
+                    println!("{}", extract_log_line(data));
+                }
             }
         } else if !line.is_empty() && !line.starts_with(':') {
             println!("{}", line);
@@ -1553,6 +1561,29 @@ pub async fn get_logs(
     }
 
     Ok(())
+}
+
+/// Extract the printable text from a `log` SSE event payload.
+///
+/// The backend emits `data: {"line": "...", "level": "info"|...}` (see
+/// `src/server/deployment/logs.rs::ClassifiedLevel`). The CLI doesn't use
+/// the level today — it just prints the raw line — but the JSON wrapping
+/// means we can't print `data` verbatim anymore. If parsing fails (unknown
+/// shape, older server, etc.) fall back to printing the raw `data` so the
+/// user still sees something useful.
+fn extract_log_line(data: &str) -> String {
+    let trimmed = data.trim_start();
+    if !trimmed.starts_with('{') {
+        return data.to_string();
+    }
+    match serde_json::from_str::<serde_json::Value>(data) {
+        Ok(value) => value
+            .get("line")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| data.to_string()),
+        Err(_) => data.to_string(),
+    }
 }
 
 fn print_log_status(data: &str) {
@@ -1661,7 +1692,10 @@ impl LogStream {
                     continue;
                 } else if let Some(data) = line.strip_prefix("data: ") {
                     if !data.is_empty() && self.event_type != "status" {
-                        return Some(Ok(data.to_string()));
+                        // `log` events are JSON-wrapped:
+                        // {"line": "...", "level": "..."}. The follow UI
+                        // just prints the text, so unwrap to the line here.
+                        return Some(Ok(extract_log_line(data)));
                     }
                     continue;
                 } else if line.is_empty() || line.starts_with(':') {
@@ -1690,8 +1724,8 @@ impl LogStream {
                         let remaining = std::mem::take(&mut self.buffer);
                         let line = remaining.trim();
                         if let Some(data) = line.strip_prefix("data: ") {
-                            if !data.is_empty() {
-                                return Some(Ok(data.to_string()));
+                            if !data.is_empty() && self.event_type != "status" {
+                                return Some(Ok(extract_log_line(data)));
                             }
                         } else if !line.is_empty() && !line.starts_with(':') {
                             return Some(Ok(line.to_string()));

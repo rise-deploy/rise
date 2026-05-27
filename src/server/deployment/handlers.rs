@@ -2434,10 +2434,19 @@ pub async fn stream_deployment_logs(
         })?;
 
     // Convert typed log events to SSE events.
+    //
+    // The `log` event payload is a JSON object `{"line": ..., "level": ...}`
+    // so the frontend chart (counted by `detected_level`) and the live log
+    // list classify each line identically — the backend is now the single
+    // source of truth for per-line level. See the wire-format contract in
+    // PR #333 / src/server/deployment/logs.rs (ClassifiedLevel).
     use futures::stream;
     let sse_stream = log_stream.flat_map(|result| match result {
-        Ok(crate::server::deployment::logs::LogEvent::Line(line)) => {
-            stream::iter(vec![Ok(Event::default().event("log").data(line))])
+        Ok(crate::server::deployment::logs::LogEvent::Line { text, level }) => {
+            stream::iter(vec![Event::default()
+                .event("log")
+                .json_data(serde_json::json!({ "line": text, "level": level }))
+                .map_err(anyhow::Error::from)])
         }
         Ok(crate::server::deployment::logs::LogEvent::Status(status)) => {
             stream::iter(vec![Event::default()

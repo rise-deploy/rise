@@ -104,7 +104,16 @@ pub struct LogCountBucket {
 
 #[derive(Debug, Clone)]
 pub enum LogEvent {
-    Line(String),
+    /// A single log line, with the backend's classification of its level.
+    ///
+    /// `text` is the same plain-text content as before (raw log line, with
+    /// optional RFC3339 prefix when `timestamps=true`). `level` is the
+    /// per-line classification — the wire format serializes both as a JSON
+    /// object so the frontend chart and list always agree.
+    Line {
+        text: String,
+        level: ClassifiedLevel,
+    },
     Status(LogStatus),
     /// Sent once the initial backlog phase of a streaming request has been
     /// fully emitted, before the live-tail loop begins. `count` is the number
@@ -306,12 +315,14 @@ impl RuntimeLogBackend for KubernetesLogBackend {
                 if !line_matches_level(&line, level) { continue; }
                 if !line_matches_search(&line, search.as_deref()) { continue; }
                 if skip == 0 {
-                    yield Ok(LogEvent::Line(line));
+                    let level = classify_line_by_regex(&line);
+                    yield Ok(LogEvent::Line { text: line, level });
                 } else {
                     trailing.push_back(line);
                     if trailing.len() > skip {
                         if let Some(out) = trailing.pop_front() {
-                            yield Ok(LogEvent::Line(out));
+                            let level = classify_line_by_regex(&out);
+                            yield Ok(LogEvent::Line { text: out, level });
                         }
                     }
                 }
@@ -530,7 +541,8 @@ impl LokiLogBackend {
         let stream = async_stream::try_stream! {
             let backlog_count = initial.len();
             for line in initial {
-                yield LogEvent::Line(line.render(query.timestamps));
+                let level = line.classified_level();
+                yield LogEvent::Line { text: line.render(query.timestamps), level };
             }
             yield LogEvent::BacklogLoaded { count: backlog_count };
 
@@ -573,7 +585,11 @@ impl LokiLogBackend {
                         for stream in response.streams {
                             for value in stream.values {
                                 if let Some(line) = LogLine::from_loki_value(value) {
-                                    yield LogEvent::Line(line.render(query.timestamps));
+                                    let level = line.classified_level();
+                                    yield LogEvent::Line {
+                                        text: line.render(query.timestamps),
+                                        level,
+                                    };
                                 }
                             }
                         }
@@ -710,7 +726,7 @@ impl LokiLogBackend {
                     ClassifiedLevel::Info => info = info.saturating_add(value),
                     ClassifiedLevel::Warn => warn = warn.saturating_add(value),
                     ClassifiedLevel::Error => error = error.saturating_add(value),
-                    ClassifiedLevel::Other => {}
+                    ClassifiedLevel::Unknown => {}
                 }
             }
 
@@ -751,11 +767,13 @@ impl RuntimeLogBackend for LokiLogBackend {
         }
 
         let timestamps = query.timestamps;
-        Ok(futures::stream::iter(
-            lines
-                .into_iter()
-                .map(move |line| Ok(LogEvent::Line(line.render(timestamps)))),
-        )
+        Ok(futures::stream::iter(lines.into_iter().map(move |line| {
+            let level = line.classified_level();
+            Ok(LogEvent::Line {
+                text: line.render(timestamps),
+                level,
+            })
+        }))
         .boxed())
     }
 
@@ -848,18 +866,45 @@ impl RuntimeLogBackend for LokiLogBackend {
 struct LogLine {
     timestamp_nanos: i128,
     line: String,
+    /// `detected_level` extracted from the Loki entry's structured metadata
+    /// (Loki 3.x query_range / tail responses emit a third array element
+    /// alongside `[ts, line]` carrying structured metadata key/value pairs).
+    /// `None` means the entry didn't include a `detected_level`; the line is
+    /// then classified by regex (matching the K8s backend's behavior).
+    detected_level: Option<String>,
 }
 
 impl LogLine {
-    fn from_loki_value(value: Vec<String>) -> Option<Self> {
-        if value.len() != 2 {
-            return None;
-        }
-        let timestamp_nanos = value[0].parse().ok()?;
+    fn from_loki_value(value: LokiValue) -> Option<Self> {
+        let LokiValue {
+            timestamp,
+            line,
+            structured_metadata,
+        } = value;
+        let timestamp_nanos = timestamp.parse().ok()?;
+        let detected_level = structured_metadata
+            .as_ref()
+            .and_then(|m| m.get("detected_level"))
+            .cloned();
         Some(Self {
             timestamp_nanos,
-            line: value[1].clone(),
+            line,
+            detected_level,
         })
+    }
+
+    fn classified_level(&self) -> ClassifiedLevel {
+        // Prefer Loki's per-line `detected_level` structured metadata when
+        // present; fall back to the same regex set the K8s backend uses so
+        // chart counts (which already use detected_level via `sum by`) and
+        // the line list stay aligned for unclassified entries.
+        match self.detected_level.as_deref() {
+            Some(raw) if !raw.trim().is_empty() => match classify_detected_level(raw) {
+                ClassifiedLevel::Unknown => classify_unknown_line(&self.line),
+                classified => classified,
+            },
+            _ => classify_unknown_line(&self.line),
+        }
     }
 
     fn render(self, timestamps: bool) -> String {
@@ -868,6 +913,74 @@ impl LogLine {
         }
         let ts = DateTime::<Utc>::from_timestamp_nanos(self.timestamp_nanos as i64);
         format!("{} {}", ts.to_rfc3339(), self.line)
+    }
+}
+
+/// When Loki couldn't classify a line (no `detected_level`, empty, or one of
+/// the values the chart's `unknown` bucket already swallows), report
+/// `Unknown` on the wire rather than guessing. The frontend can decide how to
+/// render that — keeping it distinct from regex-detected Info preserves the
+/// chart/list parity for unclassified entries.
+fn classify_unknown_line(line: &str) -> ClassifiedLevel {
+    match classify_line_by_regex(line) {
+        ClassifiedLevel::Info => ClassifiedLevel::Unknown,
+        other => other,
+    }
+}
+
+/// A single entry from a Loki `query_range` or `tail` response.
+///
+/// Loki encodes entries as positional JSON arrays:
+///   * `[timestamp_ns_string, line]` — historical 2-tuple form
+///   * `[timestamp_ns_string, line, { "detected_level": "info", ... }]` —
+///     Loki 3.x form when structured metadata (including the auto-detected
+///     `detected_level`) is attached to the entry.
+///
+/// We accept either shape so older Loki deployments keep working.
+#[derive(Debug)]
+struct LokiValue {
+    timestamp: String,
+    line: String,
+    structured_metadata: Option<std::collections::HashMap<String, String>>,
+}
+
+impl<'de> Deserialize<'de> for LokiValue {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, SeqAccess, Visitor};
+        use std::fmt;
+
+        struct LokiValueVisitor;
+        impl<'de> Visitor<'de> for LokiValueVisitor {
+            type Value = LokiValue;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a Loki log entry [timestamp, line] or [timestamp, line, metadata]")
+            }
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<LokiValue, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let timestamp: String = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+                let line: String = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(1, &self))?;
+                let structured_metadata: Option<std::collections::HashMap<String, String>> =
+                    seq.next_element()?;
+                // Drain any trailing elements (forward compatibility).
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(LokiValue {
+                    timestamp,
+                    line,
+                    structured_metadata,
+                })
+            }
+        }
+
+        deserializer.deserialize_seq(LokiValueVisitor)
     }
 }
 
@@ -888,7 +1001,7 @@ struct LokiTailResponse {
 
 #[derive(Deserialize)]
 struct LokiStream {
-    values: Vec<Vec<String>>,
+    values: Vec<LokiValue>,
 }
 
 #[derive(Deserialize)]
@@ -1088,27 +1201,53 @@ fn level_filtered_selector(base: &str, level: LogLevelFilter) -> String {
     }
 }
 
-/// Classified `detected_level` value as used by the volume chart's three
-/// stacked buckets. Anything Loki tagged but Rise doesn't recognize (e.g.
-/// `unknown` or an empty label) is `Other` and contributes only to the bar's
-/// total height, not to any colored segment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClassifiedLevel {
+/// Per-line classified log level. Used both for the volume chart's three
+/// stacked buckets and as the `level` field in the streaming SSE log payload
+/// the frontend and CLI consume.
+///
+/// `Unknown` means the backend could not classify the line — for Loki, the
+/// `detected_level` label was missing/empty/unrecognized AND the regex
+/// fallback didn't match warn/error. The Kubernetes backend never emits
+/// `Unknown` (it falls back to `Info` per the wire-format contract).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClassifiedLevel {
     Info,
     Warn,
     Error,
-    Other,
+    Unknown,
 }
 
 /// Map a raw `detected_level` label to the Rise bucket. Matches the lowercase
 /// set most production log stacks emit (`info`, `warn`, `error`, plus common
-/// abbreviations like `err`, `crit`, `warning`).
+/// abbreviations like `err`, `crit`, `warning`). Empty/unrecognized values
+/// are reported as `Unknown` so the streaming SSE consumer can distinguish
+/// "classifier said unknown" from "Info/Warn/Error".
 fn classify_detected_level(raw: &str) -> ClassifiedLevel {
     match raw.trim().to_ascii_lowercase().as_str() {
         "error" | "err" | "fatal" | "critical" | "crit" => ClassifiedLevel::Error,
         "warn" | "warning" => ClassifiedLevel::Warn,
         "info" | "debug" | "trace" | "notice" => ClassifiedLevel::Info,
-        _ => ClassifiedLevel::Other,
+        _ => ClassifiedLevel::Unknown,
+    }
+}
+
+/// Classify a raw log line using the same regex set the K8s backend uses for
+/// its `LogLevelFilter`. Returns `Error` / `Warn` / `Info` — never `Unknown`,
+/// since the regex set has explicit fallback (anything not matching
+/// error/warn is treated as "info" by the existing filter semantics).
+pub(crate) fn classify_line_by_regex(line: &str) -> ClassifiedLevel {
+    use std::sync::OnceLock;
+    static ERROR_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static WARN_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let err = ERROR_RE.get_or_init(|| regex::Regex::new(LEVEL_REGEX_ERROR).unwrap());
+    let warn = WARN_RE.get_or_init(|| regex::Regex::new(LEVEL_REGEX_WARN).unwrap());
+    if err.is_match(line) {
+        ClassifiedLevel::Error
+    } else if warn.is_match(line) {
+        ClassifiedLevel::Warn
+    } else {
+        ClassifiedLevel::Info
     }
 }
 
@@ -1186,7 +1325,8 @@ fn websocket_url(http_url: &str, selector: &str) -> String {
     format!("{}?query={}", url, urlencoding::encode(selector))
 }
 
-/// Parse a short retention hint like `"7d"`. Supported units: `s`, `m`, `h`, `d`.
+/// Parse a short retention hint like `"7d"` or `"2w"`. Supported units:
+/// `s` (seconds), `m` (minutes), `h` (hours), `d` (days), `w` (weeks; 7 days).
 fn parse_duration_hint(value: &str) -> Option<Duration> {
     let trimmed = value.trim();
     if trimmed.len() < 2 {
@@ -1199,6 +1339,7 @@ fn parse_duration_hint(value: &str) -> Option<Duration> {
         "m" => Some(Duration::minutes(number)),
         "h" => Some(Duration::hours(number)),
         "d" => Some(Duration::days(number)),
+        "w" => Some(Duration::weeks(number)),
         _ => None,
     }
 }
@@ -1349,7 +1490,7 @@ mod tests {
             assert_eq!(classify_detected_level(v), ClassifiedLevel::Info);
         }
         for v in ["", "unknown", "verbose"] {
-            assert_eq!(classify_detected_level(v), ClassifiedLevel::Other);
+            assert_eq!(classify_detected_level(v), ClassifiedLevel::Unknown);
         }
     }
 
@@ -1523,6 +1664,108 @@ mod tests {
         let series = &parsed.data.result[0];
         assert_eq!(series.values[0].0, 1700000000.0);
         assert_eq!(series.points()[0].count, 5);
+    }
+
+    #[test]
+    fn parse_duration_hint_supports_all_units_including_weeks() {
+        // Cover every supported unit; `w` is the new one and must equal 7d.
+        assert_eq!(parse_duration_hint("30s"), Some(Duration::seconds(30)));
+        assert_eq!(parse_duration_hint("5m"), Some(Duration::minutes(5)));
+        assert_eq!(parse_duration_hint("2h"), Some(Duration::hours(2)));
+        assert_eq!(parse_duration_hint("7d"), Some(Duration::days(7)));
+        assert_eq!(parse_duration_hint("2w"), Some(Duration::weeks(2)));
+        assert_eq!(parse_duration_hint("2w"), Some(Duration::days(14)));
+        // Negative weeks pass through (chrono::Duration accepts negatives) — a
+        // retention hint of "-1w" is nonsensical but the parser shouldn't
+        // crash on it. We only assert the unit math here.
+        assert_eq!(parse_duration_hint("0w"), Some(Duration::zero()));
+
+        // Unsupported unit / malformed input.
+        assert_eq!(parse_duration_hint("5y"), None);
+        assert_eq!(parse_duration_hint("xw"), None);
+        // Whitespace is trimmed.
+        assert_eq!(parse_duration_hint("  3w  "), Some(Duration::weeks(3)));
+    }
+
+    #[test]
+    fn loki_value_deserialize_accepts_two_and_three_tuples() {
+        // Legacy 2-tuple: no structured metadata → detected_level is None.
+        let v2: LokiValue =
+            serde_json::from_str(r#"["1700000000000000000","hello"]"#).expect("2-tuple must parse");
+        assert_eq!(v2.line, "hello");
+        assert!(v2.structured_metadata.is_none());
+
+        // Loki 3.x 3-tuple with structured metadata carrying detected_level.
+        let v3: LokiValue = serde_json::from_str(
+            r#"["1700000000000000000","boom",{"detected_level":"error","trace_id":"abc"}]"#,
+        )
+        .expect("3-tuple must parse");
+        let md = v3
+            .structured_metadata
+            .as_ref()
+            .expect("metadata must be populated");
+        assert_eq!(md.get("detected_level").map(String::as_str), Some("error"));
+    }
+
+    #[test]
+    fn classified_level_prefers_detected_level_then_falls_back_to_regex() {
+        // detected_level=warn → Warn (even if the line text says nothing).
+        let l = LogLine {
+            timestamp_nanos: 0,
+            line: "all good".into(),
+            detected_level: Some("warn".into()),
+        };
+        assert_eq!(l.classified_level(), ClassifiedLevel::Warn);
+
+        // detected_level absent, line clearly matches the error regex → Error.
+        let l = LogLine {
+            timestamp_nanos: 0,
+            line: "panic: nil pointer".into(),
+            detected_level: None,
+        };
+        assert_eq!(l.classified_level(), ClassifiedLevel::Error);
+
+        // Loki returned a detected_level it couldn't classify AND the line
+        // text doesn't match warn/error → Unknown (so the SSE consumer can
+        // distinguish "couldn't classify" from regex-resolved Info).
+        let l = LogLine {
+            timestamp_nanos: 0,
+            line: "starting up on port 8080".into(),
+            detected_level: Some("verbose".into()),
+        };
+        assert_eq!(l.classified_level(), ClassifiedLevel::Unknown);
+
+        // Empty detected_level + line text that DOES match warn → Warn.
+        let l = LogLine {
+            timestamp_nanos: 0,
+            line: "WARN low disk space".into(),
+            detected_level: Some(String::new()),
+        };
+        assert_eq!(l.classified_level(), ClassifiedLevel::Warn);
+    }
+
+    #[test]
+    fn k8s_regex_classifier_never_emits_unknown() {
+        // The wire-format contract says the K8s path uses Info as its
+        // "couldn't classify" fallback (matching the existing
+        // LogLevelFilter::Info regex semantics).
+        assert_eq!(
+            classify_line_by_regex("plain hello world"),
+            ClassifiedLevel::Info
+        );
+        assert_eq!(
+            classify_line_by_regex("WARN connection retry"),
+            ClassifiedLevel::Warn
+        );
+        assert_eq!(
+            classify_line_by_regex("ERROR: failed to connect"),
+            ClassifiedLevel::Error
+        );
+        // Error wins over warn when both match.
+        assert_eq!(
+            classify_line_by_regex("WARN: fatal error in handler"),
+            ClassifiedLevel::Error
+        );
     }
 
     #[test]
