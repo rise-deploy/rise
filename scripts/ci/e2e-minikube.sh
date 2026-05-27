@@ -304,7 +304,7 @@ if [[ "${deployment_list}" != *"Healthy"* ]]; then
   exit 1
 fi
 
-echo "Smoke test: logs flow to Loki and Rise API can query them"
+echo "Smoke test: Loki retains deployment logs after the pod is gone"
 
 deployment_id="$(curl -sS -H "Authorization: Bearer ${RISE_TOKEN}" \
   "http://127.0.0.1:3000/api/v1/projects/${PROJECT_NAME}/deployments" \
@@ -315,10 +315,27 @@ if [[ -z "${deployment_id}" || "${deployment_id}" == "null" ]]; then
 fi
 echo "Resolved deployment_id=${deployment_id}"
 
-# nginx-unprivileged's readiness/liveness probes (kube-probe) hit / on
-# port 8080 every 10s, producing access-log lines on PID 1's stdout that
-# kubelet captures and Alloy ships to Loki — so we don't need to inject
-# any additional traffic to have something to assert on.
+# Stop the deployment and wait for kubelet to remove the pod. With the
+# pod gone, the Kubernetes log backend cannot serve logs — so a passing
+# assertion below proves Loki actually retained them (and that the
+# `logs.backend: loki` setting is what's answering, not a hidden
+# fallback to live kubelet streaming).
+rise_cli deployment stop --project "${PROJECT_NAME}" --group default
+
+echo "Waiting for app pods to be removed"
+remaining=0
+for _ in {1..60}; do
+  remaining="$(kubectl get pods -n "${APP_NAMESPACE}" --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+  if [[ "${remaining}" == "0" ]]; then
+    break
+  fi
+  sleep 2
+done
+if [[ "${remaining}" != "0" ]]; then
+  echo "Expected app pods in ${APP_NAMESPACE} to be removed; got ${remaining}"
+  kubectl get pods -n "${APP_NAMESPACE}" || true
+  exit 1
+fi
 
 start_ts="$(date -u -d '-10 minutes' +%Y-%m-%dT%H:%M:%SZ)"
 end_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -337,26 +354,24 @@ for _ in {1..30}; do
   sleep 3
 done
 
-echo "Log counts: total=${total} info=${info}"
+echo "Log counts (post-pod-removal): total=${total} info=${info}"
 if (( total == 0 )); then
-  echo "Expected /logs/counts to report total>0; last response: ${body}"
+  echo "Expected /logs/counts to report total>0 after pod removal; last response: ${body}"
   exit 1
 fi
 if (( info == 0 )); then
-  echo "Expected /logs/counts to report info bucket > 0; last response: ${body}"
+  echo "Expected /logs/counts to report info bucket > 0 after pod removal; last response: ${body}"
   exit 1
 fi
 
-# Exercise the SSE log stream via the CLI. `rise logs` is non-follow by
-# default (`--follow` is opt-in); in non-follow mode the server returns
-# the backlog and closes the SSE stream, so the CLI exits naturally.
-# (Cannot wrap with `timeout`: rise_cli is a bash function and `timeout`
-# only invokes executables. If the server ever hangs the job-level
-# timeout still catches it.)
+# Exercise the SSE log stream via the CLI. `rise deployment logs` is
+# non-follow by default (`--follow` is opt-in); in non-follow mode the
+# server returns the backlog and closes the SSE stream, so the CLI
+# exits naturally.
 lines="$(rise_cli deployment logs --project "${PROJECT_NAME}" "${deployment_id}" --tail 20 | wc -l)"
-echo "rise logs returned ${lines} line(s)"
+echo "rise deployment logs returned ${lines} line(s)"
 if (( lines == 0 )); then
-  echo "Expected 'rise logs' to print at least one line"
+  echo "Expected 'rise deployment logs' to print at least one line after pod removal"
   exit 1
 fi
 
