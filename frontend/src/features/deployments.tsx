@@ -1232,6 +1232,10 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
     const [rangeValue, setRangeValue] = useState('6h');
     const [customStart, setCustomStart] = useState(null);
     const [customEnd, setCustomEnd] = useState(null);
+    // Bumped on Refresh to force the preset rangeWindow's end to re-anchor
+    // at "now". Without this, lines that streamed in after page-load would
+    // stay marked out-of-range even after a manual reload.
+    const [rangeNowTick, setRangeNowTick] = useState(0);
     const [hasMore, setHasMore] = useState(false);
     const [loadingMore, setLoadingMore] = useState(false);
     const [expandedIds, setExpandedIds] = useState(() => new Set());
@@ -1269,7 +1273,8 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
     // by the small effect right below.
     const entriesCountRef = useRef(0);
 
-    const rangeWindow = useMemo(() => resolveLogWindow(rangeValue, customStart, customEnd, anchorEnd), [rangeValue, customStart, customEnd, anchorEnd]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    const rangeWindow = useMemo(() => resolveLogWindow(rangeValue, customStart, customEnd, anchorEnd), [rangeValue, customStart, customEnd, anchorEnd, rangeNowTick]);
     const rangeLabel = useMemo(() => formatRangeLabel(rangeValue, rangeWindow, anchorEnd), [rangeValue, rangeWindow, anchorEnd]);
     const rangeStepSeconds = useMemo(() => {
         if (!rangeWindow) return 60;
@@ -1749,6 +1754,9 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
     }, []);
 
     const handleRefresh = useCallback(() => {
+        // Re-anchor preset ranges to wall-clock now so lines that streamed
+        // in after page-load fall back inside the window.
+        setRangeNowTick((t) => t + 1);
         if (streamable) {
             void startStreaming();
         } else {
