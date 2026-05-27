@@ -1251,6 +1251,11 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
     // scroll to load older. Once the backlog count is known we set `hasMore`
     // definitively and stop overriding it with each new live-tail line.
     const backlogCompleteRef = useRef(false);
+    // Set once `loadOlder` proves the backend can't surface more historical
+    // lines (returned a page but all rows were already in view — typical for
+    // the Kubernetes backend, whose `pods/log` API has no end-time filter).
+    // Streaming onLine handlers must not flip `hasMore` back on after this.
+    const paginationExhaustedRef = useRef(false);
 
     const rangeWindow = useMemo(() => resolveLogWindow(rangeValue, customStart, customEnd, anchorEnd), [rangeValue, customStart, customEnd, anchorEnd]);
     const rangeLabel = useMemo(() => formatRangeLabel(rangeValue, rangeWindow, anchorEnd), [rangeValue, rangeWindow, anchorEnd]);
@@ -1406,6 +1411,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
         setStreaming(false);
         setHasMore(false);
         oldestLoadedMsRef.current = null;
+        paginationExhaustedRef.current = false;
 
         const collected = [];
         let newStatus = null;
@@ -1498,16 +1504,28 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
 
             if (controller.signal.aborted) return;
             const reversed = collected.slice().reverse();
+            let newlyAdded = 0;
             setEntries((prev) => {
                 const seen = new Set(prev.map((e) => e.id));
                 const filtered = reversed.filter((e) => !seen.has(e.id) && e.timestampMs < oldestMs);
+                newlyAdded = filtered.length;
                 if (filtered.length === 0) return prev;
                 return prev.concat(filtered);
             });
-            if (reversed.length > 0) {
+            if (newlyAdded > 0) {
                 oldestLoadedMsRef.current = reversed[reversed.length - 1].timestampMs;
             }
-            setHasMore(collected.length === LOG_PAGE_SIZE);
+            // Gate on *new* rows. Without this, a backend that ignores
+            // end_time (e.g. Kubernetes' pods/log API) returns the same
+            // most-recent N lines every time, dedup filters them all, but
+            // collected.length stays at the page size — the IntersectionObserver
+            // would re-fire forever. A page short of new rows means we're
+            // either at the start of the range or this backend can't paginate.
+            const exhausted = newlyAdded < LOG_PAGE_SIZE;
+            if (exhausted) {
+                paginationExhaustedRef.current = true;
+            }
+            setHasMore(!exhausted);
         } catch (err) {
             if (err.name === 'AbortError') return;
             console.error('Failed to load older logs:', err);
@@ -1530,6 +1548,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
         setHasMore(false);
         oldestLoadedMsRef.current = null;
         backlogCompleteRef.current = false;
+        paginationExhaustedRef.current = false;
 
         try {
             await fetchLogFeed({
@@ -1560,9 +1579,10 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                             || newEntry.timestampMs < oldestLoadedMsRef.current)) {
                         oldestLoadedMsRef.current = newEntry.timestampMs;
                     }
-                    // Optimistic during backlog; once backlog_complete fires,
+                    // Optimistic during backlog; once backlog_complete fires or
+                    // loadOlder has proven the backend can't surface more,
                     // hasMore is authoritative — don't override on tail lines.
-                    if (!backlogCompleteRef.current) {
+                    if (!backlogCompleteRef.current && !paginationExhaustedRef.current) {
                         setHasMore(true);
                     }
                 },
