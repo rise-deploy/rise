@@ -946,17 +946,17 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
     // chart still renders the full range; we just override the log query.
     const [selectedBucket, setSelectedBucket] = useState(null);
     // Auto-refresh interval in seconds (0 = off). Persisted to localStorage so
-    // the user's preference survives a reload; defaults to 30s on first use.
+    // the user's preference survives a reload; defaults to 5m on first use.
     const [autoRefreshSeconds, setAutoRefreshSeconds] = useState(() => {
-        if (typeof window === 'undefined') return 30;
+        if (typeof window === 'undefined') return 300;
         try {
             const raw = window.localStorage.getItem('rise.deploymentLogs.autoRefreshSeconds');
-            if (raw === null) return 30;
+            if (raw === null) return 300;
             const parsed = Number.parseInt(raw, 10);
-            if (Number.isNaN(parsed) || parsed < 0) return 30;
+            if (Number.isNaN(parsed) || parsed < 0) return 300;
             return parsed;
         } catch {
-            return 30;
+            return 300;
         }
     });
 
