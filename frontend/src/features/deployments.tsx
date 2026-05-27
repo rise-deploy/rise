@@ -1256,6 +1256,10 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
     // the Kubernetes backend, whose `pods/log` API has no end-time filter).
     // Streaming onLine handlers must not flip `hasMore` back on after this.
     const paginationExhaustedRef = useRef(false);
+    // Mirrors `entries.length` so `loadOlder` can pass it as `skip_recent`
+    // without re-creating the callback on every streamed line. Kept in sync
+    // by the small effect right below.
+    const entriesCountRef = useRef(0);
 
     const rangeWindow = useMemo(() => resolveLogWindow(rangeValue, customStart, customEnd, anchorEnd), [rangeValue, customStart, customEnd, anchorEnd]);
     const rangeLabel = useMemo(() => formatRangeLabel(rangeValue, rangeWindow, anchorEnd), [rangeValue, rangeWindow, anchorEnd]);
@@ -1274,6 +1278,10 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
         }
         return rangeWindow;
     }, [rangeWindow, selectedBucket]);
+
+    useEffect(() => {
+        entriesCountRef.current = entries.length;
+    }, [entries.length]);
 
     const stopStreaming = useCallback(() => {
         if (abortControllerRef.current) {
@@ -1480,6 +1488,12 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
         });
         if (levelFilter && levelFilter !== 'all') params.set('level', levelFilter);
         if (searchActive) params.set('search', searchActive);
+        // K8s backend uses this to skip past the lines already in view (it
+        // has no end-time filter on pods/log). Loki ignores it and uses
+        // `end` instead — sending both lets each backend pick what it needs.
+        if (entriesCountRef.current > 0) {
+            params.set('skip_recent', String(entriesCountRef.current));
+        }
 
         try {
             const response = await fetch(

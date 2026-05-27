@@ -29,6 +29,11 @@ Limitations:
 - **No history past the Pod's lifetime.** When a deployment is rolled,
   superseded, or its Pod is evicted, its logs vanish. The UI and CLI
   surface this as "no active deployment pod was found."
+- **Backward scrolling is bounded by the kubelet's per-container log
+  retention.** The UI can page back through whatever the kubelet
+  currently holds (typically a few MB per container, controlled by
+  `--container-log-max-size`), and stops at "Start of selected range"
+  once that buffer is exhausted.
 - **No cross-Pod aggregation.** Each Pod's stream is independent; there
   is no merged view across replicas (only a single Pod's lines are
   returned per request).

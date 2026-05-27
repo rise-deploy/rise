@@ -2286,6 +2286,12 @@ pub struct LogStreamParams {
     pub level: Option<String>,
     /// Case-insensitive substring filter applied to each line.
     pub search: Option<String>,
+    /// For backward pagination: skip this many of the most-recent qualifying
+    /// lines before returning. Used by the Kubernetes backend (whose
+    /// `pods/log` API has no end-time filter) so the frontend can scroll
+    /// further back than the initial tail window. The Loki backend ignores
+    /// this and uses its own timestamp-based pagination.
+    pub skip_recent: Option<i64>,
 }
 
 /// Query parameters for log counts
@@ -2395,6 +2401,7 @@ pub async fn stream_deployment_logs(
                 end_time,
                 level,
                 search,
+                skip_recent: params.skip_recent.filter(|n| *n > 0),
             },
         )
         .await

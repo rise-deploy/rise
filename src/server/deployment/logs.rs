@@ -41,6 +41,12 @@ pub struct LogQuery {
     /// Optional case-insensitive substring users can type into the runtime
     /// logs search box. Empty/whitespace means "no filter".
     pub search: Option<String>,
+    /// Skip this many of the most-recent qualifying lines before returning.
+    /// Used by the Kubernetes backend to paginate older lines without an
+    /// end-time filter — the frontend passes the number of lines it has
+    /// already displayed. The Loki backend ignores this and uses its
+    /// timestamp-windowed pagination instead.
+    pub skip_recent: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -237,12 +243,21 @@ impl RuntimeLogBackend for KubernetesLogBackend {
             .context("Pod name not found")?
             .clone();
 
+        // `skip_recent` lets the frontend page backward without an end-time
+        // filter: the kubelet returns lines in chronological order, so by
+        // bumping `tail_lines` we widen the window backward and then drop
+        // the trailing N qualifying lines (which the frontend already has).
+        let skip_recent = query.skip_recent.unwrap_or(0).max(0);
+        let effective_tail = query
+            .tail_lines
+            .map(|t| t.saturating_add(skip_recent).max(1));
+
         let mut log_params = LogParams {
             follow: query.follow && is_followable_status(&deployment.status),
             timestamps: query.timestamps,
             ..Default::default()
         };
-        if let Some(tail) = query.tail_lines {
+        if let Some(tail) = effective_tail {
             log_params.tail_lines = Some(tail);
         }
         if let Some(since) = query.since_seconds {
@@ -261,6 +276,12 @@ impl RuntimeLogBackend for KubernetesLogBackend {
         let search = query.search.clone();
         let stream = async_stream::stream! {
             use futures::AsyncBufReadExt;
+            use std::collections::VecDeque;
+            let skip = skip_recent as usize;
+            // Buffer the trailing `skip` qualifying lines so we can drop them
+            // once the stream ends. While the buffer is full, evict the oldest
+            // and yield it — that's a line the frontend doesn't already have.
+            let mut trailing: VecDeque<String> = VecDeque::with_capacity(skip.saturating_add(1));
             let mut lines = futures::io::BufReader::new(log_stream).lines();
             while let Some(line) = lines.next().await {
                 let line = match line {
@@ -273,8 +294,19 @@ impl RuntimeLogBackend for KubernetesLogBackend {
                 if line.is_empty() { continue; }
                 if !line_matches_level(&line, level) { continue; }
                 if !line_matches_search(&line, search.as_deref()) { continue; }
-                yield Ok(LogEvent::Line(line));
+                if skip == 0 {
+                    yield Ok(LogEvent::Line(line));
+                } else {
+                    trailing.push_back(line);
+                    if trailing.len() > skip {
+                        if let Some(out) = trailing.pop_front() {
+                            yield Ok(LogEvent::Line(out));
+                        }
+                    }
+                }
             }
+            // Anything left in the buffer is in the trailing `skip` window and
+            // intentionally dropped — those are the lines the frontend already has.
         };
 
         Ok(stream.boxed())
@@ -1063,6 +1095,58 @@ mod tests {
         // rather than `|~ \`(?i)\``.
         let out = append_search_filter("{job=\"x\"}", Some("```"));
         assert_eq!(out, "{job=\"x\"}");
+    }
+
+    /// Mirror of the K8s backend's tail-offset slice math: given a buffer of
+    /// chronologically-ordered lines from the kubelet (oldest first, most
+    /// recent last), the backend yields all but the trailing `skip_recent`
+    /// entries. This is the logic that lets the frontend page backward
+    /// without an end-time filter.
+    fn slice_for_skip_recent(lines: Vec<String>, skip_recent: usize) -> Vec<String> {
+        use std::collections::VecDeque;
+        let mut out = Vec::new();
+        let mut trailing: VecDeque<String> = VecDeque::with_capacity(skip_recent.saturating_add(1));
+        for line in lines {
+            if skip_recent == 0 {
+                out.push(line);
+            } else {
+                trailing.push_back(line);
+                if trailing.len() > skip_recent {
+                    if let Some(o) = trailing.pop_front() {
+                        out.push(o);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn skip_recent_drops_the_trailing_window() {
+        // Kubelet returns chronological [1..=10]. With skip_recent=4, we want
+        // [1..=6] yielded (the older 6); the most recent 4 are what the
+        // frontend already has.
+        let lines: Vec<String> = (1..=10).map(|n| format!("line-{n}")).collect();
+        let out = slice_for_skip_recent(lines, 4);
+        assert_eq!(
+            out,
+            vec!["line-1", "line-2", "line-3", "line-4", "line-5", "line-6"]
+        );
+    }
+
+    #[test]
+    fn skip_recent_zero_is_passthrough() {
+        let lines: Vec<String> = (1..=3).map(|n| format!("line-{n}")).collect();
+        let out = slice_for_skip_recent(lines.clone(), 0);
+        assert_eq!(out, lines);
+    }
+
+    #[test]
+    fn skip_recent_larger_than_input_yields_nothing() {
+        // Kubelet rotated; we've already shown more than it has left.
+        let lines: Vec<String> = (1..=3).map(|n| format!("line-{n}")).collect();
+        let out = slice_for_skip_recent(lines, 10);
+        assert!(out.is_empty());
     }
 
     #[test]
