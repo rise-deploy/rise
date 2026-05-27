@@ -1,8 +1,8 @@
-// @ts-nocheck
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Bar, BarChart, CartesianGrid, Cell, ResponsiveContainer, Tooltip as RechartsTooltip, XAxis, YAxis } from 'recharts';
 import { DayPicker } from 'react-day-picker';
 import { api } from '../lib/api';
+import { CONFIG } from '../lib/config';
 import { navigate } from '../lib/navigation';
 import { copyToClipboard, formatDate, formatISO8601, formatRelativeTimeRounded, formatTimeRemaining, isSafeUrl, stripUrlScheme } from '../lib/utils';
 import { usePolling } from '../lib/polling';
@@ -330,7 +330,7 @@ export function DeploymentsList({ projectName }) {
 
     const loadDeployments = useCallback(async () => {
         try {
-            const params = {
+            const params: { limit: number; offset: number; group?: string } = {
                 limit: pageSize,
                 offset: page * pageSize,
             };
@@ -1028,7 +1028,7 @@ function formatTickLabel(ms, rangeMs) {
     return `${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-function LogChartTooltip({ active, payload, stepSeconds }) {
+function LogChartTooltip({ active, payload, stepSeconds }: { active?: boolean; payload?: any[]; stepSeconds: number }) {
     if (!active || !payload || payload.length === 0) return null;
     const b = payload[0].payload;
     // Each bucket counts the preceding window (T - step, T], so the bar at
@@ -1296,7 +1296,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
         setCountsLoading(true);
         setCountsError(null);
 
-        const baseUrl = window.API_BASE_URL || '';
+        const baseUrl = CONFIG.backendUrl;
         const params = new URLSearchParams({
             start: rangeWindow.start.toISOString(),
             end: rangeWindow.end.toISOString(),
@@ -1341,7 +1341,17 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
     }, [deploymentId, projectName, rangeStepSeconds, rangeWindow, levelFilter, searchActive]);
 
     // Cancellable SSE fetch. `onLine` receives raw (timestamped) lines.
-    const fetchLogFeed = useCallback(async ({ follow, start, end, tail, level, search, onLine, onStatus, onBacklogComplete }) => {
+    const fetchLogFeed = useCallback(async ({ follow, start, end, tail, level, search, onLine, onStatus, onBacklogComplete }: {
+        follow: boolean;
+        start?: string;
+        end?: string;
+        tail: number;
+        level?: string;
+        search?: string;
+        onLine: (line: string) => void;
+        onStatus?: (payload: string) => void;
+        onBacklogComplete?: (payload: string) => void;
+    }) => {
         if (abortControllerRef.current) {
             abortControllerRef.current.abort();
             abortControllerRef.current = null;
@@ -1350,7 +1360,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
         const controller = new AbortController();
         abortControllerRef.current = controller;
 
-        const baseUrl = window.API_BASE_URL || '';
+        const baseUrl = CONFIG.backendUrl;
         const params = new URLSearchParams({
             timestamps: 'true',
             tail: String(tail),
@@ -1455,7 +1465,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
         loadingMoreRef.current = true;
         setLoadingMore(true);
 
-        const baseUrl = window.API_BASE_URL || '';
+        const baseUrl = CONFIG.backendUrl;
         const params = new URLSearchParams({
             timestamps: 'true',
             tail: String(LOG_PAGE_SIZE),
@@ -2141,7 +2151,17 @@ function PodInfoRow({ pod }: { pod: PodInfo }) {
                         <div style={{ fontSize: 11.5, color: 'var(--text-soft)', whiteSpace: 'nowrap' }}>
                             {pod.containers?.filter(c => c.ready).length || 0}/{pod.containers?.length || 0} ready
                         </div>
-                        <Icon name="chev" size={12} className="chev" style={{ transform: expanded ? 'rotate(90deg)' : 'none', transition: 'transform .15s', color: 'var(--text-soft)' }} />
+                        <span
+                            className="chev"
+                            style={{
+                                display: 'inline-flex',
+                                transform: expanded ? 'rotate(90deg)' : 'none',
+                                transition: 'transform .15s',
+                                color: 'var(--text-soft)',
+                            }}
+                        >
+                            <Icon name="chev" size={12} />
+                        </span>
                     </div>
                 </div>
             </button>
