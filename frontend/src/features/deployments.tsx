@@ -1055,7 +1055,7 @@ function LogChartTooltip({ active, payload, stepSeconds }) {
     );
 }
 
-function LogCountsChart({ counts, loading, error, status, rangeLabel, rangeStartMs, rangeEndMs, stepSeconds, onSelectBucket, selectedBucketStartMs, collapsed, onToggleCollapsed }) {
+function LogCountsChart({ counts, loading, error, status, rangeLabel, rangeStartMs, rangeEndMs, stepSeconds, onSelectBucket, selectedBucketTs, collapsed, onToggleCollapsed }) {
     const data = useMemo(
         () =>
             counts.map((b) => ({
@@ -1094,7 +1094,7 @@ function LogCountsChart({ counts, loading, error, status, rangeLabel, rangeStart
         const end = entry.ts;
         const start = entry.ts - stepSeconds * 1000;
         // Toggle: re-clicking the same bar clears the selection.
-        if (selectedBucketStartMs === start) {
+        if (selectedBucketTs === end) {
             onSelectBucket(null);
         } else {
             onSelectBucket({ startMs: start, endMs: end });
@@ -1158,7 +1158,7 @@ function LogCountsChart({ counts, loading, error, status, rangeLabel, rangeStart
                                     <Cell
                                         key={`info-${d.ts}`}
                                         fill={LOG_CHART_COLOR_INFO}
-                                        fillOpacity={selectedBucketStartMs == null || selectedBucketStartMs === d.ts ? 1 : 0.3}
+                                        fillOpacity={selectedBucketTs == null || selectedBucketTs === d.ts ? 1 : 0.3}
                                     />
                                 ))}
                             </Bar>
@@ -1167,7 +1167,7 @@ function LogCountsChart({ counts, loading, error, status, rangeLabel, rangeStart
                                     <Cell
                                         key={`warn-${d.ts}`}
                                         fill={LOG_CHART_COLOR_WARN}
-                                        fillOpacity={selectedBucketStartMs == null || selectedBucketStartMs === d.ts ? 1 : 0.3}
+                                        fillOpacity={selectedBucketTs == null || selectedBucketTs === d.ts ? 1 : 0.3}
                                     />
                                 ))}
                             </Bar>
@@ -1176,7 +1176,7 @@ function LogCountsChart({ counts, loading, error, status, rangeLabel, rangeStart
                                     <Cell
                                         key={`error-${d.ts}`}
                                         fill={LOG_CHART_COLOR_ERROR}
-                                        fillOpacity={selectedBucketStartMs == null || selectedBucketStartMs === d.ts ? 1 : 0.3}
+                                        fillOpacity={selectedBucketTs == null || selectedBucketTs === d.ts ? 1 : 0.3}
                                     />
                                 ))}
                             </Bar>
@@ -1751,7 +1751,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                     rangeEndMs={rangeWindow?.end.getTime() || 0}
                     stepSeconds={rangeStepSeconds}
                     onSelectBucket={handleSelectBucket}
-                    selectedBucketStartMs={selectedBucket?.startMs ?? null}
+                    selectedBucketTs={selectedBucket?.endMs ?? null}
                     collapsed={chartCollapsed}
                     onToggleCollapsed={() => setChartCollapsed((v) => !v)}
                 />
