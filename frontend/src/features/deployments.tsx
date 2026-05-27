@@ -847,6 +847,42 @@ const LOG_LONG_LINE_THRESHOLD = 120;
 // Without this, the default range can clip those trailing lines off-screen.
 const LOG_TERMINATED_END_CUSHION_MS = 10 * 60 * 1000;
 
+// Severity-ascending order so the Combobox and the stacked chart present
+// levels in a sensible reading order. Anything not in this map (forward
+// compat: Loki adds a new value) sorts after the known ones.
+const LEVEL_SEVERITY_ORDER = {
+    trace: 0,
+    debug: 1,
+    info: 2,
+    notice: 3,
+    warn: 4,
+    error: 5,
+    critical: 6,
+    fatal: 7,
+    unknown: 8,
+};
+
+function levelSeverityRank(level) {
+    const rank = LEVEL_SEVERITY_ORDER[level];
+    return rank === undefined ? 99 : rank;
+}
+
+function levelLabel(level) {
+    if (!level) return '';
+    return level.charAt(0).toUpperCase() + level.slice(1);
+}
+
+function orderedLevelOptions(levels) {
+    return [...levels]
+        .sort((a, b) => levelSeverityRank(a) - levelSeverityRank(b))
+        .map((value) => ({ value, label: levelLabel(value) }));
+}
+
+// Stable order for chart stacking and tooltip entries.
+function orderedLevels(levels) {
+    return [...levels].sort((a, b) => levelSeverityRank(a) - levelSeverityRank(b));
+}
+
 function parseLogLine(line, seq, level) {
     // Backend prepends "<RFC3339> " when timestamps=true.
     const sp = line.indexOf(' ');
@@ -946,7 +982,19 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
     const [countsError, setCountsError] = useState(null);
     const [countsStatus, setCountsStatus] = useState(null);
     const [autoScroll, setAutoScroll] = useState(true);
-    const [levelFilter, setLevelFilter] = useState('all');
+    // Empty array = "all levels". Each value sent to the server as a
+    // separate `?level=` query param. Population options come from
+    // `capabilities.levels` once it loads.
+    const [levelFilter, setLevelFilter] = useState([]);
+    // Server-scoped capabilities — drives the level filter options, chart
+    // palette, and whether the volume panel is rendered at all. Default to
+    // a "supports everything" shape so the UI is fully usable while the
+    // first request is in flight.
+    const [capabilities, setCapabilities] = useState({
+        backend: null,
+        levels: ['info', 'warn', 'error'],
+        supports_volume: true,
+    });
     const [rangeValue, setRangeValue] = useState('6h');
     const [customStart, setCustomStart] = useState(null);
     const [customEnd, setCustomEnd] = useState(null);
@@ -1024,6 +1072,28 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
     }, [rangeWindow, selectedBucket]);
 
     useEffect(() => {
+        let cancelled = false;
+        async function loadCapabilities() {
+            try {
+                const caps = await api.getLogsCapabilities();
+                if (cancelled || !caps) return;
+                setCapabilities({
+                    backend: caps.backend || null,
+                    levels: Array.isArray(caps.levels) && caps.levels.length > 0
+                        ? caps.levels
+                        : ['info', 'warn', 'error'],
+                    supports_volume: Boolean(caps.supports_volume),
+                });
+            } catch (err) {
+                console.error('Failed to load log capabilities:', err);
+                // Keep the default — the UI stays usable.
+            }
+        }
+        loadCapabilities();
+        return () => { cancelled = true; };
+    }, []);
+
+    useEffect(() => {
         entriesCountRef.current = entries.length;
     }, [entries.length]);
 
@@ -1059,12 +1129,14 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
             end: rangeWindow.end.toISOString(),
             step_seconds: String(rangeStepSeconds),
         });
-        if (levelFilter && levelFilter !== 'all') params.set('level', levelFilter);
+        for (const level of levelFilter) {
+            params.append('level', level);
+        }
         if (searchActive) params.set('search', searchActive);
 
         try {
             const response = await fetch(
-                `${baseUrl}/api/v1/projects/${projectName}/deployments/${deploymentId}/logs/counts?${params.toString()}`,
+                `${baseUrl}/api/v1/projects/${projectName}/deployments/${deploymentId}/logs/volume?${params.toString()}`,
                 {
                     headers: { 'Accept': 'application/json' },
                     credentials: 'include',
@@ -1099,12 +1171,12 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
 
     // Cancellable SSE fetch. `onLine` receives raw (timestamped) lines along
     // with the backend-provided per-line level classification.
-    const fetchLogFeed = useCallback(async ({ follow, start, end, tail, level, search, onLine, onStatus, onBacklogComplete }: {
+    const fetchLogFeed = useCallback(async ({ follow, start, end, tail, levels, search, onLine, onStatus, onBacklogComplete }: {
         follow: boolean;
         start?: string;
         end?: string;
         tail: number;
-        level?: string;
+        levels?: string[];
         search?: string;
         onLine: (line: string, lineLevel: string) => void;
         onStatus?: (payload: string) => void;
@@ -1128,7 +1200,9 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
         }
         if (start) params.set('start', start);
         if (end) params.set('end', end);
-        if (level && level !== 'all') params.set('level', level);
+        for (const lv of levels || []) {
+            params.append('level', lv);
+        }
         if (search) params.set('search', search);
 
         const response = await fetch(
@@ -1176,7 +1250,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                 start: logWindow.start.toISOString(),
                 end: logWindow.end.toISOString(),
                 tail: LOG_PAGE_SIZE,
-                level: levelFilter,
+                levels: levelFilter,
                 search: searchActive,
                 onLine: (line, lineLevel) => {
                     if (gen !== streamGenRef.current) return;
@@ -1240,7 +1314,9 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
             tail: String(LOG_PAGE_SIZE),
             end: new Date(oldestMs).toISOString(),
         });
-        if (levelFilter && levelFilter !== 'all') params.set('level', levelFilter);
+        for (const level of levelFilter) {
+            params.append('level', level);
+        }
         if (searchActive) params.set('search', searchActive);
         // K8s backend uses this to skip past the lines already in view (it
         // has no end-time filter on pods/log). Loki ignores it and uses
@@ -1331,7 +1407,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                 // returns lines older than the user's range.
                 start: rangeWindow ? rangeWindow.start.toISOString() : undefined,
                 tail: LOG_PAGE_SIZE,
-                level: levelFilter,
+                levels: levelFilter,
                 search: searchActive,
                 onLine: (line, lineLevel) => {
                     if (streamGenRef.current !== gen) return;
@@ -1421,7 +1497,9 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
         void refreshCounts();
     }, [loggable, rangeWindow, refreshCounts]);
 
-    const chartUnsupported = countsStatus?.reason === 'historical_backend_not_configured';
+    const chartUnsupported =
+        !capabilities.supports_volume
+        || countsStatus?.reason === 'historical_backend_not_configured';
 
     // Reload on deployment identity/status changes, when the user changes the
     // level/search filters, and when the visible time range changes. A preset
@@ -1508,7 +1586,8 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
     };
 
     const handleLevelFilterChange = (value) => {
-        setLevelFilter(value);
+        // multi-select onChange always emits string[]
+        setLevelFilter(Array.isArray(value) ? value : []);
         if (selectedBucket) setSelectedBucket(null);
     };
 
@@ -1617,13 +1696,11 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                 <div className="r-logs-head-left">
                     <div className="r-logs-level">
                         <Combobox
+                            multi
                             value={levelFilter}
-                            options={[
-                                { value: 'all', label: 'All levels' },
-                                { value: 'info', label: 'Info' },
-                                { value: 'warn', label: 'Warn' },
-                                { value: 'error', label: 'Error' },
-                            ]}
+                            placeholder="All levels"
+                            allowClear
+                            options={orderedLevelOptions(capabilities.levels)}
                             onChange={handleLevelFilterChange}
                         />
                     </div>
@@ -1734,6 +1811,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                         <Suspense fallback={<div className="py-6 text-center text-xs text-[var(--text-soft)]">Loading chart…</div>}>
                             <LogVolumeChart
                                 counts={counts}
+                                levels={orderedLevels(capabilities.levels)}
                                 loading={countsLoading}
                                 error={countsError}
                                 status={countsStatus}

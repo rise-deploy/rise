@@ -49,6 +49,12 @@ class RiseAPI {
         return this.request('/users/me');
     }
 
+    // Server capabilities for the configured runtime log backend. Drives the
+    // level filter options + chart palette on the deployment logs page.
+    async getLogsCapabilities() {
+        return this.request('/logs/capabilities');
+    }
+
     async lookupUsers(emails) {
         return this.request('/users/lookup', {
             method: 'POST',

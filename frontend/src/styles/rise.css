@@ -44,6 +44,13 @@
     --r-log-chart-info: oklch(0.55 0.005 80);
     --r-log-chart-warn: oklch(0.70 0.14 85);
     --r-log-chart-error: oklch(0.58 0.18 25);
+    /* Loki emits additional `detected_level` values beyond info/warn/error.
+       The CLI mirrors this palette in ANSI; keep them in sync if you tweak. */
+    --r-log-chart-critical: oklch(0.50 0.20 25);
+    --r-log-chart-fatal: oklch(0.45 0.20 20);
+    --r-log-chart-debug: oklch(0.65 0.02 230);
+    --r-log-chart-trace: oklch(0.70 0.02 230);
+    --r-log-chart-unknown: oklch(0.72 0.005 80);
 }
 
 .dark {
@@ -82,6 +89,11 @@
     --r-log-chart-info: oklch(0.62 0.005 80);
     --r-log-chart-warn: oklch(0.78 0.13 85);
     --r-log-chart-error: oklch(0.62 0.16 25);
+    --r-log-chart-critical: oklch(0.55 0.18 25);
+    --r-log-chart-fatal: oklch(0.50 0.20 20);
+    --r-log-chart-debug: oklch(0.55 0.04 230);
+    --r-log-chart-trace: oklch(0.62 0.04 230);
+    --r-log-chart-unknown: oklch(0.50 0.005 80);
 }
 
 /* Palette: shifts the accent plus a subtle tint of the light-mode
@@ -1124,9 +1136,18 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
 .dark .r-logs { color: oklch(0.92 0.005 80); }
 .r-logs .ts { color: oklch(0.55 0.005 80); margin-right: 10px; }
 .r-logs .src { color: oklch(0.72 0.10 165); margin-right: 8px; }
-.r-logs .lv-info { color: oklch(0.82 0.005 80); }
+.r-logs .lv-info,
+.r-logs .lv-notice { color: oklch(0.82 0.005 80); }
 .r-logs .lv-warn { color: oklch(0.80 0.11 85); }
 .r-logs .lv-error { color: oklch(0.68 0.14 25); }
+/* Loki-emitted level variants beyond info/warn/error. Match the palette
+   used by the chart's CSS variables semantically: error family in reds,
+   debug/trace/unknown in muted/dim greys. */
+.r-logs .lv-critical { color: oklch(0.62 0.18 25); }
+.r-logs .lv-fatal { color: oklch(0.58 0.20 20); }
+.r-logs .lv-debug,
+.r-logs .lv-trace,
+.r-logs .lv-unknown { color: oklch(0.62 0.005 80); }
 .r-logs-row {
     position: relative;
     display: block;
