@@ -958,7 +958,7 @@ impl LogLine {
     }
 
     fn classified_level(&self) -> String {
-        // Three cases:
+        // Two cases:
         //   * Loki returned a concrete `detected_level` (`info`, `warn`,
         //     `unknown`, …) — pass through verbatim. This includes Loki's
         //     own `"unknown"`: when Loki actively says "I can't classify
