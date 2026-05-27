@@ -607,6 +607,11 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
     border-color: var(--accent);
     box-shadow: 0 0 0 3px color-mix(in oklch, var(--accent) 16%, transparent);
 }
+.r-cbox-trigger[aria-disabled="true"] {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+.r-cbox-trigger[aria-disabled="true"]:hover { background: var(--surface); }
 .r-cbox-trigger.placeholder { color: var(--text-soft); }
 .r-cbox-trigger .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .r-cbox-trigger .chev {
