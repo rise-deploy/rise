@@ -1402,6 +1402,21 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
         return () => window.clearTimeout(handle);
     }, [rangeWindow, loggable, refreshCounts, chartCollapsed]);
 
+    // One-time probe so we learn the backend's chart capability up front and
+    // can disable Refresh / Auto-refresh when log volumes aren't supported.
+    // For the Kubernetes backend the call short-circuits to a status response;
+    // for Loki it costs one count query whose result is reused if the user
+    // expands the chart.
+    const countsProbedRef = useRef(false);
+    useEffect(() => {
+        if (countsProbedRef.current) return;
+        if (!loggable || !rangeWindow) return;
+        countsProbedRef.current = true;
+        void refreshCounts();
+    }, [loggable, rangeWindow, refreshCounts]);
+
+    const chartUnsupported = countsStatus?.reason === 'historical_backend_not_configured';
+
     // Reload on deployment identity/status changes, when the user changes the
     // level/search filters, and when the visible time range changes. A preset
     // range (15m, 1h, ...) means "live tail with this much history"; custom
@@ -1649,23 +1664,6 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                     <span className="r-logs-count" aria-label="Loaded log lines">
                         {entries.length.toLocaleString()} {entries.length === 1 ? 'line' : 'lines'}
                     </span>
-                    <RButton size="sm" onClick={handleRefresh}>Refresh</RButton>
-                    <div className="r-logs-autorefresh">
-                        <Combobox
-                            value={String(autoRefreshSeconds)}
-                            options={[
-                                { value: '0', label: 'Auto: Off' },
-                                { value: '10', label: 'Auto: 10s' },
-                                { value: '30', label: 'Auto: 30s' },
-                                { value: '60', label: 'Auto: 1m' },
-                                { value: '300', label: 'Auto: 5m' },
-                            ]}
-                            onChange={(v) => {
-                                const parsed = Number.parseInt(v, 10);
-                                setAutoRefreshSeconds(Number.isNaN(parsed) ? 0 : parsed);
-                            }}
-                        />
-                    </div>
                     <RButton size="sm" onClick={handleCopyLogs} disabled={entries.length === 0} title="Copy logs">
                         <Icon name="copy" size={11} />
                     </RButton>
@@ -1679,18 +1677,47 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                     </div>
                 )}
                 <div className="r-logs-chart" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                    <button
-                        type="button"
-                        className="r-logs-chart-head"
-                        onClick={() => setChartCollapsed((v) => !v)}
-                        aria-expanded={!chartCollapsed}
-                    >
-                        <span className="r-logs-chart-head-toggle">
-                            <Icon name={chartCollapsed ? 'chev' : 'chevd'} size={12} />
-                        </span>
-                        <span className="r-logs-chart-head-title">Log volume</span>
-                        <span className="r-logs-chart-head-range">{rangeLabel}</span>
-                    </button>
+                    <div className="r-logs-chart-head">
+                        <button
+                            type="button"
+                            className="r-logs-chart-head-toggle-btn"
+                            onClick={() => setChartCollapsed((v) => !v)}
+                            aria-expanded={!chartCollapsed}
+                        >
+                            <span className="r-logs-chart-head-toggle">
+                                <Icon name={chartCollapsed ? 'chev' : 'chevd'} size={12} />
+                            </span>
+                            <span className="r-logs-chart-head-title">Log volume</span>
+                            <span className="r-logs-chart-head-range">{rangeLabel}</span>
+                        </button>
+                        <div className="r-logs-chart-head-actions">
+                            <RButton
+                                size="sm"
+                                onClick={handleRefresh}
+                                disabled={chartUnsupported}
+                                title={chartUnsupported ? "Log volumes aren't supported by the configured log backend." : undefined}
+                            >
+                                Refresh
+                            </RButton>
+                            <div className="r-logs-autorefresh">
+                                <Combobox
+                                    value={String(autoRefreshSeconds)}
+                                    disabled={chartUnsupported}
+                                    options={[
+                                        { value: '0', label: 'Auto: Off' },
+                                        { value: '10', label: 'Auto: 10s' },
+                                        { value: '30', label: 'Auto: 30s' },
+                                        { value: '60', label: 'Auto: 1m' },
+                                        { value: '300', label: 'Auto: 5m' },
+                                    ]}
+                                    onChange={(v) => {
+                                        const parsed = Number.parseInt(v, 10);
+                                        setAutoRefreshSeconds(Number.isNaN(parsed) ? 0 : parsed);
+                                    }}
+                                />
+                            </div>
+                        </div>
+                    </div>
                     {!chartCollapsed && (
                         <Suspense fallback={<div className="py-6 text-center text-xs text-[var(--text-soft)]">Loading chart…</div>}>
                             <LogVolumeChart

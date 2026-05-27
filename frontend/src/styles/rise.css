@@ -1322,16 +1322,26 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
     display: flex;
     align-items: center;
     gap: 8px;
-    background: transparent;
-    border: 0;
     padding: 4px 2px;
     font-size: 12px;
     color: var(--text-soft);
-    cursor: pointer;
-    text-align: left;
     width: 100%;
 }
-.r-logs-chart-head:hover .r-logs-chart-head-title { color: var(--text); }
+.r-logs-chart-head-toggle-btn {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1;
+    min-width: 0;
+    background: transparent;
+    border: 0;
+    padding: 0;
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
+    text-align: left;
+}
+.r-logs-chart-head-toggle-btn:hover .r-logs-chart-head-title { color: var(--text); }
 .r-logs-chart-head-toggle {
     display: inline-flex;
     align-items: center;
@@ -1344,6 +1354,11 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
 .r-logs-chart-head-range {
     margin-left: auto;
     color: var(--text-soft);
+}
+.r-logs-chart-head-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
 }
 
 /* ---------- Date range popover ---------- */
