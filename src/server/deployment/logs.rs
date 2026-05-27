@@ -1323,17 +1323,7 @@ fn websocket_url(http_url: &str, selector: &str) -> String {
     } else if let Some(rest) = url.strip_prefix("http://") {
         url = format!("ws://{}", rest);
     }
-    // `delay_for` buffers each entry for N seconds before emitting on the
-    // tail stream — this gives Loki's async `detected_level` classifier
-    // time to run, so the `detected_level` stream label is populated by
-    // the time the entry reaches us. Without it, the most-recent entries
-    // arrive un-classified and the SSE consumer renders them as
-    // `"unknown"`. 5s is Loki's documented maximum.
-    format!(
-        "{}?query={}&delay_for=5",
-        url,
-        urlencoding::encode(selector)
-    )
+    format!("{}?query={}", url, urlencoding::encode(selector))
 }
 
 /// Parse a short retention hint like `"7d"` or `"2w"`. Supported units:
