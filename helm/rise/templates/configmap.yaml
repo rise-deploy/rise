@@ -18,7 +18,13 @@ data:
 {{- if .Values.logs.loki.bearerTokenSecret.name }}
 {{- $_ := set $deploymentLogs "bearer_token_env" "RISE_LOKI_BEARER_TOKEN" }}
 {{- end }}
-{{- with (.Values.logs.loki.retentionHint | default .Values.loki.loki.limits_config.retention_period) }}
+{{- $retentionHint := .Values.logs.loki.retentionHint }}
+{{- if and (not $retentionHint) .Values.logs.loki.enabled }}
+{{- /* Only inherit the bundled Loki retention when we actually installed it.
+       For an external Loki, the operator should set retentionHint explicitly. */}}
+{{- $retentionHint = .Values.loki.loki.limits_config.retention_period }}
+{{- end }}
+{{- with $retentionHint }}
 {{- $_ := set $deploymentLogs "retention_hint" . }}
 {{- end }}
 {{- $_ := set $deploymentLogs "timeout_secs" (.Values.logs.loki.timeoutSeconds | int) }}

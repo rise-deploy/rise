@@ -95,6 +95,13 @@ pub struct LogCountBucket {
 pub enum LogEvent {
     Line(String),
     Status(LogStatus),
+    /// Sent once the initial backlog phase of a streaming request has been
+    /// fully emitted, before the live-tail loop begins. `count` is the number
+    /// of backlog lines yielded; the frontend uses it to decide whether older
+    /// lines may still exist in the selected window.
+    BacklogLoaded {
+        count: usize,
+    },
 }
 
 pub type LogEventStream = futures::stream::BoxStream<'static, Result<LogEvent>>;
@@ -180,7 +187,6 @@ impl RuntimeLogBackend for KubernetesLogBackend {
         project: &Project,
         query: LogQuery,
     ) -> Result<LogEventStream> {
-        use futures::AsyncReadExt;
         use k8s_openapi::api::core::v1::Pod;
         use kube::api::{Api, ListParams, LogParams};
 
@@ -238,30 +244,32 @@ impl RuntimeLogBackend for KubernetesLogBackend {
         if let Some(since) = query.since_seconds {
             log_params.since_seconds = Some(since);
         } else if let Some(start_time) = query.start_time {
-            log_params.since_seconds = Some((Utc::now() - start_time).num_seconds().max(1));
+            // The Kubernetes pods/log API only supports a since-anchored window;
+            // a future-dated start (and any explicit end_time) cannot be honored.
+            let delta = (Utc::now() - start_time).num_seconds();
+            if delta > 0 {
+                log_params.since_seconds = Some(delta);
+            }
         }
 
-        let mut log_stream = pod_api.log_stream(&pod_name, &log_params).await?;
+        let log_stream = pod_api.log_stream(&pod_name, &log_params).await?;
         let level = query.level;
         let search = query.search.clone();
         let stream = async_stream::stream! {
-            let mut buffer = vec![0u8; 8192];
-            loop {
-                match log_stream.read(&mut buffer).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        for line in String::from_utf8_lossy(&buffer[..n]).lines() {
-                            if line.is_empty() { continue; }
-                            if !line_matches_level(line, level) { continue; }
-                            if !line_matches_search(line, search.as_deref()) { continue; }
-                            yield Ok(LogEvent::Line(line.to_string()));
-                        }
-                    }
+            use futures::AsyncBufReadExt;
+            let mut lines = futures::io::BufReader::new(log_stream).lines();
+            while let Some(line) = lines.next().await {
+                let line = match line {
+                    Ok(line) => line,
                     Err(e) => {
                         yield Err(anyhow::anyhow!("Log stream error: {}", e));
                         break;
                     }
-                }
+                };
+                if line.is_empty() { continue; }
+                if !line_matches_level(&line, level) { continue; }
+                if !line_matches_search(&line, search.as_deref()) { continue; }
+                yield Ok(LogEvent::Line(line));
             }
         };
 
@@ -447,16 +455,25 @@ impl LokiLogBackend {
         project: Project,
         query: LogQuery,
     ) -> Result<LogEventStream> {
-        let initial = self.query_range(&deployment, &project, &query).await?;
+        // Skip the historical query entirely when the caller only wants a
+        // negligible backlog. Otherwise query_range would scan the full
+        // [start, end] window just to drop all but one row at the limit.
+        let initial = if matches!(query.tail_lines, Some(t) if t <= 1) {
+            Vec::new()
+        } else {
+            self.query_range(&deployment, &project, &query).await?
+        };
         let selector = self.selector(&deployment, &project, query.level, query.search.as_deref());
         let url = websocket_url(&self.tail_url, &selector);
         let tenant_id = self.tenant_id.clone();
         let bearer_token = self.bearer_token.clone();
 
         let stream = async_stream::try_stream! {
+            let backlog_count = initial.len();
             for line in initial {
                 yield LogEvent::Line(line.render(query.timestamps));
             }
+            yield LogEvent::BacklogLoaded { count: backlog_count };
 
             let mut request = tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url.as_str())
                 .context("Failed to build Loki tail websocket request")?;
@@ -594,7 +611,10 @@ impl LokiLogBackend {
 
         let mut buckets = Vec::new();
         let mut current = start_time;
-        while current <= end_time {
+        // Half-open: each bucket represents [current, current + step), so we stop
+        // once `current` reaches the aligned end — including it would emit one
+        // extra empty bucket past the requested range.
+        while current < end_time {
             let bucket_nanos = current.timestamp_nanos_opt().unwrap_or_default();
             buckets.push(LogCountBucket {
                 timestamp: current.to_rfc3339(),
@@ -825,7 +845,14 @@ impl LokiMetricSeries {
         samples
             .into_iter()
             .map(|MetricSample(ts_seconds, count_str)| {
-                let timestamp_nanos = (ts_seconds * 1_000_000_000.0) as i64;
+                // Loki returns metric timestamps as JSON numbers (seconds). For step
+                // sizes >= 1s — the only ones the chart uses — they are whole
+                // seconds. Multiplying as f64 loses precision above ~2^53 ns
+                // (early 2255), so round-then-multiply as i64 to land exactly on
+                // bucket boundaries.
+                let timestamp_nanos = (ts_seconds.round() as i64)
+                    .checked_mul(1_000_000_000)
+                    .unwrap_or(i64::MAX);
                 let count = count_str
                     .parse::<f64>()
                     .ok()
@@ -874,8 +901,14 @@ fn append_search_filter(selector: &str, search: Option<&str>) -> String {
         return selector.to_string();
     };
     // Loki's `|~` accepts a regex. We escape user input so it behaves as a
-    // literal case-insensitive substring match.
-    let escaped = regex::escape(&text);
+    // literal case-insensitive substring match. LogQL backtick-quoted literals
+    // have no escape for the backtick character itself, so strip any from the
+    // search before regex-escaping.
+    let sanitized = text.replace('`', "");
+    if sanitized.is_empty() {
+        return selector.to_string();
+    }
+    let escaped = regex::escape(&sanitized);
     format!("{selector} |~ `(?i){escaped}`")
 }
 
@@ -931,5 +964,73 @@ fn parse_duration_hint(value: &str) -> Option<Duration> {
         "h" => Some(Duration::hours(number)),
         "d" => Some(Duration::days(number)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_count_buckets_is_half_open_at_end() {
+        // [0s, 300s) at step=60s should yield exactly 5 buckets at 0, 60, 120,
+        // 180, 240 — not 6. The aligned-end bucket itself represents [300, 360)
+        // and would be empty by construction; emitting it pads every chart.
+        let start = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+        let end = DateTime::<Utc>::from_timestamp(300, 0).unwrap();
+        let buckets = LokiLogBackend::build_count_buckets(
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            start,
+            end,
+            60,
+        );
+        assert_eq!(buckets.len(), 5);
+    }
+
+    #[test]
+    fn build_count_buckets_sums_samples_into_their_bucket() {
+        // A Loki point at the bucket boundary belongs to that bucket (exact-match
+        // path). A point inside the bucket window also counts; nothing should
+        // double-count into the next bucket.
+        let step = 60;
+        let start = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+        let end = DateTime::<Utc>::from_timestamp(180, 0).unwrap();
+        let mut total = BTreeMap::new();
+        total.insert(0i64, 3);
+        total.insert(60i64 * 1_000_000_000, 7);
+        let buckets = LokiLogBackend::build_count_buckets(
+            total,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            start,
+            end,
+            step,
+        );
+        assert_eq!(buckets.len(), 3);
+        assert_eq!(buckets[0].total, 3);
+        assert_eq!(buckets[1].total, 7);
+        assert_eq!(buckets[2].total, 0);
+    }
+
+    #[test]
+    fn append_search_filter_strips_backticks() {
+        // Backticks would close the LogQL raw-string literal mid-filter and
+        // produce a syntactically invalid query — must be stripped, not
+        // regex-escaped.
+        let out = append_search_filter("{job=\"x\"}", Some("a`b"));
+        assert!(!out.contains('`') || out.matches('`').count() == 2);
+        assert!(out.contains("ab"));
+    }
+
+    #[test]
+    fn append_search_filter_with_only_backticks_is_noop() {
+        // After stripping, an all-backtick search yields the original selector
+        // rather than `|~ \`(?i)\``.
+        let out = append_search_filter("{job=\"x\"}", Some("```"));
+        assert_eq!(out, "{job=\"x\"}");
     }
 }

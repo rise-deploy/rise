@@ -2424,6 +2424,12 @@ pub async fn stream_deployment_logs(
                 .json_data(status)
                 .map_err(anyhow::Error::from)])
         }
+        Ok(crate::server::deployment::logs::LogEvent::BacklogLoaded { count }) => {
+            stream::iter(vec![Event::default()
+                .event("backlog_complete")
+                .json_data(serde_json::json!({ "count": count }))
+                .map_err(anyhow::Error::from)])
+        }
         Err(e) => {
             // Send error as SSE event
             error!("Log stream error: {}", e);

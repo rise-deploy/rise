@@ -519,6 +519,7 @@ pub async fn mark_cancelled(pool: &PgPool, id: Uuid) -> Result<Deployment> {
             status = 'Cancelled',
             termination_reason = 'Cancelled',
             controller_metadata = '{}',
+            completed_at = NOW(),
             updated_at = NOW()
         WHERE id = $1
         RETURNING
@@ -556,6 +557,7 @@ pub async fn mark_stopped(pool: &PgPool, id: Uuid) -> Result<Deployment> {
             status = 'Stopped',
             termination_reason = 'UserStopped',
             controller_metadata = '{}',
+            completed_at = NOW(),
             updated_at = NOW()
         WHERE id = $1
         RETURNING
@@ -593,6 +595,7 @@ pub async fn mark_superseded(pool: &PgPool, id: Uuid) -> Result<Deployment> {
             status = 'Superseded',
             termination_reason = 'Superseded',
             controller_metadata = '{}',
+            completed_at = NOW(),
             updated_at = NOW()
         WHERE id = $1
         RETURNING
@@ -630,6 +633,7 @@ pub async fn mark_expired(pool: &PgPool, id: Uuid) -> Result<Deployment> {
             status = 'Expired',
             termination_reason = 'Expired',
             controller_metadata = '{}',
+            completed_at = NOW(),
             updated_at = NOW()
         WHERE id = $1
         RETURNING

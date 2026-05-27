@@ -140,9 +140,17 @@ logs:
     externalUrl: ""
     tenantId: ""
     timeoutSeconds: 10
-    # Display-only hint used by Rise when no logs are found. Retention is still
-    # enforced by Loki itself.
+    # Display-only hint used by Rise when no logs are found in a window. Loki
+    # itself still enforces the actual retention. When the bundled Loki
+    # subchart is enabled and this is left empty, the bundled Loki's
+    # `limits_config.retention_period` is used as a fallback. For an external
+    # Loki, set this explicitly — the bundled-Loki default is not used.
     retentionHint: ""
+    # If your external Loki requires a bearer token, set name/key here and
+    # the backend gets it via RISE_LOKI_BEARER_TOKEN. NOTE: this only wires
+    # the *backend*; Alloy must also receive the token. Add the matching
+    # extraEnv to alloy.alloy.extraEnv (see the README "Bearer token" section
+    # for the exact snippet).
     bearerTokenSecret:
       name: ""
       key: token

@@ -725,16 +725,19 @@ function presetToMilliseconds(value) {
     return preset ? preset.minutes * 60 * 1000 : LOG_RANGE_PRESETS[2].minutes * 60 * 1000;
 }
 
-function resolveLogWindow(rangeValue, customStart, customEnd) {
-    const now = new Date();
+function resolveLogWindow(rangeValue, customStart, customEnd, anchorEnd) {
     if (rangeValue === 'custom') {
         if (!customStart) return null;
-        const end = customEnd || now;
+        const end = customEnd || new Date();
         if (customStart >= end) return null;
         return { start: customStart, end };
     }
+    // For presets, anchor to the deployment's end time when supplied so
+    // "Last 6h" means "the 6h leading up to when the deployment stopped"
+    // for terminal deployments instead of wall-clock now.
+    const end = anchorEnd || new Date();
     const durationMs = presetToMilliseconds(rangeValue);
-    return { start: new Date(now.getTime() - durationMs), end: now };
+    return { start: new Date(end.getTime() - durationMs), end };
 }
 
 function formatDateTimeShort(date) {
@@ -865,13 +868,17 @@ function chooseCountStepSeconds(rangeMs) {
     return 6 * 60 * 60;
 }
 
-function formatRangeLabel(rangeValue, window) {
+function formatRangeLabel(rangeValue, window, anchorEnd) {
     if (!window) return 'Select a valid time range';
     if (rangeValue === 'custom') {
         return `${formatDate(window.start.toISOString())} to ${formatDate(window.end.toISOString())}`;
     }
     const preset = LOG_RANGE_PRESETS.find((option) => option.value === rangeValue);
-    return preset ? `Last ${preset.label}` : 'Selected range';
+    if (!preset) return 'Selected range';
+    if (anchorEnd) {
+        return `Last ${preset.label} up to ${formatDateTimeShort(anchorEnd)}`;
+    }
+    return `Last ${preset.label}`;
 }
 
 async function readHttpErrorMessage(response) {
@@ -917,6 +924,8 @@ async function readSseResponse(response, handlers) {
                 const payload = line.substring(6);
                 if (eventType === 'status') {
                     handlers.onStatus?.(payload);
+                } else if (eventType === 'backlog_complete') {
+                    handlers.onBacklogComplete?.(payload);
                 } else if (payload.trim()) {
                     handlers.onLine?.(payload);
                 }
@@ -1190,9 +1199,18 @@ function LogCountsChart({ counts, loading, error, status, rangeLabel, rangeStart
 }
 
 // Deployment Logs Component with SSE streaming + infinite scroll
-function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
+function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymentCompletedAt }) {
     const streamable = STREAMABLE_LOG_STATUSES.has(deploymentStatus);
     const loggable = LOGGABLE_STATUSES.has(deploymentStatus);
+    // For terminal deployments anchor preset ranges ("Last 6h") to the
+    // deployment's end time instead of wall-clock now, otherwise "Last 6h"
+    // for a deployment that died three days ago would always be empty.
+    const anchorEnd = useMemo(() => {
+        if (streamable) return null;
+        if (!deploymentCompletedAt) return null;
+        const d = new Date(deploymentCompletedAt);
+        return Number.isNaN(d.getTime()) ? null : d;
+    }, [streamable, deploymentCompletedAt]);
     const [entries, setEntries] = useState([]);
     const [streaming, setStreaming] = useState(false);
     const [error, setError] = useState(null);
@@ -1220,15 +1238,22 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
     const logBoxRef = useRef(null);
     const loadMoreRef = useRef(null);
     const abortControllerRef = useRef(null);
+    const countsAbortControllerRef = useRef(null);
+    const loadOlderAbortControllerRef = useRef(null);
     const countsRequestIdRef = useRef(0);
     const seqRef = useRef(0);
     const oldestLoadedMsRef = useRef(null);
     const loadingMoreRef = useRef(false);
     const ignoreScrollRef = useRef(false);
     const streamGenRef = useRef(0);
+    // Tracks whether the active streaming request has finished its initial
+    // backlog phase. Until then we keep `hasMore` optimistic so the user can
+    // scroll to load older. Once the backlog count is known we set `hasMore`
+    // definitively and stop overriding it with each new live-tail line.
+    const backlogCompleteRef = useRef(false);
 
-    const rangeWindow = useMemo(() => resolveLogWindow(rangeValue, customStart, customEnd), [rangeValue, customStart, customEnd]);
-    const rangeLabel = useMemo(() => formatRangeLabel(rangeValue, rangeWindow), [rangeValue, rangeWindow]);
+    const rangeWindow = useMemo(() => resolveLogWindow(rangeValue, customStart, customEnd, anchorEnd), [rangeValue, customStart, customEnd, anchorEnd]);
+    const rangeLabel = useMemo(() => formatRangeLabel(rangeValue, rangeWindow, anchorEnd), [rangeValue, rangeWindow, anchorEnd]);
     const rangeStepSeconds = useMemo(() => {
         if (!rangeWindow) return 60;
         return chooseCountStepSeconds(rangeWindow.end.getTime() - rangeWindow.start.getTime());
@@ -1263,6 +1288,11 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
 
         const requestId = countsRequestIdRef.current + 1;
         countsRequestIdRef.current = requestId;
+        if (countsAbortControllerRef.current) {
+            countsAbortControllerRef.current.abort();
+        }
+        const controller = new AbortController();
+        countsAbortControllerRef.current = controller;
         setCountsLoading(true);
         setCountsError(null);
 
@@ -1281,6 +1311,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                 {
                     headers: { 'Accept': 'application/json' },
                     credentials: 'include',
+                    signal: controller.signal,
                 },
             );
 
@@ -1294,6 +1325,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
             setCountsStatus(data.status || null);
         } catch (err) {
             if (countsRequestIdRef.current !== requestId) return;
+            if (err.name === 'AbortError') return;
             console.error('Failed to load log counts:', err);
             setCounts([]);
             setCountsStatus(null);
@@ -1301,12 +1333,15 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
         } finally {
             if (countsRequestIdRef.current === requestId) {
                 setCountsLoading(false);
+                if (countsAbortControllerRef.current === controller) {
+                    countsAbortControllerRef.current = null;
+                }
             }
         }
     }, [deploymentId, projectName, rangeStepSeconds, rangeWindow, levelFilter, searchActive]);
 
     // Cancellable SSE fetch. `onLine` receives raw (timestamped) lines.
-    const fetchLogFeed = useCallback(async ({ follow, start, end, tail, level, search, onLine, onStatus }) => {
+    const fetchLogFeed = useCallback(async ({ follow, start, end, tail, level, search, onLine, onStatus, onBacklogComplete }) => {
         if (abortControllerRef.current) {
             abortControllerRef.current.abort();
             abortControllerRef.current = null;
@@ -1341,7 +1376,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
             throw new Error(await readHttpErrorMessage(response));
         }
 
-        await readSseResponse(response, { onLine, onStatus });
+        await readSseResponse(response, { onLine, onStatus, onBacklogComplete });
     }, [deploymentId, projectName]);
 
     const loadHistoricalLogs = useCallback(async () => {
@@ -1396,11 +1431,11 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
             if (err.name === 'AbortError') return;
             console.error('Failed to load logs:', err);
             setError(err.message);
-        } finally {
-            if (abortControllerRef.current) {
-                abortControllerRef.current = null;
-            }
         }
+        // Don't null `abortControllerRef.current` here: a newer invocation may
+        // have already overwritten it with its own controller, and clearing it
+        // would prevent `stopStreaming()` from aborting the in-flight call.
+        // The next `fetchLogFeed` invocation owns aborting any predecessor.
     }, [fetchLogFeed, logWindow, levelFilter, searchActive]);
 
     const loadOlder = useCallback(async () => {
@@ -1410,6 +1445,13 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
         const oldestMs = oldestLoadedMsRef.current;
         if (!oldestMs) return;
 
+        // Abort any in-flight pagination; otherwise a stale response can land
+        // after the user has changed filter/range and overwrite the new window.
+        if (loadOlderAbortControllerRef.current) {
+            loadOlderAbortControllerRef.current.abort();
+        }
+        const controller = new AbortController();
+        loadOlderAbortControllerRef.current = controller;
         loadingMoreRef.current = true;
         setLoadingMore(true);
 
@@ -1429,6 +1471,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                 {
                     headers: { 'Accept': 'text/event-stream' },
                     credentials: 'include',
+                    signal: controller.signal,
                 },
             );
 
@@ -1443,6 +1486,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                 },
             });
 
+            if (controller.signal.aborted) return;
             const reversed = collected.slice().reverse();
             setEntries((prev) => {
                 const seen = new Set(prev.map((e) => e.id));
@@ -1455,10 +1499,14 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
             }
             setHasMore(collected.length === LOG_PAGE_SIZE);
         } catch (err) {
+            if (err.name === 'AbortError') return;
             console.error('Failed to load older logs:', err);
         } finally {
-            loadingMoreRef.current = false;
-            setLoadingMore(false);
+            if (loadOlderAbortControllerRef.current === controller) {
+                loadOlderAbortControllerRef.current = null;
+                loadingMoreRef.current = false;
+                setLoadingMore(false);
+            }
         }
     }, [deploymentId, projectName, hasMore, logWindow, levelFilter, searchActive]);
 
@@ -1471,11 +1519,16 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
         setStreaming(true);
         setHasMore(false);
         oldestLoadedMsRef.current = null;
+        backlogCompleteRef.current = false;
 
         try {
             await fetchLogFeed({
                 follow: true,
-                tail: 1,
+                // Bound the initial backlog to the selected window. Without a
+                // start, the backend falls back to deployment.created_at and
+                // returns lines older than the user's range.
+                start: rangeWindow ? rangeWindow.start.toISOString() : undefined,
+                tail: LOG_PAGE_SIZE,
                 level: levelFilter,
                 search: searchActive,
                 onLine: (line) => {
@@ -1497,7 +1550,11 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                             || newEntry.timestampMs < oldestLoadedMsRef.current)) {
                         oldestLoadedMsRef.current = newEntry.timestampMs;
                     }
-                    setHasMore(true);
+                    // Optimistic during backlog; once backlog_complete fires,
+                    // hasMore is authoritative — don't override on tail lines.
+                    if (!backlogCompleteRef.current) {
+                        setHasMore(true);
+                    }
                 },
                 onStatus: (payload) => {
                     if (streamGenRef.current !== gen) return;
@@ -1506,6 +1563,19 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                     } catch {
                         setLogStatus({ reason: 'backend_unavailable' });
                     }
+                },
+                onBacklogComplete: (payload) => {
+                    if (streamGenRef.current !== gen) return;
+                    backlogCompleteRef.current = true;
+                    let count = 0;
+                    try {
+                        count = JSON.parse(payload).count || 0;
+                    } catch {
+                        // Treat malformed payload as a full page so we don't
+                        // wrongly claim we've reached the start of the range.
+                        count = LOG_PAGE_SIZE;
+                    }
+                    setHasMore(count >= LOG_PAGE_SIZE);
                 },
             });
         } catch (err) {
@@ -1521,7 +1591,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                 setStreaming(false);
             }
         }
-    }, [fetchLogFeed, levelFilter, searchActive]);
+    }, [fetchLogFeed, levelFilter, searchActive, rangeWindow]);
 
     // Refresh the volume chart whenever the time range or filters change. A
     // small debounce smooths out custom datetime-local edits. Skip entirely
@@ -1728,6 +1798,14 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                             onChange={handleCustomRangeChange}
                         />
                     )}
+                    {anchorEnd && rangeValue !== 'custom' && (
+                        <span
+                            title="This deployment is terminal; preset ranges end at the deployment's stop time instead of now."
+                            style={{ fontSize: 11.5, color: 'var(--text-soft)' }}
+                        >
+                            ending {formatDateTimeShort(anchorEnd)}
+                        </span>
+                    )}
                     <span className="r-logs-count" aria-label="Loaded log lines">
                         {entries.length.toLocaleString()} {entries.length === 1 ? 'line' : 'lines'}
                     </span>
@@ -1839,8 +1917,10 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                                     {loadingMore ? 'Loading older…' : ' '}
                                 </div>
                             )}
-                            {!hasMore && entries.length > 0 && !streaming && (
-                                <div className="r-logs-loader" style={{ opacity: 0.6 }}>End of range</div>
+                            {!hasMore && entries.length > 0 && (
+                                <div className="r-logs-loader" style={{ opacity: 0.6 }}>
+                                    Start of selected range
+                                </div>
                             )}
                         </>
                     )}
@@ -2718,7 +2798,12 @@ export function DeploymentDetail({ projectName, deploymentId }) {
 
             {activeTab === 'logs' && (
                 <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 320px', gap: 18, alignItems: 'start' }}>
-                    <DeploymentLogs projectName={projectName} deploymentId={deploymentId} deploymentStatus={deployment.status} />
+                    <DeploymentLogs
+                        projectName={projectName}
+                        deploymentId={deploymentId}
+                        deploymentStatus={deployment.status}
+                        deploymentCompletedAt={deployment.completed_at}
+                    />
                     <div className="r-stack">
                         {buildKv}
                         {runtimeKv}
