@@ -104,7 +104,7 @@ services:
   # Start locally with: docker compose --profile jfrog-vault up -d jfrog vault
   jfrog:
     profiles: ["jfrog-vault"]
-    image: releases-docker.jfrog.io/jfrog/artifactory-jcr:7.146.13
+    image: releases-docker.jfrog.io/jfrog/artifactory-jcr:7.146.15
     container_name: rise-jfrog
     restart: unless-stopped
     ports:
