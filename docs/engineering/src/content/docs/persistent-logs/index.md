@@ -45,10 +45,12 @@ For any of the above, switch to the Loki backend.
 
 ## Loki backend
 
-Requires Loki 3.0+ — Rise depends on the `detected_level` structured
-metadata for level classification and the log volume chart, and older
-versions return empty results (see [Loki backend](./loki/)). The bundled
-subchart already meets this; external-Loki operators should verify.
+Requires Loki 3.0+ — the volume chart and the server-side `?level=`
+filter both rely on Loki's `detected_level` label and come back empty
+on older versions. Per-line classification has a regex fallback so the
+unfiltered line list still renders levels even when Loki hasn't yet
+classified an entry. See [Loki backend](./loki/) for the full picture
+including the available level vocabulary.
 
 See [Loki backend](./loki/) for setup with the bundled Helm subchart, an
 operator-managed external Loki, label overrides, and bearer-token wiring.

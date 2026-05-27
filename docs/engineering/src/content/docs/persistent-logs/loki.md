@@ -9,16 +9,27 @@ in Loki itself; `retention_hint` is only used to explain empty results
 in the UI and CLI.
 
 :::caution[Requires Loki 3.0+]
-Rise relies on Loki's `detected_level` structured metadata (introduced
-in Loki 3.0) for per-line level classification and for the log volume
-chart's `sum by (detected_level) (count_over_time(...))` query. Older
-Loki versions don't surface this label and will silently return empty
-results — no `detected_level` classification, no volume chart, and any
-level-filtered queries will come back empty. The bundled Loki subchart
-already pins a 3.x release, so this only affects operators pointing
-Rise at an external Loki: verify your deployment runs Loki 3.0 or
-later.
+Rise's volume chart (`sum by (detected_level) (count_over_time(...))`)
+and the server-side `?level=` filter both push `detected_level` into
+LogQL — without it, the chart and any level-filtered query come back
+empty. Per-line classification on the unfiltered line list also
+prefers `detected_level` when present, but falls back to the same
+regex the Kubernetes backend uses when Loki hasn't classified an
+entry yet (in-flight entries on the WS tail are emitted before the
+classifier hits the chunk), so the live tail is never dim by default.
+The bundled Loki subchart already pins a 3.x release, so this only
+affects operators pointing Rise at an external Loki: verify your
+deployment runs Loki 3.0 or later.
 :::
+
+## Available levels
+
+Loki advertises eight `detected_level` values — `unknown, trace,
+debug, info, warn, error, critical, fatal`. Rise mirrors that list
+via `GET /api/v1/logs/capabilities`, which the frontend uses to drive
+the filter dropdown and the chart's per-level palette. The endpoint
+also reports `supports_volume: false` for the Kubernetes backend so
+clients hide the volume panel rather than waiting for a 404.
 
 ## Backend configuration
 
