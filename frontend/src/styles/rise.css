@@ -1166,8 +1166,14 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
 }
 .r-logs-row.is-expandable { cursor: pointer; }
 .r-logs-row.is-expanded { cursor: zoom-out; }
+/* Subtle row striping. Tuned per mode: light mode wants a near-white
+   tint so it doesn't shout, dark mode wants a row a step brighter than
+   the panel bg to remain visible. */
 .r-logs-row:nth-child(odd):not(.is-expanded) {
-    background: oklch(0.16 0.004 80 / 0.45);
+    background: oklch(0.965 0.004 80);
+}
+.dark .r-logs-row:nth-child(odd):not(.is-expanded) {
+    background: oklch(0.195 0.005 80);
 }
 .r-logs-row:hover:not(.is-expanded),
 .r-logs-row:focus-visible:not(.is-expanded) {
