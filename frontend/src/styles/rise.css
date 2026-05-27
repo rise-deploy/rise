@@ -1347,6 +1347,20 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
     text-align: left;
 }
 .r-logs-chart-head-toggle-btn:hover .r-logs-chart-head-title { color: var(--text); }
+.r-logs-chart-head-toggle-btn.inert {
+    cursor: default;
+}
+.r-logs-chart-head.disabled .r-logs-chart-head-toggle {
+    color: var(--text-muted);
+}
+.r-logs-chart-head.disabled .r-logs-chart-head-title {
+    color: var(--text-soft);
+}
+.r-logs-chart-head-note {
+    margin-left: 6px;
+    color: var(--text-soft);
+    font-style: italic;
+}
 .r-logs-chart-head-toggle {
     display: inline-flex;
     align-items: center;
@@ -1355,10 +1369,6 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
 .r-logs-chart-head-title {
     font-weight: 500;
     color: var(--text);
-}
-.r-logs-chart-head-range {
-    margin-left: auto;
-    color: var(--text-soft);
 }
 .r-logs-chart-head-actions {
     display: flex;

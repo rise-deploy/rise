@@ -759,19 +759,6 @@ function chooseCountStepSeconds(rangeMs) {
     return 6 * 60 * 60;
 }
 
-function formatRangeLabel(rangeValue, window, anchorEnd) {
-    if (!window) return 'Select a valid time range';
-    if (rangeValue === 'custom') {
-        return `${formatDate(window.start.toISOString())} to ${formatDate(window.end.toISOString())}`;
-    }
-    const preset = LOG_RANGE_PRESETS.find((option) => option.value === rangeValue);
-    if (!preset) return 'Selected range';
-    if (anchorEnd) {
-        return `Last ${preset.label} up to ${formatDateTimeShort(anchorEnd)}`;
-    }
-    return `Last ${preset.label}`;
-}
-
 async function readHttpErrorMessage(response) {
     try {
         const text = await response.text();
@@ -1001,7 +988,6 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
 
     // eslint-disable-next-line react-hooks/exhaustive-deps
     const rangeWindow = useMemo(() => resolveLogWindow(rangeValue, customStart, customEnd, anchorEnd), [rangeValue, customStart, customEnd, anchorEnd, rangeNowTick]);
-    const rangeLabel = useMemo(() => formatRangeLabel(rangeValue, rangeWindow, anchorEnd), [rangeValue, rangeWindow, anchorEnd]);
     const rangeStepSeconds = useMemo(() => {
         if (!rangeWindow) return 60;
         return chooseCountStepSeconds(rangeWindow.end.getTime() - rangeWindow.start.getTime());
@@ -1677,26 +1663,32 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                     </div>
                 )}
                 <div className="r-logs-chart" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                    <div className="r-logs-chart-head">
-                        <button
-                            type="button"
-                            className="r-logs-chart-head-toggle-btn"
-                            onClick={() => setChartCollapsed((v) => !v)}
-                            aria-expanded={!chartCollapsed}
-                        >
-                            <span className="r-logs-chart-head-toggle">
-                                <Icon name={chartCollapsed ? 'chev' : 'chevd'} size={12} />
-                            </span>
-                            <span className="r-logs-chart-head-title">Log volume</span>
-                            <span className="r-logs-chart-head-range">{rangeLabel}</span>
-                        </button>
-                        <div className="r-logs-chart-head-actions">
-                            <RButton
-                                size="sm"
-                                onClick={handleRefresh}
-                                disabled={chartUnsupported}
-                                title={chartUnsupported ? "Log volumes aren't supported by the configured log backend." : undefined}
+                    <div className={chartUnsupported ? 'r-logs-chart-head disabled' : 'r-logs-chart-head'}>
+                        {chartUnsupported ? (
+                            <div className="r-logs-chart-head-toggle-btn inert">
+                                <span className="r-logs-chart-head-toggle">
+                                    <Icon name="chev" size={12} />
+                                </span>
+                                <span className="r-logs-chart-head-title">Log volume</span>
+                                <span className="r-logs-chart-head-note">
+                                    Log volume charts aren’t supported by the configured log backend.
+                                </span>
+                            </div>
+                        ) : (
+                            <button
+                                type="button"
+                                className="r-logs-chart-head-toggle-btn"
+                                onClick={() => setChartCollapsed((v) => !v)}
+                                aria-expanded={!chartCollapsed}
                             >
+                                <span className="r-logs-chart-head-toggle">
+                                    <Icon name={chartCollapsed ? 'chev' : 'chevd'} size={12} />
+                                </span>
+                                <span className="r-logs-chart-head-title">Log volume</span>
+                            </button>
+                        )}
+                        <div className="r-logs-chart-head-actions">
+                            <RButton size="sm" onClick={handleRefresh} disabled={chartUnsupported}>
                                 Refresh
                             </RButton>
                             <div className="r-logs-autorefresh">
@@ -1718,7 +1710,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                             </div>
                         </div>
                     </div>
-                    {!chartCollapsed && (
+                    {!chartUnsupported && !chartCollapsed && (
                         <Suspense fallback={<div className="py-6 text-center text-xs text-[var(--text-soft)]">Loading chart…</div>}>
                             <LogVolumeChart
                                 counts={counts}

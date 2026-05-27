@@ -71,9 +71,6 @@ export default function LogVolumeChart({ counts, loading, error, status, rangeSt
                 ? `No log volume found. Runtime logs are retained for ${status.retention_hint}, so this range may no longer be available.`
                 : 'No log volume found. It may have expired based on the log backend retention policy.';
         }
-        if (status.reason === 'historical_backend_not_configured') {
-            return 'Log volume charts aren’t supported by the configured log backend.';
-        }
         if (status.reason === 'deployment_not_ready') {
             return 'Deployment logs are not ready yet.';
         }
