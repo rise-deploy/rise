@@ -669,8 +669,26 @@ impl RuntimeLogBackend for LokiLogBackend {
             });
         }
 
+        // Align the bucket grid to the step (60s → :00, 300s → :00 :05 :10 …)
+        // so the chart's X-axis labels are sensible and so the per-bucket
+        // window query the frontend sends back matches Loki's count_over_time
+        // window byte-for-byte. Round start down and end up to the grid.
+        let step_seconds = query.step_seconds.max(1);
+        let step_nanos = (step_seconds as i128) * 1_000_000_000;
+        let aligned_nanos = |ts: DateTime<Utc>, round_up: bool| -> DateTime<Utc> {
+            let ns = ts.timestamp_nanos_opt().unwrap_or_default() as i128;
+            let mut q = ns / step_nanos;
+            let r = ns % step_nanos;
+            if round_up && r != 0 {
+                q += 1;
+            }
+            DateTime::<Utc>::from_timestamp_nanos((q * step_nanos) as i64)
+        };
+        let aligned_start = aligned_nanos(query.start_time, false);
+        let aligned_end = aligned_nanos(query.end_time, true);
+
         let base = self.base_selector(deployment, project);
-        let range = format!("[{}s]", query.step_seconds.max(1));
+        let range = format!("[{step_seconds}s]");
         // The chart should reflect the same filters as the log list. We layer
         // the search filter onto each per-level sub-query and skip levels that
         // the user filtered out (their bars would always read zero).
@@ -691,30 +709,10 @@ impl RuntimeLogBackend for LokiLogBackend {
         let info_query = build_segment(LogLevelFilter::Info);
 
         let (total, warn, error, info) = futures::try_join!(
-            self.query_counts_series(
-                total_query,
-                query.start_time,
-                query.end_time,
-                query.step_seconds,
-            ),
-            self.query_counts_or_empty(
-                warn_query,
-                query.start_time,
-                query.end_time,
-                query.step_seconds,
-            ),
-            self.query_counts_or_empty(
-                error_query,
-                query.start_time,
-                query.end_time,
-                query.step_seconds,
-            ),
-            self.query_counts_or_empty(
-                info_query,
-                query.start_time,
-                query.end_time,
-                query.step_seconds,
-            ),
+            self.query_counts_series(total_query, aligned_start, aligned_end, step_seconds,),
+            self.query_counts_or_empty(warn_query, aligned_start, aligned_end, step_seconds,),
+            self.query_counts_or_empty(error_query, aligned_start, aligned_end, step_seconds,),
+            self.query_counts_or_empty(info_query, aligned_start, aligned_end, step_seconds,),
         )?;
 
         let is_empty = total.is_empty() && warn.is_empty() && error.is_empty() && info.is_empty();
@@ -723,9 +721,9 @@ impl RuntimeLogBackend for LokiLogBackend {
             info,
             warn,
             error,
-            query.start_time,
-            query.end_time,
-            query.step_seconds,
+            aligned_start,
+            aligned_end,
+            step_seconds,
         );
 
         Ok(LogCountsResponse {
@@ -734,9 +732,9 @@ impl RuntimeLogBackend for LokiLogBackend {
             } else {
                 None
             },
-            start_time: query.start_time.to_rfc3339(),
-            end_time: query.end_time.to_rfc3339(),
-            step_seconds: query.step_seconds,
+            start_time: aligned_start.to_rfc3339(),
+            end_time: aligned_end.to_rfc3339(),
+            step_seconds,
             buckets,
         })
     }
