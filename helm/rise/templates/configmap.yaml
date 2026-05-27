@@ -28,6 +28,10 @@ data:
 {{- $_ := set $deploymentLogs "retention_hint" . }}
 {{- end }}
 {{- $_ := set $deploymentLogs "timeout_secs" (.Values.logs.loki.timeoutSeconds | int) }}
+{{- $_ := set $deploymentLogs "labels" (dict
+    "project" .Values.logs.loki.labels.project
+    "deployment_id" .Values.logs.loki.labels.deploymentId
+) }}
 {{- $_ := set $config "deployment_logs" $deploymentLogs }}
 {{- else }}
 {{- $_ := set $config "deployment_logs" (dict "type" "kubernetes") }}

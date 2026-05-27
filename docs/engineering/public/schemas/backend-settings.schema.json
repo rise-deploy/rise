@@ -532,6 +532,10 @@
                 "null"
               ]
             },
+            "labels": {
+              "$ref": "#/$defs/LokiLabels",
+              "description": "Override the Loki stream label names. Useful when pointing Rise\nat an operator-managed Loki/Alloy stack that labels logs\ndifferently than the bundled chart."
+            },
             "retention_hint": {
               "default": null,
               "type": [
@@ -1051,6 +1055,21 @@
           "type": "object"
         }
       ]
+    },
+    "LokiLabels": {
+      "properties": {
+        "deployment_id": {
+          "default": "rise_deployment_id",
+          "description": "Loki stream label that carries the Rise deployment id (e.g.\n\"20241205-1234\"). Together with `project`, this must uniquely\nidentify a deployment's log stream.",
+          "type": "string"
+        },
+        "project": {
+          "default": "rise_project",
+          "description": "Loki stream label that carries the Rise project name.",
+          "type": "string"
+        }
+      },
+      "type": "object"
     },
     "NetworkPolicyConfig": {
       "description": "NetworkPolicy configuration for deployed apps\n\nUses Kubernetes NetworkPolicy types directly. Egress semantics:\n- null: policyTypes is [\"Ingress\"] only, Kubernetes does not restrict egress\n- Empty list: policyTypes includes \"Egress\" with no rules = deny all egress\n- Non-empty list: explicit egress rules enforced",

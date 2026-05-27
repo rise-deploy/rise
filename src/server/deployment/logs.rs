@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::db::models::{Deployment, DeploymentStatus, Project};
 use crate::server::deployment::resource_builder::ResourceBuilder;
-use crate::server::settings::DeploymentLogsSettings;
+use crate::server::settings::{DeploymentLogsSettings, LokiLabels};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevelFilter {
@@ -144,7 +144,10 @@ pub async fn init_runtime_log_backend(
             bearer_token_env,
             timeout_secs,
             retention_hint,
+            labels,
         } => {
+            validate_loki_label_name("project", &labels.project)?;
+            validate_loki_label_name("deployment_id", &labels.deployment_id)?;
             let bearer_token = bearer_token_env
                 .as_ref()
                 .map(|name| {
@@ -158,6 +161,7 @@ pub async fn init_runtime_log_backend(
                 bearer_token,
                 *timeout_secs,
                 retention_hint.clone(),
+                labels.clone(),
             )?))
         }
     }
@@ -308,6 +312,7 @@ struct LokiLogBackend {
     tenant_id: Option<String>,
     bearer_token: Option<String>,
     retention_hint: Option<String>,
+    labels: LokiLabels,
     http_client: reqwest::Client,
 }
 
@@ -318,6 +323,7 @@ impl LokiLogBackend {
         bearer_token: Option<String>,
         timeout_secs: u64,
         retention_hint: Option<String>,
+        labels: LokiLabels,
     ) -> Result<Self> {
         let base_url = url.trim_end_matches('/').to_string();
         let query_url = format!("{}/loki/api/v1/query_range", base_url);
@@ -334,16 +340,21 @@ impl LokiLogBackend {
             tenant_id,
             bearer_token,
             retention_hint,
+            labels,
             http_client,
         })
     }
 
     fn base_selector(&self, deployment: &Deployment, project: &Project) -> String {
+        // {project, deployment_id} is enough to uniquely scope to a single
+        // deployment's log stream — deployment_id is generated to be unique
+        // within a project, and Rise enforces project-level authz upstream.
         format!(
-            "{{rise_project=\"{}\",rise_deployment_id=\"{}\",rise_deployment_uuid=\"{}\"}}",
+            "{{{}=\"{}\",{}=\"{}\"}}",
+            self.labels.project,
             escape_logql_label_value(&project.name),
+            self.labels.deployment_id,
             escape_logql_label_value(&deployment.deployment_id),
-            deployment.id
         )
     }
 
@@ -871,6 +882,26 @@ fn escape_logql_label_value(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// Reject Loki/Prometheus label names that wouldn't be valid identifiers.
+/// Prevents an operator-supplied override from producing malformed LogQL.
+fn validate_loki_label_name(role: &str, name: &str) -> Result<()> {
+    let mut chars = name.chars();
+    let valid = match chars.next() {
+        Some(c) if c == '_' || c.is_ascii_alphabetic() => {
+            chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+        }
+        _ => false,
+    };
+    if !valid {
+        anyhow::bail!(
+            "Loki '{}' label name '{}' is invalid; must match [a-zA-Z_][a-zA-Z0-9_]*",
+            role,
+            name
+        );
+    }
+    Ok(())
+}
+
 // LogQL filter expressions for each level. The same regex set is used for the
 // log counts chart so the chart segments stay in sync with the filtered view.
 const LEVEL_REGEX_ERROR: &str = r"(?i)\b(error|err|fatal|panic|exception|failed)\b";
@@ -1032,5 +1063,18 @@ mod tests {
         // rather than `|~ \`(?i)\``.
         let out = append_search_filter("{job=\"x\"}", Some("```"));
         assert_eq!(out, "{job=\"x\"}");
+    }
+
+    #[test]
+    fn validate_loki_label_name_rejects_bad_inputs() {
+        assert!(validate_loki_label_name("project", "rise_project").is_ok());
+        assert!(validate_loki_label_name("project", "_internal").is_ok());
+        // Leading digit, hyphen, dot, brace — all invalid in Loki/Prom label
+        // names and would break the LogQL selector if interpolated.
+        assert!(validate_loki_label_name("project", "1bad").is_err());
+        assert!(validate_loki_label_name("project", "with-hyphen").is_err());
+        assert!(validate_loki_label_name("project", "a.b").is_err());
+        assert!(validate_loki_label_name("project", "x}\"=\"y").is_err());
+        assert!(validate_loki_label_name("project", "").is_err());
     }
 }

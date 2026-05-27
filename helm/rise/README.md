@@ -149,7 +149,15 @@ The following table lists the configurable parameters of the Rise chart and thei
 | `logs.loki.retentionHint` | Display-only retention hint for empty log states | `""` |
 | `logs.loki.bearerTokenSecret.name` | Secret holding a bearer token for the backend's Loki client (also requires matching Alloy `extraEnv`, see below) | `""` |
 | `logs.loki.bearerTokenSecret.key` | Key inside the secret holding the token | `token` |
+| `logs.loki.labels.project` | Loki stream label that carries the Rise project name | `rise_project` |
+| `logs.loki.labels.deploymentId` | Loki stream label that carries the Rise deployment id | `rise_deployment_id` |
 | `logs.alloy.enabled` | Install bundled Grafana Alloy subchart for Pod log shipping | `false` |
+
+When pointing Rise at an operator-managed Loki whose existing labels differ
+(e.g. `app` / `instance`), override `logs.loki.labels.project` and
+`logs.loki.labels.deploymentId` to match. When the bundled Alloy subchart is
+also enabled, those names flow through to its relabel rules so backend
+queries and shipped logs stay in sync.
 
 #### Loki bearer token
 

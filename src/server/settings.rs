@@ -32,6 +32,35 @@ fn default_loki_timeout_secs() -> u64 {
     10
 }
 
+fn default_loki_project_label() -> String {
+    "rise_project".to_string()
+}
+
+fn default_loki_deployment_id_label() -> String {
+    "rise_deployment_id".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct LokiLabels {
+    /// Loki stream label that carries the Rise project name.
+    #[serde(default = "default_loki_project_label")]
+    pub project: String,
+    /// Loki stream label that carries the Rise deployment id (e.g.
+    /// "20241205-1234"). Together with `project`, this must uniquely
+    /// identify a deployment's log stream.
+    #[serde(default = "default_loki_deployment_id_label")]
+    pub deployment_id: String,
+}
+
+impl Default for LokiLabels {
+    fn default() -> Self {
+        Self {
+            project: default_loki_project_label(),
+            deployment_id: default_loki_deployment_id_label(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum DeploymentLogsSettings {
@@ -47,6 +76,11 @@ pub enum DeploymentLogsSettings {
         timeout_secs: u64,
         #[serde(default)]
         retention_hint: Option<String>,
+        /// Override the Loki stream label names. Useful when pointing Rise
+        /// at an operator-managed Loki/Alloy stack that labels logs
+        /// differently than the bundled chart.
+        #[serde(default)]
+        labels: LokiLabels,
     },
 }
 

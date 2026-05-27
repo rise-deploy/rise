@@ -101,9 +101,14 @@ deployment_logs:
   tenant_id: "tenant-a"              # optional X-Scope-OrgID
   bearer_token_env: "RISE_LOKI_TOKEN" # optional backend-only token
   retention_hint: "7d"               # optional display-only hint
+  labels:                            # optional — override Loki label names
+    project: "rise_project"          #   defaults shown
+    deployment_id: "rise_deployment_id"
 ```
 
 The Loki backend keeps Loki backend-only: clients still call the Rise API, and Rise enforces project authorization before querying Loki. Retention is configured in Loki; `retention_hint` is only used to explain empty log results in the UI and CLI.
+
+Rise scopes queries to a single deployment by selecting on two stream labels — `project` and `deployment_id` by default. If your Loki/Alloy stack already labels log lines with different names (e.g. an operator-managed stack that uses `app` and `instance`), set `labels.project` / `labels.deployment_id` to match.
 
 The Helm chart can install Grafana Loki and Grafana Alloy as optional subcharts:
 

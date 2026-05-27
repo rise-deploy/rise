@@ -25,7 +25,7 @@ data:
 
       rule {
         source_labels = ["__meta_kubernetes_pod_label_rise_dev_project"]
-        target_label = "rise_project"
+        target_label = {{ .Values.logs.loki.labels.project | quote }}
       }
 
       rule {
@@ -40,12 +40,7 @@ data:
 
       rule {
         source_labels = ["__meta_kubernetes_pod_label_rise_dev_deployment_id"]
-        target_label = "rise_deployment_id"
-      }
-
-      rule {
-        source_labels = ["__meta_kubernetes_pod_label_rise_dev_deployment_uuid"]
-        target_label = "rise_deployment_uuid"
+        target_label = {{ .Values.logs.loki.labels.deploymentId | quote }}
       }
 
       rule {
