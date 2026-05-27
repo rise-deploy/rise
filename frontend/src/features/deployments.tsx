@@ -1928,9 +1928,18 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                                 const actionLabel = expanded
                                     ? (entry.isJson ? 'Collapse JSON' : 'Show less')
                                     : (entry.isJson ? 'Expand JSON' : 'Show more');
+                                // K8s pagination can surface lines older than the
+                                // user's selected range (kubelet buffer is bounded
+                                // by container retention, not the picker). Mark
+                                // those rows so CSS can dim the timestamp.
+                                const outOfRange = rangeWindow != null
+                                    && entry.timestampMs > 0
+                                    && (entry.timestampMs < rangeWindow.start.getTime()
+                                        || entry.timestampMs > rangeWindow.end.getTime());
                                 const classes = `r-logs-row lv-${entry.level}`
                                     + (canExpand ? ' is-expandable' : '')
-                                    + (expanded ? ' is-expanded' : '');
+                                    + (expanded ? ' is-expanded' : '')
+                                    + (outOfRange ? ' is-out-of-range' : '');
                                 return (
                                     <div
                                         key={entry.id}

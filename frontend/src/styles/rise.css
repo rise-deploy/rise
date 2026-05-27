@@ -1147,6 +1147,13 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
     user-select: none;
     font-variant-numeric: tabular-nums;
 }
+/* Lines paginated in from outside the user's selected range (the Kubernetes
+   backend can keep going as long as the kubelet has buffered them). The row
+   stays readable, but the timestamp fades so it's clear the line is older
+   (or newer) than the chart's window. */
+.r-logs-row.is-out-of-range .r-logs-ts {
+    opacity: 0.4;
+}
 .r-logs-row .r-logs-action {
     display: none;
     position: absolute;
