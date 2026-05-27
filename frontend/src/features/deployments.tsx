@@ -940,6 +940,11 @@ const LOG_PAGE_SIZE = 200;
 const LOG_STREAM_CAP = 2000;
 const LOG_SCROLL_TOP_THRESHOLD = 8;
 const LOG_LONG_LINE_THRESHOLD = 120;
+// Cushion added to a terminated deployment's `completed_at` when anchoring
+// the log range end. The deployment is marked complete before its Pods are
+// guaranteed to be torn down, so log lines can still arrive briefly after.
+// Without this, the default range can clip those trailing lines off-screen.
+const LOG_TERMINATED_END_CUSHION_MS = 10 * 60 * 1000;
 
 function detectLogLevel(line) {
     const l = line.toLowerCase();
@@ -1204,12 +1209,15 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
     const loggable = LOGGABLE_STATUSES.has(deploymentStatus);
     // For terminal deployments anchor preset ranges ("Last 6h") to the
     // deployment's end time instead of wall-clock now, otherwise "Last 6h"
-    // for a deployment that died three days ago would always be empty.
+    // for a deployment that died three days ago would always be empty. The
+    // cushion accounts for log lines that arrive after the deployment is
+    // marked complete but before its Pods actually terminate.
     const anchorEnd = useMemo(() => {
         if (streamable) return null;
         if (!deploymentCompletedAt) return null;
         const d = new Date(deploymentCompletedAt);
-        return Number.isNaN(d.getTime()) ? null : d;
+        if (Number.isNaN(d.getTime())) return null;
+        return new Date(d.getTime() + LOG_TERMINATED_END_CUSHION_MS);
     }, [streamable, deploymentCompletedAt]);
     const [entries, setEntries] = useState([]);
     const [streaming, setStreaming] = useState(false);
