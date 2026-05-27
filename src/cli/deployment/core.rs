@@ -1409,6 +1409,11 @@ pub struct GetLogsParams<'a> {
     pub tail: Option<usize>,
     pub timestamps: bool,
     pub since: Option<&'a str>,
+    /// Restrict to these levels (repeated `?level=` on the wire). Empty =
+    /// no filter. Accepted values come from `/api/v1/logs/capabilities`,
+    /// but the CLI doesn't validate — the server returns no matches for
+    /// unknown values.
+    pub levels: &'a [String],
 }
 
 /// Get logs from a deployment
@@ -1426,25 +1431,22 @@ pub async fn get_logs(
         backend_url, params.project, params.deployment_id
     );
 
-    let mut query_params = vec![];
-    let tail_param;
-    let since_param;
-
+    let mut query_params: Vec<String> = vec![];
     if params.follow {
-        query_params.push("follow=true");
+        query_params.push("follow=true".to_string());
     }
     if let Some(t) = params.tail {
-        tail_param = format!("tail={}", t);
-        query_params.push(&tail_param);
+        query_params.push(format!("tail={}", t));
     }
     if params.timestamps {
-        query_params.push("timestamps=true");
+        query_params.push("timestamps=true".to_string());
     }
     if let Some(s) = params.since {
-        // Parse duration like "5m", "1h" into seconds
         let seconds = parse_duration_to_seconds(s)?;
-        since_param = format!("since={}", seconds);
-        query_params.push(&since_param);
+        query_params.push(format!("since={}", seconds));
+    }
+    for level in params.levels {
+        query_params.push(format!("level={}", urlencoding::encode(level)));
     }
 
     if !query_params.is_empty() {
@@ -1513,12 +1515,13 @@ pub async fn get_logs(
                                 if !data.is_empty() {
                                     if event_type == "status" {
                                         print_log_status(data);
-                                    } else {
-                                        // `log` events are JSON-wrapped now:
+                                    } else if event_type == "log" || event_type == "message" {
+                                        // `log` events are JSON-wrapped:
                                         // {"line": "...", "level": "..."}.
-                                        // Extract the line for printing so the
-                                        // CLI output stays identical to before.
-                                        println!("{}", extract_log_line(data));
+                                        // Other event types (`backlog_complete`)
+                                        // are ignored — they're meta-events
+                                        // the CLI has no use for.
+                                        print_log_event(data);
                                     }
                                 }
                             } else if line.is_empty() {
@@ -1551,8 +1554,8 @@ pub async fn get_logs(
             if !data.is_empty() {
                 if event_type == "status" {
                     print_log_status(data);
-                } else {
-                    println!("{}", extract_log_line(data));
+                } else if event_type == "log" || event_type == "message" {
+                    print_log_event(data);
                 }
             }
         } else if !line.is_empty() && !line.starts_with(':') {
@@ -1563,26 +1566,71 @@ pub async fn get_logs(
     Ok(())
 }
 
-/// Extract the printable text from a `log` SSE event payload.
+/// Extract `(line, level)` from a `log` SSE event payload.
 ///
-/// The backend emits `data: {"line": "...", "level": "info"|...}` (see
-/// `src/server/deployment/logs.rs::ClassifiedLevel`). The CLI doesn't use
-/// the level today — it just prints the raw line — but the JSON wrapping
-/// means we can't print `data` verbatim anymore. If parsing fails (unknown
-/// shape, older server, etc.) fall back to printing the raw `data` so the
-/// user still sees something useful.
-fn extract_log_line(data: &str) -> String {
+/// The backend emits `data: {"line": "...", "level": "..."}`. If parsing
+/// fails (unexpected shape, older server, plain text) fall back to using
+/// the raw `data` as the line with an empty level so the user still sees
+/// something useful.
+fn extract_log_event(data: &str) -> (String, String) {
     let trimmed = data.trim_start();
     if !trimmed.starts_with('{') {
-        return data.to_string();
+        return (data.to_string(), String::new());
     }
     match serde_json::from_str::<serde_json::Value>(data) {
-        Ok(value) => value
-            .get("line")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| data.to_string()),
-        Err(_) => data.to_string(),
+        Ok(value) => {
+            let line = value
+                .get("line")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| data.to_string());
+            let level = value
+                .get("level")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            (line, level)
+        }
+        Err(_) => (data.to_string(), String::new()),
+    }
+}
+
+/// Pull `(line, level)` from a `log` SSE event payload and print it,
+/// coloured by level when stdout is a TTY and `NO_COLOR` isn't set.
+fn print_log_event(data: &str) {
+    let (line, level) = extract_log_event(data);
+    if let Some(code) = level_ansi_color(&level) {
+        println!("{}{}{}", code, line, ANSI_RESET);
+    } else {
+        println!("{}", line);
+    }
+}
+
+const ANSI_RESET: &str = "\x1b[0m";
+
+/// Returns the ANSI start sequence for a given level string, or `None` if
+/// colours should be skipped (non-TTY, `NO_COLOR` set, or unknown level
+/// that maps to the terminal default).
+///
+/// The palette matches the frontend's `--r-log-chart-*` CSS variables
+/// semantically: errors family in red, warn in amber/yellow, info in the
+/// terminal default, debug/trace/unknown in dim grey.
+fn level_ansi_color(level: &str) -> Option<&'static str> {
+    use std::io::IsTerminal;
+    if std::env::var_os("NO_COLOR").is_some() {
+        return None;
+    }
+    if !std::io::stdout().is_terminal() {
+        return None;
+    }
+    match level.trim().to_ascii_lowercase().as_str() {
+        "error" => Some("\x1b[31m"),              // red
+        "critical" | "fatal" => Some("\x1b[91m"), // bright red
+        "warn" => Some("\x1b[33m"),               // yellow
+        "debug" | "trace" => Some("\x1b[2m"),     // dim
+        "unknown" => Some("\x1b[2m"),             // dim grey
+        // info / notice / anything else: no colour (terminal default).
+        _ => None,
     }
 }
 
@@ -1691,11 +1739,15 @@ impl LogStream {
                     self.event_type = event.to_string();
                     continue;
                 } else if let Some(data) = line.strip_prefix("data: ") {
-                    if !data.is_empty() && self.event_type != "status" {
+                    if !data.is_empty()
+                        && (self.event_type == "log" || self.event_type == "message")
+                    {
                         // `log` events are JSON-wrapped:
                         // {"line": "...", "level": "..."}. The follow UI
-                        // just prints the text, so unwrap to the line here.
-                        return Some(Ok(extract_log_line(data)));
+                        // just prints the text, so drop the level here.
+                        // Other event types (status, backlog_complete) are
+                        // ignored by the streaming follow UI.
+                        return Some(Ok(extract_log_event(data).0));
                     }
                     continue;
                 } else if line.is_empty() || line.starts_with(':') {
@@ -1724,8 +1776,10 @@ impl LogStream {
                         let remaining = std::mem::take(&mut self.buffer);
                         let line = remaining.trim();
                         if let Some(data) = line.strip_prefix("data: ") {
-                            if !data.is_empty() && self.event_type != "status" {
-                                return Some(Ok(extract_log_line(data)));
+                            if !data.is_empty()
+                                && (self.event_type == "log" || self.event_type == "message")
+                            {
+                                return Some(Ok(extract_log_event(data).0));
                             }
                         } else if !line.is_empty() && !line.starts_with(':') {
                             return Some(Ok(line.to_string()));
