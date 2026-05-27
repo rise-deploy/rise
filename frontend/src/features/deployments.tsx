@@ -1136,7 +1136,6 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
     const [customEnd, setCustomEnd] = useState(null);
     const [hasMore, setHasMore] = useState(false);
     const [loadingMore, setLoadingMore] = useState(false);
-    const [rangeDirty, setRangeDirty] = useState(false);
     const [expandedIds, setExpandedIds] = useState(() => new Set());
     const [searchInput, setSearchInput] = useState('');
     const [searchActive, setSearchActive] = useState('');
@@ -1147,7 +1146,6 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
     const countsRequestIdRef = useRef(0);
     const seqRef = useRef(0);
     const oldestLoadedMsRef = useRef(null);
-    const initialMountRef = useRef(true);
     const loadingMoreRef = useRef(false);
     const ignoreScrollRef = useRef(false);
     const streamGenRef = useRef(0);
@@ -1300,7 +1298,6 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
             const reversed = collected.slice().reverse();
             setEntries(reversed);
             setLogStatus(newStatus);
-            setRangeDirty(false);
             if (reversed.length > 0) {
                 oldestLoadedMsRef.current = reversed[reversed.length - 1].timestampMs;
             }
@@ -1384,7 +1381,6 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
         setStreaming(true);
         setHasMore(false);
         oldestLoadedMsRef.current = null;
-        setRangeDirty(false);
 
         try {
             await fetchLogFeed({
@@ -1447,32 +1443,24 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
         return () => window.clearTimeout(handle);
     }, [rangeWindow, loggable, refreshCounts]);
 
-    // Mark the range dirty when the user picks a different window after the
-    // initial load, so we can hint that the log list is stale until Refresh.
-    useEffect(() => {
-        if (initialMountRef.current) {
-            initialMountRef.current = false;
-            return;
-        }
-        setRangeDirty(true);
-    }, [rangeWindow]);
-
-    // Reload on deployment identity/status changes, and also when the user
-    // changes the level filter (so the backend can filter the stream/page
-    // queries themselves rather than us paginating until we trip the filter
-    // client-side).
+    // Reload on deployment identity/status changes, when the user changes the
+    // level/search filters, and when the visible time range changes. A preset
+    // range (15m, 1h, ...) means "live tail with this much history"; custom
+    // implies the user picked specific historical times, so don't open the
+    // live tail (otherwise current-time lines keep arriving even though the
+    // user is looking at a past window).
     // eslint-disable-next-line react-hooks/exhaustive-deps
     useEffect(() => {
         if (!loggable) {
             return undefined;
         }
-        if (streamable) {
+        if (streamable && rangeValue !== 'custom') {
             void startStreaming();
         } else {
             void loadHistoricalLogs();
         }
         return () => stopStreaming();
-    }, [deploymentId, deploymentStatus, levelFilter, searchActive]);
+    }, [deploymentId, deploymentStatus, levelFilter, searchActive, rangeValue, customStart, customEnd]);
 
     // Debounce the search input so we don't reopen the SSE on every keystroke.
     useEffect(() => {
@@ -1599,13 +1587,18 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
         <Panel style={{ display: 'flex', flexDirection: 'column' }}>
             <div className="r-panel-head r-logs-head">
                 <div className="r-logs-head-left">
-                    <div className="r-panel-title">Runtime logs</div>
-                    <Segmented
-                        value={levelFilter}
-                        options={['all', 'info', 'warn', 'error']}
-                        onChange={setLevelFilter}
-                        capitalize
-                    />
+                    <div className="r-logs-level">
+                        <Combobox
+                            value={levelFilter}
+                            options={[
+                                { value: 'all', label: 'All levels' },
+                                { value: 'info', label: 'Info' },
+                                { value: 'warn', label: 'Warn' },
+                                { value: 'error', label: 'Error' },
+                            ]}
+                            onChange={setLevelFilter}
+                        />
+                    </div>
                     <div className="r-logs-search">
                         <Icon name="search" size={12} />
                         <input
@@ -1619,11 +1612,16 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                     </div>
                 </div>
                 <div className="r-logs-head-right">
-                    <Segmented
-                        value={rangeValue}
-                        options={LOG_RANGE_PRESETS.map((option) => ({ value: option.value, label: option.label }))}
-                        onChange={handleRangeChange}
-                    />
+                    <div className="r-logs-range">
+                        <Combobox
+                            value={rangeValue}
+                            options={LOG_RANGE_PRESETS.map((option) => ({
+                                value: option.value,
+                                label: option.value === 'custom' ? 'Custom range' : `Last ${option.label}`,
+                            }))}
+                            onChange={handleRangeChange}
+                        />
+                    </div>
                     {rangeValue === 'custom' && (
                         <DateRangePopover
                             start={customStart}
@@ -1658,11 +1656,6 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus }) {
                 {isHistoricalUnavailable && (
                     <div className="text-xs text-[var(--text-soft)]">
                         Historical volume charts are not available for this log backend.
-                    </div>
-                )}
-                {rangeDirty && !streaming && (
-                    <div className="text-xs text-[var(--text-soft)]" style={{ padding: '4px 2px' }}>
-                        Range changed &mdash; click <strong>Refresh</strong> to reload logs.
                     </div>
                 )}
                 <div

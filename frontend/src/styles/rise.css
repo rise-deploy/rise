@@ -496,6 +496,8 @@ a { color: inherit; }
     -webkit-appearance: none;
     margin: 0;
 }
+.r-logs-level { width: 130px; }
+.r-logs-range { width: 150px; }
 
 /* ---------- Inputs ---------- *
    All form fields share a single visual style: same border, padding, focus
@@ -1277,7 +1279,8 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
 .r-date-range-popover {
     position: absolute;
     top: calc(100% + 6px);
-    right: 0;
+    left: 50%;
+    transform: translateX(-50%);
     z-index: 60;
     background: var(--surface);
     border: 1px solid var(--border);
@@ -1287,6 +1290,16 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
     display: flex;
     flex-direction: column;
     gap: 10px;
+    width: max-content;
+    max-width: 90vw;
+}
+.r-date-range-popover .rdp-months {
+    display: flex;
+    flex-wrap: nowrap;
+    gap: var(--rdp-months-gap);
+}
+.r-date-range-popover .rdp-month {
+    flex: 0 0 auto;
 }
 .r-date-range-times {
     display: flex;
@@ -1307,23 +1320,89 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
     font-family: 'JetBrains Mono', monospace;
     font-size: 12px;
 }
-.r-date-range .rdp {
+.r-date-range .rdp-root {
     --rdp-accent-color: var(--accent);
-    --rdp-accent-background-color: oklch(0.30 0.05 250 / 0.35);
+    --rdp-accent-background-color: oklch(0.40 0.10 260 / 0.28);
     --rdp-background-color: transparent;
+    --rdp-day-height: 34px;
+    --rdp-day-width: 34px;
+    --rdp-day_button-height: 30px;
+    --rdp-day_button-width: 30px;
+    --rdp-day_button-border-radius: 6px;
+    --rdp-day_button-border: 1px solid transparent;
+    --rdp-selected-border: 1px solid transparent;
+    --rdp-range_middle-background-color: oklch(0.40 0.10 260 / 0.28);
+    --rdp-range_middle-color: var(--text);
+    --rdp-range_start-color: oklch(0.98 0.005 80);
+    --rdp-range_end-color: oklch(0.98 0.005 80);
+    --rdp-today-color: var(--accent);
+    --rdp-outside-opacity: 0.4;
+    --rdp-disabled-opacity: 0.3;
+    --rdp-nav_button-height: 28px;
+    --rdp-nav_button-width: 28px;
+    --rdp-months-gap: 1.25rem;
     color: var(--text);
     margin: 0;
+    font-size: 12px;
+}
+.r-date-range .rdp-month_caption,
+.r-date-range .rdp-caption_label {
+    color: var(--text);
+    font-weight: 600;
+    font-size: 13px;
+}
+.r-date-range .rdp-weekday {
+    color: var(--text-soft);
+    font-weight: 500;
+    font-size: 11px;
+    text-transform: none;
 }
 .r-date-range .rdp-day_button {
     color: var(--text);
 }
-.r-date-range .rdp-caption_label { color: var(--text); font-weight: 600; }
-.r-date-range .rdp-weekday { color: var(--text-soft); font-weight: 500; }
-.r-date-range .rdp-outside .rdp-day_button { color: var(--text-soft); opacity: 0.5; }
-.r-date-range .rdp-day_button:hover:not(.rdp-day_selected) {
-    background: oklch(0.22 0.005 80);
-    color: var(--text);
+.r-date-range .rdp-day_button:hover:not([disabled]) {
+    background: oklch(0.24 0.005 80);
 }
+.r-date-range .rdp-outside .rdp-day_button {
+    color: var(--text-soft);
+}
+.r-date-range .rdp-today:not(.rdp-selected) .rdp-day_button {
+    color: var(--accent);
+    font-weight: 600;
+}
+.r-date-range .rdp-selected .rdp-day_button {
+    border: none;
+    font-weight: 500;
+}
+.r-date-range .rdp-range_start .rdp-day_button,
+.r-date-range .rdp-range_end .rdp-day_button {
+    background: var(--accent);
+    color: oklch(0.98 0.005 80);
+}
+.r-date-range .rdp-range_middle .rdp-day_button {
+    background: var(--rdp-range_middle-background-color);
+    color: var(--rdp-range_middle-color);
+    border-radius: 0;
+}
+.r-date-range .rdp-range_start:not(.rdp-range_end) .rdp-day_button {
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+}
+.r-date-range .rdp-range_end:not(.rdp-range_start) .rdp-day_button {
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
+}
+.r-date-range .rdp-button_previous,
+.r-date-range .rdp-button_next {
+    color: var(--text);
+    background: transparent;
+    border-radius: 6px;
+}
+.r-date-range .rdp-button_previous:hover:not([disabled]),
+.r-date-range .rdp-button_next:hover:not([disabled]) {
+    background: oklch(0.24 0.005 80);
+}
+.r-date-range .rdp-chevron { fill: currentColor; }
 
 /* ---------- Tooltip ---------- */
 .r-tip { display: inline-flex; }
