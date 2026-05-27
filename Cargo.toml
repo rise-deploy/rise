@@ -122,6 +122,7 @@ uuid = { workspace = true }
 
 # Shared: CLI + Server
 axum = "0.8.7"
+axum-extra = { version = "0.10", features = ["query"] }
 jsonwebtoken = { version = "10.0", features = ["rust_crypto"] }
 sha2 = "0.11"
 urlencoding = "2.1"

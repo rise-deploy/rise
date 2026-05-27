@@ -40,8 +40,8 @@ pub fn deployment_routes() -> Router<AppState> {
             get(super::handlers::stream_deployment_logs),
         )
         .route(
-            "/projects/{project_name}/deployments/{deployment_id}/logs/counts",
-            get(super::handlers::count_deployment_logs),
+            "/projects/{project_name}/deployments/{deployment_id}/logs/volume",
+            get(super::handlers::query_deployment_log_volume),
         )
 }
 

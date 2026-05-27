@@ -2281,9 +2281,12 @@ pub struct LogStreamParams {
     pub start: Option<String>,
     /// End of an explicit time range in RFC3339 format
     pub end: Option<String>,
-    /// Restrict to lines matching one of "info", "warn", "error". Anything
-    /// else (or absent) returns all lines.
-    pub level: Option<String>,
+    /// Restrict to lines whose backend-emitted level matches one of these
+    /// values. Repeated query param: `?level=info&level=warn`. Empty list
+    /// (param absent) means no filter. Accepted values come from the
+    /// backend's `levels` advertised in `/api/v1/logs/capabilities`.
+    #[serde(default, rename = "level")]
+    pub level: Vec<String>,
     /// Case-insensitive substring filter applied to each line.
     pub search: Option<String>,
     /// For backward pagination: skip this many of the most-recent qualifying
@@ -2294,9 +2297,9 @@ pub struct LogStreamParams {
     pub skip_recent: Option<i64>,
 }
 
-/// Query parameters for log counts
+/// Query parameters for log volume
 #[derive(serde::Deserialize)]
-pub struct LogCountsParams {
+pub struct LogVolumeParams {
     /// Start of an explicit time range in RFC3339 format
     pub start: String,
     /// End of an explicit time range in RFC3339 format
@@ -2304,8 +2307,10 @@ pub struct LogCountsParams {
     /// Bucket step in seconds
     #[serde(default = "default_log_count_step_seconds")]
     pub step_seconds: i64,
-    /// Restrict to lines matching one of "info", "warn", "error".
-    pub level: Option<String>,
+    /// Restrict counts to lines whose backend-emitted level matches one of
+    /// these values. Repeated query param: `?level=info&level=warn`.
+    #[serde(default, rename = "level")]
+    pub level: Vec<String>,
     /// Case-insensitive substring filter applied to each line.
     pub search: Option<String>,
 }
@@ -2317,7 +2322,7 @@ pub async fn stream_deployment_logs(
     State(state): State<AppState>,
     auth: AuthContext,
     Path((project_name, deployment_id)): Path<(String, String)>,
-    Query(params): Query<LogStreamParams>,
+    axum_extra::extract::Query(params): axum_extra::extract::Query<LogStreamParams>,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, anyhow::Error>>>, ServerError> {
     // Fetch project
     let project = projects::find_by_name(&state.db_pool, &project_name)
@@ -2381,7 +2386,7 @@ pub async fn stream_deployment_logs(
         .or(Some(if params.follow && followable { 1 } else { 1000 }));
     let follow = params.follow && followable;
 
-    let level = crate::server::deployment::logs::LogLevelFilter::parse(params.level.as_deref());
+    let levels = params.level.clone();
     let search = params
         .search
         .as_ref()
@@ -2412,7 +2417,7 @@ pub async fn stream_deployment_logs(
                 since_seconds: params.since,
                 start_time,
                 end_time,
-                level,
+                levels,
                 search,
                 skip_recent: params.skip_recent.filter(|n| *n > 0),
                 namespace_prefix: Some(namespace_prefix),
@@ -2473,12 +2478,12 @@ pub async fn stream_deployment_logs(
 /// Query log counts for a deployment.
 ///
 /// GET /projects/{project_name}/deployments/{deployment_id}/logs/counts
-pub async fn count_deployment_logs(
+pub async fn query_deployment_log_volume(
     State(state): State<AppState>,
     auth: AuthContext,
     Path((project_name, deployment_id)): Path<(String, String)>,
-    Query(params): Query<LogCountsParams>,
-) -> Result<Json<crate::server::deployment::logs::LogCountsResponse>, ServerError> {
+    axum_extra::extract::Query(params): axum_extra::extract::Query<LogVolumeParams>,
+) -> Result<Json<crate::server::deployment::logs::LogVolumeResponse>, ServerError> {
     let project = projects::find_by_name(&state.db_pool, &project_name)
         .await
         .internal_err("Failed to fetch project")?
@@ -2528,22 +2533,22 @@ pub async fn count_deployment_logs(
         ));
     }
 
-    let level = crate::server::deployment::logs::LogLevelFilter::parse(params.level.as_deref());
+    let levels = params.level.clone();
     let search = params
         .search
         .as_ref()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let counts = state
+    let volume = state
         .runtime_log_backend
-        .count_logs(
+        .query_volume(
             &deployment,
             &project,
-            crate::server::deployment::logs::LogCountsQuery {
+            crate::server::deployment::logs::LogVolumeQuery {
                 start_time,
                 end_time,
                 step_seconds: params.step_seconds.max(1),
-                level,
+                levels,
                 search,
             },
         )
@@ -2556,11 +2561,11 @@ pub async fn count_deployment_logs(
                 )
                 .expected()
             } else {
-                ServerError::internal_anyhow(e, "Failed to fetch log counts")
+                ServerError::internal_anyhow(e, "Failed to fetch log volume")
             }
         })?;
 
-    Ok(Json(counts))
+    Ok(Json(volume))
 }
 
 fn parse_log_time(

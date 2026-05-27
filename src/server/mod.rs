@@ -195,6 +195,7 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
     let public_routes = Router::new()
         .route("/health", axum::routing::get(health_check))
         .route("/version", axum::routing::get(version_info))
+        .route("/logs/capabilities", axum::routing::get(logs_capabilities))
         .route(
             "/schema/rise-toml/v1",
             axum::routing::get(rise_toml_schema_v1_redirect),
@@ -387,6 +388,20 @@ async fn version_info() -> axum::Json<serde_json::Value> {
         "version": env!("CARGO_PKG_VERSION"),
         "repository": env!("CARGO_PKG_REPOSITORY"),
     }))
+}
+
+/// Static facts about the configured runtime log backend. Surfaced to the
+/// frontend so the level filter dropdown and chart palette can be driven
+/// dynamically instead of hardcoded to info/warn/error.
+async fn logs_capabilities(
+    axum::extract::State(state): axum::extract::State<state::AppState>,
+) -> axum::Json<deployment::logs::LogsCapabilities> {
+    let backend = state.runtime_log_backend.as_ref();
+    axum::Json(deployment::logs::LogsCapabilities {
+        backend: backend.backend_kind(),
+        levels: backend.levels(),
+        supports_volume: backend.supports_volume(),
+    })
 }
 
 async fn rise_toml_schema_v1_redirect() -> impl axum::response::IntoResponse {

@@ -3,33 +3,24 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::db::models::{Deployment, DeploymentStatus, Project};
 use crate::server::deployment::resource_builder::ResourceBuilder;
 use crate::server::settings::{DeploymentLogsSettings, KubernetesLogBackendSettings, LokiLabels};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LogLevelFilter {
-    All,
-    Info,
-    Warn,
-    Error,
-}
+/// Loki 3.x's documented `detected_level` value set. Passed through verbatim
+/// to clients; the frontend renders each via its own palette entry.
+pub const LOKI_LEVELS: &[&str] = &[
+    "unknown", "trace", "debug", "info", "warn", "error", "critical", "fatal",
+];
 
-impl LogLevelFilter {
-    pub fn parse(value: Option<&str>) -> Self {
-        match value.map(|v| v.to_ascii_lowercase()).as_deref() {
-            Some("info") => Self::Info,
-            Some("warn") => Self::Warn,
-            Some("error") => Self::Error,
-            _ => Self::All,
-        }
-    }
-}
+/// The three levels the Kubernetes backend's internal regex classifier can
+/// emit. Each line lands in exactly one of these.
+pub const KUBERNETES_LEVELS: &[&str] = &["info", "warn", "error"];
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LogQuery {
     pub follow: bool,
     pub tail_lines: Option<i64>,
@@ -37,7 +28,10 @@ pub struct LogQuery {
     pub since_seconds: Option<i64>,
     pub start_time: Option<DateTime<Utc>>,
     pub end_time: Option<DateTime<Utc>>,
-    pub level: LogLevelFilter,
+    /// Levels the caller wants to see. Empty means "all" (no filter).
+    /// Loki passes these straight into a `| detected_level=~"a|b|..."` clause;
+    /// the K8s backend filters post-classification.
+    pub levels: Vec<String>,
     /// Optional case-insensitive substring users can type into the runtime
     /// logs search box. Empty/whitespace means "no filter".
     pub search: Option<String>,
@@ -55,11 +49,12 @@ pub struct LogQuery {
 }
 
 #[derive(Debug, Clone)]
-pub struct LogCountsQuery {
+pub struct LogVolumeQuery {
     pub start_time: DateTime<Utc>,
     pub end_time: DateTime<Utc>,
     pub step_seconds: i64,
-    pub level: LogLevelFilter,
+    /// Levels the caller wants counted. Empty means "all" (no filter).
+    pub levels: Vec<String>,
     pub search: Option<String>,
 }
 
@@ -84,35 +79,37 @@ pub struct LogStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct LogCountsResponse {
+pub struct LogVolumeResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<LogStatus>,
     pub start_time: String,
     pub end_time: String,
     pub step_seconds: i64,
-    pub buckets: Vec<LogCountBucket>,
+    pub buckets: Vec<LogVolumeBucket>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct LogCountBucket {
+pub struct LogVolumeBucket {
     pub timestamp: String,
     pub total: u64,
-    pub info: u64,
-    pub warn: u64,
-    pub error: u64,
+    /// Sparse per-level counts. Keys are level strings emitted by the
+    /// backend; zero counts are omitted. The sum across entries equals
+    /// `total`.
+    pub by_level: HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone)]
 pub enum LogEvent {
-    /// A single log line, with the backend's classification of its level.
+    /// A single log line plus the backend's classification of its level.
     ///
-    /// `text` is the same plain-text content as before (raw log line, with
-    /// optional RFC3339 prefix when `timestamps=true`). `level` is the
-    /// per-line classification — the wire format serializes both as a JSON
-    /// object so the frontend chart and list always agree.
+    /// `text` is the raw log line content (with an optional RFC3339 prefix
+    /// when `timestamps=true`). `level` is the level string the configured
+    /// backend emits — either Loki's `detected_level` (one of `LOKI_LEVELS`,
+    /// defaulting to `"unknown"`) or the K8s regex classifier's output (one
+    /// of `KUBERNETES_LEVELS`).
     Line {
         text: String,
-        level: ClassifiedLevel,
+        level: String,
     },
     Status(LogStatus),
     /// Sent once the initial backlog phase of a streaming request has been
@@ -126,8 +123,34 @@ pub enum LogEvent {
 
 pub type LogEventStream = futures::stream::BoxStream<'static, Result<LogEvent>>;
 
+/// Server-scoped capabilities of the configured log backend. Surfaced to the
+/// frontend (and any other client) via `GET /api/v1/logs/capabilities` so the
+/// filter UI and chart can be driven dynamically rather than hardcoded to
+/// info/warn/error.
+#[derive(Debug, Clone, Serialize)]
+pub struct LogsCapabilities {
+    pub backend: &'static str,
+    pub levels: &'static [&'static str],
+    pub supports_volume: bool,
+}
+
 #[async_trait]
 pub trait RuntimeLogBackend: Send + Sync {
+    /// Identifier for the backend variant (`"loki"` or `"kubernetes"`). Used
+    /// only in the capabilities response — handlers branch on the trait, not
+    /// this string.
+    fn backend_kind(&self) -> &'static str;
+
+    /// Full list of level strings the backend can emit. Drives both the
+    /// `level` filter dropdown options and the chart's color palette on the
+    /// frontend.
+    fn levels(&self) -> &'static [&'static str];
+
+    /// Whether the backend can return per-level volume buckets. The
+    /// Kubernetes backend has no historical store, so this is `false` and
+    /// the chart panel is hidden.
+    fn supports_volume(&self) -> bool;
+
     async fn stream_logs(
         &self,
         deployment: &Deployment,
@@ -135,12 +158,12 @@ pub trait RuntimeLogBackend: Send + Sync {
         query: LogQuery,
     ) -> Result<LogEventStream>;
 
-    async fn count_logs(
+    async fn query_volume(
         &self,
         deployment: &Deployment,
         project: &Project,
-        query: LogCountsQuery,
-    ) -> Result<LogCountsResponse>;
+        query: LogVolumeQuery,
+    ) -> Result<LogVolumeResponse>;
 }
 
 pub async fn init_runtime_log_backend(
@@ -202,6 +225,18 @@ pub(crate) fn is_followable_status(status: &DeploymentStatus) -> bool {
 
 #[async_trait]
 impl RuntimeLogBackend for KubernetesLogBackend {
+    fn backend_kind(&self) -> &'static str {
+        "kubernetes"
+    }
+
+    fn levels(&self) -> &'static [&'static str] {
+        KUBERNETES_LEVELS
+    }
+
+    fn supports_volume(&self) -> bool {
+        false
+    }
+
     async fn stream_logs(
         &self,
         deployment: &Deployment,
@@ -292,7 +327,7 @@ impl RuntimeLogBackend for KubernetesLogBackend {
         }
 
         let log_stream = pod_api.log_stream(&pod_name, &log_params).await?;
-        let level = query.level;
+        let levels = query.levels.clone();
         let search = query.search.clone();
         let stream = async_stream::stream! {
             use futures::AsyncBufReadExt;
@@ -301,7 +336,7 @@ impl RuntimeLogBackend for KubernetesLogBackend {
             // Buffer the trailing `skip` qualifying lines so we can drop them
             // once the stream ends. While the buffer is full, evict the oldest
             // and yield it — that's a line the frontend doesn't already have.
-            let mut trailing: VecDeque<String> = VecDeque::with_capacity(skip.saturating_add(1));
+            let mut trailing: VecDeque<(String, &'static str)> = VecDeque::with_capacity(skip.saturating_add(1));
             let mut lines = futures::io::BufReader::new(log_stream).lines();
             while let Some(line) = lines.next().await {
                 let line = match line {
@@ -312,17 +347,16 @@ impl RuntimeLogBackend for KubernetesLogBackend {
                     }
                 };
                 if line.is_empty() { continue; }
-                if !line_matches_level(&line, level) { continue; }
+                let level = classify_k8s_line(&line);
+                if !levels.is_empty() && !levels.iter().any(|l| l == level) { continue; }
                 if !line_matches_search(&line, search.as_deref()) { continue; }
                 if skip == 0 {
-                    let level = classify_line_by_regex(&line);
-                    yield Ok(LogEvent::Line { text: line, level });
+                    yield Ok(LogEvent::Line { text: line, level: level.to_string() });
                 } else {
-                    trailing.push_back(line);
+                    trailing.push_back((line, level));
                     if trailing.len() > skip {
-                        if let Some(out) = trailing.pop_front() {
-                            let level = classify_line_by_regex(&out);
-                            yield Ok(LogEvent::Line { text: out, level });
+                        if let Some((out, level)) = trailing.pop_front() {
+                            yield Ok(LogEvent::Line { text: out, level: level.to_string() });
                         }
                     }
                 }
@@ -334,17 +368,17 @@ impl RuntimeLogBackend for KubernetesLogBackend {
         Ok(stream.boxed())
     }
 
-    async fn count_logs(
+    async fn query_volume(
         &self,
         _deployment: &Deployment,
         _project: &Project,
-        query: LogCountsQuery,
-    ) -> Result<LogCountsResponse> {
-        Ok(LogCountsResponse {
+        query: LogVolumeQuery,
+    ) -> Result<LogVolumeResponse> {
+        Ok(LogVolumeResponse {
             status: Some(LogStatus {
                 reason: LogStatusReason::HistoricalBackendNotConfigured,
                 message: Some(
-                    "Historical log counts aren't supported by the configured log backend.".into(),
+                    "Historical log volume isn't supported by the configured log backend.".into(),
                 ),
                 retention_hint: None,
             }),
@@ -416,11 +450,11 @@ impl LokiLogBackend {
         &self,
         deployment: &Deployment,
         project: &Project,
-        level: LogLevelFilter,
+        levels: &[String],
         search: Option<&str>,
     ) -> String {
         let base = self.base_selector(deployment, project);
-        let with_level = level_filtered_selector(&base, level);
+        let with_level = append_detected_level_filter(&base, levels);
         append_search_filter(&with_level, search)
     }
 
@@ -444,7 +478,7 @@ impl LokiLogBackend {
         project: &Project,
         query: &LogQuery,
     ) -> Result<Vec<LogLine>> {
-        let selector = self.selector(deployment, project, query.level, query.search.as_deref());
+        let selector = self.selector(deployment, project, &query.levels, query.search.as_deref());
         let end = self.effective_end_time(query);
         let start = self.effective_start_time(deployment, query);
         let tail = if query.follow {
@@ -533,7 +567,12 @@ impl LokiLogBackend {
         } else {
             self.query_range(&deployment, &project, &query).await?
         };
-        let selector = self.selector(&deployment, &project, query.level, query.search.as_deref());
+        let selector = self.selector(
+            &deployment,
+            &project,
+            &query.levels,
+            query.search.as_deref(),
+        );
         let url = websocket_url(&self.tail_url, &selector);
         let tenant_id = self.tenant_id.clone();
         let bearer_token = self.bearer_token.clone();
@@ -680,7 +719,7 @@ impl LokiLogBackend {
         start_time: DateTime<Utc>,
         end_time: DateTime<Utc>,
         step_seconds: i64,
-    ) -> Vec<LogCountBucket> {
+    ) -> Vec<LogVolumeBucket> {
         // Emit a contiguous row of buckets at right-edged timestamps spanning
         // (start_time, end_time] at step_seconds intervals — i.e. the first
         // bucket is at start_time + step and the last is at end_time. This
@@ -704,9 +743,7 @@ impl LokiLogBackend {
             let bucket_start_exclusive = bucket_end.saturating_sub(step_nanos);
 
             let mut total: u64 = 0;
-            let mut info: u64 = 0;
-            let mut warn: u64 = 0;
-            let mut error: u64 = 0;
+            let mut by_level: HashMap<String, u64> = HashMap::new();
             for (level_label, points) in series_by_level {
                 // Common case: Loki point lands exactly on the right edge.
                 let exact = points.get(&bucket_end).copied().unwrap_or(0);
@@ -722,20 +759,22 @@ impl LokiLogBackend {
                     continue;
                 }
                 total = total.saturating_add(value);
-                match classify_detected_level(level_label) {
-                    ClassifiedLevel::Info => info = info.saturating_add(value),
-                    ClassifiedLevel::Warn => warn = warn.saturating_add(value),
-                    ClassifiedLevel::Error => error = error.saturating_add(value),
-                    ClassifiedLevel::Unknown => {}
-                }
+                // Coerce empty/whitespace labels to "unknown" so the map's
+                // keys are always non-empty. Loki returns the label verbatim
+                // otherwise, including its own `"unknown"` for entries it
+                // couldn't classify.
+                let key = match level_label.trim() {
+                    "" => "unknown".to_string(),
+                    trimmed => trimmed.to_string(),
+                };
+                let slot = by_level.entry(key).or_insert(0);
+                *slot = slot.saturating_add(value);
             }
 
-            buckets.push(LogCountBucket {
+            buckets.push(LogVolumeBucket {
                 timestamp: current.to_rfc3339(),
                 total,
-                info,
-                warn,
-                error,
+                by_level,
             });
             current += step;
         }
@@ -745,6 +784,18 @@ impl LokiLogBackend {
 
 #[async_trait]
 impl RuntimeLogBackend for LokiLogBackend {
+    fn backend_kind(&self) -> &'static str {
+        "loki"
+    }
+
+    fn levels(&self) -> &'static [&'static str] {
+        LOKI_LEVELS
+    }
+
+    fn supports_volume(&self) -> bool {
+        true
+    }
+
     async fn stream_logs(
         &self,
         deployment: &Deployment,
@@ -777,12 +828,12 @@ impl RuntimeLogBackend for LokiLogBackend {
         .boxed())
     }
 
-    async fn count_logs(
+    async fn query_volume(
         &self,
         deployment: &Deployment,
         project: &Project,
-        query: LogCountsQuery,
-    ) -> Result<LogCountsResponse> {
+        query: LogVolumeQuery,
+    ) -> Result<LogVolumeResponse> {
         if matches!(
             deployment.status,
             DeploymentStatus::Pending
@@ -790,7 +841,7 @@ impl RuntimeLogBackend for LokiLogBackend {
                 | DeploymentStatus::Pushing
                 | DeploymentStatus::Pushed
         ) {
-            return Ok(LogCountsResponse {
+            return Ok(LogVolumeResponse {
                 status: Some(LogStatus {
                     reason: LogStatusReason::DeploymentNotReady,
                     message: Some(
@@ -825,20 +876,17 @@ impl RuntimeLogBackend for LokiLogBackend {
 
         let base = self.base_selector(deployment, project);
         let range = format!("[{step_seconds}s]");
-        // The chart should reflect the same filters as the log list. We layer
-        // the search filter onto the selector and, when the user picked a
-        // specific level, push it through Loki's `detected_level` label so the
-        // single query returns only the relevant series.
+        // The chart reflects the same filters as the log list: same search
+        // clause, same `detected_level` filter. When the caller passes
+        // levels, the same alternation is used in both paths so the views
+        // stay aligned by construction.
         let search = query.search.as_deref();
-        let mut selector = append_search_filter(&base, search);
-        if let Some(pattern) = detected_level_regex_for_filter(query.level) {
-            selector = format!("{selector} | detected_level=~\"{pattern}\"");
-        }
-        // `sum by (detected_level)` collapses each detected_level value into a
-        // single series. The total reported in each bucket is the sum across
-        // all series — including `unknown`/unclassified — so unclassified
-        // lines still raise the bar height even though they don't paint a
-        // colored segment.
+        let with_search = append_search_filter(&base, search);
+        let selector = append_detected_level_filter(&with_search, &query.levels);
+        // `sum by (detected_level)` collapses each detected_level value into
+        // a single series. Per-bucket totals are the sum of all series; the
+        // raw label is preserved in `by_level` so the frontend can render
+        // each Loki-emitted value as its own segment.
         let count_query = format!("sum by (detected_level) (count_over_time(({selector}){range}))");
 
         let series = self
@@ -848,7 +896,7 @@ impl RuntimeLogBackend for LokiLogBackend {
         let is_empty = series.iter().all(|(_, points)| points.is_empty());
         let buckets = Self::build_count_buckets(&series, aligned_start, aligned_end, step_seconds);
 
-        Ok(LogCountsResponse {
+        Ok(LogVolumeResponse {
             status: if is_empty {
                 Some(self.empty_status(deployment))
             } else {
@@ -899,17 +947,14 @@ impl LogLine {
         })
     }
 
-    fn classified_level(&self) -> ClassifiedLevel {
-        // Prefer Loki's per-line `detected_level` structured metadata when
-        // present; fall back to the same regex set the K8s backend uses so
-        // chart counts (which already use detected_level via `sum by`) and
-        // the line list stay aligned for unclassified entries.
-        match self.detected_level.as_deref() {
-            Some(raw) if !raw.trim().is_empty() => match classify_detected_level(raw) {
-                ClassifiedLevel::Unknown => classify_unknown_line(&self.line),
-                classified => classified,
-            },
-            _ => classify_unknown_line(&self.line),
+    fn classified_level(&self) -> String {
+        // Pass Loki's `detected_level` through verbatim; the frontend's
+        // palette is driven by `/api/v1/logs/capabilities`. Missing/empty
+        // metadata defaults to `"unknown"` so the wire format always carries
+        // a level string.
+        match self.detected_level.as_deref().map(str::trim) {
+            Some(raw) if !raw.is_empty() => raw.to_string(),
+            _ => "unknown".to_string(),
         }
     }
 
@@ -919,18 +964,6 @@ impl LogLine {
         }
         let ts = DateTime::<Utc>::from_timestamp_nanos(self.timestamp_nanos as i64);
         format!("{} {}", ts.to_rfc3339(), self.line)
-    }
-}
-
-/// When Loki couldn't classify a line (no `detected_level`, empty, or one of
-/// the values the chart's `unknown` bucket already swallows), report
-/// `Unknown` on the wire rather than guessing. The frontend can decide how to
-/// render that — keeping it distinct from regex-detected Info preserves the
-/// chart/list parity for unclassified entries.
-fn classify_unknown_line(line: &str) -> ClassifiedLevel {
-    match classify_line_by_regex(line) {
-        ClassifiedLevel::Info => ClassifiedLevel::Unknown,
-        other => other,
     }
 }
 
@@ -1189,84 +1222,46 @@ fn validate_loki_label_name(role: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-// LogQL filter expressions for each level. The same regex set is used for the
-// log counts chart so the chart segments stay in sync with the filtered view.
+// LogQL regex patterns the Kubernetes backend uses for per-line
+// classification. Loki classifies via its built-in `detected_level` metadata
+// (passed through verbatim), so these are now K8s-only.
 const LEVEL_REGEX_ERROR: &str = r"(?i)\b(error|err|fatal|panic|exception|failed)\b";
 const LEVEL_REGEX_WARN: &str = r"(?i)\b(warn|warning)\b";
-const LEVEL_REGEX_INFO_EXCLUDE: &str =
-    r"(?i)\b(error|err|fatal|panic|exception|failed|warn|warning)\b";
 
-fn level_filtered_selector(base: &str, level: LogLevelFilter) -> String {
-    match level {
-        LogLevelFilter::All => base.to_string(),
-        LogLevelFilter::Error => format!("{base} |~ `{LEVEL_REGEX_ERROR}`"),
-        LogLevelFilter::Warn => {
-            format!("{base} |~ `{LEVEL_REGEX_WARN}` !~ `{LEVEL_REGEX_ERROR}`")
-        }
-        LogLevelFilter::Info => format!("{base} !~ `{LEVEL_REGEX_INFO_EXCLUDE}`"),
-    }
-}
-
-/// Per-line classified log level. Used both for the volume chart's three
-/// stacked buckets and as the `level` field in the streaming SSE log payload
-/// the frontend and CLI consume.
-///
-/// `Unknown` means the backend could not classify the line — for Loki, the
-/// `detected_level` label was missing/empty/unrecognized AND the regex
-/// fallback didn't match warn/error. The Kubernetes backend never emits
-/// `Unknown` (it falls back to `Info` per the wire-format contract).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ClassifiedLevel {
-    Info,
-    Warn,
-    Error,
-    Unknown,
-}
-
-/// Map a raw `detected_level` label to the Rise bucket. Matches the lowercase
-/// set most production log stacks emit (`info`, `warn`, `error`, plus common
-/// abbreviations like `err`, `crit`, `warning`). Empty/unrecognized values
-/// are reported as `Unknown` so the streaming SSE consumer can distinguish
-/// "classifier said unknown" from "Info/Warn/Error".
-fn classify_detected_level(raw: &str) -> ClassifiedLevel {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "error" | "err" | "fatal" | "critical" | "crit" => ClassifiedLevel::Error,
-        "warn" | "warning" => ClassifiedLevel::Warn,
-        "info" | "debug" | "trace" | "notice" => ClassifiedLevel::Info,
-        _ => ClassifiedLevel::Unknown,
-    }
-}
-
-/// Classify a raw log line using the same regex set the K8s backend uses for
-/// its `LogLevelFilter`. Returns `Error` / `Warn` / `Info` — never `Unknown`,
-/// since the regex set has explicit fallback (anything not matching
-/// error/warn is treated as "info" by the existing filter semantics).
-pub(crate) fn classify_line_by_regex(line: &str) -> ClassifiedLevel {
+/// Classify a raw log line into one of the three `KUBERNETES_LEVELS`. The
+/// Kubernetes backend has no upstream classifier (kubelet returns raw bytes),
+/// so each line is scanned for error/warn keywords with an info catch-all.
+fn classify_k8s_line(line: &str) -> &'static str {
     use std::sync::OnceLock;
     static ERROR_RE: OnceLock<regex::Regex> = OnceLock::new();
     static WARN_RE: OnceLock<regex::Regex> = OnceLock::new();
     let err = ERROR_RE.get_or_init(|| regex::Regex::new(LEVEL_REGEX_ERROR).unwrap());
     let warn = WARN_RE.get_or_init(|| regex::Regex::new(LEVEL_REGEX_WARN).unwrap());
     if err.is_match(line) {
-        ClassifiedLevel::Error
+        "error"
     } else if warn.is_match(line) {
-        ClassifiedLevel::Warn
+        "warn"
     } else {
-        ClassifiedLevel::Info
+        "info"
     }
 }
 
-/// LogQL `detected_level=~"..."` alternation matching the same patterns as
-/// `classify_detected_level`. Used to push the user's level filter into the
-/// single `count_over_time` query.
-fn detected_level_regex_for_filter(level: LogLevelFilter) -> Option<&'static str> {
-    match level {
-        LogLevelFilter::All => None,
-        LogLevelFilter::Error => Some("error|err|fatal|critical|crit"),
-        LogLevelFilter::Warn => Some("warn|warning"),
-        LogLevelFilter::Info => Some("info|debug|trace|notice"),
+/// Append a `| detected_level=~"a|b|..."` clause to a Loki selector when the
+/// caller has provided one or more levels to filter on. Empty levels means
+/// "no filter" — the original selector is returned unchanged. Each level is
+/// regex-escaped so values are matched literally.
+fn append_detected_level_filter(selector: &str, levels: &[String]) -> String {
+    let cleaned: Vec<String> = levels
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(regex::escape)
+        .collect();
+    if cleaned.is_empty() {
+        return selector.to_string();
     }
+    let pattern = cleaned.join("|");
+    format!("{selector} | detected_level=~\"{pattern}\"")
 }
 
 fn normalize_search(value: Option<&str>) -> Option<String> {
@@ -1299,22 +1294,6 @@ pub(crate) fn line_matches_search(line: &str, search: Option<&str>) -> bool {
     let lower_line = line.to_lowercase();
     let lower_text = text.to_lowercase();
     lower_line.contains(&lower_text)
-}
-
-/// Match a raw log line against the same regex set used by the LogQL filters.
-/// Used by the Kubernetes log backend which has to filter line-by-line.
-pub(crate) fn line_matches_level(line: &str, level: LogLevelFilter) -> bool {
-    use std::sync::OnceLock;
-    static ERROR_RE: OnceLock<regex::Regex> = OnceLock::new();
-    static WARN_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let err = ERROR_RE.get_or_init(|| regex::Regex::new(LEVEL_REGEX_ERROR).unwrap());
-    let warn = WARN_RE.get_or_init(|| regex::Regex::new(LEVEL_REGEX_WARN).unwrap());
-    match level {
-        LogLevelFilter::All => true,
-        LogLevelFilter::Error => err.is_match(line),
-        LogLevelFilter::Warn => warn.is_match(line) && !err.is_match(line),
-        LogLevelFilter::Info => !err.is_match(line) && !warn.is_match(line),
-    }
 }
 
 fn to_loki_nanos(ts: DateTime<Utc>) -> String {
@@ -1414,19 +1393,21 @@ mod tests {
         assert_eq!(buckets.len(), 5);
         // Last bucket carries the value; earlier buckets are empty.
         assert_eq!(buckets.last().unwrap().total, 42);
-        assert_eq!(buckets.last().unwrap().info, 42);
+        assert_eq!(
+            buckets.last().unwrap().by_level.get("info").copied(),
+            Some(42)
+        );
         for b in &buckets[..buckets.len() - 1] {
             assert_eq!(b.total, 0);
-            assert_eq!(b.info, 0);
+            assert!(b.by_level.is_empty());
         }
     }
 
     #[test]
-    fn build_count_buckets_classifies_detected_level_per_bucket() {
-        // sum by (detected_level) returns one series per level value. Buckets
-        // should split into Info/Warn/Error bins by classify_detected_level
-        // while still summing into `total`, and unknown levels should land in
-        // `total` only.
+    fn build_count_buckets_passes_detected_level_through_verbatim() {
+        // sum by (detected_level) returns one series per level value. The
+        // bucket's `by_level` map preserves the raw label, and empty labels
+        // coerce to "unknown" so the map's keys are always non-empty.
         let step = 60;
         let start = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
         let end = DateTime::<Utc>::from_timestamp(60, 0).unwrap();
@@ -1441,7 +1422,7 @@ mod tests {
                 [(bucket_ns, 2u64)].into_iter().collect(),
             ),
             (
-                "ERROR".to_string(),
+                "error".to_string(),
                 [(bucket_ns, 1u64)].into_iter().collect(),
             ),
             (
@@ -1453,10 +1434,13 @@ mod tests {
         let buckets = LokiLogBackend::build_count_buckets(&series, start, end, step);
         assert_eq!(buckets.len(), 1);
         let b = &buckets[0];
-        assert_eq!(b.info, 5);
-        assert_eq!(b.warn, 2);
-        assert_eq!(b.error, 1);
-        // total = info + warn + error + unknown + empty
+        assert_eq!(b.by_level.get("info").copied(), Some(5));
+        assert_eq!(b.by_level.get("warn").copied(), Some(2));
+        assert_eq!(b.by_level.get("error").copied(), Some(1));
+        // Both the explicit "unknown" series and the empty-label series
+        // accumulate into the "unknown" key.
+        assert_eq!(b.by_level.get("unknown").copied(), Some(9 + 4));
+        // total = sum of all series counts.
         assert_eq!(b.total, 5 + 2 + 1 + 9 + 4);
     }
 
@@ -1507,19 +1491,18 @@ mod tests {
     }
 
     #[test]
-    fn classify_detected_level_recognizes_common_labels() {
-        for v in ["error", "ERR", "Fatal", "critical", "CRIT"] {
-            assert_eq!(classify_detected_level(v), ClassifiedLevel::Error);
-        }
-        for v in ["warn", "Warning"] {
-            assert_eq!(classify_detected_level(v), ClassifiedLevel::Warn);
-        }
-        for v in ["info", "DEBUG", "trace", "notice"] {
-            assert_eq!(classify_detected_level(v), ClassifiedLevel::Info);
-        }
-        for v in ["", "unknown", "verbose"] {
-            assert_eq!(classify_detected_level(v), ClassifiedLevel::Unknown);
-        }
+    fn append_detected_level_filter_handles_levels_and_regex_escape() {
+        // Empty levels → no clause appended.
+        let out = append_detected_level_filter("{job=\"x\"}", &[]);
+        assert_eq!(out, "{job=\"x\"}");
+        // Whitespace-only entries are dropped.
+        let out =
+            append_detected_level_filter("{job=\"x\"}", &["info".to_string(), "  ".to_string()]);
+        assert_eq!(out, "{job=\"x\"} | detected_level=~\"info\"");
+        // Multiple levels are alternated, regex-special chars escaped.
+        let out =
+            append_detected_level_filter("{job=\"x\"}", &["error".to_string(), "warn".to_string()]);
+        assert_eq!(out, "{job=\"x\"} | detected_level=~\"error|warn\"");
     }
 
     #[test]
@@ -1627,13 +1610,12 @@ mod tests {
     }
 
     #[test]
-    fn count_logs_pipeline_aligns_detected_level_series_to_right_edged_buckets() {
+    fn volume_pipeline_aligns_detected_level_series_to_right_edged_buckets() {
         // End-to-end-ish: take a realistic `sum by (detected_level)` response,
         // parse it the way `query_counts_by_level` does, and feed the result
         // into `build_count_buckets`. The point at timestamp=aligned_end must
-        // land in the LAST bucket and split correctly across detected_level
-        // values. This guards against regressing both the alignment fix
-        // (task 1) and the detected_level migration (task 2).
+        // land in the LAST bucket and the per-level counts must round-trip
+        // verbatim into `by_level` (no remapping).
         let payload = r#"{
           "status":"success",
           "data":{
@@ -1669,11 +1651,11 @@ mod tests {
         assert_eq!(buckets.len(), 1);
         let b = &buckets[0];
         assert_eq!(b.timestamp, "1970-01-01T00:01:00+00:00");
-        assert_eq!(b.info, 5);
-        assert_eq!(b.warn, 3);
-        assert_eq!(b.error, 2);
-        // total includes unknown → 5+3+2+4 = 14.
-        assert_eq!(b.total, 14);
+        assert_eq!(b.by_level.get("info").copied(), Some(5));
+        assert_eq!(b.by_level.get("warn").copied(), Some(3));
+        assert_eq!(b.by_level.get("error").copied(), Some(2));
+        assert_eq!(b.by_level.get("unknown").copied(), Some(4));
+        assert_eq!(b.total, 5 + 3 + 2 + 4);
     }
 
     #[test]
@@ -1736,64 +1718,47 @@ mod tests {
     }
 
     #[test]
-    fn classified_level_prefers_detected_level_then_falls_back_to_regex() {
-        // detected_level=warn → Warn (even if the line text says nothing).
-        let l = LogLine {
-            timestamp_nanos: 0,
-            line: "all good".into(),
-            detected_level: Some("warn".into()),
-        };
-        assert_eq!(l.classified_level(), ClassifiedLevel::Warn);
+    fn classified_level_passes_detected_level_through_verbatim() {
+        // Whatever Loki's auto-detection emits, we surface it as-is. No
+        // remapping into a Rise-specific enum; the frontend's palette is
+        // driven by `/api/v1/logs/capabilities`.
+        for raw in ["info", "warn", "error", "critical", "fatal", "trace"] {
+            let l = LogLine {
+                timestamp_nanos: 0,
+                line: "anything".into(),
+                detected_level: Some(raw.into()),
+            };
+            assert_eq!(l.classified_level(), raw);
+        }
 
-        // detected_level absent, line clearly matches the error regex → Error.
+        // Whitespace is trimmed.
         let l = LogLine {
             timestamp_nanos: 0,
-            line: "panic: nil pointer".into(),
-            detected_level: None,
+            line: "anything".into(),
+            detected_level: Some("  warn  ".into()),
         };
-        assert_eq!(l.classified_level(), ClassifiedLevel::Error);
+        assert_eq!(l.classified_level(), "warn");
 
-        // Loki returned a detected_level it couldn't classify AND the line
-        // text doesn't match warn/error → Unknown (so the SSE consumer can
-        // distinguish "couldn't classify" from regex-resolved Info).
-        let l = LogLine {
-            timestamp_nanos: 0,
-            line: "starting up on port 8080".into(),
-            detected_level: Some("verbose".into()),
-        };
-        assert_eq!(l.classified_level(), ClassifiedLevel::Unknown);
-
-        // Empty detected_level + line text that DOES match warn → Warn.
-        let l = LogLine {
-            timestamp_nanos: 0,
-            line: "WARN low disk space".into(),
-            detected_level: Some(String::new()),
-        };
-        assert_eq!(l.classified_level(), ClassifiedLevel::Warn);
+        // Missing/empty/whitespace metadata → "unknown" on the wire.
+        for raw in [None, Some(String::new()), Some("   ".into())] {
+            let l = LogLine {
+                timestamp_nanos: 0,
+                line: "anything".into(),
+                detected_level: raw,
+            };
+            assert_eq!(l.classified_level(), "unknown");
+        }
     }
 
     #[test]
-    fn k8s_regex_classifier_never_emits_unknown() {
-        // The wire-format contract says the K8s path uses Info as its
-        // "couldn't classify" fallback (matching the existing
-        // LogLevelFilter::Info regex semantics).
-        assert_eq!(
-            classify_line_by_regex("plain hello world"),
-            ClassifiedLevel::Info
-        );
-        assert_eq!(
-            classify_line_by_regex("WARN connection retry"),
-            ClassifiedLevel::Warn
-        );
-        assert_eq!(
-            classify_line_by_regex("ERROR: failed to connect"),
-            ClassifiedLevel::Error
-        );
+    fn classify_k8s_line_returns_one_of_three_levels() {
+        // The K8s backend has no upstream classifier; its regex catch-all
+        // promises every line lands in exactly one of `KUBERNETES_LEVELS`.
+        assert_eq!(classify_k8s_line("plain hello world"), "info");
+        assert_eq!(classify_k8s_line("WARN connection retry"), "warn");
+        assert_eq!(classify_k8s_line("ERROR: failed to connect"), "error");
         // Error wins over warn when both match.
-        assert_eq!(
-            classify_line_by_regex("WARN: fatal error in handler"),
-            ClassifiedLevel::Error
-        );
+        assert_eq!(classify_k8s_line("WARN: fatal error in handler"), "error");
     }
 
     #[test]
