@@ -1084,12 +1084,10 @@ function LogCountsChart({ counts, loading, error, status, rangeLabel, rangeStart
         return 'No log volume found for the selected range.';
     };
 
-    const handleChartClick = (chartEvent) => {
-        if (!onSelectBucket) return;
-        const payload = chartEvent?.activePayload?.[0]?.payload;
-        if (!payload) return;
-        const start = payload.ts;
-        const end = payload.ts + stepSeconds * 1000;
+    const handleBucketClick = (entry) => {
+        if (!onSelectBucket || !entry || typeof entry.ts !== 'number') return;
+        const start = entry.ts;
+        const end = entry.ts + stepSeconds * 1000;
         // Toggle: re-clicking the same bar clears the selection.
         if (selectedBucketStartMs === start) {
             onSelectBucket(null);
@@ -1124,7 +1122,6 @@ function LogCountsChart({ counts, loading, error, status, rangeLabel, rangeStart
                     <ResponsiveContainer width="100%" height={96}>
                         <BarChart
                             data={data}
-                            onClick={handleChartClick}
                             margin={{ top: 4, right: 6, bottom: 4, left: 4 }}
                             barCategoryGap={1}
                         >
@@ -1151,7 +1148,7 @@ function LogCountsChart({ counts, loading, error, status, rangeLabel, rangeStart
                                 content={<LogChartTooltip stepSeconds={stepSeconds} />}
                                 cursor={{ fill: 'oklch(0.22 0.005 80 / 0.45)' }}
                             />
-                            <Bar dataKey="info" stackId="a" isAnimationActive={false}>
+                            <Bar dataKey="info" stackId="a" isAnimationActive={false} onClick={handleBucketClick} style={{ cursor: 'pointer' }}>
                                 {data.map((d) => (
                                     <Cell
                                         key={`info-${d.ts}`}
@@ -1160,7 +1157,7 @@ function LogCountsChart({ counts, loading, error, status, rangeLabel, rangeStart
                                     />
                                 ))}
                             </Bar>
-                            <Bar dataKey="warn" stackId="a" isAnimationActive={false}>
+                            <Bar dataKey="warn" stackId="a" isAnimationActive={false} onClick={handleBucketClick} style={{ cursor: 'pointer' }}>
                                 {data.map((d) => (
                                     <Cell
                                         key={`warn-${d.ts}`}
@@ -1169,7 +1166,7 @@ function LogCountsChart({ counts, loading, error, status, rangeLabel, rangeStart
                                     />
                                 ))}
                             </Bar>
-                            <Bar dataKey="error" stackId="a" isAnimationActive={false}>
+                            <Bar dataKey="error" stackId="a" isAnimationActive={false} onClick={handleBucketClick} style={{ cursor: 'pointer' }}>
                                 {data.map((d) => (
                                     <Cell
                                         key={`error-${d.ts}`}
