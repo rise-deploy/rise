@@ -7,7 +7,8 @@ IMAGE_REPOSITORY="${RISE_IMAGE_REPOSITORY:?RISE_IMAGE_REPOSITORY is required}"
 IMAGE_TAG="${RISE_IMAGE_TAG:?RISE_IMAGE_TAG is required}"
 CLI_IMAGE_REPOSITORY="${RISE_CLI_IMAGE_REPOSITORY:-${IMAGE_REPOSITORY}}"
 RISE_E2E_REGISTRY_MODE="${RISE_E2E_REGISTRY_MODE:-oci-client-auth}"
-MINIKUBE_MEMORY="${MINIKUBE_MEMORY:-4096}"
+MINIKUBE_MEMORY="${MINIKUBE_MEMORY:-6144}"
+MINIKUBE_CPUS="${MINIKUBE_CPUS:-4}"
 RISE_E2E_ARTIFACT_DIR="${RISE_E2E_ARTIFACT_DIR:-.rise-e2e-artifacts}"
 RISE_PUBLIC_URL="http://rise.local"
 RISE_CI_JWT_SIGNING_SECRET_B64="dGVzdC1qd3Qtc2VjcmV0LWtleS1mb3ItY2ktdGVzdGluZy1vbmx5LW5vdC1zZWN1cmU="
@@ -138,6 +139,9 @@ cleanup() {
   if [[ -n "${PF_PID:-}" ]] && kill -0 "${PF_PID}" >/dev/null 2>&1; then
     kill "${PF_PID}" >/dev/null 2>&1 || true
   fi
+  if [[ -n "${APP_PF_PID:-}" ]] && kill -0 "${APP_PF_PID}" >/dev/null 2>&1; then
+    kill "${APP_PF_PID}" >/dev/null 2>&1 || true
+  fi
   if [[ $exit_code -ne 0 ]]; then
     kubectl get pods -A || true
     kubectl get events -A --sort-by=.metadata.creationTimestamp | tail -n 200 || true
@@ -175,7 +179,7 @@ if [[ "${RISE_E2E_REGISTRY_MODE}" == "jfrog-vault" ]]; then
 fi
 
 echo "Starting Minikube"
-minikube_args=(--driver=docker --cpus=2 --memory="${MINIKUBE_MEMORY}")
+minikube_args=(--driver=docker --cpus="${MINIKUBE_CPUS}" --memory="${MINIKUBE_MEMORY}")
 if [[ "${RISE_E2E_REGISTRY_MODE}" == "jfrog-vault" ]]; then
   minikube_args+=(--insecure-registry=rise-jfrog:8082)
 fi
@@ -300,6 +304,75 @@ for _ in {1..30}; do
 done
 if [[ "${deployment_list}" != *"Healthy"* ]]; then
   echo "Expected Rise deployment status to become Healthy"
+  exit 1
+fi
+
+echo "Smoke test: logs flow to Loki and Rise API can query them"
+
+deployment_id="$(curl -sS -H "Authorization: Bearer ${RISE_TOKEN}" \
+  "http://127.0.0.1:3000/api/v1/projects/${PROJECT_NAME}/deployments" \
+  | jq -r '.[0].deployment_id')"
+if [[ -z "${deployment_id}" || "${deployment_id}" == "null" ]]; then
+  echo "Failed to resolve deployment_id from Rise API"
+  exit 1
+fi
+echo "Resolved deployment_id=${deployment_id}"
+
+# Generate a few log lines via the app service. nginx-unprivileged writes
+# its startup banner and access-log lines to stdout from PID 1, which
+# kubelet captures and Alloy ships to Loki. Sending traffic via a
+# port-forward (rather than `kubectl exec`, whose process output goes
+# back to the exec client, not the pod log stream) keeps the source of
+# observed log lines unambiguous.
+app_svc="$(kubectl -n "${APP_NAMESPACE}" get svc -o jsonpath='{.items[0].metadata.name}')"
+if [[ -z "${app_svc}" ]]; then
+  echo "Failed to locate app service in namespace ${APP_NAMESPACE}"
+  exit 1
+fi
+kubectl -n "${APP_NAMESPACE}" port-forward "svc/${app_svc}" 8080:8080 \
+  >/tmp/rise-e2e-app-pf.log 2>&1 &
+APP_PF_PID=$!
+sleep 3
+for _ in 1 2 3; do
+  curl -sS --max-time 5 http://127.0.0.1:8080/ >/dev/null || true
+  sleep 1
+done
+
+start_ts="$(date -u -d '-10 minutes' +%Y-%m-%dT%H:%M:%SZ)"
+end_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+counts_url="http://127.0.0.1:3000/api/v1/projects/${PROJECT_NAME}/deployments/${deployment_id}/logs/counts?start=${start_ts}&end=${end_ts}&step_seconds=60"
+
+total=0
+info=0
+body=""
+for _ in {1..30}; do
+  body="$(curl -sS -H "Authorization: Bearer ${RISE_TOKEN}" "${counts_url}" || true)"
+  total="$(printf '%s' "${body}" | jq '[.buckets[].total] | add // 0' 2>/dev/null || echo 0)"
+  info="$(printf '%s' "${body}" | jq '[.buckets[].info]  | add // 0' 2>/dev/null || echo 0)"
+  if (( total > 0 && info > 0 )); then
+    break
+  fi
+  sleep 3
+done
+
+echo "Log counts: total=${total} info=${info}"
+if (( total == 0 )); then
+  echo "Expected /logs/counts to report total>0; last response: ${body}"
+  exit 1
+fi
+if (( info == 0 )); then
+  echo "Expected /logs/counts to report info bucket > 0; last response: ${body}"
+  exit 1
+fi
+
+# Exercise the SSE log stream via the CLI. `rise logs` is non-follow by
+# default (`--follow` is opt-in); in non-follow mode the server returns
+# the backlog and closes the SSE stream, so the CLI exits naturally.
+# `timeout` is a belt-and-braces guard against a stuck port-forward.
+lines="$(timeout 30s rise_cli logs --project "${PROJECT_NAME}" "${deployment_id}" --tail 20 | wc -l)"
+echo "rise logs returned ${lines} line(s)"
+if (( lines == 0 )); then
+  echo "Expected 'rise logs' to print at least one line"
   exit 1
 fi
 
