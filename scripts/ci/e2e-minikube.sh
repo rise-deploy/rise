@@ -339,28 +339,33 @@ fi
 
 start_ts="$(date -u -d '-10 minutes' +%Y-%m-%dT%H:%M:%SZ)"
 end_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-counts_url="http://127.0.0.1:3000/api/v1/projects/${PROJECT_NAME}/deployments/${deployment_id}/logs/counts?start=${start_ts}&end=${end_ts}&step_seconds=60"
+volume_url="http://127.0.0.1:3000/api/v1/projects/${PROJECT_NAME}/deployments/${deployment_id}/logs/volume?start=${start_ts}&end=${end_ts}&step_seconds=60"
 
+# Loki classifies most nginx/kube-probe lines as `detected_level=unknown`,
+# so we can't pin the assertion to a specific level bucket. Instead assert
+# (a) total > 0 (logs reached Loki and the API can query them) and (b) at
+# least one distinct level key appears across the buckets (levels
+# round-trip through the wire format).
 total=0
-info=0
+levels_seen=0
 body=""
 for _ in {1..30}; do
-  body="$(curl -sS -H "Authorization: Bearer ${RISE_TOKEN}" "${counts_url}" || true)"
+  body="$(curl -sS -H "Authorization: Bearer ${RISE_TOKEN}" "${volume_url}" || true)"
   total="$(printf '%s' "${body}" | jq '[.buckets[].total] | add // 0' 2>/dev/null || echo 0)"
-  info="$(printf '%s' "${body}" | jq '[.buckets[].info]  | add // 0' 2>/dev/null || echo 0)"
-  if (( total > 0 && info > 0 )); then
+  levels_seen="$(printf '%s' "${body}" | jq '[.buckets[].by_level | keys[]] | unique | length' 2>/dev/null || echo 0)"
+  if (( total > 0 && levels_seen >= 1 )); then
     break
   fi
   sleep 3
 done
 
-echo "Log counts (post-pod-removal): total=${total} info=${info}"
+echo "Log volume (post-pod-removal): total=${total} distinct_levels=${levels_seen}"
 if (( total == 0 )); then
-  echo "Expected /logs/counts to report total>0 after pod removal; last response: ${body}"
+  echo "Expected /logs/volume to report total>0 after pod removal; last response: ${body}"
   exit 1
 fi
-if (( info == 0 )); then
-  echo "Expected /logs/counts to report info bucket > 0 after pod removal; last response: ${body}"
+if (( levels_seen == 0 )); then
+  echo "Expected /logs/volume to report at least one level in by_level; last response: ${body}"
   exit 1
 fi
 
