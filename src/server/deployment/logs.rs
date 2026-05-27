@@ -958,13 +958,22 @@ impl LogLine {
     }
 
     fn classified_level(&self) -> String {
-        // Pass Loki's `detected_level` through verbatim; the frontend's
-        // palette is driven by `/api/v1/logs/capabilities`. Missing/empty
-        // metadata defaults to `"unknown"` so the wire format always carries
-        // a level string.
+        // Three cases:
+        //   * Loki returned a concrete `detected_level` (`info`, `warn`,
+        //     `unknown`, …) — pass through verbatim. This includes Loki's
+        //     own `"unknown"`: when Loki actively says "I can't classify
+        //     this", we trust it rather than guessing.
+        //   * Loki returned no label at all (or empty/whitespace). Happens
+        //     for in-flight entries on the WS tail because Loki's
+        //     classifier runs during chunk processing, not against the
+        //     ingester's in-memory write buffer. Fall back to the same
+        //     regex the Kubernetes backend uses so the live tail is
+        //     never un-classified for the user. Returns one of
+        //     `KUBERNETES_LEVELS` — a subset of Loki's vocabulary, safe
+        //     to render with the same palette.
         match self.detected_level.as_deref().map(str::trim) {
             Some(raw) if !raw.is_empty() => raw.to_string(),
-            _ => "unknown".to_string(),
+            _ => classify_k8s_line(&self.line).to_string(),
         }
     }
 
@@ -1362,14 +1371,17 @@ mod tests {
         let parsed = LogLine::from_loki_value(value, Some("warn")).expect("valid loki value");
         assert_eq!(parsed.classified_level(), "warn");
 
-        // Whitespace/empty stream labels are treated as "no classification".
+        // Whitespace/empty stream labels are treated as "no classification"
+        // — same as a missing label. The regex fallback runs against the
+        // line content; here `"anything"` has no warn/error keyword so it
+        // falls into the catch-all info bucket.
         let value = LokiValue {
             timestamp: "1000000000".to_string(),
             line: "anything".to_string(),
             structured_metadata: None,
         };
         let parsed = LogLine::from_loki_value(value, Some("  ")).expect("valid loki value");
-        assert_eq!(parsed.classified_level(), "unknown");
+        assert_eq!(parsed.classified_level(), "info");
 
         // Per-entry structured metadata wins over the stream-level label.
         let mut md = std::collections::HashMap::new();
@@ -1789,14 +1801,37 @@ mod tests {
         };
         assert_eq!(l.classified_level(), "warn");
 
-        // Missing/empty/whitespace metadata → "unknown" on the wire.
-        for raw in [None, Some(String::new()), Some("   ".into())] {
-            let l = LogLine {
-                timestamp_nanos: 0,
-                line: "anything".into(),
-                detected_level: raw,
-            };
-            assert_eq!(l.classified_level(), "unknown");
+        // Loki's explicit "unknown" is still trusted verbatim — when Loki
+        // says "I can't classify this", we don't second-guess.
+        let l = LogLine {
+            timestamp_nanos: 0,
+            line: "ERROR something exploded".into(),
+            detected_level: Some("unknown".into()),
+        };
+        assert_eq!(l.classified_level(), "unknown");
+    }
+
+    #[test]
+    fn classified_level_falls_back_to_regex_when_label_is_missing() {
+        // Loki's WS tail emits in-flight entries before the classifier has
+        // run on them, so the `detected_level` label is missing entirely.
+        // Fall back to the K8s line-regex so the live tail isn't dim by
+        // default. Empty / whitespace-only labels are treated the same as
+        // absent — they signal "not classified" rather than "unknown".
+        let cases = [
+            ("info line that says hello", "info"),
+            ("WARN connection retry", "warn"),
+            ("ERROR boom", "error"),
+        ];
+        for (line, expected) in cases {
+            for raw in [None, Some(String::new()), Some("   ".into())] {
+                let l = LogLine {
+                    timestamp_nanos: 0,
+                    line: line.into(),
+                    detected_level: raw,
+                };
+                assert_eq!(l.classified_level(), expected, "input {line:?}");
+            }
         }
     }
 
