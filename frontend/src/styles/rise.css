@@ -1292,7 +1292,11 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
 
 /* ---------- Log volume chart tooltip ---------- */
 .r-logs-chart-tip {
-    background: var(--surface);
+    /* Explicit background-color (not the shorthand) and a backdrop blur so
+       the log lines behind the chart aren't visible through the tooltip in
+       case Recharts' wrapper carries any residual transition opacity. */
+    background-color: var(--surface);
+    backdrop-filter: blur(6px);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     box-shadow: var(--shadow-md);
@@ -1301,6 +1305,10 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
     color: var(--text);
     min-width: 180px;
 }
+/* Recharts' tooltip-wrapper sometimes settles below opacity:1 during the
+   show/hide animation; force it solid so our tooltip background is the
+   final word on visibility. */
+.recharts-tooltip-wrapper { opacity: 1 !important; }
 .r-logs-chart-tip-title {
     font-weight: 600;
     margin-bottom: 6px;

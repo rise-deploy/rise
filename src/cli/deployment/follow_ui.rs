@@ -464,7 +464,7 @@ async fn stream_logs_with_status_polling(
                 biased; // prefer draining log lines over status checks
                 line = stream.recv() => {
                     match line {
-                        Some(Ok(text)) => println!("{}", text),
+                        Some(Ok((text, level))) => super::core::print_log_line(&text, &level),
                         Some(Err(e)) => {
                             debug!("Log stream error: {:?}", e);
                             log_stream = None;
@@ -544,7 +544,7 @@ async fn drain_log_stream(stream: &mut super::core::LogStream) {
         tokio::select! {
             line = stream.recv() => {
                 match line {
-                    Some(Ok(text)) => println!("{}", text),
+                    Some(Ok((text, level))) => super::core::print_log_line(&text, &level),
                     _ => break,
                 }
             }

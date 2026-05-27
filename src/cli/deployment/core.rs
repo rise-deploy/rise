@@ -1599,7 +1599,14 @@ fn extract_log_event(data: &str) -> (String, String) {
 /// coloured by level when stdout is a TTY and `NO_COLOR` isn't set.
 fn print_log_event(data: &str) {
     let (line, level) = extract_log_event(data);
-    if let Some(code) = level_ansi_color(&level) {
+    print_log_line(&line, &level);
+}
+
+/// Print a log line, coloured by its level when colour output is enabled.
+/// Used by both the one-shot `rise deployment logs` path and the
+/// follow-UI's live stream so both render levels consistently.
+pub(super) fn print_log_line(line: &str, level: &str) {
+    if let Some(code) = level_ansi_color(level) {
         println!("{}{}{}", code, line, ANSI_RESET);
     } else {
         println!("{}", line);
@@ -1724,9 +1731,12 @@ pub(super) struct LogStream {
 }
 
 impl LogStream {
-    /// Receive the next log line from the stream.
-    /// Returns `None` when the stream ends.
-    pub async fn recv(&mut self) -> Option<Result<String>> {
+    /// Receive the next log line from the stream plus its backend-classified
+    /// level. Returns `None` when the stream ends. The level is the raw
+    /// string the SSE payload carried (one of the values advertised by
+    /// `/api/v1/logs/capabilities`), or an empty string if the payload
+    /// didn't carry one.
+    pub async fn recv(&mut self) -> Option<Result<(String, String)>> {
         use futures::StreamExt;
 
         loop {
@@ -1743,11 +1753,11 @@ impl LogStream {
                         && (self.event_type == "log" || self.event_type == "message")
                     {
                         // `log` events are JSON-wrapped:
-                        // {"line": "...", "level": "..."}. The follow UI
-                        // just prints the text, so drop the level here.
+                        // {"line": "...", "level": "..."}. Yield both so
+                        // the follow UI can colour the line by level.
                         // Other event types (status, backlog_complete) are
                         // ignored by the streaming follow UI.
-                        return Some(Ok(extract_log_event(data).0));
+                        return Some(Ok(extract_log_event(data)));
                     }
                     continue;
                 } else if line.is_empty() || line.starts_with(':') {
@@ -1757,7 +1767,7 @@ impl LogStream {
                     }
                     continue;
                 } else {
-                    return Some(Ok(line.to_string()));
+                    return Some(Ok((line.to_string(), String::new())));
                 }
             }
 
@@ -1779,10 +1789,10 @@ impl LogStream {
                             if !data.is_empty()
                                 && (self.event_type == "log" || self.event_type == "message")
                             {
-                                return Some(Ok(extract_log_event(data).0));
+                                return Some(Ok(extract_log_event(data)));
                             }
                         } else if !line.is_empty() && !line.starts_with(':') {
-                            return Some(Ok(line.to_string()));
+                            return Some(Ok((line.to_string(), String::new())));
                         }
                     }
                     return None;
