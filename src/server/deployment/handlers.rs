@@ -2420,7 +2420,7 @@ pub async fn stream_deployment_logs(
         )
         .await
         .map_err(|e| {
-            let error_msg = e.to_string();
+            let error_msg = format!("{:#}", e);
             if error_msg.contains("not ready yet") || error_msg.contains("waiting to start") {
                 ServerError::service_unavailable("Deployment logs are not ready yet.").expected()
             } else if error_msg.contains("exceeds the limit") {
@@ -2453,7 +2453,7 @@ pub async fn stream_deployment_logs(
         }
         Err(e) => {
             // Send error as SSE event
-            error!("Log stream error: {}", e);
+            error!("Log stream error: {:?}", e);
             stream::iter(vec![Err(e)])
         }
     });
@@ -2540,7 +2540,7 @@ pub async fn count_deployment_logs(
         )
         .await
         .map_err(|e| {
-            let error_msg = e.to_string();
+            let error_msg = format!("{:#}", e);
             if error_msg.contains("exceeds the limit") {
                 ServerError::bad_request(
                     "Selected time range is too large for the log backend. Pick a shorter range.",

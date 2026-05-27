@@ -1,6 +1,4 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Bar, BarChart, CartesianGrid, Cell, ResponsiveContainer, Tooltip as RechartsTooltip, XAxis, YAxis } from 'recharts';
-import { DayPicker } from 'react-day-picker';
+import { Fragment, lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../lib/api';
 import { CONFIG } from '../lib/config';
 import { navigate } from '../lib/navigation';
@@ -12,6 +10,12 @@ import { Button as RButton, Combobox, ConfirmDialog, ENV_COLOR_STYLES, Empty, En
 import { Icon } from '../components/icon';
 import { EnvVarsList } from './resources';
 import { EmptyState, ErrorState, LoadingState } from '../components/states';
+
+// recharts (~8.5 MB unpacked) and react-day-picker (~3.4 MB unpacked, plus its
+// own CSS) load only when the deployment-logs panel actually renders the
+// chart / opens the date picker.
+const LogVolumeChart = lazy(() => import('./log-volume-chart'));
+const DateRangePopover = lazy(() => import('./date-range-popover'));
 
 const STATUS_TONES = {
     Healthy: 'ok',
@@ -746,119 +750,6 @@ function formatDateTimeShort(date) {
     return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
-function formatTimeHm(date) {
-    if (!(date instanceof Date) || Number.isNaN(date.getTime())) return '00:00';
-    const pad = (n) => String(n).padStart(2, '0');
-    return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
-}
-
-function applyTimeOfDay(target, source) {
-    if (!(target instanceof Date)) return null;
-    const next = new Date(target);
-    if (source instanceof Date && !Number.isNaN(source.getTime())) {
-        next.setHours(source.getHours(), source.getMinutes(), 0, 0);
-    }
-    return next;
-}
-
-function applyTimeString(date, hhmm) {
-    if (!(date instanceof Date)) return date;
-    const match = /^(\d{1,2}):(\d{2})$/.exec(hhmm || '');
-    if (!match) return date;
-    const next = new Date(date);
-    next.setHours(Math.min(23, Number(match[1])), Math.min(59, Number(match[2])), 0, 0);
-    return next;
-}
-
-function DateRangePopover({ start, end, onChange }) {
-    const [open, setOpen] = useState(false);
-    const rootRef = useRef(null);
-
-    useEffect(() => {
-        if (!open) return undefined;
-        const onDocMouseDown = (e) => {
-            if (rootRef.current && !rootRef.current.contains(e.target)) setOpen(false);
-        };
-        const onKey = (e) => { if (e.key === 'Escape') setOpen(false); };
-        document.addEventListener('mousedown', onDocMouseDown);
-        document.addEventListener('keydown', onKey);
-        return () => {
-            document.removeEventListener('mousedown', onDocMouseDown);
-            document.removeEventListener('keydown', onKey);
-        };
-    }, [open]);
-
-    const label = start && end
-        ? `${formatDateTimeShort(start)} → ${formatDateTimeShort(end)}`
-        : 'Select range';
-
-    // We drive selection from `onDayClick` rather than the built-in
-    // mode="range" `onSelect` so that clicking inside an already-complete
-    // range starts a fresh selection (the default behavior tries to extend
-    // the existing range instead).
-    const handleDayClick = (day) => {
-        if (!start || (start && end)) {
-            // Fresh first click - either we have no selection, or we already
-            // have a complete one and the user wants to start over.
-            onChange(applyTimeOfDay(day, start), null);
-            return;
-        }
-        // We have `start` only; this click finishes the range.
-        let s = start;
-        let e = day;
-        if (day.getTime() < start.getTime()) {
-            s = day;
-            e = start;
-        }
-        onChange(applyTimeOfDay(s, start), applyTimeOfDay(e, end));
-    };
-
-    return (
-        <div ref={rootRef} className="r-date-range">
-            <button
-                type="button"
-                className="r-field r-date-range-trigger"
-                onClick={() => setOpen((v) => !v)}
-            >
-                {label}
-            </button>
-            {open && (
-                <div className="r-date-range-popover">
-                    <DayPicker
-                        mode="range"
-                        numberOfMonths={2}
-                        selected={{ from: start || undefined, to: end || undefined }}
-                        onDayClick={handleDayClick}
-                        defaultMonth={start || new Date()}
-                    />
-                    <div className="r-date-range-times">
-                        <label>
-                            <span>From</span>
-                            <input
-                                type="time"
-                                value={formatTimeHm(start)}
-                                onChange={(e) => onChange(applyTimeString(start, e.target.value), end)}
-                                className="r-field"
-                            />
-                        </label>
-                        <label>
-                            <span>To</span>
-                            <input
-                                type="time"
-                                value={formatTimeHm(end)}
-                                onChange={(e) => onChange(start, applyTimeString(end, e.target.value))}
-                                className="r-field"
-                            />
-                        </label>
-                        <RButton size="sm" variant="ghost" onClick={() => onChange(null, null)}>Clear</RButton>
-                        <RButton size="sm" onClick={() => setOpen(false)}>Done</RButton>
-                    </div>
-                </div>
-            )}
-        </div>
-    );
-}
-
 function chooseCountStepSeconds(rangeMs) {
     const rangeSeconds = Math.max(60, Math.floor(rangeMs / 1000));
     if (rangeSeconds <= 3600) return 60;
@@ -1016,191 +907,12 @@ function highlightLogJson(value) {
 }
 
 function ExpandedLogLine({ entry }) {
-    if (entry.isJson) return highlightLogJson(entry.parsed);
+    const highlighted = useMemo(
+        () => (entry.isJson ? highlightLogJson(entry.parsed) : null),
+        [entry.id, entry.isJson],
+    );
+    if (entry.isJson) return highlighted;
     return <span>{entry.raw}</span>;
-}
-
-const LOG_CHART_COLOR_INFO = 'oklch(0.62 0.005 80)';
-const LOG_CHART_COLOR_WARN = 'oklch(0.78 0.13 85)';
-const LOG_CHART_COLOR_ERROR = 'oklch(0.62 0.16 25)';
-
-function formatTickLabel(ms, rangeMs) {
-    const d = new Date(ms);
-    const pad = (n) => String(n).padStart(2, '0');
-    if (rangeMs <= 24 * 3600 * 1000) {
-        return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
-    }
-    return `${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
-}
-
-function LogChartTooltip({ active, payload, stepSeconds }: { active?: boolean; payload?: any[]; stepSeconds: number }) {
-    if (!active || !payload || payload.length === 0) return null;
-    const b = payload[0].payload;
-    // Each bucket counts the preceding window (T - step, T], so the bar at
-    // ts=T represents lines from start = T - step up to end = T.
-    const end = new Date(b.ts);
-    const start = new Date(b.ts - stepSeconds * 1000);
-    return (
-        <div className="r-logs-chart-tip">
-            <div className="r-logs-chart-tip-title">
-                {formatDate(start.toISOString())} – {formatTickLabel(end.getTime(), 0)}
-            </div>
-            <div className="r-logs-chart-tip-row">
-                <span className="dot" style={{ background: LOG_CHART_COLOR_ERROR }} />
-                <span className="lbl">Error</span>
-                <span className="val">{b.error || 0}</span>
-            </div>
-            <div className="r-logs-chart-tip-row">
-                <span className="dot" style={{ background: LOG_CHART_COLOR_WARN }} />
-                <span className="lbl">Warn</span>
-                <span className="val">{b.warn || 0}</span>
-            </div>
-            <div className="r-logs-chart-tip-row">
-                <span className="dot" style={{ background: LOG_CHART_COLOR_INFO }} />
-                <span className="lbl">Info</span>
-                <span className="val">{b.info || 0}</span>
-            </div>
-            <div className="r-logs-chart-tip-total">
-                <span className="lbl">Total</span>
-                <span className="val">{b.total || 0}</span>
-            </div>
-            <div className="r-logs-chart-tip-hint">Click bar to filter logs</div>
-        </div>
-    );
-}
-
-function LogCountsChart({ counts, loading, error, status, rangeLabel, rangeStartMs, rangeEndMs, stepSeconds, onSelectBucket, selectedBucketTs, collapsed, onToggleCollapsed }) {
-    const data = useMemo(
-        () =>
-            counts.map((b) => ({
-                ...b,
-                ts: new Date(b.timestamp).getTime(),
-            })),
-        [counts],
-    );
-    const totalSum = useMemo(() => data.reduce((sum, b) => sum + (b.total || 0), 0), [data]);
-    const rangeMs = (rangeEndMs || 0) - (rangeStartMs || 0);
-
-    const statusMessage = () => {
-        if (!status) return 'No log volume found for the selected range.';
-        if (status.reason === 'retention_expired_possible') {
-            return status.retention_hint
-                ? `No log volume found. Runtime logs are retained for ${status.retention_hint}, so this range may no longer be available.`
-                : 'No log volume found. It may have expired based on the log backend retention policy.';
-        }
-        if (status.reason === 'historical_backend_not_configured') {
-            return 'Log volume charts aren’t supported by the configured log backend.';
-        }
-        if (status.reason === 'deployment_not_ready') {
-            return 'Deployment logs are not ready yet.';
-        }
-        if (status.reason === 'backend_unavailable') {
-            return 'The log backend is unavailable.';
-        }
-        return 'No log volume found for the selected range.';
-    };
-
-    const handleBucketClick = (entry) => {
-        if (!onSelectBucket || !entry || typeof entry.ts !== 'number') return;
-        // Loki's count_over_time(...[Xs]) at step T counts the preceding
-        // X-second window (T - step, T], so the bucket at ts=T covers that
-        // range, not [T, T + step).
-        const end = entry.ts;
-        const start = entry.ts - stepSeconds * 1000;
-        // Toggle: re-clicking the same bar clears the selection.
-        if (selectedBucketTs === end) {
-            onSelectBucket(null);
-        } else {
-            onSelectBucket({ startMs: start, endMs: end });
-        }
-    };
-
-    return (
-        <div className="r-logs-chart" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            <button
-                type="button"
-                className="r-logs-chart-head"
-                onClick={onToggleCollapsed}
-                aria-expanded={!collapsed}
-            >
-                <span className="r-logs-chart-head-toggle">
-                    <Icon name={collapsed ? 'chev' : 'chevd'} size={12} />
-                </span>
-                <span className="r-logs-chart-head-title">Log volume</span>
-                <span className="r-logs-chart-head-range">{rangeLabel}</span>
-            </button>
-            {collapsed ? null : (
-            <div className="rounded border border-[var(--border)] bg-[var(--panel)] px-2 py-1">
-                {loading ? (
-                    <div className="py-6 text-center text-xs text-[var(--text-soft)]">Loading chart…</div>
-                ) : error ? (
-                    <div className="py-6 text-center text-xs text-[var(--err)]">{error}</div>
-                ) : !data.length || totalSum === 0 ? (
-                    <div className="py-6 text-center text-xs text-[var(--text-soft)]">{statusMessage()}</div>
-                ) : (
-                    <ResponsiveContainer width="100%" height={96}>
-                        <BarChart
-                            data={data}
-                            margin={{ top: 4, right: 6, bottom: 4, left: 4 }}
-                            barCategoryGap={1}
-                        >
-                            <CartesianGrid stroke="var(--border)" strokeDasharray="2 3" vertical={false} />
-                            <XAxis
-                                dataKey="ts"
-                                type="number"
-                                scale="time"
-                                domain={['dataMin', 'dataMax']}
-                                tickFormatter={(ms) => formatTickLabel(ms, rangeMs)}
-                                tick={{ fontSize: 10, fill: 'var(--text-soft)' }}
-                                axisLine={{ stroke: 'var(--border)' }}
-                                tickLine={{ stroke: 'var(--border)' }}
-                                minTickGap={48}
-                            />
-                            <YAxis
-                                allowDecimals={false}
-                                tick={{ fontSize: 10, fill: 'var(--text-soft)' }}
-                                axisLine={{ stroke: 'var(--border)' }}
-                                tickLine={{ stroke: 'var(--border)' }}
-                                width={44}
-                            />
-                            <RechartsTooltip
-                                content={<LogChartTooltip stepSeconds={stepSeconds} />}
-                                cursor={{ fill: 'oklch(0.22 0.005 80 / 0.45)' }}
-                            />
-                            <Bar dataKey="info" stackId="a" isAnimationActive={false} onClick={handleBucketClick} style={{ cursor: 'pointer' }}>
-                                {data.map((d) => (
-                                    <Cell
-                                        key={`info-${d.ts}`}
-                                        fill={LOG_CHART_COLOR_INFO}
-                                        fillOpacity={selectedBucketTs == null || selectedBucketTs === d.ts ? 1 : 0.3}
-                                    />
-                                ))}
-                            </Bar>
-                            <Bar dataKey="warn" stackId="a" isAnimationActive={false} onClick={handleBucketClick} style={{ cursor: 'pointer' }}>
-                                {data.map((d) => (
-                                    <Cell
-                                        key={`warn-${d.ts}`}
-                                        fill={LOG_CHART_COLOR_WARN}
-                                        fillOpacity={selectedBucketTs == null || selectedBucketTs === d.ts ? 1 : 0.3}
-                                    />
-                                ))}
-                            </Bar>
-                            <Bar dataKey="error" stackId="a" isAnimationActive={false} onClick={handleBucketClick} style={{ cursor: 'pointer' }}>
-                                {data.map((d) => (
-                                    <Cell
-                                        key={`error-${d.ts}`}
-                                        fill={LOG_CHART_COLOR_ERROR}
-                                        fillOpacity={selectedBucketTs == null || selectedBucketTs === d.ts ? 1 : 0.3}
-                                    />
-                                ))}
-                            </Bar>
-                        </BarChart>
-                    </ResponsiveContainer>
-                )}
-            </div>
-            )}
-        </div>
-    );
 }
 
 // Deployment Logs Component with SSE streaming + infinite scroll
@@ -1416,6 +1128,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
     }, [deploymentId, projectName]);
 
     const loadHistoricalLogs = useCallback(async () => {
+        const gen = ++streamGenRef.current;
         if (!logWindow) {
             setError('Select a valid time range.');
             setCounts([]);
@@ -1456,6 +1169,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                     }
                 },
             });
+            if (gen !== streamGenRef.current) return;
             // Backend sorts ascending; reverse so newest is on top.
             const reversed = collected.slice().reverse();
             setEntries(reversed);
@@ -1466,6 +1180,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
             setHasMore(collected.length === LOG_PAGE_SIZE);
         } catch (err) {
             if (err.name === 'AbortError') return;
+            if (gen !== streamGenRef.current) return;
             console.error('Failed to load logs:', err);
             setError(err.message);
         }
@@ -1536,15 +1251,20 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
             if (controller.signal.aborted) return;
             const reversed = collected.slice().reverse();
             let newlyAdded = 0;
+            let oldestAddedMs: number | null = null;
             setEntries((prev) => {
                 const seen = new Set(prev.map((e) => e.id));
                 const filtered = reversed.filter((e) => !seen.has(e.id) && e.timestampMs < oldestMs);
                 newlyAdded = filtered.length;
                 if (filtered.length === 0) return prev;
+                // Stable descending sort by timestamp so any backdated rows
+                // land in the right place rather than appended out of order.
+                filtered.sort((a, b) => b.timestampMs - a.timestampMs);
+                oldestAddedMs = filtered[filtered.length - 1].timestampMs;
                 return prev.concat(filtered);
             });
-            if (newlyAdded > 0) {
-                oldestLoadedMsRef.current = reversed[reversed.length - 1].timestampMs;
+            if (newlyAdded > 0 && oldestAddedMs !== null) {
+                oldestLoadedMsRef.current = oldestAddedMs;
             }
             // Gate on *new* rows. Without this, a backend that ignores
             // end_time (e.g. Kubernetes' pods/log API) returns the same
@@ -1687,18 +1407,19 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
         return () => stopStreaming();
     }, [deploymentId, deploymentStatus, levelFilter, searchActive, rangeValue, customStart, customEnd, selectedBucket]);
 
-    // A bucket selection is tied to a specific chart row; if the range or
-    // filters change, the previously-selected bucket may no longer be on
-    // screen, so drop it.
-    useEffect(() => {
-        setSelectedBucket(null);
-    }, [rangeWindow, levelFilter, searchActive]);
-
     // Debounce the search input so we don't reopen the SSE on every keystroke.
+    // A bucket selection is tied to a specific chart row, so any new searchActive
+    // value drops it along the way.
     useEffect(() => {
-        const handle = window.setTimeout(() => setSearchActive(searchInput.trim()), 350);
+        const handle = window.setTimeout(() => {
+            const next = searchInput.trim();
+            setSearchActive((prev) => {
+                if (prev !== next && selectedBucket) setSelectedBucket(null);
+                return next;
+            });
+        }, 350);
         return () => window.clearTimeout(handle);
-    }, [searchInput]);
+    }, [searchInput, selectedBucket]);
 
     // Pin scroll to top when new entries arrive at the top and auto-scroll is on.
     useEffect(() => {
@@ -1731,12 +1452,13 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
         }, { root: logBoxRef.current, rootMargin: '120px 0px' });
         observer.observe(sentinel);
         return () => observer.disconnect();
-    }, [hasMore, loadOlder, entries.length]);
+    }, [hasMore, loadOlder]);
 
     const isHistoricalUnavailable = countsStatus?.reason === 'historical_backend_not_configured';
 
     const handleRangeChange = (value) => {
         setRangeValue(value);
+        if (selectedBucket) setSelectedBucket(null);
         if (value === 'custom' && !customStart && !customEnd) {
             const now = new Date();
             setCustomEnd(now);
@@ -1747,6 +1469,12 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
     const handleCustomRangeChange = (newStart, newEnd) => {
         setCustomStart(newStart);
         setCustomEnd(newEnd);
+        if (selectedBucket) setSelectedBucket(null);
+    };
+
+    const handleLevelFilterChange = (value) => {
+        setLevelFilter(value);
+        if (selectedBucket) setSelectedBucket(null);
     };
 
     const handleSelectBucket = useCallback((bucket) => {
@@ -1757,12 +1485,12 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
         // Re-anchor preset ranges to wall-clock now so lines that streamed
         // in after page-load fall back inside the window.
         setRangeNowTick((t) => t + 1);
-        if (streamable) {
+        if (streamable && rangeValue !== 'custom' && selectedBucket == null) {
             void startStreaming();
         } else {
             void loadHistoricalLogs();
         }
-    }, [streamable, startStreaming, loadHistoricalLogs]);
+    }, [streamable, rangeValue, selectedBucket, startStreaming, loadHistoricalLogs]);
 
     const handleCopyLogs = async () => {
         try {
@@ -1829,7 +1557,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                                 { value: 'warn', label: 'Warn' },
                                 { value: 'error', label: 'Error' },
                             ]}
-                            onChange={setLevelFilter}
+                            onChange={handleLevelFilterChange}
                         />
                     </div>
                     <div className="r-logs-search">
@@ -1856,11 +1584,13 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                         />
                     </div>
                     {rangeValue === 'custom' && (
-                        <DateRangePopover
-                            start={customStart}
-                            end={customEnd}
-                            onChange={handleCustomRangeChange}
-                        />
+                        <Suspense fallback={null}>
+                            <DateRangePopover
+                                start={customStart}
+                                end={customEnd}
+                                onChange={handleCustomRangeChange}
+                            />
+                        </Suspense>
                     )}
                     {anchorEnd && rangeValue !== 'custom' && (
                         <span
@@ -1886,20 +1616,35 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                         <div style={{ flex: 1 }}>Error: {error}</div>
                     </div>
                 )}
-                <LogCountsChart
-                    counts={counts}
-                    loading={countsLoading}
-                    error={countsError}
-                    status={countsStatus}
-                    rangeLabel={rangeLabel}
-                    rangeStartMs={rangeWindow?.start.getTime() || 0}
-                    rangeEndMs={rangeWindow?.end.getTime() || 0}
-                    stepSeconds={rangeStepSeconds}
-                    onSelectBucket={handleSelectBucket}
-                    selectedBucketTs={selectedBucket?.endMs ?? null}
-                    collapsed={chartCollapsed}
-                    onToggleCollapsed={() => setChartCollapsed((v) => !v)}
-                />
+                <div className="r-logs-chart" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                    <button
+                        type="button"
+                        className="r-logs-chart-head"
+                        onClick={() => setChartCollapsed((v) => !v)}
+                        aria-expanded={!chartCollapsed}
+                    >
+                        <span className="r-logs-chart-head-toggle">
+                            <Icon name={chartCollapsed ? 'chev' : 'chevd'} size={12} />
+                        </span>
+                        <span className="r-logs-chart-head-title">Log volume</span>
+                        <span className="r-logs-chart-head-range">{rangeLabel}</span>
+                    </button>
+                    {!chartCollapsed && (
+                        <Suspense fallback={<div className="py-6 text-center text-xs text-[var(--text-soft)]">Loading chart…</div>}>
+                            <LogVolumeChart
+                                counts={counts}
+                                loading={countsLoading}
+                                error={countsError}
+                                status={countsStatus}
+                                rangeStartMs={rangeWindow?.start.getTime() || 0}
+                                rangeEndMs={rangeWindow?.end.getTime() || 0}
+                                stepSeconds={rangeStepSeconds}
+                                onSelectBucket={handleSelectBucket}
+                                selectedBucketTs={selectedBucket?.endMs ?? null}
+                            />
+                        </Suspense>
+                    )}
+                </div>
                 {isHistoricalUnavailable && (
                     <div className="text-xs text-[var(--text-soft)]">
                         Historical volume charts are not available for this log backend.

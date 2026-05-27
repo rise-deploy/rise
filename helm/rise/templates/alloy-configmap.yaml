@@ -1,6 +1,14 @@
 {{- if .Values.logs.alloy.enabled }}
-{{- if and .Values.logs.loki.bearerTokenSecret.name (empty .Values.alloy.alloy.extraEnv) }}
-{{- fail "logs.loki.bearerTokenSecret is set, but Alloy also needs alloy.alloy.extraEnv to expose RISE_LOKI_BEARER_TOKEN from the same Secret" }}
+{{- if .Values.logs.loki.bearerTokenSecret.name }}
+{{- $found := false }}
+{{- range (default (list) .Values.alloy.alloy.extraEnv) }}
+{{- if eq (.name | toString) "RISE_LOKI_BEARER_TOKEN" }}
+{{- $found = true }}
+{{- end }}
+{{- end }}
+{{- if not $found }}
+{{- fail (printf "logs.loki.bearerTokenSecret.name is set to %q, but alloy.alloy.extraEnv has no entry with name=RISE_LOKI_BEARER_TOKEN sourcing the same Secret. Add an extraEnv item that exposes RISE_LOKI_BEARER_TOKEN (e.g. from secretKeyRef.name=%s) so Alloy can authenticate against Loki." .Values.logs.loki.bearerTokenSecret.name .Values.logs.loki.bearerTokenSecret.name) }}
+{{- end }}
 {{- end }}
 apiVersion: v1
 kind: ConfigMap

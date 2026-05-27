@@ -218,13 +218,14 @@ jobs:
       - name: Install mise tools
         run: mise use -g helm
 
-      - name: Add Helm repos used by chart deps
-        run: helm repo add rise-grafana https://grafana.github.io/helm-charts
-
       - name: Verify vendored chart dependencies
         shell: bash
+        env:
+          HELM_REPOSITORY_CONFIG: ${{ runner.temp }}/helm-repos.yaml
+          HELM_REPOSITORY_CACHE: ${{ runner.temp }}/helm-cache
         run: |
           set -euo pipefail
+          helm repo add rise-grafana https://grafana.github.io/helm-charts
           helm dependency build helm/rise
           git diff --exit-code -- helm/rise/Chart.lock helm/rise/charts
 

@@ -22,6 +22,13 @@ deployment_logs:
     deployment_id: "rise_deployment_id"
 ```
 
+Note the casing difference between the two surfaces: the backend YAML
+uses snake_case keys (`labels.deployment_id`), while the Helm values
+expose the same setting as `logs.loki.labels.deploymentId` (camelCase,
+because Helm renders the Rust struct's serde alias). Both ultimately set
+the same Loki label name — copy snippets carefully when moving between
+`/etc/rise/local.yaml` and `--set` / `values.yaml`.
+
 Rise scopes every query to a single deployment by selecting on two
 stream labels — `project` and `deployment_id` by default. The pair must
 uniquely identify a deployment's log stream; `deployment_id` is already
@@ -52,6 +59,24 @@ The bundled Alloy is configured to scrape only Pods labelled
 `app.kubernetes.io/managed-by=rise` and writes the same label names the
 backend selects on, so query and ingest stay in sync automatically.
 
+### Alloy RBAC scope
+
+The bundled Alloy watches Pods **cluster-wide** rather than restricting
+its `discovery.kubernetes` to a single namespace. Rise spreads app
+workloads across many namespaces (typically one per project/environment,
+sharing a common prefix), and Alloy's `namespaces.names` field accepts
+only literal names — no wildcards or regex. The cluster-wide watch is
+paired with a relabel rule that keeps only Pods carrying
+`app.kubernetes.io/managed-by=rise`, so non-Rise workloads are dropped
+at ingest.
+
+This means the bundled Alloy `ServiceAccount` needs cluster-wide
+`get`/`list`/`watch` on Pods (the chart's RBAC reflects that). Operators
+who require stricter RBAC scoping can disable the bundled shipper
+(`logs.alloy.enabled: false`) and run their own log shipper — either
+with a tighter per-namespace selector, or one deployment per namespace —
+provided it emits the same Loki labels the backend queries on.
+
 ## Operator-managed external Loki
 
 To point Rise at an existing Loki, leave the subchart disabled and set
@@ -70,6 +95,11 @@ logs:
   alloy:
     enabled: true
 ```
+
+If you also run your own log shipper, set `logs.alloy.enabled: false`
+and skip the `extraEnv` block below. The three supported topologies are
+then: (a) bundled Loki + bundled Alloy, (b) external Loki + bundled
+Alloy, and (c) external Loki + external shipper.
 
 When you bring your own log shipper too, set
 `logs.loki.labels.{project,deploymentId}` to match the labels your

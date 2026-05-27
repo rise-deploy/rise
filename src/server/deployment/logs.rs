@@ -432,6 +432,7 @@ impl LokiLogBackend {
         } else {
             query.tail_lines.unwrap_or(1000)
         };
+        let tail = tail.clamp(1, 5000);
 
         let url = format!(
             "{}?query={}&direction=BACKWARD&start={}&end={}&limit={}",
@@ -540,21 +541,43 @@ impl LokiLogBackend {
             let (ws_stream, _) = tokio_tungstenite::connect_async(request)
                 .await
                 .context("Failed to connect to Loki tail endpoint")?;
-            let (_write, mut read) = ws_stream.split();
+            let (mut write, mut read) = ws_stream.split();
 
-            while let Some(message) = read.next().await {
-                let message = message.context("Loki tail websocket error")?;
-                if !message.is_text() {
-                    continue;
-                }
-                let payload = message.into_text().context("Invalid Loki tail frame")?;
-                let response: LokiTailResponse = serde_json::from_str(&payload)
-                    .context("Invalid Loki tail payload")?;
-                for stream in response.streams {
-                    for value in stream.values {
-                        if let Some(line) = LogLine::from_loki_value(value) {
-                            yield LogEvent::Line(line.render(query.timestamps));
+            use futures::SinkExt;
+            let idle = std::time::Duration::from_secs(30);
+            let mut consecutive_timeouts: u32 = 0;
+            loop {
+                match tokio::time::timeout(idle, read.next()).await {
+                    Ok(Some(message)) => {
+                        consecutive_timeouts = 0;
+                        let message = message.context("Loki tail websocket error")?;
+                        if !message.is_text() {
+                            continue;
                         }
+                        let payload = message.into_text().context("Invalid Loki tail frame")?;
+                        let response: LokiTailResponse = serde_json::from_str(&payload)
+                            .context("Invalid Loki tail payload")?;
+                        for stream in response.streams {
+                            for value in stream.values {
+                                if let Some(line) = LogLine::from_loki_value(value) {
+                                    yield LogEvent::Line(line.render(query.timestamps));
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => {
+                        consecutive_timeouts += 1;
+                        if consecutive_timeouts >= 2 {
+                            Err(anyhow::anyhow!(
+                                "Loki tail websocket idle for {}s with no pong",
+                                idle.as_secs() * 2
+                            ))?;
+                        }
+                        write
+                            .send(tokio_tungstenite::tungstenite::Message::Ping(Vec::new().into()))
+                            .await
+                            .context("Failed to send Loki tail websocket ping")?;
                     }
                 }
             }
@@ -870,8 +893,78 @@ struct LokiMetricSeries {
     value: Option<MetricSample>,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Clone)]
 struct MetricSample(f64, String);
+
+impl<'de> Deserialize<'de> for MetricSample {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, SeqAccess, Visitor};
+        use std::fmt;
+
+        struct CountField(String);
+        impl<'de> Deserialize<'de> for CountField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct CountVisitor;
+                impl<'de> Visitor<'de> for CountVisitor {
+                    type Value = CountField;
+                    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                        f.write_str("a string or numeric Loki sample count")
+                    }
+                    fn visit_str<E: de::Error>(
+                        self,
+                        v: &str,
+                    ) -> std::result::Result<CountField, E> {
+                        Ok(CountField(v.to_string()))
+                    }
+                    fn visit_string<E: de::Error>(
+                        self,
+                        v: String,
+                    ) -> std::result::Result<CountField, E> {
+                        Ok(CountField(v))
+                    }
+                    fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<CountField, E> {
+                        Ok(CountField(v.to_string()))
+                    }
+                    fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<CountField, E> {
+                        Ok(CountField(v.to_string()))
+                    }
+                    fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<CountField, E> {
+                        Ok(CountField(v.to_string()))
+                    }
+                }
+                deserializer.deserialize_any(CountVisitor)
+            }
+        }
+
+        struct SampleVisitor;
+        impl<'de> Visitor<'de> for SampleVisitor {
+            type Value = MetricSample;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a Loki metric sample [timestamp, count]")
+            }
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<MetricSample, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let ts: f64 = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+                let count: CountField = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(1, &self))?;
+                Ok(MetricSample(ts, count.0))
+            }
+        }
+
+        deserializer.deserialize_seq(SampleVisitor)
+    }
+}
 
 #[derive(Debug)]
 struct CountPoint {
@@ -889,7 +982,10 @@ impl LokiMetricSeries {
 
         samples
             .into_iter()
-            .map(|MetricSample(ts_seconds, count_str)| {
+            .filter_map(|MetricSample(ts_seconds, count_str)| {
+                if !ts_seconds.is_finite() {
+                    return None;
+                }
                 // Loki returns metric timestamps as JSON numbers (seconds). For step
                 // sizes >= 1s — the only ones the chart uses — they are whole
                 // seconds. Multiplying as f64 loses precision above ~2^53 ns
@@ -898,15 +994,15 @@ impl LokiMetricSeries {
                 let timestamp_nanos = (ts_seconds.round() as i64)
                     .checked_mul(1_000_000_000)
                     .unwrap_or(i64::MAX);
-                let count = count_str
-                    .parse::<f64>()
-                    .ok()
-                    .map(|v| v.round().max(0.0) as u64)
-                    .unwrap_or(0);
-                CountPoint {
+                let parsed = count_str.parse::<f64>().ok()?;
+                if !parsed.is_finite() {
+                    return None;
+                }
+                let count = parsed.round().max(0.0) as u64;
+                Some(CountPoint {
                     timestamp_nanos,
                     count,
-                }
+                })
             })
             .collect()
     }
@@ -1016,6 +1112,7 @@ fn websocket_url(http_url: &str, selector: &str) -> String {
     format!("{}?query={}", url, urlencoding::encode(selector))
 }
 
+/// Parse a short retention hint like `"7d"`. Supported units: `s`, `m`, `h`, `d`.
 fn parse_duration_hint(value: &str) -> Option<Duration> {
     let trimmed = value.trim();
     if trimmed.len() < 2 {
@@ -1149,6 +1246,43 @@ mod tests {
         let lines: Vec<String> = (1..=3).map(|n| format!("line-{n}")).collect();
         let out = slice_for_skip_recent(lines, 10);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn loki_metric_response_parses_numeric_timestamps_and_string_counts() {
+        let payload = r#"{
+          "status":"success",
+          "data":{
+            "resultType":"matrix",
+            "result":[{"metric":{},"values":[[1700000000,"5"],[1700000060,"3"]]}]
+          }
+        }"#;
+        let parsed: LokiMetricQueryResponse =
+            serde_json::from_str(payload).expect("response should parse");
+        let series = &parsed.data.result[0];
+        let sample = &series.values[0];
+        assert_eq!(sample.0, 1700000000.0);
+        let points = series.points();
+        assert_eq!(points[0].count, 5);
+        assert_eq!(points[1].count, 3);
+    }
+
+    #[test]
+    fn loki_metric_response_accepts_numeric_count() {
+        // Lock in the numeric-count contract (item 4): even though Loki normally
+        // returns counts as JSON strings, a numeric value must not fail parsing.
+        let payload = r#"{
+          "status":"success",
+          "data":{
+            "resultType":"matrix",
+            "result":[{"metric":{},"values":[[1700000000, 5]]}]
+          }
+        }"#;
+        let parsed: LokiMetricQueryResponse =
+            serde_json::from_str(payload).expect("numeric count should parse");
+        let series = &parsed.data.result[0];
+        assert_eq!(series.values[0].0, 1700000000.0);
+        assert_eq!(series.points()[0].count, 5);
     }
 
     #[test]

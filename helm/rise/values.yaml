@@ -212,6 +212,9 @@ loki:
     enabled: false
   gateway:
     enabled: false
+  # Force the SimpleScalable component replicas to 0 — the upstream chart
+  # defaults them to 3, and its validate.yaml fails when both SingleBinary
+  # and SimpleScalable targets have replicas > 0.
   read:
     replicas: 0
   write:

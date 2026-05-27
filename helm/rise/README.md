@@ -164,6 +164,11 @@ When pointing Rise at an operator-managed Loki whose existing labels differ
 also enabled, those names flow through to its relabel rules so backend
 queries and shipped logs stay in sync.
 
+The bundled Alloy uses a cluster-wide Pod watch (filtered to
+`app.kubernetes.io/managed-by=rise`); see the [Loki backend doc](../../docs/engineering/src/content/docs/persistent-logs/loki.md)
+for the RBAC trade-off and how to swap in your own shipper if you need
+tighter scoping.
+
 #### Loki bearer token
 
 When `logs.loki.bearerTokenSecret.name` is set, the Rise backend reads the token
