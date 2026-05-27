@@ -1022,8 +1022,10 @@ function formatTickLabel(ms, rangeMs) {
 function LogChartTooltip({ active, payload, stepSeconds }) {
     if (!active || !payload || payload.length === 0) return null;
     const b = payload[0].payload;
-    const start = new Date(b.ts);
-    const end = new Date(b.ts + stepSeconds * 1000);
+    // Each bucket counts the preceding window (T - step, T], so the bar at
+    // ts=T represents lines from start = T - step up to end = T.
+    const end = new Date(b.ts);
+    const start = new Date(b.ts - stepSeconds * 1000);
     return (
         <div className="r-logs-chart-tip">
             <div className="r-logs-chart-tip-title">
@@ -1048,7 +1050,7 @@ function LogChartTooltip({ active, payload, stepSeconds }) {
                 <span className="lbl">Total</span>
                 <span className="val">{b.total || 0}</span>
             </div>
-            <div className="r-logs-chart-tip-hint">Click to zoom</div>
+            <div className="r-logs-chart-tip-hint">Click bar to filter logs</div>
         </div>
     );
 }
@@ -1086,8 +1088,11 @@ function LogCountsChart({ counts, loading, error, status, rangeLabel, rangeStart
 
     const handleBucketClick = (entry) => {
         if (!onSelectBucket || !entry || typeof entry.ts !== 'number') return;
-        const start = entry.ts;
-        const end = entry.ts + stepSeconds * 1000;
+        // Loki's count_over_time(...[Xs]) at step T counts the preceding
+        // X-second window (T - step, T], so the bucket at ts=T covers that
+        // range, not [T, T + step).
+        const end = entry.ts;
+        const start = entry.ts - stepSeconds * 1000;
         // Toggle: re-clicking the same bar clears the selection.
         if (selectedBucketStartMs === start) {
             onSelectBucket(null);
