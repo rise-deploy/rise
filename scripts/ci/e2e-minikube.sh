@@ -139,9 +139,6 @@ cleanup() {
   if [[ -n "${PF_PID:-}" ]] && kill -0 "${PF_PID}" >/dev/null 2>&1; then
     kill "${PF_PID}" >/dev/null 2>&1 || true
   fi
-  if [[ -n "${APP_PF_PID:-}" ]] && kill -0 "${APP_PF_PID}" >/dev/null 2>&1; then
-    kill "${APP_PF_PID}" >/dev/null 2>&1 || true
-  fi
   if [[ $exit_code -ne 0 ]]; then
     kubectl get pods -A || true
     kubectl get events -A --sort-by=.metadata.creationTimestamp | tail -n 200 || true
@@ -318,25 +315,10 @@ if [[ -z "${deployment_id}" || "${deployment_id}" == "null" ]]; then
 fi
 echo "Resolved deployment_id=${deployment_id}"
 
-# Generate a few log lines via the app service. nginx-unprivileged writes
-# its startup banner and access-log lines to stdout from PID 1, which
-# kubelet captures and Alloy ships to Loki. Sending traffic via a
-# port-forward (rather than `kubectl exec`, whose process output goes
-# back to the exec client, not the pod log stream) keeps the source of
-# observed log lines unambiguous.
-app_svc="$(kubectl -n "${APP_NAMESPACE}" get svc -o jsonpath='{.items[0].metadata.name}')"
-if [[ -z "${app_svc}" ]]; then
-  echo "Failed to locate app service in namespace ${APP_NAMESPACE}"
-  exit 1
-fi
-kubectl -n "${APP_NAMESPACE}" port-forward "svc/${app_svc}" 8080:8080 \
-  >/tmp/rise-e2e-app-pf.log 2>&1 &
-APP_PF_PID=$!
-sleep 3
-for _ in 1 2 3; do
-  curl -sS --max-time 5 http://127.0.0.1:8080/ >/dev/null || true
-  sleep 1
-done
+# nginx-unprivileged's readiness/liveness probes (kube-probe) hit / on
+# port 8080 every 10s, producing access-log lines on PID 1's stdout that
+# kubelet captures and Alloy ships to Loki — so we don't need to inject
+# any additional traffic to have something to assert on.
 
 start_ts="$(date -u -d '-10 minutes' +%Y-%m-%dT%H:%M:%SZ)"
 end_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -368,8 +350,10 @@ fi
 # Exercise the SSE log stream via the CLI. `rise logs` is non-follow by
 # default (`--follow` is opt-in); in non-follow mode the server returns
 # the backlog and closes the SSE stream, so the CLI exits naturally.
-# `timeout` is a belt-and-braces guard against a stuck port-forward.
-lines="$(timeout 30s rise_cli logs --project "${PROJECT_NAME}" "${deployment_id}" --tail 20 | wc -l)"
+# (Cannot wrap with `timeout`: rise_cli is a bash function and `timeout`
+# only invokes executables. If the server ever hangs the job-level
+# timeout still catches it.)
+lines="$(rise_cli logs --project "${PROJECT_NAME}" "${deployment_id}" --tail 20 | wc -l)"
 echo "rise logs returned ${lines} line(s)"
 if (( lines == 0 )); then
   echo "Expected 'rise logs' to print at least one line"
