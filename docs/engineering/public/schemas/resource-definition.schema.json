@@ -1,0 +1,169 @@
+{
+  "$defs": {
+    "ResourceDefinitionSpec": {
+      "properties": {
+        "allowedStatusControllerIds": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "group": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "parent": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResourceParentRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The resource is root-scoped when this is absent; otherwise it must live\nunder a parent of the referenced API group and kind."
+        },
+        "plural": {
+          "type": "string"
+        },
+        "versions": {
+          "items": {
+            "$ref": "#/$defs/ResourceDefinitionVersion"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "group",
+        "kind",
+        "plural",
+        "versions"
+      ],
+      "type": "object"
+    },
+    "ResourceDefinitionStatus": {
+      "properties": {
+        "controllers": {
+          "additionalProperties": true,
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "ResourceDefinitionVersion": {
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "schema": true,
+        "served": {
+          "type": "boolean"
+        },
+        "storage": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "served",
+        "storage"
+      ],
+      "type": "object"
+    },
+    "ResourceMetadata": {
+      "properties": {
+        "annotations": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "deletionTimestamp": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "discriminator": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "finalizers": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "name": {
+          "type": "string"
+        },
+        "revision": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "uid": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "ResourceParentRef": {
+      "properties": {
+        "apiVersion": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "apiVersion": {
+      "type": "string"
+    },
+    "kind": {
+      "type": "string"
+    },
+    "metadata": {
+      "$ref": "#/$defs/ResourceMetadata"
+    },
+    "spec": {
+      "$ref": "#/$defs/ResourceDefinitionSpec"
+    },
+    "status": {
+      "$ref": "#/$defs/ResourceDefinitionStatus"
+    }
+  },
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata"
+  ],
+  "title": "Resource",
+  "type": "object"
+}

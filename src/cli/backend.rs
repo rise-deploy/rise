@@ -17,6 +17,32 @@ pub enum BackendCommands {
     /// Print the RiseProject CRD as YAML
     #[cfg(feature = "backend")]
     CrdSchema,
+    /// Generate or print JSON schemas for the generic resource API.
+    #[cfg(feature = "backend")]
+    #[command(subcommand)]
+    Schemas(SchemasCommands),
+}
+
+/// `rise backend schemas …` — JSON Schema artifacts for resource API types.
+///
+/// `rise.toml` and backend settings have dedicated top-level commands
+/// (`rise-toml-schema`, `config-schema`) and are intentionally not generated
+/// here, to avoid two code paths that could drift.
+#[derive(Debug, Clone, clap::Subcommand)]
+#[cfg(feature = "backend")]
+pub enum SchemasCommands {
+    /// Write deterministic JSON Schema files to a directory.
+    ///
+    /// Defaults to `docs/engineering/public/schemas/`, the location served
+    /// by the operator docs site. Output is byte-identical across runs,
+    /// so this command is safe to wire into a CI `check` task.
+    Generate {
+        /// Directory to write schema files into. Created if missing.
+        #[arg(long, default_value = "docs/engineering/public/schemas")]
+        out_dir: std::path::PathBuf,
+    },
+    /// Print the generated schemas to stdout (for inspection / piping).
+    Print,
 }
 
 #[cfg(feature = "backend")]
@@ -58,6 +84,27 @@ pub async fn handle_backend_command(cmd: BackendCommands) -> Result<()> {
             use kube::CustomResourceExt;
             let crd = crate::server::deployment::crd::RiseProject::crd();
             print!("{}", serde_yaml::to_string(&crd)?);
+            Ok(())
+        }
+        #[cfg(feature = "backend")]
+        BackendCommands::Schemas(sub) => handle_schemas_command(sub).await,
+    }
+}
+
+#[cfg(feature = "backend")]
+async fn handle_schemas_command(cmd: SchemasCommands) -> Result<()> {
+    use crate::server::resources::schemas;
+
+    match cmd {
+        SchemasCommands::Generate { out_dir } => {
+            let written = schemas::write_to_dir(&out_dir)?;
+            for path in written {
+                println!("{}", path.display());
+            }
+            Ok(())
+        }
+        SchemasCommands::Print => {
+            schemas::print_to_stdout()?;
             Ok(())
         }
     }

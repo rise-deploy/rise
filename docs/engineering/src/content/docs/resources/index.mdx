@@ -1,0 +1,34 @@
+---
+title: "Resources"
+description: "Rise's generic, Kubernetes-style resource substrate: storage model, API, and custom resource registration."
+---
+
+Rise carries a small generic resource substrate that backs Organizations, ResourceDefinitions, and (eventually) any custom kind an external controller wants to reconcile. The model is intentionally Kubernetes-shaped — typed objects with `apiVersion` / `kind` / `metadata` / `spec` / `status`, controller-owned status keys, finalizer-gated deletion, optimistic concurrency on `revision` — without making Kubernetes itself a dependency.
+
+The contract was introduced together with multi-organization support: an Organization is just a built-in root-scoped resource, and the same substrate that stores it can store anything else a controller registers.
+
+## When to use it
+
+- **You're writing a controller** that reconciles state outside Kubernetes (Snowflake, ECR, AWS RDS, internal services). Register a `ResourceDefinition`, persist `spec`, write under `status.controllers["your-id"]`. See [Custom Resources](./custom-resources).
+- **You're an operator** managing built-in objects (Organizations, ResourceDefinitions). Use the HTTP API directly. See [HTTP API](./api).
+- **You need to understand storage semantics** — finalizers, cascade deletion, revision conflicts. See [Storage Model](./storage).
+
+## What's in scope today
+
+| Built-in resources | `Organization`, `ResourceDefinition` |
+|---|---|
+| External custom resources | Yes, via `ResourceDefinition` |
+| HTTP API access tiers | Operator (full CRUD), Controller (own status/finalizers) |
+| Status writes by end users | No (operator-only API in v1) |
+| Watch / change feed | Not yet — controllers poll `list` |
+| Pagination / selectors | Not yet — `list` returns everything |
+| Version conversion | Storage-version writes only; reads/lists project across served versions |
+
+End-user / Organization-scoped RBAC is deferred. The generic API is **operator-only** in v1; admins on the default Organization do *not* implicitly receive Operator. Controllers may use a dedicated controller-JWT auth context for status/finalizer writes, but cannot perform operator CRUD.
+
+## Section guide
+
+- [Storage Model](./storage) — the `resources` table, finalizers, cascade deletion, garbage collection, revision/concurrency semantics, organization namespace-prefix behavior.
+- [HTTP API](./api) — path grammar, auth tiers, request/response envelopes, status and finalizer subresources.
+- [Custom Resources](./custom-resources) — registering a `ResourceDefinition`, schema validation, version lifecycle, controller migration responsibilities.
+- [Schema Reference](./schemas) — generated JSON Schemas for `Resource`, `ResourceMetadata`, `Organization`, `ResourceDefinition`, and the controller status map.

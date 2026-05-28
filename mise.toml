@@ -86,6 +86,7 @@ cargo clippy --package rise-resource-api --all-targets -- -D warnings
 cargo clippy --package rise-resource-store --all-targets -- -D warnings
 cargo fmt --all -- --check
 mise sqlx:check
+mise resource:schema:check
 helm lint helm/rise
 """
 env.SQLX_OFFLINE = true
@@ -113,6 +114,24 @@ env.SQLX_OFFLINE = true
 [tasks."config:schema:check"]
 description = "Verify the committed backend settings JSON schema is up to date."
 run = "mise config:schema:generate && git --no-pager diff --exit-code -- docs/engineering/public/schemas/backend-settings.schema.json"
+env.SQLX_OFFLINE = true
+
+[tasks."resource:schema:generate"]
+description = "Generate JSON schemas for the generic resource API."
+run = "cargo run --package rise-deploy --features cli,backend -- backend schemas generate --out-dir docs/engineering/public/schemas"
+env.SQLX_OFFLINE = true
+
+[tasks."resource:schema:check"]
+description = "Verify the committed resource API JSON schemas are up to date."
+run = """
+mise resource:schema:generate
+git --no-pager diff --exit-code -- \
+  docs/engineering/public/schemas/resource-envelope.schema.json \
+  docs/engineering/public/schemas/resource-metadata.schema.json \
+  docs/engineering/public/schemas/controller-status-map.schema.json \
+  docs/engineering/public/schemas/organization.schema.json \
+  docs/engineering/public/schemas/resource-definition.schema.json
+"""
 env.SQLX_OFFLINE = true
 
 [tasks."rise-toml:schema:generate"]
