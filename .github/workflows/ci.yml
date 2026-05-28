@@ -808,8 +808,20 @@ jobs:
         uses: rust-lang/crates-io-auth-action@v1
         id: auth
 
+      - name: Strip path-only workspace deps from Cargo.toml
+        # `rise-resource-api`/`rise-resource-store` are path-only workspace
+        # crates and aren't published. Cargo refuses to publish a manifest
+        # with path-only deps, so strip them and their `dep:` references
+        # before invoking `cargo publish`. Other backend deps come from
+        # crates.io and stay in the manifest (unreachable but harmless).
+        run: |
+          sed -i \
+            -e '/# --- BEGIN BACKEND/,/# --- END BACKEND/d' \
+            -e '/# strip-on-publish$/d' \
+            Cargo.toml
+
       - name: Publish to crates.io
-        run: cargo publish --features cli
+        run: cargo publish --features cli --allow-dirty
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
