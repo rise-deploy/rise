@@ -1398,20 +1398,102 @@ async fn compute_desired_children(
         .await?;
         children.push(serde_json::to_value(&identity.secret)?);
 
-        let k8s_deploy = resource_builder.create_k8s_deployment(
-            project,
-            deployment,
-            &namespace,
-            &image,
-            deployment.http_port as u16,
-            env_vars.plain_env_vars,
-            secret_env_name,
-            secret_env_hash,
-            sa_name,
-            env_name.as_deref(),
-            Some(identity.mount),
-        );
-        children.push(serde_json::to_value(&k8s_deploy)?);
+        // Multi-container side-data: when present, emit one K8s Deployment
+        // per container. When NULL (legacy), use the existing single-container
+        // path so on-cluster resources remain byte-identical for old rows.
+        let containers_json = db_deployments::get_containers(&state.db_pool, deployment.id)
+            .await
+            .ok()
+            .and_then(|sd| sd.containers);
+
+        let container_specs: Vec<crate::server::deployment::models::ContainerSpec> =
+            containers_json
+                .as_ref()
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+
+        if container_specs.is_empty() {
+            // Legacy single-container path — unchanged from before.
+            let k8s_deploy = resource_builder.create_k8s_deployment(
+                project,
+                deployment,
+                &namespace,
+                &image,
+                deployment.http_port as u16,
+                env_vars.plain_env_vars,
+                secret_env_name,
+                secret_env_hash,
+                sa_name.clone(),
+                env_name.as_deref(),
+                Some(identity.mount),
+            );
+            children.push(serde_json::to_value(&k8s_deploy)?);
+        } else {
+            // Multi-container path: one K8s Deployment per container.
+            // - The shared workload-identity Secret is mounted once per pod
+            //   spec, so each container's pod re-mounts it (intended).
+            // - Global env vars apply to every container; per-container env
+            //   overrides come from ContainerSpec.env_overrides.
+            // - Resource names are suffixed with `-<container>` (see
+            //   `ResourceBuilder::deployment_name_for_container`).
+            for spec in &container_specs {
+                let mut per_container_env = env_vars.plain_env_vars.clone();
+                for over in &spec.env_overrides {
+                    if over.is_secret {
+                        // Per-container secret values would need a per-container
+                        // Secret. v1 does not yet support that — log and skip
+                        // so the reconciler is honest about its semantics.
+                        warn!(
+                            deployment_id = %deployment.deployment_id,
+                            container = spec.name,
+                            key = over.key,
+                            "Per-container secret env overrides are not yet supported; ignoring"
+                        );
+                        continue;
+                    }
+                    // Replace if present, otherwise append.
+                    if let Some(existing) =
+                        per_container_env.iter_mut().find(|v| v.name == over.key)
+                    {
+                        existing.value = Some(over.value.clone());
+                    } else {
+                        per_container_env.push(k8s_openapi::api::core::v1::EnvVar {
+                            name: over.key.clone(),
+                            value: Some(over.value.clone()),
+                            ..Default::default()
+                        });
+                    }
+                }
+
+                let runtime = crate::server::deployment::resource_builder::ContainerRuntime {
+                    name: &spec.name,
+                    image: &spec.image,
+                    http_port: spec.http_port,
+                    replicas: spec
+                        .replicas
+                        .map(|r| r as i32)
+                        .unwrap_or(deployment.replicas),
+                    cpu: spec.cpu.as_deref().unwrap_or(&deployment.cpu),
+                    memory: spec.memory.as_deref().unwrap_or(&deployment.memory),
+                    env_vars: per_container_env,
+                    secret_env_name: secret_env_name.clone(),
+                    secret_env_hash: secret_env_hash.clone(),
+                    health_check: spec.health_check.clone(),
+                    is_legacy: false,
+                };
+
+                let k8s_deploy = resource_builder.create_k8s_deployment_for_container(
+                    project,
+                    deployment,
+                    &namespace,
+                    &runtime,
+                    sa_name.clone(),
+                    env_name.as_deref(),
+                    Some(identity.mount.clone()),
+                );
+                children.push(serde_json::to_value(&k8s_deploy)?);
+            }
+        }
 
         if deployment.is_active {
             active_by_group.insert(deployment.deployment_group.clone(), deployment);
@@ -1462,21 +1544,110 @@ async fn compute_desired_children(
             .and_then(|env| domains_by_env.get(&env.id).cloned())
             .unwrap_or_default();
 
-        // Service (selector points to the active deployment)
-        let service = resource_builder.create_service(
-            project,
-            active_deployment,
-            &namespace,
-            active_deployment.http_port as u16,
-            env_name.as_deref(),
-        );
-        children.push(serde_json::to_value(&service)?);
+        // Service(s) — per-container when the active deployment is
+        // multi-container, otherwise one shared Service at the legacy name.
+        let active_containers_json =
+            db_deployments::get_containers(&state.db_pool, active_deployment.id)
+                .await
+                .ok()
+                .and_then(|sd| sd.containers);
+        let active_container_specs: Vec<crate::server::deployment::models::ContainerSpec> =
+            active_containers_json
+                .as_ref()
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+
+        if active_container_specs.is_empty() {
+            let service = resource_builder.create_service(
+                project,
+                active_deployment,
+                &namespace,
+                active_deployment.http_port as u16,
+                env_name.as_deref(),
+            );
+            children.push(serde_json::to_value(&service)?);
+        } else {
+            for spec in &active_container_specs {
+                if spec.http_port.is_none() {
+                    continue; // workers — no Service
+                }
+                let runtime = crate::server::deployment::resource_builder::ContainerRuntime {
+                    name: &spec.name,
+                    image: &spec.image,
+                    http_port: spec.http_port,
+                    replicas: spec.replicas.map(|r| r as i32).unwrap_or(1),
+                    cpu: spec.cpu.as_deref().unwrap_or(""),
+                    memory: spec.memory.as_deref().unwrap_or(""),
+                    env_vars: Vec::new(),
+                    secret_env_name: None,
+                    secret_env_hash: None,
+                    health_check: None,
+                    is_legacy: false,
+                };
+                if let Some(service) = resource_builder.create_service_for_container(
+                    project,
+                    active_deployment,
+                    &namespace,
+                    &runtime,
+                    env_name.as_deref(),
+                ) {
+                    children.push(serde_json::to_value(&service)?);
+                }
+            }
+        }
 
         // Primary Ingress
         let inline_domains: &[crate::db::models::CustomDomain] = if split_custom_domains {
             &[]
         } else {
             &domains_for_group
+        };
+        // Build the (path, service_name) pairs for multi-container routing.
+        // Reuse the container list we already fetched for Service emission so
+        // we don't make another DB roundtrip.
+        let multi_container_routes: Option<Vec<(String, String)>> = if active_container_specs
+            .is_empty()
+        {
+            None
+        } else {
+            let routes_json = db_deployments::get_containers(&state.db_pool, active_deployment.id)
+                .await
+                .ok()
+                .and_then(|sd| sd.routes);
+            let route_specs: Vec<crate::server::deployment::models::RouteSpec> = routes_json
+                .as_ref()
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            let routable_names: std::collections::HashSet<String> = active_container_specs
+                .iter()
+                .filter(|s| s.http_port.is_some())
+                .map(|s| s.name.clone())
+                .collect();
+            let pairs: Vec<(String, String)> = route_specs
+                    .iter()
+                    .filter(|r| routable_names.contains(&r.container))
+                    .map(|r| {
+                        let svc_name = if active_deployment
+                            .deployment_group
+                            .is_empty()
+                        {
+                            r.container.clone()
+                        } else {
+                            // Mirror the suffix logic in service_name_for_container:
+                            // non-legacy containers get `<group>-<container>`.
+                            format!(
+                                "{}-{}",
+                                crate::server::deployment::resource_builder::ResourceBuilder::service_name(
+                                    project,
+                                    active_deployment,
+                                ),
+                                r.container
+                            )
+                        };
+                        (r.path.clone(), svc_name)
+                    })
+                    .collect();
+            Some(pairs)
         };
         if let Some(ingress) = resource_builder.create_primary_ingress(
             project,
@@ -1486,6 +1657,7 @@ async fn compute_desired_children(
             inline_domains,
             env_name.as_deref(),
             &all_environments,
+            multi_container_routes.as_deref(),
         )? {
             children.push(serde_json::to_value(&ingress)?);
         }
@@ -1503,6 +1675,7 @@ async fn compute_desired_children(
                 &namespace,
                 &domains_for_group,
                 env_name.as_deref(),
+                multi_container_routes.as_deref(),
             )?;
             children.push(serde_json::to_value(&custom_ingress)?);
         }
