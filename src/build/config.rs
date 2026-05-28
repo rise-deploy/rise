@@ -443,4 +443,211 @@ env.NODE_ENV = "production"
         let production = config.environments.get("production").unwrap();
         assert!(!production.default);
     }
+
+    fn write_toml(contents: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("rise.toml"), contents).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_multi_container_basic() {
+        let dir = write_toml(
+            r#"
+[project]
+name = "my-app"
+
+[containers.frontend]
+image = "registry.example.com/myapp/frontend:latest"
+http_port = 8080
+replicas = 2
+
+[containers.backend]
+image = "registry.example.com/myapp/backend:latest"
+http_port = 9090
+replicas = 3
+health_check = { path = "/health" }
+
+[containers.worker]
+image = "registry.example.com/myapp/worker:latest"
+
+[routes]
+"/api" = { container = "backend" }
+"/" = { container = "frontend" }
+"#,
+        );
+        let config = load_full_project_config(dir.path().to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.containers.len(), 3);
+        assert_eq!(config.routes.len(), 2);
+        let resolved = config.resolve_deploy();
+        assert_eq!(resolved.containers.len(), 3);
+        assert!(resolved.containers.iter().all(|c| !c.is_legacy));
+        assert_eq!(resolved.routes.len(), 2);
+        let api_route = resolved.routes.iter().find(|r| r.path == "/api").unwrap();
+        assert_eq!(api_route.container, "backend");
+        assert_eq!(api_route.port, 9090);
+    }
+
+    #[test]
+    fn test_multi_container_rejects_top_level_build() {
+        let dir = write_toml(
+            r#"
+[build]
+backend = "docker"
+
+[containers.app]
+image = "foo:bar"
+http_port = 8080
+"#,
+        );
+        let err = load_full_project_config(dir.path().to_str().unwrap())
+            .expect_err("expected mutual-exclusion error");
+        assert!(err.to_string().contains("Top-level [build]"), "got: {err}");
+    }
+
+    #[test]
+    fn test_multi_container_rejects_route_to_unknown_container() {
+        let dir = write_toml(
+            r#"
+[containers.api]
+image = "foo:bar"
+http_port = 8080
+
+[routes]
+"/" = { container = "frontend" }
+"#,
+        );
+        let err = load_full_project_config(dir.path().to_str().unwrap())
+            .expect_err("expected unknown-container error");
+        assert!(
+            err.to_string().contains("unknown container 'frontend'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_multi_container_rejects_route_to_worker() {
+        // Worker = container without http_port = not routable.
+        let dir = write_toml(
+            r#"
+[containers.worker]
+image = "foo:bar"
+
+[routes]
+"/" = { container = "worker" }
+"#,
+        );
+        let err = load_full_project_config(dir.path().to_str().unwrap())
+            .expect_err("expected http_port error");
+        assert!(err.to_string().contains("no http_port"), "got: {err}");
+    }
+
+    #[test]
+    fn test_health_check_false_disables_probes() {
+        let dir = write_toml(
+            r#"
+[containers.api]
+image = "foo:bar"
+http_port = 8080
+health_check = false
+"#,
+        );
+        let config = load_full_project_config(dir.path().to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        let api = config.containers.get("api").unwrap();
+        assert!(matches!(
+            api.health_check,
+            Some(crate::rise_toml::HealthCheckSetting::Disabled(_))
+        ));
+    }
+
+    #[test]
+    fn test_health_check_true_is_rejected() {
+        let dir = write_toml(
+            r#"
+[containers.api]
+image = "foo:bar"
+http_port = 8080
+health_check = true
+"#,
+        );
+        let err = load_full_project_config(dir.path().to_str().unwrap())
+            .expect_err("expected health_check=true to be rejected");
+        // Untagged enum: the message indicates no variant matched. (BoolFalse
+        // rejects `true`; the table variant doesn't match a scalar bool.)
+        let msg = err.to_string();
+        assert!(
+            msg.contains("HealthCheckSetting") || msg.contains("not allowed"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_default_route_synthesised_for_single_routable_container() {
+        // When only one container has http_port and [routes] is omitted,
+        // resolve_deploy should synthesise `/` → that container.
+        let dir = write_toml(
+            r#"
+[containers.api]
+image = "foo:bar"
+http_port = 8080
+
+[containers.worker]
+image = "bar:baz"
+"#,
+        );
+        let config = load_full_project_config(dir.path().to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        let resolved = config.resolve_deploy();
+        assert_eq!(resolved.routes.len(), 1);
+        assert_eq!(resolved.routes[0].path, "/");
+        assert_eq!(resolved.routes[0].container, "api");
+        assert_eq!(resolved.routes[0].port, 8080);
+    }
+
+    #[test]
+    fn test_legacy_single_container_still_works() {
+        let dir = write_toml(
+            r#"
+[project]
+name = "legacy"
+
+[build]
+backend = "docker"
+
+[deploy]
+replicas = 2
+"#,
+        );
+        let config = load_full_project_config(dir.path().to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(config.containers.is_empty());
+        let resolved = config.resolve_deploy();
+        assert_eq!(resolved.containers.len(), 1);
+        assert!(resolved.containers[0].is_legacy);
+        assert_eq!(resolved.containers[0].name, "app");
+        assert_eq!(resolved.containers[0].replicas, Some(2));
+    }
+
+    #[test]
+    fn test_invalid_container_name() {
+        let dir = write_toml(
+            r#"
+[containers."Bad Name"]
+image = "foo:bar"
+http_port = 8080
+"#,
+        );
+        let err = load_full_project_config(dir.path().to_str().unwrap())
+            .expect_err("expected invalid-name error");
+        assert!(
+            err.to_string().contains("Invalid container name"),
+            "got: {err}"
+        );
+    }
 }

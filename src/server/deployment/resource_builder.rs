@@ -93,6 +93,7 @@ pub const LABEL_CONTAINER: &str = "rise.dev/container";
 /// Default container name used when a deployment row has no `containers` JSON
 /// (legacy single-container path). Matches the hardcoded value used to live
 /// inside the K8s pod spec, so no on-cluster renaming happens for old rows.
+#[allow(dead_code)]
 pub const LEGACY_CONTAINER_NAME: &str = "app";
 
 /// Per-container runtime parameters consumed by `create_k8s_deployment_for`

@@ -13,6 +13,133 @@ use crate::config::Config;
 // Re-export models from API module (always available)
 pub use crate::api::models::{Deployment, DeploymentStatus};
 
+/// Convert the resolved multi-container section of `rise.toml` into the
+/// JSON shape expected by `POST /deployments`. Returns `(None, None)` when
+/// the project is single-container (legacy `[build]`/`[deploy]` shape) so
+/// the existing single-image code path continues to drive the request.
+///
+/// v1 requires every container to declare `image = "..."` directly; build
+/// orchestration per container is a follow-up. Routes default to `/` →
+/// the only routable container when `[routes]` is omitted and exactly one
+/// container has `http_port`.
+fn build_multi_container_payload(
+    toml_config: Option<&crate::rise_toml::ProjectBuildConfig>,
+) -> Result<(Option<serde_json::Value>, Option<serde_json::Value>)> {
+    use crate::rise_toml::HealthCheckSetting;
+
+    let Some(cfg) = toml_config else {
+        return Ok((None, None));
+    };
+    let resolved = cfg.resolve_deploy();
+    if resolved.containers.iter().all(|c| c.is_legacy) {
+        // Single-container legacy path; let the existing image flow handle it.
+        return Ok((None, None));
+    }
+
+    let mut container_payload = Vec::with_capacity(resolved.containers.len());
+    for c in &resolved.containers {
+        let image = c.image.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "[containers.{}] must set `image = \"...\"` in this CLI version. \
+                 Per-container build orchestration is a planned follow-up; for now, \
+                 build and push each container's image out-of-band and reference it here.",
+                c.name
+            )
+        })?;
+        if c.build.is_some() {
+            bail!(
+                "[containers.{}] has a [build] block but this CLI version cannot build per-container images yet. \
+                 Build and push it manually, then set `image = \"...\"` for now.",
+                c.name
+            );
+        }
+
+        let mut env_overrides = Vec::with_capacity(c.env.len());
+        for (key, value) in &c.env {
+            env_overrides.push(serde_json::json!({
+                "key": key,
+                "value": value,
+                "is_secret": false,
+                "source": "toml",
+            }));
+        }
+
+        let health_check_payload = c.health_check.as_ref().map(|hc| match hc {
+            HealthCheckSetting::Disabled(_) => serde_json::json!({ "disabled": true }),
+            HealthCheckSetting::Config(cfg) => {
+                let mut v = serde_json::json!({ "disabled": false });
+                if let Some(ref p) = cfg.path {
+                    v["path"] = serde_json::json!(p);
+                }
+                if let Some(d) = cfg.initial_delay_seconds {
+                    v["initial_delay_seconds"] = serde_json::json!(d);
+                }
+                if let Some(p) = cfg.period_seconds {
+                    v["period_seconds"] = serde_json::json!(p);
+                }
+                if let Some(t) = cfg.timeout_seconds {
+                    v["timeout_seconds"] = serde_json::json!(t);
+                }
+                if let Some(f) = cfg.failure_threshold {
+                    v["failure_threshold"] = serde_json::json!(f);
+                }
+                if let Some(l) = cfg.liveness_enabled {
+                    v["liveness_enabled"] = serde_json::json!(l);
+                }
+                if let Some(r) = cfg.readiness_enabled {
+                    v["readiness_enabled"] = serde_json::json!(r);
+                }
+                v
+            }
+        });
+
+        let mut spec = serde_json::json!({
+            "name": c.name,
+            "image": image,
+        });
+        if let Some(p) = c.http_port {
+            spec["http_port"] = serde_json::json!(p);
+        }
+        if let Some(r) = c.replicas {
+            spec["replicas"] = serde_json::json!(r);
+        }
+        if let Some(ref cpu) = c.cpu {
+            spec["cpu"] = serde_json::json!(cpu);
+        }
+        if let Some(ref mem) = c.memory {
+            spec["memory"] = serde_json::json!(mem);
+        }
+        if !env_overrides.is_empty() {
+            spec["env_overrides"] = serde_json::json!(env_overrides);
+        }
+        if let Some(hc) = health_check_payload {
+            spec["health_check"] = hc;
+        }
+        container_payload.push(spec);
+    }
+
+    let route_payload: Vec<serde_json::Value> = resolved
+        .routes
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "path": r.path,
+                "container": r.container,
+                "port": r.port,
+            })
+        })
+        .collect();
+
+    Ok((
+        Some(serde_json::json!(container_payload)),
+        if route_payload.is_empty() {
+            None
+        } else {
+            Some(serde_json::json!(route_payload))
+        },
+    ))
+}
+
 /// Parse duration string (e.g., "5m", "30s", "1h")
 pub(super) fn parse_duration(s: &str) -> Result<Duration> {
     let s = s.trim();
@@ -607,6 +734,13 @@ pub async fn create_deployment(
         info!("Deployment git repository: {}", url);
     }
 
+    // Multi-container: if rise.toml has [containers], build the wire-format
+    // spec list now and validate the request shape before talking to the
+    // server. v1 requires every container to declare an `image` directly;
+    // per-container build orchestration is a follow-up.
+    let (containers_payload, routes_payload) =
+        build_multi_container_payload(deploy_opts.toml_config.as_ref())?;
+
     // Step 1: Create deployment and get deployment ID + credentials
     info!(
         "Creating deployment for project '{}'",
@@ -637,6 +771,8 @@ pub async fn create_deployment(
             .as_ref()
             .and_then(|c| c.identity.as_ref())
             .map(|i| &i.audiences),
+        containers_payload.as_ref(),
+        routes_payload.as_ref(),
     )
     .await?;
 
@@ -1194,6 +1330,8 @@ async fn call_create_deployment_api(
     cpu: Option<&str>,
     memory: Option<&str>,
     identity_audiences: Option<&std::collections::BTreeMap<String, String>>,
+    containers: Option<&serde_json::Value>,
+    routes: Option<&serde_json::Value>,
 ) -> Result<CreateDeploymentResponse> {
     let url = format!("{}/api/v1/deployments", backend_url);
     let mut payload = serde_json::json!({
@@ -1291,6 +1429,13 @@ async fn call_create_deployment_api(
             })
             .collect();
         payload["env_overrides"] = serde_json::json!(overrides);
+    }
+
+    if let Some(c) = containers {
+        payload["containers"] = c.clone();
+    }
+    if let Some(r) = routes {
+        payload["routes"] = r.clone();
     }
 
     let response = http_client

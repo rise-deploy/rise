@@ -288,6 +288,35 @@ fn filter_env_overrides_by_environment<'a>(
 ///
 /// Only client-allowed source values (`toml`, `cli`) are accepted. Unknown or
 /// server-managed source values are replaced with `cli`.
+/// If the create request carries multi-container fields, serialise them to
+/// JSON and persist on the deployment row. No-op for legacy single-container
+/// requests (older CLI clients).
+async fn persist_multi_container_fields(
+    state: &AppState,
+    deployment_id: uuid::Uuid,
+    payload: &CreateDeploymentRequest,
+) -> Result<(), ServerError> {
+    let Some(containers) = &payload.containers else {
+        return Ok(());
+    };
+    let containers_json =
+        serde_json::to_value(containers).internal_err("Failed to serialise containers")?;
+    let routes_json = if payload.routes.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_value(&payload.routes).internal_err("Failed to serialise routes")?)
+    };
+    db_deployments::set_containers(
+        &state.db_pool,
+        deployment_id,
+        Some(&containers_json),
+        routes_json.as_ref(),
+    )
+    .await
+    .internal_err("Failed to persist multi-container fields")?;
+    Ok(())
+}
+
 async fn apply_env_overrides(
     state: &AppState,
     deployment_id: uuid::Uuid,
@@ -1065,6 +1094,8 @@ pub async fn create_deployment(
         )
         .await?;
 
+        persist_multi_container_fields(&state, new_deployment.id, &payload).await?;
+
         // Handle environment variables based on use_source_env_vars flag
         if payload.use_source_env_vars {
             // Copy environment variables from source deployment
@@ -1226,6 +1257,8 @@ pub async fn create_deployment(
                 deployment_id, payload.project
             );
 
+            persist_multi_container_fields(&state, deployment.id, &payload).await?;
+
             // Copy project environment variables to deployment
             crate::db::env_vars::copy_project_env_vars_to_deployment(
                 &state.db_pool,
@@ -1318,6 +1351,8 @@ pub async fn create_deployment(
             "Created pre-built image deployment {} for project {}",
             deployment_id, payload.project
         );
+
+        persist_multi_container_fields(&state, deployment.id, &payload).await?;
 
         // Copy project environment variables to deployment
         crate::db::env_vars::copy_project_env_vars_to_deployment(
@@ -1430,6 +1465,8 @@ pub async fn create_deployment(
             "Created build-from-source deployment {} for project {}",
             deployment_id, payload.project
         );
+
+        persist_multi_container_fields(&state, deployment.id, &payload).await?;
 
         // Copy project environment variables to deployment
         crate::db::env_vars::copy_project_env_vars_to_deployment(
