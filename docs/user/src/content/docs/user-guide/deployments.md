@@ -224,6 +224,46 @@ Rise injects variables like `PORT`, `RISE_ISSUER`, `RISE_APP_URL`, `RISE_APP_URL
 
 For JWT validation using `RISE_ISSUER`, see [Validating JWTs](../authentication-for-apps/validating-jwts).
 
+## Multi-Container Deployments
+
+A single Rise deployment can run multiple containers — for example a frontend, an HA backend, and a worker — each as its own Kubernetes Deployment so replica counts scale independently. Configure them under `[containers.<name>]` in `rise.toml` and route HTTP traffic across them via `[routes]`:
+
+```toml
+[project]
+name = "my-app"
+
+[containers.frontend]
+image = "registry.example.com/my-app/frontend:1.2.3"
+http_port = 8080
+replicas = 2
+
+[containers.backend]
+image = "registry.example.com/my-app/backend:1.2.3"
+http_port = 9090
+replicas = 3
+# Override the default HTTP probe (defaults to GET / when http_port is set):
+health_check = { path = "/health", initial_delay_seconds = 5 }
+# Per-container env vars. Project-level env vars also apply.
+env = { LOG_LEVEL = "info" }
+
+[containers.worker]
+image = "registry.example.com/my-app/worker:1.2.3"
+replicas = 4
+# Workers have no http_port → no Service, no HTTP probes.
+
+[routes]
+"/api" = { container = "backend" }
+"/" = { container = "frontend" }
+```
+
+Notes:
+
+- `[containers]` is mutually exclusive with the top-level `[build]` and `[deploy]` sections. Existing single-container projects keep working unchanged — the top-level `[build]`/`[deploy]` is treated as an implicit `app` container.
+- Each container must set `image = "..."` in the current CLI release. Per-container build orchestration is a planned follow-up; for now, build and push each container's image out-of-band (e.g., from CI).
+- Containers without `http_port` get no `Service` and no HTTP probes — exactly what you want for workers / batch jobs.
+- `health_check = false` disables probes entirely on a container.
+- Routes are matched longest-prefix-first by the ingress, so `/api` shadows `/` correctly. If `[routes]` is omitted and exactly one container has `http_port`, Rise synthesises `/` → that container.
+
 ## CI/CD Deployments
 
 For automated deployments from CI/CD pipelines, use service accounts with OIDC workload identity. See [Service Accounts](../service-accounts) for setup instructions and examples for GitLab CI and GitHub Actions.
