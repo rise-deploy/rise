@@ -116,6 +116,9 @@ rise deploy
 # Preview release notes
 ./scripts/tag-version.sh --dry-run 0.14.0
 
+# Preview release notes with extra Claude guidance
+./scripts/tag-version.sh --dry-run --claude-guidance "Emphasize operator-facing changes" 0.14.0
+
 # Create and publish release
 ./scripts/tag-version.sh 0.14.0
 ```

@@ -36,6 +36,7 @@ check_prerequisites() {
 # Parse arguments
 DRY_RUN=false
 SKIP_AI_RELEASE_NOTES=false
+CLAUDE_GUIDANCE=""
 VERSION=""
 COMMIT_RANGE=""
 
@@ -47,6 +48,31 @@ while [[ $# -gt 0 ]]; do
             ;;
         --skip-ai-release-notes)
             SKIP_AI_RELEASE_NOTES=true
+            shift
+            ;;
+        --claude-guidance)
+            if [ -z "${2:-}" ]; then
+                echo "Error: --claude-guidance requires a value"
+                exit 1
+            fi
+            if [ -n "$CLAUDE_GUIDANCE" ]; then
+                CLAUDE_GUIDANCE="${CLAUDE_GUIDANCE}"$'\n'"${2}"
+            else
+                CLAUDE_GUIDANCE="$2"
+            fi
+            shift 2
+            ;;
+        --claude-guidance=*)
+            GUIDANCE_VALUE="${1#*=}"
+            if [ -z "$GUIDANCE_VALUE" ]; then
+                echo "Error: --claude-guidance requires a value"
+                exit 1
+            fi
+            if [ -n "$CLAUDE_GUIDANCE" ]; then
+                CLAUDE_GUIDANCE="${CLAUDE_GUIDANCE}"$'\n'"${GUIDANCE_VALUE}"
+            else
+                CLAUDE_GUIDANCE="$GUIDANCE_VALUE"
+            fi
             shift
             ;;
         *)
@@ -62,12 +88,13 @@ done
 
 # Check if version argument is provided
 if [ -z "$VERSION" ]; then
-    echo "Usage: $0 [--dry-run] [--skip-ai-release-notes] <version> [commit-range]"
+    echo "Usage: $0 [--dry-run] [--skip-ai-release-notes] [--claude-guidance <text>] <version> [commit-range]"
     echo ""
     echo "Examples:"
     echo "  $0 0.1.4                    # Create release for version 0.1.4"
     echo "  $0 0.21.0-rc1               # Create prerelease for version 0.21.0-rc1"
     echo "  $0 --dry-run 0.1.4          # Preview release notes for next version"
+    echo "  $0 --dry-run --claude-guidance \"Emphasize Helm chart changes\" 0.1.4"
     echo "  $0 --skip-ai-release-notes 0.1.4  # Tag without Claude-generated notes"
     echo "  $0 --dry-run 0.1.4 v0.13.0..HEAD  # Preview notes for specific range"
     exit 1
@@ -153,6 +180,17 @@ Analyze the following Git commit messages and provide a concise summary for rele
 
 Be concise and user-focused. Use markdown formatting. Start with a brief overview, then list key changes.
 
+EOF
+
+    if [ -n "$CLAUDE_GUIDANCE" ]; then
+        cat >> "$TEMP_PROMPT" << EOF
+Additional guidance:
+${CLAUDE_GUIDANCE}
+
+EOF
+    fi
+
+    cat >> "$TEMP_PROMPT" << EOF
 Commits:
 ${COMMITS}
 EOF
