@@ -1,0 +1,67 @@
+# yaml-language-server: $schema=../docs/engineering/public/schemas/backend-settings.schema.json
+#
+# Shipped defaults loaded before the run-mode (development.yaml/production.yaml)
+# and local.yaml layers. Anything you define in those later files REPLACES the
+# matching section here (arrays are not merged). To extend the quickstart
+# catalog with custom entries, copy the templates below into your own config
+# and add to the list.
+
+quickstart:
+  templates:
+    - id: welcome
+      display_name: "Welcome page"
+      tagline: "Friendly landing page with pod/host info."
+      description: >
+        A tiny Node.js app that serves a welcome page showing the pod name,
+        hostname, and a configurable greeting. Perfect as a first deployment
+        to confirm Rise is wired up end-to-end.
+      icon: welcome
+      image: paulbouwer/hello-kubernetes:1.10.1
+      http_port: 8080
+      learn_more_url: https://github.com/paulbouwer/hello-kubernetes
+      tags: [demo, hello-world]
+
+    - id: whoami
+      display_name: "Request echo"
+      tagline: "Echoes the incoming HTTP request."
+      description: >
+        A small Node.js server that pretty-prints request headers, method,
+        path, body, and TLS info as JSON. Useful for inspecting how Rise's
+        ingress, identity tokens, and forwarded headers reach your app.
+      icon: whoami
+      image: mendhak/http-https-echo:40
+      http_port: 8080
+      learn_more_url: https://github.com/mendhak/docker-http-https-echo
+      tags: [debug, diagnostics]
+
+    - id: httpbin
+      display_name: "httpbin"
+      tagline: "HTTP request & response testing service."
+      description: >
+        A Go reimplementation of the classic httpbin testing toolkit. Exposes
+        endpoints for status codes, headers, auth schemes, redirects, cookies
+        and more — handy when wiring up clients or debugging proxies.
+      icon: httpbin
+      image: mccutchen/go-httpbin:2.22.1
+      http_port: 8080
+      learn_more_url: https://github.com/mccutchen/go-httpbin
+      tags: [debug, api]
+
+    - id: excalidraw
+      display_name: "Excalidraw"
+      tagline: "Virtual whiteboard for sketching diagrams."
+      description: >
+        A hand-drawn-style whiteboard for sketching diagrams collaboratively.
+        The server is stateless — drawings live in your browser's
+        localStorage, so nothing is lost on restart.
+      icon: excalidraw
+      image: excalidraw/excalidraw:latest
+      http_port: 80
+      learn_more_url: https://github.com/excalidraw/excalidraw
+      tags: [productivity, whiteboard]
+      warning: >
+        This image runs nginx as root and listens on port 80. It will fail to
+        start on clusters that enforce non-root containers or disallow
+        privileged ports. The upstream image is only published as `:latest`,
+        so the "Update from template" button can't detect drift — clicking it
+        will simply redeploy with whatever the tag currently resolves to.

@@ -4,7 +4,7 @@ import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
 import { formatISO8601, formatRelativeTimeRounded, isSafeUrl, stripUrlScheme } from '../lib/utils';
 import { useToast } from '../components/toast';
-import { Button, ConfirmDialog, Empty, EnvPill, KV, KVRow, Panel, PanelBody, PanelHead, Pill, SourceLinkGroup, Status, Tabs } from '../components/r-ui';
+import { Alert, Button, ConfirmDialog, Empty, EnvPill, GroupPill, KV, KVRow, Panel, PanelBody, PanelHead, Pill, SourceLinkGroup, Status, Tabs, Tooltip } from '../components/r-ui';
 import { Icon } from '../components/icon';
 import { LoadingState, ErrorState, EmptyState } from '../components/states';
 
@@ -251,16 +251,28 @@ export function ProjectDetail({ projectName, initialTab }: { projectName: string
     );
 }
 
-function RecentDeploymentsPanel({ projectName }: { projectName: string }) {
+function RecentDeploymentsPanel({ projectName, environments }: { projectName: string; environments: any[] }) {
     const [rows, setRows] = useState<any[] | null>(null);
 
-    useEffect(() => {
+    const load = useCallback(() => {
         let cancelled = false;
         api.getProjectDeployments(projectName, { limit: 6 })
             .then((d: any[]) => { if (!cancelled) setRows(Array.isArray(d) ? d : []); })
             .catch(() => { if (!cancelled) setRows([]); });
         return () => { cancelled = true; };
     }, [projectName]);
+
+    useEffect(() => {
+        const cleanup = load();
+        // Refresh whenever a mutation elsewhere in the app might have produced
+        // a new deployment (e.g. the "Upgrade/Redeploy from template" button).
+        const onMutation = () => { load(); };
+        window.addEventListener('rise:mutation', onMutation);
+        return () => {
+            cleanup?.();
+            window.removeEventListener('rise:mutation', onMutation);
+        };
+    }, [load]);
 
     return (
         <Panel>
@@ -276,6 +288,7 @@ function RecentDeploymentsPanel({ projectName }: { projectName: string }) {
                             <th>ID</th>
                             <th>Status</th>
                             <th>Env</th>
+                            <th>Group</th>
                             <th style={{ textAlign: 'right' }}>Age</th>
                         </tr>
                     </thead>
@@ -292,6 +305,17 @@ function RecentDeploymentsPanel({ projectName }: { projectName: string }) {
                                     {d.environment ? (
                                         <EnvPill env={d.environment} color={d.environment_color} />
                                     ) : <span style={{ color: 'var(--text-soft)' }}>—</span>}
+                                </td>
+                                <td>
+                                    {d.deployment_group ? (() => {
+                                        const env = (environments || []).find((e: any) => e.name === d.environment);
+                                        return (
+                                            <GroupPill
+                                                group={d.deployment_group}
+                                                primary={!!env && env.primary_deployment_group === d.deployment_group}
+                                            />
+                                        );
+                                    })() : <span style={{ color: 'var(--text-soft)' }}>—</span>}
                                 </td>
                                 <td style={{ textAlign: 'right', color: 'var(--text-muted)' }}>
                                     {d.created ? formatRelativeTimeRounded(d.created) : '—'}
@@ -395,9 +419,13 @@ function CurrentDeploymentPanel({ projectName, environments }: { projectName: st
 }
 
 // Right-column panel surfacing the quickstart template a project was created
-// from. The "Update from template" button is always rendered (so the binding
-// is discoverable) but greyed out unless the catalog entry's image:tag has
-// moved ahead of what's stored on the project.
+// from. The "Redeploy from template" button is enabled whenever the project's
+// catalog entry still exists — clicking it always pulls the catalog image
+// fresh, which is useful both when the catalog has moved ahead of the deployed
+// version and when the image uses a floating tag (e.g. `:latest`) that the
+// drift detector can't observe. When the catalog `image:tag` differs from the
+// stored one, the panel surfaces an "Update available" badge and promotes the
+// button to the primary variant so the action stands out.
 function ProjectTemplatePanel({ project, projectName, onUpdated }: { project: any; projectName: string; onUpdated: () => void }) {
     const { templates } = useQuickstartTemplates();
     const { showToast } = useToast();
@@ -409,7 +437,7 @@ function ProjectTemplatePanel({ project, projectName, onUpdated }: { project: an
     const updateAvailable = !!catalog && catalog.image !== stored.image;
 
     const handleUpdate = async () => {
-        if (!catalog || !updateAvailable) return;
+        if (!catalog) return;
         setUpdating(true);
         try {
             await api.createDeploymentFromImage(projectName, catalog.image, catalog.http_port);
@@ -424,15 +452,44 @@ function ProjectTemplatePanel({ project, projectName, onUpdated }: { project: an
         }
     };
 
+    const actionTooltip = catalog && (
+        <div>
+            <div>
+                Redeploy with <code className="mono">{catalog.image}</code>.
+            </div>
+            <div style={{ marginTop: 6, fontStyle: 'italic', color: 'var(--text-soft)' }}>
+                {updateAvailable
+                    ? 'The catalog has moved ahead of the version currently deployed.'
+                    : 'The image digest will be refreshed to whatever the tag currently resolves to — useful when the catalog uses a floating tag (e.g. :latest).'}
+            </div>
+        </div>
+    );
+
     return (
         <Panel>
-            <PanelHead title="Template" />
+            <PanelHead
+                title="Template"
+                right={
+                    catalog && (
+                        <Tooltip content={actionTooltip} focusable>
+                            <Button
+                                icon="refresh"
+                                variant={updateAvailable ? 'primary' : undefined}
+                                loading={updating}
+                                onClick={handleUpdate}
+                            >
+                                {updateAvailable ? 'Upgrade' : 'Redeploy'}
+                            </Button>
+                        </Tooltip>
+                    )
+                }
+            />
             <PanelBody>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
                     {catalog?.icon_url && (
                         <img src={catalog.icon_url} alt="" width={32} height={32} style={{ borderRadius: 6 }} />
                     )}
-                    <div style={{ minWidth: 0 }}>
+                    <div style={{ minWidth: 0, flex: 1 }}>
                         <div style={{ fontWeight: 500, fontSize: 13.5 }}>
                             {catalog?.display_name || stored.id}
                         </div>
@@ -448,29 +505,16 @@ function ProjectTemplatePanel({ project, projectName, onUpdated }: { project: an
                     {catalog && (
                         <KVRow k="Catalog">
                             <code className="mono" style={{ fontSize: 12 }}>{catalog.image}</code>
-                            {!updateAvailable && (
-                                <span style={{ marginLeft: 8, fontSize: 11, color: 'var(--text-soft)' }}>up to date</span>
-                            )}
                         </KVRow>
                     )}
                 </KV>
-                <div style={{ marginTop: 12 }}>
-                    <Button
-                        icon="refresh"
-                        loading={updating}
-                        disabled={!updateAvailable}
-                        onClick={handleUpdate}
-                        title={
-                            !catalog
-                                ? 'Template no longer in catalog'
-                                : updateAvailable
-                                    ? `Redeploy with ${catalog.image}`
-                                    : 'Template image has not changed'
-                        }
-                    >
-                        Update from template
-                    </Button>
-                </div>
+                {!catalog && (
+                    <div style={{ marginTop: 10 }}>
+                        <Alert tone="info" icon="info">
+                            This template is no longer in the catalog. Redeploy is unavailable.
+                        </Alert>
+                    </div>
+                )}
             </PanelBody>
         </Panel>
     );
@@ -484,7 +528,7 @@ function ProjectOverview({ project, projectName, accessLabel, environments, onUp
             <div className="r-stack">
                 <CurrentDeploymentPanel projectName={projectName} environments={environments} />
 
-                <RecentDeploymentsPanel projectName={projectName} />
+                <RecentDeploymentsPanel projectName={projectName} environments={environments} />
             </div>
 
             <div className="r-stack">

@@ -1094,18 +1094,67 @@ export function AutocompleteInput({
 // Pass `focusable` when the tooltip carries information that keyboard-only
 // users would otherwise miss (e.g. tooltipped icon-only buttons).
 export function Tooltip({ content, children, focusable = false }: { content: React.ReactNode; children: React.ReactNode; focusable?: boolean }) {
+    const triggerRef = React.useRef<HTMLSpanElement | null>(null);
+    const popRef = React.useRef<HTMLSpanElement | null>(null);
+    const [visible, setVisible] = React.useState(false);
+    // `pos` is set in a layout effect AFTER the bubble mounts, so we can read
+    // its real width/height and clamp/flip to keep it inside the viewport.
+    // The first render hides the bubble (`visibility: hidden`) so users never
+    // see it at the unclamped position.
     const [pos, setPos] = React.useState<{ top: number; left: number } | null>(null);
-    const ref = React.useRef<HTMLSpanElement | null>(null);
-    const show = () => {
-        const el = ref.current;
-        if (!el) return;
-        const r = el.getBoundingClientRect();
-        setPos({ top: r.bottom + 6, left: r.left + r.width / 2 });
+
+    const compute = React.useCallback(() => {
+        const trigger = triggerRef.current;
+        const pop = popRef.current;
+        if (!trigger || !pop) return;
+        const tr = trigger.getBoundingClientRect();
+        const pr = pop.getBoundingClientRect();
+        const margin = 8;
+        const gap = 6;
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+
+        // Default: centered below the trigger, then clamped horizontally so
+        // the bubble doesn't escape either viewport edge.
+        let left = tr.left + tr.width / 2 - pr.width / 2;
+        left = Math.max(margin, Math.min(left, vw - pr.width - margin));
+
+        // Flip above the trigger when there's no room below.
+        let top = tr.bottom + gap;
+        if (top + pr.height > vh - margin) {
+            const above = tr.top - pr.height - gap;
+            if (above >= margin) top = above;
+        }
+
+        setPos({ top, left });
+    }, []);
+
+    const show = () => setVisible(true);
+    const hide = () => {
+        setVisible(false);
+        setPos(null);
     };
-    const hide = () => setPos(null);
+
+    React.useLayoutEffect(() => {
+        if (visible) compute();
+    }, [visible, compute, content]);
+
+    React.useEffect(() => {
+        if (!visible) return;
+        const onReflow = () => compute();
+        // Capture-phase scroll listener catches scroll on any ancestor, which
+        // is what we want — the trigger may live inside a scrollable column.
+        window.addEventListener('scroll', onReflow, true);
+        window.addEventListener('resize', onReflow);
+        return () => {
+            window.removeEventListener('scroll', onReflow, true);
+            window.removeEventListener('resize', onReflow);
+        };
+    }, [visible, compute]);
+
     return (
         <span
-            ref={ref}
+            ref={triggerRef}
             className="r-tip"
             tabIndex={focusable ? 0 : undefined}
             onMouseEnter={show}
@@ -1114,11 +1163,17 @@ export function Tooltip({ content, children, focusable = false }: { content: Rea
             onBlur={hide}
         >
             {children}
-            {pos && createPortal(
+            {visible && createPortal(
                 <span
+                    ref={popRef}
                     className="r-tip-pop"
                     role="tooltip"
-                    style={{ position: 'fixed', top: pos.top, left: pos.left, transform: 'translateX(-50%)' }}
+                    style={{
+                        position: 'fixed',
+                        top: pos?.top ?? 0,
+                        left: pos?.left ?? 0,
+                        visibility: pos ? 'visible' : 'hidden',
+                    }}
                 >
                     {content}
                 </span>,

@@ -906,6 +906,14 @@ pub async fn update_project_template_image(
         .await
         .internal_err("Failed to update template image")?;
 
+    tracing::info!(
+        project = %updated.name,
+        template_id = ?updated.template_id,
+        new_image = %payload.image,
+        user = %user.email,
+        "Updated project template image"
+    );
+
     let owner_info = resolve_owner_info(&state, &updated)
         .await
         .map_err(|e| ServerError::internal(format!("Failed to resolve owner info: {}", e)))?;

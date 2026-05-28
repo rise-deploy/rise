@@ -1070,6 +1070,72 @@ mod tests {
         );
     }
 
+    /// Round-trip: create a project from a template, observe both fields, then
+    /// reset `template_image` via `update_template_image` and verify the row
+    /// reflects the new image while `template_id` stays put.
+    #[sqlx::test]
+    async fn test_template_image_round_trip(pool: PgPool) {
+        let user = crate::db::users::create(&pool, "tpl@example.com")
+            .await
+            .expect("Failed to create test user");
+
+        let project = create_with_template(
+            &pool,
+            "tpl-rt",
+            ProjectStatus::Stopped,
+            "default".to_string(),
+            Some(user.id),
+            None,
+            None,
+            Some("welcome"),
+            Some("paulbouwer/hello-kubernetes:1.10.1"),
+        )
+        .await
+        .expect("Failed to create template-backed project");
+
+        assert_eq!(project.template_id.as_deref(), Some("welcome"));
+        assert_eq!(
+            project.template_image.as_deref(),
+            Some("paulbouwer/hello-kubernetes:1.10.1")
+        );
+
+        let updated =
+            update_template_image(&pool, project.id, "paulbouwer/hello-kubernetes:1.11.0")
+                .await
+                .expect("Failed to update template image");
+
+        assert_eq!(updated.template_id.as_deref(), Some("welcome"));
+        assert_eq!(
+            updated.template_image.as_deref(),
+            Some("paulbouwer/hello-kubernetes:1.11.0")
+        );
+    }
+
+    /// Projects created without a template carry `None` in both columns and
+    /// the default `create()` wrapper preserves that — guards against future
+    /// callers leaking a template snapshot into non-template projects.
+    #[sqlx::test]
+    async fn test_create_without_template_leaves_columns_null(pool: PgPool) {
+        let user = crate::db::users::create(&pool, "no-tpl@example.com")
+            .await
+            .expect("Failed to create test user");
+
+        let project = create(
+            &pool,
+            "no-tpl",
+            ProjectStatus::Stopped,
+            "default".to_string(),
+            Some(user.id),
+            None,
+            None,
+        )
+        .await
+        .expect("Failed to create non-template project");
+
+        assert!(project.template_id.is_none());
+        assert!(project.template_image.is_none());
+    }
+
     /// Test that project status is Stopped when no active deployment but has failed deployment
     #[sqlx::test]
     async fn test_project_status_with_only_failed_deployment(pool: PgPool) {

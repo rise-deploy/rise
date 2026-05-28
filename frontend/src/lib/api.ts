@@ -147,7 +147,7 @@ class RiseAPI {
     // catalog-vs-project diff used to enable/disable that button.
     async updateProjectTemplateImage(projectName, image) {
         return this.request(`/projects/${projectName}/template-image`, {
-            method: 'POST',
+            method: 'PATCH',
             body: JSON.stringify({ image }),
         });
     }

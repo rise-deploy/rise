@@ -135,7 +135,7 @@ pub struct ProjectTemplateInfo {
     pub image: String,
 }
 
-/// Request body for `POST /projects/{name}/template-image` — used by the UI
+/// Request body for `PATCH /projects/{name}/template-image` — used by the UI
 /// to record the new image:tag after a redeploy triggered by the
 /// "Update from template" button.
 #[derive(Debug, Deserialize, Serialize, Clone)]
