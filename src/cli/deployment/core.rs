@@ -1409,6 +1409,11 @@ pub struct GetLogsParams<'a> {
     pub tail: Option<usize>,
     pub timestamps: bool,
     pub since: Option<&'a str>,
+    /// Restrict to these levels (repeated `?level=` on the wire). Empty =
+    /// no filter. Accepted values come from `/api/v1/logs/capabilities`,
+    /// but the CLI doesn't validate — the server returns no matches for
+    /// unknown values.
+    pub levels: &'a [String],
 }
 
 /// Get logs from a deployment
@@ -1426,25 +1431,22 @@ pub async fn get_logs(
         backend_url, params.project, params.deployment_id
     );
 
-    let mut query_params = vec![];
-    let tail_param;
-    let since_param;
-
+    let mut query_params: Vec<String> = vec![];
     if params.follow {
-        query_params.push("follow=true");
+        query_params.push("follow=true".to_string());
     }
     if let Some(t) = params.tail {
-        tail_param = format!("tail={}", t);
-        query_params.push(&tail_param);
+        query_params.push(format!("tail={}", t));
     }
     if params.timestamps {
-        query_params.push("timestamps=true");
+        query_params.push("timestamps=true".to_string());
     }
     if let Some(s) = params.since {
-        // Parse duration like "5m", "1h" into seconds
         let seconds = parse_duration_to_seconds(s)?;
-        since_param = format!("since={}", seconds);
-        query_params.push(&since_param);
+        query_params.push(format!("since={}", seconds));
+    }
+    for level in params.levels {
+        query_params.push(format!("level={}", urlencoding::encode(level)));
     }
 
     if !query_params.is_empty() {
@@ -1479,9 +1481,11 @@ pub async fn get_logs(
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
 
-    // Stream response bytes
+    // Stream response bytes. Buffer raw bytes so we don't corrupt UTF-8
+    // codepoints split across chunk boundaries (see `ByteLineBuffer`).
     let mut stream = response.bytes_stream();
-    let mut buffer = String::new();
+    let mut buffer = ByteLineBuffer::new();
+    let mut event_type = String::from("message");
 
     loop {
         tokio::select! {
@@ -1494,21 +1498,32 @@ pub async fn get_logs(
             chunk_result = stream.next() => {
                 match chunk_result {
                     Some(Ok(chunk)) => {
-                        let text = String::from_utf8_lossy(&chunk);
-                        buffer.push_str(&text);
+                        buffer.push_chunk(&chunk);
 
                         // Process complete lines from buffer
-                        while let Some(newline_pos) = buffer.find('\n') {
-                            let line = buffer.drain(..=newline_pos).collect::<String>();
-                            let line = line.trim_end();
+                        while let Some(line) = buffer.next_line() {
+                            if let Some(event) = line.strip_prefix("event: ") {
+                                event_type = event.to_string();
+                                continue;
+                            }
 
                             // Parse SSE format: lines starting with "data: "
                             if let Some(data) = line.strip_prefix("data: ") {
-                                // Only print non-empty data lines
                                 if !data.is_empty() {
-                                    println!("{}", data);
+                                    if event_type == "status" {
+                                        print_log_status(data);
+                                    } else if event_type == "log" || event_type == "message" {
+                                        // `log` events are JSON-wrapped:
+                                        // {"line": "...", "level": "..."}.
+                                        // Other event types (`backlog_complete`)
+                                        // are ignored — they're meta-events
+                                        // the CLI has no use for.
+                                        print_log_event(data);
+                                    }
                                 }
-                            } else if !line.is_empty() && !line.starts_with(':') {
+                            } else if line.is_empty() {
+                                event_type = String::from("message");
+                            } else if !line.starts_with(':') {
                                 // SSE comments start with ':', skip them
                                 // Print other non-empty lines (in case format changes)
                                 println!("{}", line);
@@ -1528,13 +1543,17 @@ pub async fn get_logs(
         }
     }
 
-    // Print any remaining buffered content
-    if !buffer.is_empty() {
-        let line = buffer.trim();
+    // Print any remaining buffered content (final line without trailing '\n').
+    if let Some(remainder) = buffer.take_remainder() {
+        let line = remainder.trim();
         if let Some(data) = line.strip_prefix("data: ") {
             // Only print non-empty data
             if !data.is_empty() {
-                println!("{}", data);
+                if event_type == "status" {
+                    print_log_status(data);
+                } else if event_type == "log" || event_type == "message" {
+                    print_log_event(data);
+                }
             }
         } else if !line.is_empty() && !line.starts_with(':') {
             println!("{}", line);
@@ -1542,6 +1561,112 @@ pub async fn get_logs(
     }
 
     Ok(())
+}
+
+/// Extract `(line, level)` from a `log` SSE event payload.
+///
+/// The backend emits `data: {"line": "...", "level": "..."}`. If parsing
+/// fails (unexpected shape, older server, plain text) fall back to using
+/// the raw `data` as the line with an empty level so the user still sees
+/// something useful.
+fn extract_log_event(data: &str) -> (String, String) {
+    let trimmed = data.trim_start();
+    if !trimmed.starts_with('{') {
+        return (data.to_string(), String::new());
+    }
+    match serde_json::from_str::<serde_json::Value>(data) {
+        Ok(value) => {
+            let line = value
+                .get("line")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| data.to_string());
+            let level = value
+                .get("level")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            (line, level)
+        }
+        Err(_) => (data.to_string(), String::new()),
+    }
+}
+
+/// Pull `(line, level)` from a `log` SSE event payload and print it,
+/// coloured by level when stdout is a TTY and `NO_COLOR` isn't set.
+fn print_log_event(data: &str) {
+    let (line, level) = extract_log_event(data);
+    print_log_line(&line, &level);
+}
+
+/// Print a log line, coloured by its level when colour output is enabled.
+/// Used by both the one-shot `rise deployment logs` path and the
+/// follow-UI's live stream so both render levels consistently.
+pub(super) fn print_log_line(line: &str, level: &str) {
+    if let Some(code) = level_ansi_color(level) {
+        println!("{}{}{}", code, line, ANSI_RESET);
+    } else {
+        println!("{}", line);
+    }
+}
+
+const ANSI_RESET: &str = "\x1b[0m";
+
+/// Returns the ANSI start sequence for a given level string, or `None` if
+/// colours should be skipped (non-TTY, `NO_COLOR` set, or unknown level
+/// that maps to the terminal default).
+///
+/// The palette matches the frontend's `--r-log-chart-*` CSS variables
+/// semantically: errors family in red, warn in amber/yellow, info in the
+/// terminal default, debug/trace/unknown in dim grey.
+fn level_ansi_color(level: &str) -> Option<&'static str> {
+    use std::io::IsTerminal;
+    if std::env::var_os("NO_COLOR").is_some() {
+        return None;
+    }
+    if !std::io::stdout().is_terminal() {
+        return None;
+    }
+    match level.trim().to_ascii_lowercase().as_str() {
+        "error" => Some("\x1b[31m"),              // red
+        "critical" | "fatal" => Some("\x1b[91m"), // bright red
+        "warn" => Some("\x1b[33m"),               // yellow
+        "debug" | "trace" => Some("\x1b[2m"),     // dim
+        "unknown" => Some("\x1b[2m"),             // dim grey
+        // info / notice / anything else: no colour (terminal default).
+        _ => None,
+    }
+}
+
+fn print_log_status(data: &str) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+        return;
+    };
+
+    let reason = value
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("no_logs_found");
+    let retention_hint = value.get("retention_hint").and_then(|v| v.as_str());
+
+    match reason {
+        "retention_expired_possible" => {
+            if let Some(hint) = retention_hint {
+                println!(
+                    "No logs found. Runtime logs are retained for {}, so this deployment's logs may no longer be available.",
+                    hint
+                );
+            } else {
+                println!("No logs found. They may have expired based on the log backend retention policy.");
+            }
+        }
+        "historical_backend_not_configured" => {
+            println!("No active deployment pod was found and historical logs are not configured.")
+        }
+        "deployment_not_ready" => println!("Deployment logs are not ready yet."),
+        "backend_unavailable" => println!("The log backend is unavailable."),
+        _ => println!("No logs found."),
+    }
 }
 
 /// Parse duration string (e.g., "5m", "1h", "30s") into seconds
@@ -1572,6 +1697,74 @@ fn parse_duration_to_seconds(duration: &str) -> anyhow::Result<i64> {
 // Log streaming helpers (used by follow_ui for inline log display)
 // ============================================================================
 
+/// Byte-level line buffer for SSE byte streams.
+///
+/// `reqwest::Response::chunk()` can split a UTF-8 codepoint across HTTP/TCP
+/// chunk boundaries. Decoding each chunk with `from_utf8_lossy` would emit
+/// `U+FFFD` replacement characters for the partial bytes on either side of
+/// the boundary, silently corrupting any log line with non-ASCII content
+/// (emoji, accented chars, CJK, …).
+///
+/// This buffer accumulates raw bytes and only decodes *complete* lines
+/// (delimited by `\n`), leaving any trailing partial-line bytes — which
+/// may include a partial codepoint at the end — buffered for the next
+/// chunk. Decoding still uses `from_utf8_lossy` so genuinely-invalid byte
+/// sequences within a complete line don't break the stream.
+pub(super) struct ByteLineBuffer {
+    buf: Vec<u8>,
+}
+
+impl ByteLineBuffer {
+    pub(super) fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    /// Append a chunk of raw bytes to the buffer.
+    pub(super) fn push_chunk(&mut self, chunk: &[u8]) {
+        self.buf.extend_from_slice(chunk);
+    }
+
+    /// Drain and return the next complete line from the buffer (without
+    /// the trailing `\n`, and with any trailing `\r` trimmed). Returns
+    /// `None` if the buffer doesn't yet contain a full line.
+    pub(super) fn next_line(&mut self) -> Option<String> {
+        let newline_pos = self.buf.iter().position(|&b| b == b'\n')?;
+        let mut line_bytes: Vec<u8> = self.buf.drain(..=newline_pos).collect();
+        // Drop the trailing '\n'
+        line_bytes.pop();
+        // Drop a trailing '\r' if present (CRLF tolerance).
+        if line_bytes.last() == Some(&b'\r') {
+            line_bytes.pop();
+        }
+        Some(decode_line(&line_bytes))
+    }
+
+    /// Drain the remainder of the buffer as a final partial line, if any.
+    /// Use this once the underlying byte stream has ended.
+    pub(super) fn take_remainder(&mut self) -> Option<String> {
+        if self.buf.is_empty() {
+            return None;
+        }
+        let mut bytes = std::mem::take(&mut self.buf);
+        // Tolerate CRLF on the last line just in case.
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+        Some(decode_line(&bytes))
+    }
+}
+
+/// Decode a complete line. Prefers strict UTF-8 decoding; falls back to
+/// `from_utf8_lossy` only when the line genuinely contains invalid byte
+/// sequences (not just a codepoint split across chunks — that's handled
+/// at the `ByteLineBuffer` layer).
+fn decode_line(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
 /// Error type for log stream connection attempts.
 pub(super) enum LogStreamError {
     /// Server returned 503 - pod/logs not ready yet
@@ -1598,58 +1791,81 @@ impl std::fmt::Debug for LogStreamError {
 /// a simple async interface for receiving individual log lines.
 pub(super) struct LogStream {
     stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, reqwest::Error>>,
-    buffer: String,
+    buffer: ByteLineBuffer,
+    event_type: String,
+    /// Set once the underlying byte stream returns `None`, so we can yield
+    /// any trailing partial-line bytes as a final line before reporting
+    /// stream end on the next call.
+    stream_done: bool,
 }
 
 impl LogStream {
-    /// Receive the next log line from the stream.
-    /// Returns `None` when the stream ends.
-    pub async fn recv(&mut self) -> Option<Result<String>> {
+    /// Receive the next log line from the stream plus its backend-classified
+    /// level. Returns `None` when the stream ends. The level is the raw
+    /// string the SSE payload carried (one of the values advertised by
+    /// `/api/v1/logs/capabilities`), or an empty string if the payload
+    /// didn't carry one.
+    pub async fn recv(&mut self) -> Option<Result<(String, String)>> {
         use futures::StreamExt;
 
         loop {
             // Try to extract a complete line from the buffer
-            if let Some(newline_pos) = self.buffer.find('\n') {
-                let line: String = self.buffer.drain(..=newline_pos).collect();
-                let line = line.trim_end();
-
-                // Parse SSE format: "data: ..." lines contain log content
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if !data.is_empty() {
-                        return Some(Ok(data.to_string()));
+            if let Some(line) = self.buffer.next_line() {
+                if let Some(event) = line.strip_prefix("event: ") {
+                    self.event_type = event.to_string();
+                    continue;
+                } else if let Some(data) = line.strip_prefix("data: ") {
+                    if !data.is_empty()
+                        && (self.event_type == "log" || self.event_type == "message")
+                    {
+                        // `log` events are JSON-wrapped:
+                        // {"line": "...", "level": "..."}. Yield both so
+                        // the follow UI can colour the line by level.
+                        // Other event types (status, backlog_complete) are
+                        // ignored by the streaming follow UI.
+                        return Some(Ok(extract_log_event(data)));
                     }
                     continue;
                 } else if line.is_empty() || line.starts_with(':') {
                     // SSE comment or empty line, skip
+                    if line.is_empty() {
+                        self.event_type = String::from("message");
+                    }
                     continue;
                 } else {
-                    return Some(Ok(line.to_string()));
+                    return Some(Ok((line, String::new())));
                 }
+            }
+
+            // If the upstream stream already ended, flush any trailing
+            // partial-line bytes as a final line, then signal end-of-stream.
+            if self.stream_done {
+                if let Some(remainder) = self.buffer.take_remainder() {
+                    let line = remainder.trim();
+                    if let Some(data) = line.strip_prefix("data: ") {
+                        if !data.is_empty()
+                            && (self.event_type == "log" || self.event_type == "message")
+                        {
+                            return Some(Ok(extract_log_event(data)));
+                        }
+                    } else if !line.is_empty() && !line.starts_with(':') {
+                        return Some(Ok((line.to_string(), String::new())));
+                    }
+                }
+                return None;
             }
 
             // Need more data from the stream
             match self.stream.next().await {
                 Some(Ok(chunk)) => {
-                    let text = String::from_utf8_lossy(&chunk);
-                    self.buffer.push_str(&text);
+                    self.buffer.push_chunk(&chunk);
                 }
                 Some(Err(e)) => {
                     return Some(Err(anyhow::anyhow!("Log stream error: {}", e)));
                 }
                 None => {
-                    // Stream ended - process any remaining buffer content
-                    if !self.buffer.is_empty() {
-                        let remaining = std::mem::take(&mut self.buffer);
-                        let line = remaining.trim();
-                        if let Some(data) = line.strip_prefix("data: ") {
-                            if !data.is_empty() {
-                                return Some(Ok(data.to_string()));
-                            }
-                        } else if !line.is_empty() && !line.starts_with(':') {
-                            return Some(Ok(line.to_string()));
-                        }
-                    }
-                    return None;
+                    self.stream_done = true;
+                    // Loop around to flush any remainder.
                 }
             }
         }
@@ -1703,13 +1919,120 @@ pub(super) async fn open_log_stream(
 
     Ok(LogStream {
         stream: response.bytes_stream().boxed(),
-        buffer: String::new(),
+        buffer: ByteLineBuffer::new(),
+        event_type: String::from("message"),
+        stream_done: false,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_git_url;
+    use super::{extract_log_event, normalize_git_url, ByteLineBuffer};
+
+    /// Feeding a non-ASCII line one byte at a time — i.e. splitting *every*
+    /// multi-byte codepoint mid-character — must still round-trip the line
+    /// intact. With the old `String::from_utf8_lossy(&chunk)` per-chunk
+    /// approach, each partial-codepoint chunk would produce a `U+FFFD`
+    /// replacement character, corrupting the output.
+    #[test]
+    fn byte_line_buffer_round_trips_codepoints_split_across_chunks() {
+        let line = "data: 你好🌍 héllo\n";
+        let bytes = line.as_bytes();
+
+        let mut buffer = ByteLineBuffer::new();
+        // Feed one byte at a time — guarantees every multi-byte codepoint
+        // is split across chunk boundaries.
+        for &b in bytes {
+            buffer.push_chunk(&[b]);
+        }
+
+        let got = buffer.next_line().expect("expected one full line");
+        assert_eq!(got, "data: 你好🌍 héllo");
+        assert!(
+            !got.contains('\u{FFFD}'),
+            "line must not contain replacement chars: {:?}",
+            got
+        );
+        assert!(buffer.next_line().is_none());
+    }
+
+    /// Same shape, but split at deliberately awkward offsets: inside each
+    /// of `你`, `🌍`, and `é`. Catches off-by-one mistakes in the buffer
+    /// boundary handling.
+    #[test]
+    fn byte_line_buffer_handles_multiple_mid_codepoint_splits() {
+        let line = "data: 你好🌍 héllo\n";
+        let bytes = line.as_bytes();
+
+        // Split into three chunks, each cut mid-codepoint.
+        // `你` is 3 bytes starting at index 6: split after byte 7 (mid-`你`).
+        // `🌍` is 4 bytes starting at index 12: split after byte 14 (mid-`🌍`).
+        let cut1 = 7;
+        let cut2 = 14;
+        assert!(cut1 < cut2 && cut2 < bytes.len());
+
+        let mut buffer = ByteLineBuffer::new();
+        buffer.push_chunk(&bytes[..cut1]);
+        // No line yet — first chunk ends mid-codepoint and has no '\n'.
+        assert!(buffer.next_line().is_none());
+        buffer.push_chunk(&bytes[cut1..cut2]);
+        assert!(buffer.next_line().is_none());
+        buffer.push_chunk(&bytes[cut2..]);
+
+        let got = buffer.next_line().expect("expected one full line");
+        assert_eq!(got, "data: 你好🌍 héllo");
+        assert!(!got.contains('\u{FFFD}'));
+    }
+
+    /// Multiple lines in a single buffer must each be yielded once, in
+    /// order, with CRLF tolerated.
+    #[test]
+    fn byte_line_buffer_yields_multiple_lines_in_order() {
+        let mut buffer = ByteLineBuffer::new();
+        buffer.push_chunk(b"event: log\r\ndata: hello\nworld\n");
+        assert_eq!(buffer.next_line().as_deref(), Some("event: log"));
+        assert_eq!(buffer.next_line().as_deref(), Some("data: hello"));
+        assert_eq!(buffer.next_line().as_deref(), Some("world"));
+        assert_eq!(buffer.next_line(), None);
+    }
+
+    /// A trailing partial line (no terminating '\n') must be retrievable
+    /// via `take_remainder` once the underlying byte stream has ended.
+    #[test]
+    fn byte_line_buffer_take_remainder_returns_trailing_partial_line() {
+        let mut buffer = ByteLineBuffer::new();
+        buffer.push_chunk(b"data: partial");
+        assert!(buffer.next_line().is_none());
+        assert_eq!(buffer.take_remainder().as_deref(), Some("data: partial"));
+        // Empty buffer afterwards.
+        assert_eq!(buffer.take_remainder(), None);
+    }
+
+    #[test]
+    fn extract_log_event_reads_line_and_level() {
+        let payload = r#"{"line":"2026-05-27T22:29:06+00:00 {\"level\":\"warn\",\"msg\":\"HTTP/2 skipped\"}","level":"warn"}"#;
+        let (line, level) = extract_log_event(payload);
+        assert_eq!(level, "warn");
+        assert!(line.contains("HTTP/2 skipped"));
+    }
+
+    #[test]
+    fn extract_log_event_handles_level_first_field() {
+        // serde_json::Value doesn't care about field order, but verify
+        // explicitly since the wire format isn't field-order-stable.
+        let payload = r#"{"level":"error","line":"boom"}"#;
+        let (line, level) = extract_log_event(payload);
+        assert_eq!(level, "error");
+        assert_eq!(line, "boom");
+    }
+
+    #[test]
+    fn extract_log_event_missing_level_yields_empty_string() {
+        let payload = r#"{"line":"plain"}"#;
+        let (line, level) = extract_log_event(payload);
+        assert_eq!(line, "plain");
+        assert_eq!(level, "");
+    }
 
     #[test]
     fn normalizes_scp_like_url() {

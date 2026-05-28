@@ -87,6 +87,8 @@ pub struct AppState {
     pub public_url: String,
     pub encryption_provider: Option<Arc<dyn EncryptionProvider>>,
     pub deployment_backend: Arc<dyn crate::server::deployment::controller::DeploymentBackend>,
+    #[cfg(feature = "backend")]
+    pub runtime_log_backend: Arc<dyn crate::server::deployment::logs::RuntimeLogBackend>,
     pub extension_registry: Arc<crate::server::extensions::registry::ExtensionRegistry>,
     /// Rate limiter for encrypt endpoint (key: "encrypt:{user_id}", value: request count)
     pub encrypt_rate_limiter: Arc<moka::future::Cache<String, u32>>,
@@ -788,6 +790,13 @@ impl AppState {
             init_kubernetes_backend(rb, kc, db_pool.clone()).await?
         };
 
+        #[cfg(feature = "backend")]
+        let runtime_log_backend = crate::server::deployment::logs::init_runtime_log_backend(
+            &settings.deployment_logs,
+            webhook_kube_client.clone(),
+        )
+        .await?;
+
         // Initialize extension registry
         #[allow(unused_mut)]
         let mut extension_registry = crate::server::extensions::registry::ExtensionRegistry::new();
@@ -1124,6 +1133,8 @@ impl AppState {
             public_url,
             encryption_provider,
             deployment_backend,
+            #[cfg(feature = "backend")]
+            runtime_log_backend,
             extension_registry,
             encrypt_rate_limiter,
             oauth_rate_limiter,

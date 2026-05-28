@@ -90,6 +90,21 @@ helm lint helm/rise
 """
 env.SQLX_OFFLINE = true
 
+[tasks."helm:deps"]
+description = "Refresh vendored Helm chart dependencies under helm/rise/charts."
+run = """
+helm_repo_state=$(mktemp -d)
+trap 'rm -rf "$helm_repo_state"' EXIT
+mkdir -p "$helm_repo_state/cache"
+printf 'repositories: []\n' > "$helm_repo_state/repositories.yaml"
+helm repo add rise-grafana https://grafana.github.io/helm-charts \
+  --repository-config "$helm_repo_state/repositories.yaml" \
+  --repository-cache "$helm_repo_state/cache"
+helm dependency build helm/rise \
+  --repository-config "$helm_repo_state/repositories.yaml" \
+  --repository-cache "$helm_repo_state/cache"
+"""
+
 [tasks."config:schema:generate"]
 description = "Generate the backend settings JSON schema."
 run = "cargo run --package rise-deploy --features cli,backend -- backend config-schema > docs/engineering/public/schemas/backend-settings.schema.json"
@@ -199,7 +214,7 @@ if [ -z "${RISE_AUTH_BACKEND_URL:-}" ] || [ -z "${RISE_K8S_HOST_IP:-}" ]; then
   printf "Error: .env is missing the rise-managed block (RISE_K8S_HOST_IP, RISE_AUTH_BACKEND_URL).\n  Run 'mise setup' to (re)write it.\n" >&2
   exit 1
 fi
-docker build . -t rise --target rise && docker run --rm --network host -v $PWD/config:/etc/rise:ro -v $HOME/.kube:/root/.kube:ro -v $HOME/.minikube:$HOME/.minikube:ro -e DATABASE_URL=$DATABASE_URL -e RISE_CONFIG_DIR=/etc/rise -e RISE_CONFIG_RUN_MODE=development -e RISE_AUTH_BACKEND_URL=$RISE_AUTH_BACKEND_URL -e RISE_K8S_HOST_IP=$RISE_K8S_HOST_IP rise backend server
+docker build . -t rise --target rise && docker run --rm --network host -v $PWD/config:/etc/rise:ro -v $HOME/.kube:/root/.kube:ro -v $HOME/.minikube:$HOME/.minikube:ro -e DATABASE_URL=$DATABASE_URL -e RISE_CONFIG_DIR=/etc/rise -e RISE_CONFIG_RUN_MODE=development -e RISE_AUTH_BACKEND_URL=$RISE_AUTH_BACKEND_URL -e RISE_K8S_HOST_IP=$RISE_K8S_HOST_IP -e RISE_LOKI_URL=${RISE_LOKI_URL:-http://localhost:3100} rise backend server
 """
 
 [tasks."frontend:dev"]

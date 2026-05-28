@@ -49,6 +49,40 @@ class RiseAPI {
         return this.request('/users/me');
     }
 
+    // Server capabilities for the configured runtime log backend. Drives the
+    // level filter options + chart palette on the deployment logs page. The
+    // call sites carry `// @ts-nocheck`, so a defensive shape check here is
+    // the only thing standing between a backend schema change and a silently
+    // broken UI. We extract each field individually with a per-field type
+    // guard rather than spread-merging — that way a backend that returns,
+    // say, `levels: "all"` or `supports_volume: "yes"` can't leak off-type
+    // values into Combobox options or the chart panel's visibility check.
+    async getLogsCapabilities() {
+        const safeDefault = { levels: [], supports_volume: false, backend: null, max_tail: null };
+        let payload;
+        try {
+            payload = await this.request('/logs/capabilities');
+        } catch (err) {
+            console.warn('getLogsCapabilities request failed; using safe default:', err);
+            return safeDefault;
+        }
+        if (!payload || typeof payload !== 'object') {
+            console.warn('getLogsCapabilities returned non-object payload; using safe default:', payload);
+            return safeDefault;
+        }
+        const levels = Array.isArray(payload.levels)
+            ? payload.levels.filter((l) => typeof l === 'string')
+            : [];
+        const supports_volume = typeof payload.supports_volume === 'boolean'
+            ? payload.supports_volume
+            : false;
+        const backend = typeof payload.backend === 'string' ? payload.backend : null;
+        const max_tail = typeof payload.max_tail === 'number' && Number.isFinite(payload.max_tail)
+            ? payload.max_tail
+            : null;
+        return { levels, supports_volume, backend, max_tail };
+    }
+
     async lookupUsers(emails) {
         return this.request('/users/lookup', {
             method: 'POST',

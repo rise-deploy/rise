@@ -204,6 +204,7 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
 
     // Auth-only routes (require authentication but NOT platform access)
     let auth_only_routes = Router::new()
+        .route("/logs/capabilities", axum::routing::get(logs_capabilities))
         .merge(auth::routes::auth_only_routes())
         // Apply auth middleware only
         .route_layer(axum_middleware::from_fn_with_state(
@@ -387,6 +388,21 @@ async fn version_info() -> axum::Json<serde_json::Value> {
         "version": env!("CARGO_PKG_VERSION"),
         "repository": env!("CARGO_PKG_REPOSITORY"),
     }))
+}
+
+/// Static facts about the configured runtime log backend. Surfaced to the
+/// frontend so the level filter dropdown and chart palette can be driven
+/// dynamically instead of hardcoded to info/warn/error.
+async fn logs_capabilities(
+    axum::extract::State(state): axum::extract::State<state::AppState>,
+) -> axum::Json<deployment::logs::LogsCapabilities> {
+    let backend = state.runtime_log_backend.as_ref();
+    axum::Json(deployment::logs::LogsCapabilities {
+        backend: backend.backend_kind(),
+        levels: backend.levels(),
+        supports_volume: backend.supports_volume(),
+        max_tail: backend.max_tail(),
+    })
 }
 
 async fn rise_toml_schema_v1_redirect() -> impl axum::response::IntoResponse {

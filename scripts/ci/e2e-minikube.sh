@@ -7,7 +7,8 @@ IMAGE_REPOSITORY="${RISE_IMAGE_REPOSITORY:?RISE_IMAGE_REPOSITORY is required}"
 IMAGE_TAG="${RISE_IMAGE_TAG:?RISE_IMAGE_TAG is required}"
 CLI_IMAGE_REPOSITORY="${RISE_CLI_IMAGE_REPOSITORY:-${IMAGE_REPOSITORY}}"
 RISE_E2E_REGISTRY_MODE="${RISE_E2E_REGISTRY_MODE:-oci-client-auth}"
-MINIKUBE_MEMORY="${MINIKUBE_MEMORY:-4096}"
+MINIKUBE_MEMORY="${MINIKUBE_MEMORY:-6144}"
+MINIKUBE_CPUS="${MINIKUBE_CPUS:-4}"
 RISE_E2E_ARTIFACT_DIR="${RISE_E2E_ARTIFACT_DIR:-.rise-e2e-artifacts}"
 RISE_PUBLIC_URL="http://rise.local"
 RISE_CI_JWT_SIGNING_SECRET_B64="dGVzdC1qd3Qtc2VjcmV0LWtleS1mb3ItY2ktdGVzdGluZy1vbmx5LW5vdC1zZWN1cmU="
@@ -175,7 +176,7 @@ if [[ "${RISE_E2E_REGISTRY_MODE}" == "jfrog-vault" ]]; then
 fi
 
 echo "Starting Minikube"
-minikube_args=(--driver=docker --cpus=2 --memory="${MINIKUBE_MEMORY}")
+minikube_args=(--driver=docker --cpus="${MINIKUBE_CPUS}" --memory="${MINIKUBE_MEMORY}")
 if [[ "${RISE_E2E_REGISTRY_MODE}" == "jfrog-vault" ]]; then
   minikube_args+=(--insecure-registry=rise-jfrog:8082)
 fi
@@ -189,7 +190,6 @@ fi
 echo "Installing chart with CI image ${IMAGE_REPOSITORY}:${IMAGE_TAG}"
 echo "Using CI values from helm/rise/values-ci.yaml"
 cat helm/rise/values-ci.yaml
-helm dependency build helm/rise
 
 helm_args=(
   --namespace "${NAMESPACE}"
@@ -301,6 +301,89 @@ for _ in {1..30}; do
 done
 if [[ "${deployment_list}" != *"Healthy"* ]]; then
   echo "Expected Rise deployment status to become Healthy"
+  exit 1
+fi
+
+# Give Alloy a small window to scrape kube-probe traffic before we tear the
+# pod down. Without this, the pod can disappear between Alloy poll cycles
+# and the post-removal /logs/volume assertion below flakes with total=0.
+# kube-probe pings produce reliable kubernetes-emitted log lines, so 5s
+# is comfortably above Alloy's default discovery/scrape interval.
+sleep 5
+
+echo "Smoke test: Loki retains deployment logs after the pod is gone"
+
+deployment_id="$(curl -sS -H "Authorization: Bearer ${RISE_TOKEN}" \
+  "http://127.0.0.1:3000/api/v1/projects/${PROJECT_NAME}/deployments" \
+  | jq -r '.[0].deployment_id')"
+if [[ -z "${deployment_id}" || "${deployment_id}" == "null" ]]; then
+  echo "Failed to resolve deployment_id from Rise API"
+  exit 1
+fi
+echo "Resolved deployment_id=${deployment_id}"
+
+# Stop the deployment and wait for kubelet to remove the pod. With the
+# pod gone, the Kubernetes log backend cannot serve logs — so a passing
+# assertion below proves Loki actually retained them (and that the
+# `logs.backend: loki` setting is what's answering, not a hidden
+# fallback to live kubelet streaming).
+rise_cli deployment stop --project "${PROJECT_NAME}" --group default
+
+echo "Waiting for app pods to be removed"
+remaining=0
+for _ in {1..60}; do
+  remaining="$(kubectl get pods -n "${APP_NAMESPACE}" --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+  if [[ "${remaining}" == "0" ]]; then
+    break
+  fi
+  sleep 2
+done
+if [[ "${remaining}" != "0" ]]; then
+  echo "Expected app pods in ${APP_NAMESPACE} to be removed; got ${remaining}"
+  kubectl get pods -n "${APP_NAMESPACE}" || true
+  exit 1
+fi
+
+start_ts="$(date -u -d '-10 minutes' +%Y-%m-%dT%H:%M:%SZ)"
+end_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+volume_url="http://127.0.0.1:3000/api/v1/projects/${PROJECT_NAME}/deployments/${deployment_id}/logs/volume?start=${start_ts}&end=${end_ts}&step_seconds=60"
+
+# Loki classifies most nginx/kube-probe lines as `detected_level=unknown`,
+# so we can't pin the assertion to a specific level bucket. Instead assert
+# (a) total > 0 (logs reached Loki and the API can query them) and (b) at
+# least one distinct level key appears across the buckets (levels
+# round-trip through the wire format).
+total=0
+levels_seen=0
+body=""
+for _ in {1..30}; do
+  body="$(curl -sS -H "Authorization: Bearer ${RISE_TOKEN}" "${volume_url}" || true)"
+  total="$(printf '%s' "${body}" | jq '[.buckets[].total] | add // 0' 2>/dev/null || echo 0)"
+  levels_seen="$(printf '%s' "${body}" | jq '[.buckets[].by_level | keys[]] | unique | length' 2>/dev/null || echo 0)"
+  if (( total > 0 && levels_seen >= 1 )); then
+    break
+  fi
+  sleep 3
+done
+
+echo "Log volume (post-pod-removal): total=${total} distinct_levels=${levels_seen}"
+if (( total == 0 )); then
+  echo "Expected /logs/volume to report total>0 after pod removal; last response: ${body}"
+  exit 1
+fi
+if (( levels_seen == 0 )); then
+  echo "Expected /logs/volume to report at least one level in by_level; last response: ${body}"
+  exit 1
+fi
+
+# Exercise the SSE log stream via the CLI. `rise deployment logs` is
+# non-follow by default (`--follow` is opt-in); in non-follow mode the
+# server returns the backlog and closes the SSE stream, so the CLI
+# exits naturally.
+lines="$(rise_cli deployment logs --project "${PROJECT_NAME}" "${deployment_id}" --tail 20 | wc -l)"
+echo "rise deployment logs returned ${lines} line(s)"
+if (( lines == 0 )); then
+  echo "Expected 'rise deployment logs' to print at least one line after pod removal"
   exit 1
 fi
 

@@ -9,6 +9,13 @@ dex:
   config:
     issuer: http://rise-ci-chart-dex.rise-ci.svc.cluster.local:5556/dex
 
+logs:
+  backend: loki
+  loki:
+    enabled: true
+  alloy:
+    enabled: true
+
 ingress:
   enabled: false
 

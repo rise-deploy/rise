@@ -218,11 +218,46 @@ jobs:
       - name: Install mise tools
         run: mise use -g helm
 
-      - name: Build chart dependencies
-        run: helm dependency build helm/rise
+      - name: Verify vendored chart dependencies
+        shell: bash
+        env:
+          HELM_REPOSITORY_CONFIG: ${{ runner.temp }}/helm-repos.yaml
+          HELM_REPOSITORY_CACHE: ${{ runner.temp }}/helm-cache
+        run: |
+          set -euo pipefail
+          helm repo add grafana https://grafana.github.io/helm-charts
+          helm dependency build helm/rise
+          # Helm v4's Chart.lock only stores one aggregate digest over the
+          # dependencies block, not per-tarball bytes — `helm dependency
+          # build` would re-use a corrupted-but-correctly-named tarball
+          # already in helm/rise/charts/. Pin the bytes explicitly against
+          # helm/rise/charts.sha256.
+          if [ ! -f helm/rise/charts.sha256 ]; then
+            echo "ERROR: helm/rise/charts.sha256 is missing; cannot verify vendored tarballs." >&2
+            exit 1
+          fi
+          ( cd helm/rise/charts && shasum -a 256 -c ../charts.sha256 ) || {
+            echo "ERROR: vendored chart tarball digest mismatch against helm/rise/charts.sha256." >&2
+            echo "Either the tarball was tampered with, or the upstream chart was re-released." >&2
+            echo "If legitimate, regenerate the manifest:" >&2
+            echo "  (cd helm/rise/charts && shasum -a 256 *.tgz) > helm/rise/charts.sha256" >&2
+            exit 1
+          }
+          # Also check there are no extra/unexpected tarballs in charts/.
+          expected="$(awk '!/^#/ && NF>=2 {print $2}' helm/rise/charts.sha256 | sort)"
+          actual="$(cd helm/rise/charts && ls *.tgz 2>/dev/null | sort)"
+          if [ "${expected}" != "${actual}" ]; then
+            echo "ERROR: helm/rise/charts/ tarballs do not match helm/rise/charts.sha256 manifest." >&2
+            diff <(printf '%s\n' "${expected}") <(printf '%s\n' "${actual}") || true
+            exit 1
+          fi
+          git diff --exit-code -- helm/rise/Chart.lock helm/rise/charts
 
       - name: Set up chart-testing
         uses: helm/chart-testing-action@v2.8.0
+
+      - name: Add chart repositories
+        run: helm repo add grafana https://grafana.github.io/helm-charts
 
       - name: Run chart-testing (lint)
         run: ct lint --target-branch ${{ github.event.repository.default_branch }} --charts helm/rise --validate-maintainers=false
@@ -327,9 +362,6 @@ jobs:
           sed -i "s/^version: .*/version: ${ci_version}/" helm/rise/Chart.yaml
           sed -i "s/^appVersion: .*/appVersion: \"${image_tag}\"/" helm/rise/Chart.yaml
           cat helm/rise/Chart.yaml
-
-      - name: Build chart dependencies
-        run: helm dependency build helm/rise
 
       - name: Package chart
         run: |

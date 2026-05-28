@@ -18,6 +18,9 @@
 #   ./scripts/dev-setup.sh pf            # background ingress port-forward
 #                                          (localhost:8080 + :8443)
 #   ./scripts/dev-setup.sh pf-down       # stop the ingress port-forward
+#   ./scripts/dev-setup.sh loki-pf       # background Loki port-forward
+#                                          (localhost:3100)
+#   ./scripts/dev-setup.sh loki-pf-down  # stop the Loki port-forward
 #   ./scripts/dev-setup.sh preflight     # hosts + docker, no cluster
 #
 # Run this script directly (not via a `mise` task dependency chain) so that
@@ -388,6 +391,7 @@ write_dev_env_block() {
 export RISE_K8S_HOST_IP="${host_ip}"
 export RISE_AUTH_BACKEND_URL="http://${host_ip}:3000"
 export RISE_METACONTROLLER_WEBHOOK_BASE_URL="http://${host_ip}:3001"
+export RISE_LOKI_URL="http://localhost:3100"
 # END RISE K8S DEV
 EOF
   ok "Wrote .env block (RISE_K8S_HOST_IP=$host_ip)"
@@ -396,7 +400,6 @@ EOF
 helm_install_rise_dev() {
   local host_ip=$1 skip_crds=${2:-}
   cd "$REPO_ROOT"
-  helm dependency build helm/rise
   local args=(
     upgrade --install rise-dev ./helm/rise
     -f helm/rise/values-dev.yaml
@@ -405,6 +408,53 @@ helm_install_rise_dev() {
   )
   [[ -n "$skip_crds" ]] && args+=(--skip-crds)
   helm "${args[@]}"
+}
+
+# ---- Loki port-forward ----------------------------------------------------
+
+wait_for_loki() {
+  require_cmd kubectl
+  if ! kubectl get svc -n rise rise-dev-loki >/dev/null 2>&1; then
+    err "Service rise/rise-dev-loki not found."
+    err "Run './scripts/dev-setup.sh minikube' or './scripts/dev-setup.sh k3s' first."
+    return 1
+  fi
+  log "Waiting for rise-dev-loki to become ready"
+  kubectl rollout status --namespace rise statefulset/rise-dev-loki \
+    --timeout=180s
+}
+
+# Rise runs on the host in development, while dev Loki runs in the cluster.
+start_loki_port_forward() {
+  require_cmd kubectl
+  if lsof -iTCP:3100 -sTCP:LISTEN >/dev/null 2>&1; then
+    ok "Port 3100 already in use; Loki port-forward is already running"
+    return 0
+  fi
+  wait_for_loki
+  log "Port-forwarding rise-dev-loki to localhost:3100"
+  kubectl port-forward --namespace rise svc/rise-dev-loki 3100:3100 \
+    >/dev/null 2>&1 &
+  local pf_pid=$!
+  sleep 1
+  if ! kill -0 "$pf_pid" 2>/dev/null; then
+    err "Loki port-forward exited before it became ready."
+    err "Run './scripts/dev-setup.sh loki-pf' after Loki is ready, or inspect 'kubectl get pods -n rise'."
+    return 1
+  fi
+  ok "Loki port-forward running in background (PID: $pf_pid)"
+}
+
+stop_loki_port_forward() {
+  local pids
+  pids=$(pgrep -f 'kubectl port-forward.*rise-dev-loki.*3100:3100' 2>/dev/null || true)
+  if [[ -n "$pids" ]]; then
+    log "Killing Loki port-forward processes: $pids"
+    kill $pids 2>/dev/null || true
+    ok "Loki port-forward processes terminated"
+  else
+    ok "No Loki port-forward processes running"
+  fi
 }
 
 # ---- Minikube --------------------------------------------------------------
@@ -492,6 +542,7 @@ EOF
   fi
   write_dev_env_block "$host_ip"
   helm_install_rise_dev "$host_ip" ""
+  start_loki_port_forward
   ok "minikube ready. If you use direnv: run 'direnv reload'."
 }
 
@@ -586,6 +637,7 @@ EOF
   write_dev_env_block "$host_ip"
   kubectl apply --server-side --force-conflicts -f helm/rise/crds/
   helm_install_rise_dev "$host_ip" "--skip-crds"
+  start_loki_port_forward
   ok "k3s ready. K3s internal IP: $host_ip. If you use direnv: run 'direnv reload'."
 }
 
@@ -685,6 +737,7 @@ clear_docker() {
 cmd_down() {
   log "This will undo what 'mise setup' did:"
   echo "    - terminate any 'kubectl port-forward' for ingress-nginx (8080/8443)"
+  echo "    - terminate any 'kubectl port-forward' for Loki (3100)"
   echo "    - delete the minikube cluster (if present)"
   [[ "$OS" == "Linux" ]] && echo "    - uninstall k3s (if installed)"
   echo "    - strip the rise-managed block from .env"
@@ -701,6 +754,7 @@ cmd_down() {
 
   # Reverse order of setup, so we don't pull /etc/hosts entries out from
   # under a still-running cluster.
+  stop_loki_port_forward
   stop_ingress_port_forward
   down_minikube
   down_k3s
@@ -787,6 +841,8 @@ main() {
     k3s-down)      down_k3s ;;
     pf)            start_ingress_port_forward ;;
     pf-down)       stop_ingress_port_forward ;;
+    loki-pf)       start_loki_port_forward ;;
+    loki-pf-down)  stop_loki_port_forward ;;
     preflight)     cmd_preflight ;;
     all)           cmd_all ;;
     down)          cmd_down ;;

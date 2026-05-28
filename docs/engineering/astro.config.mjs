@@ -48,6 +48,13 @@ export default defineConfig({
                 { label: 'Operations & Security', slug: 'kubernetes/operations' },
               ],
             },
+            {
+              label: 'Persistent Logs',
+              items: [
+                { label: 'Overview', slug: 'persistent-logs' },
+                { label: 'Loki Backend', slug: 'persistent-logs/loki' },
+              ],
+            },
             { label: 'Production Deployment', slug: 'production' },
             { label: 'Database', slug: 'database' },
             { label: 'PostgreSQL Upgrades', slug: 'upgrading-postgresql' },

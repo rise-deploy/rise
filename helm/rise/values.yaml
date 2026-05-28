@@ -135,6 +135,102 @@ metacontroller:
   # RiseProject CR (the legacy single-controller behaviour).
   controllerClass: "default"
 
+# Runtime deployment logs.
+# The Rise API always enforces authorization and proxies log access; Loki is only
+# contacted by the backend and by Alloy.
+logs:
+  # kubernetes: stream directly from active Pods only.
+  # loki: query historical logs from Loki.
+  backend: kubernetes
+  loki:
+    # Installs the Grafana Loki subchart when true. Set false with externalUrl
+    # to connect Rise to an operator-managed Loki.
+    enabled: false
+    externalUrl: ""
+    tenantId: ""
+    timeoutSeconds: 10
+    # Display-only hint used by Rise when no logs are found in a window. Loki
+    # itself still enforces the actual retention. When the bundled Loki
+    # subchart is enabled and this is left empty, the bundled Loki's
+    # `limits_config.retention_period` is used as a fallback. For an external
+    # Loki, set this explicitly — the bundled-Loki default is not used.
+    retentionHint: ""
+    # If your external Loki requires a bearer token, set name/key here and
+    # the backend gets it via RISE_LOKI_BEARER_TOKEN. NOTE: this only wires
+    # the *backend*; Alloy must also receive the token. Add the matching
+    # extraEnv to alloy.alloy.extraEnv (see the README "Bearer token" section
+    # for the exact snippet).
+    bearerTokenSecret:
+      name: ""
+      key: token
+    # Loki stream label names the backend selects on. When the bundled Alloy
+    # is enabled, the same names are used as the relabel target so backend
+    # queries and shipped logs stay in sync. Override only when pointing Rise
+    # at an external Loki whose existing labels differ.
+    labels:
+      project: rise_project
+      deploymentId: rise_deployment_id
+  alloy:
+    # Installs the Grafana Alloy subchart when true. Alloy ships pod logs to
+    # Loki and preserves Rise deployment labels for historical lookup.
+    enabled: false
+
+# Grafana Loki subchart values. These defaults are intentionally small and
+# PVC-backed for simple installs; production operators should tune or provide
+# their own Loki.
+loki:
+  deploymentMode: SingleBinary
+  singleBinary:
+    replicas: 1
+    persistence:
+      enabled: true
+      size: 10Gi
+  loki:
+    auth_enabled: false
+    commonConfig:
+      replication_factor: 1
+    storage:
+      type: filesystem
+    schemaConfig:
+      configs:
+        - from: "2024-04-01"
+          store: tsdb
+          object_store: filesystem
+          schema: v13
+          index:
+            prefix: rise_loki_index_
+            period: 24h
+    limits_config:
+      retention_period: 168h
+  chunksCache:
+    enabled: false
+  resultsCache:
+    enabled: false
+  test:
+    enabled: false
+  lokiCanary:
+    enabled: false
+  gateway:
+    enabled: false
+  # Force the SimpleScalable component replicas to 0 — the upstream chart
+  # defaults them to 3, and its validate.yaml fails when both SingleBinary
+  # and SimpleScalable targets have replicas > 0.
+  read:
+    replicas: 0
+  write:
+    replicas: 0
+  backend:
+    replicas: 0
+
+# Grafana Alloy subchart values. The configMap name is fixed so this chart can
+# provide templated Alloy configuration while still using the upstream subchart.
+alloy:
+  alloy:
+    configMap:
+      create: false
+      name: rise-alloy-config
+      key: config.alloy
+
 # Rise backend configuration overrides
 # Converted to YAML and mounted as /etc/rise/local.yaml
 # The backend supports both TOML and YAML - this chart outputs YAML by default

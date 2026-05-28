@@ -530,6 +530,13 @@ enum DeploymentCommands {
         /// Show logs since duration (e.g., "5m", "1h")
         #[arg(long)]
         since: Option<String>,
+        /// Filter to lines with the given level. Repeat to allow multiple
+        /// (e.g. `--level warn --level error`). Omit for all levels. The
+        /// set of accepted values is server-defined; see
+        /// `GET /api/v1/logs/capabilities` for the configured backend's
+        /// vocabulary.
+        #[arg(long = "level")]
+        level: Vec<String>,
     },
 }
 
@@ -1478,6 +1485,7 @@ async fn main() -> Result<()> {
                 tail,
                 timestamps,
                 since,
+                level,
             } => {
                 let project_name = resolve_project_name(project.clone(), path)?;
                 let token = config.get_token().ok_or_else(|| {
@@ -1494,6 +1502,7 @@ async fn main() -> Result<()> {
                         tail: *tail,
                         timestamps: *timestamps,
                         since: since.as_deref(),
+                        levels: level,
                     },
                 )
                 .await?;

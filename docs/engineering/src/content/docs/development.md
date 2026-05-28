@@ -79,12 +79,14 @@ Everything is driven by `./scripts/dev-setup.sh`. `mise setup` and `mise down` a
 | `mise setup hosts-clear` | Remove the managed `/etc/hosts` block |
 | `mise setup docker` | Configure Docker insecure-registries (asks to restart Docker Desktop on macOS) |
 | `mise setup docker-clear` | Remove rise registries from `daemon.json` |
-| `mise setup minikube` | Bring up Minikube + ingress port-forward + Helm install (**preferred** on most dev machines) |
+| `mise setup minikube` | Bring up Minikube + ingress/Loki port-forwards + Helm install (**preferred** on most dev machines) |
 | `mise setup minikube-down` | `minikube delete` |
 | `mise setup k3s` | Bring up k3s (Linux only — use when Minikube doesn't work, or in ephemeral/dedicated Rise dev environments) |
 | `mise setup k3s-down` | Uninstall k3s |
 | `mise setup pf` | Start the ingress port-forward (`localhost:8080` + `:8443`) in the background |
 | `mise setup pf-down` | Stop the ingress port-forward |
+| `mise setup loki-pf` | Start the Loki port-forward (`localhost:3100`) in the background |
+| `mise setup loki-pf-down` | Stop the Loki port-forward |
 | `mise setup preflight` | hosts + docker only, no cluster |
 
 **Minikube vs K3s**: Minikube is preferred on most developer machines — it runs a single-node Kubernetes cluster inside a Docker container, starts quickly, and integrates well with the local Docker network so pods can reach `rise-registry:5000`. Use k3s (Linux only) when Minikube doesn't work on your machine (e.g., nested virtualization issues) or when setting up an ephemeral or dedicated environment solely for Rise development where the slight extra k3s overhead doesn't matter.
@@ -168,6 +170,7 @@ Host Machine (127.0.0.1)
 ├── rise.local:3000     → Rise Backend
 ├── localhost:5173      → Vite dev server
 ├── localhost:8080/8443 → K8s ingress (port-forward or hostPort)
+├── localhost:3100      → Loki (port-forward)
 │
 ├── Docker network: rise_default
 │   ├── rise-postgres       (5432)
@@ -184,6 +187,9 @@ Host Machine (127.0.0.1)
 - Minikube joins the same network so pods can pull images.
 - The local cluster setup writes `.env` values such as `RISE_AUTH_BACKEND_URL`
   and `RISE_K8S_HOST_IP` so Kubernetes pods can reach the host backend.
+- Runtime logs use the local Loki backend by default. `mise setup` installs the
+  dev Loki/Alloy chart components and forwards Loki to `localhost:3100`, which
+  `config/development.yaml` reads through `RISE_LOKI_URL`.
 
 ## Troubleshooting
 

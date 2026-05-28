@@ -64,25 +64,4 @@ pub trait DeploymentBackend: Send + Sync {
         let _ = (project, environment_name);
         Ok(())
     }
-
-    /// Stream logs from a deployment
-    ///
-    /// Returns a stream of log bytes from the deployment's runtime (pod/container).
-    ///
-    /// `namespace_prefix` is the project's Org-resolved namespace prefix
-    /// (see `webhook::load_org_view`); the caller resolves it because the
-    /// per-Org cache lives on `AppState`, not on this backend. See
-    /// `crate::server::deployment::webhook::resolve_project_namespace_prefix`
-    /// for the canonical resolver.
-    #[allow(clippy::too_many_arguments)]
-    async fn stream_logs(
-        &self,
-        deployment: &Deployment,
-        project: &Project,
-        follow: bool,
-        tail_lines: Option<i64>,
-        timestamps: bool,
-        since_seconds: Option<i64>,
-        namespace_prefix: &str,
-    ) -> anyhow::Result<futures::stream::BoxStream<'static, Result<bytes::Bytes, anyhow::Error>>>;
 }

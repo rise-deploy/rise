@@ -541,6 +541,75 @@
       },
       "type": "object"
     },
+    "DeploymentLogsSettings": {
+      "oneOf": [
+        {
+          "properties": {
+            "max_tail_lines": {
+              "default": 100000,
+              "description": "Upper bound on the number of lines the backend will ever request from\nthe kubelet in a single call. The frontend pages backward by widening\n`tail_lines`; once `tail_lines + skip_recent` reaches this ceiling,\npaging stops yielding new lines — the same outcome as when the\nkubelet's own ring buffer is exhausted. Default: 100000.",
+              "format": "int64",
+              "type": "integer"
+            },
+            "type": {
+              "const": "kubernetes",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "bearer_token_env": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "labels": {
+              "$ref": "#/$defs/LokiLabels",
+              "description": "Override the Loki stream label names. Useful when pointing Rise\nat an operator-managed Loki/Alloy stack that labels logs\ndifferently than the bundled chart."
+            },
+            "retention_hint": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tenant_id": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "timeout_secs": {
+              "default": 10,
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "loki",
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "EncryptionSettings": {
       "description": "Encryption provider configuration",
       "oneOf": [
@@ -1024,6 +1093,21 @@
           "type": "object"
         }
       ]
+    },
+    "LokiLabels": {
+      "properties": {
+        "deployment_id": {
+          "default": "rise_deployment_id",
+          "description": "Loki stream label that carries the Rise deployment id (e.g.\n\"20241205-1234\"). Together with `project`, this must uniquely\nidentify a deployment's log stream.",
+          "type": "string"
+        },
+        "project": {
+          "default": "rise_project",
+          "description": "Loki stream label that carries the Rise project name.",
+          "type": "string"
+        }
+      },
+      "type": "object"
     },
     "NetworkPolicyConfig": {
       "description": "NetworkPolicy configuration for deployed apps\n\nUses Kubernetes NetworkPolicy types directly. Egress semantics:\n- null: policyTypes is [\"Ingress\"] only, Kubernetes does not restrict egress\n- Empty list: policyTypes includes \"Egress\" with no rules = deny all egress\n- Non-empty list: explicit egress rules enforced",
@@ -1685,6 +1769,9 @@
           "type": "null"
         }
       ]
+    },
+    "deployment_logs": {
+      "$ref": "#/$defs/DeploymentLogsSettings"
     },
     "encryption": {
       "anyOf": [

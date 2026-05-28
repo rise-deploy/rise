@@ -1,0 +1,98 @@
+{{- if .Values.logs.alloy.enabled }}
+{{- if .Values.logs.loki.bearerTokenSecret.name }}
+{{- $found := false }}
+{{- $badEntry := "" }}
+{{- range (default (list) .Values.alloy.alloy.extraEnv) }}
+{{- if eq (.name | toString) "RISE_LOKI_BEARER_TOKEN" }}
+{{- /* Require valueFrom.secretKeyRef.{name,key} — an inline `value:` (even
+       empty) wouldn't actually authenticate against Loki, so reject the
+       half-configured case the same way as a fully missing entry. */ -}}
+{{- if and (hasKey . "valueFrom") (kindIs "map" .valueFrom) (hasKey .valueFrom "secretKeyRef") (kindIs "map" .valueFrom.secretKeyRef) (hasKey .valueFrom.secretKeyRef "name") (hasKey .valueFrom.secretKeyRef "key") (.valueFrom.secretKeyRef.name) (.valueFrom.secretKeyRef.key) }}
+{{- $found = true }}
+{{- else }}
+{{- $badEntry = "present-but-not-secretKeyRef" }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if not $found }}
+{{- if eq $badEntry "present-but-not-secretKeyRef" }}
+{{- fail (printf "logs.loki.bearerTokenSecret.name is set to %q, and alloy.alloy.extraEnv has an entry named RISE_LOKI_BEARER_TOKEN, but it does not use valueFrom.secretKeyRef with both name and key set. An inline `value:` (or empty value) will not authenticate against Loki. Replace the entry with: { name: RISE_LOKI_BEARER_TOKEN, valueFrom: { secretKeyRef: { name: %s, key: %s } } }." .Values.logs.loki.bearerTokenSecret.name .Values.logs.loki.bearerTokenSecret.name (.Values.logs.loki.bearerTokenSecret.key | default "token")) }}
+{{- else }}
+{{- fail (printf "logs.loki.bearerTokenSecret.name is set to %q, but alloy.alloy.extraEnv has no entry with name=RISE_LOKI_BEARER_TOKEN sourcing the same Secret. Add an extraEnv item that exposes RISE_LOKI_BEARER_TOKEN (e.g. from secretKeyRef.name=%s) so Alloy can authenticate against Loki." .Values.logs.loki.bearerTokenSecret.name .Values.logs.loki.bearerTokenSecret.name) }}
+{{- end }}
+{{- end }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.alloy.alloy.configMap.name | quote }}
+  labels:
+    {{- include "rise.labels" . | nindent 4 }}
+data:
+  {{ .Values.alloy.alloy.configMap.key }}: |
+    discovery.kubernetes "pods" {
+      role = "pod"
+    }
+
+    discovery.relabel "rise_pods" {
+      targets = discovery.kubernetes.pods.targets
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_managed_by"]
+        regex = "rise"
+        action = "keep"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_label_rise_dev_project"]
+        target_label = {{ .Values.logs.loki.labels.project | quote }}
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_label_rise_dev_environment"]
+        target_label = "rise_environment"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_label_rise_dev_deployment_group"]
+        target_label = "rise_deployment_group"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_label_rise_dev_deployment_id"]
+        target_label = {{ .Values.logs.loki.labels.deploymentId | quote }}
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_namespace"]
+        target_label = "namespace"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_name"]
+        target_label = "pod"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_container_name"]
+        target_label = "container"
+      }
+    }
+
+    loki.source.kubernetes "rise_pods" {
+      targets    = discovery.relabel.rise_pods.output
+      forward_to = [loki.write.rise.receiver]
+    }
+
+    loki.write "rise" {
+      endpoint {
+        url = {{ printf "%s/loki/api/v1/push" (.Values.logs.loki.externalUrl | default (printf "http://%s-loki:3100" .Release.Name)) | quote }}
+        {{- with .Values.logs.loki.tenantId }}
+        tenant_id = {{ . | quote }}
+        {{- end }}
+        {{- if .Values.logs.loki.bearerTokenSecret.name }}
+        bearer_token = sys.env("RISE_LOKI_BEARER_TOKEN")
+        {{- end }}
+      }
+    }
+{{- end }}

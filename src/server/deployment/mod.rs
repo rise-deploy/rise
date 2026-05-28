@@ -4,6 +4,8 @@ pub mod crd;
 pub mod handlers;
 #[cfg(feature = "backend")]
 pub mod ip_validator;
+#[cfg(feature = "backend")]
+pub mod logs;
 pub mod models;
 #[cfg(feature = "backend")]
 pub mod quantity;

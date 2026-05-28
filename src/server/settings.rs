@@ -14,6 +14,8 @@ pub struct Settings {
     #[serde(default)]
     pub deployment_controller: Option<DeploymentControllerSettings>,
     #[serde(default)]
+    pub deployment_logs: DeploymentLogsSettings,
+    #[serde(default)]
     pub encryption: Option<EncryptionSettings>,
     #[serde(default)]
     pub extensions: Option<ExtensionsSettings>,
@@ -83,6 +85,95 @@ impl Default for DefaultOrganizationSettings {
             display_name: default_default_organization_display_name(),
             annotations: std::collections::BTreeMap::new(),
             kubernetes_namespace_prefix: None,
+        }
+    }
+}
+
+fn default_loki_timeout_secs() -> u64 {
+    10
+}
+
+fn default_kubernetes_max_tail_lines() -> i64 {
+    100_000
+}
+
+fn default_loki_project_label() -> String {
+    "rise_project".to_string()
+}
+
+fn default_loki_deployment_id_label() -> String {
+    "rise_deployment_id".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct LokiLabels {
+    /// Loki stream label that carries the Rise project name.
+    #[serde(default = "default_loki_project_label")]
+    pub project: String,
+    /// Loki stream label that carries the Rise deployment id (e.g.
+    /// "20241205-1234"). Together with `project`, this must uniquely
+    /// identify a deployment's log stream.
+    #[serde(default = "default_loki_deployment_id_label")]
+    pub deployment_id: String,
+}
+
+impl Default for LokiLabels {
+    fn default() -> Self {
+        Self {
+            project: default_loki_project_label(),
+            deployment_id: default_loki_deployment_id_label(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct KubernetesLogBackendSettings {
+    /// Upper bound on the number of lines the backend will ever request from
+    /// the kubelet in a single call. The frontend pages backward by widening
+    /// `tail_lines`; once `tail_lines + skip_recent` reaches this ceiling,
+    /// paging stops yielding new lines — the same outcome as when the
+    /// kubelet's own ring buffer is exhausted. Default: 100000.
+    #[serde(default = "default_kubernetes_max_tail_lines")]
+    pub max_tail_lines: i64,
+}
+
+impl Default for KubernetesLogBackendSettings {
+    fn default() -> Self {
+        Self {
+            max_tail_lines: default_kubernetes_max_tail_lines(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum DeploymentLogsSettings {
+    Kubernetes {
+        #[serde(flatten)]
+        config: KubernetesLogBackendSettings,
+    },
+    Loki {
+        url: String,
+        #[serde(default)]
+        tenant_id: Option<String>,
+        #[serde(default)]
+        bearer_token_env: Option<String>,
+        #[serde(default = "default_loki_timeout_secs")]
+        timeout_secs: u64,
+        #[serde(default)]
+        retention_hint: Option<String>,
+        /// Override the Loki stream label names. Useful when pointing Rise
+        /// at an operator-managed Loki/Alloy stack that labels logs
+        /// differently than the bundled chart.
+        #[serde(default)]
+        labels: LokiLabels,
+    },
+}
+
+impl Default for DeploymentLogsSettings {
+    fn default() -> Self {
+        Self::Kubernetes {
+            config: KubernetesLogBackendSettings::default(),
         }
     }
 }

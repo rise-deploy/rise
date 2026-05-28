@@ -2277,6 +2277,45 @@ pub struct LogStreamParams {
     pub timestamps: bool,
     /// Show logs since this many seconds ago
     pub since: Option<i64>,
+    /// Start of an explicit time range in RFC3339 format
+    pub start: Option<String>,
+    /// End of an explicit time range in RFC3339 format. Honored by the Loki
+    /// backend. The Kubernetes backend has no `pods/log` end-time filter and
+    /// silently ignores this — for past windows on the Kubernetes backend,
+    /// use the Loki backend instead.
+    pub end: Option<String>,
+    /// Restrict to lines whose backend-emitted level matches one of these
+    /// values. Repeated query param: `?level=info&level=warn`. Empty list
+    /// (param absent) means no filter. Accepted values come from the
+    /// backend's `levels` advertised in `/api/v1/logs/capabilities`.
+    #[serde(default, rename = "level")]
+    pub level: Vec<String>,
+    /// Case-insensitive substring filter applied to each line.
+    pub search: Option<String>,
+    /// For backward pagination: skip this many of the most-recent qualifying
+    /// lines before returning. Used by the Kubernetes backend (whose
+    /// `pods/log` API has no end-time filter) so the frontend can scroll
+    /// further back than the initial tail window. The Loki backend ignores
+    /// this and uses its own timestamp-based pagination.
+    pub skip_recent: Option<i64>,
+}
+
+/// Query parameters for log volume
+#[derive(serde::Deserialize)]
+pub struct LogVolumeParams {
+    /// Start of an explicit time range in RFC3339 format
+    pub start: String,
+    /// End of an explicit time range in RFC3339 format
+    pub end: String,
+    /// Bucket step in seconds
+    #[serde(default = "default_log_count_step_seconds")]
+    pub step_seconds: i64,
+    /// Restrict counts to lines whose backend-emitted level matches one of
+    /// these values. Repeated query param: `?level=info&level=warn`.
+    #[serde(default, rename = "level")]
+    pub level: Vec<String>,
+    /// Case-insensitive substring filter applied to each line.
+    pub search: Option<String>,
 }
 
 /// Stream logs from a deployment via Server-Sent Events
@@ -2286,7 +2325,7 @@ pub async fn stream_deployment_logs(
     State(state): State<AppState>,
     auth: AuthContext,
     Path((project_name, deployment_id)): Path<(String, String)>,
-    Query(params): Query<LogStreamParams>,
+    axum_extra::extract::Query(params): axum_extra::extract::Query<LogStreamParams>,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, anyhow::Error>>>, ServerError> {
     // Fetch project
     let project = projects::find_by_name(&state.db_pool, &project_name)
@@ -2331,36 +2370,36 @@ pub async fn stream_deployment_logs(
         ))
     })?;
 
-    // Check if deployment is in a state where logs make sense
-    if state_machine::is_terminal(&deployment.status) {
-        return Err(ServerError::gone(
-            "Deployment is no longer running - logs may not be available",
-        ));
+    let start_time = parse_log_time(params.start.as_deref())?;
+    let end_time = parse_log_time(params.end.as_deref())?;
+    let followable = crate::server::deployment::logs::is_followable_status(&deployment.status);
+    if let (Some(start_time), Some(end_time)) = (start_time, end_time) {
+        if start_time >= end_time {
+            return Err(ServerError::bad_request(
+                "Log range start must be before end",
+            ));
+        }
     }
 
-    // Don't allow streaming logs from deployments that haven't reached Deploying yet
-    if matches!(
-        deployment.status,
-        DbDeploymentStatus::Pending
-            | DbDeploymentStatus::Building
-            | DbDeploymentStatus::Pushing
-            | DbDeploymentStatus::Pushed
-    ) {
-        return Err(ServerError::service_unavailable(
-            "Deployment not ready yet - no logs available. Try again when deployment is running.",
-        )
-        .expected());
-    }
+    // Get log stream from configured runtime log backend.
+    // Follow defaults to 1 line so active deployments start at the most
+    // recent log entry, while non-follow requests keep the broader backlog.
+    let tail = params
+        .tail
+        .or(Some(if params.follow && followable { 1 } else { 1000 }));
+    let follow = params.follow && followable;
 
-    // Get log stream from deployment backend
-    // Default to last 1000 lines if tail not specified
-    let tail = params.tail.or(Some(1000));
-
-    // Resolve the project's Org-scoped namespace prefix; the backend
-    // doesn't have access to `AppState`'s cache, so the caller threads
-    // the prefix in (same pattern as the Metacontroller webhook). The
-    // Organization UID is resolved once and threaded through so the
-    // missing-linkage error message is consistent with the webhook path.
+    validate_log_levels(&params.level, state.runtime_log_backend.levels())?;
+    let levels = params.level.clone();
+    let search = params
+        .search
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    // Resolve the project's Org-scoped namespace prefix; the backend doesn't
+    // have access to `AppState`'s cache, so the caller threads the prefix in
+    // via LogQuery (same pattern as the Metacontroller webhook). Only the
+    // Kubernetes log backend uses it; Loki ignores it.
     let org_uid =
         crate::server::deployment::webhook::resolve_project_organization_uid(&state, &project)
             .await
@@ -2370,29 +2409,32 @@ pub async fn stream_deployment_logs(
     )
     .await
     .internal_err("Failed to resolve project namespace prefix")?;
-
     let log_stream = state
-        .deployment_backend
+        .runtime_log_backend
         .stream_logs(
             &deployment,
             &project,
-            params.follow,
-            tail,
-            params.timestamps,
-            params.since,
-            &namespace_prefix,
+            crate::server::deployment::logs::LogQuery {
+                follow,
+                tail_lines: tail,
+                timestamps: params.timestamps,
+                since_seconds: params.since,
+                start_time,
+                end_time,
+                levels,
+                search,
+                skip_recent: params.skip_recent.filter(|n| *n > 0),
+                namespace_prefix: Some(namespace_prefix),
+            },
         )
         .await
         .map_err(|e| {
-            let error_msg = e.to_string();
-            if error_msg.contains("Pod not found")
-                || error_msg.contains("not ready yet")
-                || error_msg.contains("waiting to start")
-                || error_msg.contains("ContainerCreating")
-                || error_msg.contains("PodInitializing")
-            {
-                ServerError::service_unavailable(
-                    "Deployment pod not ready yet. Please try again in a moment.",
+            let error_msg = format!("{:#}", e);
+            if error_msg.contains("not ready yet") || error_msg.contains("waiting to start") {
+                ServerError::service_unavailable("Deployment logs are not ready yet.").expected()
+            } else if error_msg.contains("exceeds the limit") {
+                ServerError::bad_request(
+                    "Selected time range is too large for the log backend. Pick a shorter range.",
                 )
                 .expected()
             } else {
@@ -2400,29 +2442,185 @@ pub async fn stream_deployment_logs(
             }
         })?;
 
-    // Convert log stream to SSE events
-    // We need to flatten the stream since each chunk may contain multiple lines
+    // Convert typed log events to SSE events.
+    //
+    // The `log` event payload is a JSON object `{"line": ..., "level": ...}`
+    // so the frontend chart (counted by `detected_level`) and the live log
+    // list classify each line identically — the backend is now the single
+    // source of truth for per-line level. See the wire-format contract in
+    // PR #333 / src/server/deployment/logs.rs (ClassifiedLevel).
     use futures::stream;
     let sse_stream = log_stream.flat_map(|result| match result {
-        Ok(bytes) => {
-            // Convert bytes to string (log lines)
-            let log_text = String::from_utf8_lossy(&bytes).to_string();
-            // Split into individual lines and create an event for each
-            let events: Vec<Result<Event, anyhow::Error>> = log_text
-                .lines()
-                .filter(|line| !line.is_empty())
-                .map(|line| Ok(Event::default().data(line)))
-                .collect();
-            stream::iter(events)
+        Ok(crate::server::deployment::logs::LogEvent::Line { text, level }) => {
+            stream::iter(vec![Event::default()
+                .event("log")
+                .json_data(serde_json::json!({ "line": text, "level": level }))
+                .map_err(anyhow::Error::from)])
+        }
+        Ok(crate::server::deployment::logs::LogEvent::Status(status)) => {
+            stream::iter(vec![Event::default()
+                .event("status")
+                .json_data(status)
+                .map_err(anyhow::Error::from)])
+        }
+        Ok(crate::server::deployment::logs::LogEvent::BacklogLoaded { count }) => {
+            stream::iter(vec![Event::default()
+                .event("backlog_complete")
+                .json_data(serde_json::json!({ "count": count }))
+                .map_err(anyhow::Error::from)])
         }
         Err(e) => {
             // Send error as SSE event
-            error!("Log stream error: {}", e);
+            error!("Log stream error: {:?}", e);
             stream::iter(vec![Err(e)])
         }
     });
 
     Ok(Sse::new(sse_stream).keep_alive(KeepAlive::default()))
+}
+
+/// Query log counts for a deployment.
+///
+/// GET /projects/{project_name}/deployments/{deployment_id}/logs/counts
+pub async fn query_deployment_log_volume(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path((project_name, deployment_id)): Path<(String, String)>,
+    axum_extra::extract::Query(params): axum_extra::extract::Query<LogVolumeParams>,
+) -> Result<Json<crate::server::deployment::logs::LogVolumeResponse>, ServerError> {
+    let project = projects::find_by_name(&state.db_pool, &project_name)
+        .await
+        .internal_err("Failed to fetch project")?
+        .ok_or_else(|| ServerError::not_found(format!("Project '{}' not found", project_name)))?;
+
+    let (_user, is_sa) = auth
+        .resolve_for_project(
+            &state.db_pool,
+            &project,
+            state.controllers_by_issuer.as_ref(),
+        )
+        .await
+        .map_err(|e| {
+            if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {
+                ServerError::not_found(format!("Project '{}' not found", project.name))
+            } else {
+                e
+            }
+        })?;
+
+    if !is_sa {
+        crate::server::project::handlers::ensure_project_access_or_admin(&state, &_user, &project)
+            .await?;
+    }
+
+    let deployment = db_deployments::find_by_project_and_deployment_id(
+        &state.db_pool,
+        project.id,
+        &deployment_id,
+    )
+    .await
+    .internal_err("Failed to fetch deployment")?
+    .ok_or_else(|| {
+        ServerError::not_found(format!(
+            "Deployment '{}' not found for project '{}'",
+            deployment_id, project_name
+        ))
+    })?;
+
+    let start_time = parse_log_time(Some(&params.start))?
+        .ok_or_else(|| ServerError::bad_request("Log range start is required"))?;
+    let end_time = parse_log_time(Some(&params.end))?
+        .ok_or_else(|| ServerError::bad_request("Log range end is required"))?;
+    if start_time >= end_time {
+        return Err(ServerError::bad_request(
+            "Log range start must be before end",
+        ));
+    }
+
+    validate_log_levels(&params.level, state.runtime_log_backend.levels())?;
+    let levels = params.level.clone();
+    let search = params
+        .search
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    // Cap step + bucket count so a caller can't coerce `build_count_buckets`
+    // into emitting an arbitrarily long array. 86_400 = 1d (max meaningful
+    // bucket); 10_000 buckets keeps the volume response bounded regardless
+    // of the time range the caller picks.
+    let step_seconds = params.step_seconds.clamp(1, 86_400);
+    let range_secs = (end_time - start_time).num_seconds().max(0);
+    if range_secs / step_seconds > 10_000 {
+        return Err(ServerError::bad_request(
+            "Time range and step_seconds produce too many buckets (max 10000). \
+             Widen step_seconds or pick a shorter range.",
+        ));
+    }
+
+    let volume = state
+        .runtime_log_backend
+        .query_volume(
+            &deployment,
+            &project,
+            crate::server::deployment::logs::LogVolumeQuery {
+                start_time,
+                end_time,
+                step_seconds,
+                levels,
+                search,
+            },
+        )
+        .await
+        .map_err(|e| {
+            let error_msg = format!("{:#}", e);
+            if error_msg.contains("exceeds the limit") {
+                ServerError::bad_request(
+                    "Selected time range is too large for the log backend. Pick a shorter range.",
+                )
+                .expected()
+            } else {
+                ServerError::internal_anyhow(e, "Failed to fetch log volume")
+            }
+        })?;
+
+    Ok(Json(volume))
+}
+
+/// Validate caller-supplied `?level=` values against the configured backend's
+/// advertised level set. Returns a 400 with the accepted values as suggestions
+/// when an unknown level is passed so typos like `warning` (vs `warn`) surface
+/// loudly instead of silently returning empty results. An empty `levels` list
+/// means "no filter" and is accepted.
+fn validate_log_levels(levels: &[String], allowed: &[&'static str]) -> Result<(), ServerError> {
+    for level in levels {
+        if !allowed.iter().any(|a| a.eq_ignore_ascii_case(level)) {
+            return Err(ServerError::bad_request(format!(
+                "Unknown log level '{}'. See /api/v1/logs/capabilities for accepted values.",
+                level
+            ))
+            .with_suggestions(Some(allowed.iter().map(|s| (*s).to_string()).collect())));
+        }
+    }
+    Ok(())
+}
+
+fn parse_log_time(
+    value: Option<&str>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, ServerError> {
+    match value {
+        Some(value) if !value.trim().is_empty() => {
+            let parsed = chrono::DateTime::parse_from_rfc3339(value).map_err(|_| {
+                ServerError::bad_request(format!("Invalid RFC3339 timestamp: {}", value))
+            })?;
+            Ok(Some(parsed.with_timezone(&chrono::Utc)))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn default_log_count_step_seconds() -> i64 {
+    60
 }
 
 #[cfg(test)]

@@ -39,6 +39,10 @@ pub fn deployment_routes() -> Router<AppState> {
             "/projects/{project_name}/deployments/{deployment_id}/logs",
             get(super::handlers::stream_deployment_logs),
         )
+        .route(
+            "/projects/{project_name}/deployments/{deployment_id}/logs/volume",
+            get(super::handlers::query_deployment_log_volume),
+        )
 }
 
 /// Metacontroller webhook routes (token-authenticated on an internal listener).
