@@ -78,6 +78,16 @@ export default defineConfig({
             { label: 'Snowflake OAuth Provisioner', slug: 'extensions/snowflake-oauth-provisioner' },
           ],
         },
+        {
+          label: 'Resources',
+          items: [
+            { label: 'Overview', slug: 'resources' },
+            { label: 'Storage Model', slug: 'resources/storage' },
+            { label: 'HTTP API', slug: 'resources/api' },
+            { label: 'Custom Resources', slug: 'resources/custom-resources' },
+            { label: 'Schema Reference', slug: 'resources/schemas' },
+          ],
+        },
       ],
     }),
   ],

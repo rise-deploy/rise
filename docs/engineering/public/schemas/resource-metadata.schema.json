@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "annotations": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "default": {},
+      "type": "object"
+    },
+    "deletionTimestamp": {
+      "format": "date-time",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "discriminator": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "finalizers": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "name": {
+      "type": "string"
+    },
+    "revision": {
+      "format": "int64",
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "uid": {
+      "format": "uuid",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "name"
+  ],
+  "title": "ResourceMetadata",
+  "type": "object"
+}

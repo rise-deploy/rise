@@ -123,6 +123,9 @@ jobs:
       - name: Verify rise.toml schema is up to date
         run: mise rise-toml:schema:check
 
+      - name: Verify resource API schemas are up to date
+        run: mise resource:schema:check
+
       - name: Verify CRDs are up to date
         run: mise crd:check
 

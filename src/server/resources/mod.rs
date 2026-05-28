@@ -11,3 +11,4 @@ pub mod models;
 mod organization;
 pub mod path;
 pub mod routes;
+pub mod schemas;
