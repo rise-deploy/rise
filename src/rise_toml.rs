@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
 /// Root structure for rise.toml / .rise.toml configuration file
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 #[cfg_attr(feature = "backend", derive(schemars::JsonSchema))]
 pub struct ProjectBuildConfig {
     /// Optional version (must be 1 if present)

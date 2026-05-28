@@ -1467,7 +1467,7 @@ async fn compute_desired_children(
 
                 let runtime = crate::server::deployment::resource_builder::ContainerRuntime {
                     name: &spec.name,
-                    image: &spec.image,
+                    image: spec.image.as_deref().unwrap_or_default(),
                     http_port: spec.http_port,
                     replicas: spec
                         .replicas
@@ -1573,7 +1573,7 @@ async fn compute_desired_children(
                 }
                 let runtime = crate::server::deployment::resource_builder::ContainerRuntime {
                     name: &spec.name,
-                    image: &spec.image,
+                    image: spec.image.as_deref().unwrap_or_default(),
                     http_port: spec.http_port,
                     replicas: spec.replicas.map(|r| r as i32).unwrap_or(1),
                     cpu: spec.cpu.as_deref().unwrap_or(""),
@@ -2277,7 +2277,7 @@ mod tests {
         async fn get_credentials(
             &self,
             _repository: &str,
-            _tag: &str,
+            _tags: &[&str],
         ) -> Result<RegistryCredentials> {
             unreachable!("not used in these tests")
         }

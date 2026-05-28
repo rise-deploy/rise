@@ -38,21 +38,14 @@ fn build_multi_container_payload(
 
     let mut container_payload = Vec::with_capacity(resolved.containers.len());
     for c in &resolved.containers {
-        let image = c.image.as_deref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "[containers.{}] must set `image = \"...\"` in this CLI version. \
-                 Per-container build orchestration is a planned follow-up; for now, \
-                 build and push each container's image out-of-band and reference it here.",
-                c.name
-            )
-        })?;
-        if c.build.is_some() {
-            bail!(
-                "[containers.{}] has a [build] block but this CLI version cannot build per-container images yet. \
-                 Build and push it manually, then set `image = \"...\"` for now.",
-                c.name
-            );
-        }
+        // Each container needs exactly one of `image` or `[build]`.
+        // - With `image`: pass the user-supplied reference through; backend
+        //   uses it verbatim and the CLI skips the push for this container.
+        // - With `[build]`: leave `image` unset; the backend derives a tag
+        //   under the project repository and returns it in
+        //   `container_images` so the CLI can `docker build -t <tag>`.
+        // (`load_full_project_config` already enforces exactly-one-of.)
+        let image_payload = c.image.as_deref().map(serde_json::Value::from);
 
         let mut env_overrides = Vec::with_capacity(c.env.len());
         for (key, value) in &c.env {
@@ -93,10 +86,10 @@ fn build_multi_container_payload(
             }
         });
 
-        let mut spec = serde_json::json!({
-            "name": c.name,
-            "image": image,
-        });
+        let mut spec = serde_json::json!({ "name": c.name });
+        if let Some(image) = image_payload {
+            spec["image"] = image;
+        }
         if let Some(p) = c.http_port {
             spec["http_port"] = serde_json::json!(p);
         }
@@ -549,6 +542,11 @@ struct CreateDeploymentResponse {
     /// Kept for deserialization compatibility with older backends.
     #[allow(dead_code)]
     credentials: RegistryCredentials,
+    /// Multi-container deployments only: map of container name → fully-
+    /// qualified client-facing image tag the CLI should build and push.
+    /// Absent for single-container responses; older backends omit it.
+    #[serde(default)]
+    container_images: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -948,6 +946,21 @@ pub async fn create_deployment(
                 "current project"
             }
         );
+    } else if deployment_info.container_images.is_some() {
+        // Multi-container build path. The backend returned the resolved
+        // image tag for every container; we build/push each one in turn
+        // using its own `[containers.X.build]` config. Pre-built containers
+        // (the ones whose rise.toml entry sets `image = "..."`) are
+        // skipped — the backend already persisted their tag verbatim.
+        build_and_push_multi_container(
+            http_client,
+            backend_url,
+            &token,
+            config,
+            &deploy_opts,
+            &deployment_info,
+        )
+        .await?;
     } else {
         // Build from source path: Execute build and push.
         //
@@ -1046,6 +1059,164 @@ pub async fn create_deployment(
 
     Ok(())
 }
+/// Multi-container build path: builds every container with `[build]` set
+/// using the image tag the backend returned (in
+/// `CreateDeploymentResponse.container_images`) and pushes it. Containers
+/// whose rise.toml entry is `image = "..."` are pre-built and skipped — the
+/// backend already persisted the user-provided tag.
+///
+/// Builds run sequentially in the iteration order of `[containers.<name>]`
+/// (BTreeMap → lexicographic). All builds share a single registry login,
+/// because the backend mints credentials whose scope covers every
+/// container's tag (critical for tag-scoped providers like JFrog).
+async fn build_and_push_multi_container(
+    http_client: &Client,
+    backend_url: &str,
+    token: &str,
+    config: &Config,
+    deploy_opts: &DeploymentOptions<'_>,
+    deployment_info: &CreateDeploymentResponse,
+) -> Result<()> {
+    let toml_config = deploy_opts.toml_config.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "multi-container deployment created but no rise.toml loaded — cannot build images"
+        )
+    })?;
+    let container_images = deployment_info
+        .container_images
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("backend response missing container_images"))?;
+
+    let resolved = toml_config.resolve_deploy();
+
+    let registry_info = fetch_deployment_registry_credentials(
+        http_client,
+        backend_url,
+        token,
+        deploy_opts.project_name,
+        &deployment_info.deployment_id,
+    )
+    .await?;
+
+    // Determine container-cli from the first buildable container (or fall
+    // back to CLI args / config defaults). The CLI tool used has to match
+    // across all containers; using each container's own would be confusing.
+    // BuildOptions::from_build_args already resolves this from rise.toml's
+    // top-level `[build]` if set, else CLI defaults — we just feed it any
+    // BuildConfig and let it resolve.
+    let first_build_options = {
+        let dummy_image = "rise-multi-container-login-only".to_string();
+        // Use the first container's build config to pick container_cli;
+        // every container should use the same toolchain on this host.
+        let mut for_login = toml_config.clone();
+        for_login.build = resolved
+            .containers
+            .iter()
+            .find_map(|c| c.build.clone())
+            .or(toml_config.build.clone());
+        BuildOptions::from_build_args(
+            config,
+            dummy_image,
+            deploy_opts.path.to_string(),
+            deploy_opts.build_args,
+            Some(for_login),
+            registry_info.target_platform.as_deref(),
+        )
+    };
+
+    login_to_registry(
+        http_client,
+        backend_url,
+        token,
+        first_build_options.container_cli.command(),
+        &registry_info.credentials,
+        deploy_opts.project_name,
+        &deployment_info.deployment_id,
+    )
+    .await?;
+
+    update_deployment_status(
+        http_client,
+        backend_url,
+        token,
+        deploy_opts.project_name,
+        &deployment_info.deployment_id,
+        "Building",
+        None,
+    )
+    .await?;
+
+    for container in &resolved.containers {
+        let Some(image_tag) = container_images.get(&container.name) else {
+            // Shouldn't happen — the backend populates every container.
+            anyhow::bail!(
+                "Server response is missing image tag for container '{}'",
+                container.name
+            );
+        };
+
+        if container.build.is_none() {
+            info!(
+                "✓ Container '{}' uses pre-built image '{}', skipping build",
+                container.name, image_tag
+            );
+            continue;
+        }
+
+        // Feed BuildOptions::from_build_args a toml_config view that has
+        // this container's [build] at the top level, so backend / dockerfile
+        // / build_context / etc. all come from the per-container config.
+        let mut per_container_toml = toml_config.clone();
+        per_container_toml.build = container.build.clone();
+
+        let options = BuildOptions::from_build_args(
+            config,
+            image_tag.clone(),
+            deploy_opts.path.to_string(),
+            deploy_opts.build_args,
+            Some(per_container_toml),
+            registry_info.target_platform.as_deref(),
+        )
+        .with_push(true);
+
+        log_platform_choice(&options.platform, options.platform_source, "Building");
+        info!("→ Building container '{}' as {}", container.name, image_tag);
+
+        if let Err(e) = build::build_image(options) {
+            let msg = format!("Build of container '{}' failed: {}", container.name, e);
+            update_deployment_status(
+                http_client,
+                backend_url,
+                token,
+                deploy_opts.project_name,
+                &deployment_info.deployment_id,
+                "Failed",
+                Some(&msg),
+            )
+            .await?;
+            return Err(e);
+        }
+        info!("  ✓ Pushed container '{}'", container.name);
+    }
+
+    update_deployment_status(
+        http_client,
+        backend_url,
+        token,
+        deploy_opts.project_name,
+        &deployment_info.deployment_id,
+        "Pushed",
+        None,
+    )
+    .await?;
+
+    info!(
+        "✓ Successfully built and pushed {} container(s)",
+        resolved.containers.len()
+    );
+    Ok(())
+}
+
 /// Login to the container registry, marking the deployment as Failed on error.
 async fn login_to_registry(
     http_client: &Client,

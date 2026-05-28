@@ -232,13 +232,20 @@ A single Rise deployment can run multiple containers — for example a frontend,
 [project]
 name = "my-app"
 
+# Each container declares exactly one of `image` (pre-built reference) or
+# a `[containers.<name>.build]` block (the CLI builds and pushes for you).
+
+[containers.frontend.build]
+backend = "docker"
+dockerfile = "frontend/Dockerfile"
 [containers.frontend]
-image = "registry.example.com/my-app/frontend:1.2.3"
 http_port = 8080
 replicas = 2
 
+[containers.backend.build]
+backend = "docker"
+dockerfile = "backend/Dockerfile"
 [containers.backend]
-image = "registry.example.com/my-app/backend:1.2.3"
 http_port = 9090
 replicas = 3
 # Override the default HTTP probe (defaults to GET / when http_port is set):
@@ -247,6 +254,7 @@ health_check = { path = "/health", initial_delay_seconds = 5 }
 env = { LOG_LEVEL = "info" }
 
 [containers.worker]
+# Pre-built image — the CLI won't try to build or push this one.
 image = "registry.example.com/my-app/worker:1.2.3"
 replicas = 4
 # Workers have no http_port → no Service, no HTTP probes.
@@ -256,10 +264,11 @@ replicas = 4
 "/" = { container = "frontend" }
 ```
 
+When you run `rise deploy`, the backend allocates a deployment ID and returns one image tag per container with `[build]` (shared registry, distinct tags per container). The CLI logs in once — the temporary credentials it gets back are scoped to cover every container's tag — and then builds and pushes each container in turn. Containers with a pre-built `image` are passed through unchanged.
+
 Notes:
 
 - `[containers]` is mutually exclusive with the top-level `[build]` and `[deploy]` sections. Existing single-container projects keep working unchanged — the top-level `[build]`/`[deploy]` is treated as an implicit `app` container.
-- Each container must set `image = "..."` in the current CLI release. Per-container build orchestration is a planned follow-up; for now, build and push each container's image out-of-band (e.g., from CI).
 - Containers without `http_port` get no `Service` and no HTTP probes — exactly what you want for workers / batch jobs.
 - `health_check = false` disables probes entirely on a container.
 - Routes are matched longest-prefix-first by the ingress, so `/api` shadows `/` correctly. If `[routes]` is omitted and exactly one container has `http_port`, Rise synthesises `/` → that container.

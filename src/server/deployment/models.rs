@@ -254,13 +254,22 @@ pub struct HealthCheckSpec {
     pub readiness_enabled: Option<bool>,
 }
 
-/// One container in a multi-container deployment request. The CLI builds (or
-/// resolves) every container's image before sending this; the server treats
-/// `image` as authoritative.
+/// One container in a multi-container deployment.
+///
+/// In a `CreateDeploymentRequest` `image` is `None` when the CLI is going to
+/// build and push the container from source; the server then derives the
+/// internal image tag (`<deployment_id>-<container_name>`) and stores the
+/// fully-qualified reference on the persisted spec. Containers that point at
+/// a pre-built image set `image = Some("<external>:<tag>")` and skip the
+/// build/push.
+///
+/// In the persisted JSON (and any response from the server) every container
+/// has `image = Some(...)` filled in.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ContainerSpec {
     pub name: String,
-    pub image: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -358,6 +367,14 @@ pub struct CreateDeploymentResponse {
     /// endpoint `GET /projects/{name}/deployments/{id}/registry-credentials` instead.
     /// This field is kept for backward compatibility with older CLI versions.
     pub credentials: crate::server::registry::models::RegistryCredentials,
+    /// Multi-container deployments only: map of container name → the
+    /// fully-qualified client-facing image tag the CLI should build and push
+    /// for that container. Server-derived tags share the project's repository
+    /// and the returned `credentials` are minted to cover every entry in this
+    /// map. Containers with a pre-built image (the request set `image`)
+    /// appear with the user-supplied value so the CLI can skip the push.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_images: Option<std::collections::BTreeMap<String, String>>,
 }
 
 // Request to update deployment status

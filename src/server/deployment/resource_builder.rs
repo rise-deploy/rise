@@ -2130,7 +2130,7 @@ mod tests {
         async fn get_credentials(
             &self,
             _repository: &str,
-            _tag: &str,
+            _tags: &[&str],
         ) -> Result<RegistryCredentials> {
             unreachable!("not used in these tests")
         }

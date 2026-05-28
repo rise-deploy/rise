@@ -288,23 +288,103 @@ fn filter_env_overrides_by_environment<'a>(
 ///
 /// Only client-allowed source values (`toml`, `cli`) are accepted. Unknown or
 /// server-managed source values are replaced with `cli`.
-/// If the create request carries multi-container fields, serialise them to
-/// JSON and persist on the deployment row. No-op for legacy single-container
-/// requests (older CLI clients).
+/// Outcome of `resolve_multi_container_images`.
+///
+/// Holds everything the caller needs to: mint registry credentials with the
+/// right scope, persist the deployment's container side-data, and return the
+/// per-container image map to the CLI.
+#[cfg(feature = "backend")]
+struct ResolvedContainerPayload {
+    /// Containers with `image` filled in for every entry. Server-derived
+    /// entries hold an internal-facing reference (what the cluster pulls);
+    /// pre-built entries keep the user-supplied value verbatim.
+    resolved_specs: Vec<crate::server::deployment::models::ContainerSpec>,
+    /// Tag suffixes for which the server is going to derive image tags and
+    /// the CLI is expected to push (i.e. containers whose request entry had
+    /// `image == None`). Used to scope the credential mint — JFrog needs
+    /// every tag listed; ECR/GitLab scope by repository and ignore them.
+    push_tags: Vec<String>,
+    /// Map of container_name → fully-qualified CLIENT-facing image tag the
+    /// CLI should `docker build -t` and `docker push` to. Pre-built
+    /// containers map to their original `image` so the CLI sees a uniform
+    /// view and can skip the push for those.
+    container_images: std::collections::BTreeMap<String, String>,
+}
+
+/// Normalize the container list in a `CreateDeploymentRequest`.
+///
+/// For each container with no `image` set, derive both an internal-facing
+/// tag (persisted on the row, used by the K8s controller to pull) and a
+/// client-facing tag (returned to the CLI so it knows what to push).
+/// Containers that came in with an explicit `image` are passed through
+/// unchanged and excluded from `push_tags` (no push is expected for them).
+#[cfg(feature = "backend")]
+fn resolve_multi_container_images(
+    state: &AppState,
+    project_name: &str,
+    deployment_id: &str,
+    specs: &[crate::server::deployment::models::ContainerSpec],
+) -> ResolvedContainerPayload {
+    use crate::server::registry::ImageTagType;
+
+    let mut resolved_specs = Vec::with_capacity(specs.len());
+    let mut push_tags = Vec::new();
+    let mut container_images = std::collections::BTreeMap::new();
+
+    for spec in specs {
+        let mut resolved = spec.clone();
+        let tag_suffix = format!("{}-{}", deployment_id, spec.name);
+
+        let client_facing_tag = match spec.image.as_deref() {
+            Some(image) if !image.is_empty() => {
+                // Pre-built — CLI doesn't push, server doesn't derive.
+                image.to_string()
+            }
+            _ => {
+                // Server-derived. Persist the internal tag (controller-facing,
+                // possibly cluster-local), return the client tag to the CLI.
+                let internal = state.registry_provider.get_image_tag(
+                    project_name,
+                    &tag_suffix,
+                    ImageTagType::Internal,
+                );
+                resolved.image = Some(internal);
+                push_tags.push(tag_suffix.clone());
+                state.registry_provider.get_image_tag(
+                    project_name,
+                    &tag_suffix,
+                    ImageTagType::ClientFacing,
+                )
+            }
+        };
+
+        container_images.insert(spec.name.clone(), client_facing_tag);
+        resolved_specs.push(resolved);
+    }
+
+    ResolvedContainerPayload {
+        resolved_specs,
+        push_tags,
+        container_images,
+    }
+}
+
+/// Persist a deployment's multi-container side-data. Pass the RESOLVED specs
+/// (every container has `image` set) so the reconciler can read them
+/// directly from JSON without re-deriving anything.
+#[cfg(feature = "backend")]
 async fn persist_multi_container_fields(
     state: &AppState,
     deployment_id: uuid::Uuid,
-    payload: &CreateDeploymentRequest,
+    resolved_specs: &[crate::server::deployment::models::ContainerSpec],
+    routes: &[crate::server::deployment::models::RouteSpec],
 ) -> Result<(), ServerError> {
-    let Some(containers) = &payload.containers else {
-        return Ok(());
-    };
     let containers_json =
-        serde_json::to_value(containers).internal_err("Failed to serialise containers")?;
-    let routes_json = if payload.routes.is_empty() {
+        serde_json::to_value(resolved_specs).internal_err("Failed to serialise containers")?;
+    let routes_json = if routes.is_empty() {
         None
     } else {
-        Some(serde_json::to_value(&payload.routes).internal_err("Failed to serialise routes")?)
+        Some(serde_json::to_value(routes).internal_err("Failed to serialise routes")?)
     };
     db_deployments::set_containers(
         &state.db_pool,
@@ -996,6 +1076,16 @@ pub async fn create_deployment(
         effective_http_port, deployment_id
     );
 
+    // Resolve multi-container images before minting credentials so the
+    // mint covers every tag the CLI is going to push. Returns None for
+    // legacy single-container requests.
+    #[cfg(feature = "backend")]
+    let multi_container_resolved = payload.containers.as_ref().map(|specs| {
+        resolve_multi_container_images(&state, &payload.project, &deployment_id, specs)
+    });
+    #[cfg(not(feature = "backend"))]
+    let multi_container_resolved: Option<()> = None;
+
     // Resolve effective deployment resources (replicas, cpu, memory)
     // Priority: request payload > platform defaults
     // Validation against constraints happens after rollback inheritance (below)
@@ -1159,7 +1249,15 @@ pub async fn create_deployment(
         )
         .await?;
 
-        persist_multi_container_fields(&state, new_deployment.id, &payload).await?;
+        if let Some(ref r) = multi_container_resolved {
+            persist_multi_container_fields(
+                &state,
+                new_deployment.id,
+                &r.resolved_specs,
+                &payload.routes,
+            )
+            .await?;
+        }
 
         // Handle environment variables based on use_source_env_vars flag
         if payload.use_source_env_vars {
@@ -1257,6 +1355,9 @@ pub async fn create_deployment(
                 expires_in: None,
                 auth_method: Default::default(),
             },
+            container_images: multi_container_resolved
+                .as_ref()
+                .map(|r| r.container_images.clone()),
         }));
     }
 
@@ -1291,9 +1392,12 @@ pub async fn create_deployment(
                 &deployment_id,
                 ImageTagType::ClientFacing,
             );
+            // push-image is single-container only; the multi-container CLI
+            // always sends `image: None` at the top level and uses the
+            // build-from-source branch below.
             let credentials = state
                 .registry_provider
-                .get_credentials(&payload.project, &deployment_id)
+                .get_credentials(&payload.project, &[deployment_id.as_str()])
                 .await
                 .internal_err("Failed to get credentials")?;
 
@@ -1329,7 +1433,15 @@ pub async fn create_deployment(
                 deployment_id, payload.project
             );
 
-            persist_multi_container_fields(&state, deployment.id, &payload).await?;
+            if let Some(ref r) = multi_container_resolved {
+                persist_multi_container_fields(
+                    &state,
+                    deployment.id,
+                    &r.resolved_specs,
+                    &payload.routes,
+                )
+                .await?;
+            }
 
             // Copy project environment variables to deployment
             crate::db::env_vars::copy_project_env_vars_to_deployment(
@@ -1369,6 +1481,9 @@ pub async fn create_deployment(
                 deployment_id,
                 image_tag,
                 credentials,
+                container_images: multi_container_resolved
+                    .as_ref()
+                    .map(|r| r.container_images.clone()),
             }));
         }
 
@@ -1424,7 +1539,15 @@ pub async fn create_deployment(
             deployment_id, payload.project
         );
 
-        persist_multi_container_fields(&state, deployment.id, &payload).await?;
+        if let Some(ref r) = multi_container_resolved {
+            persist_multi_container_fields(
+                &state,
+                deployment.id,
+                &r.resolved_specs,
+                &payload.routes,
+            )
+            .await?;
+        }
 
         // Copy project environment variables to deployment
         crate::db::env_vars::copy_project_env_vars_to_deployment(
@@ -1486,6 +1609,9 @@ pub async fn create_deployment(
                 expires_in: None,
                 auth_method: Default::default(),
             },
+            container_images: multi_container_resolved
+                .as_ref()
+                .map(|r| r.container_images.clone()),
         }))
     } else {
         // Path 2: Build from source (current behavior)
@@ -1496,12 +1622,25 @@ pub async fn create_deployment(
             ImageTagType::ClientFacing,
         );
 
-        // Get registry credentials scoped to this exact tag
-        let credentials = state
-            .registry_provider
-            .get_credentials(&payload.project, &deployment_id)
-            .await
-            .internal_err("Failed to get credentials")?;
+        // Get registry credentials scoped to every tag that's going to be
+        // pushed. For single-container that's just the deployment ID; for
+        // multi-container it's the per-container tag list returned by
+        // `resolve_multi_container_images`, so a single mint covers every
+        // `docker push` the CLI will perform (critical for JFrog, which
+        // scopes by tag).
+        let credentials = {
+            let owned_tags: Vec<String> = multi_container_resolved
+                .as_ref()
+                .filter(|r| !r.push_tags.is_empty())
+                .map(|r| r.push_tags.clone())
+                .unwrap_or_else(|| vec![deployment_id.clone()]);
+            let tag_refs: Vec<&str> = owned_tags.iter().map(String::as_str).collect();
+            state
+                .registry_provider
+                .get_credentials(&payload.project, &tag_refs)
+                .await
+                .internal_err("Failed to get credentials")?
+        };
 
         debug!("Image tag: {}", image_tag);
 
@@ -1538,7 +1677,15 @@ pub async fn create_deployment(
             deployment_id, payload.project
         );
 
-        persist_multi_container_fields(&state, deployment.id, &payload).await?;
+        if let Some(ref r) = multi_container_resolved {
+            persist_multi_container_fields(
+                &state,
+                deployment.id,
+                &r.resolved_specs,
+                &payload.routes,
+            )
+            .await?;
+        }
 
         // Copy project environment variables to deployment
         crate::db::env_vars::copy_project_env_vars_to_deployment(
@@ -1582,6 +1729,9 @@ pub async fn create_deployment(
             deployment_id,
             image_tag,
             credentials,
+            container_images: multi_container_resolved
+                .as_ref()
+                .map(|r| r.container_images.clone()),
         }))
     }
 }
@@ -2750,7 +2900,7 @@ mod tests {
     ) -> ContainerSpec {
         ContainerSpec {
             name: name.to_string(),
-            image: "img".to_string(),
+            image: Some("img".to_string()),
             http_port: None,
             replicas,
             cpu: cpu.map(str::to_string),

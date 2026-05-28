@@ -77,12 +77,19 @@ pub async fn get_deployment_registry_credentials(
         ));
     }
 
-    // Get credentials from the registry provider
+    // Get credentials from the registry provider.
+    //
+    // For multi-container deployments the credentials need to cover every
+    // container's tag — provider-side scoping (JFrog) is per-tag, so a
+    // single-tag mint would only let the CLI push one of the N images.
+    // Look up the persisted container list to derive the full tag set.
     let repository = project.name.clone();
+    let push_tags = derive_push_tags(&state, &deployment).await?;
+    let push_tag_refs: Vec<&str> = push_tags.iter().map(String::as_str).collect();
 
     let credentials = state
         .registry_provider
-        .get_credentials(&repository, &deployment_id)
+        .get_credentials(&repository, &push_tag_refs)
         .await
         .internal_err("Failed to get registry credentials")
         .map_err(|e| {
@@ -104,4 +111,36 @@ pub async fn get_deployment_registry_credentials(
         repository,
         target_platform,
     }))
+}
+
+/// Resolve the full set of image tags a deployment's CLI push needs to write.
+///
+/// Single-container deployments (legacy / `containers IS NULL`) push exactly
+/// one image tagged with the deployment ID. Multi-container deployments push
+/// one image per container, all sharing the project repository and tagged
+/// `<deployment_id>-<container_name>`. The returned slice is what
+/// `RegistryProvider::get_credentials` needs in order to scope the minted
+/// credential to every push — critical for tag-scoped providers like JFrog.
+async fn derive_push_tags(
+    state: &AppState,
+    deployment: &crate::db::models::Deployment,
+) -> Result<Vec<String>, ServerError> {
+    let side = db_deployments::get_containers(&state.db_pool, deployment.id)
+        .await
+        .internal_err("Failed to load deployment containers")?;
+
+    let container_specs: Vec<crate::server::deployment::models::ContainerSpec> = side
+        .containers
+        .as_ref()
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
+    if container_specs.is_empty() {
+        return Ok(vec![deployment.deployment_id.clone()]);
+    }
+
+    Ok(container_specs
+        .iter()
+        .map(|c| format!("{}-{}", deployment.deployment_id, c.name))
+        .collect())
 }

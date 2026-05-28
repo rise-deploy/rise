@@ -207,25 +207,23 @@ impl JfrogProvider {
 
 #[async_trait]
 impl RegistryProvider for JfrogProvider {
-    async fn get_credentials(&self, repository: &str, tag: &str) -> Result<RegistryCredentials> {
-        // Docker/OCI push writes to three sub-path groups:
-        //   1. {tag}/** — manifest (manifest.json or list.manifest.json)
-        //   2. _uploads/** — blob staging during upload
-        //   3. sha256*/* — content-addressed manifests written by BuildKit
-        //      (attestations, multi-platform indexes stored as siblings of the tag)
-        //
-        // The sha256 scope uses `sha256*/*` (not `sha256:*`) because JFrog
-        // stores these as `sha256:{digest}/` directories and the colon is
-        // matched by the glob wildcard.
-        let base = self.scope_path(repository);
-        let perms = &self.config.push_permissions;
-        let scope = format!(
-            "artifact:{base}/{tag}/**:{perms} artifact:{base}/_uploads/**:{perms} artifact:{base}/sha256*/*:{perms}",
+    async fn get_credentials(
+        &self,
+        repository: &str,
+        tags: &[&str],
+    ) -> Result<RegistryCredentials> {
+        if tags.is_empty() {
+            anyhow::bail!("JFrog get_credentials called with no tags");
+        }
+        let scope = build_push_scope(
+            &self.scope_path(repository),
+            tags,
+            &self.config.push_permissions,
         );
 
         tracing::info!(
             repository = repository,
-            tag = tag,
+            tags = ?tags,
             scope = %scope,
             "Fetching scoped JFrog push token"
         );
@@ -325,5 +323,78 @@ impl RegistryProvider for JfrogProvider {
 
     fn requires_pull_secret(&self) -> bool {
         self.config.mint_pull_secrets
+    }
+}
+
+/// Build the JFrog `scope` string for a push token covering one or more tags.
+///
+/// Docker/OCI push writes to three sub-path groups, per tag:
+///   1. `{tag}/**` — manifest (manifest.json or list.manifest.json)
+///   2. `_uploads/**` — blob staging during upload (SHARED across tags
+///      pushed against the same repository)
+///   3. `sha256*/*` — content-addressed manifests written by BuildKit,
+///      stored as siblings of the tag (SHARED across tags as well)
+///
+/// The sha256 scope uses `sha256*/*` (not `sha256:*`) because JFrog stores
+/// these as `sha256:{digest}/` directories and the colon is matched by the
+/// glob wildcard.
+///
+/// For multi-container deployments the function must extend the scope to
+/// cover every tag's manifest path; the shared blob and content-addressed
+/// paths only need to appear once.
+fn build_push_scope(base: &str, tags: &[&str], perms: &str) -> String {
+    let mut scope_parts: Vec<String> = tags
+        .iter()
+        .map(|t| format!("artifact:{base}/{t}/**:{perms}"))
+        .collect();
+    scope_parts.push(format!("artifact:{base}/_uploads/**:{perms}"));
+    scope_parts.push(format!("artifact:{base}/sha256*/*:{perms}"));
+    scope_parts.join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_push_scope;
+
+    #[test]
+    fn single_tag_scope_matches_legacy_format() {
+        // Single-container deployments mint a token covering one manifest
+        // path plus the shared blob and content-addressed scopes. This must
+        // stay byte-compatible with what JFrog has been seeing in prod.
+        let scope = build_push_scope("docker/my-app", &["20251215-204525"], "write");
+        assert_eq!(
+            scope,
+            "artifact:docker/my-app/20251215-204525/**:write \
+             artifact:docker/my-app/_uploads/**:write \
+             artifact:docker/my-app/sha256*/*:write"
+        );
+    }
+
+    #[test]
+    fn multi_tag_scope_covers_every_container() {
+        // Multi-container: every container's tag manifest path needs its
+        // own artifact: scope. Without this the second push (e.g. the
+        // backend image after the frontend) would be rejected by JFrog
+        // with a 401, since the token's scope only covers the first tag.
+        let tags = ["20251215-204525-frontend", "20251215-204525-backend"];
+        let scope = build_push_scope("docker/my-app", &tags, "write");
+        assert!(scope.contains("artifact:docker/my-app/20251215-204525-frontend/**:write"));
+        assert!(scope.contains("artifact:docker/my-app/20251215-204525-backend/**:write"));
+        // Shared scopes still appear exactly once.
+        assert_eq!(scope.matches("/_uploads/**").count(), 1);
+        assert_eq!(scope.matches("/sha256*/*").count(), 1);
+    }
+
+    #[test]
+    fn scope_preserves_caller_tag_order() {
+        // Deterministic order makes the scope string stable across
+        // reconciles — useful when something logs or compares the string.
+        let tags = ["c", "a", "b"];
+        let scope = build_push_scope("docker/x", &tags, "write");
+        let c_pos = scope.find("/c/**").expect("c");
+        let a_pos = scope.find("/a/**").expect("a");
+        let b_pos = scope.find("/b/**").expect("b");
+        assert!(c_pos < a_pos);
+        assert!(a_pos < b_pos);
     }
 }
