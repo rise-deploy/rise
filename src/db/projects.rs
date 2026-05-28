@@ -18,6 +18,7 @@ pub async fn list(pool: &PgPool, owner_user_id: Option<Uuid>) -> Result<Vec<Proj
                 access_class,
                 owner_user_id, owner_team_id,
                 finalizers, source_url,
+                template_id, template_image,
                 created_at, updated_at
             FROM projects
             WHERE owner_user_id = $1
@@ -37,6 +38,7 @@ pub async fn list(pool: &PgPool, owner_user_id: Option<Uuid>) -> Result<Vec<Proj
                 access_class,
                 owner_user_id, owner_team_id,
                 finalizers, source_url,
+                template_id, template_image,
                 created_at, updated_at
             FROM projects
             ORDER BY created_at DESC
@@ -60,6 +62,7 @@ pub async fn list_accessible_by_user(pool: &PgPool, user_id: Uuid) -> Result<Vec
             p.access_class,
             p.owner_user_id, p.owner_team_id,
             p.finalizers, p.source_url,
+            p.template_id, p.template_image,
             p.created_at, p.updated_at
         FROM projects p
         WHERE
@@ -127,6 +130,7 @@ pub async fn list_accessible_by_team(pool: &PgPool, team_id: Uuid) -> Result<Vec
             p.access_class,
             p.owner_user_id, p.owner_team_id,
             p.finalizers, p.source_url,
+            p.template_id, p.template_image,
             p.created_at, p.updated_at
         FROM projects p
         WHERE
@@ -158,6 +162,7 @@ pub async fn find_by_name(pool: &PgPool, name: &str) -> Result<Option<Project>> 
             access_class,
             owner_user_id, owner_team_id,
             finalizers, source_url,
+            template_id, template_image,
             created_at, updated_at
         FROM projects
         WHERE name = $1
@@ -182,6 +187,7 @@ pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Project>> {
             access_class,
             owner_user_id, owner_team_id,
             finalizers, source_url,
+            template_id, template_image,
             created_at, updated_at
         FROM projects
         WHERE id = $1
@@ -207,6 +213,7 @@ pub async fn find_by_ids(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<Project>> {
             access_class,
             owner_user_id, owner_team_id,
             finalizers, source_url,
+            template_id, template_image,
             created_at, updated_at
         FROM projects
         WHERE id = ANY($1)
@@ -220,7 +227,10 @@ pub async fn find_by_ids(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<Project>> {
     Ok(projects)
 }
 
-/// Create a new project
+/// Create a new project. Thin wrapper around [`create_with_template`] for
+/// callers (bootstrap, deployment handlers, tests) that never associate a
+/// quickstart template at creation time.
+#[allow(dead_code)]
 pub async fn create<'a, E>(
     executor: E,
     name: &str,
@@ -233,19 +243,52 @@ pub async fn create<'a, E>(
 where
     E: sqlx::Executor<'a, Database = sqlx::Postgres>,
 {
+    create_with_template(
+        executor,
+        name,
+        status,
+        access_class,
+        owner_user_id,
+        owner_team_id,
+        source_url,
+        None,
+        None,
+    )
+    .await
+}
+
+/// Create a new project, optionally remembering the quickstart template it
+/// was started from. The image:tag is snapshotted so the UI can later detect
+/// drift between the deployed version and the current catalog entry.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_with_template<'a, E>(
+    executor: E,
+    name: &str,
+    status: ProjectStatus,
+    access_class: String,
+    owner_user_id: Option<Uuid>,
+    owner_team_id: Option<Uuid>,
+    source_url: Option<&str>,
+    template_id: Option<&str>,
+    template_image: Option<&str>,
+) -> Result<Project>
+where
+    E: sqlx::Executor<'a, Database = sqlx::Postgres>,
+{
     let status_str = status.to_string();
 
     let project = sqlx::query_as!(
         Project,
         r#"
-        INSERT INTO projects (name, status, access_class, owner_user_id, owner_team_id, source_url)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        INSERT INTO projects (name, status, access_class, owner_user_id, owner_team_id, source_url, template_id, template_image)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         RETURNING
             id, name,
             status as "status: ProjectStatus",
             access_class,
             owner_user_id, owner_team_id,
             finalizers, source_url,
+            template_id, template_image,
             created_at, updated_at
         "#,
         name,
@@ -253,11 +296,45 @@ where
         access_class,
         owner_user_id,
         owner_team_id,
-        source_url
+        source_url,
+        template_id,
+        template_image
     )
     .fetch_one(executor)
     .await
     .context("Failed to create project")?;
+
+    Ok(project)
+}
+
+/// Update the stored `template_image` for a project — called when redeploying
+/// from a template that has moved ahead of the previously deployed version.
+pub async fn update_template_image(
+    pool: &PgPool,
+    id: Uuid,
+    template_image: &str,
+) -> Result<Project> {
+    let project = sqlx::query_as!(
+        Project,
+        r#"
+        UPDATE projects
+        SET template_image = $2
+        WHERE id = $1
+        RETURNING
+            id, name,
+            status as "status: ProjectStatus",
+            access_class,
+            owner_user_id, owner_team_id,
+            finalizers, source_url,
+            template_id, template_image,
+            created_at, updated_at
+        "#,
+        id,
+        template_image
+    )
+    .fetch_one(pool)
+    .await
+    .context("Failed to update project template image")?;
 
     Ok(project)
 }
@@ -278,6 +355,7 @@ pub async fn update_status(pool: &PgPool, id: Uuid, status: ProjectStatus) -> Re
             access_class,
             owner_user_id, owner_team_id,
             finalizers, source_url,
+            template_id, template_image,
             created_at, updated_at
         "#,
         id,
@@ -304,6 +382,7 @@ pub async fn update_access_class(pool: &PgPool, id: Uuid, access_class: String) 
             access_class,
             owner_user_id, owner_team_id,
             finalizers, source_url,
+            template_id, template_image,
             created_at, updated_at
         "#,
         id,
@@ -335,6 +414,7 @@ pub async fn update_owner(
             access_class,
             owner_user_id, owner_team_id,
             finalizers, source_url,
+            template_id, template_image,
             created_at, updated_at
         "#,
         id,
@@ -366,6 +446,7 @@ pub async fn update_source_url(
             access_class,
             owner_user_id, owner_team_id,
             finalizers, source_url,
+            template_id, template_image,
             created_at, updated_at
         "#,
         id,
@@ -579,6 +660,7 @@ pub async fn mark_deleting(pool: &PgPool, id: Uuid) -> Result<Project> {
             access_class,
             owner_user_id, owner_team_id,
             finalizers, source_url,
+            template_id, template_image,
             created_at, updated_at
         "#,
         id
@@ -601,6 +683,7 @@ pub async fn find_deleting(pool: &PgPool, limit: i64) -> Result<Vec<Project>> {
             access_class,
             owner_user_id, owner_team_id,
             finalizers, source_url,
+            template_id, template_image,
             created_at, updated_at
         FROM projects
         WHERE status = 'Deleting'
@@ -675,6 +758,7 @@ pub async fn find_deleting_with_finalizer(
             access_class,
             owner_user_id, owner_team_id,
             finalizers, source_url,
+            template_id, template_image,
             created_at, updated_at
         FROM projects
         WHERE status = 'Deleting' AND $1 = ANY(finalizers)
@@ -720,6 +804,7 @@ pub async fn list_active(pool: &PgPool) -> Result<Vec<Project>> {
             access_class,
             owner_user_id, owner_team_id,
             finalizers, source_url,
+            template_id, template_image,
             created_at, updated_at
         FROM projects
         WHERE status NOT IN ('Deleting', 'Terminated')
@@ -983,6 +1068,72 @@ mod tests {
             vec![project.id],
             "team member user A should own the team's project via team membership"
         );
+    }
+
+    /// Round-trip: create a project from a template, observe both fields, then
+    /// reset `template_image` via `update_template_image` and verify the row
+    /// reflects the new image while `template_id` stays put.
+    #[sqlx::test]
+    async fn test_template_image_round_trip(pool: PgPool) {
+        let user = crate::db::users::create(&pool, "tpl@example.com")
+            .await
+            .expect("Failed to create test user");
+
+        let project = create_with_template(
+            &pool,
+            "tpl-rt",
+            ProjectStatus::Stopped,
+            "default".to_string(),
+            Some(user.id),
+            None,
+            None,
+            Some("welcome"),
+            Some("paulbouwer/hello-kubernetes:1.10.1"),
+        )
+        .await
+        .expect("Failed to create template-backed project");
+
+        assert_eq!(project.template_id.as_deref(), Some("welcome"));
+        assert_eq!(
+            project.template_image.as_deref(),
+            Some("paulbouwer/hello-kubernetes:1.10.1")
+        );
+
+        let updated =
+            update_template_image(&pool, project.id, "paulbouwer/hello-kubernetes:1.11.0")
+                .await
+                .expect("Failed to update template image");
+
+        assert_eq!(updated.template_id.as_deref(), Some("welcome"));
+        assert_eq!(
+            updated.template_image.as_deref(),
+            Some("paulbouwer/hello-kubernetes:1.11.0")
+        );
+    }
+
+    /// Projects created without a template carry `None` in both columns and
+    /// the default `create()` wrapper preserves that — guards against future
+    /// callers leaking a template snapshot into non-template projects.
+    #[sqlx::test]
+    async fn test_create_without_template_leaves_columns_null(pool: PgPool) {
+        let user = crate::db::users::create(&pool, "no-tpl@example.com")
+            .await
+            .expect("Failed to create test user");
+
+        let project = create(
+            &pool,
+            "no-tpl",
+            ProjectStatus::Stopped,
+            "default".to_string(),
+            Some(user.id),
+            None,
+            None,
+        )
+        .await
+        .expect("Failed to create non-template project");
+
+        assert!(project.template_id.is_none());
+        assert!(project.template_image.is_none());
     }
 
     /// Test that project status is Stopped when no active deployment but has failed deployment

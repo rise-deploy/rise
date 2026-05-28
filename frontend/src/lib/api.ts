@@ -135,10 +135,20 @@ class RiseAPI {
         return this.request(`/projects/${idOrName}${queryString ? '?' + queryString : ''}`);
     }
 
-    async createProject(name, access_class, owner) {
+    async createProject(name, access_class, owner, template = null) {
         return this.request('/projects', {
             method: 'POST',
-            body: JSON.stringify({ name, access_class, owner })
+            body: JSON.stringify({ name, access_class, owner, ...(template ? { template } : {}) })
+        });
+    }
+
+    // Record the new template image:tag on a project after a redeploy
+    // triggered by the "Redeploy from template" button in the UI. Resets the
+    // catalog-vs-project diff used to enable/disable that button.
+    async updateProjectTemplateImage(projectName, image) {
+        return this.request(`/projects/${projectName}/template-image`, {
+            method: 'PATCH',
+            body: JSON.stringify({ image }),
         });
     }
 
@@ -195,6 +205,26 @@ class RiseAPI {
                 group: sourceDeployment.deployment_group || 'default',
             })
         });
+    }
+
+    // Create a new deployment directly from a pre-built public image reference
+    // (e.g. "nginx:latest", "ghcr.io/owner/repo:tag"). The server resolves the
+    // digest via the OCI client and skips the build pipeline entirely.
+    async createDeploymentFromImage(projectName, image, httpPort) {
+        return this.request(`/deployments`, {
+            method: 'POST',
+            body: JSON.stringify({
+                project: projectName,
+                image,
+                push_image: false,
+                http_port: httpPort,
+            })
+        });
+    }
+
+    // Quickstart templates: curated stateless public images deployable in one click
+    async getQuickstartTemplates() {
+        return this.request('/quickstart-templates');
     }
 
     // Service account endpoints

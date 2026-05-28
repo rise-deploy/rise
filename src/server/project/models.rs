@@ -98,6 +98,9 @@ pub struct Project {
     /// Platform-level deployment constraints (min/max ranges)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub platform_constraints: Option<PlatformConstraintsInfo>,
+    /// Quickstart template the project was created from, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template: Option<ProjectTemplateInfo>,
     // Timestamps
     #[serde(default)]
     pub created: String,
@@ -116,6 +119,28 @@ pub struct CreateProjectRequest {
     pub app_teams: Vec<String>, // Team names or IDs
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_url: Option<String>, // URL to where the project code lives
+    /// If the project is being created from a quickstart template, the
+    /// template id and image:tag at the time of creation are stored on the
+    /// project so the UI can surface a "Template" badge and detect when the
+    /// catalog has moved ahead of the deployed version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<ProjectTemplateInfo>,
+}
+
+/// Template association stored on a project — id of the quickstart entry
+/// plus the image:tag that was deployed.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ProjectTemplateInfo {
+    pub id: String,
+    pub image: String,
+}
+
+/// Request body for `PATCH /projects/{name}/template-image` — used by the UI
+/// to record the new image:tag after a redeploy triggered by the
+/// "Redeploy from template" button.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct UpdateProjectTemplateImageRequest {
+    pub image: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

@@ -8,10 +8,11 @@ Rise backend uses YAML configuration files with environment variable substitutio
 
 Configuration files are located in `config/` and loaded in this order:
 
-1. `{RISE_CONFIG_RUN_MODE}.{toml,yaml,yml}` - Environment-specific config (**required**)
+1. `default.{toml,yaml,yml}` - Shipped defaults (optional). Ships with the Rise image at `/etc/rise/default.yaml` and carries built-in defaults such as the quickstart catalog.
+2. `{RISE_CONFIG_RUN_MODE}.{toml,yaml,yml}` - Environment-specific config (**required**)
    - `development.toml` or `development.yaml` when `RISE_CONFIG_RUN_MODE=development`
    - `production.toml` or `production.yaml` when `RISE_CONFIG_RUN_MODE=production`
-2. `local.{toml,yaml,yml}` - Local overrides (not checked into git, optional)
+3. `local.{toml,yaml,yml}` - Local overrides (not checked into git, optional)
 
 Later files override earlier ones.
 
@@ -53,10 +54,15 @@ This happens **after** TOML/YAML parsing but **before** deserialization, so:
 
 Configuration is loaded in this order (later values override earlier ones):
 
-1. `{RISE_CONFIG_RUN_MODE}.{toml,yaml,yml}` - Active environment config (required)
-2. `local.{toml,yaml,yml}` - Local overrides (not in git, optional)
-3. Environment variable substitution - `${VAR}` patterns are replaced
-4. DATABASE_URL special case - Overrides `[database] url` if set
+1. `default.{toml,yaml,yml}` - Shipped defaults (optional, e.g. the quickstart catalog)
+2. `{RISE_CONFIG_RUN_MODE}.{toml,yaml,yml}` - Active environment config (required)
+3. `local.{toml,yaml,yml}` - Local overrides (not in git, optional)
+4. Environment variable substitution - `${VAR}` patterns are replaced
+5. DATABASE_URL special case - Overrides `[database] url` if set
+
+### Merge semantics
+
+The config loader uses the [`config`](https://crates.io/crates/config) crate, which deep-merges *maps* but **replaces** *arrays*. Practically: if `default.yaml` defines `quickstart.templates` with four entries and `local.yaml` defines `quickstart.templates` with one entry, the resulting catalog contains only that one entry — the defaults are not preserved. To extend a shipped list, copy the entries from `default.yaml` into your override and add to the list.
 
 **Note**: When multiple file formats exist for the same config file, TOML takes precedence over YAML.
 
@@ -451,6 +457,74 @@ Run with `RUST_LOG=debug` to see configuration loading details:
 ```bash
 RUST_LOG=debug cargo run --bin rise -- backend server
 ```
+
+## Quickstart Templates
+
+Rise's web UI surfaces a curated catalog of stateless container images that
+end-users can deploy in one click ("quickstart templates"). The catalog lives
+under the `quickstart` key in backend config:
+
+```yaml
+quickstart:
+  templates:
+    - id: welcome                       # kebab-case, unique across the catalog
+      display_name: "Welcome page"
+      tagline: "Friendly landing page with pod/host info."
+      description: >
+        Longer description shown in the deploy dialog.
+      icon: welcome                     # built-in name OR absolute URL/path
+      image: paulbouwer/hello-kubernetes:1.10.1
+      http_port: 8080
+      learn_more_url: https://github.com/paulbouwer/hello-kubernetes
+      tags: [demo, hello-world]
+      warning: null                     # optional caveat shown in deploy modal
+```
+
+### Icons
+
+The `icon` field accepts either:
+
+- A **built-in icon name** (e.g. `welcome`, `whoami`, `httpbin`, `excalidraw`) —
+  resolved against `/assets/quickstart/<name>.svg` shipped with Rise.
+- An **absolute URL** (`http://...`, `https://...`) — used verbatim.
+- An **absolute static path** (`/some/path.svg`) — used verbatim. Useful for
+  operators serving custom icons from a mounted static dir.
+
+### Defaults and overrides
+
+Rise ships a `default.yaml` config layer with four curated templates. The
+config loader (`default.yaml` → `<run_mode>.yaml` → `local.yaml`) merges maps
+but **replaces arrays**, so any `quickstart.templates` list in a later layer
+replaces the defaults entirely. To extend the shipped catalog, copy
+`/etc/rise/default.yaml`'s `quickstart.templates` into your override file and
+add to the list.
+
+### Validation
+
+The backend validates the catalog at startup and refuses to boot on:
+
+- a template `id` that isn't lowercase kebab-case
+- duplicate `id`s within the catalog
+- empty `display_name`, `tagline`, `description`, `icon`, `image`, or `learn_more_url`
+- `http_port` of `0`
+
+### Invariants for catalog entries
+
+Operators adding custom templates should respect the following invariants —
+they aren't enforced by code, but the deploy modal and "Redeploy from template"
+feature assume them:
+
+- **Tag-pinned**: use a real tag (e.g. `:1.2.3`) rather than `:latest`.
+  Floating tags work, but the drift detector compares stored vs. catalog
+  `image:tag` strings — when both sides are `:latest`, the "Redeploy from
+  template" button can't observe drift. Floating-tag entries should set a
+  `warning` mentioning this.
+- **Stateless**: no volume mounts, no external databases, no user-supplied
+  secrets required to start serving traffic.
+- **Restricted-PSS friendly**: prefer images that run as a non-root user and
+  listen on a port `>= 1024`. Entries that violate this still work on
+  permissive clusters but **must** set a `warning` so the deploy modal
+  surfaces the caveat.
 
 ## Custom Domains
 

@@ -38,6 +38,56 @@ pub struct Settings {
     /// `"rise-"`) to preserve historic naming on existing installs.
     #[serde(default)]
     pub default_organization: DefaultOrganizationSettings,
+    /// Curated catalog of stateless container images surfaced as one-click
+    /// "quickstart" deploys in the UI. The catalog is layered: `default.yaml`
+    /// ships the built-in selection and any `quickstart.templates` list in a
+    /// later layer (run-mode or `local.yaml`) *replaces* it entirely. Operators
+    /// who want to add to the defaults must re-include them.
+    #[serde(default)]
+    pub quickstart: Option<QuickstartSettings>,
+}
+
+/// Catalog of quickstart templates exposed via `GET /api/v1/quickstart-templates`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct QuickstartSettings {
+    #[serde(default)]
+    pub templates: Vec<QuickstartTemplateConfig>,
+}
+
+/// A single quickstart catalog entry. Mirrors the API shape on the wire, with
+/// one difference: `icon` accepts either a built-in icon name (resolved to
+/// `/assets/quickstart/<name>.svg`) or an absolute URL/path (must start with
+/// `http://`, `https://`, or `/`).
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct QuickstartTemplateConfig {
+    /// Stable kebab-case identifier used in URLs and project records.
+    pub id: String,
+    /// Short, human-friendly name shown in cards and dialogs.
+    pub display_name: String,
+    /// One-line description for the card.
+    pub tagline: String,
+    /// Longer description shown in the deploy dialog.
+    pub description: String,
+    /// Built-in icon name (e.g. `welcome`, `whoami`, `httpbin`, `excalidraw`)
+    /// resolved against `/assets/quickstart/<name>.svg`, OR an absolute URL or
+    /// static path (`http://...`, `https://...`, `/some/path.svg`).
+    pub icon: String,
+    /// Fully-qualified container image. Pin a tag when one is published so the
+    /// catalog is reproducible; floating tags (`:latest`) work but defeat the
+    /// "Redeploy from template" drift detector.
+    pub image: String,
+    /// Port the container listens on.
+    pub http_port: u16,
+    /// Upstream link for users who want to learn more.
+    pub learn_more_url: String,
+    /// Free-form tags for filtering / categorisation.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Optional caveat surfaced in the deploy modal — used when the image
+    /// violates a platform invariant (root user, privileged port) but is kept
+    /// in the catalog for clusters that allow it.
+    #[serde(default)]
+    pub warning: Option<String>,
 }
 
 /// Configuration for the bootstrapped default Organization resource.
@@ -1280,10 +1330,15 @@ impl Settings {
         // Load config files in order, trying both .toml and .yaml/.yml extensions.
         // TOML takes precedence if both exist.
 
-        // 1. Load environment-specific config (required)
+        // 1. Load shipped defaults (optional). Carries the built-in quickstart
+        //    catalog and other defaults that operators can override. Loaded
+        //    first so a run-mode or local override replaces these values.
+        Self::try_add_config_file(&mut builder, config_dir, "default", false)?;
+
+        // 2. Load environment-specific config (required)
         Self::try_add_config_file(&mut builder, config_dir, run_mode, true)?;
 
-        // 2. Load local config (optional, not checked into git)
+        // 3. Load local config (optional, not checked into git)
         Self::try_add_config_file(&mut builder, config_dir, "local", false)?;
 
         // Build config and substitute environment variables
@@ -1427,6 +1482,10 @@ impl Settings {
             resource_gc.validate()?;
         }
 
+        if let Some(ref quickstart) = settings.quickstart {
+            quickstart.validate()?;
+        }
+
         Ok(settings)
     }
 
@@ -1493,6 +1552,88 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ok_template(id: &str) -> QuickstartTemplateConfig {
+        QuickstartTemplateConfig {
+            id: id.to_string(),
+            display_name: "Disp".to_string(),
+            tagline: "Tag".to_string(),
+            description: "Desc".to_string(),
+            icon: "welcome".to_string(),
+            image: "x/y:1".to_string(),
+            http_port: 8080,
+            learn_more_url: "https://example.com".to_string(),
+            tags: vec![],
+            warning: None,
+        }
+    }
+
+    #[test]
+    fn quickstart_validate_accepts_valid_catalog() {
+        let qs = QuickstartSettings {
+            templates: vec![ok_template("welcome"), ok_template("whoami")],
+        };
+        qs.validate().expect("valid catalog should pass");
+    }
+
+    #[test]
+    fn quickstart_validate_rejects_non_kebab_id() {
+        let mut t = ok_template("Welcome");
+        t.id = "Welcome".to_string();
+        let qs = QuickstartSettings { templates: vec![t] };
+        assert!(qs.validate().is_err());
+    }
+
+    #[test]
+    fn quickstart_validate_rejects_duplicate_id() {
+        let qs = QuickstartSettings {
+            templates: vec![ok_template("welcome"), ok_template("welcome")],
+        };
+        assert!(qs.validate().is_err());
+    }
+
+    #[test]
+    fn quickstart_validate_rejects_empty_required_field() {
+        let mut t = ok_template("welcome");
+        t.image = "  ".to_string();
+        let qs = QuickstartSettings { templates: vec![t] };
+        assert!(qs.validate().is_err());
+    }
+
+    #[test]
+    fn quickstart_validate_rejects_zero_port() {
+        let mut t = ok_template("welcome");
+        t.http_port = 0;
+        let qs = QuickstartSettings { templates: vec![t] };
+        assert!(qs.validate().is_err());
+    }
+
+    #[test]
+    fn quickstart_validate_rejects_unparseable_learn_more_url() {
+        let mut t = ok_template("welcome");
+        t.learn_more_url = "not a url".to_string();
+        let qs = QuickstartSettings { templates: vec![t] };
+        assert!(qs.validate().is_err());
+    }
+
+    #[test]
+    fn quickstart_validate_rejects_non_http_learn_more_url() {
+        let mut t = ok_template("welcome");
+        t.learn_more_url = "javascript:alert(1)".to_string();
+        let qs = QuickstartSettings { templates: vec![t] };
+        assert!(qs.validate().is_err());
+    }
+
+    #[test]
+    fn quickstart_validate_accepts_http_and_https_learn_more_urls() {
+        for url in ["http://example.com", "https://example.com/path"] {
+            let mut t = ok_template("welcome");
+            t.learn_more_url = url.to_string();
+            let qs = QuickstartSettings { templates: vec![t] };
+            qs.validate()
+                .unwrap_or_else(|e| panic!("{url} should pass: {e:?}"));
+        }
+    }
 
     #[test]
     fn test_substitute_env_vars_in_string_basic() {
@@ -2222,6 +2363,69 @@ impl Default for PlatformAccessConfig {
 
 fn default_platform_access_policy() -> PlatformAccessPolicy {
     PlatformAccessPolicy::AllowAll
+}
+
+impl QuickstartSettings {
+    /// Reject malformed catalog entries at load time so a typo in a config
+    /// file fails the process instead of degrading the deploy modal.
+    fn validate(&self) -> Result<(), ConfigError> {
+        let id_re = regex::Regex::new(r"^[a-z0-9]+(-[a-z0-9]+)*$").map_err(|e| {
+            ConfigError::Message(format!("Failed to compile quickstart id regex: {}", e))
+        })?;
+
+        let mut seen_ids = std::collections::HashSet::new();
+        for tpl in &self.templates {
+            if !id_re.is_match(&tpl.id) {
+                return Err(ConfigError::Message(format!(
+                    "quickstart template id '{}' must be lowercase kebab-case (letters, digits, hyphens)",
+                    tpl.id
+                )));
+            }
+            if !seen_ids.insert(&tpl.id) {
+                return Err(ConfigError::Message(format!(
+                    "quickstart template id '{}' is defined more than once",
+                    tpl.id
+                )));
+            }
+            for (field, value) in [
+                ("display_name", &tpl.display_name),
+                ("tagline", &tpl.tagline),
+                ("description", &tpl.description),
+                ("icon", &tpl.icon),
+                ("image", &tpl.image),
+                ("learn_more_url", &tpl.learn_more_url),
+            ] {
+                if value.trim().is_empty() {
+                    return Err(ConfigError::Message(format!(
+                        "quickstart template '{}' has empty {}",
+                        tpl.id, field
+                    )));
+                }
+            }
+            if tpl.http_port == 0 {
+                return Err(ConfigError::Message(format!(
+                    "quickstart template '{}' has invalid http_port 0",
+                    tpl.id
+                )));
+            }
+            match url::Url::parse(tpl.learn_more_url.trim()) {
+                Ok(u) if matches!(u.scheme(), "http" | "https") => {}
+                Ok(u) => {
+                    return Err(ConfigError::Message(format!(
+                        "quickstart template '{}' learn_more_url has unsupported scheme '{}'; only http and https are allowed",
+                        tpl.id, u.scheme()
+                    )));
+                }
+                Err(e) => {
+                    return Err(ConfigError::Message(format!(
+                        "quickstart template '{}' learn_more_url '{}' is not a valid URL: {}",
+                        tpl.id, tpl.learn_more_url, e
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Background garbage-collection worker for the generic resource store.

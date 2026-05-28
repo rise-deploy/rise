@@ -129,6 +129,9 @@ pub struct AppState {
     /// Refresh threshold is derived as TTL / 2.
     #[cfg(feature = "backend")]
     pub identity_token_ttl_seconds: u64,
+    /// Catalog of quickstart templates (resolved from config at startup).
+    /// Empty when no operator-configured catalog is present.
+    pub quickstart_templates: Arc<Vec<crate::server::quickstart::models::QuickstartTemplate>>,
 }
 
 /// Initialize encryption provider from settings
@@ -1158,6 +1161,9 @@ impl AppState {
             deployment_constraints: deployment_constraints_opt,
             #[cfg(feature = "backend")]
             identity_token_ttl_seconds,
+            quickstart_templates: Arc::new(crate::server::quickstart::registry::from_settings(
+                settings.quickstart.as_ref(),
+            )),
         })
     }
 }
