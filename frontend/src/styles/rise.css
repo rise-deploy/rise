@@ -1326,9 +1326,15 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
 }
 /* Recharts' tooltip-wrapper sometimes settles below opacity:1 during the
    show/hide animation; force it solid so our tooltip background is the
-   final word on visibility. Scoped to the log-volume chart so it doesn't
-   override Recharts opacity behaviour for any future charts on the page. */
-.r-logs-chart .recharts-tooltip-wrapper { opacity: 1 !important; }
+   final word on visibility. Also bumped to a z-index above the log rows
+   below the chart — each `.r-logs-row` creates a stacking context via
+   `position: relative`, so without this the tooltip rendered under later
+   rows. Scoped to the log-volume chart so it doesn't override Recharts
+   opacity behaviour for any future charts on the page. */
+.r-logs-chart .recharts-tooltip-wrapper {
+    opacity: 1 !important;
+    z-index: 50;
+}
 .r-logs-chart-tip-title {
     font-weight: 600;
     margin-bottom: 6px;

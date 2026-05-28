@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Multi-container demo — text analyzer queue</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 52rem; margin: 3rem auto; padding: 0 1rem; color: #1f2937; }
+    h1 { margin-bottom: 0.25rem; }
+    h1 + p { margin-top: 0; color: #6b7280; }
+    textarea { width: 100%; min-height: 7rem; padding: 0.5rem; font-family: inherit; font-size: 0.95rem; box-sizing: border-box; }
+    button { padding: 0.5rem 1rem; font: inherit; background: #4338ca; color: white; border: 0; border-radius: 0.25rem; cursor: pointer; }
+    button:disabled { background: #9ca3af; cursor: default; }
+    table { border-collapse: collapse; margin-top: 1rem; width: 100%; }
+    th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #e5e7eb; font-size: 0.9rem; vertical-align: top; }
+    th { background: #f9fafb; }
+    code { background: #f3f4f6; padding: 0.05rem 0.3rem; border-radius: 0.2rem; }
+    .status-pending { color: #92400e; }
+    .status-processing { color: #1e40af; }
+    .status-completed { color: #166534; }
+    .muted { color: #6b7280; }
+  </style>
+</head>
+<body>
+  <h1>Text analyzer queue</h1>
+  <p>Browser → ingress → <code>api</code> → Redis ← <code>worker</code>.
+     Submit text; the worker picks it up, computes stats, writes them back.</p>
+
+  <form id="submit">
+    <textarea name="text" placeholder="Paste some text…">The quick brown fox jumps over the lazy dog. The dog did not move. The fox repeated its jump.</textarea>
+    <p><button type="submit">Submit job</button></p>
+  </form>
+
+  <h2>Jobs</h2>
+  <table id="jobs">
+    <thead>
+      <tr><th>Status</th><th>Submitted</th><th>Worker PID</th><th>Preview</th><th>Result</th></tr>
+    </thead>
+    <tbody><tr><td colspan="5" class="muted">loading…</td></tr></tbody>
+  </table>
+
+  <script>
+    const tbody = document.querySelector('#jobs tbody');
+
+    document.getElementById('submit').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const btn = e.target.querySelector('button');
+      const ta = e.target.querySelector('textarea');
+      btn.disabled = true;
+      try {
+        const r = await fetch('/api/jobs', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ text: ta.value }),
+        });
+        if (!r.ok) {
+          const { error } = await r.json().catch(() => ({ error: r.statusText }));
+          alert('submit failed: ' + error);
+        }
+        await refresh();
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    function fmtResult(r) {
+      if (!r) return '—';
+      const top = (r.top_words ?? []).slice(0, 5).map((w) => `${w.word}×${w.count}`).join(' ');
+      return `${r.words} words, ${r.unique_words} unique, ${r.reading_minutes}m read — top: ${top}`;
+    }
+
+    function esc(s) {
+      return String(s).replace(/[&<>"]/g, (c) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;',
+      }[c]));
+    }
+
+    async function refresh() {
+      const r = await fetch('/api/jobs');
+      const { jobs } = await r.json();
+      if (jobs.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="5" class="muted">no jobs yet</td></tr>';
+        return;
+      }
+      tbody.innerHTML = jobs.map((j) => `
+        <tr>
+          <td class="status-${esc(j.status)}">${esc(j.status)}</td>
+          <td><small>${esc((j.submitted_at ?? '').slice(11, 19))}</small></td>
+          <td>${esc(j.worker_pid ?? '—')}</td>
+          <td class="muted">${esc(j.text_preview)}…</td>
+          <td>${esc(fmtResult(j.result))}</td>
+        </tr>
+      `).join('');
+    }
+
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>

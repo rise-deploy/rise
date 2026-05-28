@@ -372,15 +372,38 @@ fn resolve_multi_container_images(
 /// Persist a deployment's multi-container side-data. Pass the RESOLVED specs
 /// (every container has `image` set) so the reconciler can read them
 /// directly from JSON without re-deriving anything.
+///
+/// Cpu/memory/replicas follow the resolution order
+/// `[containers.<name>]` → deployment-level effective value (CLI flag /
+/// rise.toml env override / rise.toml global / platform default), and the
+/// resolved values are written back so the persisted JSON always has
+/// `cpu`/`memory`/`replicas` populated. The reconciler keeps its own
+/// `unwrap_or(deployment.*)` fallback for older rows that pre-date this
+/// backfill, but new deployments always have the effective values on disk.
 #[cfg(feature = "backend")]
 async fn persist_multi_container_fields(
     state: &AppState,
     deployment_id: uuid::Uuid,
     resolved_specs: &[crate::server::deployment::models::ContainerSpec],
     routes: &[crate::server::deployment::models::RouteSpec],
+    effective_replicas: u32,
+    effective_cpu: &str,
+    effective_memory: &str,
 ) -> Result<(), ServerError> {
+    let mut backfilled = resolved_specs.to_vec();
+    for spec in &mut backfilled {
+        if spec.replicas.is_none() {
+            spec.replicas = Some(effective_replicas);
+        }
+        if spec.cpu.is_none() {
+            spec.cpu = Some(effective_cpu.to_string());
+        }
+        if spec.memory.is_none() {
+            spec.memory = Some(effective_memory.to_string());
+        }
+    }
     let containers_json =
-        serde_json::to_value(resolved_specs).internal_err("Failed to serialise containers")?;
+        serde_json::to_value(&backfilled).internal_err("Failed to serialise containers")?;
     let routes_json = if routes.is_empty() {
         None
     } else {
@@ -559,6 +582,17 @@ async fn convert_deployment(
     };
     let can_rollback = state_machine::can_create_from(&deployment);
 
+    // Load multi-container side-data, if any. Falls back to `None` for legacy
+    // single-container deployments — the frontend reads the flat replicas/cpu/
+    // memory fields in that case.
+    let containers = db_deployments::get_containers(&state.db_pool, deployment.id)
+        .await
+        .ok()
+        .and_then(|sd| sd.containers)
+        .and_then(|v| {
+            serde_json::from_value::<Vec<crate::server::deployment::models::ContainerSpec>>(v).ok()
+        });
+
     // Resolve environment name and color
     let (environment, environment_color) = if let Some(env_id) = deployment.environment_id {
         let env = crate::db::environments::find_by_id(&state.db_pool, env_id)
@@ -596,6 +630,7 @@ async fn convert_deployment(
         replicas: deployment.replicas as u32,
         cpu: deployment.cpu,
         memory: deployment.memory,
+        containers,
         job_url: deployment.job_url,
         pull_request_url: deployment.pull_request_url,
         git_repository_url: deployment.git_repository_url,
@@ -1255,6 +1290,9 @@ pub async fn create_deployment(
                 new_deployment.id,
                 &r.resolved_specs,
                 &payload.routes,
+                effective_replicas,
+                &effective_cpu,
+                &effective_memory,
             )
             .await?;
         }
@@ -1439,6 +1477,9 @@ pub async fn create_deployment(
                     deployment.id,
                     &r.resolved_specs,
                     &payload.routes,
+                    effective_replicas,
+                    &effective_cpu,
+                    &effective_memory,
                 )
                 .await?;
             }
@@ -1545,6 +1586,9 @@ pub async fn create_deployment(
                 deployment.id,
                 &r.resolved_specs,
                 &payload.routes,
+                effective_replicas,
+                &effective_cpu,
+                &effective_memory,
             )
             .await?;
         }
@@ -1683,6 +1727,9 @@ pub async fn create_deployment(
                 deployment.id,
                 &r.resolved_specs,
                 &payload.routes,
+                effective_replicas,
+                &effective_cpu,
+                &effective_memory,
             )
             .await?;
         }

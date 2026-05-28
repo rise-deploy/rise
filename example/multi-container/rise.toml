@@ -1,0 +1,53 @@
+#:schema http://rise.local:3000/api/v1/schema/rise-toml/v1
+version = 1
+
+[project]
+name = "multi-container"
+
+[project.env]
+
+# Static frontend. Submits to `/api/jobs` and polls `/api/jobs` for status.
+[containers.frontend]
+http_port = 8080
+replicas = 1
+
+[containers.frontend.build]
+backend = "docker"
+dockerfile = "frontend/Dockerfile"
+build_context = "frontend"
+
+# JSON API. Stateless — job state lives in Redis, so this scales horizontally.
+# Reads `RISE_CONTAINER_HOST__REDIS` (auto-injected by the controller).
+[containers.api]
+http_port = 8080
+replicas = 2
+health_check = { path = "/api/health" }
+
+[containers.api.build]
+backend = "docker"
+dockerfile = "api/Dockerfile"
+build_context = "api"
+
+# Background worker. BRPOPs jobs from Redis, runs text analysis, writes the
+# result back. No `http_port` → no Service, no ingress route, no HTTP probes.
+[containers.worker]
+replicas = 1
+env = { WORK_MS = "2000" }
+
+[containers.worker.build]
+backend = "docker"
+dockerfile = "worker/Dockerfile"
+build_context = "worker"
+
+# Redis as the shared job queue. Upstream image — no [build] block.
+# `http_port` is a misnomer for Redis (it speaks RESP, not HTTP) but the K8s
+# Service routes TCP fine, and `health_check = false` skips HTTP probes.
+[containers.redis]
+image = "redis:7-alpine"
+http_port = 6379
+health_check = false
+
+# Path-based routing. Longest-prefix wins, so `/api` shadows `/`.
+[routes]
+"/api" = { container = "api" }
+"/" = { container = "frontend" }

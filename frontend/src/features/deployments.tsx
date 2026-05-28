@@ -38,6 +38,88 @@ function getStatusTone(status) {
     return STATUS_TONES[status] || 'muted';
 }
 
+// ── CPU / memory parsing helpers for the multi-container resource breakdown ──
+// CPU is stored as the same string K8s accepts (`"500m"`, `"1"`, `"1.5"`).
+// Memory is the same — IEC suffixes (Ki/Mi/Gi/...) plus the SI suffixes K/M/G.
+// Aggregation goes through (millicores, bytes), then re-formats for display so
+// "500m × 2 replicas + 1 × 3 replicas" prints as "4" (not "4000m") and "256Mi
+// × 4 + 1Gi" prints as a single readable value.
+
+function parseCpuToMillicores(s) {
+    if (s == null) return 0;
+    const t = String(s).trim();
+    if (!t) return 0;
+    if (t.endsWith('m')) {
+        const v = parseFloat(t.slice(0, -1));
+        return Number.isFinite(v) ? v : 0;
+    }
+    const v = parseFloat(t);
+    return Number.isFinite(v) ? v * 1000 : 0;
+}
+
+function formatMillicoresAsCpu(milli) {
+    if (!Number.isFinite(milli) || milli <= 0) return '0';
+    if (milli % 1000 === 0) return String(milli / 1000);
+    return `${Math.round(milli)}m`;
+}
+
+const MEM_UNIT_FACTORS = {
+    Ki: 1024,
+    Mi: 1024 ** 2,
+    Gi: 1024 ** 3,
+    Ti: 1024 ** 4,
+    Pi: 1024 ** 5,
+    Ei: 1024 ** 6,
+    K: 1e3,
+    M: 1e6,
+    G: 1e9,
+    T: 1e12,
+    P: 1e15,
+    E: 1e18,
+};
+
+function parseMemoryToBytes(s) {
+    if (s == null) return 0;
+    const t = String(s).trim();
+    if (!t) return 0;
+    const m = t.match(/^(\d+(?:\.\d+)?)\s*(Ki|Mi|Gi|Ti|Pi|Ei|K|M|G|T|P|E)?$/);
+    if (!m) return 0;
+    const v = parseFloat(m[1]);
+    if (!Number.isFinite(v)) return 0;
+    const factor = m[2] ? MEM_UNIT_FACTORS[m[2]] : 1;
+    return v * factor;
+}
+
+function formatBytesAsMemory(bytes) {
+    if (!Number.isFinite(bytes) || bytes <= 0) return '0';
+    // Prefer Gi when the value divides cleanly; else fall back to Mi rounded to
+    // the nearest integer (sub-Mi totals are unrealistic in practice).
+    if (bytes % (1024 ** 3) === 0) return `${bytes / 1024 ** 3}Gi`;
+    if (bytes >= 1024 ** 3) {
+        const gi = bytes / 1024 ** 3;
+        return `${gi.toFixed(2).replace(/\.?0+$/, '')}Gi`;
+    }
+    return `${Math.round(bytes / 1024 ** 2)}Mi`;
+}
+
+/** Sum (replicas × per-container cpu/memory) across the deployment's containers. */
+function aggregateContainerResources(containers) {
+    let replicas = 0;
+    let cpuMilli = 0;
+    let memBytes = 0;
+    for (const c of containers) {
+        const r = Number(c.replicas) || 0;
+        replicas += r;
+        cpuMilli += parseCpuToMillicores(c.cpu) * r;
+        memBytes += parseMemoryToBytes(c.memory) * r;
+    }
+    return {
+        replicas,
+        cpu: formatMillicoresAsCpu(cpuMilli),
+        memory: formatBytesAsMemory(memBytes),
+    };
+}
+
 
 export function ActiveDeploymentsSummary({ projectName }) {
     const [activeDeployments, setActiveDeployments] = useState({});
@@ -2544,6 +2626,7 @@ export function DeploymentDetail({ projectName, deploymentId }) {
     const [stopping, setStopping] = useState(false);
     const [detailActionStatus, setDetailActionStatus] = useState('');
     const [activeTab, setActiveTab] = useState('logs');
+    const [breakdownOpen, setBreakdownOpen] = useState(false);
     const { showToast } = useToast();
     const handleCopy = useCallback(async (value, label) => {
         if (!value || value === '-') return;
@@ -2717,14 +2800,36 @@ export function DeploymentDetail({ projectName, deploymentId }) {
         </Panel>
     );
 
+    const containers = Array.isArray(deployment.containers) ? deployment.containers : null;
+    const isMultiContainer = !!containers && containers.length > 0;
+    const totals = isMultiContainer
+        ? aggregateContainerResources(containers)
+        : { replicas: deployment.replicas, cpu: deployment.cpu, memory: deployment.memory };
+
     const runtimeKv = (
         <Panel>
-            <PanelHead title="Resources" />
+            <PanelHead
+                title="Resources"
+                right={
+                    isMultiContainer ? (
+                        <RButton size="sm" onClick={() => setBreakdownOpen(true)}>
+                            Breakdown
+                        </RButton>
+                    ) : null
+                }
+            />
             <PanelBody>
                 <KV>
-                    <KVRow k="Replicas">{deployment.replicas}</KVRow>
-                    <KVRow k="CPU">{deployment.cpu}</KVRow>
-                    <KVRow k="Memory">{deployment.memory}</KVRow>
+                    <KVRow k="Replicas">
+                        {totals.replicas}
+                        {isMultiContainer && (
+                            <span style={{ color: 'var(--text-soft)', marginLeft: 6 }}>
+                                across {containers.length} container{containers.length === 1 ? '' : 's'}
+                            </span>
+                        )}
+                    </KVRow>
+                    <KVRow k="CPU">{totals.cpu}</KVRow>
+                    <KVRow k="Memory">{totals.memory}</KVRow>
                 </KV>
             </PanelBody>
         </Panel>
@@ -3006,6 +3111,48 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                 confirmTone="danger"
                 loading={stopping}
             />
+
+            <Modal
+                isOpen={breakdownOpen}
+                onClose={() => setBreakdownOpen(false)}
+                title="Resource breakdown"
+                sub={`${containers ? containers.length : 0} container${containers && containers.length === 1 ? '' : 's'} · totals: ${totals.replicas} replicas, ${totals.cpu} CPU, ${totals.memory} memory`}
+                width="wide"
+                footer={
+                    <RButton onClick={() => setBreakdownOpen(false)}>Close</RButton>
+                }
+            >
+                {containers && containers.length > 0 ? (
+                    <MonoTableFrame>
+                        <MonoTable>
+                            <MonoTableHead>
+                                <MonoTableRow>
+                                    <MonoTh>Container</MonoTh>
+                                    <MonoTh style={{ textAlign: 'right' }}>Replicas</MonoTh>
+                                    <MonoTh style={{ textAlign: 'right' }}>CPU</MonoTh>
+                                    <MonoTh style={{ textAlign: 'right' }}>Memory</MonoTh>
+                                    <MonoTh style={{ textAlign: 'right' }}>HTTP port</MonoTh>
+                                </MonoTableRow>
+                            </MonoTableHead>
+                            <MonoTableBody>
+                                {containers.map((c) => (
+                                    <MonoTableRow key={c.name}>
+                                        <MonoTd>
+                                            <span className="mono">{c.name}</span>
+                                        </MonoTd>
+                                        <MonoTd style={{ textAlign: 'right' }}>{c.replicas ?? '-'}</MonoTd>
+                                        <MonoTd style={{ textAlign: 'right' }}>{c.cpu || '-'}</MonoTd>
+                                        <MonoTd style={{ textAlign: 'right' }}>{c.memory || '-'}</MonoTd>
+                                        <MonoTd style={{ textAlign: 'right' }}>{c.http_port ?? '-'}</MonoTd>
+                                    </MonoTableRow>
+                                ))}
+                            </MonoTableBody>
+                        </MonoTable>
+                    </MonoTableFrame>
+                ) : (
+                    <Empty>No container breakdown available.</Empty>
+                )}
+            </Modal>
         </section>
     );
 }

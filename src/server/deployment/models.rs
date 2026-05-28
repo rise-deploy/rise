@@ -102,6 +102,10 @@ pub struct Deployment {
     pub cpu: String,
     #[serde(default = "default_memory")]
     pub memory: String,
+    /// Multi-container side-data. `None` for legacy single-container deployments
+    /// (`replicas`/`cpu`/`memory` are the source of truth in that case).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub containers: Option<Vec<ContainerSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub job_url: Option<String>, // URL to the CI pipeline/job that created this deployment
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -264,7 +268,10 @@ pub struct HealthCheckSpec {
 /// build/push.
 ///
 /// In the persisted JSON (and any response from the server) every container
-/// has `image = Some(...)` filled in.
+/// has `image`, `cpu`, `memory`, and `replicas` filled in: the server applies
+/// the resolution order `[containers.<name>]` → deployment-level effective
+/// value (CLI flag / rise.toml env override / rise.toml global / platform
+/// default) before writing the row.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ContainerSpec {
     pub name: String,

@@ -723,6 +723,38 @@ impl ResourceBuilder {
         }
     }
 
+    /// Auto-injected env vars exposing each routable sibling container's
+    /// in-cluster Service address. One entry per container with `http_port`:
+    /// `RISE_CONTAINER_HOST__<NAME> = <service>:<port>`, where `<NAME>` is the
+    /// container name uppercased with dashes mapped to underscores.
+    ///
+    /// Each container also sees its own entry — handy for code that doesn't
+    /// know which container it's in, and the Service self-loop is harmless.
+    /// Order matches `container_specs` so test fixtures stay deterministic.
+    /// Multi-container path only: legacy deployments have a single group-level
+    /// Service with no sibling addresses to inject.
+    pub fn auto_container_host_env_vars(
+        deployment: &Deployment,
+        container_specs: &[crate::server::deployment::models::ContainerSpec],
+    ) -> Vec<EnvVar> {
+        let group = Self::escaped_group_name(&deployment.deployment_group);
+        container_specs
+            .iter()
+            .filter_map(|spec| {
+                let port = spec.http_port?;
+                let key = format!(
+                    "RISE_CONTAINER_HOST__{}",
+                    spec.name.to_uppercase().replace('-', "_")
+                );
+                Some(EnvVar {
+                    name: key,
+                    value: Some(format!("{group}-{}:{port}", spec.name)),
+                    ..Default::default()
+                })
+            })
+            .collect()
+    }
+
     // ── Resource spec builders ─────────────────────────────────────────
 
     pub fn create_namespace(&self, project: &Project, namespace_prefix: &str) -> Namespace {
@@ -1632,6 +1664,12 @@ impl ResourceBuilder {
 
     /// Build a K8s Service for one routable container. Workers (no `http_port`)
     /// should never have this called for them — the caller should skip them.
+    ///
+    /// The Service exposes the container's `http_port` directly (Service port
+    /// = target port). This keeps cross-container addresses intuitive — e.g.
+    /// `default-redis:6379` actually reaches Redis — and works for non-HTTP
+    /// services too. Ingresses reference the port by name (`"http"`), so
+    /// changing the number doesn't affect ingress routing.
     pub fn create_service_for_container(
         &self,
         project: &Project,
@@ -1660,7 +1698,7 @@ impl ResourceBuilder {
                 )),
                 ports: Some(vec![ServicePort {
                     name: Some("http".to_string()),
-                    port: 80,
+                    port: port as i32,
                     target_port: Some(
                         k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(port as i32),
                     ),
@@ -2829,6 +2867,142 @@ mod tests {
         assert!(
             result.is_none(),
             "expected no ingress when all candidate hosts collide"
+        );
+    }
+
+    #[test]
+    fn auto_container_host_env_vars_emits_one_entry_per_routable_container() {
+        use crate::server::deployment::models::ContainerSpec;
+        let deployment = test_deployment(); // deployment_group = "default"
+        let specs = vec![
+            ContainerSpec {
+                name: "frontend".to_string(),
+                image: Some("img".to_string()),
+                http_port: Some(8080),
+                replicas: Some(1),
+                cpu: None,
+                memory: None,
+                env_overrides: vec![],
+                health_check: None,
+            },
+            ContainerSpec {
+                name: "api".to_string(),
+                image: Some("img".to_string()),
+                http_port: Some(8080),
+                replicas: Some(1),
+                cpu: None,
+                memory: None,
+                env_overrides: vec![],
+                health_check: None,
+            },
+            ContainerSpec {
+                // Worker: no http_port, no Service, no env entry emitted.
+                name: "worker".to_string(),
+                image: Some("img".to_string()),
+                http_port: None,
+                replicas: Some(1),
+                cpu: None,
+                memory: None,
+                env_overrides: vec![],
+                health_check: None,
+            },
+            ContainerSpec {
+                // Dashes in the name get mapped to underscores in the env key.
+                name: "side-car".to_string(),
+                image: Some("img".to_string()),
+                http_port: Some(9000),
+                replicas: Some(1),
+                cpu: None,
+                memory: None,
+                env_overrides: vec![],
+                health_check: None,
+            },
+        ];
+
+        let vars = ResourceBuilder::auto_container_host_env_vars(&deployment, &specs);
+
+        let pairs: Vec<(String, String)> = vars
+            .into_iter()
+            .map(|v| (v.name, v.value.unwrap_or_default()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                (
+                    "RISE_CONTAINER_HOST__FRONTEND".to_string(),
+                    "default-frontend:8080".to_string()
+                ),
+                (
+                    "RISE_CONTAINER_HOST__API".to_string(),
+                    "default-api:8080".to_string()
+                ),
+                (
+                    "RISE_CONTAINER_HOST__SIDE_CAR".to_string(),
+                    "default-side-car:9000".to_string()
+                ),
+            ],
+            "expected one entry per routable container in spec order, with worker skipped"
+        );
+    }
+
+    #[test]
+    fn auto_container_host_env_vars_uses_escaped_group_name() {
+        use crate::server::deployment::models::ContainerSpec;
+        let mut deployment = test_deployment();
+        deployment.deployment_group = "staging".to_string();
+        let specs = vec![ContainerSpec {
+            name: "api".to_string(),
+            image: Some("img".to_string()),
+            http_port: Some(8080),
+            replicas: Some(1),
+            cpu: None,
+            memory: None,
+            env_overrides: vec![],
+            health_check: None,
+        }];
+
+        let vars = ResourceBuilder::auto_container_host_env_vars(&deployment, &specs);
+
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].name, "RISE_CONTAINER_HOST__API");
+        assert_eq!(vars[0].value.as_deref(), Some("staging-api:8080"));
+    }
+
+    #[test]
+    fn create_service_for_container_exposes_http_port_directly() {
+        // Per-container Services use port == http_port (not the legacy 80) so
+        // cross-container addresses like default-redis:6379 actually reach the
+        // backing pods. Ingress paths reference the port by name ("http") and
+        // are unaffected.
+        let builder = test_resource_builder();
+        let project = test_project();
+        let deployment = test_deployment();
+        let runtime = ContainerRuntime {
+            name: "redis",
+            image: "redis:7-alpine",
+            http_port: Some(6379),
+            replicas: 1,
+            cpu: "",
+            memory: "",
+            env_vars: Vec::new(),
+            secret_env_name: None,
+            secret_env_hash: None,
+            health_check: None,
+            is_legacy: false,
+        };
+
+        let service = builder
+            .create_service_for_container(&project, &deployment, "ns", &runtime, None)
+            .expect("Service emitted for routable container");
+
+        let spec = service.spec.expect("spec present");
+        let ports = spec.ports.expect("ports present");
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].port, 6379, "Service port should match http_port");
+        assert_eq!(ports[0].name.as_deref(), Some("http"));
+        assert_eq!(
+            ports[0].target_port,
+            Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(6379)),
         );
     }
 }

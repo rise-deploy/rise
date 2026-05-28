@@ -669,6 +669,11 @@ async fn complete_termination(
 
 /// Check deployment health from observed K8s Deployment status.
 /// Handles transitions: Deploying → Healthy/Failed, Healthy → Unhealthy, Unhealthy → Healthy.
+///
+/// Multi-container deployments emit one K8s Deployment per container
+/// (`{project}-{deployment_id}-{container}`). This function sums desired/ready
+/// replicas across every container and only marks the Rise deployment Healthy
+/// when every K8s Deployment is fully ready.
 async fn check_deployment_health_from_observed(
     state: &AppState,
     deployment: &Deployment,
@@ -678,36 +683,69 @@ async fn check_deployment_health_from_observed(
 ) -> anyhow::Result<()> {
     // Metacontroller keys namespaced children of cluster-scoped parents as "namespace/name"
     let namespace = ResourceBuilder::namespace_name(project, namespace_prefix);
-    let k8s_deploy_name = format!(
-        "{}/{}-{}",
-        namespace, project.name, deployment.deployment_id
-    );
+    let base_name = ResourceBuilder::deployment_name(project, deployment);
 
-    let observed_deploy = match observed.deployments.get(&k8s_deploy_name) {
-        Some(d) => d,
-        None => {
-            // K8s Deployment doesn't exist yet — nothing to check
-            debug!(
-                deployment_id = %deployment.deployment_id,
-                "No observed K8s Deployment yet for {}", k8s_deploy_name
-            );
-            return Ok(());
-        }
+    // Resolve the list of K8s Deployment names to aggregate over. Legacy
+    // single-container rows produce one name; multi-container rows produce one
+    // per container.
+    let container_names: Vec<String> =
+        match db_deployments::get_containers(&state.db_pool, deployment.id).await {
+            Ok(side) => side
+                .containers
+                .as_ref()
+                .and_then(|v| {
+                    serde_json::from_value::<Vec<crate::server::deployment::models::ContainerSpec>>(
+                        v.clone(),
+                    )
+                    .ok()
+                })
+                .map(|specs| specs.into_iter().map(|s| s.name).collect())
+                .unwrap_or_default(),
+            Err(e) => {
+                debug!(
+                    deployment_id = %deployment.deployment_id,
+                    "Failed to load container side-data: {:?}", e
+                );
+                Vec::new()
+            }
+        };
+
+    let k8s_deploy_names: Vec<String> = if container_names.is_empty() {
+        vec![format!("{}/{}", namespace, base_name)]
+    } else {
+        container_names
+            .iter()
+            .map(|c| format!("{}/{}-{}", namespace, base_name, c))
+            .collect()
     };
 
-    // Parse the observed deployment to check readiness
-    let observed_k8s: K8sDeployment = serde_json::from_value(observed_deploy.clone())?;
-
-    let desired_replicas = observed_k8s
-        .spec
-        .as_ref()
-        .and_then(|s| s.replicas)
-        .unwrap_or(1);
-    let ready_replicas = observed_k8s
-        .status
-        .as_ref()
-        .and_then(|s| s.ready_replicas)
-        .unwrap_or(0);
+    let mut desired_replicas: i32 = 0;
+    let mut ready_replicas: i32 = 0;
+    for name in &k8s_deploy_names {
+        let observed_deploy = match observed.deployments.get(name) {
+            Some(d) => d,
+            None => {
+                // At least one K8s Deployment hasn't been observed yet — wait
+                // for the next reconcile before computing health.
+                debug!(
+                    deployment_id = %deployment.deployment_id,
+                    "No observed K8s Deployment yet for {}", name
+                );
+                return Ok(());
+            }
+        };
+        let observed_k8s: K8sDeployment = serde_json::from_value(observed_deploy.clone())?;
+        desired_replicas += observed_k8s
+            .spec
+            .as_ref()
+            .and_then(|s| s.replicas)
+            .unwrap_or(1);
+        ready_replicas += observed_k8s
+            .status
+            .as_ref()
+            .and_then(|s| s.ready_replicas)
+            .unwrap_or(0);
+    }
 
     // Check for pod-level errors and collect full pod status via kube-rs
     // (Metacontroller only gives us the Deployment, not individual pods)
@@ -1291,6 +1329,45 @@ async fn compute_desired_children(
     // Track which deployment groups have active deployments that are ready for phase 2.
     let mut active_by_group: HashMap<String, &Deployment> = HashMap::new();
 
+    // Preload container_specs per deployment so the per-deployment loop below
+    // can decide whether THIS deployment owns the per-container Service for
+    // each of its containers (see `service_owner_per_container`). Loading once
+    // here also avoids a duplicate DB roundtrip in phase 2.
+    let mut container_specs_by_deployment: HashMap<
+        uuid::Uuid,
+        Vec<crate::server::deployment::models::ContainerSpec>,
+    > = HashMap::new();
+    for d in &infra_deployments {
+        let json = db_deployments::get_containers(&state.db_pool, d.id)
+            .await
+            .ok()
+            .and_then(|sd| sd.containers);
+        let specs: Vec<crate::server::deployment::models::ContainerSpec> = json
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        container_specs_by_deployment.insert(d.id, specs);
+    }
+
+    // Per-container Service ownership: for each (group, container_name), which
+    // deployment's labels/port the canonical Service points at.
+    //
+    // Rule:
+    //   - If the active deployment has this container, it owns the Service.
+    //     (Preserves blue-green: shared containers keep their Service pinned
+    //     to the active deployment_id until a new deployment becomes active,
+    //     at which point the Service spec swaps atomically.)
+    //   - Otherwise, the most-recent deployment that has the container owns
+    //     it. (Lets a rolling-out deployment that ADDS a new container — e.g.
+    //     a sidecar Redis — emit its Service immediately, so sibling pods can
+    //     reach it during their readiness probes.)
+    //
+    // Workers (no `http_port`) and groups with no multi-container deployments
+    // are absent from this map; legacy single-container Services are still
+    // emitted in phase 2.
+    let service_owner_per_container =
+        compute_service_owner_per_container(&infra_deployments, &container_specs_by_deployment);
+
     // Helper: look up environment name from preloaded cache
     let env_name_for = |deployment: &Deployment| -> Option<String> {
         deployment
@@ -1401,15 +1478,10 @@ async fn compute_desired_children(
         // Multi-container side-data: when present, emit one K8s Deployment
         // per container. When NULL (legacy), use the existing single-container
         // path so on-cluster resources remain byte-identical for old rows.
-        let containers_json = db_deployments::get_containers(&state.db_pool, deployment.id)
-            .await
-            .ok()
-            .and_then(|sd| sd.containers);
-
         let container_specs: Vec<crate::server::deployment::models::ContainerSpec> =
-            containers_json
-                .as_ref()
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
+            container_specs_by_deployment
+                .get(&deployment.id)
+                .cloned()
                 .unwrap_or_default();
 
         if container_specs.is_empty() {
@@ -1436,8 +1508,20 @@ async fn compute_desired_children(
             //   overrides come from ContainerSpec.env_overrides.
             // - Resource names are suffixed with `-<container>` (see
             //   `ResourceBuilder::deployment_name_for_container`).
+            // Auto-injected cross-container service discovery vars. User
+            // globals (in `plain_env_vars`) and per-container `env_overrides`
+            // both take precedence if they set the same name.
+            let injected_host_env =
+                ResourceBuilder::auto_container_host_env_vars(deployment, &container_specs);
+
             for spec in &container_specs {
                 let mut per_container_env = env_vars.plain_env_vars.clone();
+                for var in &injected_host_env {
+                    if per_container_env.iter().any(|v| v.name == var.name) {
+                        continue;
+                    }
+                    per_container_env.push(var.clone());
+                }
                 for over in &spec.env_overrides {
                     if over.is_secret {
                         // Per-container secret values would need a per-container
@@ -1492,6 +1576,26 @@ async fn compute_desired_children(
                     Some(identity.mount.clone()),
                 );
                 children.push(serde_json::to_value(&k8s_deploy)?);
+
+                // Emit the per-container Service iff THIS deployment owns it
+                // for (group, container). See `service_owner_per_container`
+                // above for the ownership rule. Skipping for non-owners keeps
+                // exactly one Service per (group, container) in the child set
+                // and preserves blue-green for shared containers.
+                let owns_service = service_owner_per_container
+                    .get(&(deployment.deployment_group.clone(), spec.name.clone()))
+                    == Some(&deployment.id);
+                if owns_service {
+                    if let Some(service) = resource_builder.create_service_for_container(
+                        project,
+                        deployment,
+                        &namespace,
+                        &runtime,
+                        env_name.as_deref(),
+                    ) {
+                        children.push(serde_json::to_value(&service)?);
+                    }
+                }
             }
         }
 
@@ -1544,17 +1648,15 @@ async fn compute_desired_children(
             .and_then(|env| domains_by_env.get(&env.id).cloned())
             .unwrap_or_default();
 
-        // Service(s) — per-container when the active deployment is
-        // multi-container, otherwise one shared Service at the legacy name.
-        let active_containers_json =
-            db_deployments::get_containers(&state.db_pool, active_deployment.id)
-                .await
-                .ok()
-                .and_then(|sd| sd.containers);
+        // Service — legacy single-container deployments emit one shared Service
+        // here at the group-level name. Multi-container Services are emitted in
+        // phase 1 alongside each container's K8s Deployment (so a new container
+        // declared by a rolling-out, not-yet-active deployment gets its Service
+        // immediately — required for sibling pods to reach it during probes).
         let active_container_specs: Vec<crate::server::deployment::models::ContainerSpec> =
-            active_containers_json
-                .as_ref()
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
+            container_specs_by_deployment
+                .get(&active_deployment.id)
+                .cloned()
                 .unwrap_or_default();
 
         if active_container_specs.is_empty() {
@@ -1566,34 +1668,6 @@ async fn compute_desired_children(
                 env_name.as_deref(),
             );
             children.push(serde_json::to_value(&service)?);
-        } else {
-            for spec in &active_container_specs {
-                if spec.http_port.is_none() {
-                    continue; // workers — no Service
-                }
-                let runtime = crate::server::deployment::resource_builder::ContainerRuntime {
-                    name: &spec.name,
-                    image: spec.image.as_deref().unwrap_or_default(),
-                    http_port: spec.http_port,
-                    replicas: spec.replicas.map(|r| r as i32).unwrap_or(1),
-                    cpu: spec.cpu.as_deref().unwrap_or(""),
-                    memory: spec.memory.as_deref().unwrap_or(""),
-                    env_vars: Vec::new(),
-                    secret_env_name: None,
-                    secret_env_hash: None,
-                    health_check: None,
-                    is_legacy: false,
-                };
-                if let Some(service) = resource_builder.create_service_for_container(
-                    project,
-                    active_deployment,
-                    &namespace,
-                    &runtime,
-                    env_name.as_deref(),
-                ) {
-                    children.push(serde_json::to_value(&service)?);
-                }
-            }
         }
 
         // Primary Ingress
@@ -1694,6 +1768,75 @@ async fn compute_desired_children(
 }
 
 /// Returns true if this deployment should have K8s infrastructure (K8s Deployment resource).
+/// Compute Service ownership per (group, container_name) across the project's
+/// in-play deployments. The owner is the deployment whose labels/port the
+/// canonical Service `<group>-<container>` points at.
+///
+/// Rule:
+///   - The active deployment owns every routable container it declares.
+///     Shared containers stay pinned to the active deployment_id until a new
+///     deployment becomes active, preserving the atomic blue-green swap.
+///   - Among non-active deployments, the most-recent one wins for any
+///     routable container the active doesn't declare. This lets a rolling-out
+///     deployment that adds a new sidecar container (e.g. Redis) emit its
+///     Service immediately, so sibling pods can reach it during probes.
+///
+/// Workers (no `http_port`) and groups whose deployments are all legacy
+/// single-container are absent from the result.
+pub(crate) fn compute_service_owner_per_container(
+    infra_deployments: &[&Deployment],
+    container_specs_by_deployment: &HashMap<
+        uuid::Uuid,
+        Vec<crate::server::deployment::models::ContainerSpec>,
+    >,
+) -> HashMap<(String, String), uuid::Uuid> {
+    let mut owner: HashMap<(String, String), uuid::Uuid> = HashMap::new();
+
+    let mut by_group: HashMap<&str, Vec<&Deployment>> = HashMap::new();
+    for d in infra_deployments {
+        by_group
+            .entry(d.deployment_group.as_str())
+            .or_default()
+            .push(d);
+    }
+
+    for (group, ds_in_group) in &by_group {
+        // Active wins for every container it declares.
+        if let Some(active) = ds_in_group.iter().find(|d| d.is_active) {
+            if let Some(specs) = container_specs_by_deployment.get(&active.id) {
+                for spec in specs {
+                    if spec.http_port.is_none() {
+                        continue;
+                    }
+                    owner.insert(((*group).to_string(), spec.name.clone()), active.id);
+                }
+            }
+        }
+        // Walk non-active deployments newest-first; assign routable containers
+        // not yet owned to the most-recent deployment that declares them.
+        let mut others: Vec<&Deployment> = ds_in_group
+            .iter()
+            .filter(|d| !d.is_active)
+            .copied()
+            .collect();
+        others.sort_by(|a, b| b.deployment_id.cmp(&a.deployment_id));
+        for d in others {
+            if let Some(specs) = container_specs_by_deployment.get(&d.id) {
+                for spec in specs {
+                    if spec.http_port.is_none() {
+                        continue;
+                    }
+                    owner
+                        .entry(((*group).to_string(), spec.name.clone()))
+                        .or_insert(d.id);
+                }
+            }
+        }
+    }
+
+    owner
+}
+
 pub(crate) fn should_have_infrastructure(deployment: &Deployment) -> bool {
     matches!(
         deployment.status,
@@ -2701,5 +2844,166 @@ mod tests {
         // this (or any) controller, even when the controller has a class
         // configured. Refuse to reconcile.
         assert!(check_controller_class(Some("kubernetes.rise.dev/default"), None).is_err());
+    }
+
+    fn cspec(name: &str, port: Option<u16>) -> crate::server::deployment::models::ContainerSpec {
+        crate::server::deployment::models::ContainerSpec {
+            name: name.to_string(),
+            image: Some("img".to_string()),
+            http_port: port,
+            replicas: Some(1),
+            cpu: None,
+            memory: None,
+            env_overrides: vec![],
+            health_check: None,
+        }
+    }
+
+    fn deploy_at(deployment_id: &str, is_active: bool) -> Deployment {
+        let mut d = test_deployment(DeploymentStatus::Healthy);
+        d.id = uuid::Uuid::new_v4();
+        d.deployment_id = deployment_id.to_string();
+        d.is_active = is_active;
+        d
+    }
+
+    #[test]
+    fn ownership_active_only_owns_all_its_routable_containers() {
+        // The simple steady-state case: one active deployment, no rolling-out
+        // sibling. Active owns every routable container it has; workers (no
+        // http_port) are absent from the map.
+        let active = deploy_at("20260520-000000", true);
+        let mut specs = HashMap::new();
+        specs.insert(
+            active.id,
+            vec![
+                cspec("api", Some(8080)),
+                cspec("worker", None),
+                cspec("redis", Some(6379)),
+            ],
+        );
+
+        let owners = compute_service_owner_per_container(&[&active], &specs);
+
+        assert_eq!(owners.len(), 2, "worker is absent");
+        assert_eq!(
+            owners.get(&("default".to_string(), "api".to_string())),
+            Some(&active.id),
+        );
+        assert_eq!(
+            owners.get(&("default".to_string(), "redis".to_string())),
+            Some(&active.id),
+        );
+        assert!(
+            !owners.contains_key(&("default".to_string(), "worker".to_string())),
+            "worker has no http_port, so no Service is owned",
+        );
+    }
+
+    #[test]
+    fn ownership_active_wins_for_shared_containers_during_rollout() {
+        // Active old [api, frontend, worker] + rolling-out new
+        // [api, frontend, worker, redis]. Active still owns api/frontend
+        // (blue-green preserved) while the rolling-out new deployment becomes
+        // the owner of the brand-new redis Service so its sibling pods can
+        // reach it during probes.
+        let old = deploy_at("20260520-000000", true);
+        let new = deploy_at("20260528-000000", false);
+
+        let mut specs = HashMap::new();
+        specs.insert(
+            old.id,
+            vec![
+                cspec("api", Some(8080)),
+                cspec("frontend", Some(8080)),
+                cspec("worker", None),
+            ],
+        );
+        specs.insert(
+            new.id,
+            vec![
+                cspec("api", Some(8080)),
+                cspec("frontend", Some(8080)),
+                cspec("worker", None),
+                cspec("redis", Some(6379)),
+            ],
+        );
+
+        let owners = compute_service_owner_per_container(&[&old, &new], &specs);
+
+        assert_eq!(
+            owners.get(&("default".to_string(), "api".to_string())),
+            Some(&old.id),
+            "shared container stays owned by the active deployment",
+        );
+        assert_eq!(
+            owners.get(&("default".to_string(), "frontend".to_string())),
+            Some(&old.id),
+        );
+        assert_eq!(
+            owners.get(&("default".to_string(), "redis".to_string())),
+            Some(&new.id),
+            "new-only container is owned by the rolling-out deployment",
+        );
+    }
+
+    #[test]
+    fn ownership_no_active_uses_most_recent_deployment() {
+        // Fresh project (or a group with no active deployment): the
+        // most-recent deployment that has each container takes ownership so
+        // intra-pod communication works during the first deploy too.
+        let older = deploy_at("20260101-000000", false);
+        let newer = deploy_at("20260528-000000", false);
+        let mut specs = HashMap::new();
+        specs.insert(
+            older.id,
+            vec![cspec("api", Some(8080)), cspec("frontend", Some(8080))],
+        );
+        specs.insert(
+            newer.id,
+            vec![
+                cspec("api", Some(8080)),
+                cspec("frontend", Some(8080)),
+                cspec("redis", Some(6379)),
+            ],
+        );
+
+        let owners = compute_service_owner_per_container(&[&older, &newer], &specs);
+
+        assert_eq!(
+            owners.get(&("default".to_string(), "api".to_string())),
+            Some(&newer.id),
+            "no active → most recent wins for shared containers",
+        );
+        assert_eq!(
+            owners.get(&("default".to_string(), "redis".to_string())),
+            Some(&newer.id),
+        );
+    }
+
+    #[test]
+    fn ownership_isolated_per_deployment_group() {
+        // Containers with the same name in different groups (e.g. "default"
+        // and "staging") have independent ownership maps — they emit distinct
+        // Services with distinct names.
+        let mut prod = deploy_at("20260520-000000", true);
+        prod.deployment_group = "default".to_string();
+        let mut stg = deploy_at("20260520-000000", true);
+        stg.deployment_group = "staging".to_string();
+
+        let mut specs = HashMap::new();
+        specs.insert(prod.id, vec![cspec("api", Some(8080))]);
+        specs.insert(stg.id, vec![cspec("api", Some(8080))]);
+
+        let owners = compute_service_owner_per_container(&[&prod, &stg], &specs);
+
+        assert_eq!(
+            owners.get(&("default".to_string(), "api".to_string())),
+            Some(&prod.id),
+        );
+        assert_eq!(
+            owners.get(&("staging".to_string(), "api".to_string())),
+            Some(&stg.id),
+        );
     }
 }
