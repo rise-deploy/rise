@@ -27,6 +27,12 @@ pub struct Project {
     pub finalizers: Vec<String>,
     /// URL to where the project code lives (e.g. a GitHub/GitLab repository)
     pub source_url: Option<String>,
+    /// ID of the quickstart template the project was created from, if any.
+    pub template_id: Option<String>,
+    /// Image:tag reference of the template at the time of the most recent
+    /// template-driven deploy. Used to detect when the catalog has moved
+    /// ahead of the deployed version.
+    pub template_image: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

@@ -187,7 +187,7 @@ pub async fn create_project(
         .await
         .internal_err("Failed to start transaction")?;
 
-    let project = projects::create(
+    let project = projects::create_with_template(
         &mut *tx,
         &payload.name,
         crate::db::models::ProjectStatus::Stopped,
@@ -195,6 +195,8 @@ pub async fn create_project(
         owner_user_id,
         owner_team_id,
         source_url.as_deref(),
+        payload.template.as_ref().map(|t| t.id.as_str()),
+        payload.template.as_ref().map(|t| t.image.as_str()),
     )
     .await
     .map_err(|e| {
@@ -417,6 +419,12 @@ async fn projects_to_api(
             resolved_source_url: None, // Not populated in list view for performance
             deployment_defaults: None, // Not populated in list view
             platform_constraints: None, // Not populated in list view
+            template: match (project.template_id, project.template_image) {
+                (Some(id), Some(image)) => {
+                    Some(crate::server::project::models::ProjectTemplateInfo { id, image })
+                }
+                _ => None,
+            },
         });
     }
 
@@ -862,6 +870,61 @@ pub async fn delete_project(
     Ok(StatusCode::ACCEPTED)
 }
 
+/// Update the `template_image` stored on a project. Called by the UI after
+/// it has redeployed from a quickstart template that moved ahead of the
+/// previously deployed version, so the catalog-vs-project diff resets.
+pub async fn update_project_template_image(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(id_or_name): Path<String>,
+    Query(params): Query<GetProjectParams>,
+    Json(payload): Json<crate::server::project::models::UpdateProjectTemplateImageRequest>,
+) -> Result<Json<crate::server::project::models::UpdateProjectResponse>, ServerError> {
+    let user = auth.user()?;
+    let project = resolve_project(&state, &id_or_name, params.by_id).await?;
+
+    let can_write = check_write_permission(&state, &project, user)
+        .await
+        .map_err(|e| ServerError::internal(format!("Failed to check permissions: {}", e)))?;
+    if !can_write {
+        return Err(ServerError::forbidden(
+            "You do not have permission to update this project",
+        ));
+    }
+    if auth.is_service_account() {
+        return Err(ServerError::forbidden(
+            "Service accounts cannot modify projects",
+        ));
+    }
+    if project.template_id.is_none() {
+        return Err(ServerError::bad_request(
+            "Project was not created from a quickstart template",
+        ));
+    }
+
+    let updated = projects::update_template_image(&state.db_pool, project.id, &payload.image)
+        .await
+        .internal_err("Failed to update template image")?;
+
+    tracing::info!(
+        project = %updated.name,
+        template_id = ?updated.template_id,
+        new_image = %payload.image,
+        user = %user.email,
+        "Updated project template image"
+    );
+
+    let owner_info = resolve_owner_info(&state, &updated)
+        .await
+        .map_err(|e| ServerError::internal(format!("Failed to resolve owner info: {}", e)))?;
+
+    Ok(Json(
+        crate::server::project::models::UpdateProjectResponse {
+            project: convert_project(updated, owner_info, &state),
+        },
+    ))
+}
+
 /// Query project by ID
 async fn query_project_by_id(
     state: &AppState,
@@ -1087,6 +1150,12 @@ fn convert_project(
         resolved_source_url: None, // Will be populated by caller if source_url is unset
         deployment_defaults,
         platform_constraints,
+        template: match (project.template_id, project.template_image) {
+            (Some(id), Some(image)) => {
+                Some(crate::server::project::models::ProjectTemplateInfo { id, image })
+            }
+            _ => None,
+        },
     }
 }
 

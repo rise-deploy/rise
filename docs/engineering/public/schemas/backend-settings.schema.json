@@ -1231,6 +1231,85 @@
       ],
       "type": "string"
     },
+    "QuickstartSettings": {
+      "description": "Catalog of quickstart templates exposed via `GET /api/v1/quickstart-templates`.",
+      "properties": {
+        "templates": {
+          "items": {
+            "$ref": "#/$defs/QuickstartTemplateConfig"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "QuickstartTemplateConfig": {
+      "description": "A single quickstart catalog entry. Mirrors the API shape on the wire, with\none difference: `icon` accepts either a built-in icon name (resolved to\n`/assets/quickstart/<name>.svg`) or an absolute URL/path (must start with\n`http://`, `https://`, or `/`).",
+      "properties": {
+        "description": {
+          "description": "Longer description shown in the deploy dialog.",
+          "type": "string"
+        },
+        "display_name": {
+          "description": "Short, human-friendly name shown in cards and dialogs.",
+          "type": "string"
+        },
+        "http_port": {
+          "description": "Port the container listens on.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "icon": {
+          "description": "Built-in icon name (e.g. `welcome`, `whoami`, `httpbin`, `excalidraw`)\nresolved against `/assets/quickstart/<name>.svg`, OR an absolute URL or\nstatic path (`http://...`, `https://...`, `/some/path.svg`).",
+          "type": "string"
+        },
+        "id": {
+          "description": "Stable kebab-case identifier used in URLs and project records.",
+          "type": "string"
+        },
+        "image": {
+          "description": "Fully-qualified container image. Pin a tag when one is published so the\ncatalog is reproducible; floating tags (`:latest`) work but defeat the\n\"Redeploy from template\" drift detector.",
+          "type": "string"
+        },
+        "learn_more_url": {
+          "description": "Upstream link for users who want to learn more.",
+          "type": "string"
+        },
+        "tagline": {
+          "description": "One-line description for the card.",
+          "type": "string"
+        },
+        "tags": {
+          "default": [],
+          "description": "Free-form tags for filtering / categorisation.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "warning": {
+          "default": null,
+          "description": "Optional caveat surfaced in the deploy modal — used when the image\nviolates a platform invariant (root user, privileged port) but is kept\nin the catalog for clusters that allow it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "display_name",
+        "tagline",
+        "description",
+        "icon",
+        "image",
+        "http_port",
+        "learn_more_url"
+      ],
+      "type": "object"
+    },
     "RegistrySettings": {
       "description": "Registry provider configuration",
       "oneOf": [
@@ -1792,6 +1871,17 @@
           "type": "null"
         }
       ]
+    },
+    "quickstart": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/QuickstartSettings"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Curated catalog of stateless container images surfaced as one-click\n\"quickstart\" deploys in the UI. The catalog is layered: `default.yaml`\nships the built-in selection and any `quickstart.templates` list in a\nlater layer (run-mode or `local.yaml`) *replaces* it entirely. Operators\nwho want to add to the defaults must re-include them."
     },
     "registry": {
       "anyOf": [

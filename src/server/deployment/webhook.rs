@@ -2542,6 +2542,8 @@ mod tests {
             owner_team_id: None,
             finalizers: vec![],
             source_url: None,
+            template_id: None,
+            template_image: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

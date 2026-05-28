@@ -20,6 +20,7 @@ pub async fn create(
         r#"
         SELECT id, name, status as "status: _", access_class,
                owner_user_id, owner_team_id, finalizers, source_url,
+               template_id, template_image,
                created_at, updated_at
         FROM projects
         WHERE id = $1
@@ -306,6 +307,7 @@ pub async fn create_with_raw_claims(
         r#"
         SELECT id, name, status as "status: _", access_class,
                owner_user_id, owner_team_id, finalizers, source_url,
+               template_id, template_image,
                created_at, updated_at
         FROM projects
         WHERE id = $1

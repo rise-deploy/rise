@@ -7,6 +7,7 @@ import { Button, Combobox, Field, Input, Modal, SearchInput, Segmented, Stat, St
 import { Icon } from '../components/icon';
 import { ProjectTable } from '../components/project-table';
 import { LoadingState, ErrorState } from '../components/states';
+import { QuickstartDeployModal, QuickstartPickerModal, useQuickstartTemplates, type QuickstartTemplate } from './quickstart-templates';
 
 interface Project {
     id?: string;
@@ -31,7 +32,18 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
     const [currentUser, setCurrentUser] = useState<any>(null);
     const [formData, setFormData] = useState({ name: '', access_class: 'public', owner: 'self' });
     const [saving, setSaving] = useState(false);
+    const [selectedTemplate, setSelectedTemplate] = useState<QuickstartTemplate | null>(null);
+    const [pickerOpen, setPickerOpen] = useState(false);
+    const { templates: quickstartTemplates } = useQuickstartTemplates();
+    const hasTemplates = !!quickstartTemplates && quickstartTemplates.length > 0;
     const { showToast } = useToast();
+
+    const handleTemplateSelect = (template: QuickstartTemplate) => {
+        // Close the blank-create modal and hand off to the quickstart deploy modal,
+        // which has its own form pre-filled with a suggested name + sensible defaults.
+        setModalOpen(false);
+        setSelectedTemplate(template);
+    };
 
     const loadProjects = useCallback(async () => {
         try {
@@ -195,7 +207,21 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
             <Modal
                 isOpen={modalOpen}
                 onClose={() => setModalOpen(false)}
-                title="Create a new project"
+                title={
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16 }}>
+                        <span>Create a new project</span>
+                        {hasTemplates && (
+                            <button
+                                type="button"
+                                className="r-link"
+                                style={{ fontSize: 12.5, fontWeight: 500, background: 'none', border: 0, padding: 0, cursor: 'pointer' }}
+                                onClick={() => { setModalOpen(false); setPickerOpen(true); }}
+                            >
+                                Create from template &rarr;
+                            </button>
+                        )}
+                    </div>
+                }
                 sub="A project bundles deployments, environments, env vars, domains and access."
                 footer={
                     <>
@@ -247,6 +273,18 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
                     </Field>
                 </div>
             </Modal>
+
+            <QuickstartPickerModal
+                open={pickerOpen}
+                onClose={() => setPickerOpen(false)}
+                onSelect={handleTemplateSelect}
+            />
+
+            <QuickstartDeployModal
+                template={selectedTemplate}
+                onClose={() => setSelectedTemplate(null)}
+                onDeployed={() => loadProjects()}
+            />
         </section>
     );
 }
