@@ -215,7 +215,7 @@ pub fn rise_system_env_vars(
 }
 
 /// A runtime environment variable override included in a deployment request
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct EnvOverride {
     pub key: String,
     pub value: String,
@@ -229,6 +229,61 @@ pub struct EnvOverride {
     /// resolved deployment environment matches. `None` means the override is global.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub for_environment: Option<String>,
+}
+
+/// Per-container probe configuration. All fields are optional and fall back to
+/// the server's `HealthProbeConfig` defaults. `disabled = true` turns probes
+/// off entirely (`health_check = false` in rise.toml).
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HealthCheckSpec {
+    #[serde(default)]
+    pub disabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_delay_seconds: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub period_seconds: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_threshold: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub liveness_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness_enabled: Option<bool>,
+}
+
+/// One container in a multi-container deployment request. The CLI builds (or
+/// resolves) every container's image before sending this; the server treats
+/// `image` as authoritative.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ContainerSpec {
+    pub name: String,
+    pub image: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<String>,
+    /// Container-scoped env vars (from `[containers.X.env]`). These are added
+    /// on top of the project-global env vars and override on conflict.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_overrides: Vec<EnvOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_check: Option<HealthCheckSpec>,
+}
+
+/// One ingress route mapping. Paths are matched longest-prefix-first by the
+/// reconciler; the request may list them in any order.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct RouteSpec {
+    pub path: String,
+    pub container: String,
+    pub port: u16,
 }
 
 // Request to create a deployment
@@ -281,6 +336,17 @@ pub struct CreateDeploymentRequest {
     /// explicit value, inherited from the source deployment.
     #[serde(default)]
     pub identity_audiences: Option<std::collections::BTreeMap<String, String>>,
+    /// Multi-container deployment spec. When present, the per-deployment
+    /// `image`/`http_port`/`replicas`/`cpu`/`memory` fields above are ignored —
+    /// every container declares its own. `None` keeps the legacy
+    /// single-container behaviour (back-compat for older CLIs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub containers: Option<Vec<ContainerSpec>>,
+    /// Ingress route map (`path` → `container`). Only meaningful when
+    /// `containers` is set. Order doesn't matter — the reconciler sorts by
+    /// path length descending for nginx longest-prefix-first semantics.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<RouteSpec>,
 }
 
 // Response from creating a deployment

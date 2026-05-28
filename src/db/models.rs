@@ -182,6 +182,15 @@ pub struct Deployment {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Multi-container side-data for a deployment, stored as JSONB on the
+/// `deployments` row and fetched separately by the reconciler/handlers.
+/// Both fields are `None` for legacy single-container deployments.
+#[derive(Debug, Clone)]
+pub struct DeploymentContainers {
+    pub containers: Option<serde_json::Value>,
+    pub routes: Option<serde_json::Value>,
+}
+
 /// Deployment status enum - tracks lifecycle of deployment
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq)]
 #[sqlx(type_name = "text")]

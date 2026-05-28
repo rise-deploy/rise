@@ -78,10 +78,99 @@ pub fn load_full_project_config(app_path: &str) -> Result<Option<ProjectBuildCon
             );
         }
 
+        validate_containers_and_routes(&config)?;
+
         Ok(Some(config))
     } else {
         Ok(None)
     }
+}
+
+/// Cross-field validation for `[containers]` and `[routes]`.
+///
+/// Rules:
+/// - `[containers]` and top-level `[build]`/`[deploy]` are mutually exclusive.
+/// - Container names must match `^[a-z][a-z0-9-]{0,38}$` (kept short to stay
+///   under the 63-char K8s resource-name limit when combined with project +
+///   deployment-id prefixes).
+/// - Each container must have exactly one of `image` / `build`.
+/// - Each container declaring a `health_check` block must also set `http_port`.
+/// - Each route's `container` must exist and must have `http_port` set.
+/// - Each route's `path` must start with `/`.
+fn validate_containers_and_routes(config: &ProjectBuildConfig) -> Result<()> {
+    if config.containers.is_empty() {
+        if !config.routes.is_empty() {
+            anyhow::bail!("[routes] requires at least one [containers.<name>] entry");
+        }
+        return Ok(());
+    }
+
+    if config.build.is_some() || config.deploy.is_some() {
+        anyhow::bail!(
+            "Top-level [build]/[deploy] cannot be combined with [containers.<name>]. \
+             Move the legacy [build]/[deploy] settings into a [containers.app] entry."
+        );
+    }
+
+    for (name, container) in &config.containers {
+        if !is_valid_container_name(name) {
+            anyhow::bail!(
+                "Invalid container name '{}': must match ^[a-z][a-z0-9-]{{0,38}}$",
+                name
+            );
+        }
+        match (&container.image, &container.build) {
+            (Some(_), Some(_)) => anyhow::bail!(
+                "[containers.{}] cannot set both 'image' and [build]; pick one",
+                name
+            ),
+            (None, None) => {
+                anyhow::bail!("[containers.{}] must set either 'image' or [build]", name)
+            }
+            _ => {}
+        }
+        if container.health_check.is_some() && container.http_port.is_none() {
+            anyhow::bail!(
+                "[containers.{}] has health_check but no http_port; \
+                 set http_port or remove health_check",
+                name
+            );
+        }
+    }
+
+    for (path, route) in &config.routes {
+        if !path.starts_with('/') {
+            anyhow::bail!("[routes] path '{}' must start with '/'", path);
+        }
+        let target = config.containers.get(&route.container).ok_or_else(|| {
+            anyhow::anyhow!(
+                "[routes] '{}' targets unknown container '{}'",
+                path,
+                route.container
+            )
+        })?;
+        if target.http_port.is_none() {
+            anyhow::bail!(
+                "[routes] '{}' targets container '{}' which has no http_port",
+                path,
+                route.container
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn is_valid_container_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 39 {
+        return false;
+    }
+    let mut chars = name.chars();
+    let first = chars.next().expect("non-empty by len() check above");
+    if !first.is_ascii_lowercase() {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 /// Write project configuration to rise.toml
@@ -239,6 +328,8 @@ FOO = "bar"
                     deploy: None,
                 },
             )]),
+            containers: BTreeMap::new(),
+            routes: BTreeMap::new(),
         };
 
         let temp_dir = tempfile::tempdir().unwrap();

@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::db::models::{Deployment, DeploymentStatus, TerminationReason};
+use crate::db::models::{Deployment, DeploymentContainers, DeploymentStatus, TerminationReason};
 use crate::server::deployment::state_machine;
 
 /// Parameters for creating a new deployment
@@ -1244,6 +1244,42 @@ pub async fn get_active_deployments_for_project(
     .await?;
 
     Ok(deployments)
+}
+
+/// Persist multi-container side-data on a deployment row. Pass `None` for
+/// `containers`/`routes` to clear them (single-container path).
+pub async fn set_containers(
+    pool: &PgPool,
+    deployment_id: Uuid,
+    containers: Option<&serde_json::Value>,
+    routes: Option<&serde_json::Value>,
+) -> Result<()> {
+    sqlx::query!(
+        "UPDATE deployments SET containers = $1, routes = $2 WHERE id = $3",
+        containers,
+        routes,
+        deployment_id
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Load multi-container side-data for a deployment. Both fields are `None`
+/// for legacy single-container deployments.
+pub async fn get_containers(pool: &PgPool, deployment_id: Uuid) -> Result<DeploymentContainers> {
+    let row = sqlx::query!(
+        r#"SELECT containers as "containers: serde_json::Value",
+                  routes as "routes: serde_json::Value"
+           FROM deployments WHERE id = $1"#,
+        deployment_id
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(DeploymentContainers {
+        containers: row.containers,
+        routes: row.routes,
+    })
 }
 
 #[cfg(test)]
