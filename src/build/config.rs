@@ -90,9 +90,8 @@ pub fn load_full_project_config(app_path: &str) -> Result<Option<ProjectBuildCon
 ///
 /// Rules:
 /// - `[containers]` and top-level `[build]`/`[deploy]` are mutually exclusive.
-/// - Container names must match `^[a-z][a-z0-9-]{0,38}$` (kept short to stay
-///   under the 63-char K8s resource-name limit when combined with project +
-///   deployment-id prefixes).
+/// - Container names must match `^[a-z][a-z0-9-]{0,14}$` (max 15 chars to keep
+///   `<project>-<deployment_id(15)>-<container>` under the 63-char K8s limit).
 /// - Each container must have exactly one of `image` / `build`.
 /// - Each container declaring a `health_check` block must also set `http_port`.
 /// - Each route's `container` must exist and must have `http_port` set.
@@ -115,7 +114,7 @@ fn validate_containers_and_routes(config: &ProjectBuildConfig) -> Result<()> {
     for (name, container) in &config.containers {
         if !is_valid_container_name(name) {
             anyhow::bail!(
-                "Invalid container name '{}': must match ^[a-z][a-z0-9-]{{0,38}}$",
+                "Invalid container name '{}': must match ^[a-z][a-z0-9-]{{0,14}}$ (max 15 chars, no trailing dash)",
                 name
             );
         }
@@ -162,7 +161,10 @@ fn validate_containers_and_routes(config: &ProjectBuildConfig) -> Result<()> {
 }
 
 fn is_valid_container_name(name: &str) -> bool {
-    if name.is_empty() || name.len() > 39 {
+    if name.is_empty() || name.len() > 15 {
+        return false;
+    }
+    if name.ends_with('-') {
         return false;
     }
     let mut chars = name.chars();
@@ -481,7 +483,7 @@ image = "registry.example.com/myapp/worker:latest"
             .unwrap();
         assert_eq!(config.containers.len(), 3);
         assert_eq!(config.routes.len(), 2);
-        let resolved = config.resolve_deploy();
+        let resolved = config.resolve_deploy().unwrap();
         assert_eq!(resolved.containers.len(), 3);
         assert!(resolved.containers.iter().all(|c| !c.is_legacy));
         assert_eq!(resolved.routes.len(), 2);
@@ -602,7 +604,7 @@ image = "bar:baz"
         let config = load_full_project_config(dir.path().to_str().unwrap())
             .unwrap()
             .unwrap();
-        let resolved = config.resolve_deploy();
+        let resolved = config.resolve_deploy().unwrap();
         assert_eq!(resolved.routes.len(), 1);
         assert_eq!(resolved.routes[0].path, "/");
         assert_eq!(resolved.routes[0].container, "api");
@@ -627,7 +629,7 @@ replicas = 2
             .unwrap()
             .unwrap();
         assert!(config.containers.is_empty());
-        let resolved = config.resolve_deploy();
+        let resolved = config.resolve_deploy().unwrap();
         assert_eq!(resolved.containers.len(), 1);
         assert!(resolved.containers[0].is_legacy);
         assert_eq!(resolved.containers[0].name, "app");

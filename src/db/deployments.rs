@@ -34,6 +34,13 @@ pub struct CreateDeploymentParams<'a> {
     pub memory: &'a str,
     /// Map of { in-pod filename -> token audience } for auto-minted workload JWTs.
     pub identity_audiences: serde_json::Value,
+    /// Multi-container side-data (`Vec<ContainerSpec>` as JSONB) or `None` for legacy.
+    /// Inserted atomically with the deployments row so we can't end up with a
+    /// multi-container deployment whose container JSON failed to persist.
+    pub containers: Option<&'a serde_json::Value>,
+    /// Ingress route map (`Vec<RouteSpec>` as JSONB) or `None`. Always `None`
+    /// when `containers` is `None`.
+    pub routes: Option<&'a serde_json::Value>,
 }
 
 /// List deployments for a project
@@ -288,8 +295,8 @@ pub async fn create(pool: &PgPool, params: CreateDeploymentParams<'_>) -> Result
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
-        INSERT INTO deployments (deployment_id, project_id, created_by_id, status, image, image_digest, rolled_back_from_deployment_id, deployment_group, environment_id, expires_at, http_port, is_active, job_url, pull_request_url, git_repository_url, replicas, cpu, memory, identity_audiences)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+        INSERT INTO deployments (deployment_id, project_id, created_by_id, status, image, image_digest, rolled_back_from_deployment_id, deployment_group, environment_id, expires_at, http_port, is_active, job_url, pull_request_url, git_repository_url, replicas, cpu, memory, identity_audiences, containers, routes)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
         RETURNING
             id, deployment_id, project_id, created_by_id,
             status as "status: DeploymentStatus",
@@ -323,7 +330,9 @@ pub async fn create(pool: &PgPool, params: CreateDeploymentParams<'_>) -> Result
         params.replicas,
         params.cpu,
         params.memory,
-        params.identity_audiences
+        params.identity_audiences,
+        params.containers,
+        params.routes,
     )
     .fetch_one(pool)
     .await
@@ -1246,25 +1255,6 @@ pub async fn get_active_deployments_for_project(
     Ok(deployments)
 }
 
-/// Persist multi-container side-data on a deployment row. Pass `None` for
-/// `containers`/`routes` to clear them (single-container path).
-pub async fn set_containers(
-    pool: &PgPool,
-    deployment_id: Uuid,
-    containers: Option<&serde_json::Value>,
-    routes: Option<&serde_json::Value>,
-) -> Result<()> {
-    sqlx::query!(
-        "UPDATE deployments SET containers = $1, routes = $2 WHERE id = $3",
-        containers,
-        routes,
-        deployment_id
-    )
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
 /// Load multi-container side-data for a deployment. Both fields are `None`
 /// for legacy single-container deployments.
 pub async fn get_containers(pool: &PgPool, deployment_id: Uuid) -> Result<DeploymentContainers> {
@@ -1533,6 +1523,8 @@ mod tests {
                 cpu: "500m",
                 memory: "256Mi",
                 identity_audiences: serde_json::json!({}),
+                containers: None,
+                routes: None,
             },
         )
         .await
@@ -1621,6 +1613,8 @@ mod tests {
                 cpu: "500m",
                 memory: "256Mi",
                 identity_audiences: serde_json::json!({}),
+                containers: None,
+                routes: None,
             },
         )
         .await

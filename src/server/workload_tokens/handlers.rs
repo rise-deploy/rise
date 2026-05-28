@@ -222,6 +222,8 @@ mod tests {
                             cpu: "500m",
                             memory: "256Mi",
                             identity_audiences: serde_json::json!({}),
+                            containers: None,
+                            routes: None,
                         },
                     )
                     .await

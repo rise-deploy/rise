@@ -30,7 +30,7 @@ fn build_multi_container_payload(
     let Some(cfg) = toml_config else {
         return Ok((None, None));
     };
-    let resolved = cfg.resolve_deploy();
+    let resolved = cfg.resolve_deploy().map_err(|e| anyhow::anyhow!(e))?;
     if resolved.containers.iter().all(|c| c.is_legacy) {
         // Single-container legacy path; let the existing image flow handle it.
         return Ok((None, None));
@@ -1087,7 +1087,9 @@ async fn build_and_push_multi_container(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("backend response missing container_images"))?;
 
-    let resolved = toml_config.resolve_deploy();
+    let resolved = toml_config
+        .resolve_deploy()
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     let registry_info = fetch_deployment_registry_credentials(
         http_client,

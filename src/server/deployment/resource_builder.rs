@@ -1826,8 +1826,27 @@ impl ResourceBuilder {
     /// `(path, service_name)` pairs, emits one `HTTPIngressPath` per route in
     /// longest-prefix-first order (lexicographic tiebreaker for deterministic
     /// output across reconciles). The `/.rise` backend path is appended last.
+    ///
+    /// Routes whose path does not start with `/` are skipped with a warning;
+    /// the request-time validator (`models::validate_containers_and_routes`)
+    /// should make this unreachable, but emitting an invalid Ingress would
+    /// take the whole project's traffic plane down — defence in depth.
     fn build_ingress_paths_multi(&self, routes: &[(String, String)]) -> Vec<HTTPIngressPath> {
-        let mut sorted: Vec<(String, String)> = routes.to_vec();
+        let mut sorted: Vec<(String, String)> = routes
+            .iter()
+            .filter(|(path, _)| {
+                if path.starts_with('/') {
+                    true
+                } else {
+                    warn!(
+                        "Skipping invalid ingress route '{}': path must start with '/'",
+                        path
+                    );
+                    false
+                }
+            })
+            .cloned()
+            .collect();
         sorted.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
 
         let mut paths: Vec<HTTPIngressPath> = sorted

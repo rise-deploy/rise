@@ -211,7 +211,14 @@ impl ProjectBuildConfig {
     /// Returns an empty resolution when neither `[containers]` nor top-level
     /// `[build]` is present — callers (CLI) must still allow `--image` to
     /// drive an image-only deployment in that case.
-    pub fn resolve_deploy(&self) -> ResolvedDeploy {
+    ///
+    /// Returns `Err` when a route references a container that has no
+    /// `http_port` (and the route itself doesn't override `port`). The CLI's
+    /// `load_full_project_config` validator catches this for the on-disk path,
+    /// but this method is public and callers may construct `ProjectBuildConfig`
+    /// in-memory or otherwise bypass the validator — so we enforce it inline to
+    /// avoid silently wiring a K8s Service to port 0.
+    pub fn resolve_deploy(&self) -> Result<ResolvedDeploy, String> {
         if !self.containers.is_empty() {
             let containers: Vec<ResolvedContainer> = self
                 .containers
@@ -248,27 +255,31 @@ impl ProjectBuildConfig {
                     Vec::new()
                 }
             } else {
-                self.routes
-                    .iter()
-                    .map(|(path, route)| {
-                        let port = route
-                            .port
-                            .or_else(|| {
-                                self.containers
-                                    .get(&route.container)
-                                    .and_then(|c| c.http_port)
-                            })
-                            .unwrap_or(0);
-                        ResolvedRoute {
-                            path: path.clone(),
-                            container: route.container.clone(),
-                            port,
+                let mut resolved = Vec::with_capacity(self.routes.len());
+                for (path, route) in &self.routes {
+                    let port = match route.port.or_else(|| {
+                        self.containers
+                            .get(&route.container)
+                            .and_then(|c| c.http_port)
+                    }) {
+                        Some(p) => p,
+                        None => {
+                            return Err(format!(
+                                "route '{}' targets container '{}' which has no http_port set",
+                                path, route.container
+                            ));
                         }
-                    })
-                    .collect()
+                    };
+                    resolved.push(ResolvedRoute {
+                        path: path.clone(),
+                        container: route.container.clone(),
+                        port,
+                    });
+                }
+                resolved
             };
 
-            return ResolvedDeploy { containers, routes };
+            return Ok(ResolvedDeploy { containers, routes });
         }
 
         // Legacy single-container path: synthesise an implicit `app` container
@@ -287,13 +298,73 @@ impl ProjectBuildConfig {
                 health_check: None,
                 is_legacy: true,
             };
-            return ResolvedDeploy {
+            return Ok(ResolvedDeploy {
                 containers: vec![container],
                 routes: Vec::new(),
-            };
+            });
         }
 
-        ResolvedDeploy::default()
+        Ok(ResolvedDeploy::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_deploy_errors_when_route_targets_container_without_http_port() {
+        // Construct in-memory (bypassing load_full_project_config's validator)
+        // to confirm resolve_deploy itself rejects port-less route targets
+        // rather than silently producing ResolvedRoute { port: 0 }.
+        let mut config = ProjectBuildConfig::default();
+        config.containers.insert(
+            "worker".to_string(),
+            ContainerConfig {
+                image: Some("foo:bar".to_string()),
+                ..Default::default()
+            },
+        );
+        config.routes.insert(
+            "/".to_string(),
+            RouteConfig {
+                container: "worker".to_string(),
+                port: None,
+            },
+        );
+
+        let err = config
+            .resolve_deploy()
+            .expect_err("expected http_port error");
+        assert!(
+            err.contains("no http_port") && err.contains("worker") && err.contains("'/'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_deploy_uses_route_port_override_when_container_has_no_http_port() {
+        // If the route supplies its own port, the container's missing http_port
+        // is fine — we shouldn't error in that case.
+        let mut config = ProjectBuildConfig::default();
+        config.containers.insert(
+            "worker".to_string(),
+            ContainerConfig {
+                image: Some("foo:bar".to_string()),
+                ..Default::default()
+            },
+        );
+        config.routes.insert(
+            "/".to_string(),
+            RouteConfig {
+                container: "worker".to_string(),
+                port: Some(8080),
+            },
+        );
+
+        let resolved = config.resolve_deploy().expect("should succeed");
+        assert_eq!(resolved.routes.len(), 1);
+        assert_eq!(resolved.routes[0].port, 8080);
     }
 }
 

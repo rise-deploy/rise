@@ -369,27 +369,21 @@ fn resolve_multi_container_images(
     }
 }
 
-/// Persist a deployment's multi-container side-data. Pass the RESOLVED specs
-/// (every container has `image` set) so the reconciler can read them
-/// directly from JSON without re-deriving anything.
+/// Serialise the resolved multi-container side-data so it can be passed into
+/// the deployments INSERT atomically (avoids the legacy "row exists but
+/// container JSON failed to persist" hazard).
 ///
-/// Cpu/memory/replicas follow the resolution order
-/// `[containers.<name>]` → deployment-level effective value (CLI flag /
-/// rise.toml env override / rise.toml global / platform default), and the
-/// resolved values are written back so the persisted JSON always has
-/// `cpu`/`memory`/`replicas` populated. The reconciler keeps its own
-/// `unwrap_or(deployment.*)` fallback for older rows that pre-date this
-/// backfill, but new deployments always have the effective values on disk.
+/// Backfills `replicas`/`cpu`/`memory` from the deployment-level effective
+/// values when a container leaves them unset, so the reconciler can read the
+/// JSON directly without re-deriving anything.
 #[cfg(feature = "backend")]
-async fn persist_multi_container_fields(
-    state: &AppState,
-    deployment_id: uuid::Uuid,
+fn build_container_side_data_json(
     resolved_specs: &[crate::server::deployment::models::ContainerSpec],
     routes: &[crate::server::deployment::models::RouteSpec],
     effective_replicas: u32,
     effective_cpu: &str,
     effective_memory: &str,
-) -> Result<(), ServerError> {
+) -> Result<(serde_json::Value, Option<serde_json::Value>), ServerError> {
     let mut backfilled = resolved_specs.to_vec();
     for spec in &mut backfilled {
         if spec.replicas.is_none() {
@@ -409,15 +403,23 @@ async fn persist_multi_container_fields(
     } else {
         Some(serde_json::to_value(routes).internal_err("Failed to serialise routes")?)
     };
-    db_deployments::set_containers(
-        &state.db_pool,
-        deployment_id,
-        Some(&containers_json),
-        routes_json.as_ref(),
-    )
-    .await
-    .internal_err("Failed to persist multi-container fields")?;
-    Ok(())
+    Ok((containers_json, routes_json))
+}
+
+/// Inherit the source deployment's container side-data verbatim. Used by the
+/// rollback path when the redeploy request itself doesn't carry a `containers`
+/// block — without this, a redeploy of a multi-container source would silently
+/// fall back to the single-container path and the reconciler would drop every
+/// per-container K8s resource.
+#[cfg(feature = "backend")]
+async fn inherit_container_side_data_from_source(
+    state: &AppState,
+    source_deployment_uuid: uuid::Uuid,
+) -> Result<(Option<serde_json::Value>, Option<serde_json::Value>), ServerError> {
+    let side = db_deployments::get_containers(&state.db_pool, source_deployment_uuid)
+        .await
+        .internal_err("Failed to load source deployment container side-data")?;
+    Ok((side.containers, side.routes))
 }
 
 async fn apply_env_overrides(
@@ -1002,6 +1004,11 @@ pub async fn create_deployment(
 
     validate_env_overrides(&payload.env_overrides)?;
 
+    // Wire-level validation for multi-container deployments (fails fast before
+    // image resolution / registry calls / DB writes). Legacy single-container
+    // requests pass through unchanged.
+    models::validate_containers_and_routes(payload.containers.as_deref(), &payload.routes)?;
+
     // Parse expiration duration if provided
     let expires_at = if let Some(ref expires_in) = payload.expires_in {
         Some(parse_expiration(expires_in).map_err(|e| {
@@ -1253,6 +1260,26 @@ pub async fn create_deployment(
             )?;
         }
 
+        // Compute container side-data BEFORE the INSERT so it lands atomically
+        // with the deployments row. If the redeploy request carries its own
+        // `containers` block, use that; otherwise inherit the source's JSON
+        // verbatim so a redeploy of a multi-container source stays
+        // multi-container (the legacy fallback would drop every per-container
+        // K8s resource).
+        let (containers_json, routes_json): (Option<serde_json::Value>, Option<serde_json::Value>) =
+            if let Some(ref r) = multi_container_resolved {
+                let (c, ro) = build_container_side_data_json(
+                    &r.resolved_specs,
+                    &payload.routes,
+                    effective_replicas,
+                    &effective_cpu,
+                    &effective_memory,
+                )?;
+                (Some(c), ro)
+            } else {
+                inherit_container_side_data_from_source(&state, source_deployment.id).await?
+            };
+
         // Create new deployment with Pushed status and invoke extension hooks
         // Copy image and image_digest from source - the helper function will determine the tag
         // For pre-built images: image_digest is copied, helper returns it
@@ -1279,23 +1306,12 @@ pub async fn create_deployment(
                 cpu: &effective_cpu,
                 memory: &effective_memory,
                 identity_audiences: effective_identity_audiences.clone(),
+                containers: containers_json.as_ref(),
+                routes: routes_json.as_ref(),
             },
             &project,
         )
         .await?;
-
-        if let Some(ref r) = multi_container_resolved {
-            persist_multi_container_fields(
-                &state,
-                new_deployment.id,
-                &r.resolved_specs,
-                &payload.routes,
-                effective_replicas,
-                &effective_cpu,
-                &effective_memory,
-            )
-            .await?;
-        }
 
         // Handle environment variables based on use_source_env_vars flag
         if payload.use_source_env_vars {
@@ -1417,6 +1433,27 @@ pub async fn create_deployment(
         )?;
     }
 
+    // Compute container side-data once (non-rollback paths) so it can be
+    // inserted atomically with the deployments row. `None` for legacy
+    // single-container requests.
+    #[cfg(feature = "backend")]
+    let (containers_json, routes_json): (Option<serde_json::Value>, Option<serde_json::Value>) =
+        if let Some(ref r) = multi_container_resolved {
+            let (c, ro) = build_container_side_data_json(
+                &r.resolved_specs,
+                &payload.routes,
+                effective_replicas,
+                &effective_cpu,
+                &effective_memory,
+            )?;
+            (Some(c), ro)
+        } else {
+            (None, None)
+        };
+    #[cfg(not(feature = "backend"))]
+    let (containers_json, routes_json): (Option<serde_json::Value>, Option<serde_json::Value>) =
+        (None, None);
+
     // Branch based on whether user provided a pre-built image
     if let Some(ref user_image) = payload.image {
         if payload.push_image {
@@ -1461,6 +1498,8 @@ pub async fn create_deployment(
                     cpu: &effective_cpu,
                     memory: &effective_memory,
                     identity_audiences: effective_identity_audiences.clone(),
+                    containers: containers_json.as_ref(),
+                    routes: routes_json.as_ref(),
                 },
                 &project,
             )
@@ -1470,19 +1509,6 @@ pub async fn create_deployment(
                 "Created push-image deployment {} for project {}",
                 deployment_id, payload.project
             );
-
-            if let Some(ref r) = multi_container_resolved {
-                persist_multi_container_fields(
-                    &state,
-                    deployment.id,
-                    &r.resolved_specs,
-                    &payload.routes,
-                    effective_replicas,
-                    &effective_cpu,
-                    &effective_memory,
-                )
-                .await?;
-            }
 
             // Copy project environment variables to deployment
             crate::db::env_vars::copy_project_env_vars_to_deployment(
@@ -1570,6 +1596,8 @@ pub async fn create_deployment(
                 cpu: &effective_cpu,
                 memory: &effective_memory,
                 identity_audiences: effective_identity_audiences.clone(),
+                containers: containers_json.as_ref(),
+                routes: routes_json.as_ref(),
             },
             &project,
         )
@@ -1579,19 +1607,6 @@ pub async fn create_deployment(
             "Created pre-built image deployment {} for project {}",
             deployment_id, payload.project
         );
-
-        if let Some(ref r) = multi_container_resolved {
-            persist_multi_container_fields(
-                &state,
-                deployment.id,
-                &r.resolved_specs,
-                &payload.routes,
-                effective_replicas,
-                &effective_cpu,
-                &effective_memory,
-            )
-            .await?;
-        }
 
         // Copy project environment variables to deployment
         crate::db::env_vars::copy_project_env_vars_to_deployment(
@@ -1711,6 +1726,8 @@ pub async fn create_deployment(
                 cpu: &effective_cpu,
                 memory: &effective_memory,
                 identity_audiences: effective_identity_audiences.clone(),
+                containers: containers_json.as_ref(),
+                routes: routes_json.as_ref(),
             },
             &project,
         )
@@ -1720,19 +1737,6 @@ pub async fn create_deployment(
             "Created build-from-source deployment {} for project {}",
             deployment_id, payload.project
         );
-
-        if let Some(ref r) = multi_container_resolved {
-            persist_multi_container_fields(
-                &state,
-                deployment.id,
-                &r.resolved_specs,
-                &payload.routes,
-                effective_replicas,
-                &effective_cpu,
-                &effective_memory,
-            )
-            .await?;
-        }
 
         // Copy project environment variables to deployment
         crate::db::env_vars::copy_project_env_vars_to_deployment(

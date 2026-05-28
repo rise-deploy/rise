@@ -1,4 +1,5 @@
 use super::controller::DeploymentUrls;
+use crate::server::error::ServerError;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
@@ -302,6 +303,127 @@ pub struct RouteSpec {
     pub port: u16,
 }
 
+/// Validate `^[a-z][a-z0-9-]{0,14}$` (max 15 chars, RFC 1123 label, starts
+/// with letter, lowercase alphanumeric + dash; no trailing dash).
+///
+/// Kept short so `<project>-<deployment_id(15)>-<container>` fits the K8s
+/// 63-char resource name limit.
+fn is_valid_container_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 15 {
+        return false;
+    }
+    if name.ends_with('-') {
+        return false;
+    }
+    let mut chars = name.chars();
+    let first = chars.next().expect("non-empty by len() check above");
+    if !first.is_ascii_lowercase() {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Validate the wire-level multi-container spec (containers + routes) from a
+/// `CreateDeploymentRequest`. Returns `Ok(())` for legacy single-container
+/// requests (`containers` is `None`).
+///
+/// Rules (see docstrings on `ContainerSpec`/`RouteSpec`):
+/// - Container name must match `^[a-z][a-z0-9-]{0,14}$`.
+/// - Container names must be unique within the request.
+/// - Each container must set exactly one of `image` (non-empty) or `build`
+///   (handled implicitly: `image == None` ⇒ CLI will build).
+/// - `env_overrides` entries with `is_secret = true` are rejected; per-container
+///   secret overrides are not yet supported on the wire.
+/// - `health_check.is_some()` requires `http_port.is_some()`.
+/// - Each route's `container` must match a container in the request.
+/// - The route's target container must have `http_port.is_some()`.
+/// - Each route's `path` must start with `/`.
+pub fn validate_containers_and_routes(
+    containers: Option<&[ContainerSpec]>,
+    routes: &[RouteSpec],
+) -> Result<(), ServerError> {
+    let Some(containers) = containers else {
+        if !routes.is_empty() {
+            return Err(ServerError::bad_request(
+                "routes requires at least one container",
+            ));
+        }
+        return Ok(());
+    };
+
+    if containers.is_empty() {
+        return Err(ServerError::bad_request(
+            "containers list must not be empty when present",
+        ));
+    }
+
+    let mut seen_names = std::collections::HashSet::with_capacity(containers.len());
+    for spec in containers {
+        if !is_valid_container_name(&spec.name) {
+            return Err(ServerError::bad_request(format!(
+                "Invalid container name '{}': must match ^[a-z][a-z0-9-]{{0,14}}$ (max 15 chars, no trailing dash)",
+                spec.name
+            )));
+        }
+        if !seen_names.insert(spec.name.clone()) {
+            return Err(ServerError::bad_request(format!(
+                "Duplicate container name '{}'",
+                spec.name
+            )));
+        }
+        if let Some(ref img) = spec.image {
+            if img.is_empty() {
+                return Err(ServerError::bad_request(format!(
+                    "Container '{}' has an empty image; either omit it (build from source) or set a non-empty value",
+                    spec.name
+                )));
+            }
+        }
+        if spec.health_check.is_some() && spec.http_port.is_none() {
+            return Err(ServerError::bad_request(format!(
+                "Container '{}' has health_check but no http_port; set http_port or remove health_check",
+                spec.name
+            )));
+        }
+        for over in &spec.env_overrides {
+            if over.is_secret {
+                return Err(ServerError::bad_request(format!(
+                    "Per-container secret env overrides are not yet supported (container '{}', key '{}'). Use a project-level secret env var, or include the secret in the per-container plain env after appropriate handling.",
+                    spec.name, over.key
+                )));
+            }
+        }
+    }
+
+    let container_by_name: std::collections::HashMap<&str, &ContainerSpec> =
+        containers.iter().map(|c| (c.name.as_str(), c)).collect();
+
+    for route in routes {
+        if !route.path.starts_with('/') {
+            return Err(ServerError::bad_request(format!(
+                "Route path '{}' must start with '/'",
+                route.path
+            )));
+        }
+        let target = container_by_name
+            .get(route.container.as_str())
+            .ok_or_else(|| {
+                ServerError::bad_request(format!(
+                    "Route '{}' targets unknown container '{}'",
+                    route.path, route.container
+                ))
+            })?;
+        if target.http_port.is_none() {
+            return Err(ServerError::bad_request(format!(
+                "Route '{}' targets container '{}' which has no http_port",
+                route.path, route.container
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 // Request to create a deployment
 #[derive(Debug, Deserialize)]
 pub struct CreateDeploymentRequest {
@@ -494,5 +616,170 @@ mod tests {
         .unwrap();
 
         assert_eq!(env_override.is_protected, Some(false));
+    }
+
+    fn cspec(name: &str, image: Option<&str>, http_port: Option<u16>) -> ContainerSpec {
+        ContainerSpec {
+            name: name.to_string(),
+            image: image.map(|s| s.to_string()),
+            http_port,
+            replicas: None,
+            cpu: None,
+            memory: None,
+            env_overrides: vec![],
+            health_check: None,
+        }
+    }
+
+    #[test]
+    fn test_validate_legacy_request_passes() {
+        assert!(validate_containers_and_routes(None, &[]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_legacy_request_with_routes_fails() {
+        let routes = vec![RouteSpec {
+            path: "/".to_string(),
+            container: "app".to_string(),
+            port: 8080,
+        }];
+        assert!(validate_containers_and_routes(None, &routes).is_err());
+    }
+
+    #[test]
+    fn test_validate_empty_containers_list_fails() {
+        let result = validate_containers_and_routes(Some(&[]), &[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_basic_multi_container_passes() {
+        let containers = vec![
+            cspec("api", Some("nginx:latest"), Some(8080)),
+            cspec("worker", Some("busybox:latest"), None),
+        ];
+        let routes = vec![RouteSpec {
+            path: "/".to_string(),
+            container: "api".to_string(),
+            port: 8080,
+        }];
+        validate_containers_and_routes(Some(&containers), &routes).unwrap();
+    }
+
+    #[test]
+    fn test_validate_invalid_container_name_uppercase() {
+        let containers = vec![cspec("API", Some("nginx"), Some(8080))];
+        let err = validate_containers_and_routes(Some(&containers), &[]).unwrap_err();
+        assert!(
+            err.message.contains("Invalid container name"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_validate_invalid_container_name_too_long() {
+        let containers = vec![cspec("aaaaaaaaaaaaaaaa", Some("nginx"), Some(8080))];
+        assert!(validate_containers_and_routes(Some(&containers), &[]).is_err());
+    }
+
+    #[test]
+    fn test_validate_invalid_container_name_trailing_dash() {
+        let containers = vec![cspec("api-", Some("nginx"), Some(8080))];
+        assert!(validate_containers_and_routes(Some(&containers), &[]).is_err());
+    }
+
+    #[test]
+    fn test_validate_container_name_15_chars_ok() {
+        let containers = vec![cspec("abcdefghijklmno", Some("nginx"), Some(8080))];
+        validate_containers_and_routes(Some(&containers), &[]).unwrap();
+    }
+
+    #[test]
+    fn test_validate_duplicate_container_names_fails() {
+        let containers = vec![
+            cspec("api", Some("nginx"), Some(8080)),
+            cspec("api", Some("nginx"), Some(9090)),
+        ];
+        let err = validate_containers_and_routes(Some(&containers), &[]).unwrap_err();
+        assert!(err.message.contains("Duplicate"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn test_validate_empty_image_string_fails() {
+        let containers = vec![cspec("api", Some(""), Some(8080))];
+        let err = validate_containers_and_routes(Some(&containers), &[]).unwrap_err();
+        assert!(err.message.contains("empty image"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn test_validate_health_check_requires_http_port() {
+        let mut spec = cspec("api", Some("nginx"), None);
+        spec.health_check = Some(HealthCheckSpec::default());
+        let err = validate_containers_and_routes(Some(&[spec]), &[]).unwrap_err();
+        assert!(err.message.contains("health_check"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn test_validate_route_to_unknown_container_fails() {
+        let containers = vec![cspec("api", Some("nginx"), Some(8080))];
+        let routes = vec![RouteSpec {
+            path: "/".to_string(),
+            container: "ghost".to_string(),
+            port: 8080,
+        }];
+        let err = validate_containers_and_routes(Some(&containers), &routes).unwrap_err();
+        assert!(
+            err.message.contains("unknown container"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_validate_route_to_worker_fails() {
+        let containers = vec![cspec("worker", Some("busybox"), None)];
+        let routes = vec![RouteSpec {
+            path: "/".to_string(),
+            container: "worker".to_string(),
+            port: 0,
+        }];
+        let err = validate_containers_and_routes(Some(&containers), &routes).unwrap_err();
+        assert!(err.message.contains("no http_port"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn test_validate_route_path_missing_leading_slash_fails() {
+        let containers = vec![cspec("api", Some("nginx"), Some(8080))];
+        let routes = vec![RouteSpec {
+            path: "api".to_string(),
+            container: "api".to_string(),
+            port: 8080,
+        }];
+        let err = validate_containers_and_routes(Some(&containers), &routes).unwrap_err();
+        assert!(
+            err.message.contains("must start with '/'"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_validate_per_container_secret_override_rejected() {
+        let mut spec = cspec("api", Some("nginx"), Some(8080));
+        spec.env_overrides.push(EnvOverride {
+            key: "API_KEY".to_string(),
+            value: "secret".to_string(),
+            is_secret: true,
+            is_protected: None,
+            source: None,
+            for_environment: None,
+        });
+        let err = validate_containers_and_routes(Some(&[spec]), &[]).unwrap_err();
+        assert!(
+            err.message.contains("secret env overrides"),
+            "got: {}",
+            err.message
+        );
     }
 }

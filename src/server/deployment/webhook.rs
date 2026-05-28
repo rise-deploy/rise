@@ -1522,17 +1522,25 @@ async fn compute_desired_children(
                     per_container_env.push(var.clone());
                 }
                 for over in &spec.env_overrides {
+                    // Per-container secret overrides are rejected at request
+                    // time (see validate_containers_and_routes); this should
+                    // never fire. If it does, the right answer is to fix the
+                    // request handler, not silently route around it.
+                    debug_assert!(
+                        !over.is_secret,
+                        "per-container secret env override leaked past validation: {}",
+                        over.key
+                    );
                     if over.is_secret {
-                        // Per-container secret values would need a per-container
-                        // Secret. v1 does not yet support that — log and skip
-                        // so the reconciler is honest about its semantics.
-                        warn!(
-                            deployment_id = %deployment.deployment_id,
-                            container = spec.name,
-                            key = over.key,
-                            "Per-container secret env overrides are not yet supported; ignoring"
-                        );
                         continue;
+                    }
+                    // Skip overrides whose `for_environment` doesn't match the
+                    // deployment's resolved environment. Mirrors the global
+                    // `apply_env_overrides` path.
+                    if let Some(ref target_env) = over.for_environment {
+                        if env_name.as_deref() != Some(target_env.as_str()) {
+                            continue;
+                        }
                     }
                     // Replace if present, otherwise append.
                     if let Some(existing) =
