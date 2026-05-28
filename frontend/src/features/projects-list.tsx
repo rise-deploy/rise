@@ -7,7 +7,7 @@ import { Button, Combobox, Field, Input, Modal, SearchInput, Segmented, Stat, St
 import { Icon } from '../components/icon';
 import { ProjectTable } from '../components/project-table';
 import { LoadingState, ErrorState } from '../components/states';
-import { QuickstartDeployModal, QuickstartGrid, useQuickstartTemplates, type QuickstartTemplate } from './quickstart-templates';
+import { QuickstartDeployModal, QuickstartPickerModal, useQuickstartTemplates, type QuickstartTemplate } from './quickstart-templates';
 
 interface Project {
     id?: string;
@@ -33,7 +33,9 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
     const [formData, setFormData] = useState({ name: '', access_class: 'public', owner: 'self' });
     const [saving, setSaving] = useState(false);
     const [selectedTemplate, setSelectedTemplate] = useState<QuickstartTemplate | null>(null);
+    const [pickerOpen, setPickerOpen] = useState(false);
     const { templates: quickstartTemplates } = useQuickstartTemplates();
+    const hasTemplates = !!quickstartTemplates && quickstartTemplates.length > 0;
     const { showToast } = useToast();
 
     const handleTemplateSelect = (template: QuickstartTemplate) => {
@@ -205,9 +207,22 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
             <Modal
                 isOpen={modalOpen}
                 onClose={() => setModalOpen(false)}
-                title="Create a new project"
+                title={
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16 }}>
+                        <span>Create a new project</span>
+                        {hasTemplates && (
+                            <button
+                                type="button"
+                                className="r-link"
+                                style={{ fontSize: 12.5, fontWeight: 500, background: 'none', border: 0, padding: 0, cursor: 'pointer' }}
+                                onClick={() => { setModalOpen(false); setPickerOpen(true); }}
+                            >
+                                Create from template &rarr;
+                            </button>
+                        )}
+                    </div>
+                }
                 sub="A project bundles deployments, environments, env vars, domains and access."
-                width={quickstartTemplates && quickstartTemplates.length > 0 ? 'wide' : 'default'}
                 footer={
                     <>
                         <Button onClick={() => setModalOpen(false)} disabled={saving}>Cancel</Button>
@@ -215,19 +230,6 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
                     </>
                 }
             >
-                {quickstartTemplates && quickstartTemplates.length > 0 && (
-                    <div style={{ marginBottom: 18 }}>
-                        <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-soft)', textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 8 }}>
-                            Start from a template
-                        </div>
-                        <QuickstartGrid templates={quickstartTemplates} onSelect={handleTemplateSelect} limit={4} />
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 10, margin: '18px 0 6px', color: 'var(--text-soft)', fontSize: 11.5, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
-                            <div style={{ flex: 1, height: 1, background: 'var(--border-faint)' }} />
-                            <span>Or start blank</span>
-                            <div style={{ flex: 1, height: 1, background: 'var(--border-faint)' }} />
-                        </div>
-                    </div>
-                )}
                 <Field label="Project name" hint="Only lowercase letters, numbers, and hyphens.">
                     <Input
                         placeholder="my-service"
@@ -271,6 +273,12 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
                     </Field>
                 </div>
             </Modal>
+
+            <QuickstartPickerModal
+                open={pickerOpen}
+                onClose={() => setPickerOpen(false)}
+                onSelect={handleTemplateSelect}
+            />
 
             <QuickstartDeployModal
                 template={selectedTemplate}

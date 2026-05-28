@@ -11,6 +11,7 @@ import { LoadingState, ErrorState, EmptyState } from '../components/states';
 import { DeploymentsList } from './deployments';
 import { DomainsList, EnvironmentsList, EnvVarsList, ExtensionsList } from './resources';
 import { AppUsersList } from './projects';
+import { useQuickstartTemplates } from './quickstart-templates';
 
 const TAB_LABELS: Record<string, string> = {
     overview: 'Overview',
@@ -209,7 +210,7 @@ export function ProjectDetail({ projectName, initialTab }: { projectName: string
 
             <div>
                 {activeTab === 'overview' && (
-                    <ProjectOverview project={project} projectName={projectName} accessLabel={accessLabel} environments={environments} />
+                    <ProjectOverview project={project} projectName={projectName} accessLabel={accessLabel} environments={environments} onUpdated={loadProject} />
                 )}
                 {activeTab === 'deployments' && <DeploymentsList projectName={projectName} />}
                 {activeTab === 'environments' && (
@@ -393,7 +394,89 @@ function CurrentDeploymentPanel({ projectName, environments }: { projectName: st
     );
 }
 
-function ProjectOverview({ project, projectName, accessLabel, environments }: { project: any; projectName: string; accessLabel: string; environments: any[] }) {
+// Right-column panel surfacing the quickstart template a project was created
+// from. The "Update from template" button is always rendered (so the binding
+// is discoverable) but greyed out unless the catalog entry's image:tag has
+// moved ahead of what's stored on the project.
+function ProjectTemplatePanel({ project, projectName, onUpdated }: { project: any; projectName: string; onUpdated: () => void }) {
+    const { templates } = useQuickstartTemplates();
+    const { showToast } = useToast();
+    const [updating, setUpdating] = useState(false);
+    if (!project.template) return null;
+
+    const stored = project.template;
+    const catalog = templates?.find((t: any) => t.id === stored.id) || null;
+    const updateAvailable = !!catalog && catalog.image !== stored.image;
+
+    const handleUpdate = async () => {
+        if (!catalog || !updateAvailable) return;
+        setUpdating(true);
+        try {
+            await api.createDeploymentFromImage(projectName, catalog.image, catalog.http_port);
+            await api.updateProjectTemplateImage(projectName, catalog.image);
+            showToast(`Redeploying ${catalog.display_name} with ${catalog.image}…`, 'success');
+            window.dispatchEvent(new Event('rise:mutation'));
+            onUpdated();
+        } catch (err: any) {
+            showToast(`Failed to update from template: ${err.message}`, 'error');
+        } finally {
+            setUpdating(false);
+        }
+    };
+
+    return (
+        <Panel>
+            <PanelHead title="Template" />
+            <PanelBody>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
+                    {catalog?.icon_url && (
+                        <img src={catalog.icon_url} alt="" width={32} height={32} style={{ borderRadius: 6 }} />
+                    )}
+                    <div style={{ minWidth: 0 }}>
+                        <div style={{ fontWeight: 500, fontSize: 13.5 }}>
+                            {catalog?.display_name || stored.id}
+                        </div>
+                        {catalog?.tagline && (
+                            <div style={{ fontSize: 11.5, color: 'var(--text-soft)' }}>{catalog.tagline}</div>
+                        )}
+                    </div>
+                </div>
+                <KV>
+                    <KVRow k="Deployed">
+                        <code className="mono" style={{ fontSize: 12 }}>{stored.image}</code>
+                    </KVRow>
+                    {catalog && (
+                        <KVRow k="Catalog">
+                            <code className="mono" style={{ fontSize: 12 }}>{catalog.image}</code>
+                            {!updateAvailable && (
+                                <span style={{ marginLeft: 8, fontSize: 11, color: 'var(--text-soft)' }}>up to date</span>
+                            )}
+                        </KVRow>
+                    )}
+                </KV>
+                <div style={{ marginTop: 12 }}>
+                    <Button
+                        icon="refresh"
+                        loading={updating}
+                        disabled={!updateAvailable}
+                        onClick={handleUpdate}
+                        title={
+                            !catalog
+                                ? 'Template no longer in catalog'
+                                : updateAvailable
+                                    ? `Redeploy with ${catalog.image}`
+                                    : 'Template image has not changed'
+                        }
+                    >
+                        Update from template
+                    </Button>
+                </div>
+            </PanelBody>
+        </Panel>
+    );
+}
+
+function ProjectOverview({ project, projectName, accessLabel, environments, onUpdated }: { project: any; projectName: string; accessLabel: string; environments: any[]; onUpdated: () => void }) {
     const sourceUrl: string | null = project.source_url || project.resolved_source_url || null;
     const sourceUrlInherited = !project.source_url && !!project.resolved_source_url;
     return (
@@ -405,6 +488,8 @@ function ProjectOverview({ project, projectName, accessLabel, environments }: { 
             </div>
 
             <div className="r-stack">
+                <ProjectTemplatePanel project={project} projectName={projectName} onUpdated={onUpdated} />
+
                 <Panel>
                     <PanelHead title="About" />
                     <PanelBody>

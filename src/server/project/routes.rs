@@ -20,4 +20,8 @@ pub fn routes() -> Router<AppState> {
         .route("/projects/{id_or_name}", get(handlers::get_project))
         .route("/projects/{id_or_name}", put(handlers::update_project))
         .route("/projects/{id_or_name}", delete(handlers::delete_project))
+        .route(
+            "/projects/{id_or_name}/template-image",
+            post(handlers::update_project_template_image),
+        )
 }

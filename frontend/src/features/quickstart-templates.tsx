@@ -3,7 +3,7 @@ import React, { useEffect, useState } from 'react';
 import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
 import { useToast } from '../components/toast';
-import { Button, Combobox, Field, Input, Modal, Panel, PanelHead } from '../components/r-ui';
+import { Alert, Button, Combobox, Field, Input, Modal, Panel, PanelHead } from '../components/r-ui';
 import { Icon } from '../components/icon';
 
 export interface QuickstartTemplate {
@@ -16,6 +16,7 @@ export interface QuickstartTemplate {
     http_port: number;
     learn_more_url: string;
     tags?: string[];
+    warning?: string;
 }
 
 // Default suggestion for the project name: template id, lightly randomized so
@@ -103,7 +104,7 @@ export function QuickstartDeployModal({ template, onClose, onDeployed }: DeployM
         setSaving(true);
         try {
             const owner = formData.owner === 'self' ? { user: currentUser.id } : { team: formData.owner };
-            await api.createProject(formData.name, formData.access_class, owner);
+            await api.createProject(formData.name, formData.access_class, owner, { id: template.id, image: template.image });
             await api.createDeploymentFromImage(formData.name, template.image, template.http_port);
             showToast(`Deploying ${template.display_name} to ${formData.name}…`, 'success');
             window.dispatchEvent(new Event('rise:mutation'));
@@ -141,6 +142,11 @@ export function QuickstartDeployModal({ template, onClose, onDeployed }: DeployM
             <p style={{ margin: '0 0 14px', fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.55 }}>
                 {template.description}
             </p>
+            {template.warning && (
+                <div style={{ marginBottom: 14 }}>
+                    <Alert tone="warn" icon="info">{template.warning}</Alert>
+                </div>
+            )}
             <div className="r-quickstart-meta">
                 <div>
                     <div className="r-quickstart-meta__label">Image</div>
@@ -204,13 +210,42 @@ export function QuickstartDeployModal({ template, onClose, onDeployed }: DeployM
     );
 }
 
+// Picker modal: lists every available template in a grid and forwards the
+// selection to the caller (typically opening the deploy modal next).
+export function QuickstartPickerModal({ open, onClose, onSelect }: { open: boolean; onClose: () => void; onSelect: (t: QuickstartTemplate) => void }) {
+    const { templates, error } = useQuickstartTemplates();
+    return (
+        <Modal
+            isOpen={open}
+            onClose={onClose}
+            width="wide"
+            title="Choose a template"
+            sub="Curated stateless apps you can deploy in one click."
+            footer={<Button onClick={onClose}>Cancel</Button>}
+        >
+            {error && <Alert tone="err" icon="info">Failed to load templates: {error}</Alert>}
+            {!error && !templates && <div style={{ padding: 12, color: 'var(--text-muted)', fontSize: 13 }}>Loading templates…</div>}
+            {templates && templates.length === 0 && (
+                <div style={{ padding: 12, color: 'var(--text-muted)', fontSize: 13 }}>No templates available.</div>
+            )}
+            {templates && templates.length > 0 && (
+                <QuickstartGrid templates={templates} onSelect={(t) => { onSelect(t); onClose(); }} />
+            )}
+        </Modal>
+    );
+}
+
 // Self-contained panel for the home dashboard. Shows up to `limit` templates
-// and opens the deploy modal on click.
-export function QuickstartPanel({ limit = 4 }: { limit?: number }) {
+// (default 2) followed by a "Show all" button that opens the picker modal.
+// Clicking a card or picking from the modal opens the deploy modal.
+export function QuickstartPanel({ limit = 2 }: { limit?: number }) {
     const { templates, error } = useQuickstartTemplates();
     const [selected, setSelected] = useState<QuickstartTemplate | null>(null);
+    const [pickerOpen, setPickerOpen] = useState(false);
 
     if (error || !templates || templates.length === 0) return null;
+
+    const hasMore = templates.length > limit;
 
     return (
         <>
@@ -219,10 +254,18 @@ export function QuickstartPanel({ limit = 4 }: { limit?: number }) {
                     title="Deploy a quickstart"
                     sub="Stateless apps ready to run on Rise in one click."
                 />
-                <div style={{ padding: '4px 12px 14px' }}>
+                <div style={{ padding: '4px 12px 14px', display: 'flex', flexDirection: 'column', gap: 10 }}>
                     <QuickstartGrid templates={templates} onSelect={setSelected} limit={limit} />
+                    <Button onClick={() => setPickerOpen(true)} icon={hasMore ? 'arrow' : 'plus'}>
+                        {hasMore ? `Show all ${templates.length} templates` : 'Browse all templates'}
+                    </Button>
                 </div>
             </Panel>
+            <QuickstartPickerModal
+                open={pickerOpen}
+                onClose={() => setPickerOpen(false)}
+                onSelect={setSelected}
+            />
             <QuickstartDeployModal
                 template={selected}
                 onClose={() => setSelected(null)}

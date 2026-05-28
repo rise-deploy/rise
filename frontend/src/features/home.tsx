@@ -151,6 +151,8 @@ export function Home({ user }: HomeProps) {
                 </Panel>
 
                 <div className="r-stack">
+                    <QuickstartPanel />
+
                     <Panel>
                         <PanelHead title="Your teams" />
                         <div style={{ padding: 6 }}>
@@ -197,10 +199,6 @@ export function Home({ user }: HomeProps) {
                         </PanelBody>
                     </Panel>
                 </div>
-            </div>
-
-            <div style={{ marginTop: 18 }}>
-                <QuickstartPanel />
             </div>
         </section>
     );

@@ -135,10 +135,20 @@ class RiseAPI {
         return this.request(`/projects/${idOrName}${queryString ? '?' + queryString : ''}`);
     }
 
-    async createProject(name, access_class, owner) {
+    async createProject(name, access_class, owner, template = null) {
         return this.request('/projects', {
             method: 'POST',
-            body: JSON.stringify({ name, access_class, owner })
+            body: JSON.stringify({ name, access_class, owner, ...(template ? { template } : {}) })
+        });
+    }
+
+    // Record the new template image:tag on a project after a redeploy
+    // triggered by the "Update from template" button in the UI. Resets the
+    // catalog-vs-project diff used to enable/disable that button.
+    async updateProjectTemplateImage(projectName, image) {
+        return this.request(`/projects/${projectName}/template-image`, {
+            method: 'POST',
+            body: JSON.stringify({ image }),
         });
     }
 
