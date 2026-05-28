@@ -652,4 +652,111 @@ http_port = 8080
             "got: {err}"
         );
     }
+
+    #[test]
+    fn test_container_rejects_both_image_and_build() {
+        let dir = write_toml(
+            r#"
+[containers.app]
+image = "foo:bar"
+http_port = 8080
+
+[containers.app.build]
+backend = "docker"
+"#,
+        );
+        let err = load_full_project_config(dir.path().to_str().unwrap())
+            .expect_err("expected image+build mutual-exclusion error");
+        assert!(
+            err.to_string()
+                .contains("cannot set both 'image' and [build]"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_container_rejects_neither_image_nor_build() {
+        let dir = write_toml(
+            r#"
+[containers.app]
+http_port = 8080
+"#,
+        );
+        let err = load_full_project_config(dir.path().to_str().unwrap())
+            .expect_err("expected missing-image-or-build error");
+        assert!(
+            err.to_string()
+                .contains("must set either 'image' or [build]"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_container_health_check_requires_http_port() {
+        let dir = write_toml(
+            r#"
+[containers.app]
+image = "foo:bar"
+health_check = { path = "/health" }
+"#,
+        );
+        let err = load_full_project_config(dir.path().to_str().unwrap())
+            .expect_err("expected health_check-without-http_port error");
+        assert!(
+            err.to_string().contains("health_check but no http_port"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_route_path_missing_leading_slash_fails() {
+        let dir = write_toml(
+            r#"
+[containers.api]
+image = "foo:bar"
+http_port = 8080
+
+[routes]
+"api" = { container = "api" }
+"#,
+        );
+        let err = load_full_project_config(dir.path().to_str().unwrap())
+            .expect_err("expected route path leading-slash error");
+        assert!(
+            err.to_string().contains("must start with '/'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_container_name_15_chars_ok() {
+        let dir = write_toml(
+            r#"
+[containers.abcdefghijklmno]
+image = "foo:bar"
+http_port = 8080
+"#,
+        );
+        let config = load_full_project_config(dir.path().to_str().unwrap())
+            .expect("15-char container name should be accepted")
+            .unwrap();
+        assert!(config.containers.contains_key("abcdefghijklmno"));
+    }
+
+    #[test]
+    fn test_container_name_16_chars_fails() {
+        let dir = write_toml(
+            r#"
+[containers.abcdefghijklmnop]
+image = "foo:bar"
+http_port = 8080
+"#,
+        );
+        let err = load_full_project_config(dir.path().to_str().unwrap())
+            .expect_err("16-char container name should be rejected");
+        assert!(
+            err.to_string().contains("Invalid container name"),
+            "got: {err}"
+        );
+    }
 }

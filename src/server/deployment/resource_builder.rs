@@ -93,7 +93,6 @@ pub const LABEL_CONTAINER: &str = "rise.dev/container";
 /// Default container name used when a deployment row has no `containers` JSON
 /// (legacy single-container path). Matches the hardcoded value used to live
 /// inside the K8s pod spec, so no on-cluster renaming happens for old rows.
-#[allow(dead_code)]
 pub const LEGACY_CONTAINER_NAME: &str = "app";
 
 /// Per-container runtime parameters consumed by `create_k8s_deployment_for`
@@ -1435,7 +1434,7 @@ impl ResourceBuilder {
                             })
                         },
                         containers: vec![Container {
-                            name: "app".to_string(),
+                            name: LEGACY_CONTAINER_NAME.to_string(),
                             image: Some(image.to_string()),
                             ports: Some(vec![ContainerPort {
                                 container_port: http_port as i32,
@@ -1898,7 +1897,6 @@ impl ResourceBuilder {
     /// `custom_domain_ingress_annotations` is configured, callers should pass an
     /// empty slice here and use `create_custom_domain_ingress` separately so the
     /// custom annotations only apply to those domains.
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn create_primary_ingress(
         &self,

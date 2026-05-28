@@ -1707,30 +1707,27 @@ async fn compute_desired_children(
                 .filter(|s| s.http_port.is_some())
                 .map(|s| s.name.clone())
                 .collect();
+            // `deployment_group` is NOT NULL with `DEFAULT 'default'` and a
+            // CHECK constraint that rejects empty strings (see migration
+            // `20251205000003_add_deployment_groups.sql`), so we always take
+            // the non-legacy suffixed path here. Mirrors `service_name_for_container`.
+            debug_assert!(
+                !active_deployment.deployment_group.is_empty(),
+                "deployment_group should never be empty (DB CHECK constraint)"
+            );
+            let service_name_base =
+                crate::server::deployment::resource_builder::ResourceBuilder::service_name(
+                    project,
+                    active_deployment,
+                );
             let pairs: Vec<(String, String)> = route_specs
-                    .iter()
-                    .filter(|r| routable_names.contains(&r.container))
-                    .map(|r| {
-                        let svc_name = if active_deployment
-                            .deployment_group
-                            .is_empty()
-                        {
-                            r.container.clone()
-                        } else {
-                            // Mirror the suffix logic in service_name_for_container:
-                            // non-legacy containers get `<group>-<container>`.
-                            format!(
-                                "{}-{}",
-                                crate::server::deployment::resource_builder::ResourceBuilder::service_name(
-                                    project,
-                                    active_deployment,
-                                ),
-                                r.container
-                            )
-                        };
-                        (r.path.clone(), svc_name)
-                    })
-                    .collect();
+                .iter()
+                .filter(|r| routable_names.contains(&r.container))
+                .map(|r| {
+                    let svc_name = format!("{}-{}", service_name_base, r.container);
+                    (r.path.clone(), svc_name)
+                })
+                .collect();
             Some(pairs)
         };
         // Workers-only multi-container deployments (no container exposes

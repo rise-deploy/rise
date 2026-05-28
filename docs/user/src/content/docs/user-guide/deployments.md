@@ -272,6 +272,7 @@ Notes:
 - Containers without `http_port` get no `Service` and no HTTP probes — exactly what you want for workers / batch jobs.
 - `health_check = false` disables probes entirely on a container.
 - Routes are matched longest-prefix-first by the ingress, so `/api` shadows `/` correctly. If `[routes]` is omitted and exactly one container has `http_port`, Rise synthesises `/` → that container.
+- Each container is given a `RISE_CONTAINER_HOST__<NAME>` env var pointing at every routable sibling's in-cluster Service. See [Environment Variables](../environment-variables#auto-injected-variables).
 
 ## CI/CD Deployments
 

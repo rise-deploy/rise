@@ -696,6 +696,23 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_container_name_empty_fails() {
+        let containers = vec![cspec("", Some("nginx"), Some(8080))];
+        let err = validate_containers_and_routes(Some(&containers), &[]).unwrap_err();
+        assert!(
+            err.message.contains("Invalid container name"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_validate_container_name_single_char_ok() {
+        let containers = vec![cspec("a", Some("nginx"), Some(8080))];
+        validate_containers_and_routes(Some(&containers), &[]).unwrap();
+    }
+
+    #[test]
     fn test_validate_duplicate_container_names_fails() {
         let containers = vec![
             cspec("api", Some("nginx"), Some(8080)),

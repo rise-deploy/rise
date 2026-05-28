@@ -1066,9 +1066,10 @@ pub async fn create_deployment(
 /// backend already persisted the user-provided tag.
 ///
 /// Builds run sequentially in the iteration order of `[containers.<name>]`
-/// (BTreeMap → lexicographic). All builds share a single registry login,
-/// because the backend mints credentials whose scope covers every
-/// container's tag (critical for tag-scoped providers like JFrog).
+/// (BTreeMap → lexicographic). Registry credentials are re-minted per
+/// container before login + build + push, because a long multi-container
+/// build (cold BuildKit cache × N containers) can outlast the issued
+/// token's `expires_in` and cause later pushes to 401.
 async fn build_and_push_multi_container(
     http_client: &Client,
     backend_url: &str,
@@ -1091,7 +1092,10 @@ async fn build_and_push_multi_container(
         .resolve_deploy()
         .map_err(|e| anyhow::anyhow!(e))?;
 
-    let registry_info = fetch_deployment_registry_credentials(
+    // Initial fetch: we need `target_platform` upfront to build BuildOptions
+    // for each container. The credentials from this call are discarded —
+    // each container re-mints fresh creds below to avoid token expiry mid-run.
+    let initial_registry_info = fetch_deployment_registry_credentials(
         http_client,
         backend_url,
         token,
@@ -1099,43 +1103,7 @@ async fn build_and_push_multi_container(
         &deployment_info.deployment_id,
     )
     .await?;
-
-    // Determine container-cli from the first buildable container (or fall
-    // back to CLI args / config defaults). The CLI tool used has to match
-    // across all containers; using each container's own would be confusing.
-    // BuildOptions::from_build_args already resolves this from rise.toml's
-    // top-level `[build]` if set, else CLI defaults — we just feed it any
-    // BuildConfig and let it resolve.
-    let first_build_options = {
-        let dummy_image = "rise-multi-container-login-only".to_string();
-        // Use the first container's build config to pick container_cli;
-        // every container should use the same toolchain on this host.
-        let mut for_login = toml_config.clone();
-        for_login.build = resolved
-            .containers
-            .iter()
-            .find_map(|c| c.build.clone())
-            .or(toml_config.build.clone());
-        BuildOptions::from_build_args(
-            config,
-            dummy_image,
-            deploy_opts.path.to_string(),
-            deploy_opts.build_args,
-            Some(for_login),
-            registry_info.target_platform.as_deref(),
-        )
-    };
-
-    login_to_registry(
-        http_client,
-        backend_url,
-        token,
-        first_build_options.container_cli.command(),
-        &registry_info.credentials,
-        deploy_opts.project_name,
-        &deployment_info.deployment_id,
-    )
-    .await?;
+    let target_platform = initial_registry_info.target_platform.clone();
 
     update_deployment_status(
         http_client,
@@ -1177,9 +1145,29 @@ async fn build_and_push_multi_container(
             deploy_opts.path.to_string(),
             deploy_opts.build_args,
             Some(per_container_toml),
-            registry_info.target_platform.as_deref(),
+            target_platform.as_deref(),
         )
         .with_push(true);
+
+        // Re-mint per container — long builds can outlast the token's expires_in.
+        let fresh_creds = fetch_deployment_registry_credentials(
+            http_client,
+            backend_url,
+            token,
+            deploy_opts.project_name,
+            &deployment_info.deployment_id,
+        )
+        .await?;
+        login_to_registry(
+            http_client,
+            backend_url,
+            token,
+            options.container_cli.command(),
+            &fresh_creds.credentials,
+            deploy_opts.project_name,
+            &deployment_info.deployment_id,
+        )
+        .await?;
 
         log_platform_choice(&options.platform, options.platform_source, "Building");
         info!("→ Building container '{}' as {}", container.name, image_tag);
