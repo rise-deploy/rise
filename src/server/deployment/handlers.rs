@@ -2279,7 +2279,10 @@ pub struct LogStreamParams {
     pub since: Option<i64>,
     /// Start of an explicit time range in RFC3339 format
     pub start: Option<String>,
-    /// End of an explicit time range in RFC3339 format
+    /// End of an explicit time range in RFC3339 format. Honored by the Loki
+    /// backend. The Kubernetes backend has no `pods/log` end-time filter and
+    /// silently ignores this — for past windows on the Kubernetes backend,
+    /// use the Loki backend instead.
     pub end: Option<String>,
     /// Restrict to lines whose backend-emitted level matches one of these
     /// values. Repeated query param: `?level=info&level=warn`. Empty list

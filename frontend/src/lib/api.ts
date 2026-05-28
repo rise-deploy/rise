@@ -53,10 +53,12 @@ class RiseAPI {
     // level filter options + chart palette on the deployment logs page. The
     // call sites carry `// @ts-nocheck`, so a defensive shape check here is
     // the only thing standing between a backend schema change and a silently
-    // broken UI — warn and return a conservative default if either field is
-    // off-type.
+    // broken UI. We extract each field individually with a per-field type
+    // guard rather than spread-merging — that way a backend that returns,
+    // say, `levels: "all"` or `supports_volume: "yes"` can't leak off-type
+    // values into Combobox options or the chart panel's visibility check.
     async getLogsCapabilities() {
-        const safeDefault = { levels: [], supports_volume: false };
+        const safeDefault = { levels: [], supports_volume: false, backend: null, max_tail: null };
         let payload;
         try {
             payload = await this.request('/logs/capabilities');
@@ -68,11 +70,17 @@ class RiseAPI {
             console.warn('getLogsCapabilities returned non-object payload; using safe default:', payload);
             return safeDefault;
         }
-        if (!Array.isArray(payload.levels) || typeof payload.supports_volume !== 'boolean') {
-            console.warn('getLogsCapabilities shape unexpected; using safe default:', payload);
-            return { ...safeDefault, ...payload, levels: [], supports_volume: false };
-        }
-        return payload;
+        const levels = Array.isArray(payload.levels)
+            ? payload.levels.filter((l) => typeof l === 'string')
+            : [];
+        const supports_volume = typeof payload.supports_volume === 'boolean'
+            ? payload.supports_volume
+            : false;
+        const backend = typeof payload.backend === 'string' ? payload.backend : null;
+        const max_tail = typeof payload.max_tail === 'number' && Number.isFinite(payload.max_tail)
+            ? payload.max_tail
+            : null;
+        return { levels, supports_volume, backend, max_tail };
     }
 
     async lookupUsers(emails) {

@@ -437,7 +437,7 @@ pub async fn mark_failed(pool: &PgPool, id: Uuid, error_message: &str) -> Result
         Deployment,
         r#"
         UPDATE deployments
-        SET status = 'Failed', completed_at = NOW(), error_message = $2
+        SET status = 'Failed', completed_at = COALESCE(completed_at, NOW()), error_message = $2
         WHERE id = $1
         RETURNING
             id, deployment_id, project_id, created_by_id,

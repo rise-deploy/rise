@@ -323,9 +323,8 @@ impl RuntimeLogBackend for KubernetesLogBackend {
         // the trailing N qualifying lines (which the frontend already has).
         let skip_recent = query.skip_recent.unwrap_or(0).max(0);
         // Cap the requested tail at the configured ceiling. Once the frontend
-        // hits this cap, paging stops yielding new lines and the user sees
-        // "Start of selected range" — the same outcome as when the kubelet's
-        // own ring buffer is exhausted.
+        // hits this cap, paging stops yielding new lines — the same outcome
+        // as when the kubelet's own ring buffer is exhausted.
         let max_tail = self.config.max_tail_lines.max(1);
         let effective_tail = query
             .tail_lines
@@ -342,8 +341,10 @@ impl RuntimeLogBackend for KubernetesLogBackend {
         if let Some(since) = query.since_seconds {
             log_params.since_seconds = Some(since);
         } else if let Some(start_time) = query.start_time {
-            // The Kubernetes pods/log API only supports a since-anchored window;
-            // a future-dated start (and any explicit end_time) cannot be honored.
+            // The Kubernetes pods/log API only supports a since-anchored window.
+            // `query.end_time` is unsupported here and is silently ignored — the
+            // Loki backend is the supported path for explicit end-bounded ranges
+            // (documented on the `end` query param in handlers.rs).
             let delta = (Utc::now() - start_time).num_seconds();
             if delta > 0 {
                 log_params.since_seconds = Some(delta);
