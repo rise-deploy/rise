@@ -706,13 +706,55 @@ fn validate_identity_audiences(
     Ok(())
 }
 
+/// Project the resource-check inputs for `validate_resource_constraints`.
+///
+/// For single-container requests (`containers` is `None`) returns the single
+/// effective values verbatim. For multi-container, sums replicas across
+/// containers (the platform/environment replica cap applies to the whole
+/// deployment) and collects per-container `(cpu, memory)` so range checks
+/// still run against each container individually.
+///
+/// Per-container fields that are unset inherit the deployment-wide
+/// `effective_*` defaults, matching how the reconciler resolves them.
+#[cfg(feature = "backend")]
+fn resolve_resource_check_inputs<'a>(
+    containers: Option<&'a [crate::server::deployment::models::ContainerSpec]>,
+    effective_replicas: u32,
+    effective_cpu: &'a str,
+    effective_memory: &'a str,
+) -> (u32, Vec<(&'a str, &'a str)>) {
+    match containers {
+        Some(specs) if !specs.is_empty() => {
+            let total_replicas: u32 = specs
+                .iter()
+                .map(|s| s.replicas.unwrap_or(effective_replicas))
+                .sum();
+            let per_container: Vec<(&str, &str)> = specs
+                .iter()
+                .map(|s| {
+                    let cpu = s.cpu.as_deref().unwrap_or(effective_cpu);
+                    let mem = s.memory.as_deref().unwrap_or(effective_memory);
+                    (cpu, mem)
+                })
+                .collect();
+            (total_replicas, per_container)
+        }
+        _ => (effective_replicas, vec![(effective_cpu, effective_memory)]),
+    }
+}
+
 #[cfg(feature = "backend")]
 fn validate_resource_constraints(
     state: &AppState,
     resolved_environment: &Option<crate::db::models::Environment>,
-    replicas: u32,
-    cpu: &str,
-    memory: &str,
+    // Total replicas across the deployment. For single-container this is the
+    // container's `replicas`; for multi-container it MUST be the sum across
+    // all containers — the limit applies to the deployment as a whole.
+    total_replicas: u32,
+    // (cpu, memory) for each container. CPU and memory ranges are enforced
+    // per-container so a worker can't dodge limits by joining a deployment
+    // alongside a tiny frontend. For single-container, pass one entry.
+    per_container_resources: &[(&str, &str)],
     is_redeploy: bool,
 ) -> Result<(), ServerError> {
     let platform_constraints = state
@@ -754,25 +796,41 @@ fn validate_resource_constraints(
         ""
     };
 
-    if replicas < eff_min_replicas || replicas > eff_max_replicas {
+    if total_replicas < eff_min_replicas || total_replicas > eff_max_replicas {
+        let summary = if per_container_resources.len() > 1 {
+            format!(
+                "Requested {} replicas total across {} containers but allowed range is [{}, {}]",
+                total_replicas,
+                per_container_resources.len(),
+                eff_min_replicas,
+                eff_max_replicas
+            )
+        } else {
+            format!(
+                "Requested {} replicas but allowed range is [{}, {}]",
+                total_replicas, eff_min_replicas, eff_max_replicas
+            )
+        };
         return Err(ServerError::bad_request(format!(
-            "Requested {} replicas but allowed range is [{}, {}]{}",
-            replicas, eff_min_replicas, eff_max_replicas, redeploy_hint
+            "{}{}",
+            summary, redeploy_hint
         )));
     }
 
-    super::quantity::validate_cpu_range(cpu, eff_min_cpu, eff_max_cpu).map_err(|e| {
-        ServerError::bad_request(format!("CPU constraint violation: {}{}", e, redeploy_hint))
-    })?;
+    for (cpu, memory) in per_container_resources {
+        super::quantity::validate_cpu_range(cpu, eff_min_cpu, eff_max_cpu).map_err(|e| {
+            ServerError::bad_request(format!("CPU constraint violation: {}{}", e, redeploy_hint))
+        })?;
 
-    super::quantity::validate_memory_range(memory, eff_min_memory, eff_max_memory).map_err(
-        |e| {
-            ServerError::bad_request(format!(
-                "Memory constraint violation: {}{}",
-                e, redeploy_hint
-            ))
-        },
-    )?;
+        super::quantity::validate_memory_range(memory, eff_min_memory, eff_max_memory).map_err(
+            |e| {
+                ServerError::bad_request(format!(
+                    "Memory constraint violation: {}{}",
+                    e, redeploy_hint
+                ))
+            },
+        )?;
+    }
 
     Ok(())
 }
@@ -1054,14 +1112,21 @@ pub async fn create_deployment(
 
         // Validate resources against constraints (after rollback inheritance)
         #[cfg(feature = "backend")]
-        validate_resource_constraints(
-            &state,
-            &resolved_environment,
-            effective_replicas,
-            &effective_cpu,
-            &effective_memory,
-            payload.from_deployment.is_some(),
-        )?;
+        {
+            let (total_replicas, per_container) = resolve_resource_check_inputs(
+                payload.containers.as_deref(),
+                effective_replicas,
+                &effective_cpu,
+                &effective_memory,
+            );
+            validate_resource_constraints(
+                &state,
+                &resolved_environment,
+                total_replicas,
+                &per_container,
+                payload.from_deployment.is_some(),
+            )?;
+        }
 
         // Create new deployment with Pushed status and invoke extension hooks
         // Copy image and image_digest from source - the helper function will determine the tag
@@ -1197,14 +1262,21 @@ pub async fn create_deployment(
 
     // Validate resources against constraints (normal deployment path)
     #[cfg(feature = "backend")]
-    validate_resource_constraints(
-        &state,
-        &resolved_environment,
-        effective_replicas,
-        &effective_cpu,
-        &effective_memory,
-        false,
-    )?;
+    {
+        let (total_replicas, per_container) = resolve_resource_check_inputs(
+            payload.containers.as_deref(),
+            effective_replicas,
+            &effective_cpu,
+            &effective_memory,
+        );
+        validate_resource_constraints(
+            &state,
+            &resolved_environment,
+            total_replicas,
+            &per_container,
+            false,
+        )?;
+    }
 
     // Branch based on whether user provided a pre-built image
     if let Some(ref user_image) = payload.image {
@@ -2663,12 +2735,84 @@ fn default_log_count_step_seconds() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_env_override_is_protected, validate_env_override, validate_env_override_key,
-        validate_identity_audiences,
+        normalize_env_override_is_protected, resolve_resource_check_inputs, validate_env_override,
+        validate_env_override_key, validate_identity_audiences,
     };
-    use crate::server::deployment::models::EnvOverride;
+    use crate::server::deployment::models::{ContainerSpec, EnvOverride};
     use axum::http::StatusCode;
     use std::collections::BTreeMap;
+
+    fn make_spec(
+        name: &str,
+        replicas: Option<u32>,
+        cpu: Option<&str>,
+        mem: Option<&str>,
+    ) -> ContainerSpec {
+        ContainerSpec {
+            name: name.to_string(),
+            image: "img".to_string(),
+            http_port: None,
+            replicas,
+            cpu: cpu.map(str::to_string),
+            memory: mem.map(str::to_string),
+            env_overrides: vec![],
+            health_check: None,
+        }
+    }
+
+    #[test]
+    fn resource_check_inputs_single_container_passthrough() {
+        // No `containers` block → use the deployment-wide effective values.
+        let (total, per) = resolve_resource_check_inputs(None, 3, "500m", "256Mi");
+        assert_eq!(total, 3);
+        assert_eq!(per, vec![("500m", "256Mi")]);
+    }
+
+    #[test]
+    fn resource_check_inputs_sums_replicas_across_containers() {
+        // The platform/environment replica cap applies to the WHOLE
+        // deployment, so this helper must sum across containers — not
+        // check each in isolation.
+        let specs = vec![
+            make_spec("frontend", Some(2), None, None),
+            make_spec("backend", Some(3), None, None),
+            make_spec("worker", Some(4), None, None),
+        ];
+        let (total, per) = resolve_resource_check_inputs(Some(&specs), 1, "500m", "256Mi");
+        assert_eq!(
+            total, 9,
+            "expected sum across containers, not per-container"
+        );
+        assert_eq!(
+            per.len(),
+            3,
+            "per-container CPU/memory still checked individually"
+        );
+    }
+
+    #[test]
+    fn resource_check_inputs_falls_back_to_defaults_per_container() {
+        // Containers that omit replicas/cpu/memory inherit the deployment
+        // defaults — matching how the reconciler resolves them.
+        let specs = vec![
+            make_spec("api", Some(2), Some("1"), Some("512Mi")),
+            make_spec("worker", None, None, None), // inherits effective defaults
+        ];
+        let (total, per) = resolve_resource_check_inputs(Some(&specs), 5, "500m", "256Mi");
+        assert_eq!(total, 7, "2 + (default 5) = 7");
+        assert_eq!(per[0], ("1", "512Mi"));
+        assert_eq!(per[1], ("500m", "256Mi"));
+    }
+
+    #[test]
+    fn resource_check_inputs_empty_containers_treated_as_legacy() {
+        // An empty `containers` slice (shouldn't happen in practice, but
+        // defensive) falls through to the single-container path so we don't
+        // accidentally accept replicas=0 for every multi-container request.
+        let (total, per) = resolve_resource_check_inputs(Some(&[]), 4, "500m", "256Mi");
+        assert_eq!(total, 4);
+        assert_eq!(per, vec![("500m", "256Mi")]);
+    }
 
     #[test]
     fn env_override_key_validation_rejects_empty_keys() {
