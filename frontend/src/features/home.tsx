@@ -5,6 +5,7 @@ import { navigate } from '../lib/navigation';
 import { Button, Panel, PanelBody, PanelHead, Stat, StatGrid, Status, colorFor, Avatar } from '../components/r-ui';
 import { LoadingState, ErrorState } from '../components/states';
 import { formatRelativeTimeRounded } from '../lib/utils';
+import { QuickstartPanel } from './quickstart-templates';
 
 interface HomeProps {
     user: { email?: string; id?: string } | null;
@@ -196,6 +197,10 @@ export function Home({ user }: HomeProps) {
                         </PanelBody>
                     </Panel>
                 </div>
+            </div>
+
+            <div style={{ marginTop: 18 }}>
+                <QuickstartPanel />
             </div>
         </section>
     );

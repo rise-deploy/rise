@@ -7,6 +7,7 @@ import { Button, Combobox, Field, Input, Modal, SearchInput, Segmented, Stat, St
 import { Icon } from '../components/icon';
 import { ProjectTable } from '../components/project-table';
 import { LoadingState, ErrorState } from '../components/states';
+import { QuickstartDeployModal, QuickstartGrid, useQuickstartTemplates, type QuickstartTemplate } from './quickstart-templates';
 
 interface Project {
     id?: string;
@@ -31,7 +32,16 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
     const [currentUser, setCurrentUser] = useState<any>(null);
     const [formData, setFormData] = useState({ name: '', access_class: 'public', owner: 'self' });
     const [saving, setSaving] = useState(false);
+    const [selectedTemplate, setSelectedTemplate] = useState<QuickstartTemplate | null>(null);
+    const { templates: quickstartTemplates } = useQuickstartTemplates();
     const { showToast } = useToast();
+
+    const handleTemplateSelect = (template: QuickstartTemplate) => {
+        // Close the blank-create modal and hand off to the quickstart deploy modal,
+        // which has its own form pre-filled with a suggested name + sensible defaults.
+        setModalOpen(false);
+        setSelectedTemplate(template);
+    };
 
     const loadProjects = useCallback(async () => {
         try {
@@ -197,6 +207,7 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
                 onClose={() => setModalOpen(false)}
                 title="Create a new project"
                 sub="A project bundles deployments, environments, env vars, domains and access."
+                width={quickstartTemplates && quickstartTemplates.length > 0 ? 'wide' : 'default'}
                 footer={
                     <>
                         <Button onClick={() => setModalOpen(false)} disabled={saving}>Cancel</Button>
@@ -204,6 +215,19 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
                     </>
                 }
             >
+                {quickstartTemplates && quickstartTemplates.length > 0 && (
+                    <div style={{ marginBottom: 18 }}>
+                        <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-soft)', textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 8 }}>
+                            Start from a template
+                        </div>
+                        <QuickstartGrid templates={quickstartTemplates} onSelect={handleTemplateSelect} limit={4} />
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 10, margin: '18px 0 6px', color: 'var(--text-soft)', fontSize: 11.5, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+                            <div style={{ flex: 1, height: 1, background: 'var(--border-faint)' }} />
+                            <span>Or start blank</span>
+                            <div style={{ flex: 1, height: 1, background: 'var(--border-faint)' }} />
+                        </div>
+                    </div>
+                )}
                 <Field label="Project name" hint="Only lowercase letters, numbers, and hyphens.">
                     <Input
                         placeholder="my-service"
@@ -247,6 +271,12 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
                     </Field>
                 </div>
             </Modal>
+
+            <QuickstartDeployModal
+                template={selectedTemplate}
+                onClose={() => setSelectedTemplate(null)}
+                onDeployed={() => loadProjects()}
+            />
         </section>
     );
 }
