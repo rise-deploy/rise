@@ -74,7 +74,7 @@ pub struct QuickstartTemplateConfig {
     pub icon: String,
     /// Fully-qualified container image. Pin a tag when one is published so the
     /// catalog is reproducible; floating tags (`:latest`) work but defeat the
-    /// "Update from template" drift detector.
+    /// "Redeploy from template" drift detector.
     pub image: String,
     /// Port the container listens on.
     pub http_port: u16,
@@ -1609,6 +1609,33 @@ mod tests {
     }
 
     #[test]
+    fn quickstart_validate_rejects_unparseable_learn_more_url() {
+        let mut t = ok_template("welcome");
+        t.learn_more_url = "not a url".to_string();
+        let qs = QuickstartSettings { templates: vec![t] };
+        assert!(qs.validate().is_err());
+    }
+
+    #[test]
+    fn quickstart_validate_rejects_non_http_learn_more_url() {
+        let mut t = ok_template("welcome");
+        t.learn_more_url = "javascript:alert(1)".to_string();
+        let qs = QuickstartSettings { templates: vec![t] };
+        assert!(qs.validate().is_err());
+    }
+
+    #[test]
+    fn quickstart_validate_accepts_http_and_https_learn_more_urls() {
+        for url in ["http://example.com", "https://example.com/path"] {
+            let mut t = ok_template("welcome");
+            t.learn_more_url = url.to_string();
+            let qs = QuickstartSettings { templates: vec![t] };
+            qs.validate()
+                .unwrap_or_else(|e| panic!("{url} should pass: {e:?}"));
+        }
+    }
+
+    #[test]
     fn test_substitute_env_vars_in_string_basic() {
         let result = Settings::substitute_env_vars_in_string_with("${TEST_VAR}", &|name| {
             (name == "TEST_VAR").then(|| "test_value".to_string())
@@ -2380,6 +2407,21 @@ impl QuickstartSettings {
                     "quickstart template '{}' has invalid http_port 0",
                     tpl.id
                 )));
+            }
+            match url::Url::parse(tpl.learn_more_url.trim()) {
+                Ok(u) if matches!(u.scheme(), "http" | "https") => {}
+                Ok(u) => {
+                    return Err(ConfigError::Message(format!(
+                        "quickstart template '{}' learn_more_url has unsupported scheme '{}'; only http and https are allowed",
+                        tpl.id, u.scheme()
+                    )));
+                }
+                Err(e) => {
+                    return Err(ConfigError::Message(format!(
+                        "quickstart template '{}' learn_more_url '{}' is not a valid URL: {}",
+                        tpl.id, tpl.learn_more_url, e
+                    )));
+                }
             }
         }
         Ok(())

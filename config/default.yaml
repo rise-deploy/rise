@@ -63,5 +63,5 @@ quickstart:
         This image runs nginx as root and listens on port 80. It will fail to
         start on clusters that enforce non-root containers or disallow
         privileged ports. The upstream image is only published as `:latest`,
-        so the "Update from template" button can't detect drift — clicking it
-        will simply redeploy with whatever the tag currently resolves to.
+        so the "Redeploy from template" button can't detect drift — clicking
+        it will simply redeploy with whatever the tag currently resolves to.

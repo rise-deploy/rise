@@ -143,7 +143,7 @@ class RiseAPI {
     }
 
     // Record the new template image:tag on a project after a redeploy
-    // triggered by the "Update from template" button in the UI. Resets the
+    // triggered by the "Redeploy from template" button in the UI. Resets the
     // catalog-vs-project diff used to enable/disable that button.
     async updateProjectTemplateImage(projectName, image) {
         return this.request(`/projects/${projectName}/template-image`, {

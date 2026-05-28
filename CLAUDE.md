@@ -181,6 +181,7 @@ For user-facing documentation, see the [`/docs`](./docs) directory. Key topics i
 - Any SQLX queries are to be wrapped by helper functions in the `rise_deploy::db` crate. No SQLX queries outside of this crate are allowed.
 - When we log errors and don't handle them further, we should include a sensible amount of information about the error. Often logging the error with `{:?}` is good enough.
 - When capturing screenshots, the playwright tool will successfully install the driver even if you might think its install step failed. Always use minimum 1280px width and 800px height for the browser.
+- Never use `// @ts-nocheck` (or `// @ts-ignore` / `// @ts-expect-error`) in frontend code. Existing files that still carry the directive are legacy; new files must not add it, and edits to legacy files should remove it where feasible. If TypeScript flags something, fix the types — don't suppress the diagnostic.
 
 ### Tag/Badge Design Language
 

@@ -265,7 +265,7 @@ function RecentDeploymentsPanel({ projectName, environments }: { projectName: st
     useEffect(() => {
         const cleanup = load();
         // Refresh whenever a mutation elsewhere in the app might have produced
-        // a new deployment (e.g. the "Upgrade/Redeploy from template" button).
+        // a new deployment (e.g. the "Redeploy from template" button).
         const onMutation = () => { load(); };
         window.addEventListener('rise:mutation', onMutation);
         return () => {
@@ -446,7 +446,7 @@ function ProjectTemplatePanel({ project, projectName, onUpdated }: { project: an
             window.dispatchEvent(new Event('rise:mutation'));
             onUpdated();
         } catch (err: any) {
-            showToast(`Failed to update from template: ${err.message}`, 'error');
+            showToast(`Failed to redeploy from template: ${err.message}`, 'error');
         } finally {
             setUpdating(false);
         }

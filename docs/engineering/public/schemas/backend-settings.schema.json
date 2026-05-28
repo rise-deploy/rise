@@ -1270,7 +1270,7 @@
           "type": "string"
         },
         "image": {
-          "description": "Fully-qualified container image. Pin a tag when one is published so the\ncatalog is reproducible; floating tags (`:latest`) work but defeat the\n\"Update from template\" drift detector.",
+          "description": "Fully-qualified container image. Pin a tag when one is published so the\ncatalog is reproducible; floating tags (`:latest`) work but defeat the\n\"Redeploy from template\" drift detector.",
           "type": "string"
         },
         "learn_more_url": {

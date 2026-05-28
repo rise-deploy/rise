@@ -511,12 +511,12 @@ The backend validates the catalog at startup and refuses to boot on:
 ### Invariants for catalog entries
 
 Operators adding custom templates should respect the following invariants —
-they aren't enforced by code, but the deploy modal and "Update from template"
+they aren't enforced by code, but the deploy modal and "Redeploy from template"
 feature assume them:
 
 - **Tag-pinned**: use a real tag (e.g. `:1.2.3`) rather than `:latest`.
   Floating tags work, but the drift detector compares stored vs. catalog
-  `image:tag` strings — when both sides are `:latest`, the "Update from
+  `image:tag` strings — when both sides are `:latest`, the "Redeploy from
   template" button can't observe drift. Floating-tag entries should set a
   `warning` mentioning this.
 - **Stateless**: no volume mounts, no external databases, no user-supplied
