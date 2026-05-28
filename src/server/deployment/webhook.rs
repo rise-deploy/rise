@@ -688,27 +688,23 @@ async fn check_deployment_health_from_observed(
     // Resolve the list of K8s Deployment names to aggregate over. Legacy
     // single-container rows produce one name; multi-container rows produce one
     // per container.
-    let container_names: Vec<String> =
-        match db_deployments::get_containers(&state.db_pool, deployment.id).await {
-            Ok(side) => side
-                .containers
-                .as_ref()
-                .and_then(|v| {
-                    serde_json::from_value::<Vec<crate::server::deployment::models::ContainerSpec>>(
-                        v.clone(),
-                    )
-                    .ok()
-                })
-                .map(|specs| specs.into_iter().map(|s| s.name).collect())
-                .unwrap_or_default(),
-            Err(e) => {
-                debug!(
-                    deployment_id = %deployment.deployment_id,
-                    "Failed to load container side-data: {:?}", e
-                );
-                Vec::new()
-            }
-        };
+    // Propagate DB errors: silently falling back to the legacy single-name path
+    // would mis-aggregate a multi-container deployment's health and could flip
+    // it Healthy/Failed against the wrong K8s Deployment.
+    let side = db_deployments::get_containers(&state.db_pool, deployment.id)
+        .await
+        .context("failed to load deployment container side-data")?;
+    let container_names: Vec<String> = side
+        .containers
+        .as_ref()
+        .and_then(|v| {
+            serde_json::from_value::<Vec<crate::server::deployment::models::ContainerSpec>>(
+                v.clone(),
+            )
+            .ok()
+        })
+        .map(|specs| specs.into_iter().map(|s| s.name).collect())
+        .unwrap_or_default();
 
     let k8s_deploy_names: Vec<String> = if container_names.is_empty() {
         vec![format!("{}/{}", namespace, base_name)]
@@ -1338,10 +1334,13 @@ async fn compute_desired_children(
         Vec<crate::server::deployment::models::ContainerSpec>,
     > = HashMap::new();
     for d in &infra_deployments {
+        // Propagate DB errors: an `.ok()` fallback would silently mis-treat a
+        // multi-container deployment as legacy, dropping its per-container K8s
+        // Deployments from the desired set and letting Metacontroller GC them.
         let json = db_deployments::get_containers(&state.db_pool, d.id)
             .await
-            .ok()
-            .and_then(|sd| sd.containers);
+            .context("failed to load deployment container side-data")?
+            .containers;
         let specs: Vec<crate::server::deployment::models::ContainerSpec> = json
             .as_ref()
             .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -1684,10 +1683,13 @@ async fn compute_desired_children(
         {
             None
         } else {
+            // Propagate DB errors: silently treating routes as empty would
+            // either skip ingress (workers-only path) or fall through to the
+            // legacy `/`-Service backend, both wrong for a multi-container row.
             let routes_json = db_deployments::get_containers(&state.db_pool, active_deployment.id)
                 .await
-                .ok()
-                .and_then(|sd| sd.routes);
+                .context("failed to load deployment routes side-data")?
+                .routes;
             let route_specs: Vec<crate::server::deployment::models::RouteSpec> = routes_json
                 .as_ref()
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -1723,35 +1725,48 @@ async fn compute_desired_children(
                     .collect();
             Some(pairs)
         };
-        if let Some(ingress) = resource_builder.create_primary_ingress(
-            project,
-            active_deployment,
-            &namespace,
-            env_for_group,
-            inline_domains,
-            env_name.as_deref(),
-            &all_environments,
+        // Workers-only multi-container deployments (no container exposes
+        // `http_port`, or no route targets a routable container) produce an
+        // empty `pairs`. We must NOT emit an Ingress in that case — falling
+        // through to the legacy `/` backend would point at a Service that
+        // phase 2 didn't emit. The legacy single-container path (where
+        // `multi_container_routes` is `None`) is unaffected.
+        let multi_container_no_routes = matches!(
             multi_container_routes.as_deref(),
-        )? {
-            children.push(serde_json::to_value(&ingress)?);
-        }
-        // When `create_primary_ingress` returns `None`, every candidate host for
-        // this group collided with another env's URL (e.g. a deployment group
-        // named the same as an environment whose primary group is different).
-        // Skip the ingress so nginx admission doesn't reject it; the deployment
-        // still runs and a warning was logged in `create_primary_ingress`.
+            Some(routes) if routes.is_empty()
+        );
 
-        // Sibling custom-domain ingress, only when carve-out annotations are set.
-        if split_custom_domains && !domains_for_group.is_empty() {
-            let custom_ingress = resource_builder.create_custom_domain_ingress(
+        if !multi_container_no_routes {
+            if let Some(ingress) = resource_builder.create_primary_ingress(
                 project,
                 active_deployment,
                 &namespace,
-                &domains_for_group,
+                env_for_group,
+                inline_domains,
                 env_name.as_deref(),
+                &all_environments,
                 multi_container_routes.as_deref(),
-            )?;
-            children.push(serde_json::to_value(&custom_ingress)?);
+            )? {
+                children.push(serde_json::to_value(&ingress)?);
+            }
+            // When `create_primary_ingress` returns `None`, every candidate host for
+            // this group collided with another env's URL (e.g. a deployment group
+            // named the same as an environment whose primary group is different).
+            // Skip the ingress so nginx admission doesn't reject it; the deployment
+            // still runs and a warning was logged in `create_primary_ingress`.
+
+            // Sibling custom-domain ingress, only when carve-out annotations are set.
+            if split_custom_domains && !domains_for_group.is_empty() {
+                let custom_ingress = resource_builder.create_custom_domain_ingress(
+                    project,
+                    active_deployment,
+                    &namespace,
+                    &domains_for_group,
+                    env_name.as_deref(),
+                    multi_container_routes.as_deref(),
+                )?;
+                children.push(serde_json::to_value(&custom_ingress)?);
+            }
         }
 
         // NetworkPolicy

@@ -1892,9 +1892,23 @@ impl ResourceBuilder {
         all_environments: &[crate::db::models::Environment],
         // (path, service_name) pairs for multi-container routing. When None,
         // falls back to a single `/` → service_name(project, deployment) path
-        // (legacy single-container behaviour).
+        // (legacy single-container behaviour). Callers should pre-filter:
+        // passing `Some(&[])` is a multi-container-with-no-routable-pairs
+        // signal (workers-only), for which we must NOT emit an ingress at all.
         multi_container_routes: Option<&[(String, String)]>,
     ) -> anyhow::Result<Option<Ingress>> {
+        // Defensive guard: a multi-container deployment with zero routable
+        // pairs (workers-only) would otherwise fall through to the legacy
+        // `/` → group-service backend in the match below, pointing at a
+        // Service phase 2 never emitted. Caller is responsible for skipping
+        // this call entirely; this is belt-and-suspenders.
+        if matches!(multi_container_routes, Some(routes) if routes.is_empty()) {
+            debug_assert!(
+                false,
+                "create_primary_ingress called with empty multi_container_routes; caller should skip"
+            );
+            return Ok(None);
+        }
         let mut hosts = self.primary_ingress_hosts(
             project,
             &deployment.deployment_group,

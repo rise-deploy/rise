@@ -219,7 +219,7 @@ impl RegistryProvider for JfrogProvider {
             &self.scope_path(repository),
             tags,
             &self.config.push_permissions,
-        );
+        )?;
 
         tracing::info!(
             repository = repository,
@@ -342,14 +342,41 @@ impl RegistryProvider for JfrogProvider {
 /// For multi-container deployments the function must extend the scope to
 /// cover every tag's manifest path; the shared blob and content-addressed
 /// paths only need to appear once.
-fn build_push_scope(base: &str, tags: &[&str], perms: &str) -> String {
+///
+/// Defense-in-depth: each tag is validated against the OCI tag charset
+/// (`[a-zA-Z0-9._-]+`) before interpolation. A tag containing a space,
+/// `/`, `:`, `*`, or other unexpected character would either malform the
+/// space-separated scope string or — worse — be parsed by Artifactory as
+/// additional scope entries, potentially escalating privileges. Callers
+/// validate inputs upstream, but we reject malformed tags here as well.
+fn build_push_scope(base: &str, tags: &[&str], perms: &str) -> Result<String> {
+    for tag in tags {
+        if !is_valid_oci_tag(tag) {
+            anyhow::bail!(
+                "JFrog push scope rejected: tag '{}' contains characters outside the OCI tag charset [a-zA-Z0-9._-]",
+                tag
+            );
+        }
+    }
     let mut scope_parts: Vec<String> = tags
         .iter()
         .map(|t| format!("artifact:{base}/{t}/**:{perms}"))
         .collect();
     scope_parts.push(format!("artifact:{base}/_uploads/**:{perms}"));
     scope_parts.push(format!("artifact:{base}/sha256*/*:{perms}"));
-    scope_parts.join(" ")
+    Ok(scope_parts.join(" "))
+}
+
+/// Validate that a string conforms to the OCI tag charset.
+///
+/// Per the OCI distribution spec, tags match `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}`.
+/// We additionally require non-empty; this is sufficient to keep the JFrog
+/// scope string well-formed (no spaces, no `/`, no `:`, no `*`, no control chars).
+fn is_valid_oci_tag(tag: &str) -> bool {
+    !tag.is_empty()
+        && tag
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
 }
 
 #[cfg(test)]
@@ -361,7 +388,7 @@ mod tests {
         // Single-container deployments mint a token covering one manifest
         // path plus the shared blob and content-addressed scopes. This must
         // stay byte-compatible with what JFrog has been seeing in prod.
-        let scope = build_push_scope("docker/my-app", &["20251215-204525"], "write");
+        let scope = build_push_scope("docker/my-app", &["20251215-204525"], "write").unwrap();
         assert_eq!(
             scope,
             "artifact:docker/my-app/20251215-204525/**:write \
@@ -377,7 +404,7 @@ mod tests {
         // backend image after the frontend) would be rejected by JFrog
         // with a 401, since the token's scope only covers the first tag.
         let tags = ["20251215-204525-frontend", "20251215-204525-backend"];
-        let scope = build_push_scope("docker/my-app", &tags, "write");
+        let scope = build_push_scope("docker/my-app", &tags, "write").unwrap();
         assert!(scope.contains("artifact:docker/my-app/20251215-204525-frontend/**:write"));
         assert!(scope.contains("artifact:docker/my-app/20251215-204525-backend/**:write"));
         // Shared scopes still appear exactly once.
@@ -390,11 +417,47 @@ mod tests {
         // Deterministic order makes the scope string stable across
         // reconciles — useful when something logs or compares the string.
         let tags = ["c", "a", "b"];
-        let scope = build_push_scope("docker/x", &tags, "write");
+        let scope = build_push_scope("docker/x", &tags, "write").unwrap();
         let c_pos = scope.find("/c/**").expect("c");
         let a_pos = scope.find("/a/**").expect("a");
         let b_pos = scope.find("/b/**").expect("b");
         assert!(c_pos < a_pos);
         assert!(a_pos < b_pos);
+    }
+
+    #[test]
+    fn scope_rejects_tags_with_unsafe_characters() {
+        // Defense-in-depth: any character outside the OCI tag charset
+        // could either malform the space-separated scope string or be
+        // re-parsed by Artifactory as additional scope entries. Each of
+        // these must be rejected with a clear error naming the tag.
+        for bad in [
+            "20260528-120000 api", // space
+            "20260528/api",        // path separator
+            "20260528:api",        // scope separator
+            "20260528-*",          // wildcard
+        ] {
+            let err = build_push_scope("docker/my-app", &[bad], "write")
+                .expect_err(&format!("expected rejection for tag '{}'", bad));
+            let msg = format!("{:#}", err);
+            assert!(
+                msg.contains(bad),
+                "error message should name the offending tag '{}', got: {}",
+                bad,
+                msg
+            );
+        }
+    }
+
+    #[test]
+    fn scope_accepts_valid_oci_tags() {
+        // Valid tags from the OCI charset: digits, letters, `.`, `_`, `-`.
+        // Covers the single-container, multi-container, and library-style
+        // forms we actually produce.
+        for good in ["20260528-120000", "20260528-120000-api", "foo.bar_baz-0"] {
+            build_push_scope("docker/my-app", &[good], "write").unwrap_or_else(|e| {
+                panic!("tag '{}' should be accepted, got error: {:#}", good, e)
+            });
+        }
     }
 }
