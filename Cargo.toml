@@ -61,8 +61,8 @@ cli = [
 ]
 backend = [
     # Server core (former "server" feature)
-    "dep:rise-resource-api",
-    "dep:rise-resource-store",
+    "dep:rise-resource-api", # strip-on-publish
+    "dep:rise-resource-store", # strip-on-publish
     "dep:config",
     "dep:openssl",
     "dep:rsa",
@@ -100,9 +100,11 @@ backend = [
 ]
 
 [dependencies]
+# --- BEGIN BACKEND (stripped before `cargo publish` in CI; see .github/workflows/ci.yml) ---
 # Workspace crates (backend only)
 rise-resource-api = { path = "crates/rise-resource-api", optional = true }
 rise-resource-store = { path = "crates/rise-resource-store", optional = true }
+# --- END BACKEND ---
 
 # Common (always enabled - shared across features)
 anyhow = "1.0.100"
