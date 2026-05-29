@@ -424,12 +424,14 @@ fn build_container_side_data_json(
             spec.memory = Some(effective_memory.to_string());
         }
     }
+    // Wrap both columns in the versioned side-data envelope so the persisted
+    // shape can evolve (see `models::CONTAINER_SIDE_DATA_VERSION`).
     let containers_json =
-        serde_json::to_value(&backfilled).internal_err("Failed to serialise containers")?;
+        models::encode_side_data(&backfilled).internal_err("Failed to serialise containers")?;
     let routes_json = if routes.is_empty() {
         None
     } else {
-        Some(serde_json::to_value(routes).internal_err("Failed to serialise routes")?)
+        Some(models::encode_side_data(routes).internal_err("Failed to serialise routes")?)
     };
     Ok((containers_json, routes_json))
 }
@@ -610,14 +612,12 @@ async fn convert_deployment(
     // because one row is bad.
     let containers = match deployment.containers.as_ref() {
         Some(v) => {
-            match serde_json::from_value::<Vec<crate::server::deployment::models::ContainerSpec>>(
-                v.clone(),
-            ) {
+            match models::decode_side_data::<crate::server::deployment::models::ContainerSpec>(v) {
                 Ok(specs) => Some(specs),
                 Err(e) => {
                     error!(
                         deployment_id = %deployment.deployment_id,
-                        "non-NULL `containers` column could not be deserialized into \
+                        "non-NULL `containers` column could not be decoded into \
                          Vec<ContainerSpec>; rendering without container side-data: {:?}", e
                     );
                     None
@@ -1238,15 +1238,12 @@ pub async fn create_deployment(
     // covers every tag the CLI is going to push, and so pre-built container
     // images are pinned to an immutable digest. Returns None for legacy
     // single-container requests.
-    #[cfg(feature = "backend")]
     let multi_container_resolved = match payload.containers.as_ref() {
         Some(specs) => Some(
             resolve_multi_container_images(&state, &payload.project, &deployment_id, specs).await?,
         ),
         None => None,
     };
-    #[cfg(not(feature = "backend"))]
-    let multi_container_resolved: Option<()> = None;
 
     // Resolve effective deployment resources (replicas, cpu, memory)
     // Priority: request payload > platform defaults
@@ -1374,10 +1371,10 @@ pub async fn create_deployment(
             Vec<crate::server::deployment::models::ContainerSpec>,
         > = if payload.containers.is_none() {
             match source_deployment.containers.as_ref() {
-                Some(v) => Some(serde_json::from_value(v.clone()).map_err(|e| {
+                Some(v) => Some(models::decode_side_data(v).map_err(|e| {
                     ServerError::internal(format!(
                         "Source deployment {} ({}) has a non-NULL `containers` column that could \
-                         not be deserialized into Vec<ContainerSpec>: {:?}",
+                         not be decoded into Vec<ContainerSpec>: {:?}",
                         source_deployment.id, source_deployment.deployment_id, e
                     ))
                 })?),
@@ -1586,7 +1583,6 @@ pub async fn create_deployment(
     // Compute container side-data once (non-rollback paths) so it can be
     // inserted atomically with the deployments row. `None` for legacy
     // single-container requests.
-    #[cfg(feature = "backend")]
     let (containers_json, routes_json): (Option<serde_json::Value>, Option<serde_json::Value>) =
         if let Some(ref r) = multi_container_resolved {
             let (c, ro) = build_container_side_data_json(
@@ -1600,9 +1596,6 @@ pub async fn create_deployment(
         } else {
             (None, None)
         };
-    #[cfg(not(feature = "backend"))]
-    let (containers_json, routes_json): (Option<serde_json::Value>, Option<serde_json::Value>) =
-        (None, None);
 
     // Branch based on whether user provided a pre-built image
     if let Some(ref user_image) = payload.image {

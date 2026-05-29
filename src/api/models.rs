@@ -135,4 +135,80 @@ mod client_models {
     }
 
     pub const DEFAULT_DEPLOYMENT_GROUP: &str = "default";
+
+    // ── Multi-container request wire types ──────────────────────────────────
+    //
+    // CLI-only mirrors of the server's request structs in
+    // `server::deployment::models`. With `--features backend` the glob
+    // re-export above supplies the real server types instead, so these must
+    // stay byte-for-byte wire-identical (field names, types, and serde
+    // skip/default rules) to what the server deserializes. The CLI only ever
+    // serializes these, but they derive `Deserialize` too so they line up with
+    // the server derives under a combined build.
+
+    /// Request-side env var override. Mirrors `server::deployment::models::EnvOverride`.
+    #[derive(Debug, Deserialize, Serialize, Clone)]
+    pub struct EnvOverride {
+        pub key: String,
+        pub value: String,
+        #[serde(default)]
+        pub is_secret: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub is_protected: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub source: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub for_environment: Option<String>,
+    }
+
+    /// Per-container probe config. Mirrors `server::deployment::models::HealthCheckSpec`.
+    /// A single flat struct keyed by `disabled` — NOT an untagged enum: the
+    /// server reads `health_check = false` as `{ "disabled": true }`.
+    #[derive(Debug, Deserialize, Serialize, Clone, Default)]
+    pub struct HealthCheckSpec {
+        #[serde(default)]
+        pub disabled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub initial_delay_seconds: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub period_seconds: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub timeout_seconds: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub failure_threshold: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub liveness_enabled: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub readiness_enabled: Option<bool>,
+    }
+
+    /// One container in a multi-container request.
+    /// Mirrors `server::deployment::models::ContainerSpec`.
+    #[derive(Debug, Deserialize, Serialize, Clone)]
+    pub struct ContainerSpec {
+        pub name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub image: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub port: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub replicas: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub cpu: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub memory: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub env_overrides: Vec<EnvOverride>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub health_check: Option<HealthCheckSpec>,
+    }
+
+    /// One ingress route mapping. Mirrors `server::deployment::models::RouteSpec`.
+    #[derive(Debug, Deserialize, Serialize, Clone)]
+    pub struct RouteSpec {
+        pub path: String,
+        pub container: String,
+    }
 }

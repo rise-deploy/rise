@@ -306,6 +306,66 @@ pub struct RouteSpec {
     pub container: String,
 }
 
+/// On-disk schema version for the `containers` / `routes` JSONB side-data on the
+/// `deployments` row. Bump this whenever the persisted [`ContainerSpec`] /
+/// [`RouteSpec`] shape changes in a way older code cannot read, and add a
+/// matching arm in [`decode_side_data`] that maps the old shape forward.
+///
+/// Multi-container is an unreleased feature, so every persisted value is a
+/// versioned envelope — there is no un-versioned "bare array" shape to read.
+pub const CONTAINER_SIDE_DATA_VERSION: u32 = 1;
+
+/// Borrowed envelope used to *write* side-data: `{ "version": N, "items": [...] }`.
+#[derive(Serialize)]
+struct SideDataWrite<'a, T> {
+    version: u32,
+    items: &'a [T],
+}
+
+/// Owned envelope used to *read* side-data. `items` is kept as a raw value so
+/// the version can be checked before committing to a concrete item type.
+#[derive(Deserialize)]
+struct SideDataRead {
+    version: u32,
+    items: serde_json::Value,
+}
+
+/// Wrap a list of container/route specs in the versioned envelope for storage
+/// in the `containers` / `routes` JSONB columns.
+pub fn encode_side_data<T: Serialize>(items: &[T]) -> Result<serde_json::Value, serde_json::Error> {
+    serde_json::to_value(SideDataWrite {
+        version: CONTAINER_SIDE_DATA_VERSION,
+        items,
+    })
+}
+
+/// Decode a persisted `containers` / `routes` envelope into its item list.
+///
+/// Every persisted value is a versioned envelope (multi-container is unreleased,
+/// so there is no legacy bare-array shape to accept). An unknown/future version
+/// is a hard error rather than a silent empty list — callers map it to their own
+/// failure mode (mark the deployment Failed, return a 500, or render without the
+/// side-data).
+pub fn decode_side_data<T: serde::de::DeserializeOwned>(
+    value: &serde_json::Value,
+) -> anyhow::Result<Vec<T>> {
+    let envelope: SideDataRead = serde_json::from_value(value.clone())
+        .map_err(|e| anyhow::anyhow!("side-data envelope could not be deserialized: {e}"))?;
+    if envelope.version != CONTAINER_SIDE_DATA_VERSION {
+        anyhow::bail!(
+            "unsupported container side-data version {} (this build understands version {})",
+            envelope.version,
+            CONTAINER_SIDE_DATA_VERSION
+        );
+    }
+    serde_json::from_value(envelope.items).map_err(|e| {
+        anyhow::anyhow!(
+            "side-data items (version {}) could not be deserialized: {e}",
+            envelope.version
+        )
+    })
+}
+
 /// Validate `^[a-z][a-z0-9-]{0,14}$` (max 15 chars, RFC 1123 label, starts
 /// with letter, lowercase alphanumeric + dash; no trailing dash).
 ///
@@ -874,5 +934,114 @@ mod tests {
             "got: {}",
             err.message
         );
+    }
+
+    // ── Versioned side-data envelope (encode/decode round-trip) ─────────────
+
+    #[test]
+    fn side_data_round_trips_through_versioned_envelope() {
+        // Every persisted field populated, so a future field drop/rename shows up
+        // here as a round-trip mismatch.
+        let specs = vec![
+            ContainerSpec {
+                name: "api".to_string(),
+                image: Some("img-api".to_string()),
+                port: Some(8080),
+                replicas: Some(3),
+                cpu: Some("500m".to_string()),
+                memory: Some("256Mi".to_string()),
+                env_overrides: vec![EnvOverride {
+                    key: "K".to_string(),
+                    value: "V".to_string(),
+                    is_secret: false,
+                    is_protected: Some(true),
+                    source: Some("toml".to_string()),
+                    for_environment: Some("production".to_string()),
+                }],
+                health_check: Some(HealthCheckSpec {
+                    disabled: false,
+                    path: Some("/health".to_string()),
+                    initial_delay_seconds: Some(5),
+                    period_seconds: Some(10),
+                    timeout_seconds: Some(2),
+                    failure_threshold: Some(3),
+                    liveness_enabled: Some(true),
+                    readiness_enabled: Some(false),
+                }),
+            },
+            ContainerSpec {
+                name: "worker".to_string(),
+                image: Some("img-worker".to_string()),
+                port: None,
+                replicas: Some(1),
+                cpu: None,
+                memory: None,
+                env_overrides: vec![],
+                health_check: None,
+            },
+        ];
+
+        let encoded = encode_side_data(&specs).expect("encode");
+        // The on-disk shape is a versioned envelope, never a bare array.
+        assert_eq!(encoded["version"], CONTAINER_SIDE_DATA_VERSION);
+        assert!(encoded["items"].is_array());
+
+        let decoded: Vec<ContainerSpec> = decode_side_data(&encoded).expect("decode");
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].name, "api");
+        assert_eq!(decoded[0].port, Some(8080));
+        assert_eq!(decoded[0].env_overrides[0].is_protected, Some(true));
+        let hc = decoded[0].health_check.as_ref().unwrap();
+        assert_eq!(hc.path.as_deref(), Some("/health"));
+        assert_eq!(hc.readiness_enabled, Some(false));
+        assert_eq!(decoded[1].name, "worker");
+        assert_eq!(decoded[1].port, None);
+
+        // Routes round-trip through the same envelope.
+        let routes = vec![RouteSpec {
+            path: "/api".to_string(),
+            container: "api".to_string(),
+        }];
+        let routes_decoded: Vec<RouteSpec> =
+            decode_side_data(&encode_side_data(&routes).unwrap()).unwrap();
+        assert_eq!(routes_decoded.len(), 1);
+        assert_eq!(routes_decoded[0].path, "/api");
+    }
+
+    #[test]
+    fn side_data_decode_tolerates_unknown_item_fields() {
+        // Additive evolution: an item carrying a field this build doesn't know
+        // must still decode (no deny_unknown_fields), so old readers survive a
+        // new optional field without a version bump.
+        let envelope = serde_json::json!({
+            "version": CONTAINER_SIDE_DATA_VERSION,
+            "items": [ { "name": "api", "port": 8080, "future_field": 123 } ],
+        });
+        let decoded: Vec<ContainerSpec> = decode_side_data(&envelope).expect("decode");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].name, "api");
+    }
+
+    #[test]
+    fn side_data_decode_rejects_unknown_version() {
+        // A future/unknown version is a hard error (callers map it to Failed /
+        // 500 / render-without) rather than silently decoding the wrong shape.
+        let envelope = serde_json::json!({
+            "version": CONTAINER_SIDE_DATA_VERSION + 1,
+            "items": [ { "name": "api", "port": 8080 } ],
+        });
+        let err = decode_side_data::<ContainerSpec>(&envelope).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("unsupported container side-data version"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn side_data_decode_rejects_bare_array() {
+        // Hard cutover: a legacy bare array (no envelope) is NOT accepted — it
+        // has no `version`/`items`, so the envelope deserialization fails.
+        let bare = serde_json::json!([ { "name": "api", "port": 8080 } ]);
+        assert!(decode_side_data::<ContainerSpec>(&bare).is_err());
     }
 }
