@@ -84,27 +84,21 @@ enum ProbeType {
     Readiness,
 }
 
-/// Label set on a Pod/Service to identify which container within a
-/// multi-container deployment it belongs to. Only emitted on the
-/// multi-container path; legacy single-container Deployments don't carry it,
-/// preserving K8s selector immutability for existing rollouts.
+/// Label set on a Pod/Service to identify which container of a deployment it
+/// belongs to. Every deployment is modelled as one or more containers — a
+/// single-container app is the one-container case (implicit container `app`).
 pub const LABEL_CONTAINER: &str = "rise.dev/container";
 
-/// Default container name used when a deployment row has no `containers` JSON
-/// (legacy single-container path). Matches the hardcoded value used to live
-/// inside the K8s pod spec, so no on-cluster renaming happens for old rows.
-pub const LEGACY_CONTAINER_NAME: &str = "app";
-
-/// Per-container runtime parameters consumed by `create_k8s_deployment_for`
-/// and `create_service_for`. Built by the reconciler from either:
-///   - the deployment's `containers` JSON (one runtime per ContainerSpec), or
-///   - the deployment row's legacy columns (a single runtime named "app").
+/// Per-container runtime parameters consumed by `create_k8s_deployment_for_container`
+/// and `create_service_for_container`. Built by the reconciler from the
+/// deployment's normalized container list (one runtime per `ContainerSpec`;
+/// single-container deployments synthesise a single `app` container).
 #[derive(Debug, Clone)]
 pub struct ContainerRuntime<'a> {
     pub name: &'a str,
     pub image: &'a str,
     /// `None` for workers (no port → no Service emitted, no HTTP probes).
-    pub http_port: Option<u16>,
+    pub port: Option<u16>,
     pub replicas: i32,
     pub cpu: &'a str,
     pub memory: &'a str,
@@ -117,14 +111,12 @@ pub struct ContainerRuntime<'a> {
     /// Hash of the secret data, written as a pod-template annotation so
     /// secret rotations trigger pod restarts.
     pub secret_env_hash: Option<String>,
-    /// Optional per-container probe configuration overriding the server's
-    /// `HealthProbeConfig` defaults. `Some(spec)` with `disabled=true` turns
-    /// probes off entirely. `None` falls back to the server defaults.
+    /// Per-container probe configuration. `Some(spec)` with `disabled=true`
+    /// turns probes off; `Some(spec)` with overrides merges on top of the
+    /// server's `HealthProbeConfig` defaults; `None` falls back to the
+    /// defaults. The reconciler resolves the "probe only routed containers"
+    /// policy into this field before constructing the runtime.
     pub health_check: Option<crate::server::deployment::models::HealthCheckSpec>,
-    /// True when this runtime represents the legacy implicit `app` container
-    /// (the deployment row has no `containers` JSON). Used to keep K8s
-    /// resource names unsuffixed for back-compat.
-    pub is_legacy: bool,
 }
 
 /// Parsed ingress URL components
@@ -686,52 +678,47 @@ impl ResourceBuilder {
         labels
     }
 
-    /// Per-container variant of `deployment_name`. Legacy containers keep the
-    /// unsuffixed name; multi-container deployments suffix with `-<container>`.
+    /// Per-container Deployment name: `<deployment_name>-<container>`. Every
+    /// container (including the implicit `app` of a single-container deployment)
+    /// is suffixed, so there is a single naming scheme.
     pub fn deployment_name_for_container(
         project: &Project,
         deployment: &Deployment,
         runtime: &ContainerRuntime<'_>,
     ) -> String {
-        if runtime.is_legacy {
-            Self::deployment_name(project, deployment)
-        } else {
-            format!(
-                "{}-{}",
-                Self::deployment_name(project, deployment),
-                runtime.name
-            )
-        }
+        format!(
+            "{}-{}",
+            Self::deployment_name(project, deployment),
+            runtime.name
+        )
     }
 
-    /// Per-container Service name. Legacy keeps the group-only name (Ingress
-    /// references it as today); multi-container deployments suffix `-<container>`.
+    /// Per-container Service name: `<service_name>-<container>` (i.e.
+    /// `<group>-<container>`). The auto-injected `RISE_CONTAINER_HOST__*` host
+    /// uses the same `<group>-<container>` form (see `auto_container_host_env_vars`).
     pub fn service_name_for_container(
         project: &Project,
         deployment: &Deployment,
         runtime: &ContainerRuntime<'_>,
     ) -> String {
-        if runtime.is_legacy {
-            Self::service_name(project, deployment)
-        } else {
-            format!(
-                "{}-{}",
-                Self::service_name(project, deployment),
-                runtime.name
-            )
-        }
+        format!(
+            "{}-{}",
+            Self::service_name(project, deployment),
+            runtime.name
+        )
     }
 
     /// Auto-injected env vars exposing each routable sibling container's
-    /// in-cluster Service address. One entry per container with `http_port`:
+    /// in-cluster Service address. One entry per container with a `port`:
     /// `RISE_CONTAINER_HOST__<NAME> = <service>:<port>`, where `<NAME>` is the
-    /// container name uppercased with dashes mapped to underscores.
+    /// container name uppercased with dashes mapped to underscores. The host
+    /// `<group>-<name>` matches `service_name_for_container`.
     ///
     /// Each container also sees its own entry — handy for code that doesn't
     /// know which container it's in, and the Service self-loop is harmless.
     /// Order matches `container_specs` so test fixtures stay deterministic.
-    /// Multi-container path only: legacy deployments have a single group-level
-    /// Service with no sibling addresses to inject.
+    /// The reconciler only calls this when a deployment has ≥2 containers, so a
+    /// single-container app doesn't get a pointless self-entry.
     pub fn auto_container_host_env_vars(
         deployment: &Deployment,
         container_specs: &[crate::server::deployment::models::ContainerSpec],
@@ -740,7 +727,7 @@ impl ResourceBuilder {
         container_specs
             .iter()
             .filter_map(|spec| {
-                let port = spec.http_port?;
+                let port = spec.port?;
                 let key = format!(
                     "RISE_CONTAINER_HOST__{}",
                     spec.name.to_uppercase().replace('-', "_")
@@ -972,45 +959,6 @@ impl ResourceBuilder {
         }
     }
 
-    pub fn create_service(
-        &self,
-        project: &Project,
-        deployment: &Deployment,
-        namespace: &str,
-        http_port: u16,
-        environment_name: Option<&str>,
-    ) -> Service {
-        Service {
-            metadata: ObjectMeta {
-                name: Some(Self::service_name(project, deployment)),
-                namespace: Some(namespace.to_string()),
-                labels: Some(Self::common_labels(project, environment_name)),
-                ..Default::default()
-            },
-            spec: Some(ServiceSpec {
-                type_: Some("ClusterIP".to_string()),
-                selector: Some(Self::deployment_labels(
-                    project,
-                    deployment,
-                    environment_name,
-                )),
-                ports: Some(vec![ServicePort {
-                    name: Some("http".to_string()),
-                    port: 80,
-                    target_port: Some(
-                        k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
-                            http_port as i32,
-                        ),
-                    ),
-                    protocol: Some("TCP".to_string()),
-                    ..Default::default()
-                }]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-    }
-
     pub fn create_backend_service_externalname(
         &self,
         project: &Project,
@@ -1192,10 +1140,6 @@ impl ResourceBuilder {
         })
     }
 
-    fn create_http_probe(&self, port: i32, probe_type: ProbeType) -> Option<Probe> {
-        self.create_http_probe_with_override(port, probe_type, None)
-    }
-
     /// Build a probe, merging per-container overrides on top of the server's
     /// `HealthProbeConfig` defaults. `override_spec` with `disabled = true`
     /// returns `None`; individual override fields fall through to defaults
@@ -1329,172 +1273,11 @@ impl ResourceBuilder {
 
     // ── K8s Deployment ─────────────────────────────────────────────────
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn create_k8s_deployment(
-        &self,
-        project: &Project,
-        deployment: &Deployment,
-        namespace: &str,
-        image: &str,
-        http_port: u16,
-        env_vars: Vec<EnvVar>,
-        secret_env_name: Option<String>,
-        secret_env_hash: Option<String>,
-        service_account_name: Option<String>,
-        environment_name: Option<&str>,
-        identity: Option<IdentityMount>,
-    ) -> K8sDeployment {
-        let mut volumes: Vec<Volume> = Vec::new();
-        let mut volume_mounts: Vec<VolumeMount> = Vec::new();
-
-        if let Some(volume) = self.create_extra_service_token_volume() {
-            volumes.push(volume);
-        }
-        if let Some(mount) = self.create_extra_service_token_volume_mount() {
-            volume_mounts.push(mount);
-        }
-
-        // The bootstrap credential and auto-minted tokens are exposed purely as
-        // files under a standard path (IDENTITY_MOUNT_PATH); no env vars are
-        // injected, mirroring the `extra_service_token_audiences` mount.
-        if let Some(ref identity) = identity {
-            volumes.push(Self::create_identity_volume(identity));
-            volume_mounts.push(Self::create_identity_volume_mount());
-        }
-
-        let volumes = (!volumes.is_empty()).then_some(volumes);
-        let volume_mounts = (!volume_mounts.is_empty()).then_some(volume_mounts);
-
-        K8sDeployment {
-            metadata: ObjectMeta {
-                name: Some(Self::deployment_name(project, deployment)),
-                namespace: Some(namespace.to_string()),
-                labels: Some(Self::deployment_labels(
-                    project,
-                    deployment,
-                    environment_name,
-                )),
-                ..Default::default()
-            },
-            spec: Some(DeploymentSpec {
-                replicas: Some(deployment.replicas),
-                min_ready_seconds: None,
-                selector: LabelSelector {
-                    match_labels: Some(Self::deployment_labels(
-                        project,
-                        deployment,
-                        environment_name,
-                    )),
-                    ..Default::default()
-                },
-                strategy: Some(k8s_openapi::api::apps::v1::DeploymentStrategy {
-                    type_: Some("RollingUpdate".to_string()),
-                    rolling_update: Some(k8s_openapi::api::apps::v1::RollingUpdateDeployment {
-                        max_surge: Some(
-                            k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(1),
-                        ),
-                        max_unavailable: Some(
-                            k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(0),
-                        ),
-                    }),
-                }),
-                template: PodTemplateSpec {
-                    metadata: Some(ObjectMeta {
-                        labels: Some(Self::deployment_labels(
-                            project,
-                            deployment,
-                            environment_name,
-                        )),
-                        annotations: secret_env_hash.map(|hash| {
-                            let mut annotations = BTreeMap::new();
-                            annotations.insert(ANNOTATION_ENV_SECRET_HASH.to_string(), hash);
-                            annotations
-                        }),
-                        ..Default::default()
-                    }),
-                    spec: Some(PodSpec {
-                        security_context: self.create_pod_security_context(),
-                        image_pull_secrets: {
-                            // Use the explicitly-configured secret name if present.
-                            // Fall back to the default constant only when the registry
-                            // provider needs the controller to mint pull secrets.
-                            // requires_pull_secret() == false means the cluster handles
-                            // auth itself (e.g. node IAM), but an explicit
-                            // image_pull_secret_name should still always be honoured.
-                            let secret_name =
-                                self.image_pull_secret_name.as_deref().or_else(|| {
-                                    self.registry_provider
-                                        .requires_pull_secret()
-                                        .then_some(IMAGE_PULL_SECRET_NAME)
-                                });
-                            secret_name.map(|name| {
-                                vec![LocalObjectReference {
-                                    name: name.to_string(),
-                                }]
-                            })
-                        },
-                        containers: vec![Container {
-                            name: LEGACY_CONTAINER_NAME.to_string(),
-                            image: Some(image.to_string()),
-                            ports: Some(vec![ContainerPort {
-                                container_port: http_port as i32,
-                                ..Default::default()
-                            }]),
-                            image_pull_policy: Some("Always".to_string()),
-                            env: (!env_vars.is_empty()).then_some(env_vars),
-                            env_from: secret_env_name.map(|name| {
-                                vec![EnvFromSource {
-                                    secret_ref: Some(SecretEnvSource {
-                                        name,
-                                        ..Default::default()
-                                    }),
-                                    ..Default::default()
-                                }]
-                            }),
-                            security_context: self.create_container_security_context(),
-                            resources: self
-                                .create_resource_requirements(&deployment.cpu, &deployment.memory),
-                            liveness_probe: self
-                                .create_http_probe(http_port as i32, ProbeType::Liveness),
-                            readiness_probe: self
-                                .create_http_probe(http_port as i32, ProbeType::Readiness),
-                            volume_mounts,
-                            ..Default::default()
-                        }],
-                        volumes,
-                        node_selector: if self.node_selector.is_empty() {
-                            None
-                        } else {
-                            Some(self.node_selector.clone().into_iter().collect())
-                        },
-                        host_aliases: if self.host_aliases.is_empty() {
-                            None
-                        } else {
-                            Some(
-                                self.host_aliases
-                                    .iter()
-                                    .map(|(hostname, ip)| HostAlias {
-                                        hostnames: Some(vec![hostname.clone()]),
-                                        ip: ip.clone(),
-                                    })
-                                    .collect(),
-                            )
-                        },
-                        service_account_name,
-                        ..Default::default()
-                    }),
-                },
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-    }
-
-    /// Build a K8s Deployment for one container in a multi-container Rise
-    /// deployment. Mirrors `create_k8s_deployment` but uses the
+    /// Build a K8s Deployment for one container of a Rise deployment. Uses the
     /// `ContainerRuntime` for per-container fields (image, port, replicas,
     /// resources, probes) and adds a `rise.dev/container` selector label so
-    /// each container's Pods are isolated.
+    /// each container's Pods are isolated. A single-container app is the
+    /// one-container case (implicit container `app`).
     #[allow(clippy::too_many_arguments)]
     pub fn create_k8s_deployment_for_container(
         &self,
@@ -1531,7 +1314,7 @@ impl ResourceBuilder {
             runtime.name,
         );
 
-        let ports = runtime.http_port.map(|port| {
+        let ports = runtime.port.map(|port| {
             vec![ContainerPort {
                 container_port: port as i32,
                 ..Default::default()
@@ -1539,7 +1322,7 @@ impl ResourceBuilder {
         });
 
         let (liveness, readiness) = runtime
-            .http_port
+            .port
             .map(|port| {
                 (
                     self.create_http_probe_with_override(
@@ -1661,10 +1444,10 @@ impl ResourceBuilder {
         }
     }
 
-    /// Build a K8s Service for one routable container. Workers (no `http_port`)
+    /// Build a K8s Service for one routable container. Workers (no `port`)
     /// should never have this called for them — the caller should skip them.
     ///
-    /// The Service exposes the container's `http_port` directly (Service port
+    /// The Service exposes the container's `port` directly (Service port
     /// = target port). This keeps cross-container addresses intuitive — e.g.
     /// `default-redis:6379` actually reaches Redis — and works for non-HTTP
     /// services too. Ingresses reference the port by name (`"http"`), so
@@ -1677,7 +1460,7 @@ impl ResourceBuilder {
         runtime: &ContainerRuntime<'_>,
         environment_name: Option<&str>,
     ) -> Option<Service> {
-        let port = runtime.http_port?;
+        let port = runtime.port?;
         Some(Service {
             metadata: ObjectMeta {
                 name: Some(Self::service_name_for_container(
@@ -1796,42 +1579,32 @@ impl ResourceBuilder {
         Ok(&access_class.ingress_class)
     }
 
+    /// Build the ingress path list for a deployment's route table.
+    ///
+    /// `routes` is the resolved `(path, service_name)` table — a single-container
+    /// deployment is just `[("/", "<group>-app")]`. Paths are emitted
+    /// longest-prefix-first (lexicographic tiebreaker) for deterministic output
+    /// and nginx longest-match semantics. The `/.rise` backend path is appended
+    /// last.
+    ///
+    /// `prefix` is the deployment's URL sub-path in sub-path mode (no wildcard
+    /// cert), e.g. `/pr-123`; `None` in subdomain mode. In sub-path mode every
+    /// route is emitted as a regex that strips the prefix and preserves the route
+    /// path, so the container receives the same path it would behind a subdomain.
+    /// The single per-ingress `rewrite-target: /$2` (set by the caller) works
+    /// uniformly because every route's regex captures the container-visible path
+    /// (minus its leading slash) into group `$2`.
+    ///
+    /// Routes whose path does not start with `/` are skipped with a warning; the
+    /// request-time validator should make this unreachable, but emitting an
+    /// invalid Ingress would take the whole project's traffic plane down —
+    /// defence in depth.
     fn build_ingress_paths(
         &self,
-        service_name: &str,
-        app_path: &str,
-        app_path_type: &str,
+        routes: &[(String, String)],
+        prefix: Option<&str>,
     ) -> Vec<HTTPIngressPath> {
-        let mut paths = vec![HTTPIngressPath {
-            path: Some(app_path.to_string()),
-            path_type: app_path_type.to_string(),
-            backend: IngressBackend {
-                service: Some(IngressServiceBackend {
-                    name: service_name.to_string(),
-                    port: Some(ServiceBackendPort {
-                        name: Some("http".to_string()),
-                        ..Default::default()
-                    }),
-                }),
-                ..Default::default()
-            },
-        }];
-
-        self.append_rise_backend_path(&mut paths);
-        paths
-    }
-
-    /// Multi-route variant of `build_ingress_paths`. Given a list of
-    /// `(path, service_name)` pairs, emits one `HTTPIngressPath` per route in
-    /// longest-prefix-first order (lexicographic tiebreaker for deterministic
-    /// output across reconciles). The `/.rise` backend path is appended last.
-    ///
-    /// Routes whose path does not start with `/` are skipped with a warning;
-    /// the request-time validator (`models::validate_containers_and_routes`)
-    /// should make this unreachable, but emitting an invalid Ingress would
-    /// take the whole project's traffic plane down — defence in depth.
-    fn build_ingress_paths_multi(&self, routes: &[(String, String)]) -> Vec<HTTPIngressPath> {
-        let mut sorted: Vec<(String, String)> = routes
+        let mut sorted: Vec<(&str, &str)> = routes
             .iter()
             .filter(|(path, _)| {
                 if path.starts_with('/') {
@@ -1844,25 +1617,48 @@ impl ResourceBuilder {
                     false
                 }
             })
-            .cloned()
+            .map(|(p, s)| (p.as_str(), s.as_str()))
             .collect();
-        sorted.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
+        sorted.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(b.0)));
 
         let mut paths: Vec<HTTPIngressPath> = sorted
             .into_iter()
-            .map(|(path, service_name)| HTTPIngressPath {
-                path: Some(path),
-                path_type: "Prefix".to_string(),
-                backend: IngressBackend {
-                    service: Some(IngressServiceBackend {
-                        name: service_name,
-                        port: Some(ServiceBackendPort {
-                            name: Some("http".to_string()),
-                            ..Default::default()
+            .map(|(route_path, service_name)| {
+                let (path, path_type) = match prefix {
+                    None => (route_path.to_string(), "Prefix"),
+                    Some(prefix) => {
+                        let prefix = prefix.trim_end_matches('/');
+                        if route_path == "/" {
+                            // Root route: strip the prefix; container sees `/` + rest.
+                            (format!("{prefix}(/|$)(.*)"), "ImplementationSpecific")
+                        } else {
+                            // Non-root: capture the container-visible path (route
+                            // path + remainder) into $2 so the uniform `/$2`
+                            // rewrite preserves the route path. The route body is
+                            // regex-escaped (user input); the segment boundary is
+                            // non-capturing so $2 keeps its index.
+                            let body = regex::escape(route_path.trim_start_matches('/'));
+                            (
+                                format!("{prefix}(/)({body}(?:/|$).*)"),
+                                "ImplementationSpecific",
+                            )
+                        }
+                    }
+                };
+                HTTPIngressPath {
+                    path: Some(path),
+                    path_type: path_type.to_string(),
+                    backend: IngressBackend {
+                        service: Some(IngressServiceBackend {
+                            name: service_name.to_string(),
+                            port: Some(ServiceBackendPort {
+                                name: Some("http".to_string()),
+                                ..Default::default()
+                            }),
                         }),
-                    }),
-                    ..Default::default()
-                },
+                        ..Default::default()
+                    },
+                }
             })
             .collect();
 
@@ -1907,23 +1703,14 @@ impl ResourceBuilder {
         inline_custom_domains: &[CustomDomain],
         environment_name: Option<&str>,
         all_environments: &[crate::db::models::Environment],
-        // (path, service_name) pairs for multi-container routing. When None,
-        // falls back to a single `/` → service_name(project, deployment) path
-        // (legacy single-container behaviour). Callers should pre-filter:
-        // passing `Some(&[])` is a multi-container-with-no-routable-pairs
-        // signal (workers-only), for which we must NOT emit an ingress at all.
-        multi_container_routes: Option<&[(String, String)]>,
+        // Resolved `(path, service_name)` route table. A single-container
+        // deployment passes `[("/", "<group>-app")]`; a multi-container one
+        // passes its route table. An empty slice means a workers-only
+        // deployment (no routable container) — emit no ingress at all.
+        routes: &[(String, String)],
     ) -> anyhow::Result<Option<Ingress>> {
-        // Defensive guard: a multi-container deployment with zero routable
-        // pairs (workers-only) would otherwise fall through to the legacy
-        // `/` → group-service backend in the match below, pointing at a
-        // Service phase 2 never emitted. Caller is responsible for skipping
-        // this call entirely; this is belt-and-suspenders.
-        if matches!(multi_container_routes, Some(routes) if routes.is_empty()) {
-            debug_assert!(
-                false,
-                "create_primary_ingress called with empty multi_container_routes; caller should skip"
-            );
+        // Workers-only deployment (no routable container): emit no ingress.
+        if routes.is_empty() {
             return Ok(None);
         }
         let mut hosts = self.primary_ingress_hosts(
@@ -1976,29 +1763,14 @@ impl ResourceBuilder {
             );
         }
 
-        let service_name = Self::service_name(project, deployment);
-
         let rules: Vec<IngressRule> = hosts
             .iter()
             .map(|host| {
-                let paths = match multi_container_routes {
-                    // Multi-container path: ignore per-host path_prefix (it was
-                    // designed for the single-service-at-/ shape) and emit the
-                    // user-declared route table verbatim. Per-host rewrite
-                    // annotations are also skipped above for the multi case.
-                    Some(routes) if !routes.is_empty() => self.build_ingress_paths_multi(routes),
-                    _ => {
-                        let (path, path_type) = if let Some(ref prefix) = host.path_prefix {
-                            (
-                                format!("{}(/|$)(.*)", prefix.trim_end_matches('/')),
-                                "ImplementationSpecific",
-                            )
-                        } else {
-                            ("/".to_string(), "Prefix")
-                        };
-                        self.build_ingress_paths(&service_name, &path, path_type)
-                    }
-                };
+                // Each host applies its own sub-path prefix (if any) to the
+                // route table. The per-ingress rewrite annotation above is keyed
+                // off the first host's prefix — mixed prefix/non-prefix hosts on
+                // one ingress are not supported by nginx-ingress.
+                let paths = self.build_ingress_paths(routes, host.path_prefix.as_deref());
                 IngressRule {
                     host: Some(host.host.clone()),
                     http: Some(HTTPIngressRuleValue { paths }),
@@ -2039,9 +1811,9 @@ impl ResourceBuilder {
         namespace: &str,
         custom_domains: &[CustomDomain],
         environment_name: Option<&str>,
-        // Multi-container routes ((path, service_name) pairs). None falls back
-        // to `/` → legacy group service.
-        multi_container_routes: Option<&[(String, String)]>,
+        // Resolved `(path, service_name)` route table (same as `create_primary_ingress`).
+        // Custom domains are always served at the host root (no sub-path prefix).
+        routes: &[(String, String)],
     ) -> anyhow::Result<Ingress> {
         let mut annotations = self.build_ingress_annotations(project)?;
 
@@ -2049,14 +1821,10 @@ impl ResourceBuilder {
             annotations.insert(k.clone(), v.clone());
         }
 
-        let service_name = Self::service_name(project, deployment);
-
         let mut rules = Vec::new();
         for domain in custom_domains {
-            let paths = match multi_container_routes {
-                Some(routes) if !routes.is_empty() => self.build_ingress_paths_multi(routes),
-                _ => self.build_ingress_paths(&service_name, "/", "Prefix"),
-            };
+            // Custom domains are full hostnames, never sub-paths → prefix None.
+            let paths = self.build_ingress_paths(routes, None);
             rules.push(IngressRule {
                 host: Some(domain.domain.clone()),
                 http: Some(HTTPIngressRuleValue { paths }),
@@ -2355,13 +2123,56 @@ mod tests {
         assert_eq!(secret.data, Some(data));
     }
 
+    /// Test helper: build the single implicit `app` container Deployment the
+    /// way the reconciler does for a single-container deployment, keeping the
+    /// old `create_k8s_deployment` positional signature so existing tests stay
+    /// terse.
+    #[allow(clippy::too_many_arguments)]
+    fn legacy_app_deployment(
+        builder: &ResourceBuilder,
+        project: &Project,
+        deployment: &Deployment,
+        namespace: &str,
+        image: &str,
+        port: u16,
+        env_vars: Vec<EnvVar>,
+        secret_env_name: Option<String>,
+        secret_env_hash: Option<String>,
+        service_account_name: Option<String>,
+        environment_name: Option<&str>,
+        identity: Option<IdentityMount>,
+    ) -> K8sDeployment {
+        let runtime = ContainerRuntime {
+            name: "app",
+            image,
+            port: Some(port),
+            replicas: deployment.replicas,
+            cpu: &deployment.cpu,
+            memory: &deployment.memory,
+            env_vars,
+            secret_env_name,
+            secret_env_hash,
+            health_check: None,
+        };
+        builder.create_k8s_deployment_for_container(
+            project,
+            deployment,
+            namespace,
+            &runtime,
+            service_account_name,
+            environment_name,
+            identity,
+        )
+    }
+
     #[test]
     fn create_k8s_deployment_uses_env_from_for_secret_env() {
         let builder = test_resource_builder();
         let project = test_project();
         let deployment = test_deployment();
 
-        let k8s_deployment = builder.create_k8s_deployment(
+        let k8s_deployment = legacy_app_deployment(
+            &builder,
             &project,
             &deployment,
             "demo",
@@ -2420,7 +2231,8 @@ mod tests {
         let project = test_project();
         let deployment = test_deployment();
 
-        let k8s_deployment = builder.create_k8s_deployment(
+        let k8s_deployment = legacy_app_deployment(
+            &builder,
             &project,
             &deployment,
             "demo",
@@ -2451,7 +2263,8 @@ mod tests {
     #[test]
     fn create_k8s_deployment_mounts_identity_secret() {
         let builder = test_resource_builder();
-        let k8s_deployment = builder.create_k8s_deployment(
+        let k8s_deployment = legacy_app_deployment(
+            &builder,
             &test_project(),
             &test_deployment(),
             "demo",
@@ -2503,7 +2316,8 @@ mod tests {
     #[test]
     fn create_k8s_deployment_omits_identity_when_absent() {
         let builder = test_resource_builder();
-        let k8s_deployment = builder.create_k8s_deployment(
+        let k8s_deployment = legacy_app_deployment(
+            &builder,
             &test_project(),
             &test_deployment(),
             "demo",
@@ -2546,7 +2360,8 @@ mod tests {
             requires_pull_secret,
         });
         builder.image_pull_secret_name = image_pull_secret_name.map(str::to_string);
-        builder.create_k8s_deployment(
+        legacy_app_deployment(
+            &builder,
             &test_project(),
             &test_deployment(),
             "demo",
@@ -2834,7 +2649,7 @@ mod tests {
                 &domains,
                 Some("production"),
                 &[],
-                None,
+                &[("/".to_string(), "default-app".to_string())],
             )
             .expect("primary ingress")
             .expect("ingress should be emitted");
@@ -2891,7 +2706,7 @@ mod tests {
                 &[],
                 Some("staging"),
                 std::slice::from_ref(&staging_env),
-                None,
+                &[("/".to_string(), "staging-app".to_string())],
             )
             .expect("call ok");
 
@@ -2909,7 +2724,7 @@ mod tests {
             ContainerSpec {
                 name: "frontend".to_string(),
                 image: Some("img".to_string()),
-                http_port: Some(8080),
+                port: Some(8080),
                 replicas: Some(1),
                 cpu: None,
                 memory: None,
@@ -2919,7 +2734,7 @@ mod tests {
             ContainerSpec {
                 name: "api".to_string(),
                 image: Some("img".to_string()),
-                http_port: Some(8080),
+                port: Some(8080),
                 replicas: Some(1),
                 cpu: None,
                 memory: None,
@@ -2930,7 +2745,7 @@ mod tests {
                 // Worker: no http_port, no Service, no env entry emitted.
                 name: "worker".to_string(),
                 image: Some("img".to_string()),
-                http_port: None,
+                port: None,
                 replicas: Some(1),
                 cpu: None,
                 memory: None,
@@ -2941,7 +2756,7 @@ mod tests {
                 // Dashes in the name get mapped to underscores in the env key.
                 name: "side-car".to_string(),
                 image: Some("img".to_string()),
-                http_port: Some(9000),
+                port: Some(9000),
                 replicas: Some(1),
                 cpu: None,
                 memory: None,
@@ -2984,7 +2799,7 @@ mod tests {
         let specs = vec![ContainerSpec {
             name: "api".to_string(),
             image: Some("img".to_string()),
-            http_port: Some(8080),
+            port: Some(8080),
             replicas: Some(1),
             cpu: None,
             memory: None,
@@ -3011,7 +2826,7 @@ mod tests {
         let runtime = ContainerRuntime {
             name: "redis",
             image: "redis:7-alpine",
-            http_port: Some(6379),
+            port: Some(6379),
             replicas: 1,
             cpu: "",
             memory: "",
@@ -3019,7 +2834,6 @@ mod tests {
             secret_env_name: None,
             secret_env_hash: None,
             health_check: None,
-            is_legacy: false,
         };
 
         let service = builder
@@ -3035,6 +2849,62 @@ mod tests {
             ports[0].target_port,
             Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(6379)),
         );
+    }
+
+    #[test]
+    fn build_ingress_paths_subdomain_emits_literal_prefix_paths() {
+        // No sub-path prefix → literal `Prefix` paths, longest-first, no regex.
+        let builder = test_resource_builder();
+        let routes = vec![
+            ("/".to_string(), "default-frontend".to_string()),
+            ("/api".to_string(), "default-api".to_string()),
+        ];
+        let paths = builder.build_ingress_paths(&routes, None);
+        // `/api` (longer) is emitted before `/`.
+        assert_eq!(paths[0].path.as_deref(), Some("/api"));
+        assert_eq!(paths[0].path_type, "Prefix");
+        assert_eq!(
+            paths[0].backend.service.as_ref().unwrap().name,
+            "default-api"
+        );
+        assert_eq!(paths[1].path.as_deref(), Some("/"));
+        assert_eq!(paths[1].path_type, "Prefix");
+    }
+
+    #[test]
+    fn build_ingress_paths_subpath_strips_prefix_and_preserves_route() {
+        // Sub-path mode: each route becomes a regex that strips the deployment
+        // prefix and captures the container-visible path into $2 (so the uniform
+        // `rewrite-target: /$2` keeps the route path).
+        let builder = test_resource_builder();
+        let routes = vec![
+            ("/".to_string(), "default-frontend".to_string()),
+            ("/api".to_string(), "default-api".to_string()),
+        ];
+        let paths = builder.build_ingress_paths(&routes, Some("/pr-123"));
+        // Longest-first: `/api` before `/`.
+        assert_eq!(
+            paths[0].path.as_deref(),
+            Some("/pr-123(/)(api(?:/|$).*)"),
+            "non-root route strips prefix, keeps the route path, segment-bounded"
+        );
+        assert_eq!(paths[0].path_type, "ImplementationSpecific");
+        assert_eq!(
+            paths[1].path.as_deref(),
+            Some("/pr-123(/|$)(.*)"),
+            "root route strips the prefix to `/`"
+        );
+        assert_eq!(paths[1].path_type, "ImplementationSpecific");
+    }
+
+    #[test]
+    fn build_ingress_paths_subpath_regex_escapes_route_body() {
+        // A route path containing a regex metacharacter must be escaped so it
+        // matches literally (and can't inject regex structure).
+        let builder = test_resource_builder();
+        let routes = vec![("/a.b".to_string(), "default-svc".to_string())];
+        let paths = builder.build_ingress_paths(&routes, Some("/pr-1"));
+        assert_eq!(paths[0].path.as_deref(), Some(r"/pr-1(/)(a\.b(?:/|$).*)"));
     }
 }
 

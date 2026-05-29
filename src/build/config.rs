@@ -93,8 +93,8 @@ pub fn load_full_project_config(app_path: &str) -> Result<Option<ProjectBuildCon
 /// - Container names must match `^[a-z][a-z0-9-]{0,14}$` (max 15 chars to keep
 ///   `<project>-<deployment_id(15)>-<container>` under the 63-char K8s limit).
 /// - Each container must have exactly one of `image` / `build`.
-/// - Each container declaring a `health_check` block must also set `http_port`.
-/// - Each route's `container` must exist and must have `http_port` set.
+/// - Each container declaring a `health_check` block must also set `port`.
+/// - Each route's `container` must exist and must have `port` set.
 /// - Each route's `path` must start with `/`.
 fn validate_containers_and_routes(config: &ProjectBuildConfig) -> Result<()> {
     if config.containers.is_empty() {
@@ -107,7 +107,7 @@ fn validate_containers_and_routes(config: &ProjectBuildConfig) -> Result<()> {
     if config.build.is_some() || config.deploy.is_some() {
         anyhow::bail!(
             "Top-level [build]/[deploy] cannot be combined with [containers.<name>]. \
-             Move the legacy [build]/[deploy] settings into a [containers.app] entry."
+             Move the top-level [build]/[deploy] settings into a [containers.app] entry."
         );
     }
 
@@ -128,10 +128,10 @@ fn validate_containers_and_routes(config: &ProjectBuildConfig) -> Result<()> {
             }
             _ => {}
         }
-        if container.health_check.is_some() && container.http_port.is_none() {
+        if container.health_check.is_some() && container.port.is_none() {
             anyhow::bail!(
-                "[containers.{}] has health_check but no http_port; \
-                 set http_port or remove health_check",
+                "[containers.{}] has health_check but no port; \
+                 set port or remove health_check",
                 name
             );
         }
@@ -148,9 +148,9 @@ fn validate_containers_and_routes(config: &ProjectBuildConfig) -> Result<()> {
                 route.container
             )
         })?;
-        if target.http_port.is_none() {
+        if target.port.is_none() {
             anyhow::bail!(
-                "[routes] '{}' targets container '{}' which has no http_port",
+                "[routes] '{}' targets container '{}' which has no port",
                 path,
                 route.container
             );
@@ -461,12 +461,12 @@ name = "my-app"
 
 [containers.frontend]
 image = "registry.example.com/myapp/frontend:latest"
-http_port = 8080
+port = 8080
 replicas = 2
 
 [containers.backend]
 image = "registry.example.com/myapp/backend:latest"
-http_port = 9090
+port = 9090
 replicas = 3
 health_check = { path = "/health" }
 
@@ -485,7 +485,6 @@ image = "registry.example.com/myapp/worker:latest"
         assert_eq!(config.routes.len(), 2);
         let resolved = config.resolve_deploy().unwrap();
         assert_eq!(resolved.containers.len(), 3);
-        assert!(resolved.containers.iter().all(|c| !c.is_legacy));
         assert_eq!(resolved.routes.len(), 2);
         let api_route = resolved.routes.iter().find(|r| r.path == "/api").unwrap();
         assert_eq!(api_route.container, "backend");
@@ -501,7 +500,7 @@ backend = "docker"
 
 [containers.app]
 image = "foo:bar"
-http_port = 8080
+port = 8080
 "#,
         );
         let err = load_full_project_config(dir.path().to_str().unwrap())
@@ -515,7 +514,7 @@ http_port = 8080
             r#"
 [containers.api]
 image = "foo:bar"
-http_port = 8080
+port = 8080
 
 [routes]
 "/" = { container = "frontend" }
@@ -531,7 +530,7 @@ http_port = 8080
 
     #[test]
     fn test_multi_container_rejects_route_to_worker() {
-        // Worker = container without http_port = not routable.
+        // Worker = container without a port = not routable.
         let dir = write_toml(
             r#"
 [containers.worker]
@@ -542,8 +541,8 @@ image = "foo:bar"
 "#,
         );
         let err = load_full_project_config(dir.path().to_str().unwrap())
-            .expect_err("expected http_port error");
-        assert!(err.to_string().contains("no http_port"), "got: {err}");
+            .expect_err("expected missing-port error");
+        assert!(err.to_string().contains("no port"), "got: {err}");
     }
 
     #[test]
@@ -552,7 +551,7 @@ image = "foo:bar"
             r#"
 [containers.api]
 image = "foo:bar"
-http_port = 8080
+port = 8080
 health_check = false
 "#,
         );
@@ -572,7 +571,7 @@ health_check = false
             r#"
 [containers.api]
 image = "foo:bar"
-http_port = 8080
+port = 8080
 health_check = true
 "#,
         );
@@ -595,7 +594,7 @@ health_check = true
             r#"
 [containers.api]
 image = "foo:bar"
-http_port = 8080
+port = 8080
 
 [containers.worker]
 image = "bar:baz"
@@ -612,11 +611,15 @@ image = "bar:baz"
     }
 
     #[test]
-    fn test_legacy_single_container_still_works() {
+    fn test_single_container_config_resolves_empty() {
+        // A single-container project (top-level [build]/[deploy], no [containers])
+        // resolves to no explicit containers — the CLI drives it through the
+        // single-container build flow and the backend synthesises the implicit
+        // `app` container at reconcile time.
         let dir = write_toml(
             r#"
 [project]
-name = "legacy"
+name = "simple"
 
 [build]
 backend = "docker"
@@ -630,10 +633,8 @@ replicas = 2
             .unwrap();
         assert!(config.containers.is_empty());
         let resolved = config.resolve_deploy().unwrap();
-        assert_eq!(resolved.containers.len(), 1);
-        assert!(resolved.containers[0].is_legacy);
-        assert_eq!(resolved.containers[0].name, "app");
-        assert_eq!(resolved.containers[0].replicas, Some(2));
+        assert!(resolved.containers.is_empty());
+        assert!(resolved.routes.is_empty());
     }
 
     #[test]
@@ -642,7 +643,7 @@ replicas = 2
             r#"
 [containers."Bad Name"]
 image = "foo:bar"
-http_port = 8080
+port = 8080
 "#,
         );
         let err = load_full_project_config(dir.path().to_str().unwrap())
@@ -659,7 +660,7 @@ http_port = 8080
             r#"
 [containers.app]
 image = "foo:bar"
-http_port = 8080
+port = 8080
 
 [containers.app.build]
 backend = "docker"
@@ -679,7 +680,7 @@ backend = "docker"
         let dir = write_toml(
             r#"
 [containers.app]
-http_port = 8080
+port = 8080
 "#,
         );
         let err = load_full_project_config(dir.path().to_str().unwrap())
@@ -701,9 +702,9 @@ health_check = { path = "/health" }
 "#,
         );
         let err = load_full_project_config(dir.path().to_str().unwrap())
-            .expect_err("expected health_check-without-http_port error");
+            .expect_err("expected health_check-without-port error");
         assert!(
-            err.to_string().contains("health_check but no http_port"),
+            err.to_string().contains("health_check but no port"),
             "got: {err}"
         );
     }
@@ -714,7 +715,7 @@ health_check = { path = "/health" }
             r#"
 [containers.api]
 image = "foo:bar"
-http_port = 8080
+port = 8080
 
 [routes]
 "api" = { container = "api" }
@@ -734,7 +735,7 @@ http_port = 8080
             r#"
 [containers.abcdefghijklmno]
 image = "foo:bar"
-http_port = 8080
+port = 8080
 "#,
         );
         let config = load_full_project_config(dir.path().to_str().unwrap())
@@ -749,7 +750,7 @@ http_port = 8080
             r#"
 [containers.abcdefghijklmnop]
 image = "foo:bar"
-http_port = 8080
+port = 8080
 "#,
         );
         let err = load_full_project_config(dir.path().to_str().unwrap())

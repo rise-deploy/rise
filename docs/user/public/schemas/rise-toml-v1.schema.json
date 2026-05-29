@@ -135,17 +135,7 @@
               "type": "null"
             }
           ],
-          "description": "Health check configuration. When `http_port` is set and this is omitted,\nHTTP liveness+readiness probes default to ON (path `/`). Set\n`health_check = false` to disable probes entirely."
-        },
-        "http_port": {
-          "description": "HTTP port the container listens on. Required if the container should be\nreachable via the ingress (referenced from `[routes]`). Omit for workers.",
-          "format": "uint16",
-          "maximum": 65535,
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
+          "description": "Health check configuration. HTTP liveness+readiness probes default to ON\n(path `/`) only for containers reachable via `[routes]`; non-routed\ncontainers (e.g. a database) get no probe unless one is configured here.\nSet `health_check = false` to disable probes entirely; set a config block\nto force them on with custom settings. Requires `port` to be set."
         },
         "image": {
           "description": "Pre-built image reference. Exclusive with `build`.",
@@ -158,6 +148,16 @@
           "description": "Memory allocation (e.g. \"256Mi\", \"1Gi\") — sets both request and limit.",
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "port": {
+          "description": "Port the container listens on. Required if the container should be\nreachable via the ingress (referenced from `[routes]`) or by sibling\ncontainers via `RISE_CONTAINER_HOST__*`. Need not be HTTP — the Service\nis plain TCP. Omit for workers.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": [
+            "integer",
             "null"
           ]
         },
@@ -344,11 +344,11 @@
       "description": "One ingress path → container mapping.",
       "properties": {
         "container": {
-          "description": "Target container name (must exist in `[containers]` and have `http_port`).",
+          "description": "Target container name (must exist in `[containers]` and have `port` set).",
           "type": "string"
         },
         "port": {
-          "description": "Override the container's `http_port` for this route (rare; usually omit).",
+          "description": "Override the container's `port` for this route (rare; usually omit).",
           "format": "uint16",
           "maximum": 65535,
           "minimum": 0,
@@ -434,7 +434,7 @@
       "additionalProperties": {
         "$ref": "#/$defs/RouteConfig"
       },
-      "description": "Path-based ingress routing across containers. Path strings are the keys\n(e.g. `\"/api\"`, `\"/\"`); the value picks the target container and an\noptional port (defaults to the container's `http_port`).",
+      "description": "Path-based ingress routing across containers. Path strings are the keys\n(e.g. `\"/api\"`, `\"/\"`); the value picks the target container and an\noptional port (defaults to the container's `port`).",
       "type": "object"
     },
     "version": {

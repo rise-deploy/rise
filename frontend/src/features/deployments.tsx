@@ -3143,7 +3143,7 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                                         <MonoTd style={{ textAlign: 'right' }}>{c.replicas ?? '-'}</MonoTd>
                                         <MonoTd style={{ textAlign: 'right' }}>{c.cpu || '-'}</MonoTd>
                                         <MonoTd style={{ textAlign: 'right' }}>{c.memory || '-'}</MonoTd>
-                                        <MonoTd style={{ textAlign: 'right' }}>{c.http_port ?? '-'}</MonoTd>
+                                        <MonoTd style={{ textAlign: 'right' }}>{c.port ?? '-'}</MonoTd>
                                     </MonoTableRow>
                                 ))}
                             </MonoTableBody>

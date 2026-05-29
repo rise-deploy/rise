@@ -278,8 +278,11 @@ pub struct ContainerSpec {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    /// Port the container listens on. Drives the per-container Service and
+    /// ingress routing. Need not be HTTP — the Service is plain TCP. `None`
+    /// for workers (no Service, no probes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub http_port: Option<u16>,
+    pub port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replicas: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -333,10 +336,12 @@ fn is_valid_container_name(name: &str) -> bool {
 /// - Each container must set exactly one of `image` (non-empty) or `build`
 ///   (handled implicitly: `image == None` ⇒ CLI will build).
 /// - `env_overrides` entries with `is_secret = true` are rejected; per-container
-///   secret overrides are not yet supported on the wire.
-/// - `health_check.is_some()` requires `http_port.is_some()`.
+///   secret overrides are not yet supported on the wire. (Key/`PORT`/protected
+///   validation of per-container overrides happens in the request handler,
+///   reusing the same `validate_env_override` as top-level overrides.)
+/// - `health_check.is_some()` requires `port.is_some()`.
 /// - Each route's `container` must match a container in the request.
-/// - The route's target container must have `http_port.is_some()`.
+/// - The route's target container must have `port.is_some()`.
 /// - Each route's `path` must start with `/`.
 pub fn validate_containers_and_routes(
     containers: Option<&[ContainerSpec]>,
@@ -379,9 +384,9 @@ pub fn validate_containers_and_routes(
                 )));
             }
         }
-        if spec.health_check.is_some() && spec.http_port.is_none() {
+        if spec.health_check.is_some() && spec.port.is_none() {
             return Err(ServerError::bad_request(format!(
-                "Container '{}' has health_check but no http_port; set http_port or remove health_check",
+                "Container '{}' has health_check but no port; set port or remove health_check",
                 spec.name
             )));
         }
@@ -413,9 +418,9 @@ pub fn validate_containers_and_routes(
                     route.path, route.container
                 ))
             })?;
-        if target.http_port.is_none() {
+        if target.port.is_none() {
             return Err(ServerError::bad_request(format!(
-                "Route '{}' targets container '{}' which has no http_port",
+                "Route '{}' targets container '{}' which has no port",
                 route.path, route.container
             )));
         }
@@ -618,11 +623,11 @@ mod tests {
         assert_eq!(env_override.is_protected, Some(false));
     }
 
-    fn cspec(name: &str, image: Option<&str>, http_port: Option<u16>) -> ContainerSpec {
+    fn cspec(name: &str, image: Option<&str>, port: Option<u16>) -> ContainerSpec {
         ContainerSpec {
             name: name.to_string(),
             image: image.map(|s| s.to_string()),
-            http_port,
+            port,
             replicas: None,
             cpu: None,
             memory: None,
@@ -762,7 +767,7 @@ mod tests {
             port: 0,
         }];
         let err = validate_containers_and_routes(Some(&containers), &routes).unwrap_err();
-        assert!(err.message.contains("no http_port"), "got: {}", err.message);
+        assert!(err.message.contains("no port"), "got: {}", err.message);
     }
 
     #[test]

@@ -41,7 +41,7 @@ pub struct ProjectBuildConfig {
 
     /// Path-based ingress routing across containers. Path strings are the keys
     /// (e.g. `"/api"`, `"/"`); the value picks the target container and an
-    /// optional port (defaults to the container's `http_port`).
+    /// optional port (defaults to the container's `port`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub routes: BTreeMap<String, RouteConfig>,
 }
@@ -56,9 +56,11 @@ pub struct ContainerConfig {
     /// Build configuration to produce this container's image. Exclusive with `image`.
     pub build: Option<BuildConfig>,
 
-    /// HTTP port the container listens on. Required if the container should be
-    /// reachable via the ingress (referenced from `[routes]`). Omit for workers.
-    pub http_port: Option<u16>,
+    /// Port the container listens on. Required if the container should be
+    /// reachable via the ingress (referenced from `[routes]`) or by sibling
+    /// containers via `RISE_CONTAINER_HOST__*`. Need not be HTTP — the Service
+    /// is plain TCP. Omit for workers.
+    pub port: Option<u16>,
 
     /// Number of replicas.
     pub replicas: Option<u32>,
@@ -74,9 +76,11 @@ pub struct ContainerConfig {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
 
-    /// Health check configuration. When `http_port` is set and this is omitted,
-    /// HTTP liveness+readiness probes default to ON (path `/`). Set
-    /// `health_check = false` to disable probes entirely.
+    /// Health check configuration. HTTP liveness+readiness probes default to ON
+    /// (path `/`) only for containers reachable via `[routes]`; non-routed
+    /// containers (e.g. a database) get no probe unless one is configured here.
+    /// Set `health_check = false` to disable probes entirely; set a config block
+    /// to force them on with custom settings. Requires `port` to be set.
     pub health_check: Option<HealthCheckSetting>,
 }
 
@@ -156,38 +160,35 @@ pub struct HealthCheckConfig {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[cfg_attr(feature = "backend", derive(schemars::JsonSchema))]
 pub struct RouteConfig {
-    /// Target container name (must exist in `[containers]` and have `http_port`).
+    /// Target container name (must exist in `[containers]` and have `port` set).
     pub container: String,
-    /// Override the container's `http_port` for this route (rare; usually omit).
+    /// Override the container's `port` for this route (rare; usually omit).
     pub port: Option<u16>,
 }
 
-/// Default container name used when synthesising a single container from the
-/// legacy top-level `[build]` + `[deploy]` shape.
+/// Name of the implicit container the backend synthesises for a single-container
+/// deployment (one with top-level `[build]`/`[deploy]` and no `[containers]`).
+/// A single-container app is just the one-container case — not a "legacy" shape.
+// Only referenced by the backend reconciler/handlers; allow dead-code in CLI-only builds.
+#[cfg_attr(not(feature = "backend"), allow(dead_code))]
 pub const DEFAULT_CONTAINER_NAME: &str = "app";
 
-/// A container resolved from rise.toml — either an explicit `[containers.X]`
-/// entry or the implicit `app` container synthesised from top-level
-/// `[build]`/`[deploy]`. Always non-empty after resolution.
+/// A container resolved from an explicit `[containers.X]` entry in rise.toml.
 #[derive(Debug, Clone)]
 pub struct ResolvedContainer {
     pub name: String,
     pub image: Option<String>,
     pub build: Option<BuildConfig>,
-    pub http_port: Option<u16>,
+    pub port: Option<u16>,
     pub replicas: Option<u32>,
     pub cpu: Option<String>,
     pub memory: Option<String>,
     pub env: BTreeMap<String, String>,
     pub health_check: Option<HealthCheckSetting>,
-    /// True when this container was synthesised from the legacy single-container
-    /// shape (no `[containers]` block in rise.toml). The reconciler relies on
-    /// this to keep emitting unsuffixed K8s resource names for back-compat.
-    pub is_legacy: bool,
 }
 
 /// One ingress route resolved from rise.toml. Includes a port (defaulting to
-/// the target container's http_port) so the reconciler doesn't need to chase
+/// the target container's `port`) so the reconciler doesn't need to chase
 /// the container list to build the K8s Service reference.
 #[derive(Debug, Clone)]
 pub struct ResolvedRoute {
@@ -204,107 +205,80 @@ pub struct ResolvedDeploy {
 }
 
 impl ProjectBuildConfig {
-    /// Resolve the canonical list of containers + routes downstream code should
-    /// operate on, normalising legacy single-container configs (no
-    /// `[containers]`) into an implicit `app` container.
+    /// Resolve the explicit `[containers]` + `[routes]` from rise.toml.
     ///
-    /// Returns an empty resolution when neither `[containers]` nor top-level
-    /// `[build]` is present — callers (CLI) must still allow `--image` to
-    /// drive an image-only deployment in that case.
+    /// Returns an empty resolution when there is no `[containers]` block — a
+    /// single-container project (top-level `[build]`/`[deploy]`, or `--image`)
+    /// is driven by the CLI's single-container flow, and the backend synthesises
+    /// its implicit `app` container at reconcile time.
     ///
-    /// Returns `Err` when a route references a container that has no
-    /// `http_port` (and the route itself doesn't override `port`). The CLI's
+    /// Returns `Err` when a route references a container that has no `port`
+    /// (and the route itself doesn't override `port`). The CLI's
     /// `load_full_project_config` validator catches this for the on-disk path,
     /// but this method is public and callers may construct `ProjectBuildConfig`
     /// in-memory or otherwise bypass the validator — so we enforce it inline to
     /// avoid silently wiring a K8s Service to port 0.
     pub fn resolve_deploy(&self) -> Result<ResolvedDeploy, String> {
-        if !self.containers.is_empty() {
-            let containers: Vec<ResolvedContainer> = self
-                .containers
-                .iter()
-                .map(|(name, c)| ResolvedContainer {
-                    name: name.clone(),
-                    image: c.image.clone(),
-                    build: c.build.clone(),
-                    http_port: c.http_port,
-                    replicas: c.replicas,
-                    cpu: c.cpu.clone(),
-                    memory: c.memory.clone(),
-                    env: c.env.clone(),
-                    health_check: c.health_check.clone(),
-                    is_legacy: false,
-                })
-                .collect();
+        if self.containers.is_empty() {
+            return Ok(ResolvedDeploy::default());
+        }
 
-            let routes = if self.routes.is_empty() {
-                // No explicit routes: if exactly one container has http_port,
-                // expose it at `/`. Otherwise emit no routes (workers-only or
-                // ambiguous — validation should have caught the latter).
-                let routable: Vec<&ResolvedContainer> = containers
-                    .iter()
-                    .filter(|c| c.http_port.is_some())
-                    .collect();
-                if routable.len() == 1 {
-                    vec![ResolvedRoute {
-                        path: "/".to_string(),
-                        container: routable[0].name.clone(),
-                        port: routable[0].http_port.expect("filtered for Some"),
-                    }]
-                } else {
-                    Vec::new()
-                }
+        let containers: Vec<ResolvedContainer> = self
+            .containers
+            .iter()
+            .map(|(name, c)| ResolvedContainer {
+                name: name.clone(),
+                image: c.image.clone(),
+                build: c.build.clone(),
+                port: c.port,
+                replicas: c.replicas,
+                cpu: c.cpu.clone(),
+                memory: c.memory.clone(),
+                env: c.env.clone(),
+                health_check: c.health_check.clone(),
+            })
+            .collect();
+
+        let routes = if self.routes.is_empty() {
+            // No explicit routes: if exactly one container has a port, expose it
+            // at `/`. Otherwise emit no routes (workers-only or ambiguous —
+            // validation should have caught the latter).
+            let routable: Vec<&ResolvedContainer> =
+                containers.iter().filter(|c| c.port.is_some()).collect();
+            if routable.len() == 1 {
+                vec![ResolvedRoute {
+                    path: "/".to_string(),
+                    container: routable[0].name.clone(),
+                    port: routable[0].port.expect("filtered for Some"),
+                }]
             } else {
-                let mut resolved = Vec::with_capacity(self.routes.len());
-                for (path, route) in &self.routes {
-                    let port = match route.port.or_else(|| {
-                        self.containers
-                            .get(&route.container)
-                            .and_then(|c| c.http_port)
-                    }) {
-                        Some(p) => p,
-                        None => {
-                            return Err(format!(
-                                "route '{}' targets container '{}' which has no http_port set",
-                                path, route.container
-                            ));
-                        }
-                    };
-                    resolved.push(ResolvedRoute {
-                        path: path.clone(),
-                        container: route.container.clone(),
-                        port,
-                    });
-                }
-                resolved
-            };
+                Vec::new()
+            }
+        } else {
+            let mut resolved = Vec::with_capacity(self.routes.len());
+            for (path, route) in &self.routes {
+                let port = match route
+                    .port
+                    .or_else(|| self.containers.get(&route.container).and_then(|c| c.port))
+                {
+                    Some(p) => p,
+                    None => {
+                        return Err(format!(
+                            "route '{}' targets container '{}' which has no port set",
+                            path, route.container
+                        ));
+                    }
+                };
+                resolved.push(ResolvedRoute {
+                    path: path.clone(),
+                    container: route.container.clone(),
+                    port,
+                });
+            }
+            resolved
+        };
 
-            return Ok(ResolvedDeploy { containers, routes });
-        }
-
-        // Legacy single-container path: synthesise an implicit `app` container
-        // when top-level [build] or [deploy] is present.
-        if self.build.is_some() || self.deploy.is_some() {
-            let deploy = self.deploy.clone().unwrap_or_default();
-            let container = ResolvedContainer {
-                name: DEFAULT_CONTAINER_NAME.to_string(),
-                image: None,
-                build: self.build.clone(),
-                http_port: None,
-                replicas: deploy.replicas,
-                cpu: deploy.cpu,
-                memory: deploy.memory,
-                env: BTreeMap::new(),
-                health_check: None,
-                is_legacy: true,
-            };
-            return Ok(ResolvedDeploy {
-                containers: vec![container],
-                routes: Vec::new(),
-            });
-        }
-
-        Ok(ResolvedDeploy::default())
+        Ok(ResolvedDeploy { containers, routes })
     }
 }
 
@@ -335,16 +309,16 @@ mod tests {
 
         let err = config
             .resolve_deploy()
-            .expect_err("expected http_port error");
+            .expect_err("expected missing-port error");
         assert!(
-            err.contains("no http_port") && err.contains("worker") && err.contains("'/'"),
+            err.contains("no port") && err.contains("worker") && err.contains("'/'"),
             "got: {err}"
         );
     }
 
     #[test]
-    fn resolve_deploy_uses_route_port_override_when_container_has_no_http_port() {
-        // If the route supplies its own port, the container's missing http_port
+    fn resolve_deploy_uses_route_port_override_when_container_has_no_port() {
+        // If the route supplies its own port, the container's missing port
         // is fine — we shouldn't error in that case.
         let mut config = ProjectBuildConfig::default();
         config.containers.insert(

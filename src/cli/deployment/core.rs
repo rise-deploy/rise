@@ -13,15 +13,14 @@ use crate::config::Config;
 // Re-export models from API module (always available)
 pub use crate::api::models::{Deployment, DeploymentStatus};
 
-/// Convert the resolved multi-container section of `rise.toml` into the
-/// JSON shape expected by `POST /deployments`. Returns `(None, None)` when
-/// the project is single-container (legacy `[build]`/`[deploy]` shape) so
-/// the existing single-image code path continues to drive the request.
+/// Convert the `[containers]` section of `rise.toml` into the JSON shape
+/// expected by `POST /deployments`. Returns `(None, None)` when the project is
+/// single-container (no `[containers]` block) so the existing single-image code
+/// path drives the request and the backend synthesises the implicit `app`
+/// container at reconcile time.
 ///
-/// v1 requires every container to declare `image = "..."` directly; build
-/// orchestration per container is a follow-up. Routes default to `/` →
-/// the only routable container when `[routes]` is omitted and exactly one
-/// container has `http_port`.
+/// Routes default to `/` → the only routable container when `[routes]` is
+/// omitted and exactly one container has a `port`.
 fn build_multi_container_payload(
     toml_config: Option<&crate::rise_toml::ProjectBuildConfig>,
 ) -> Result<(Option<serde_json::Value>, Option<serde_json::Value>)> {
@@ -31,8 +30,8 @@ fn build_multi_container_payload(
         return Ok((None, None));
     };
     let resolved = cfg.resolve_deploy().map_err(|e| anyhow::anyhow!(e))?;
-    if resolved.containers.iter().all(|c| c.is_legacy) {
-        // Single-container legacy path; let the existing image flow handle it.
+    if resolved.containers.is_empty() {
+        // Single-container project; let the existing image flow handle it.
         return Ok((None, None));
     }
 
@@ -90,8 +89,8 @@ fn build_multi_container_payload(
         if let Some(image) = image_payload {
             spec["image"] = image;
         }
-        if let Some(p) = c.http_port {
-            spec["http_port"] = serde_json::json!(p);
+        if let Some(p) = c.port {
+            spec["port"] = serde_json::json!(p);
         }
         if let Some(r) = c.replicas {
             spec["replicas"] = serde_json::json!(r);

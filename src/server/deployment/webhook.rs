@@ -685,35 +685,18 @@ async fn check_deployment_health_from_observed(
     let namespace = ResourceBuilder::namespace_name(project, namespace_prefix);
     let base_name = ResourceBuilder::deployment_name(project, deployment);
 
-    // Resolve the list of K8s Deployment names to aggregate over. Legacy
-    // single-container rows produce one name; multi-container rows produce one
-    // per container.
-    // Propagate DB errors: silently falling back to the legacy single-name path
-    // would mis-aggregate a multi-container deployment's health and could flip
-    // it Healthy/Failed against the wrong K8s Deployment.
+    // Resolve the list of K8s Deployment names to aggregate over — one per
+    // container. A single-container deployment has its implicit `app` container.
+    // Propagate DB errors: silently aggregating against the wrong names could
+    // flip the deployment Healthy/Failed incorrectly.
     let side = db_deployments::get_containers(&state.db_pool, deployment.id)
         .await
         .context("failed to load deployment container side-data")?;
-    let container_names: Vec<String> = side
-        .containers
-        .as_ref()
-        .and_then(|v| {
-            serde_json::from_value::<Vec<crate::server::deployment::models::ContainerSpec>>(
-                v.clone(),
-            )
-            .ok()
-        })
-        .map(|specs| specs.into_iter().map(|s| s.name).collect())
-        .unwrap_or_default();
-
-    let k8s_deploy_names: Vec<String> = if container_names.is_empty() {
-        vec![format!("{}/{}", namespace, base_name)]
-    } else {
-        container_names
-            .iter()
-            .map(|c| format!("{}/{}-{}", namespace, base_name, c))
-            .collect()
-    };
+    let (container_specs, _routes) = resolve_runtime_containers(deployment, &side);
+    let k8s_deploy_names: Vec<String> = container_specs
+        .iter()
+        .map(|spec| format!("{}/{}-{}", namespace, base_name, spec.name))
+        .collect();
 
     let mut desired_replicas: i32 = 0;
     let mut ready_replicas: i32 = 0;
@@ -1325,27 +1308,29 @@ async fn compute_desired_children(
     // Track which deployment groups have active deployments that are ready for phase 2.
     let mut active_by_group: HashMap<String, &Deployment> = HashMap::new();
 
-    // Preload container_specs per deployment so the per-deployment loop below
-    // can decide whether THIS deployment owns the per-container Service for
-    // each of its containers (see `service_owner_per_container`). Loading once
-    // here also avoids a duplicate DB roundtrip in phase 2.
+    // Preload the normalized container + route list per deployment. A
+    // single-container deployment (`containers IS NULL`) synthesises an implicit
+    // `app` container from the row's columns; multi-container deployments parse
+    // their persisted side-data. Loading once here drives Service ownership and
+    // avoids a duplicate DB roundtrip in phase 2.
     let mut container_specs_by_deployment: HashMap<
         uuid::Uuid,
         Vec<crate::server::deployment::models::ContainerSpec>,
     > = HashMap::new();
+    let mut routes_by_deployment: HashMap<
+        uuid::Uuid,
+        Vec<crate::server::deployment::models::RouteSpec>,
+    > = HashMap::new();
     for d in &infra_deployments {
-        // Propagate DB errors: an `.ok()` fallback would silently mis-treat a
-        // multi-container deployment as legacy, dropping its per-container K8s
-        // Deployments from the desired set and letting Metacontroller GC them.
-        let json = db_deployments::get_containers(&state.db_pool, d.id)
+        // Propagate DB errors: an `.ok()` fallback would silently drop a
+        // deployment's containers from the desired set and let Metacontroller
+        // GC its on-cluster resources.
+        let side = db_deployments::get_containers(&state.db_pool, d.id)
             .await
-            .context("failed to load deployment container side-data")?
-            .containers;
-        let specs: Vec<crate::server::deployment::models::ContainerSpec> = json
-            .as_ref()
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
+            .context("failed to load deployment container side-data")?;
+        let (specs, routes) = resolve_runtime_containers(d, &side);
         container_specs_by_deployment.insert(d.id, specs);
+        routes_by_deployment.insert(d.id, routes);
     }
 
     // Per-container Service ownership: for each (group, container_name), which
@@ -1361,9 +1346,8 @@ async fn compute_desired_children(
     //     a sidecar Redis — emit its Service immediately, so sibling pods can
     //     reach it during their readiness probes.)
     //
-    // Workers (no `http_port`) and groups with no multi-container deployments
-    // are absent from this map; legacy single-container Services are still
-    // emitted in phase 2.
+    // Workers (no `port`) are absent from this map. A single-container app
+    // participates via its implicit `app` container.
     let service_owner_per_container =
         compute_service_owner_per_container(&infra_deployments, &container_specs_by_deployment);
 
@@ -1474,134 +1458,133 @@ async fn compute_desired_children(
         .await?;
         children.push(serde_json::to_value(&identity.secret)?);
 
-        // Multi-container side-data: when present, emit one K8s Deployment
-        // per container. When NULL (legacy), use the existing single-container
-        // path so on-cluster resources remain byte-identical for old rows.
+        // Emit one K8s Deployment per container. A single-container deployment
+        // has a single synthesised `app` container (see `resolve_runtime_containers`);
+        // a multi-container deployment has one entry per `[containers.<name>]`.
+        // - The shared workload-identity Secret is mounted once per pod spec.
+        // - Global env vars apply to every container; per-container overrides
+        //   come from `ContainerSpec.env_overrides`.
+        // - Resource names are suffixed with `-<container>` (see
+        //   `ResourceBuilder::deployment_name_for_container`).
         let container_specs: Vec<crate::server::deployment::models::ContainerSpec> =
             container_specs_by_deployment
                 .get(&deployment.id)
                 .cloned()
                 .unwrap_or_default();
 
-        if container_specs.is_empty() {
-            // Legacy single-container path — unchanged from before.
-            let k8s_deploy = resource_builder.create_k8s_deployment(
+        // Containers targeted by a route get HTTP probes by default; non-routed
+        // containers (e.g. a database) don't, unless they configure one.
+        let routed_containers: std::collections::HashSet<&str> = routes_by_deployment
+            .get(&deployment.id)
+            .map(|routes| routes.iter().map(|r| r.container.as_str()).collect())
+            .unwrap_or_default();
+
+        // Cross-container service-discovery vars — only meaningful with ≥2
+        // containers, so a single-container app doesn't get a pointless
+        // self-entry. User globals (in `plain_env_vars`) and per-container
+        // `env_overrides` take precedence if they set the same name.
+        let injected_host_env = if container_specs.len() >= 2 {
+            ResourceBuilder::auto_container_host_env_vars(deployment, &container_specs)
+        } else {
+            Vec::new()
+        };
+
+        for spec in &container_specs {
+            let mut per_container_env = env_vars.plain_env_vars.clone();
+            for var in &injected_host_env {
+                if per_container_env.iter().any(|v| v.name == var.name) {
+                    continue;
+                }
+                per_container_env.push(var.clone());
+            }
+            for over in &spec.env_overrides {
+                // Per-container secret overrides are rejected at request time
+                // (see validate_containers_and_routes); this should never fire.
+                // If it does, the right answer is to fix the request handler,
+                // not silently route around it.
+                debug_assert!(
+                    !over.is_secret,
+                    "per-container secret env override leaked past validation: {}",
+                    over.key
+                );
+                if over.is_secret {
+                    continue;
+                }
+                // Skip overrides whose `for_environment` doesn't match the
+                // deployment's resolved environment. Mirrors `apply_env_overrides`.
+                if let Some(ref target_env) = over.for_environment {
+                    if env_name.as_deref() != Some(target_env.as_str()) {
+                        continue;
+                    }
+                }
+                // Replace if present, otherwise append.
+                if let Some(existing) = per_container_env.iter_mut().find(|v| v.name == over.key) {
+                    existing.value = Some(over.value.clone());
+                } else {
+                    per_container_env.push(k8s_openapi::api::core::v1::EnvVar {
+                        name: over.key.clone(),
+                        value: Some(over.value.clone()),
+                        ..Default::default()
+                    });
+                }
+            }
+
+            // Resolve the effective probe policy: a container with an explicit
+            // `health_check` uses it; otherwise a routed container gets the
+            // default HTTP probes and a non-routed one gets none.
+            let health_check = match &spec.health_check {
+                Some(hc) => Some(hc.clone()),
+                None if routed_containers.contains(spec.name.as_str()) => None,
+                None => Some(crate::server::deployment::models::HealthCheckSpec {
+                    disabled: true,
+                    ..Default::default()
+                }),
+            };
+
+            let runtime = crate::server::deployment::resource_builder::ContainerRuntime {
+                name: &spec.name,
+                // Synthesised `app` carries no image; fall back to the
+                // deployment's resolved image. Explicit containers always have one.
+                image: spec.image.as_deref().unwrap_or(&image),
+                port: spec.port,
+                replicas: spec
+                    .replicas
+                    .map(|r| r as i32)
+                    .unwrap_or(deployment.replicas),
+                cpu: spec.cpu.as_deref().unwrap_or(&deployment.cpu),
+                memory: spec.memory.as_deref().unwrap_or(&deployment.memory),
+                env_vars: per_container_env,
+                secret_env_name: secret_env_name.clone(),
+                secret_env_hash: secret_env_hash.clone(),
+                health_check,
+            };
+
+            let k8s_deploy = resource_builder.create_k8s_deployment_for_container(
                 project,
                 deployment,
                 &namespace,
-                &image,
-                deployment.http_port as u16,
-                env_vars.plain_env_vars,
-                secret_env_name,
-                secret_env_hash,
+                &runtime,
                 sa_name.clone(),
                 env_name.as_deref(),
-                Some(identity.mount),
+                Some(identity.mount.clone()),
             );
             children.push(serde_json::to_value(&k8s_deploy)?);
-        } else {
-            // Multi-container path: one K8s Deployment per container.
-            // - The shared workload-identity Secret is mounted once per pod
-            //   spec, so each container's pod re-mounts it (intended).
-            // - Global env vars apply to every container; per-container env
-            //   overrides come from ContainerSpec.env_overrides.
-            // - Resource names are suffixed with `-<container>` (see
-            //   `ResourceBuilder::deployment_name_for_container`).
-            // Auto-injected cross-container service discovery vars. User
-            // globals (in `plain_env_vars`) and per-container `env_overrides`
-            // both take precedence if they set the same name.
-            let injected_host_env =
-                ResourceBuilder::auto_container_host_env_vars(deployment, &container_specs);
 
-            for spec in &container_specs {
-                let mut per_container_env = env_vars.plain_env_vars.clone();
-                for var in &injected_host_env {
-                    if per_container_env.iter().any(|v| v.name == var.name) {
-                        continue;
-                    }
-                    per_container_env.push(var.clone());
-                }
-                for over in &spec.env_overrides {
-                    // Per-container secret overrides are rejected at request
-                    // time (see validate_containers_and_routes); this should
-                    // never fire. If it does, the right answer is to fix the
-                    // request handler, not silently route around it.
-                    debug_assert!(
-                        !over.is_secret,
-                        "per-container secret env override leaked past validation: {}",
-                        over.key
-                    );
-                    if over.is_secret {
-                        continue;
-                    }
-                    // Skip overrides whose `for_environment` doesn't match the
-                    // deployment's resolved environment. Mirrors the global
-                    // `apply_env_overrides` path.
-                    if let Some(ref target_env) = over.for_environment {
-                        if env_name.as_deref() != Some(target_env.as_str()) {
-                            continue;
-                        }
-                    }
-                    // Replace if present, otherwise append.
-                    if let Some(existing) =
-                        per_container_env.iter_mut().find(|v| v.name == over.key)
-                    {
-                        existing.value = Some(over.value.clone());
-                    } else {
-                        per_container_env.push(k8s_openapi::api::core::v1::EnvVar {
-                            name: over.key.clone(),
-                            value: Some(over.value.clone()),
-                            ..Default::default()
-                        });
-                    }
-                }
-
-                let runtime = crate::server::deployment::resource_builder::ContainerRuntime {
-                    name: &spec.name,
-                    image: spec.image.as_deref().unwrap_or_default(),
-                    http_port: spec.http_port,
-                    replicas: spec
-                        .replicas
-                        .map(|r| r as i32)
-                        .unwrap_or(deployment.replicas),
-                    cpu: spec.cpu.as_deref().unwrap_or(&deployment.cpu),
-                    memory: spec.memory.as_deref().unwrap_or(&deployment.memory),
-                    env_vars: per_container_env,
-                    secret_env_name: secret_env_name.clone(),
-                    secret_env_hash: secret_env_hash.clone(),
-                    health_check: spec.health_check.clone(),
-                    is_legacy: false,
-                };
-
-                let k8s_deploy = resource_builder.create_k8s_deployment_for_container(
+            // Emit the per-container Service iff THIS deployment owns it for
+            // (group, container) — see `service_owner_per_container`. Exactly one
+            // Service per (group, container) is emitted, preserving blue-green.
+            let owns_service = service_owner_per_container
+                .get(&(deployment.deployment_group.clone(), spec.name.clone()))
+                == Some(&deployment.id);
+            if owns_service {
+                if let Some(service) = resource_builder.create_service_for_container(
                     project,
                     deployment,
                     &namespace,
                     &runtime,
-                    sa_name.clone(),
                     env_name.as_deref(),
-                    Some(identity.mount.clone()),
-                );
-                children.push(serde_json::to_value(&k8s_deploy)?);
-
-                // Emit the per-container Service iff THIS deployment owns it
-                // for (group, container). See `service_owner_per_container`
-                // above for the ownership rule. Skipping for non-owners keeps
-                // exactly one Service per (group, container) in the child set
-                // and preserves blue-green for shared containers.
-                let owns_service = service_owner_per_container
-                    .get(&(deployment.deployment_group.clone(), spec.name.clone()))
-                    == Some(&deployment.id);
-                if owns_service {
-                    if let Some(service) = resource_builder.create_service_for_container(
-                        project,
-                        deployment,
-                        &namespace,
-                        &runtime,
-                        env_name.as_deref(),
-                    ) {
-                        children.push(serde_json::to_value(&service)?);
-                    }
+                ) {
+                    children.push(serde_json::to_value(&service)?);
                 }
             }
         }
@@ -1655,27 +1638,16 @@ async fn compute_desired_children(
             .and_then(|env| domains_by_env.get(&env.id).cloned())
             .unwrap_or_default();
 
-        // Service — legacy single-container deployments emit one shared Service
-        // here at the group-level name. Multi-container Services are emitted in
-        // phase 1 alongside each container's K8s Deployment (so a new container
-        // declared by a rolling-out, not-yet-active deployment gets its Service
-        // immediately — required for sibling pods to reach it during probes).
+        // All Services (including the single-container `app`) are emitted in
+        // phase 1 alongside each container's K8s Deployment via the ownership
+        // map — so a new container declared by a rolling-out, not-yet-active
+        // deployment gets its Service immediately (sibling pods can reach it
+        // during probes). Here we only build the ingress route table.
         let active_container_specs: Vec<crate::server::deployment::models::ContainerSpec> =
             container_specs_by_deployment
                 .get(&active_deployment.id)
                 .cloned()
                 .unwrap_or_default();
-
-        if active_container_specs.is_empty() {
-            let service = resource_builder.create_service(
-                project,
-                active_deployment,
-                &namespace,
-                active_deployment.http_port as u16,
-                env_name.as_deref(),
-            );
-            children.push(serde_json::to_value(&service)?);
-        }
 
         // Primary Ingress
         let inline_domains: &[crate::db::models::CustomDomain] = if split_custom_domains {
@@ -1683,65 +1655,35 @@ async fn compute_desired_children(
         } else {
             &domains_for_group
         };
-        // Build the (path, service_name) pairs for multi-container routing.
-        // Reuse the container list we already fetched for Service emission so
-        // we don't make another DB roundtrip.
-        let multi_container_routes: Option<Vec<(String, String)>> = if active_container_specs
-            .is_empty()
-        {
-            None
-        } else {
-            // Propagate DB errors: silently treating routes as empty would
-            // either skip ingress (workers-only path) or fall through to the
-            // legacy `/`-Service backend, both wrong for a multi-container row.
-            let routes_json = db_deployments::get_containers(&state.db_pool, active_deployment.id)
-                .await
-                .context("failed to load deployment routes side-data")?
-                .routes;
-            let route_specs: Vec<crate::server::deployment::models::RouteSpec> = routes_json
-                .as_ref()
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
-            let routable_names: std::collections::HashSet<String> = active_container_specs
-                .iter()
-                .filter(|s| s.http_port.is_some())
-                .map(|s| s.name.clone())
-                .collect();
-            // `deployment_group` is NOT NULL with `DEFAULT 'default'` and a
-            // CHECK constraint that rejects empty strings (see migration
-            // `20251205000003_add_deployment_groups.sql`), so we always take
-            // the non-legacy suffixed path here. Mirrors `service_name_for_container`.
-            debug_assert!(
-                !active_deployment.deployment_group.is_empty(),
-                "deployment_group should never be empty (DB CHECK constraint)"
-            );
-            let service_name_base =
-                crate::server::deployment::resource_builder::ResourceBuilder::service_name(
-                    project,
-                    active_deployment,
-                );
-            let pairs: Vec<(String, String)> = route_specs
-                .iter()
-                .filter(|r| routable_names.contains(&r.container))
-                .map(|r| {
-                    let svc_name = format!("{}-{}", service_name_base, r.container);
-                    (r.path.clone(), svc_name)
-                })
-                .collect();
-            Some(pairs)
-        };
-        // Workers-only multi-container deployments (no container exposes
-        // `http_port`, or no route targets a routable container) produce an
-        // empty `pairs`. We must NOT emit an Ingress in that case — falling
-        // through to the legacy `/` backend would point at a Service that
-        // phase 2 didn't emit. The legacy single-container path (where
-        // `multi_container_routes` is `None`) is unaffected.
-        let multi_container_no_routes = matches!(
-            multi_container_routes.as_deref(),
-            Some(routes) if routes.is_empty()
-        );
+        // Build the `(path, service_name)` ingress route table from the
+        // preloaded route side-data (no extra DB roundtrip). Routes targeting a
+        // non-routable container are filtered out. A single-container app yields
+        // `[("/", "<group>-app")]`; a workers-only deployment yields an empty
+        // table → no ingress.
+        let routable_names: std::collections::HashSet<&str> = active_container_specs
+            .iter()
+            .filter(|s| s.port.is_some())
+            .map(|s| s.name.as_str())
+            .collect();
+        let service_name_base = ResourceBuilder::service_name(project, active_deployment);
+        let routes: Vec<(String, String)> = routes_by_deployment
+            .get(&active_deployment.id)
+            .map(|route_specs| {
+                route_specs
+                    .iter()
+                    .filter(|r| routable_names.contains(r.container.as_str()))
+                    .map(|r| {
+                        (
+                            r.path.clone(),
+                            format!("{}-{}", service_name_base, r.container),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
-        if !multi_container_no_routes {
+        // A workers-only deployment (no routable container) emits no ingress.
+        if !routes.is_empty() {
             if let Some(ingress) = resource_builder.create_primary_ingress(
                 project,
                 active_deployment,
@@ -1750,7 +1692,7 @@ async fn compute_desired_children(
                 inline_domains,
                 env_name.as_deref(),
                 &all_environments,
-                multi_container_routes.as_deref(),
+                &routes,
             )? {
                 children.push(serde_json::to_value(&ingress)?);
             }
@@ -1768,7 +1710,7 @@ async fn compute_desired_children(
                     &namespace,
                     &domains_for_group,
                     env_name.as_deref(),
-                    multi_container_routes.as_deref(),
+                    &routes,
                 )?;
                 children.push(serde_json::to_value(&custom_ingress)?);
             }
@@ -1787,6 +1729,60 @@ async fn compute_desired_children(
     Ok(children)
 }
 
+/// Resolve the container + route list the reconciler should emit for a
+/// deployment. A multi-container deployment parses its persisted side-data; a
+/// single-container deployment (`containers IS NULL`) synthesises an implicit
+/// `app` container from the row's columns plus a `/` route. The synthesised
+/// `app` carries no image (`image: None`) — the reconciler fills it from the
+/// deployment's resolved image, so the existing single-container image (tagged
+/// with the deployment ID) is reused with no rebuild.
+fn resolve_runtime_containers(
+    deployment: &Deployment,
+    side: &crate::db::models::DeploymentContainers,
+) -> (
+    Vec<crate::server::deployment::models::ContainerSpec>,
+    Vec<crate::server::deployment::models::RouteSpec>,
+) {
+    use crate::server::deployment::models::{ContainerSpec, RouteSpec};
+
+    let parsed: Option<Vec<ContainerSpec>> = side
+        .containers
+        .as_ref()
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+
+    if let Some(specs) = parsed {
+        if !specs.is_empty() {
+            let routes = side
+                .routes
+                .as_ref()
+                .and_then(|v| serde_json::from_value::<Vec<RouteSpec>>(v.clone()).ok())
+                .unwrap_or_default();
+            return (specs, routes);
+        }
+    }
+
+    // Single-container deployment: synthesise the implicit `app` container.
+    // A single-container deployment always has an http port (NOT NULL, default
+    // 8080), so it is always routable at `/`.
+    let port = deployment.http_port as u16;
+    let app = ContainerSpec {
+        name: crate::rise_toml::DEFAULT_CONTAINER_NAME.to_string(),
+        image: None,
+        port: Some(port),
+        replicas: Some(deployment.replicas as u32),
+        cpu: Some(deployment.cpu.clone()),
+        memory: Some(deployment.memory.clone()),
+        env_overrides: Vec::new(),
+        health_check: None,
+    };
+    let routes = vec![RouteSpec {
+        path: "/".to_string(),
+        container: crate::rise_toml::DEFAULT_CONTAINER_NAME.to_string(),
+        port,
+    }];
+    (vec![app], routes)
+}
+
 /// Returns true if this deployment should have K8s infrastructure (K8s Deployment resource).
 /// Compute Service ownership per (group, container_name) across the project's
 /// in-play deployments. The owner is the deployment whose labels/port the
@@ -1801,8 +1797,8 @@ async fn compute_desired_children(
 ///     deployment that adds a new sidecar container (e.g. Redis) emit its
 ///     Service immediately, so sibling pods can reach it during probes.
 ///
-/// Workers (no `http_port`) and groups whose deployments are all legacy
-/// single-container are absent from the result.
+/// Workers (no `port`) are absent from the result. A single-container app
+/// participates via its implicit `app` container.
 pub(crate) fn compute_service_owner_per_container(
     infra_deployments: &[&Deployment],
     container_specs_by_deployment: &HashMap<
@@ -1825,7 +1821,7 @@ pub(crate) fn compute_service_owner_per_container(
         if let Some(active) = ds_in_group.iter().find(|d| d.is_active) {
             if let Some(specs) = container_specs_by_deployment.get(&active.id) {
                 for spec in specs {
-                    if spec.http_port.is_none() {
+                    if spec.port.is_none() {
                         continue;
                     }
                     owner.insert(((*group).to_string(), spec.name.clone()), active.id);
@@ -1843,7 +1839,7 @@ pub(crate) fn compute_service_owner_per_container(
         for d in others {
             if let Some(specs) = container_specs_by_deployment.get(&d.id) {
                 for spec in specs {
-                    if spec.http_port.is_none() {
+                    if spec.port.is_none() {
                         continue;
                     }
                     owner
@@ -2870,7 +2866,7 @@ mod tests {
         crate::server::deployment::models::ContainerSpec {
             name: name.to_string(),
             image: Some("img".to_string()),
-            http_port: port,
+            port,
             replicas: Some(1),
             cpu: None,
             memory: None,
@@ -3025,5 +3021,59 @@ mod tests {
             owners.get(&("staging".to_string(), "api".to_string())),
             Some(&stg.id),
         );
+    }
+
+    #[test]
+    fn resolve_runtime_containers_synthesises_app_for_single_container() {
+        // A row with no `containers` side-data is a single-container deployment:
+        // synthesise one `app` container (no image — the reconciler fills it from
+        // the resolved deployment image) plus a `/` route to it.
+        let mut d = test_deployment(DeploymentStatus::Healthy);
+        d.http_port = 8080;
+        d.replicas = 2;
+        d.cpu = "500m".to_string();
+        d.memory = "256Mi".to_string();
+        let side = crate::db::models::DeploymentContainers {
+            containers: None,
+            routes: None,
+        };
+
+        let (specs, routes) = resolve_runtime_containers(&d, &side);
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "app");
+        assert_eq!(specs[0].port, Some(8080));
+        assert_eq!(specs[0].replicas, Some(2));
+        assert_eq!(specs[0].cpu.as_deref(), Some("500m"));
+        assert_eq!(specs[0].image, None, "image is filled by the reconciler");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].path, "/");
+        assert_eq!(routes[0].container, "app");
+        assert_eq!(routes[0].port, 8080);
+    }
+
+    #[test]
+    fn resolve_runtime_containers_parses_persisted_multi_container() {
+        // A row WITH persisted container side-data parses it (and does not
+        // synthesise the implicit `app`).
+        let d = test_deployment(DeploymentStatus::Healthy);
+        let side = crate::db::models::DeploymentContainers {
+            containers: Some(serde_json::json!([
+                { "name": "api", "image": "img-api", "port": 8080 },
+                { "name": "worker", "image": "img-worker" },
+            ])),
+            routes: Some(serde_json::json!([
+                { "path": "/", "container": "api", "port": 8080 },
+            ])),
+        };
+
+        let (specs, routes) = resolve_runtime_containers(&d, &side);
+
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].name, "api");
+        assert_eq!(specs[1].name, "worker");
+        assert_eq!(specs[1].port, None, "worker has no port");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].container, "api");
     }
 }
