@@ -504,12 +504,27 @@ async fn fetch_deployment_registry_credentials(
     })
 }
 
-/// Fetch the deployment platform's capabilities (architecture, etc.).
-async fn fetch_platform_capabilities(
+/// Legacy default build platform, used when the backend predates the platform
+/// capabilities endpoint. Older backends advertised `linux/amd64` by default
+/// (their node selector pinned amd64), so a newer CLI talking to an older
+/// backend keeps that behavior instead of erroring.
+///
+/// TODO: remove this fallback once all backends expose
+/// `GET /api/v1/platform/capabilities`.
+const LEGACY_PLATFORM_FALLBACK: &str = "linux/amd64";
+
+/// Derive the container build platform the target cluster expects (e.g.
+/// "linux/amd64") from the platform capabilities endpoint. `None` when the
+/// cluster is unconstrained — the build then falls back to the host
+/// architecture.
+///
+/// For backward compatibility with backends that predate the endpoint, a 404 is
+/// treated as "use the legacy `linux/amd64` default" rather than a hard failure.
+async fn fetch_backend_platform_hint(
     http_client: &Client,
     backend_url: &str,
     token: &str,
-) -> Result<PlatformCapabilities> {
+) -> Result<Option<String>> {
     let url = format!("{}/api/v1/platform/capabilities", backend_url);
 
     let response = http_client
@@ -518,6 +533,16 @@ async fn fetch_platform_capabilities(
         .send()
         .await
         .context("Failed to fetch platform capabilities")?;
+
+    // Older backend without the endpoint: don't break the deploy, fall back to
+    // the platform older backends defaulted to.
+    if response.status().as_u16() == 404 {
+        debug!(
+            "Backend has no /platform/capabilities endpoint; falling back to legacy platform '{}'",
+            LEGACY_PLATFORM_FALLBACK
+        );
+        return Ok(Some(LEGACY_PLATFORM_FALLBACK.to_string()));
+    }
 
     if !response.status().is_success() {
         let status = response.status();
@@ -532,22 +557,10 @@ async fn fetch_platform_capabilities(
         );
     }
 
-    response
+    let caps: PlatformCapabilities = response
         .json()
         .await
-        .context("Failed to parse platform capabilities response")
-}
-
-/// Derive the container build platform the target cluster expects (e.g.
-/// "linux/amd64") from the platform capabilities endpoint. `None` when the
-/// cluster is unconstrained — the build then falls back to the host
-/// architecture.
-async fn fetch_backend_platform_hint(
-    http_client: &Client,
-    backend_url: &str,
-    token: &str,
-) -> Result<Option<String>> {
-    let caps = fetch_platform_capabilities(http_client, backend_url, token).await?;
+        .context("Failed to parse platform capabilities response")?;
     Ok(caps.runtime_arch.map(|arch| format!("linux/{arch}")))
 }
 
