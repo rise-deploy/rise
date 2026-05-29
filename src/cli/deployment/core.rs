@@ -528,7 +528,7 @@ struct GetRegistryCredsResponse {
 
 /// Decoded response from `GET /api/v1/platform/capabilities`.
 /// Other capability flags (e.g. `runtime_allows_root`) are ignored by the CLI.
-#[derive(serde::Deserialize)]
+#[derive(Deserialize)]
 struct PlatformCapabilities {
     /// Container architecture the target cluster accepts (e.g. "amd64").
     /// Absent when the cluster is unconstrained.
