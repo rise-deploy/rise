@@ -135,7 +135,7 @@
               "type": "null"
             }
           ],
-          "description": "Health check configuration. HTTP liveness+readiness probes default to ON\n(path `/`) only for containers reachable via `[routes]`; non-routed\ncontainers (e.g. a database) get no probe unless one is configured here.\nSet `health_check = false` to disable probes entirely; set a config block\nto force them on with custom settings. Requires `port` to be set."
+          "description": "Health check configuration. HTTP liveness+readiness probes are disabled\nby default — they must be explicitly configured here. Set a config block\nto enable probes with a custom path/timing, or `health_check = false` to\nexplicitly mark them disabled. Requires `port` to be set."
         },
         "image": {
           "description": "Pre-built image reference. Exclusive with `build`.",

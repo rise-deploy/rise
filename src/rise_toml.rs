@@ -76,11 +76,10 @@ pub struct ContainerConfig {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
 
-    /// Health check configuration. HTTP liveness+readiness probes default to ON
-    /// (path `/`) only for containers reachable via `[routes]`; non-routed
-    /// containers (e.g. a database) get no probe unless one is configured here.
-    /// Set `health_check = false` to disable probes entirely; set a config block
-    /// to force them on with custom settings. Requires `port` to be set.
+    /// Health check configuration. HTTP liveness+readiness probes are disabled
+    /// by default — they must be explicitly configured here. Set a config block
+    /// to enable probes with a custom path/timing, or `health_check = false` to
+    /// explicitly mark them disabled. Requires `port` to be set.
     pub health_check: Option<HealthCheckSetting>,
 }
 

@@ -1527,13 +1527,6 @@ async fn compute_desired_children(
         //   `ResourceBuilder::deployment_name_for_container`).
         // `container_specs` was computed above (before the env-secret guard).
 
-        // Containers targeted by a route get HTTP probes by default; non-routed
-        // containers (e.g. a database) don't, unless they configure one.
-        let routed_containers: std::collections::HashSet<&str> = routes_by_deployment
-            .get(&deployment.id)
-            .map(|routes| routes.iter().map(|r| r.container.as_str()).collect())
-            .unwrap_or_default();
-
         // Cross-container service-discovery vars — only meaningful with ≥2
         // containers, so a single-container app doesn't get a pointless
         // self-entry. User globals (in `plain_env_vars`) and per-container
@@ -1584,17 +1577,7 @@ async fn compute_desired_children(
                 }
             }
 
-            // Resolve the effective probe policy: a container with an explicit
-            // `health_check` uses it; otherwise a routed container gets the
-            // default HTTP probes and a non-routed one gets none.
-            let health_check = match &spec.health_check {
-                Some(hc) => Some(hc.clone()),
-                None if routed_containers.contains(spec.name.as_str()) => None,
-                None => Some(crate::server::deployment::models::HealthCheckSpec {
-                    disabled: true,
-                    ..Default::default()
-                }),
-            };
+            let health_check = spec.health_check.clone();
 
             let runtime = crate::server::deployment::resource_builder::ContainerRuntime {
                 name: &spec.name,
@@ -1821,35 +1804,35 @@ fn resolve_runtime_containers(
     Vec<crate::server::deployment::models::ContainerSpec>,
     Vec<crate::server::deployment::models::RouteSpec>,
 )> {
-    use crate::server::deployment::models::{ContainerSpec, RouteSpec};
+    use crate::server::deployment::models::{decode_side_data, ContainerSpec, RouteSpec};
 
     if let Some(containers_value) = deployment.containers.as_ref() {
-        let specs: Vec<ContainerSpec> = serde_json::from_value(containers_value.clone())
-            .with_context(|| {
+        let specs: Vec<ContainerSpec> = decode_side_data(containers_value).with_context(|| {
+            format!(
+                "deployment {} ({}) has a non-NULL `containers` column that could not be \
+                 decoded into Vec<ContainerSpec>",
+                deployment.id, deployment.deployment_id
+            )
+        })?;
+        if specs.is_empty() {
+            anyhow::bail!(
+                "deployment {} ({}) has a non-NULL `containers` column with an empty items list; \
+                 this is a degenerate state that should have been rejected at write time",
+                deployment.id,
+                deployment.deployment_id
+            );
+        }
+        let routes: Vec<RouteSpec> = match deployment.routes.as_ref() {
+            Some(routes_value) => decode_side_data(routes_value).with_context(|| {
                 format!(
-                    "deployment {} ({}) has a non-NULL `containers` column that could not be \
-                     deserialized into Vec<ContainerSpec>",
+                    "deployment {} ({}) has a non-NULL `routes` column that could not be \
+                     decoded into Vec<RouteSpec>",
                     deployment.id, deployment.deployment_id
                 )
-            })?;
-        // A present-but-empty list is degenerate (server validation rejects it
-        // on the write path); fall through to the synthesised `app` rather than
-        // emitting a deployment with zero containers.
-        if !specs.is_empty() {
-            let routes: Vec<RouteSpec> = match deployment.routes.as_ref() {
-                Some(routes_value) => {
-                    serde_json::from_value(routes_value.clone()).with_context(|| {
-                        format!(
-                            "deployment {} ({}) has a non-NULL `routes` column that could not be \
-                             deserialized into Vec<RouteSpec>",
-                            deployment.id, deployment.deployment_id
-                        )
-                    })?
-                }
-                None => Vec::new(),
-            };
-            return Ok((specs, routes));
-        }
+            })?,
+            None => Vec::new(),
+        };
+        return Ok((specs, routes));
     }
 
     // Single-container deployment: synthesise the implicit `app` container.
@@ -3143,16 +3126,20 @@ mod tests {
 
     #[test]
     fn resolve_runtime_containers_parses_persisted_multi_container() {
-        // A row WITH persisted container side-data parses it (and does not
-        // synthesise the implicit `app`).
+        // A row WITH persisted container side-data (a versioned envelope) parses
+        // it (and does not synthesise the implicit `app`).
         let mut d = test_deployment(DeploymentStatus::Healthy);
-        d.containers = Some(serde_json::json!([
-            { "name": "api", "image": "img-api", "port": 8080 },
-            { "name": "worker", "image": "img-worker" },
-        ]));
-        d.routes = Some(serde_json::json!([
-            { "path": "/", "container": "api" },
-        ]));
+        d.containers = Some(serde_json::json!({
+            "version": 1,
+            "items": [
+                { "name": "api", "image": "img-api", "port": 8080 },
+                { "name": "worker", "image": "img-worker" },
+            ]
+        }));
+        d.routes = Some(serde_json::json!({
+            "version": 1,
+            "items": [ { "path": "/", "container": "api" } ]
+        }));
 
         let (specs, routes) = resolve_runtime_containers(&d).unwrap();
 
@@ -3168,14 +3155,18 @@ mod tests {
     fn resolve_runtime_containers_errors_on_unparseable_containers() {
         // A non-NULL but corrupt `containers` column is a hard error for THIS
         // deployment — it must NOT silently collapse to the single-container
-        // fallback (which would drop every per-container K8s resource).
+        // fallback (which would drop every per-container K8s resource). Here the
+        // envelope is well-formed but `items` is not a list of container specs.
         let mut d = test_deployment(DeploymentStatus::Healthy);
-        d.containers = Some(serde_json::json!({ "not": "a list of container specs" }));
+        d.containers = Some(serde_json::json!({
+            "version": 1,
+            "items": { "not": "a list of container specs" }
+        }));
 
         let err = resolve_runtime_containers(&d).unwrap_err();
         assert!(
             format!("{:?}", err).contains("could not be"),
-            "error should mention the deserialization failure, got: {:?}",
+            "error should mention the decode failure, got: {:?}",
             err
         );
     }
@@ -3185,10 +3176,14 @@ mod tests {
         // Same for routes: present-but-corrupt is an error, not an empty route
         // set.
         let mut d = test_deployment(DeploymentStatus::Healthy);
-        d.containers = Some(serde_json::json!([
-            { "name": "api", "image": "img-api", "port": 8080 },
-        ]));
-        d.routes = Some(serde_json::json!({ "not": "a list of routes" }));
+        d.containers = Some(serde_json::json!({
+            "version": 1,
+            "items": [ { "name": "api", "image": "img-api", "port": 8080 } ]
+        }));
+        d.routes = Some(serde_json::json!({
+            "version": 1,
+            "items": { "not": "a list of routes" }
+        }));
 
         assert!(resolve_runtime_containers(&d).is_err());
     }

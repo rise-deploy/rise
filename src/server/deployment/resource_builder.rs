@@ -1321,23 +1321,13 @@ impl ResourceBuilder {
             }]
         });
 
-        let (liveness, readiness) = runtime
-            .port
-            .map(|port| {
-                (
-                    self.create_http_probe_with_override(
-                        port as i32,
-                        ProbeType::Liveness,
-                        runtime.health_check.as_ref(),
-                    ),
-                    self.create_http_probe_with_override(
-                        port as i32,
-                        ProbeType::Readiness,
-                        runtime.health_check.as_ref(),
-                    ),
-                )
-            })
-            .unwrap_or((None, None));
+        let (liveness, readiness) = match (runtime.port, runtime.health_check.as_ref()) {
+            (Some(port), Some(hc)) => (
+                self.create_http_probe_with_override(port as i32, ProbeType::Liveness, Some(hc)),
+                self.create_http_probe_with_override(port as i32, ProbeType::Readiness, Some(hc)),
+            ),
+            _ => (None, None),
+        };
 
         K8sDeployment {
             metadata: ObjectMeta {
@@ -1397,7 +1387,23 @@ impl ResourceBuilder {
                             image: Some(runtime.image.to_string()),
                             ports,
                             image_pull_policy: Some("Always".to_string()),
-                            env: (!runtime.env_vars.is_empty()).then(|| runtime.env_vars.clone()),
+                            env: {
+                                // Always inject RISE_CONTAINER — the container's own name,
+                                // a system identity var. Overwrite any user-supplied value.
+                                let mut env_vars = runtime.env_vars.clone();
+                                if let Some(existing) =
+                                    env_vars.iter_mut().find(|v| v.name == "RISE_CONTAINER")
+                                {
+                                    existing.value = Some(runtime.name.to_string());
+                                } else {
+                                    env_vars.push(EnvVar {
+                                        name: "RISE_CONTAINER".to_string(),
+                                        value: Some(runtime.name.to_string()),
+                                        ..Default::default()
+                                    });
+                                }
+                                Some(env_vars)
+                            },
                             env_from: runtime.secret_env_name.as_ref().map(|name| {
                                 vec![EnvFromSource {
                                     secret_ref: Some(SecretEnvSource {
@@ -2202,7 +2208,8 @@ mod tests {
             .unwrap()
             .containers[0];
 
-        assert_eq!(container.env.as_ref().unwrap().len(), 1);
+        // PORT (from the caller) + RISE_CONTAINER (always injected by the builder)
+        assert_eq!(container.env.as_ref().unwrap().len(), 2);
         assert_eq!(
             container.env_from.as_ref().unwrap()[0]
                 .secret_ref
@@ -2258,7 +2265,14 @@ mod tests {
             .unwrap()
             .containers[0];
 
-        assert!(container.env.is_none());
+        // RISE_CONTAINER is always injected; env is never None.
+        let env = container
+            .env
+            .as_ref()
+            .expect("RISE_CONTAINER always present");
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].name, "RISE_CONTAINER");
+        assert_eq!(env[0].value.as_deref(), Some("app"));
         assert!(container.env_from.is_none());
     }
 
@@ -2311,8 +2325,13 @@ mod tests {
         assert_eq!(mount.mount_path, IDENTITY_MOUNT_PATH);
         assert_eq!(mount.read_only, Some(true));
 
-        // Identity is exposed purely as mounted files — no env vars injected.
-        assert!(container.env.is_none());
+        // Identity is exposed purely as mounted files; RISE_CONTAINER is the only env var.
+        let env = container
+            .env
+            .as_ref()
+            .expect("RISE_CONTAINER always present");
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].name, "RISE_CONTAINER");
     }
 
     #[test]

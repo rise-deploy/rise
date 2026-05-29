@@ -12,30 +12,33 @@ use crate::config::Config;
 
 // Re-export models from API module (always available)
 pub use crate::api::models::{Deployment, DeploymentStatus};
+// Multi-container request wire types (serialized into the create-deployment body).
+use crate::api::models::{ContainerSpec, RouteSpec};
 
-/// Convert the `[containers]` section of `rise.toml` into the JSON shape
-/// expected by `POST /deployments`. Returns `(None, None)` when the project is
-/// single-container (no `[containers]` block) so the existing single-image code
-/// path drives the request and the backend synthesises the implicit `app`
-/// container at reconcile time.
+/// Convert the `[containers]` section of `rise.toml` into the typed request
+/// structs expected by `POST /deployments`. Returns `(None, [])` when the
+/// project is single-container (no `[containers]` block) so the existing
+/// single-image code path drives the request and the backend synthesises the
+/// implicit `app` container at reconcile time.
 ///
 /// Routes default to `/` → the only routable container when `[routes]` is
 /// omitted and exactly one container has a `port`.
 fn build_multi_container_payload(
     toml_config: Option<&crate::rise_toml::ProjectBuildConfig>,
-) -> Result<(Option<serde_json::Value>, Option<serde_json::Value>)> {
+) -> Result<(Option<Vec<ContainerSpec>>, Vec<RouteSpec>)> {
+    use crate::api::models::{EnvOverride as WireEnvOverride, HealthCheckSpec};
     use crate::rise_toml::HealthCheckSetting;
 
     let Some(cfg) = toml_config else {
-        return Ok((None, None));
+        return Ok((None, Vec::new()));
     };
     let resolved = cfg.resolve_deploy().map_err(|e| anyhow::anyhow!(e))?;
     if resolved.containers.is_empty() {
         // Single-container project; let the existing image flow handle it.
-        return Ok((None, None));
+        return Ok((None, Vec::new()));
     }
 
-    let mut container_payload = Vec::with_capacity(resolved.containers.len());
+    let mut containers = Vec::with_capacity(resolved.containers.len());
     for c in &resolved.containers {
         // Each container needs exactly one of `image` or `[build]`.
         // - With `image`: pass the user-supplied reference through; backend
@@ -44,91 +47,60 @@ fn build_multi_container_payload(
         //   under the project repository and returns it in
         //   `container_images` so the CLI can `docker build -t <tag>`.
         // (`load_full_project_config` already enforces exactly-one-of.)
-        let image_payload = c.image.as_deref().map(serde_json::Value::from);
+        let env_overrides: Vec<WireEnvOverride> = c
+            .env
+            .iter()
+            .map(|(key, value)| WireEnvOverride {
+                key: key.clone(),
+                value: value.clone(),
+                is_secret: false,
+                // Per-container env is plain-only and never environment-scoped;
+                // leave is_protected/for_environment unset (omitted on the wire).
+                is_protected: None,
+                source: Some("toml".to_string()),
+                for_environment: None,
+            })
+            .collect();
 
-        let mut env_overrides = Vec::with_capacity(c.env.len());
-        for (key, value) in &c.env {
-            env_overrides.push(serde_json::json!({
-                "key": key,
-                "value": value,
-                "is_secret": false,
-                "source": "toml",
-            }));
-        }
-
-        let health_check_payload = c.health_check.as_ref().map(|hc| match hc {
-            HealthCheckSetting::Disabled(_) => serde_json::json!({ "disabled": true }),
-            HealthCheckSetting::Config(cfg) => {
-                let mut v = serde_json::json!({ "disabled": false });
-                if let Some(ref p) = cfg.path {
-                    v["path"] = serde_json::json!(p);
-                }
-                if let Some(d) = cfg.initial_delay_seconds {
-                    v["initial_delay_seconds"] = serde_json::json!(d);
-                }
-                if let Some(p) = cfg.period_seconds {
-                    v["period_seconds"] = serde_json::json!(p);
-                }
-                if let Some(t) = cfg.timeout_seconds {
-                    v["timeout_seconds"] = serde_json::json!(t);
-                }
-                if let Some(f) = cfg.failure_threshold {
-                    v["failure_threshold"] = serde_json::json!(f);
-                }
-                if let Some(l) = cfg.liveness_enabled {
-                    v["liveness_enabled"] = serde_json::json!(l);
-                }
-                if let Some(r) = cfg.readiness_enabled {
-                    v["readiness_enabled"] = serde_json::json!(r);
-                }
-                v
-            }
+        let health_check = c.health_check.as_ref().map(|hc| match hc {
+            HealthCheckSetting::Disabled(_) => HealthCheckSpec {
+                disabled: true,
+                ..Default::default()
+            },
+            HealthCheckSetting::Config(cfg) => HealthCheckSpec {
+                disabled: false,
+                path: cfg.path.clone(),
+                initial_delay_seconds: cfg.initial_delay_seconds,
+                period_seconds: cfg.period_seconds,
+                timeout_seconds: cfg.timeout_seconds,
+                failure_threshold: cfg.failure_threshold,
+                liveness_enabled: cfg.liveness_enabled,
+                readiness_enabled: cfg.readiness_enabled,
+            },
         });
 
-        let mut spec = serde_json::json!({ "name": c.name });
-        if let Some(image) = image_payload {
-            spec["image"] = image;
-        }
-        if let Some(p) = c.port {
-            spec["port"] = serde_json::json!(p);
-        }
-        if let Some(r) = c.replicas {
-            spec["replicas"] = serde_json::json!(r);
-        }
-        if let Some(ref cpu) = c.cpu {
-            spec["cpu"] = serde_json::json!(cpu);
-        }
-        if let Some(ref mem) = c.memory {
-            spec["memory"] = serde_json::json!(mem);
-        }
-        if !env_overrides.is_empty() {
-            spec["env_overrides"] = serde_json::json!(env_overrides);
-        }
-        if let Some(hc) = health_check_payload {
-            spec["health_check"] = hc;
-        }
-        container_payload.push(spec);
+        containers.push(ContainerSpec {
+            name: c.name.clone(),
+            image: c.image.clone(),
+            port: c.port,
+            replicas: c.replicas,
+            cpu: c.cpu.clone(),
+            memory: c.memory.clone(),
+            env_overrides,
+            health_check,
+        });
     }
 
-    let route_payload: Vec<serde_json::Value> = resolved
+    let routes: Vec<RouteSpec> = resolved
         .routes
         .iter()
-        .map(|r| {
-            serde_json::json!({
-                "path": r.path,
-                "container": r.container,
-            })
+        .map(|r| RouteSpec {
+            path: r.path.clone(),
+            container: r.container.clone(),
         })
         .collect();
 
-    Ok((
-        Some(serde_json::json!(container_payload)),
-        if route_payload.is_empty() {
-            None
-        } else {
-            Some(serde_json::json!(route_payload))
-        },
-    ))
+    Ok((Some(containers), routes))
 }
 
 /// Parse duration string (e.g., "5m", "30s", "1h")
@@ -767,8 +739,8 @@ pub async fn create_deployment(
             .as_ref()
             .and_then(|c| c.identity.as_ref())
             .map(|i| &i.audiences),
-        containers_payload.as_ref(),
-        routes_payload.as_ref(),
+        containers_payload.as_deref(),
+        &routes_payload,
     )
     .await?;
 
@@ -1489,8 +1461,8 @@ async fn call_create_deployment_api(
     cpu: Option<&str>,
     memory: Option<&str>,
     identity_audiences: Option<&std::collections::BTreeMap<String, String>>,
-    containers: Option<&serde_json::Value>,
-    routes: Option<&serde_json::Value>,
+    containers: Option<&[ContainerSpec]>,
+    routes: &[RouteSpec],
 ) -> Result<CreateDeploymentResponse> {
     let url = format!("{}/api/v1/deployments", backend_url);
     let mut payload = serde_json::json!({
@@ -1590,11 +1562,15 @@ async fn call_create_deployment_api(
         payload["env_overrides"] = serde_json::json!(overrides);
     }
 
+    // Serialize the typed container/route specs. ContainerSpec/RouteSpec carry
+    // the same serde skip/default rules as the server's structs, so this
+    // produces exactly what the server deserializes. Omit when absent/empty to
+    // match the legacy single-container request shape.
     if let Some(c) = containers {
-        payload["containers"] = c.clone();
+        payload["containers"] = serde_json::to_value(c)?;
     }
-    if let Some(r) = routes {
-        payload["routes"] = r.clone();
+    if !routes.is_empty() {
+        payload["routes"] = serde_json::to_value(routes)?;
     }
 
     let response = http_client
