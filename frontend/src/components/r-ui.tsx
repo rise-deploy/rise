@@ -543,13 +543,6 @@ export function Combobox(props: ComboboxProps) {
     const [query, setQuery] = useState('');
     const [activeIndex, setActiveIndex] = useState(0);
     const [popRect, setPopRect] = useState<{ top: number; left: number; width: number } | null>(null);
-    // When inside a Modal, portal to the .r-modal element (position: static) so:
-    //   • the modal's focus-trap (which queries within .r-modal) sees the popover
-    //   • the popup uses position:absolute whose containing block becomes .r-modal-mask
-    //     (the nearest positioned ancestor), avoiding backdrop-filter containing-block issues
-    //   • .r-modal's overflow:hidden does NOT clip it (containing block is above .r-modal)
-    const [inModal, setInModal] = useState(false);
-    const [portalEl, setPortalEl] = useState<Element | null>(null);
     const wrapRef = useRef<HTMLDivElement>(null);
     const triggerRef = useRef<HTMLDivElement>(null);
     const popRef = useRef<HTMLDivElement>(null);
@@ -596,10 +589,7 @@ export function Combobox(props: ComboboxProps) {
     }, [open]);
 
     useEffect(() => {
-        if (!open) { setPopRect(null); setQuery(''); setPortalEl(null); return; }
-        const modal = wrapRef.current?.closest<Element>('.r-modal') ?? null;
-        setInModal(Boolean(modal));
-        setPortalEl(modal ?? document.body);
+        if (!open) { setPopRect(null); setQuery(''); return; }
         const update = () => {
             const el = triggerRef.current;
             if (!el) return;
@@ -695,13 +685,15 @@ export function Combobox(props: ComboboxProps) {
 
     // Close when focus leaves both the wrapper and the portaled popover. The
     // existing mousedown click-away handles clicks; this covers keyboard Tab.
+    // Returning focus to the trigger ensures Tab stays within a modal's focus trap.
     const handleSearchBlur = () => {
         window.setTimeout(() => {
             const active = document.activeElement as Node | null;
-            if (!active) { setOpen(false); return; }
+            if (!active) { setOpen(false); triggerRef.current?.focus(); return; }
             if (wrapRef.current?.contains(active)) return;
             if (popRef.current?.contains(active)) return;
             setOpen(false);
+            triggerRef.current?.focus();
         }, 0);
     };
 
@@ -741,7 +733,7 @@ export function Combobox(props: ComboboxProps) {
                 )}
                 <Icon name="chevd" size={14} className="chev" />
             </div>
-            {open && popRect && portalEl && (() => {
+            {open && popRect && (() => {
                 const popover = (
                     <div
                         ref={popRef}
@@ -749,7 +741,7 @@ export function Combobox(props: ComboboxProps) {
                         className="r-cbox-pop"
                         role="listbox"
                         aria-multiselectable={isMulti || undefined}
-                        style={{ position: inModal ? 'absolute' : 'fixed', top: popRect.top, left: popRect.left, width: popRect.width }}
+                        style={{ position: 'fixed', top: popRect.top, left: popRect.left, width: popRect.width }}
                     >
                         <div className="r-cbox-search">
                             <Icon name="search" size={13} />
@@ -806,7 +798,7 @@ export function Combobox(props: ComboboxProps) {
                         </div>
                     </div>
                 );
-                return createPortal(popover, portalEl);
+                return createPortal(popover, document.body);
             })()}
         </div>
     );
