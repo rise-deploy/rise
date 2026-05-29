@@ -201,6 +201,10 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
             "/schema/rise-toml/v1",
             axum::routing::get(rise_toml_schema_v1_redirect),
         )
+        // Platform capabilities are non-sensitive and must be reachable by
+        // project service accounts (which have no project context here), so the
+        // route is public.
+        .merge(platform::routes::routes())
         .merge(auth::routes::public_routes())
         .merge(workload_tokens::routes::routes());
 
@@ -227,8 +231,7 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         .merge(environments::routes::routes())
         .merge(extensions::routes::routes())
         .merge(encryption::routes::routes())
-        .merge(quickstart::routes::routes())
-        .merge(platform::routes::routes());
+        .merge(quickstart::routes::routes());
 
     #[cfg(feature = "backend")]
     let platform_routes = platform_routes.merge(resources::routes::routes());
