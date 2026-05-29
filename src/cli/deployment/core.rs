@@ -437,14 +437,9 @@ struct GetRegistryCredsResponse {
 #[derive(serde::Deserialize)]
 struct PlatformCapabilities {
     /// Container architecture the target cluster accepts (e.g. "amd64"). Absent
-    /// when the cluster is unconstrained.
-    #[serde(default)]
+    /// when the cluster is unconstrained. (`Option` fields default to `None`
+    /// when the key is missing, so no `#[serde(default)]` is needed.)
     runtime_arch: Option<String>,
-}
-
-/// Registry credentials for a deployment.
-struct DeploymentRegistryInfo {
-    credentials: RegistryCredentials,
 }
 
 /// Log the resolved build platform and the source it was inferred from, so the
@@ -456,7 +451,15 @@ fn log_platform_choice(platform: &str, source: PlatformSource, operation: &str) 
         CliFlag | EnvVar | RiseToml => {} // explicit user choice, stay silent
         BackendHint => info!("{operation} for {platform} (target cluster architecture)"),
         HostFallback => {
-            info!("{operation} for {platform} (host architecture; pass --platform to override)")
+            // Reached only when a *supported* capabilities endpoint reported no
+            // required architecture (a genuinely unconstrained cluster — e.g.
+            // local dev). An *unsupported* endpoint (old backend → 404) does NOT
+            // land here: `fetch_backend_platform_hint` maps that to the legacy
+            // `linux/amd64` default, which resolves as `BackendHint` above. So
+            // we can state "unconstrained" here without conflating the two.
+            info!(
+                "{operation} for {platform} (host architecture; target cluster is unconstrained — pass --platform to override)"
+            )
         }
     }
 }
@@ -468,7 +471,7 @@ async fn fetch_deployment_registry_credentials(
     token: &str,
     project_name: &str,
     deployment_id: &str,
-) -> Result<DeploymentRegistryInfo> {
+) -> Result<RegistryCredentials> {
     let url = format!(
         "{}/api/v1/projects/{}/deployments/{}/registry-credentials",
         backend_url, project_name, deployment_id
@@ -499,9 +502,7 @@ async fn fetch_deployment_registry_credentials(
         .await
         .context("Failed to parse registry credentials response")?;
 
-    Ok(DeploymentRegistryInfo {
-        credentials: resp.credentials,
-    })
+    Ok(resp.credentials)
 }
 
 /// Legacy default build platform, used when the backend predates the platform
@@ -752,7 +753,7 @@ pub async fn create_deployment(
             };
 
             // Fetch deployment-scoped registry credentials
-            let registry_info = fetch_deployment_registry_credentials(
+            let credentials = fetch_deployment_registry_credentials(
                 http_client,
                 backend_url,
                 &token,
@@ -760,14 +761,13 @@ pub async fn create_deployment(
                 &deployment_info.deployment_id,
             )
             .await?;
-            let credentials = &registry_info.credentials;
 
             login_to_registry(
                 http_client,
                 backend_url,
                 &token,
                 &container_cli,
-                credentials,
+                &credentials,
                 deploy_opts.project_name,
                 &deployment_info.deployment_id,
             )
@@ -885,7 +885,7 @@ pub async fn create_deployment(
         // BuildOptions' platform precedence.
         let backend_platform =
             fetch_backend_platform_hint(http_client, backend_url, &token).await?;
-        let registry_info = fetch_deployment_registry_credentials(
+        let credentials = fetch_deployment_registry_credentials(
             http_client,
             backend_url,
             &token,
@@ -909,7 +909,7 @@ pub async fn create_deployment(
             backend_url,
             &token,
             options.container_cli.command(),
-            &registry_info.credentials,
+            &credentials,
             deploy_opts.project_name,
             &deployment_info.deployment_id,
         )
