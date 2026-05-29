@@ -36,11 +36,11 @@ export function useQuickstartTemplates() {
     return { templates, error };
 }
 
-// Read-only properties of the deployment platform. `capabilities` is an open,
-// namespaced map of boolean flags (e.g. `deployments:canRunAsRoot`).
+// Read-only properties of the deployment platform. Capability flags sit flat
+// at the top level under namespaced keys (e.g. `deployments:canRunAsRoot`).
 export interface PlatformCapabilities {
     runtime_arch: string | null;
-    capabilities: Record<string, boolean>;
+    'deployments:canRunAsRoot': boolean;
 }
 
 export function usePlatformCapabilities() {
@@ -115,7 +115,7 @@ export function QuickstartDeployModal({ template, onClose, onDeployed }: DeployM
     // capabilities mean a privileged port (< 1024) can't be bound and the app
     // will crash-loop. This is computed client-side from the platform
     // capability rather than baked into each template's `warning`.
-    const canRunAsRoot = caps?.capabilities['deployments:canRunAsRoot'] ?? true;
+    const canRunAsRoot = caps?.['deployments:canRunAsRoot'] ?? true;
     const privilegedPortRisk = !canRunAsRoot && template.http_port < 1024;
 
     const handleDeploy = async () => {
