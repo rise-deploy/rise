@@ -344,18 +344,8 @@
       "description": "One ingress path → container mapping.",
       "properties": {
         "container": {
-          "description": "Target container name (must exist in `[containers]` and have `port` set).",
+          "description": "Target container name (must exist in `[containers]` and have `port` set).\nThe route's port is always the target container's `port`.",
           "type": "string"
-        },
-        "port": {
-          "description": "Override the container's `port` for this route (rare; usually omit).",
-          "format": "uint16",
-          "maximum": 65535,
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
         }
       },
       "required": [
@@ -434,7 +424,7 @@
       "additionalProperties": {
         "$ref": "#/$defs/RouteConfig"
       },
-      "description": "Path-based ingress routing across containers. Path strings are the keys\n(e.g. `\"/api\"`, `\"/\"`); the value picks the target container and an\noptional port (defaults to the container's `port`).",
+      "description": "Path-based ingress routing across containers. Path strings are the keys\n(e.g. `\"/api\"`, `\"/\"`); the value picks the target container. The route's\nport is always the target container's `port`.",
       "type": "object"
     },
     "version": {

@@ -82,9 +82,10 @@ pub async fn get_deployment_registry_credentials(
     // For multi-container deployments the credentials need to cover every
     // container's tag — provider-side scoping (JFrog) is per-tag, so a
     // single-tag mint would only let the CLI push one of the N images.
-    // Look up the persisted container list to derive the full tag set.
+    // The persisted container list (folded onto the deployment row) drives the
+    // full tag set.
     let repository = project.name.clone();
-    let push_tags = derive_push_tags(&state, &deployment).await?;
+    let push_tags = derive_push_tags(&deployment)?;
     let push_tag_refs: Vec<&str> = push_tags.iter().map(String::as_str).collect();
 
     let credentials = state
@@ -121,19 +122,24 @@ pub async fn get_deployment_registry_credentials(
 /// `<deployment_id>-<container_name>`. The returned slice is what
 /// `RegistryProvider::get_credentials` needs in order to scope the minted
 /// credential to every push — critical for tag-scoped providers like JFrog.
-async fn derive_push_tags(
-    state: &AppState,
+fn derive_push_tags(
     deployment: &crate::db::models::Deployment,
 ) -> Result<Vec<String>, ServerError> {
-    let side = db_deployments::get_containers(&state.db_pool, deployment.id)
-        .await
-        .internal_err("Failed to load deployment containers")?;
-
-    let container_specs: Vec<crate::server::deployment::models::ContainerSpec> = side
-        .containers
-        .as_ref()
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
+    // Container side-data is folded onto the deployment row. A NULL `containers`
+    // column is a legacy single-container deployment: one image tagged with the
+    // deployment ID. A non-NULL but unparseable column is corrupt — fail with a
+    // 500 rather than silently minting a credential scoped to the wrong tags.
+    let container_specs: Vec<crate::server::deployment::models::ContainerSpec> =
+        match deployment.containers.as_ref() {
+            Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+                ServerError::internal(format!(
+                    "Deployment {} ({}) has a non-NULL `containers` column that could not be \
+                     deserialized into Vec<ContainerSpec>: {:?}",
+                    deployment.id, deployment.deployment_id, e
+                ))
+            })?,
+            None => Vec::new(),
+        };
 
     if container_specs.is_empty() {
         return Ok(vec![deployment.deployment_id.clone()]);

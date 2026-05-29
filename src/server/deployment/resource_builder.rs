@@ -2073,6 +2073,8 @@ mod tests {
             memory: "256Mi".to_string(),
             identity_credential_hash: None,
             identity_audiences: serde_json::json!({}),
+            containers: None,
+            routes: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

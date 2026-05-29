@@ -40,8 +40,8 @@ pub struct ProjectBuildConfig {
     pub containers: BTreeMap<String, ContainerConfig>,
 
     /// Path-based ingress routing across containers. Path strings are the keys
-    /// (e.g. `"/api"`, `"/"`); the value picks the target container and an
-    /// optional port (defaults to the container's `port`).
+    /// (e.g. `"/api"`, `"/"`); the value picks the target container. The route's
+    /// port is always the target container's `port`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub routes: BTreeMap<String, RouteConfig>,
 }
@@ -161,9 +161,8 @@ pub struct HealthCheckConfig {
 #[cfg_attr(feature = "backend", derive(schemars::JsonSchema))]
 pub struct RouteConfig {
     /// Target container name (must exist in `[containers]` and have `port` set).
+    /// The route's port is always the target container's `port`.
     pub container: String,
-    /// Override the container's `port` for this route (rare; usually omit).
-    pub port: Option<u16>,
 }
 
 /// Name of the implicit container the backend synthesises for a single-container
@@ -187,14 +186,12 @@ pub struct ResolvedContainer {
     pub health_check: Option<HealthCheckSetting>,
 }
 
-/// One ingress route resolved from rise.toml. Includes a port (defaulting to
-/// the target container's `port`) so the reconciler doesn't need to chase
-/// the container list to build the K8s Service reference.
+/// One ingress route resolved from rise.toml. A route maps a path to a target
+/// container; the effective port is always the target container's `port`.
 #[derive(Debug, Clone)]
 pub struct ResolvedRoute {
     pub path: String,
     pub container: String,
-    pub port: u16,
 }
 
 /// Outcome of `ProjectBuildConfig::resolve_containers()`.
@@ -212,12 +209,11 @@ impl ProjectBuildConfig {
     /// is driven by the CLI's single-container flow, and the backend synthesises
     /// its implicit `app` container at reconcile time.
     ///
-    /// Returns `Err` when a route references a container that has no `port`
-    /// (and the route itself doesn't override `port`). The CLI's
-    /// `load_full_project_config` validator catches this for the on-disk path,
-    /// but this method is public and callers may construct `ProjectBuildConfig`
-    /// in-memory or otherwise bypass the validator — so we enforce it inline to
-    /// avoid silently wiring a K8s Service to port 0.
+    /// Returns `Err` when a route references a container that has no `port`.
+    /// The CLI's `load_full_project_config` validator catches this for the
+    /// on-disk path, but this method is public and callers may construct
+    /// `ProjectBuildConfig` in-memory or otherwise bypass the validator — so we
+    /// enforce it inline to avoid silently wiring a K8s Service to port 0.
     pub fn resolve_deploy(&self) -> Result<ResolvedDeploy, String> {
         if self.containers.is_empty() {
             return Ok(ResolvedDeploy::default());
@@ -249,7 +245,6 @@ impl ProjectBuildConfig {
                 vec![ResolvedRoute {
                     path: "/".to_string(),
                     container: routable[0].name.clone(),
-                    port: routable[0].port.expect("filtered for Some"),
                 }]
             } else {
                 Vec::new()
@@ -257,22 +252,23 @@ impl ProjectBuildConfig {
         } else {
             let mut resolved = Vec::with_capacity(self.routes.len());
             for (path, route) in &self.routes {
-                let port = match route
-                    .port
-                    .or_else(|| self.containers.get(&route.container).and_then(|c| c.port))
+                // A route maps a path to a container; the effective port is
+                // always the target container's `port`. Reject routes whose
+                // target has no port so we never wire a K8s Service to port 0.
+                if self
+                    .containers
+                    .get(&route.container)
+                    .and_then(|c| c.port)
+                    .is_none()
                 {
-                    Some(p) => p,
-                    None => {
-                        return Err(format!(
-                            "route '{}' targets container '{}' which has no port set",
-                            path, route.container
-                        ));
-                    }
-                };
+                    return Err(format!(
+                        "route '{}' targets container '{}' which has no port set",
+                        path, route.container
+                    ));
+                }
                 resolved.push(ResolvedRoute {
                     path: path.clone(),
                     container: route.container.clone(),
-                    port,
                 });
             }
             resolved
@@ -290,7 +286,7 @@ mod tests {
     fn resolve_deploy_errors_when_route_targets_container_without_http_port() {
         // Construct in-memory (bypassing load_full_project_config's validator)
         // to confirm resolve_deploy itself rejects port-less route targets
-        // rather than silently producing ResolvedRoute { port: 0 }.
+        // rather than silently wiring a K8s Service to port 0.
         let mut config = ProjectBuildConfig::default();
         config.containers.insert(
             "worker".to_string(),
@@ -303,7 +299,6 @@ mod tests {
             "/".to_string(),
             RouteConfig {
                 container: "worker".to_string(),
-                port: None,
             },
         );
 
@@ -314,31 +309,6 @@ mod tests {
             err.contains("no port") && err.contains("worker") && err.contains("'/'"),
             "got: {err}"
         );
-    }
-
-    #[test]
-    fn resolve_deploy_uses_route_port_override_when_container_has_no_port() {
-        // If the route supplies its own port, the container's missing port
-        // is fine — we shouldn't error in that case.
-        let mut config = ProjectBuildConfig::default();
-        config.containers.insert(
-            "worker".to_string(),
-            ContainerConfig {
-                image: Some("foo:bar".to_string()),
-                ..Default::default()
-            },
-        );
-        config.routes.insert(
-            "/".to_string(),
-            RouteConfig {
-                container: "worker".to_string(),
-                port: Some(8080),
-            },
-        );
-
-        let resolved = config.resolve_deploy().expect("should succeed");
-        assert_eq!(resolved.routes.len(), 1);
-        assert_eq!(resolved.routes[0].port, 8080);
     }
 }
 

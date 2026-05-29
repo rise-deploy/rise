@@ -184,17 +184,15 @@ pub struct Deployment {
     pub identity_credential_hash: Option<String>,
     /// Map of { in-pod filename -> token audience } for auto-minted workload JWTs.
     pub identity_audiences: serde_json::Value,
+    /// Multi-container side-data (`Vec<ContainerSpec>` as JSONB) or `None` for
+    /// legacy single-container deployments. Folded onto the row so callers don't
+    /// need a separate query to read it.
+    pub containers: Option<serde_json::Value>,
+    /// Ingress route map (`Vec<RouteSpec>` as JSONB) or `None`. Always `None`
+    /// when `containers` is `None`.
+    pub routes: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-}
-
-/// Multi-container side-data for a deployment, stored as JSONB on the
-/// `deployments` row and fetched separately by the reconciler/handlers.
-/// Both fields are `None` for legacy single-container deployments.
-#[derive(Debug, Clone)]
-pub struct DeploymentContainers {
-    pub containers: Option<serde_json::Value>,
-    pub routes: Option<serde_json::Value>,
 }
 
 /// Deployment status enum - tracks lifecycle of deployment

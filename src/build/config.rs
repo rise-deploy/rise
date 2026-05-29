@@ -95,7 +95,8 @@ pub fn load_full_project_config(app_path: &str) -> Result<Option<ProjectBuildCon
 /// - Each container must have exactly one of `image` / `build`.
 /// - Each container declaring a `health_check` block must also set `port`.
 /// - Each route's `container` must exist and must have `port` set.
-/// - Each route's `path` must start with `/`.
+/// - Each route's `path` must start with `/`, must not use the reserved
+///   `/.rise` platform prefix, and must match a conservative URL-path charset.
 fn validate_containers_and_routes(config: &ProjectBuildConfig) -> Result<()> {
     if config.containers.is_empty() {
         if !config.routes.is_empty() {
@@ -138,9 +139,7 @@ fn validate_containers_and_routes(config: &ProjectBuildConfig) -> Result<()> {
     }
 
     for (path, route) in &config.routes {
-        if !path.starts_with('/') {
-            anyhow::bail!("[routes] path '{}' must start with '/'", path);
-        }
+        validate_route_path(path)?;
         let target = config.containers.get(&route.container).ok_or_else(|| {
             anyhow::anyhow!(
                 "[routes] '{}' targets unknown container '{}'",
@@ -173,6 +172,39 @@ fn is_valid_container_name(name: &str) -> bool {
         return false;
     }
     chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Validate a `[routes]` ingress path.
+///
+/// The path flows verbatim into the Kubernetes Ingress, in the same host rule
+/// where the platform appends `/.rise -> rise-backend` for auth/workload-token
+/// endpoints. Two guards:
+///  - The `/.rise` prefix is reserved for the platform; a tenant route there
+///    (e.g. `/.rise` or `/.rise/auth`) could shadow the platform auth backend.
+///  - The path must match a conservative URL-path charset
+///    (`^/[A-Za-z0-9._~/-]*$`, still allowing root `/`) so control chars,
+///    whitespace, quotes, `;`, `#`, backslashes, etc. can't be injected.
+fn validate_route_path(path: &str) -> Result<()> {
+    if !path.starts_with('/') {
+        anyhow::bail!("[routes] path '{}' must start with '/'", path);
+    }
+    if path == "/.rise" || path.starts_with("/.rise/") {
+        anyhow::bail!(
+            "[routes] path '{}' uses the reserved '/.rise' platform prefix",
+            path
+        );
+    }
+    // ^/[A-Za-z0-9._~/-]*$ — leading '/' already checked above.
+    if !path[1..]
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '~' | '/' | '-'))
+    {
+        anyhow::bail!(
+            "[routes] path '{}' contains invalid characters; allowed: letters, digits, and '. _ ~ / -'",
+            path
+        );
+    }
+    Ok(())
 }
 
 /// Write project configuration to rise.toml
@@ -488,7 +520,6 @@ image = "registry.example.com/myapp/worker:latest"
         assert_eq!(resolved.routes.len(), 2);
         let api_route = resolved.routes.iter().find(|r| r.path == "/api").unwrap();
         assert_eq!(api_route.container, "backend");
-        assert_eq!(api_route.port, 9090);
     }
 
     #[test]
@@ -607,7 +638,6 @@ image = "bar:baz"
         assert_eq!(resolved.routes.len(), 1);
         assert_eq!(resolved.routes[0].path, "/");
         assert_eq!(resolved.routes[0].container, "api");
-        assert_eq!(resolved.routes[0].port, 8080);
     }
 
     #[test]
@@ -727,6 +757,68 @@ port = 8080
             err.to_string().contains("must start with '/'"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn test_route_path_reserved_rise_prefix_rejected() {
+        for reserved in ["/.rise", "/.rise/auth"] {
+            let dir = write_toml(&format!(
+                r#"
+[containers.api]
+image = "foo:bar"
+port = 8080
+
+[routes]
+"{reserved}" = {{ container = "api" }}
+"#,
+            ));
+            let err = load_full_project_config(dir.path().to_str().unwrap())
+                .expect_err("expected reserved-prefix error");
+            assert!(
+                err.to_string().contains("reserved") && err.to_string().contains("/.rise"),
+                "got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_route_path_normal_accepted() {
+        let dir = write_toml(
+            r#"
+[containers.api]
+image = "foo:bar"
+port = 8080
+
+[routes]
+"/api" = { container = "api" }
+"#,
+        );
+        let config = load_full_project_config(dir.path().to_str().unwrap())
+            .expect("normal /api path should be accepted")
+            .unwrap();
+        assert!(config.routes.contains_key("/api"));
+    }
+
+    #[test]
+    fn test_route_path_invalid_charset_rejected() {
+        // A space and a ';' are both outside the allowed URL-path charset
+        // (and are valid inside a quoted TOML key, so parsing reaches the
+        // validator).
+        for bad in ["/has space", "/has;semicolon"] {
+            let dir = write_toml(&format!(
+                r#"
+[containers.api]
+image = "foo:bar"
+port = 8080
+
+[routes]
+"{bad}" = {{ container = "api" }}
+"#,
+            ));
+            let err = load_full_project_config(dir.path().to_str().unwrap())
+                .expect_err("expected invalid-charset error");
+            assert!(err.to_string().contains("invalid characters"), "got: {err}");
+        }
     }
 
     #[test]

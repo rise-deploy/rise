@@ -298,12 +298,12 @@ pub struct ContainerSpec {
 }
 
 /// One ingress route mapping. Paths are matched longest-prefix-first by the
-/// reconciler; the request may list them in any order.
+/// reconciler; the request may list them in any order. A route maps a path to a
+/// target container; the effective port is always the target container's `port`.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct RouteSpec {
     pub path: String,
     pub container: String,
-    pub port: u16,
 }
 
 /// Validate `^[a-z][a-z0-9-]{0,14}$` (max 15 chars, RFC 1123 label, starts
@@ -326,6 +326,42 @@ fn is_valid_container_name(name: &str) -> bool {
     chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
+/// Validate an ingress route path at the server trust boundary.
+///
+/// The path flows verbatim into the Kubernetes Ingress, in the same host rule
+/// where the platform appends `/.rise -> rise-backend` for auth/workload-token
+/// endpoints. Two guards:
+///  - The `/.rise` prefix is reserved for the platform; a tenant route there
+///    (e.g. `/.rise` or `/.rise/auth`) could shadow the platform auth backend.
+///  - The path must match a conservative URL-path charset
+///    (`^/[A-Za-z0-9._~/-]*$`, still allowing root `/`) so control chars,
+///    whitespace, quotes, `;`, `#`, backslashes, etc. can't be injected.
+fn validate_route_path(path: &str) -> Result<(), ServerError> {
+    if !path.starts_with('/') {
+        return Err(ServerError::bad_request(format!(
+            "Route path '{}' must start with '/'",
+            path
+        )));
+    }
+    if path == "/.rise" || path.starts_with("/.rise/") {
+        return Err(ServerError::bad_request(format!(
+            "Route path '{}' uses the reserved '/.rise' platform prefix",
+            path
+        )));
+    }
+    // ^/[A-Za-z0-9._~/-]*$ — leading '/' already checked above.
+    if !path[1..]
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '~' | '/' | '-'))
+    {
+        return Err(ServerError::bad_request(format!(
+            "Route path '{}' contains invalid characters; allowed: letters, digits, and '. _ ~ / -'",
+            path
+        )));
+    }
+    Ok(())
+}
+
 /// Validate the wire-level multi-container spec (containers + routes) from a
 /// `CreateDeploymentRequest`. Returns `Ok(())` for legacy single-container
 /// requests (`containers` is `None`).
@@ -342,7 +378,8 @@ fn is_valid_container_name(name: &str) -> bool {
 /// - `health_check.is_some()` requires `port.is_some()`.
 /// - Each route's `container` must match a container in the request.
 /// - The route's target container must have `port.is_some()`.
-/// - Each route's `path` must start with `/`.
+/// - Each route's `path` must start with `/`, must not use the reserved
+///   `/.rise` platform prefix, and must match a conservative URL-path charset.
 pub fn validate_containers_and_routes(
     containers: Option<&[ContainerSpec]>,
     routes: &[RouteSpec],
@@ -404,12 +441,7 @@ pub fn validate_containers_and_routes(
         containers.iter().map(|c| (c.name.as_str(), c)).collect();
 
     for route in routes {
-        if !route.path.starts_with('/') {
-            return Err(ServerError::bad_request(format!(
-                "Route path '{}' must start with '/'",
-                route.path
-            )));
-        }
+        validate_route_path(&route.path)?;
         let target = container_by_name
             .get(route.container.as_str())
             .ok_or_else(|| {
@@ -646,7 +678,6 @@ mod tests {
         let routes = vec![RouteSpec {
             path: "/".to_string(),
             container: "app".to_string(),
-            port: 8080,
         }];
         assert!(validate_containers_and_routes(None, &routes).is_err());
     }
@@ -666,7 +697,6 @@ mod tests {
         let routes = vec![RouteSpec {
             path: "/".to_string(),
             container: "api".to_string(),
-            port: 8080,
         }];
         validate_containers_and_routes(Some(&containers), &routes).unwrap();
     }
@@ -748,7 +778,6 @@ mod tests {
         let routes = vec![RouteSpec {
             path: "/".to_string(),
             container: "ghost".to_string(),
-            port: 8080,
         }];
         let err = validate_containers_and_routes(Some(&containers), &routes).unwrap_err();
         assert!(
@@ -764,7 +793,6 @@ mod tests {
         let routes = vec![RouteSpec {
             path: "/".to_string(),
             container: "worker".to_string(),
-            port: 0,
         }];
         let err = validate_containers_and_routes(Some(&containers), &routes).unwrap_err();
         assert!(err.message.contains("no port"), "got: {}", err.message);
@@ -776,7 +804,6 @@ mod tests {
         let routes = vec![RouteSpec {
             path: "api".to_string(),
             container: "api".to_string(),
-            port: 8080,
         }];
         let err = validate_containers_and_routes(Some(&containers), &routes).unwrap_err();
         assert!(
@@ -784,6 +811,50 @@ mod tests {
             "got: {}",
             err.message
         );
+    }
+
+    #[test]
+    fn test_validate_route_path_reserved_rise_prefix_rejected() {
+        let containers = vec![cspec("api", Some("nginx"), Some(8080))];
+        for reserved in ["/.rise", "/.rise/auth"] {
+            let routes = vec![RouteSpec {
+                path: reserved.to_string(),
+                container: "api".to_string(),
+            }];
+            let err = validate_containers_and_routes(Some(&containers), &routes).unwrap_err();
+            assert!(
+                err.message.contains("reserved") && err.message.contains("/.rise"),
+                "got: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_route_path_normal_accepted() {
+        let containers = vec![cspec("api", Some("nginx"), Some(8080))];
+        let routes = vec![RouteSpec {
+            path: "/api".to_string(),
+            container: "api".to_string(),
+        }];
+        validate_containers_and_routes(Some(&containers), &routes).unwrap();
+    }
+
+    #[test]
+    fn test_validate_route_path_invalid_charset_rejected() {
+        let containers = vec![cspec("api", Some("nginx"), Some(8080))];
+        for bad in ["/has space", "/has\"quote"] {
+            let routes = vec![RouteSpec {
+                path: bad.to_string(),
+                container: "api".to_string(),
+            }];
+            let err = validate_containers_and_routes(Some(&containers), &routes).unwrap_err();
+            assert!(
+                err.message.contains("invalid characters"),
+                "got: {}",
+                err.message
+            );
+        }
     }
 
     #[test]

@@ -112,7 +112,7 @@ Rise automatically injects these variables into every deployment:
 | `RISE_DEPLOYMENT_GROUP` | Deployment group name | `default` |
 | `RISE_DEPLOYMENT_GROUP_NORMALIZED` | Deployment group name normalized for URLs and K8s resource names (sequences of characters not in `[A-Za-z0-9-_.]` are replaced with `--`, and non-alphanumeric leading/trailing characters are trimmed) | `mr--123` |
 | `RISE_ENVIRONMENT` | Environment name (if the deployment has an associated environment) | `staging` |
-| `RISE_CONTAINER_HOST__<NAME>` | In-cluster address (`<host>:<port>`) of each routable container in a [multi-container deployment](../deployments#multi-container-deployments) — one entry per container that exposes a `port`. `<NAME>` is the uppercase container name (dashes mapped to underscores). Workers (containers without a `port`) are excluded. Injected only when the deployment has two or more containers. Each container also sees its own entry. | `api:8080` |
+| `RISE_CONTAINER_HOST__<NAME>` | In-cluster address (`<host>:<port>`) of each sibling container in a [multi-container deployment](../deployments#multi-container-deployments) that exposes a `port` — one entry per such container, whether or not it is routed (a port-having database like Redis is included). `<NAME>` is the uppercase container name (dashes mapped to underscores). Workers (containers without a `port`) are excluded. Injected only when the deployment has two or more containers. Each container also sees its own entry. | `api:8080` |
 
 `PORT` defaults to 8080. Override it per-deployment with `--http-port` on `rise deploy`, or set it permanently with `rise env set -p my-app PORT 3000`.
 

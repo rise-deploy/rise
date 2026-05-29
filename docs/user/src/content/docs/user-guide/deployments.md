@@ -264,7 +264,7 @@ replicas = 4
 "/" = { container = "frontend" }
 ```
 
-When you run `rise deploy`, the backend allocates a deployment ID and returns one image tag per container with `[build]` (shared registry, distinct tags per container). The credentials it returns are scoped to cover every container's tag, and the CLI builds and pushes each container in turn (re-minting credentials per container so a long build can't outlast the token). Containers with a pre-built `image` are passed through unchanged.
+When you run `rise deploy`, the backend allocates a deployment ID and returns one image tag for every container (a freshly minted registry tag for each `[build]` container — shared registry, distinct tags — and the verbatim reference for each pre-built `image = ...` container). The credentials it returns are scoped to cover every container's tag, and the CLI builds and pushes only the `[build]` containers in turn (re-minting credentials per container so a long build can't outlast the token). Containers with a pre-built `image` are passed through unchanged.
 
 Notes:
 
@@ -272,7 +272,7 @@ Notes:
 - Containers without `port` get no `Service` and no HTTP probes — exactly what you want for workers / batch jobs.
 - HTTP probes default to `GET /` only for containers that are routed (referenced by `[routes]`); a container with a `port` but no route (e.g. a database) gets a `Service` for discovery but no probe. Set a `health_check` block to force one on, or `health_check = false` to disable.
 - Routes are matched longest-prefix-first by the ingress, so `/api` shadows `/` correctly. If `[routes]` is omitted and exactly one container has a `port`, Rise synthesises `/` → that container.
-- When a deployment has two or more containers, each is given a `RISE_CONTAINER_HOST__<NAME>` env var pointing at every routable sibling's in-cluster Service. See [Environment Variables](../environment-variables#auto-injected-variables).
+- When a deployment has two or more containers, each is given a `RISE_CONTAINER_HOST__<NAME>` env var for every sibling that exposes a `port` (including a port-having container that isn't routed, such as a database) — pointing at that sibling's in-cluster Service. See [Environment Variables](../environment-variables#auto-injected-variables).
 
 ## CI/CD Deployments
 

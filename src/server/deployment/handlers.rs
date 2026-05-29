@@ -410,16 +410,16 @@ fn build_container_side_data_json(
 /// rollback path when the redeploy request itself doesn't carry a `containers`
 /// block — without this, a redeploy of a multi-container source would silently
 /// fall back to the single-container path and the reconciler would drop every
-/// per-container K8s resource.
+/// per-container K8s resource. The side-data is folded onto the source
+/// [`Deployment`] row, so this is a plain clone with no extra query.
 #[cfg(feature = "backend")]
-async fn inherit_container_side_data_from_source(
-    state: &AppState,
-    source_deployment_uuid: uuid::Uuid,
-) -> Result<(Option<serde_json::Value>, Option<serde_json::Value>), ServerError> {
-    let side = db_deployments::get_containers(&state.db_pool, source_deployment_uuid)
-        .await
-        .internal_err("Failed to load source deployment container side-data")?;
-    Ok((side.containers, side.routes))
+fn inherit_container_side_data_from_source(
+    source_deployment: &crate::db::models::Deployment,
+) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
+    (
+        source_deployment.containers.clone(),
+        source_deployment.routes.clone(),
+    )
 }
 
 async fn apply_env_overrides(
@@ -584,16 +584,30 @@ async fn convert_deployment(
     };
     let can_rollback = state_machine::can_create_from(&deployment);
 
-    // Load multi-container side-data, if any. Falls back to `None` for legacy
-    // single-container deployments — the frontend reads the flat replicas/cpu/
-    // memory fields in that case.
-    let containers = db_deployments::get_containers(&state.db_pool, deployment.id)
-        .await
-        .ok()
-        .and_then(|sd| sd.containers)
-        .and_then(|v| {
-            serde_json::from_value::<Vec<crate::server::deployment::models::ContainerSpec>>(v).ok()
-        });
+    // Multi-container side-data, folded onto the row. `None` is a legacy
+    // single-container deployment — the frontend reads the flat replicas/cpu/
+    // memory fields in that case. A present-but-unparseable column is corrupt:
+    // log it (the reconciler will have marked the deployment Failed, surfacing
+    // the problem) but render best-effort rather than 500-ing a whole list
+    // because one row is bad.
+    let containers = match deployment.containers.as_ref() {
+        Some(v) => {
+            match serde_json::from_value::<Vec<crate::server::deployment::models::ContainerSpec>>(
+                v.clone(),
+            ) {
+                Ok(specs) => Some(specs),
+                Err(e) => {
+                    error!(
+                        deployment_id = %deployment.deployment_id,
+                        "non-NULL `containers` column could not be deserialized into \
+                         Vec<ContainerSpec>; rendering without container side-data: {:?}", e
+                    );
+                    None
+                }
+            }
+        }
+        None => None,
+    };
 
     // Resolve environment name and color
     let (environment, environment_color) = if let Some(env_id) = deployment.environment_id {
@@ -1309,11 +1323,41 @@ pub async fn create_deployment(
             effective_identity_audiences = source_deployment.identity_audiences.clone();
         }
 
-        // Validate resources against constraints (after rollback inheritance)
+        // Validate resources against constraints (after rollback inheritance).
+        //
+        // When the redeploy request carries no `[containers]` block we must
+        // still re-validate against the SOURCE's persisted per-container specs:
+        // those replicas/cpu/memory can sum higher than the deployment-level
+        // `effective_replicas`, so a cap that tightened since the source was
+        // created would otherwise be silently bypassed on a bare redeploy.
+        #[cfg(feature = "backend")]
+        let inherited_source_specs: Option<
+            Vec<crate::server::deployment::models::ContainerSpec>,
+        > = if payload.containers.is_none() {
+            match source_deployment.containers.as_ref() {
+                Some(v) => Some(serde_json::from_value(v.clone()).map_err(|e| {
+                    ServerError::internal(format!(
+                        "Source deployment {} ({}) has a non-NULL `containers` column that could \
+                         not be deserialized into Vec<ContainerSpec>: {:?}",
+                        source_deployment.id, source_deployment.deployment_id, e
+                    ))
+                })?),
+                None => None,
+            }
+        } else {
+            None
+        };
+
         #[cfg(feature = "backend")]
         {
+            // Prefer the request's containers; otherwise the source's inherited
+            // specs (so the across-container sum is re-checked); else single.
+            let check_specs = payload
+                .containers
+                .as_deref()
+                .or(inherited_source_specs.as_deref());
             let (total_replicas, per_container) = resolve_resource_check_inputs(
-                payload.containers.as_deref(),
+                check_specs,
                 effective_replicas,
                 &effective_cpu,
                 &effective_memory,
@@ -1344,7 +1388,7 @@ pub async fn create_deployment(
                 )?;
                 (Some(c), ro)
             } else {
-                inherit_container_side_data_from_source(&state, source_deployment.id).await?
+                inherit_container_side_data_from_source(&source_deployment)
             };
 
         // Create new deployment with Pushed status and invoke extension hooks

@@ -687,12 +687,27 @@ async fn check_deployment_health_from_observed(
 
     // Resolve the list of K8s Deployment names to aggregate over — one per
     // container. A single-container deployment has its implicit `app` container.
-    // Propagate DB errors: silently aggregating against the wrong names could
-    // flip the deployment Healthy/Failed incorrectly.
-    let side = db_deployments::get_containers(&state.db_pool, deployment.id)
-        .await
-        .context("failed to load deployment container side-data")?;
-    let (container_specs, _routes) = resolve_runtime_containers(deployment, &side);
+    // `containers`/`routes` come folded onto the row. An unparseable (non-NULL
+    // but corrupt) side-data column fails ONLY this deployment — mark it Failed
+    // and stop aggregating health for it rather than flipping it Healthy/Failed
+    // against the wrong names or failing the whole project sync.
+    let (container_specs, _routes) = match resolve_runtime_containers(deployment) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            error!(
+                deployment_id = %deployment.deployment_id,
+                "container side-data could not be deserialized; marking deployment Failed: {:?}", e
+            );
+            db_deployments::mark_failed(
+                &state.db_pool,
+                deployment.id,
+                "container side-data could not be deserialized",
+            )
+            .await?;
+            db_projects::update_calculated_status(&state.db_pool, project.id).await?;
+            return Ok(());
+        }
+    };
     let k8s_deploy_names: Vec<String> = container_specs
         .iter()
         .map(|spec| format!("{}/{}-{}", namespace, base_name, spec.name))
@@ -1275,7 +1290,7 @@ async fn compute_desired_children(
     }
 
     // Collect deployments that should have K8s infrastructure
-    let infra_deployments: Vec<&Deployment> = all_deployments
+    let mut infra_deployments: Vec<&Deployment> = all_deployments
         .iter()
         .filter(|d| should_have_infrastructure(d))
         .collect();
@@ -1321,16 +1336,37 @@ async fn compute_desired_children(
         uuid::Uuid,
         Vec<crate::server::deployment::models::RouteSpec>,
     > = HashMap::new();
+    // `containers`/`routes` come folded onto each row. An unparseable (non-NULL
+    // but corrupt) side-data column fails ONLY that deployment: mark it Failed,
+    // log, and drop it from `infra_deployments` so it contributes no children
+    // (Metacontroller then GCs its on-cluster resources). NEVER propagate the
+    // error up — that would fail the whole project sync.
+    let mut failed_to_parse: std::collections::HashSet<uuid::Uuid> =
+        std::collections::HashSet::new();
     for d in &infra_deployments {
-        // Propagate DB errors: an `.ok()` fallback would silently drop a
-        // deployment's containers from the desired set and let Metacontroller
-        // GC its on-cluster resources.
-        let side = db_deployments::get_containers(&state.db_pool, d.id)
-            .await
-            .context("failed to load deployment container side-data")?;
-        let (specs, routes) = resolve_runtime_containers(d, &side);
-        container_specs_by_deployment.insert(d.id, specs);
-        routes_by_deployment.insert(d.id, routes);
+        match resolve_runtime_containers(d) {
+            Ok((specs, routes)) => {
+                container_specs_by_deployment.insert(d.id, specs);
+                routes_by_deployment.insert(d.id, routes);
+            }
+            Err(e) => {
+                error!(
+                    deployment_id = %d.deployment_id,
+                    "container side-data could not be deserialized; marking deployment Failed: {:?}", e
+                );
+                db_deployments::mark_failed(
+                    &state.db_pool,
+                    d.id,
+                    "container side-data could not be deserialized",
+                )
+                .await?;
+                failed_to_parse.insert(d.id);
+            }
+        }
+    }
+    if !failed_to_parse.is_empty() {
+        db_projects::update_calculated_status(&state.db_pool, project.id).await?;
+        infra_deployments.retain(|d| !failed_to_parse.contains(&d.id));
     }
 
     // Per-container Service ownership: for each (group, container_name), which
@@ -1364,6 +1400,16 @@ async fn compute_desired_children(
         let env_name = env_name_for(deployment);
         let env_vars = load_env_vars(state, project, deployment).await?;
 
+        // Container spec list for this deployment. A single-container deployment
+        // has its synthesised `app`; a multi-container one has one entry per
+        // `[containers.<name>]`. Computed here (before the env-secret guard) so
+        // the guard can look up the per-container K8s Deployment names.
+        let container_specs: Vec<crate::server::deployment::models::ContainerSpec> =
+            container_specs_by_deployment
+                .get(&deployment.id)
+                .cloned()
+                .unwrap_or_default();
+
         let secret_env = if env_vars.secret_env_vars.is_empty() {
             None
         } else {
@@ -1384,8 +1430,21 @@ async fn compute_desired_children(
             children.push(serde_json::to_value(&secret_env.secret)?);
 
             if !is_ready {
-                let k8s_deploy_name = ResourceBuilder::deployment_name(project, deployment);
-                let deploy_already_observed = observed.deployments.contains_key(&k8s_deploy_name);
+                // Observed Deployments are keyed `<namespace>/<name>` and each
+                // container emits `<project>-<deployment_id>-<container>` (see
+                // the health path). The deployment counts as already-observed if
+                // ANY of its container Deployments exists — using the bare
+                // `<project>-<deployment_id>` key (no namespace, no container
+                // suffix) never matches, so the guard would always withhold the
+                // Deployment and let Metacontroller GC it on every secret/env
+                // rotation.
+                let base_name = ResourceBuilder::deployment_name(project, deployment);
+                let deploy_already_observed = any_container_deployment_observed(
+                    observed,
+                    &namespace,
+                    &base_name,
+                    &container_specs,
+                );
 
                 // Defer Deployment creation until the Secret is observed, preventing
                 // pods from starting with a missing env secret. However, if a
@@ -1466,11 +1525,7 @@ async fn compute_desired_children(
         //   come from `ContainerSpec.env_overrides`.
         // - Resource names are suffixed with `-<container>` (see
         //   `ResourceBuilder::deployment_name_for_container`).
-        let container_specs: Vec<crate::server::deployment::models::ContainerSpec> =
-            container_specs_by_deployment
-                .get(&deployment.id)
-                .cloned()
-                .unwrap_or_default();
+        // `container_specs` was computed above (before the env-secret guard).
 
         // Containers targeted by a route get HTTP probes by default; non-routed
         // containers (e.g. a database) don't, unless they configure one.
@@ -1729,6 +1784,24 @@ async fn compute_desired_children(
     Ok(children)
 }
 
+/// Returns true if ANY of a deployment's per-container K8s Deployments has been
+/// observed. Observed Deployments are keyed `<namespace>/<name>`, and each
+/// container emits `<project>-<deployment_id>-<container>` (see the health
+/// path). Using the bare `<project>-<deployment_id>` key — no namespace, no
+/// container suffix — never matches, so callers that relied on it would always
+/// treat the deployment as un-observed.
+fn any_container_deployment_observed(
+    observed: &ObservedChildren,
+    namespace: &str,
+    base_name: &str,
+    container_specs: &[crate::server::deployment::models::ContainerSpec],
+) -> bool {
+    container_specs.iter().any(|spec| {
+        let key = format!("{}/{}-{}", namespace, base_name, spec.name);
+        observed.deployments.contains_key(&key)
+    })
+}
+
 /// Resolve the container + route list the reconciler should emit for a
 /// deployment. A multi-container deployment parses its persisted side-data; a
 /// single-container deployment (`containers IS NULL`) synthesises an implicit
@@ -1736,28 +1809,46 @@ async fn compute_desired_children(
 /// `app` carries no image (`image: None`) — the reconciler fills it from the
 /// deployment's resolved image, so the existing single-container image (tagged
 /// with the deployment ID) is reused with no rebuild.
+///
+/// `containers`/`routes` come folded onto the [`Deployment`] row. A `None`
+/// `containers` column is a legitimate single-container deployment and triggers
+/// the synthesised `app`. A `Some` column that fails to deserialize is treated
+/// as a hard error for *this* deployment (returned `Err`): silently collapsing
+/// it to the single-container fallback would drop every per-container resource.
 fn resolve_runtime_containers(
     deployment: &Deployment,
-    side: &crate::db::models::DeploymentContainers,
-) -> (
+) -> anyhow::Result<(
     Vec<crate::server::deployment::models::ContainerSpec>,
     Vec<crate::server::deployment::models::RouteSpec>,
-) {
+)> {
     use crate::server::deployment::models::{ContainerSpec, RouteSpec};
 
-    let parsed: Option<Vec<ContainerSpec>> = side
-        .containers
-        .as_ref()
-        .and_then(|v| serde_json::from_value(v.clone()).ok());
-
-    if let Some(specs) = parsed {
+    if let Some(containers_value) = deployment.containers.as_ref() {
+        let specs: Vec<ContainerSpec> = serde_json::from_value(containers_value.clone())
+            .with_context(|| {
+                format!(
+                    "deployment {} ({}) has a non-NULL `containers` column that could not be \
+                     deserialized into Vec<ContainerSpec>",
+                    deployment.id, deployment.deployment_id
+                )
+            })?;
+        // A present-but-empty list is degenerate (server validation rejects it
+        // on the write path); fall through to the synthesised `app` rather than
+        // emitting a deployment with zero containers.
         if !specs.is_empty() {
-            let routes = side
-                .routes
-                .as_ref()
-                .and_then(|v| serde_json::from_value::<Vec<RouteSpec>>(v.clone()).ok())
-                .unwrap_or_default();
-            return (specs, routes);
+            let routes: Vec<RouteSpec> = match deployment.routes.as_ref() {
+                Some(routes_value) => {
+                    serde_json::from_value(routes_value.clone()).with_context(|| {
+                        format!(
+                            "deployment {} ({}) has a non-NULL `routes` column that could not be \
+                             deserialized into Vec<RouteSpec>",
+                            deployment.id, deployment.deployment_id
+                        )
+                    })?
+                }
+                None => Vec::new(),
+            };
+            return Ok((specs, routes));
         }
     }
 
@@ -1778,9 +1869,8 @@ fn resolve_runtime_containers(
     let routes = vec![RouteSpec {
         path: "/".to_string(),
         container: crate::rise_toml::DEFAULT_CONTAINER_NAME.to_string(),
-        port,
     }];
-    (vec![app], routes)
+    Ok((vec![app], routes))
 }
 
 /// Returns true if this deployment should have K8s infrastructure (K8s Deployment resource).
@@ -2739,6 +2829,8 @@ mod tests {
             memory: "256Mi".to_string(),
             identity_credential_hash: None,
             identity_audiences: serde_json::json!({}),
+            containers: None,
+            routes: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -3033,12 +3125,10 @@ mod tests {
         d.replicas = 2;
         d.cpu = "500m".to_string();
         d.memory = "256Mi".to_string();
-        let side = crate::db::models::DeploymentContainers {
-            containers: None,
-            routes: None,
-        };
+        d.containers = None;
+        d.routes = None;
 
-        let (specs, routes) = resolve_runtime_containers(&d, &side);
+        let (specs, routes) = resolve_runtime_containers(&d).unwrap();
 
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].name, "app");
@@ -3049,25 +3139,22 @@ mod tests {
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].path, "/");
         assert_eq!(routes[0].container, "app");
-        assert_eq!(routes[0].port, 8080);
     }
 
     #[test]
     fn resolve_runtime_containers_parses_persisted_multi_container() {
         // A row WITH persisted container side-data parses it (and does not
         // synthesise the implicit `app`).
-        let d = test_deployment(DeploymentStatus::Healthy);
-        let side = crate::db::models::DeploymentContainers {
-            containers: Some(serde_json::json!([
-                { "name": "api", "image": "img-api", "port": 8080 },
-                { "name": "worker", "image": "img-worker" },
-            ])),
-            routes: Some(serde_json::json!([
-                { "path": "/", "container": "api", "port": 8080 },
-            ])),
-        };
+        let mut d = test_deployment(DeploymentStatus::Healthy);
+        d.containers = Some(serde_json::json!([
+            { "name": "api", "image": "img-api", "port": 8080 },
+            { "name": "worker", "image": "img-worker" },
+        ]));
+        d.routes = Some(serde_json::json!([
+            { "path": "/", "container": "api" },
+        ]));
 
-        let (specs, routes) = resolve_runtime_containers(&d, &side);
+        let (specs, routes) = resolve_runtime_containers(&d).unwrap();
 
         assert_eq!(specs.len(), 2);
         assert_eq!(specs[0].name, "api");
@@ -3075,5 +3162,78 @@ mod tests {
         assert_eq!(specs[1].port, None, "worker has no port");
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].container, "api");
+    }
+
+    #[test]
+    fn resolve_runtime_containers_errors_on_unparseable_containers() {
+        // A non-NULL but corrupt `containers` column is a hard error for THIS
+        // deployment — it must NOT silently collapse to the single-container
+        // fallback (which would drop every per-container K8s resource).
+        let mut d = test_deployment(DeploymentStatus::Healthy);
+        d.containers = Some(serde_json::json!({ "not": "a list of container specs" }));
+
+        let err = resolve_runtime_containers(&d).unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("could not be"),
+            "error should mention the deserialization failure, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn resolve_runtime_containers_errors_on_unparseable_routes() {
+        // Same for routes: present-but-corrupt is an error, not an empty route
+        // set.
+        let mut d = test_deployment(DeploymentStatus::Healthy);
+        d.containers = Some(serde_json::json!([
+            { "name": "api", "image": "img-api", "port": 8080 },
+        ]));
+        d.routes = Some(serde_json::json!({ "not": "a list of routes" }));
+
+        assert!(resolve_runtime_containers(&d).is_err());
+    }
+
+    #[test]
+    fn env_secret_guard_matches_existing_observed_container_deployment() {
+        // Regression: the env-secret GC guard used to look up the bare
+        // `<project>-<deployment_id>` key, but observed Deployments are keyed
+        // `<namespace>/<project>-<deployment_id>-<container>`. The bare key
+        // never matched, so a stale env-secret hash withheld (and Metacontroller
+        // GC'd) every container Deployment. The guard must recognise an existing
+        // observed container Deployment so it re-emits it while the new secret
+        // is created.
+        let project = test_project();
+        let deployment = test_deployment(DeploymentStatus::Healthy);
+        let namespace = ResourceBuilder::namespace_name(&project, "");
+        let base_name = ResourceBuilder::deployment_name(&project, &deployment);
+        let container_specs = vec![cspec("api", Some(8080)), cspec("worker", None)];
+
+        // No observed Deployments yet → guard reports "not observed".
+        let empty = ObservedChildren::default();
+        assert!(
+            !any_container_deployment_observed(&empty, &namespace, &base_name, &container_specs),
+            "no observed Deployments should report as not-yet-observed"
+        );
+
+        // The bare key the buggy guard used must NOT be present in the observed
+        // map — this is exactly why the old guard always returned false.
+        let mut observed = ObservedChildren::default();
+        let bare_key = base_name.clone();
+        assert!(
+            !observed.deployments.contains_key(&bare_key),
+            "the bare <project>-<deployment_id> key is never how observed Deployments are keyed"
+        );
+
+        // Insert one container's observed Deployment under the real
+        // `<namespace>/<project>-<deployment_id>-<container>` key.
+        let real_key = format!("{}/{}-{}", namespace, base_name, "api");
+        observed
+            .deployments
+            .insert(real_key, serde_json::json!({ "kind": "Deployment" }));
+
+        assert!(
+            any_container_deployment_observed(&observed, &namespace, &base_name, &container_specs),
+            "an existing observed container Deployment must be recognised so it is re-emitted"
+        );
     }
 }

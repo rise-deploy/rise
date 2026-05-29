@@ -117,7 +117,6 @@ fn build_multi_container_payload(
             serde_json::json!({
                 "path": r.path,
                 "container": r.container,
-                "port": r.port,
             })
         })
         .collect();

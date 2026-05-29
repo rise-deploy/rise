@@ -373,15 +373,23 @@ fn build_push_scope(base: &str, tags: &[&str], perms: &str) -> Result<String> {
 /// We additionally require non-empty; this is sufficient to keep the JFrog
 /// scope string well-formed (no spaces, no `/`, no `:`, no `*`, no control chars).
 fn is_valid_oci_tag(tag: &str) -> bool {
-    !tag.is_empty()
-        && tag
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+    // Total length 1..=128 (a 1-char first + up to 127 trailing chars).
+    if tag.is_empty() || tag.len() > 128 {
+        return false;
+    }
+    let mut chars = tag.chars();
+    // First char must be alphanumeric or '_' (no leading '.' or '-').
+    match chars.next() {
+        Some(c) if c.is_ascii_alphanumeric() || c == '_' => {}
+        _ => return false,
+    }
+    // Remaining chars may also include '.' and '-'.
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
 }
 
 #[cfg(test)]
 mod tests {
-    use super::build_push_scope;
+    use super::{build_push_scope, is_valid_oci_tag};
 
     #[test]
     fn single_tag_scope_matches_legacy_format() {
@@ -458,6 +466,50 @@ mod tests {
             build_push_scope("docker/my-app", &[good], "write").unwrap_or_else(|e| {
                 panic!("tag '{}' should be accepted, got error: {:#}", good, e)
             });
+        }
+    }
+
+    #[test]
+    fn is_valid_oci_tag_enforces_first_char_and_length() {
+        // First char must be [A-Za-z0-9_]; a leading '.' or '-' is not a
+        // legal OCI tag even though those chars are allowed elsewhere.
+        assert!(!is_valid_oci_tag(".leading-dot"));
+        assert!(!is_valid_oci_tag("-leading-dash"));
+
+        // Empty is rejected.
+        assert!(!is_valid_oci_tag(""));
+
+        // Max length is 128; a 129-char tag must be rejected, 128 accepted.
+        let tag_128 = "a".repeat(128);
+        let tag_129 = "a".repeat(129);
+        assert!(is_valid_oci_tag(&tag_128));
+        assert!(!is_valid_oci_tag(&tag_129));
+
+        // The forms we actually mint: <deployment_id> and
+        // <deployment_id>-<container>.
+        assert!(is_valid_oci_tag("20251215-204525"));
+        assert!(is_valid_oci_tag("20251215-204525-frontend"));
+
+        // Leading '_' and leading digit/letter are fine; interior '.'/'-' too.
+        assert!(is_valid_oci_tag("_underscore.start"));
+        assert!(is_valid_oci_tag("foo.bar_baz-0"));
+    }
+
+    #[test]
+    fn scope_rejects_tags_violating_first_char_and_length() {
+        // build_push_scope delegates to is_valid_oci_tag, so a leading
+        // '.'/'-' or an over-length tag must be rejected with the tag named.
+        let long_tag = "a".repeat(129);
+        for bad in [".leading-dot", "-leading-dash", long_tag.as_str()] {
+            let err = build_push_scope("docker/my-app", &[bad], "write")
+                .expect_err(&format!("expected rejection for tag '{}'", bad));
+            let msg = format!("{:#}", err);
+            assert!(
+                msg.contains(bad),
+                "error message should name the offending tag '{}', got: {}",
+                bad,
+                msg
+            );
         }
     }
 }
