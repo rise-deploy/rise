@@ -432,8 +432,8 @@ struct GetRegistryCredsResponse {
 }
 
 /// Subset of the platform capabilities response the CLI cares about. The full
-/// response also carries a `capabilities` map (consumed by the frontend);
-/// unknown fields are ignored.
+/// response also carries other capability flags (e.g. `runtime_allows_root`)
+/// the CLI doesn't need; unknown fields are ignored.
 #[derive(serde::Deserialize)]
 struct PlatformCapabilities {
     /// Container architecture the target cluster accepts (e.g. "amd64"). Absent
