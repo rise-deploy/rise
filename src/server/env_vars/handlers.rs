@@ -22,9 +22,9 @@ use std::collections::HashMap;
 /// silently normalised — if the key contains whitespace the caller likely made
 /// a mistake and should fix the request.
 ///
-// TODO(multi-container): reserve the `RISE_` prefix here so a user-supplied env
-// var can't collide with an auto-injected `RISE_CONTAINER_HOST__<NAME>` (which,
-// as an explicit pod env, would silently shadow a same-named secret). Deferred.
+// TODO(#344): reserve the `RISE_` prefix here so a user-supplied env var can't
+// collide with an auto-injected `RISE_CONTAINER_HOST__<NAME>` (which, as an
+// explicit pod env, would silently shadow a same-named secret).
 fn validate_env_var_key(key: &str) -> Result<(), ServerError> {
     if key != key.trim() {
         return Err(ServerError::bad_request(format!(
