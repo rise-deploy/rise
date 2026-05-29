@@ -543,11 +543,13 @@ export function Combobox(props: ComboboxProps) {
     const [query, setQuery] = useState('');
     const [activeIndex, setActiveIndex] = useState(0);
     const [popRect, setPopRect] = useState<{ top: number; left: number; width: number } | null>(null);
-    // When the combobox lives inside a Modal, portaling the listbox to
-    // document.body would put it outside the modal's focus-trap root — Tab
-    // from the search input/options would escape into the modal's first
-    // focusable. Render inline in that case so the trap sees the popover.
+    // When inside a Modal, portal to the .r-modal element (position: static) so:
+    //   • the modal's focus-trap (which queries within .r-modal) sees the popover
+    //   • the popup uses position:absolute whose containing block becomes .r-modal-mask
+    //     (the nearest positioned ancestor), avoiding backdrop-filter containing-block issues
+    //   • .r-modal's overflow:hidden does NOT clip it (containing block is above .r-modal)
     const [inModal, setInModal] = useState(false);
+    const [portalEl, setPortalEl] = useState<Element | null>(null);
     const wrapRef = useRef<HTMLDivElement>(null);
     const triggerRef = useRef<HTMLDivElement>(null);
     const popRef = useRef<HTMLDivElement>(null);
@@ -594,8 +596,10 @@ export function Combobox(props: ComboboxProps) {
     }, [open]);
 
     useEffect(() => {
-        if (!open) { setPopRect(null); setQuery(''); return; }
-        setInModal(Boolean(wrapRef.current?.closest('.r-modal')));
+        if (!open) { setPopRect(null); setQuery(''); setPortalEl(null); return; }
+        const modal = wrapRef.current?.closest<Element>('.r-modal') ?? null;
+        setInModal(Boolean(modal));
+        setPortalEl(modal ?? document.body);
         const update = () => {
             const el = triggerRef.current;
             if (!el) return;
@@ -737,7 +741,7 @@ export function Combobox(props: ComboboxProps) {
                 )}
                 <Icon name="chevd" size={14} className="chev" />
             </div>
-            {open && popRect && (() => {
+            {open && popRect && portalEl && (() => {
                 const popover = (
                     <div
                         ref={popRef}
@@ -745,7 +749,7 @@ export function Combobox(props: ComboboxProps) {
                         className="r-cbox-pop"
                         role="listbox"
                         aria-multiselectable={isMulti || undefined}
-                        style={{ position: 'fixed', top: popRect.top, left: popRect.left, width: popRect.width }}
+                        style={{ position: inModal ? 'absolute' : 'fixed', top: popRect.top, left: popRect.left, width: popRect.width }}
                     >
                         <div className="r-cbox-search">
                             <Icon name="search" size={13} />
@@ -802,10 +806,7 @@ export function Combobox(props: ComboboxProps) {
                         </div>
                     </div>
                 );
-                // Render inline (no portal) when inside a Modal so the modal's
-                // focus trap can see the popover; otherwise portal to body to
-                // escape any surrounding overflow clipping.
-                return inModal ? popover : createPortal(popover, document.body);
+                return createPortal(popover, portalEl);
             })()}
         </div>
     );
