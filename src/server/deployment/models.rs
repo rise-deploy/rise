@@ -1,4 +1,5 @@
 use super::controller::DeploymentUrls;
+use crate::server::error::ServerError;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
@@ -102,6 +103,10 @@ pub struct Deployment {
     pub cpu: String,
     #[serde(default = "default_memory")]
     pub memory: String,
+    /// Multi-container side-data. `None` for legacy single-container deployments
+    /// (`replicas`/`cpu`/`memory` are the source of truth in that case).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub containers: Option<Vec<ContainerSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub job_url: Option<String>, // URL to the CI pipeline/job that created this deployment
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -215,7 +220,7 @@ pub fn rise_system_env_vars(
 }
 
 /// A runtime environment variable override included in a deployment request
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct EnvOverride {
     pub key: String,
     pub value: String,
@@ -229,6 +234,291 @@ pub struct EnvOverride {
     /// resolved deployment environment matches. `None` means the override is global.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub for_environment: Option<String>,
+}
+
+/// Per-container probe configuration. All fields are optional and fall back to
+/// the server's `HealthProbeConfig` defaults. `disabled = true` turns probes
+/// off entirely (`health_check = false` in rise.toml).
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HealthCheckSpec {
+    #[serde(default)]
+    pub disabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_delay_seconds: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub period_seconds: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_threshold: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub liveness_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness_enabled: Option<bool>,
+}
+
+/// One container in a multi-container deployment.
+///
+/// In a `CreateDeploymentRequest` `image` is `None` when the CLI is going to
+/// build and push the container from source; the server then derives the
+/// internal image tag (`<deployment_id>-<container_name>`) and stores the
+/// fully-qualified reference on the persisted spec. Containers that point at
+/// a pre-built image set `image = Some("<external>:<tag>")` and skip the
+/// build/push.
+///
+/// In the persisted JSON (and any response from the server) every container
+/// has `image`, `cpu`, `memory`, and `replicas` filled in: the server applies
+/// the resolution order `[containers.<name>]` → deployment-level effective
+/// value (CLI flag / rise.toml env override / rise.toml global / platform
+/// default) before writing the row.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ContainerSpec {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// Port the container listens on. Drives the per-container Service and
+    /// ingress routing. Need not be HTTP — the Service is plain TCP. `None`
+    /// for workers (no Service, no probes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<String>,
+    /// Container-scoped env vars (from `[containers.X.env]`). These are added
+    /// on top of the project-global env vars and override on conflict.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_overrides: Vec<EnvOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_check: Option<HealthCheckSpec>,
+}
+
+/// One ingress route mapping. Paths are matched longest-prefix-first by the
+/// reconciler; the request may list them in any order. A route maps a path to a
+/// target container; the effective port is always the target container's `port`.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct RouteSpec {
+    pub path: String,
+    pub container: String,
+}
+
+/// On-disk schema version for the `containers` / `routes` JSONB side-data on the
+/// `deployments` row. Bump this whenever the persisted [`ContainerSpec`] /
+/// [`RouteSpec`] shape changes in a way older code cannot read, and add a
+/// matching arm in [`decode_side_data`] that maps the old shape forward.
+///
+/// Multi-container is an unreleased feature, so every persisted value is a
+/// versioned envelope — there is no un-versioned "bare array" shape to read.
+pub const CONTAINER_SIDE_DATA_VERSION: u32 = 1;
+
+/// Borrowed envelope used to *write* side-data: `{ "version": N, "items": [...] }`.
+#[derive(Serialize)]
+struct SideDataWrite<'a, T> {
+    version: u32,
+    items: &'a [T],
+}
+
+/// Owned envelope used to *read* side-data. `items` is kept as a raw value so
+/// the version can be checked before committing to a concrete item type.
+#[derive(Deserialize)]
+struct SideDataRead {
+    version: u32,
+    items: serde_json::Value,
+}
+
+/// Wrap a list of container/route specs in the versioned envelope for storage
+/// in the `containers` / `routes` JSONB columns.
+pub fn encode_side_data<T: Serialize>(items: &[T]) -> Result<serde_json::Value, serde_json::Error> {
+    serde_json::to_value(SideDataWrite {
+        version: CONTAINER_SIDE_DATA_VERSION,
+        items,
+    })
+}
+
+/// Decode a persisted `containers` / `routes` envelope into its item list.
+///
+/// Every persisted value is a versioned envelope (multi-container is unreleased,
+/// so there is no legacy bare-array shape to accept). An unknown/future version
+/// is a hard error rather than a silent empty list — callers map it to their own
+/// failure mode (mark the deployment Failed, return a 500, or render without the
+/// side-data).
+pub fn decode_side_data<T: serde::de::DeserializeOwned>(
+    value: &serde_json::Value,
+) -> anyhow::Result<Vec<T>> {
+    let envelope: SideDataRead = serde_json::from_value(value.clone())
+        .map_err(|e| anyhow::anyhow!("side-data envelope could not be deserialized: {e}"))?;
+    if envelope.version != CONTAINER_SIDE_DATA_VERSION {
+        anyhow::bail!(
+            "unsupported container side-data version {} (this build understands version {})",
+            envelope.version,
+            CONTAINER_SIDE_DATA_VERSION
+        );
+    }
+    serde_json::from_value(envelope.items).map_err(|e| {
+        anyhow::anyhow!(
+            "side-data items (version {}) could not be deserialized: {e}",
+            envelope.version
+        )
+    })
+}
+
+/// Validate `^[a-z][a-z0-9-]{0,14}$` (max 15 chars, RFC 1123 label, starts
+/// with letter, lowercase alphanumeric + dash; no trailing dash).
+///
+/// Kept short so `<project>-<deployment_id(15)>-<container>` fits the K8s
+/// 63-char resource name limit.
+fn is_valid_container_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 15 {
+        return false;
+    }
+    if name.ends_with('-') {
+        return false;
+    }
+    let mut chars = name.chars();
+    let first = chars.next().expect("non-empty by len() check above");
+    if !first.is_ascii_lowercase() {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Validate an ingress route path at the server trust boundary.
+///
+/// The path flows verbatim into the Kubernetes Ingress, in the same host rule
+/// where the platform appends `/.rise -> rise-backend` for auth/workload-token
+/// endpoints. Two guards:
+///  - The `/.rise` prefix is reserved for the platform; a tenant route there
+///    (e.g. `/.rise` or `/.rise/auth`) could shadow the platform auth backend.
+///  - The path must match a conservative URL-path charset
+///    (`^/[A-Za-z0-9._~/-]*$`, still allowing root `/`) so control chars,
+///    whitespace, quotes, `;`, `#`, backslashes, etc. can't be injected.
+fn validate_route_path(path: &str) -> Result<(), ServerError> {
+    if !path.starts_with('/') {
+        return Err(ServerError::bad_request(format!(
+            "Route path '{}' must start with '/'",
+            path
+        )));
+    }
+    if path == "/.rise" || path.starts_with("/.rise/") {
+        return Err(ServerError::bad_request(format!(
+            "Route path '{}' uses the reserved '/.rise' platform prefix",
+            path
+        )));
+    }
+    // ^/[A-Za-z0-9._~/-]*$ — leading '/' already checked above.
+    if !path[1..]
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '~' | '/' | '-'))
+    {
+        return Err(ServerError::bad_request(format!(
+            "Route path '{}' contains invalid characters; allowed: letters, digits, and '. _ ~ / -'",
+            path
+        )));
+    }
+    Ok(())
+}
+
+/// Validate the wire-level multi-container spec (containers + routes) from a
+/// `CreateDeploymentRequest`. Returns `Ok(())` for legacy single-container
+/// requests (`containers` is `None`).
+///
+/// Rules (see docstrings on `ContainerSpec`/`RouteSpec`):
+/// - Container name must match `^[a-z][a-z0-9-]{0,14}$`.
+/// - Container names must be unique within the request.
+/// - Each container must set exactly one of `image` (non-empty) or `build`
+///   (handled implicitly: `image == None` ⇒ CLI will build).
+/// - `env_overrides` entries with `is_secret = true` are rejected; per-container
+///   secret overrides are not yet supported on the wire. (Key/`PORT`/protected
+///   validation of per-container overrides happens in the request handler,
+///   reusing the same `validate_env_override` as top-level overrides.)
+/// - `health_check.is_some()` requires `port.is_some()`.
+/// - Each route's `container` must match a container in the request.
+/// - The route's target container must have `port.is_some()`.
+/// - Each route's `path` must start with `/`, must not use the reserved
+///   `/.rise` platform prefix, and must match a conservative URL-path charset.
+pub fn validate_containers_and_routes(
+    containers: Option<&[ContainerSpec]>,
+    routes: &[RouteSpec],
+) -> Result<(), ServerError> {
+    let Some(containers) = containers else {
+        if !routes.is_empty() {
+            return Err(ServerError::bad_request(
+                "routes requires at least one container",
+            ));
+        }
+        return Ok(());
+    };
+
+    if containers.is_empty() {
+        return Err(ServerError::bad_request(
+            "containers list must not be empty when present",
+        ));
+    }
+
+    let mut seen_names = std::collections::HashSet::with_capacity(containers.len());
+    for spec in containers {
+        if !is_valid_container_name(&spec.name) {
+            return Err(ServerError::bad_request(format!(
+                "Invalid container name '{}': must match ^[a-z][a-z0-9-]{{0,14}}$ (max 15 chars, no trailing dash)",
+                spec.name
+            )));
+        }
+        if !seen_names.insert(spec.name.clone()) {
+            return Err(ServerError::bad_request(format!(
+                "Duplicate container name '{}'",
+                spec.name
+            )));
+        }
+        if let Some(ref img) = spec.image {
+            if img.is_empty() {
+                return Err(ServerError::bad_request(format!(
+                    "Container '{}' has an empty image; either omit it (build from source) or set a non-empty value",
+                    spec.name
+                )));
+            }
+        }
+        if spec.health_check.is_some() && spec.port.is_none() {
+            return Err(ServerError::bad_request(format!(
+                "Container '{}' has health_check but no port; set port or remove health_check",
+                spec.name
+            )));
+        }
+        for over in &spec.env_overrides {
+            if over.is_secret {
+                return Err(ServerError::bad_request(format!(
+                    "Per-container secret env overrides are not yet supported (container '{}', key '{}'). Use a project-level secret env var, or include the secret in the per-container plain env after appropriate handling.",
+                    spec.name, over.key
+                )));
+            }
+        }
+    }
+
+    let container_by_name: std::collections::HashMap<&str, &ContainerSpec> =
+        containers.iter().map(|c| (c.name.as_str(), c)).collect();
+
+    for route in routes {
+        validate_route_path(&route.path)?;
+        let target = container_by_name
+            .get(route.container.as_str())
+            .ok_or_else(|| {
+                ServerError::bad_request(format!(
+                    "Route '{}' targets unknown container '{}'",
+                    route.path, route.container
+                ))
+            })?;
+        if target.port.is_none() {
+            return Err(ServerError::bad_request(format!(
+                "Route '{}' targets container '{}' which has no port",
+                route.path, route.container
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 // Request to create a deployment
@@ -281,6 +571,17 @@ pub struct CreateDeploymentRequest {
     /// explicit value, inherited from the source deployment.
     #[serde(default)]
     pub identity_audiences: Option<std::collections::BTreeMap<String, String>>,
+    /// Multi-container deployment spec. When present, the per-deployment
+    /// `image`/`http_port`/`replicas`/`cpu`/`memory` fields above are ignored —
+    /// every container declares its own. `None` keeps the legacy
+    /// single-container behaviour (back-compat for older CLIs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub containers: Option<Vec<ContainerSpec>>,
+    /// Ingress route map (`path` → `container`). Only meaningful when
+    /// `containers` is set. Order doesn't matter — the reconciler sorts by
+    /// path length descending for nginx longest-prefix-first semantics.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<RouteSpec>,
 }
 
 // Response from creating a deployment
@@ -292,6 +593,14 @@ pub struct CreateDeploymentResponse {
     /// endpoint `GET /projects/{name}/deployments/{id}/registry-credentials` instead.
     /// This field is kept for backward compatibility with older CLI versions.
     pub credentials: crate::server::registry::models::RegistryCredentials,
+    /// Multi-container deployments only: map of container name → the
+    /// fully-qualified client-facing image tag the CLI should build and push
+    /// for that container. Server-derived tags share the project's repository
+    /// and the returned `credentials` are minted to cover every entry in this
+    /// map. Containers with a pre-built image (the request set `image`)
+    /// appear with the user-supplied value so the CLI can skip the push.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_images: Option<std::collections::BTreeMap<String, String>>,
 }
 
 // Request to update deployment status
@@ -404,5 +713,335 @@ mod tests {
         .unwrap();
 
         assert_eq!(env_override.is_protected, Some(false));
+    }
+
+    fn cspec(name: &str, image: Option<&str>, port: Option<u16>) -> ContainerSpec {
+        ContainerSpec {
+            name: name.to_string(),
+            image: image.map(|s| s.to_string()),
+            port,
+            replicas: None,
+            cpu: None,
+            memory: None,
+            env_overrides: vec![],
+            health_check: None,
+        }
+    }
+
+    #[test]
+    fn test_validate_legacy_request_passes() {
+        assert!(validate_containers_and_routes(None, &[]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_legacy_request_with_routes_fails() {
+        let routes = vec![RouteSpec {
+            path: "/".to_string(),
+            container: "app".to_string(),
+        }];
+        assert!(validate_containers_and_routes(None, &routes).is_err());
+    }
+
+    #[test]
+    fn test_validate_empty_containers_list_fails() {
+        let result = validate_containers_and_routes(Some(&[]), &[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_basic_multi_container_passes() {
+        let containers = vec![
+            cspec("api", Some("nginx:latest"), Some(8080)),
+            cspec("worker", Some("busybox:latest"), None),
+        ];
+        let routes = vec![RouteSpec {
+            path: "/".to_string(),
+            container: "api".to_string(),
+        }];
+        validate_containers_and_routes(Some(&containers), &routes).unwrap();
+    }
+
+    #[test]
+    fn test_validate_invalid_container_name_uppercase() {
+        let containers = vec![cspec("API", Some("nginx"), Some(8080))];
+        let err = validate_containers_and_routes(Some(&containers), &[]).unwrap_err();
+        assert!(
+            err.message.contains("Invalid container name"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_validate_invalid_container_name_too_long() {
+        let containers = vec![cspec("aaaaaaaaaaaaaaaa", Some("nginx"), Some(8080))];
+        assert!(validate_containers_and_routes(Some(&containers), &[]).is_err());
+    }
+
+    #[test]
+    fn test_validate_invalid_container_name_trailing_dash() {
+        let containers = vec![cspec("api-", Some("nginx"), Some(8080))];
+        assert!(validate_containers_and_routes(Some(&containers), &[]).is_err());
+    }
+
+    #[test]
+    fn test_validate_container_name_15_chars_ok() {
+        let containers = vec![cspec("abcdefghijklmno", Some("nginx"), Some(8080))];
+        validate_containers_and_routes(Some(&containers), &[]).unwrap();
+    }
+
+    #[test]
+    fn test_validate_container_name_empty_fails() {
+        let containers = vec![cspec("", Some("nginx"), Some(8080))];
+        let err = validate_containers_and_routes(Some(&containers), &[]).unwrap_err();
+        assert!(
+            err.message.contains("Invalid container name"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_validate_container_name_single_char_ok() {
+        let containers = vec![cspec("a", Some("nginx"), Some(8080))];
+        validate_containers_and_routes(Some(&containers), &[]).unwrap();
+    }
+
+    #[test]
+    fn test_validate_duplicate_container_names_fails() {
+        let containers = vec![
+            cspec("api", Some("nginx"), Some(8080)),
+            cspec("api", Some("nginx"), Some(9090)),
+        ];
+        let err = validate_containers_and_routes(Some(&containers), &[]).unwrap_err();
+        assert!(err.message.contains("Duplicate"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn test_validate_empty_image_string_fails() {
+        let containers = vec![cspec("api", Some(""), Some(8080))];
+        let err = validate_containers_and_routes(Some(&containers), &[]).unwrap_err();
+        assert!(err.message.contains("empty image"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn test_validate_health_check_requires_http_port() {
+        let mut spec = cspec("api", Some("nginx"), None);
+        spec.health_check = Some(HealthCheckSpec::default());
+        let err = validate_containers_and_routes(Some(&[spec]), &[]).unwrap_err();
+        assert!(err.message.contains("health_check"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn test_validate_route_to_unknown_container_fails() {
+        let containers = vec![cspec("api", Some("nginx"), Some(8080))];
+        let routes = vec![RouteSpec {
+            path: "/".to_string(),
+            container: "ghost".to_string(),
+        }];
+        let err = validate_containers_and_routes(Some(&containers), &routes).unwrap_err();
+        assert!(
+            err.message.contains("unknown container"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_validate_route_to_worker_fails() {
+        let containers = vec![cspec("worker", Some("busybox"), None)];
+        let routes = vec![RouteSpec {
+            path: "/".to_string(),
+            container: "worker".to_string(),
+        }];
+        let err = validate_containers_and_routes(Some(&containers), &routes).unwrap_err();
+        assert!(err.message.contains("no port"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn test_validate_route_path_missing_leading_slash_fails() {
+        let containers = vec![cspec("api", Some("nginx"), Some(8080))];
+        let routes = vec![RouteSpec {
+            path: "api".to_string(),
+            container: "api".to_string(),
+        }];
+        let err = validate_containers_and_routes(Some(&containers), &routes).unwrap_err();
+        assert!(
+            err.message.contains("must start with '/'"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_validate_route_path_reserved_rise_prefix_rejected() {
+        let containers = vec![cspec("api", Some("nginx"), Some(8080))];
+        for reserved in ["/.rise", "/.rise/auth"] {
+            let routes = vec![RouteSpec {
+                path: reserved.to_string(),
+                container: "api".to_string(),
+            }];
+            let err = validate_containers_and_routes(Some(&containers), &routes).unwrap_err();
+            assert!(
+                err.message.contains("reserved") && err.message.contains("/.rise"),
+                "got: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_route_path_normal_accepted() {
+        let containers = vec![cspec("api", Some("nginx"), Some(8080))];
+        let routes = vec![RouteSpec {
+            path: "/api".to_string(),
+            container: "api".to_string(),
+        }];
+        validate_containers_and_routes(Some(&containers), &routes).unwrap();
+    }
+
+    #[test]
+    fn test_validate_route_path_invalid_charset_rejected() {
+        let containers = vec![cspec("api", Some("nginx"), Some(8080))];
+        for bad in ["/has space", "/has\"quote"] {
+            let routes = vec![RouteSpec {
+                path: bad.to_string(),
+                container: "api".to_string(),
+            }];
+            let err = validate_containers_and_routes(Some(&containers), &routes).unwrap_err();
+            assert!(
+                err.message.contains("invalid characters"),
+                "got: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_per_container_secret_override_rejected() {
+        let mut spec = cspec("api", Some("nginx"), Some(8080));
+        spec.env_overrides.push(EnvOverride {
+            key: "API_KEY".to_string(),
+            value: "secret".to_string(),
+            is_secret: true,
+            is_protected: None,
+            source: None,
+            for_environment: None,
+        });
+        let err = validate_containers_and_routes(Some(&[spec]), &[]).unwrap_err();
+        assert!(
+            err.message.contains("secret env overrides"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    // ── Versioned side-data envelope (encode/decode round-trip) ─────────────
+
+    #[test]
+    fn side_data_round_trips_through_versioned_envelope() {
+        // Every persisted field populated, so a future field drop/rename shows up
+        // here as a round-trip mismatch.
+        let specs = vec![
+            ContainerSpec {
+                name: "api".to_string(),
+                image: Some("img-api".to_string()),
+                port: Some(8080),
+                replicas: Some(3),
+                cpu: Some("500m".to_string()),
+                memory: Some("256Mi".to_string()),
+                env_overrides: vec![EnvOverride {
+                    key: "K".to_string(),
+                    value: "V".to_string(),
+                    is_secret: false,
+                    is_protected: Some(true),
+                    source: Some("toml".to_string()),
+                    for_environment: Some("production".to_string()),
+                }],
+                health_check: Some(HealthCheckSpec {
+                    disabled: false,
+                    path: Some("/health".to_string()),
+                    initial_delay_seconds: Some(5),
+                    period_seconds: Some(10),
+                    timeout_seconds: Some(2),
+                    failure_threshold: Some(3),
+                    liveness_enabled: Some(true),
+                    readiness_enabled: Some(false),
+                }),
+            },
+            ContainerSpec {
+                name: "worker".to_string(),
+                image: Some("img-worker".to_string()),
+                port: None,
+                replicas: Some(1),
+                cpu: None,
+                memory: None,
+                env_overrides: vec![],
+                health_check: None,
+            },
+        ];
+
+        let encoded = encode_side_data(&specs).expect("encode");
+        // The on-disk shape is a versioned envelope, never a bare array.
+        assert_eq!(encoded["version"], CONTAINER_SIDE_DATA_VERSION);
+        assert!(encoded["items"].is_array());
+
+        let decoded: Vec<ContainerSpec> = decode_side_data(&encoded).expect("decode");
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].name, "api");
+        assert_eq!(decoded[0].port, Some(8080));
+        assert_eq!(decoded[0].env_overrides[0].is_protected, Some(true));
+        let hc = decoded[0].health_check.as_ref().unwrap();
+        assert_eq!(hc.path.as_deref(), Some("/health"));
+        assert_eq!(hc.readiness_enabled, Some(false));
+        assert_eq!(decoded[1].name, "worker");
+        assert_eq!(decoded[1].port, None);
+
+        // Routes round-trip through the same envelope.
+        let routes = vec![RouteSpec {
+            path: "/api".to_string(),
+            container: "api".to_string(),
+        }];
+        let routes_decoded: Vec<RouteSpec> =
+            decode_side_data(&encode_side_data(&routes).unwrap()).unwrap();
+        assert_eq!(routes_decoded.len(), 1);
+        assert_eq!(routes_decoded[0].path, "/api");
+    }
+
+    #[test]
+    fn side_data_decode_tolerates_unknown_item_fields() {
+        // Additive evolution: an item carrying a field this build doesn't know
+        // must still decode (no deny_unknown_fields), so old readers survive a
+        // new optional field without a version bump.
+        let envelope = serde_json::json!({
+            "version": CONTAINER_SIDE_DATA_VERSION,
+            "items": [ { "name": "api", "port": 8080, "future_field": 123 } ],
+        });
+        let decoded: Vec<ContainerSpec> = decode_side_data(&envelope).expect("decode");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].name, "api");
+    }
+
+    #[test]
+    fn side_data_decode_rejects_unknown_version() {
+        // A future/unknown version is a hard error (callers map it to Failed /
+        // 500 / render-without) rather than silently decoding the wrong shape.
+        let envelope = serde_json::json!({
+            "version": CONTAINER_SIDE_DATA_VERSION + 1,
+            "items": [ { "name": "api", "port": 8080 } ],
+        });
+        let err = decode_side_data::<ContainerSpec>(&envelope).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("unsupported container side-data version"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn side_data_decode_rejects_bare_array() {
+        // Hard cutover: a legacy bare array (no envelope) is NOT accepted — it
+        // has no `version`/`items`, so the envelope deserialization fails.
+        let bare = serde_json::json!([ { "name": "api", "port": 8080 } ]);
+        assert!(decode_side_data::<ContainerSpec>(&bare).is_err());
     }
 }

@@ -12,6 +12,96 @@ use crate::config::Config;
 
 // Re-export models from API module (always available)
 pub use crate::api::models::{Deployment, DeploymentStatus};
+// Multi-container request wire types (serialized into the create-deployment body).
+use crate::api::models::{ContainerSpec, RouteSpec};
+
+/// Convert the `[containers]` section of `rise.toml` into the typed request
+/// structs expected by `POST /deployments`. Returns `(None, [])` when the
+/// project is single-container (no `[containers]` block) so the existing
+/// single-image code path drives the request and the backend synthesises the
+/// implicit `app` container at reconcile time.
+///
+/// Routes default to `/` → the only routable container when `[routes]` is
+/// omitted and exactly one container has a `port`.
+fn build_multi_container_payload(
+    toml_config: Option<&crate::rise_toml::ProjectBuildConfig>,
+) -> Result<(Option<Vec<ContainerSpec>>, Vec<RouteSpec>)> {
+    use crate::api::models::{EnvOverride as WireEnvOverride, HealthCheckSpec};
+    use crate::rise_toml::HealthCheckSetting;
+
+    let Some(cfg) = toml_config else {
+        return Ok((None, Vec::new()));
+    };
+    let resolved = cfg.resolve_deploy().map_err(|e| anyhow::anyhow!(e))?;
+    if resolved.containers.is_empty() {
+        // Single-container project; let the existing image flow handle it.
+        return Ok((None, Vec::new()));
+    }
+
+    let mut containers = Vec::with_capacity(resolved.containers.len());
+    for c in &resolved.containers {
+        // Each container needs exactly one of `image` or `[build]`.
+        // - With `image`: pass the user-supplied reference through; backend
+        //   uses it verbatim and the CLI skips the push for this container.
+        // - With `[build]`: leave `image` unset; the backend derives a tag
+        //   under the project repository and returns it in
+        //   `container_images` so the CLI can `docker build -t <tag>`.
+        // (`load_full_project_config` already enforces exactly-one-of.)
+        let env_overrides: Vec<WireEnvOverride> = c
+            .env
+            .iter()
+            .map(|(key, value)| WireEnvOverride {
+                key: key.clone(),
+                value: value.clone(),
+                is_secret: false,
+                // Per-container env is plain-only and never environment-scoped;
+                // leave is_protected/for_environment unset (omitted on the wire).
+                is_protected: None,
+                source: Some("toml".to_string()),
+                for_environment: None,
+            })
+            .collect();
+
+        let health_check = c.health_check.as_ref().map(|hc| match hc {
+            HealthCheckSetting::Disabled(_) => HealthCheckSpec {
+                disabled: true,
+                ..Default::default()
+            },
+            HealthCheckSetting::Config(cfg) => HealthCheckSpec {
+                disabled: false,
+                path: cfg.path.clone(),
+                initial_delay_seconds: cfg.initial_delay_seconds,
+                period_seconds: cfg.period_seconds,
+                timeout_seconds: cfg.timeout_seconds,
+                failure_threshold: cfg.failure_threshold,
+                liveness_enabled: cfg.liveness_enabled,
+                readiness_enabled: cfg.readiness_enabled,
+            },
+        });
+
+        containers.push(ContainerSpec {
+            name: c.name.clone(),
+            image: c.image.clone(),
+            port: c.port,
+            replicas: c.replicas,
+            cpu: c.cpu.clone(),
+            memory: c.memory.clone(),
+            env_overrides,
+            health_check,
+        });
+    }
+
+    let routes: Vec<RouteSpec> = resolved
+        .routes
+        .iter()
+        .map(|r| RouteSpec {
+            path: r.path.clone(),
+            container: r.container.clone(),
+        })
+        .collect();
+
+    Ok((Some(containers), routes))
+}
 
 /// Parse duration string (e.g., "5m", "30s", "1h")
 pub(super) fn parse_duration(s: &str) -> Result<Duration> {
@@ -422,6 +512,11 @@ struct CreateDeploymentResponse {
     /// Kept for deserialization compatibility with older backends.
     #[allow(dead_code)]
     credentials: RegistryCredentials,
+    /// Multi-container deployments only: map of container name → fully-
+    /// qualified client-facing image tag the CLI should build and push.
+    /// Absent for single-container responses; older backends omit it.
+    #[serde(default)]
+    container_images: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -431,16 +526,20 @@ struct GetRegistryCredsResponse {
     repository: String,
 }
 
-/// Subset of the platform capabilities response the CLI cares about. The full
-/// response also carries other capability flags (e.g. `runtime_allows_root`)
-/// the CLI doesn't need; unknown fields are ignored.
-#[derive(serde::Deserialize)]
+/// Decoded response from `GET /api/v1/platform/capabilities`.
+/// Other capability flags (e.g. `runtime_allows_root`) are ignored by the CLI.
+#[derive(Deserialize)]
 struct PlatformCapabilities {
-    /// Container architecture the target cluster accepts (e.g. "amd64"). Absent
-    /// when the cluster is unconstrained. (`Option` fields default to `None`
-    /// when the key is missing, so no `#[serde(default)]` is needed.)
+    /// Container architecture the target cluster accepts (e.g. "amd64").
+    /// Absent when the cluster is unconstrained.
     runtime_arch: Option<String>,
 }
+
+/// Legacy default build platform, used when the backend predates the platform
+/// capabilities endpoint.
+///
+/// TODO: remove once all backends expose `GET /api/v1/platform/capabilities`.
+const LEGACY_PLATFORM_FALLBACK: &str = "linux/amd64";
 
 /// Log the resolved build platform and the source it was inferred from, so the
 /// choice isn't silent when Rise infers it. Explicit user choices (CLI flag,
@@ -454,15 +553,7 @@ fn log_platform_choice(platform: &str, source: PlatformSource, operation: &str) 
             "{operation} for {platform} (legacy default; this backend predates the platform capabilities endpoint)"
         ),
         HostFallback => {
-            // Reached only when a *supported* capabilities endpoint reported no
-            // required architecture (a genuinely unconstrained cluster — e.g.
-            // local dev). An *unsupported* endpoint (old backend → 404) does NOT
-            // land here: `fetch_backend_platform_hint` reports that as
-            // `LegacyBackendDefault` (linux/amd64). So we can state
-            // "unconstrained" here without conflating the two.
-            info!(
-                "{operation} for {platform} (host architecture; target cluster is unconstrained — pass --platform to override)"
-            )
+            info!("{operation} for {platform} (host architecture; target cluster is unconstrained — pass --platform to override)")
         }
     }
 }
@@ -508,28 +599,11 @@ async fn fetch_deployment_registry_credentials(
     Ok(resp.credentials)
 }
 
-/// Legacy default build platform, used when the backend predates the platform
-/// capabilities endpoint. Older backends advertised `linux/amd64` by default
-/// (their node selector pinned amd64), so a newer CLI talking to an older
-/// backend keeps that behavior instead of erroring.
+/// Fetch the build-platform hint from the backend's capabilities endpoint.
 ///
-/// TODO: remove this fallback once all backends expose
-/// `GET /api/v1/platform/capabilities`.
-const LEGACY_PLATFORM_FALLBACK: &str = "linux/amd64";
-
-/// Derive the container build platform the target cluster expects (e.g.
-/// "linux/amd64") from the platform capabilities endpoint.
-///
-/// Returns:
-/// - `Some(Advertised(..))` when the endpoint pins an architecture;
-/// - `Some(LegacyDefault(..))` when the endpoint is absent (404 — a backend
-///   that predates it), so the deploy keeps working with the legacy default
-///   rather than erroring;
-/// - `None` when a *supported* endpoint reports an unconstrained cluster — the
-///   build then falls back to the host architecture.
-///
-/// Any other non-success status is a hard error: without positive evidence of
-/// the target architecture we must not silently guess.
+/// Returns `Some(Advertised(..))` when the endpoint pins an architecture,
+/// `Some(LegacyDefault(..))` when the endpoint is absent (404 — a backend that
+/// predates it), or `None` when the endpoint reports an unconstrained cluster.
 async fn fetch_backend_platform_hint(
     http_client: &Client,
     backend_url: &str,
@@ -544,8 +618,6 @@ async fn fetch_backend_platform_hint(
         .await
         .context("Failed to fetch platform capabilities")?;
 
-    // Older backend without the endpoint: don't break the deploy, fall back to
-    // the platform older backends defaulted to.
     if response.status().as_u16() == 404 {
         debug!(
             "Backend has no /platform/capabilities endpoint; falling back to legacy platform '{}'",
@@ -685,6 +757,13 @@ pub async fn create_deployment(
         info!("Deployment git repository: {}", url);
     }
 
+    // Multi-container: if rise.toml has [containers], build the wire-format
+    // spec list now and validate the request shape before talking to the
+    // server. v1 requires every container to declare an `image` directly;
+    // per-container build orchestration is a follow-up.
+    let (containers_payload, routes_payload) =
+        build_multi_container_payload(deploy_opts.toml_config.as_ref())?;
+
     // Step 1: Create deployment and get deployment ID + credentials
     info!(
         "Creating deployment for project '{}'",
@@ -715,6 +794,8 @@ pub async fn create_deployment(
             .as_ref()
             .and_then(|c| c.identity.as_ref())
             .map(|i| &i.audiences),
+        containers_payload.as_deref(),
+        &routes_payload,
     )
     .await?;
 
@@ -766,7 +847,7 @@ pub async fn create_deployment(
             };
 
             // Fetch deployment-scoped registry credentials
-            let credentials = fetch_deployment_registry_credentials(
+            let registry_credentials = fetch_deployment_registry_credentials(
                 http_client,
                 backend_url,
                 &token,
@@ -780,7 +861,7 @@ pub async fn create_deployment(
                 backend_url,
                 &token,
                 &container_cli,
-                &credentials,
+                &registry_credentials,
                 deploy_opts.project_name,
                 &deployment_info.deployment_id,
             )
@@ -891,14 +972,28 @@ pub async fn create_deployment(
                 "current project"
             }
         );
+    } else if deployment_info.container_images.is_some() {
+        // Multi-container build path. The backend returned the resolved
+        // image tag for every container; we build/push each one in turn
+        // using its own `[containers.X.build]` config. Pre-built containers
+        // (the ones whose rise.toml entry sets `image = "..."`) are
+        // skipped — the backend already persisted their tag verbatim.
+        build_and_push_multi_container(
+            http_client,
+            backend_url,
+            &token,
+            config,
+            &deploy_opts,
+            &deployment_info,
+        )
+        .await?;
     } else {
         // Build from source path: Execute build and push.
         //
-        // Fetch the backend's architecture hint first so it can feed into
-        // BuildOptions' platform precedence.
+        // Fetch platform hint and credentials for the build-from-source path.
         let backend_platform =
             fetch_backend_platform_hint(http_client, backend_url, &token).await?;
-        let credentials = fetch_deployment_registry_credentials(
+        let registry_credentials = fetch_deployment_registry_credentials(
             http_client,
             backend_url,
             &token,
@@ -922,7 +1017,7 @@ pub async fn create_deployment(
             backend_url,
             &token,
             options.container_cli.command(),
-            &credentials,
+            &registry_credentials,
             deploy_opts.project_name,
             &deployment_info.deployment_id,
         )
@@ -991,6 +1086,146 @@ pub async fn create_deployment(
 
     Ok(())
 }
+/// Multi-container build path: builds every container with `[build]` set
+/// using the image tag the backend returned (in
+/// `CreateDeploymentResponse.container_images`) and pushes it. Containers
+/// whose rise.toml entry is `image = "..."` are pre-built and skipped — the
+/// backend already persisted the user-provided tag.
+///
+/// Builds run sequentially in the iteration order of `[containers.<name>]`
+/// (BTreeMap → lexicographic). Registry credentials are re-minted per
+/// container before login + build + push, because a long multi-container
+/// build (cold BuildKit cache × N containers) can outlast the issued
+/// token's `expires_in` and cause later pushes to 401.
+async fn build_and_push_multi_container(
+    http_client: &Client,
+    backend_url: &str,
+    token: &str,
+    config: &Config,
+    deploy_opts: &DeploymentOptions<'_>,
+    deployment_info: &CreateDeploymentResponse,
+) -> Result<()> {
+    let toml_config = deploy_opts.toml_config.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "multi-container deployment created but no rise.toml loaded — cannot build images"
+        )
+    })?;
+    let container_images = deployment_info
+        .container_images
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("backend response missing container_images"))?;
+
+    let resolved = toml_config
+        .resolve_deploy()
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    // Fetch the backend platform hint upfront — needed for every container's
+    // BuildOptions. Credentials are minted fresh per container below so a
+    // long multi-container build can't outlast a token's expires_in.
+    let backend_platform = fetch_backend_platform_hint(http_client, backend_url, token).await?;
+
+    update_deployment_status(
+        http_client,
+        backend_url,
+        token,
+        deploy_opts.project_name,
+        &deployment_info.deployment_id,
+        "Building",
+        None,
+    )
+    .await?;
+
+    for container in &resolved.containers {
+        let Some(image_tag) = container_images.get(&container.name) else {
+            // Shouldn't happen — the backend populates every container.
+            anyhow::bail!(
+                "Server response is missing image tag for container '{}'",
+                container.name
+            );
+        };
+
+        if container.build.is_none() {
+            info!(
+                "✓ Container '{}' uses pre-built image '{}', skipping build",
+                container.name, image_tag
+            );
+            continue;
+        }
+
+        // Feed BuildOptions::from_build_args a toml_config view that has
+        // this container's [build] at the top level, so backend / dockerfile
+        // / build_context / etc. all come from the per-container config.
+        let mut per_container_toml = toml_config.clone();
+        per_container_toml.build = container.build.clone();
+
+        let options = BuildOptions::from_build_args(
+            config,
+            image_tag.clone(),
+            deploy_opts.path.to_string(),
+            deploy_opts.build_args,
+            Some(per_container_toml),
+            backend_platform.clone(),
+        )
+        .with_push(true);
+
+        // Re-mint per container — long builds can outlast the token's expires_in.
+        let fresh_creds = fetch_deployment_registry_credentials(
+            http_client,
+            backend_url,
+            token,
+            deploy_opts.project_name,
+            &deployment_info.deployment_id,
+        )
+        .await?;
+        login_to_registry(
+            http_client,
+            backend_url,
+            token,
+            options.container_cli.command(),
+            &fresh_creds,
+            deploy_opts.project_name,
+            &deployment_info.deployment_id,
+        )
+        .await?;
+
+        log_platform_choice(&options.platform, options.platform_source, "Building");
+        info!("→ Building container '{}' as {}", container.name, image_tag);
+
+        if let Err(e) = build::build_image(options) {
+            let msg = format!("Build of container '{}' failed: {}", container.name, e);
+            update_deployment_status(
+                http_client,
+                backend_url,
+                token,
+                deploy_opts.project_name,
+                &deployment_info.deployment_id,
+                "Failed",
+                Some(&msg),
+            )
+            .await?;
+            return Err(e);
+        }
+        info!("  ✓ Pushed container '{}'", container.name);
+    }
+
+    update_deployment_status(
+        http_client,
+        backend_url,
+        token,
+        deploy_opts.project_name,
+        &deployment_info.deployment_id,
+        "Pushed",
+        None,
+    )
+    .await?;
+
+    info!(
+        "✓ Successfully built and pushed {} container(s)",
+        resolved.containers.len()
+    );
+    Ok(())
+}
+
 /// Login to the container registry, marking the deployment as Failed on error.
 async fn login_to_registry(
     http_client: &Client,
@@ -1275,6 +1510,8 @@ async fn call_create_deployment_api(
     cpu: Option<&str>,
     memory: Option<&str>,
     identity_audiences: Option<&std::collections::BTreeMap<String, String>>,
+    containers: Option<&[ContainerSpec]>,
+    routes: &[RouteSpec],
 ) -> Result<CreateDeploymentResponse> {
     let url = format!("{}/api/v1/deployments", backend_url);
     let mut payload = serde_json::json!({
@@ -1372,6 +1609,17 @@ async fn call_create_deployment_api(
             })
             .collect();
         payload["env_overrides"] = serde_json::json!(overrides);
+    }
+
+    // Serialize the typed container/route specs. ContainerSpec/RouteSpec carry
+    // the same serde skip/default rules as the server's structs, so this
+    // produces exactly what the server deserializes. Omit when absent/empty to
+    // match the legacy single-container request shape.
+    if let Some(c) = containers {
+        payload["containers"] = serde_json::to_value(c)?;
+    }
+    if !routes.is_empty() {
+        payload["routes"] = serde_json::to_value(routes)?;
     }
 
     let response = http_client
@@ -2160,76 +2408,5 @@ mod tests {
         assert_eq!(normalize_git_url(""), None);
         assert_eq!(normalize_git_url("not-a-url"), None);
         assert_eq!(normalize_git_url("/local/path/repo"), None);
-    }
-
-    /// Spawn a one-shot HTTP server that answers the first request with the
-    /// given status line (e.g. "404 Not Found") and JSON `body`, then closes.
-    /// Lets us drive `fetch_backend_platform_hint` end-to-end through reqwest
-    /// without a mock-server dependency. Returns the base URL.
-    async fn spawn_one_shot_response(status_line: &'static str, body: &'static str) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            // Drain the request first so the client has finished writing, then
-            // reply and close.
-            let mut buf = [0u8; 1024];
-            let _ = socket.read(&mut buf).await;
-            let response = format!(
-                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = socket.write_all(response.as_bytes()).await;
-            let _ = socket.shutdown().await;
-        });
-        format!("http://{addr}")
-    }
-
-    #[tokio::test]
-    async fn platform_hint_404_maps_to_legacy_default() {
-        // An old backend without the endpoint returns 404; we must fall back to
-        // the legacy linux/amd64 default rather than erroring or treating the
-        // cluster as unconstrained.
-        let base = spawn_one_shot_response("404 Not Found", "").await;
-        let hint = super::fetch_backend_platform_hint(&super::Client::new(), &base, "test-token")
-            .await
-            .expect("404 must not be a hard error");
-        assert_eq!(
-            hint,
-            Some(super::BackendPlatformHint::LegacyDefault(
-                "linux/amd64".to_string()
-            ))
-        );
-    }
-
-    #[tokio::test]
-    async fn platform_hint_uses_advertised_arch() {
-        let base = spawn_one_shot_response(
-            "200 OK",
-            r#"{"runtime_arch":"arm64","runtime_allows_root":true}"#,
-        )
-        .await;
-        let hint = super::fetch_backend_platform_hint(&super::Client::new(), &base, "test-token")
-            .await
-            .unwrap();
-        assert_eq!(
-            hint,
-            Some(super::BackendPlatformHint::Advertised(
-                "linux/arm64".to_string()
-            ))
-        );
-    }
-
-    #[tokio::test]
-    async fn platform_hint_unconstrained_cluster_is_none() {
-        // Supported endpoint, but no architecture pinned → no hint, so the
-        // build falls back to the host architecture.
-        let base = spawn_one_shot_response("200 OK", r#"{"runtime_allows_root":true}"#).await;
-        let hint = super::fetch_backend_platform_hint(&super::Client::new(), &base, "test-token")
-            .await
-            .unwrap();
-        assert_eq!(hint, None);
     }
 }

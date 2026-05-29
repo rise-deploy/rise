@@ -224,6 +224,57 @@ Rise injects variables like `PORT`, `RISE_ISSUER`, `RISE_APP_URL`, `RISE_APP_URL
 
 For JWT validation using `RISE_ISSUER`, see [Validating JWTs](../authentication-for-apps/validating-jwts).
 
+## Multi-Container Deployments
+
+A single Rise deployment can run multiple containers — for example a frontend, an HA backend, and a worker — each as its own Kubernetes Deployment so replica counts scale independently. Configure them under `[containers.<name>]` in `rise.toml` and route HTTP traffic across them via `[routes]`:
+
+```toml
+[project]
+name = "my-app"
+
+# Each container declares exactly one of `image` (pre-built reference) or
+# a `[containers.<name>.build]` block (the CLI builds and pushes for you).
+
+[containers.frontend.build]
+backend = "docker"
+dockerfile = "frontend/Dockerfile"
+[containers.frontend]
+port = 8080
+replicas = 2
+
+[containers.backend.build]
+backend = "docker"
+dockerfile = "backend/Dockerfile"
+[containers.backend]
+port = 9090
+replicas = 3
+health_check = { path = "/health", initial_delay_seconds = 5 }
+# Per-container env vars. Project-level env vars also apply.
+env = { LOG_LEVEL = "info" }
+
+[containers.worker]
+# Pre-built image — the CLI won't try to build or push this one.
+image = "registry.example.com/my-app/worker:1.2.3"
+replicas = 4
+# Workers have no port → no Service, no HTTP probes.
+
+[routes]
+"/api" = { container = "backend" }
+"/" = { container = "frontend" }
+```
+
+When you run `rise deploy`, the backend allocates a deployment ID and returns one image tag for every container (a freshly minted registry tag for each `[build]` container — shared registry, distinct tags — and an immutable digest-pinned reference for each pre-built `image = ...` container). The credentials it returns are scoped to cover every container's tag, and the CLI builds and pushes only the `[build]` containers in turn (re-minting credentials per container so a long build can't outlast the token). Containers with a pre-built `image` are not rebuilt; their reference is resolved to an immutable `repo@sha256:…` digest so the running image can't drift if the upstream tag is later re-pushed.
+
+Notes:
+
+- `[containers]` is mutually exclusive with the top-level `[build]` and `[deploy]` sections. A single-container project uses the simple top-level `[build]`/`[deploy]` form — internally that's just one container named `app`.
+- Containers without `port` get no `Service` and no HTTP probes — exactly what you want for workers / batch jobs.
+- HTTP probes are **disabled by default**. Set a `health_check` block to enable them (with a path and optional timing), or `health_check = false` to explicitly mark them disabled. Containers with a `port` but no `health_check` get a `Service` but no probe.
+- Routes are matched longest-prefix-first by the ingress, so `/api` shadows `/` correctly. If `[routes]` is omitted and exactly one container has a `port`, Rise synthesises `/` → that container.
+- Platform and environment **replica limits apply to the deployment's total** replicas summed across all containers, not per container — e.g. with a cap of 10, `frontend = 4` + `backend = 3` + `worker = 4` (sum 11) is rejected. CPU and memory limits, by contrast, are enforced per container.
+- Every container receives a `RISE_CONTAINER` env var set to its own name (e.g. `"frontend"`, `"api"`).
+- When a deployment has two or more containers, each is also given a `RISE_CONTAINER_HOST__<NAME>` env var for every sibling that exposes a `port` (including a port-having container that isn't routed, such as a database) — pointing at that sibling's in-cluster Service. See [Environment Variables](../environment-variables#auto-injected-variables).
+
 ## CI/CD Deployments
 
 For automated deployments from CI/CD pipelines, use service accounts with OIDC workload identity. See [Service Accounts](../service-accounts) for setup instructions and examples for GitLab CI and GitHub Actions.

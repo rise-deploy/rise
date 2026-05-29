@@ -19,17 +19,25 @@ pub enum ImageTagType {
 /// Trait for container registry providers
 #[async_trait]
 pub trait RegistryProvider: Send + Sync {
-    /// Get temporary credentials for pushing images (scoped to repository and tag)
+    /// Mint temporary credentials for pushing one or more images, scoped to
+    /// the smallest set of artifacts the provider can express.
     ///
     /// # Arguments
-    /// * `repository` - The repository name (e.g., "my-app")
-    /// * `tag` - The image tag (e.g., deployment ID like "20251215-204525").
-    ///           Providers that support tag-level scoping use this to mint
-    ///           the narrowest possible credentials.
+    /// * `repository` - The repository name (e.g., `"my-app"`). Every tag in
+    ///   `tags` is written to this repository — multi-container deployments
+    ///   share one repository and only differ in their tag suffix.
+    /// * `tags` - All image tags the returned credentials must be able to
+    ///   write to. For single-container this is a one-element slice (the
+    ///   deployment ID); for multi-container it has one entry per container
+    ///   (e.g. `["<deployment_id>-frontend", "<deployment_id>-backend"]`).
+    ///   Providers that scope by tag (JFrog) must include every entry in the
+    ///   minted token's scope. Providers that scope by repository (ECR,
+    ///   GitLab) may ignore the slice but MUST still accept it.
     ///
-    /// # Returns
-    /// Registry credentials including username, password, and registry URL
-    async fn get_credentials(&self, repository: &str, tag: &str) -> Result<RegistryCredentials>;
+    /// Implementations may assume `tags` is non-empty; the caller guarantees
+    /// at least one tag.
+    async fn get_credentials(&self, repository: &str, tags: &[&str])
+        -> Result<RegistryCredentials>;
 
     /// Get credentials for pulling/reading images (registry-wide)
     ///

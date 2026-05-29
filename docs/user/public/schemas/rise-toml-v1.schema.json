@@ -1,5 +1,9 @@
 {
   "$defs": {
+    "BoolFalse": {
+      "const": false,
+      "type": "boolean"
+    },
     "BuildConfig": {
       "description": "Build configuration options for a project",
       "properties": {
@@ -93,6 +97,82 @@
       },
       "type": "object"
     },
+    "ContainerConfig": {
+      "description": "Configuration for one container in a multi-container deployment.",
+      "properties": {
+        "build": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BuildConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Build configuration to produce this container's image. Exclusive with `image`."
+        },
+        "cpu": {
+          "description": "CPU allocation (e.g. \"500m\", \"1\") — sets both request and limit.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Plain-text environment variables scoped to this container. Merged on top\nof any project-level env vars; container-scoped values win on conflict.",
+          "type": "object"
+        },
+        "health_check": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HealthCheckSetting"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Health check configuration. HTTP liveness+readiness probes are disabled\nby default — they must be explicitly configured here. Set a config block\nto enable probes with a custom path/timing, or `health_check = false` to\nexplicitly mark them disabled. Requires `port` to be set."
+        },
+        "image": {
+          "description": "Pre-built image reference. Exclusive with `build`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "memory": {
+          "description": "Memory allocation (e.g. \"256Mi\", \"1Gi\") — sets both request and limit.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "port": {
+          "description": "Port the container listens on. Required if the container should be\nreachable via the ingress (referenced from `[routes]`) or by sibling\ncontainers via `RISE_CONTAINER_HOST__*`. Need not be HTTP — the Service\nis plain TCP. Omit for workers.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "replicas": {
+          "description": "Number of replicas.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "DeployConfig": {
       "description": "Deployment resource configuration",
       "properties": {
@@ -153,6 +233,78 @@
       },
       "type": "object"
     },
+    "HealthCheckConfig": {
+      "description": "Health-check configuration block. All fields are optional and fall back to\nthe server's `HealthProbeConfig` defaults (path `/`, 10s initial delay, …).",
+      "properties": {
+        "failure_threshold": {
+          "description": "Consecutive failures before the probe is considered failed.",
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "initial_delay_seconds": {
+          "description": "Seconds after container start before the first probe.",
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "liveness_enabled": {
+          "description": "Enable liveness probe (default true).",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "HTTP path to probe (default `/`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "period_seconds": {
+          "description": "Seconds between probes.",
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "readiness_enabled": {
+          "description": "Enable readiness probe (default true).",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "timeout_seconds": {
+          "description": "Probe timeout in seconds.",
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "HealthCheckSetting": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/BoolFalse",
+          "description": "Pass `false` to disable probes entirely. (Only the literal `false` is\naccepted; `true` is rejected so users always go through `Config`.)"
+        },
+        {
+          "$ref": "#/$defs/HealthCheckConfig",
+          "description": "Customised probe configuration."
+        }
+      ],
+      "description": "`health_check` may either be `false` (probes disabled) or a config block."
+    },
     "IdentityConfig": {
       "description": "Workload identity configuration",
       "properties": {
@@ -187,6 +339,19 @@
         "name"
       ],
       "type": "object"
+    },
+    "RouteConfig": {
+      "description": "One ingress path → container mapping.",
+      "properties": {
+        "container": {
+          "description": "Target container name (must exist in `[containers]` and have `port` set).\nThe route's port is always the target container's `port`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "container"
+      ],
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -203,6 +368,13 @@
       ],
       "default": null,
       "description": "Build configuration (optional)"
+    },
+    "containers": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ContainerConfig"
+      },
+      "description": "Multi-container configuration. When non-empty, top-level `[build]` and\n`[deploy]` must not be set. Each container becomes a separate K8s\nDeployment so replica counts scale independently.",
+      "type": "object"
     },
     "deploy": {
       "anyOf": [
@@ -247,6 +419,13 @@
       ],
       "default": null,
       "description": "Project metadata (optional)"
+    },
+    "routes": {
+      "additionalProperties": {
+        "$ref": "#/$defs/RouteConfig"
+      },
+      "description": "Path-based ingress routing across containers. Path strings are the keys\n(e.g. `\"/api\"`, `\"/\"`); the value picks the target container. The route's\nport is always the target container's `port`.",
+      "type": "object"
     },
     "version": {
       "description": "Optional version (must be 1 if present)",

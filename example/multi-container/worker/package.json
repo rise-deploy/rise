@@ -1,0 +1,12 @@
+{
+  "name": "multi-container-worker",
+  "version": "1.0.0",
+  "private": true,
+  "main": "worker.js",
+  "dependencies": {
+    "ioredis": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=18.x"
+  }
+}

@@ -78,10 +78,133 @@ pub fn load_full_project_config(app_path: &str) -> Result<Option<ProjectBuildCon
             );
         }
 
+        validate_containers_and_routes(&config)?;
+
         Ok(Some(config))
     } else {
         Ok(None)
     }
+}
+
+/// Cross-field validation for `[containers]` and `[routes]`.
+///
+/// Rules:
+/// - `[containers]` and top-level `[build]`/`[deploy]` are mutually exclusive.
+/// - Container names must match `^[a-z][a-z0-9-]{0,14}$` (max 15 chars to keep
+///   `<project>-<deployment_id(15)>-<container>` under the 63-char K8s limit).
+/// - Each container must have exactly one of `image` / `build`.
+/// - Each container declaring a `health_check` block must also set `port`.
+/// - Each route's `container` must exist and must have `port` set.
+/// - Each route's `path` must start with `/`, must not use the reserved
+///   `/.rise` platform prefix, and must match a conservative URL-path charset.
+fn validate_containers_and_routes(config: &ProjectBuildConfig) -> Result<()> {
+    if config.containers.is_empty() {
+        if !config.routes.is_empty() {
+            anyhow::bail!("[routes] requires at least one [containers.<name>] entry");
+        }
+        return Ok(());
+    }
+
+    if config.build.is_some() || config.deploy.is_some() {
+        anyhow::bail!(
+            "Top-level [build]/[deploy] cannot be combined with [containers.<name>]. \
+             Move the top-level [build]/[deploy] settings into a [containers.app] entry."
+        );
+    }
+
+    for (name, container) in &config.containers {
+        if !is_valid_container_name(name) {
+            anyhow::bail!(
+                "Invalid container name '{}': must match ^[a-z][a-z0-9-]{{0,14}}$ (max 15 chars, no trailing dash)",
+                name
+            );
+        }
+        match (&container.image, &container.build) {
+            (Some(_), Some(_)) => anyhow::bail!(
+                "[containers.{}] cannot set both 'image' and [build]; pick one",
+                name
+            ),
+            (None, None) => {
+                anyhow::bail!("[containers.{}] must set either 'image' or [build]", name)
+            }
+            _ => {}
+        }
+        if container.health_check.is_some() && container.port.is_none() {
+            anyhow::bail!(
+                "[containers.{}] has health_check but no port; \
+                 set port or remove health_check",
+                name
+            );
+        }
+    }
+
+    for (path, route) in &config.routes {
+        validate_route_path(path)?;
+        let target = config.containers.get(&route.container).ok_or_else(|| {
+            anyhow::anyhow!(
+                "[routes] '{}' targets unknown container '{}'",
+                path,
+                route.container
+            )
+        })?;
+        if target.port.is_none() {
+            anyhow::bail!(
+                "[routes] '{}' targets container '{}' which has no port",
+                path,
+                route.container
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn is_valid_container_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 15 {
+        return false;
+    }
+    if name.ends_with('-') {
+        return false;
+    }
+    let mut chars = name.chars();
+    let first = chars.next().expect("non-empty by len() check above");
+    if !first.is_ascii_lowercase() {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Validate a `[routes]` ingress path.
+///
+/// The path flows verbatim into the Kubernetes Ingress, in the same host rule
+/// where the platform appends `/.rise -> rise-backend` for auth/workload-token
+/// endpoints. Two guards:
+///  - The `/.rise` prefix is reserved for the platform; a tenant route there
+///    (e.g. `/.rise` or `/.rise/auth`) could shadow the platform auth backend.
+///  - The path must match a conservative URL-path charset
+///    (`^/[A-Za-z0-9._~/-]*$`, still allowing root `/`) so control chars,
+///    whitespace, quotes, `;`, `#`, backslashes, etc. can't be injected.
+fn validate_route_path(path: &str) -> Result<()> {
+    if !path.starts_with('/') {
+        anyhow::bail!("[routes] path '{}' must start with '/'", path);
+    }
+    if path == "/.rise" || path.starts_with("/.rise/") {
+        anyhow::bail!(
+            "[routes] path '{}' uses the reserved '/.rise' platform prefix",
+            path
+        );
+    }
+    // ^/[A-Za-z0-9._~/-]*$ — leading '/' already checked above.
+    if !path[1..]
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '~' | '/' | '-'))
+    {
+        anyhow::bail!(
+            "[routes] path '{}' contains invalid characters; allowed: letters, digits, and '. _ ~ / -'",
+            path
+        );
+    }
+    Ok(())
 }
 
 /// Write project configuration to rise.toml
@@ -239,6 +362,8 @@ FOO = "bar"
                     deploy: None,
                 },
             )]),
+            containers: BTreeMap::new(),
+            routes: BTreeMap::new(),
         };
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -351,5 +476,380 @@ env.NODE_ENV = "production"
         assert!(staging.default);
         let production = config.environments.get("production").unwrap();
         assert!(!production.default);
+    }
+
+    fn write_toml(contents: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("rise.toml"), contents).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_multi_container_basic() {
+        let dir = write_toml(
+            r#"
+[project]
+name = "my-app"
+
+[containers.frontend]
+image = "registry.example.com/myapp/frontend:latest"
+port = 8080
+replicas = 2
+
+[containers.backend]
+image = "registry.example.com/myapp/backend:latest"
+port = 9090
+replicas = 3
+health_check = { path = "/health" }
+
+[containers.worker]
+image = "registry.example.com/myapp/worker:latest"
+
+[routes]
+"/api" = { container = "backend" }
+"/" = { container = "frontend" }
+"#,
+        );
+        let config = load_full_project_config(dir.path().to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.containers.len(), 3);
+        assert_eq!(config.routes.len(), 2);
+        let resolved = config.resolve_deploy().unwrap();
+        assert_eq!(resolved.containers.len(), 3);
+        assert_eq!(resolved.routes.len(), 2);
+        let api_route = resolved.routes.iter().find(|r| r.path == "/api").unwrap();
+        assert_eq!(api_route.container, "backend");
+    }
+
+    #[test]
+    fn test_multi_container_rejects_top_level_build() {
+        let dir = write_toml(
+            r#"
+[build]
+backend = "docker"
+
+[containers.app]
+image = "foo:bar"
+port = 8080
+"#,
+        );
+        let err = load_full_project_config(dir.path().to_str().unwrap())
+            .expect_err("expected mutual-exclusion error");
+        assert!(err.to_string().contains("Top-level [build]"), "got: {err}");
+    }
+
+    #[test]
+    fn test_multi_container_rejects_route_to_unknown_container() {
+        let dir = write_toml(
+            r#"
+[containers.api]
+image = "foo:bar"
+port = 8080
+
+[routes]
+"/" = { container = "frontend" }
+"#,
+        );
+        let err = load_full_project_config(dir.path().to_str().unwrap())
+            .expect_err("expected unknown-container error");
+        assert!(
+            err.to_string().contains("unknown container 'frontend'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_multi_container_rejects_route_to_worker() {
+        // Worker = container without a port = not routable.
+        let dir = write_toml(
+            r#"
+[containers.worker]
+image = "foo:bar"
+
+[routes]
+"/" = { container = "worker" }
+"#,
+        );
+        let err = load_full_project_config(dir.path().to_str().unwrap())
+            .expect_err("expected missing-port error");
+        assert!(err.to_string().contains("no port"), "got: {err}");
+    }
+
+    #[test]
+    fn test_health_check_false_disables_probes() {
+        let dir = write_toml(
+            r#"
+[containers.api]
+image = "foo:bar"
+port = 8080
+health_check = false
+"#,
+        );
+        let config = load_full_project_config(dir.path().to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        let api = config.containers.get("api").unwrap();
+        assert!(matches!(
+            api.health_check,
+            Some(crate::rise_toml::HealthCheckSetting::Disabled(_))
+        ));
+    }
+
+    #[test]
+    fn test_health_check_true_is_rejected() {
+        let dir = write_toml(
+            r#"
+[containers.api]
+image = "foo:bar"
+port = 8080
+health_check = true
+"#,
+        );
+        let err = load_full_project_config(dir.path().to_str().unwrap())
+            .expect_err("expected health_check=true to be rejected");
+        // Untagged enum: the message indicates no variant matched. (BoolFalse
+        // rejects `true`; the table variant doesn't match a scalar bool.)
+        let msg = err.to_string();
+        assert!(
+            msg.contains("HealthCheckSetting") || msg.contains("not allowed"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_default_route_synthesised_for_single_routable_container() {
+        // When only one container has http_port and [routes] is omitted,
+        // resolve_deploy should synthesise `/` → that container.
+        let dir = write_toml(
+            r#"
+[containers.api]
+image = "foo:bar"
+port = 8080
+
+[containers.worker]
+image = "bar:baz"
+"#,
+        );
+        let config = load_full_project_config(dir.path().to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        let resolved = config.resolve_deploy().unwrap();
+        assert_eq!(resolved.routes.len(), 1);
+        assert_eq!(resolved.routes[0].path, "/");
+        assert_eq!(resolved.routes[0].container, "api");
+    }
+
+    #[test]
+    fn test_single_container_config_resolves_empty() {
+        // A single-container project (top-level [build]/[deploy], no [containers])
+        // resolves to no explicit containers — the CLI drives it through the
+        // single-container build flow and the backend synthesises the implicit
+        // `app` container at reconcile time.
+        let dir = write_toml(
+            r#"
+[project]
+name = "simple"
+
+[build]
+backend = "docker"
+
+[deploy]
+replicas = 2
+"#,
+        );
+        let config = load_full_project_config(dir.path().to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(config.containers.is_empty());
+        let resolved = config.resolve_deploy().unwrap();
+        assert!(resolved.containers.is_empty());
+        assert!(resolved.routes.is_empty());
+    }
+
+    #[test]
+    fn test_invalid_container_name() {
+        let dir = write_toml(
+            r#"
+[containers."Bad Name"]
+image = "foo:bar"
+port = 8080
+"#,
+        );
+        let err = load_full_project_config(dir.path().to_str().unwrap())
+            .expect_err("expected invalid-name error");
+        assert!(
+            err.to_string().contains("Invalid container name"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_container_rejects_both_image_and_build() {
+        let dir = write_toml(
+            r#"
+[containers.app]
+image = "foo:bar"
+port = 8080
+
+[containers.app.build]
+backend = "docker"
+"#,
+        );
+        let err = load_full_project_config(dir.path().to_str().unwrap())
+            .expect_err("expected image+build mutual-exclusion error");
+        assert!(
+            err.to_string()
+                .contains("cannot set both 'image' and [build]"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_container_rejects_neither_image_nor_build() {
+        let dir = write_toml(
+            r#"
+[containers.app]
+port = 8080
+"#,
+        );
+        let err = load_full_project_config(dir.path().to_str().unwrap())
+            .expect_err("expected missing-image-or-build error");
+        assert!(
+            err.to_string()
+                .contains("must set either 'image' or [build]"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_container_health_check_requires_http_port() {
+        let dir = write_toml(
+            r#"
+[containers.app]
+image = "foo:bar"
+health_check = { path = "/health" }
+"#,
+        );
+        let err = load_full_project_config(dir.path().to_str().unwrap())
+            .expect_err("expected health_check-without-port error");
+        assert!(
+            err.to_string().contains("health_check but no port"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_route_path_missing_leading_slash_fails() {
+        let dir = write_toml(
+            r#"
+[containers.api]
+image = "foo:bar"
+port = 8080
+
+[routes]
+"api" = { container = "api" }
+"#,
+        );
+        let err = load_full_project_config(dir.path().to_str().unwrap())
+            .expect_err("expected route path leading-slash error");
+        assert!(
+            err.to_string().contains("must start with '/'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_route_path_reserved_rise_prefix_rejected() {
+        for reserved in ["/.rise", "/.rise/auth"] {
+            let dir = write_toml(&format!(
+                r#"
+[containers.api]
+image = "foo:bar"
+port = 8080
+
+[routes]
+"{reserved}" = {{ container = "api" }}
+"#,
+            ));
+            let err = load_full_project_config(dir.path().to_str().unwrap())
+                .expect_err("expected reserved-prefix error");
+            assert!(
+                err.to_string().contains("reserved") && err.to_string().contains("/.rise"),
+                "got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_route_path_normal_accepted() {
+        let dir = write_toml(
+            r#"
+[containers.api]
+image = "foo:bar"
+port = 8080
+
+[routes]
+"/api" = { container = "api" }
+"#,
+        );
+        let config = load_full_project_config(dir.path().to_str().unwrap())
+            .expect("normal /api path should be accepted")
+            .unwrap();
+        assert!(config.routes.contains_key("/api"));
+    }
+
+    #[test]
+    fn test_route_path_invalid_charset_rejected() {
+        // A space and a ';' are both outside the allowed URL-path charset
+        // (and are valid inside a quoted TOML key, so parsing reaches the
+        // validator).
+        for bad in ["/has space", "/has;semicolon"] {
+            let dir = write_toml(&format!(
+                r#"
+[containers.api]
+image = "foo:bar"
+port = 8080
+
+[routes]
+"{bad}" = {{ container = "api" }}
+"#,
+            ));
+            let err = load_full_project_config(dir.path().to_str().unwrap())
+                .expect_err("expected invalid-charset error");
+            assert!(err.to_string().contains("invalid characters"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn test_container_name_15_chars_ok() {
+        let dir = write_toml(
+            r#"
+[containers.abcdefghijklmno]
+image = "foo:bar"
+port = 8080
+"#,
+        );
+        let config = load_full_project_config(dir.path().to_str().unwrap())
+            .expect("15-char container name should be accepted")
+            .unwrap();
+        assert!(config.containers.contains_key("abcdefghijklmno"));
+    }
+
+    #[test]
+    fn test_container_name_16_chars_fails() {
+        let dir = write_toml(
+            r#"
+[containers.abcdefghijklmnop]
+image = "foo:bar"
+port = 8080
+"#,
+        );
+        let err = load_full_project_config(dir.path().to_str().unwrap())
+            .expect_err("16-char container name should be rejected");
+        assert!(
+            err.to_string().contains("Invalid container name"),
+            "got: {err}"
+        );
     }
 }

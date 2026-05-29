@@ -288,6 +288,170 @@ fn filter_env_overrides_by_environment<'a>(
 ///
 /// Only client-allowed source values (`toml`, `cli`) are accepted. Unknown or
 /// server-managed source values are replaced with `cli`.
+/// Outcome of `resolve_multi_container_images`.
+///
+/// Holds everything the caller needs to: mint registry credentials with the
+/// right scope, persist the deployment's container side-data, and return the
+/// per-container image map to the CLI.
+#[cfg(feature = "backend")]
+struct ResolvedContainerPayload {
+    /// Containers with `image` filled in for every entry. Server-derived
+    /// entries hold an internal-facing reference (what the cluster pulls);
+    /// pre-built entries are pinned to an immutable `repo@sha256:…` digest so
+    /// a mutable tag can't drift across pod restarts.
+    resolved_specs: Vec<crate::server::deployment::models::ContainerSpec>,
+    /// Tag suffixes for which the server is going to derive image tags and
+    /// the CLI is expected to push (i.e. containers whose request entry had
+    /// `image == None`). Used to scope the credential mint — JFrog needs
+    /// every tag listed; ECR/GitLab scope by repository and ignore them.
+    push_tags: Vec<String>,
+    /// Map of container_name → fully-qualified CLIENT-facing image tag the
+    /// CLI should `docker build -t` and `docker push` to. Pre-built
+    /// containers map to their resolved immutable digest (exactly what the
+    /// cluster runs) so the CLI logs the real image and can skip the push.
+    container_images: std::collections::BTreeMap<String, String>,
+}
+
+/// Normalize the container list in a `CreateDeploymentRequest`.
+///
+/// For each container with no `image` set, derive both an internal-facing
+/// tag (persisted on the row, used by the K8s controller to pull) and a
+/// client-facing tag (returned to the CLI so it knows what to push).
+/// Containers that came in with an explicit `image` are pre-built: their
+/// reference is resolved to an immutable `repo@sha256:…` digest (mirroring the
+/// single-container `--image` path) and persisted pinned, so a mutable tag
+/// like `redis:7-alpine` can't drift across pod restarts under
+/// `imagePullPolicy: Always`. Pre-built containers are excluded from
+/// `push_tags` (no push is expected for them).
+///
+/// Returns an error (surfaced as a `400`) if any pre-built image can't be
+/// resolved — the whole deployment is rejected rather than shipping with an
+/// unresolvable image, matching the single-container behaviour.
+#[cfg(feature = "backend")]
+async fn resolve_multi_container_images(
+    state: &AppState,
+    project_name: &str,
+    deployment_id: &str,
+    specs: &[crate::server::deployment::models::ContainerSpec],
+) -> Result<ResolvedContainerPayload, ServerError> {
+    use crate::server::registry::ImageTagType;
+
+    let mut resolved_specs = Vec::with_capacity(specs.len());
+    let mut push_tags = Vec::new();
+    let mut container_images = std::collections::BTreeMap::new();
+
+    for spec in specs {
+        let mut resolved = spec.clone();
+        let tag_suffix = format!("{}-{}", deployment_id, spec.name);
+
+        let client_facing_tag = match spec.image.as_deref() {
+            Some(image) if !image.is_empty() => {
+                // Pre-built — CLI doesn't push, server doesn't derive. Pin the
+                // reference to an immutable digest so `imagePullPolicy: Always`
+                // can't pull a different image on a later pod restart (matches
+                // the single-container `--image` flow). The reconciler uses
+                // `spec.image` verbatim as the pod image, so persisting the
+                // pinned ref is all that's required.
+                let pinned = resolve_image_digest(
+                    &state.oci_client,
+                    &state.registry_provider,
+                    image,
+                    project_name,
+                )
+                .await
+                .map_err(|e| {
+                    ServerError::bad_request(format!(
+                        "Failed to resolve image '{}' for container '{}': {}",
+                        image, spec.name, e
+                    ))
+                })?;
+                resolved.image = Some(pinned.clone());
+                pinned
+            }
+            _ => {
+                // Server-derived. Persist the internal tag (controller-facing,
+                // possibly cluster-local), return the client tag to the CLI.
+                let internal = state.registry_provider.get_image_tag(
+                    project_name,
+                    &tag_suffix,
+                    ImageTagType::Internal,
+                );
+                resolved.image = Some(internal);
+                push_tags.push(tag_suffix.clone());
+                state.registry_provider.get_image_tag(
+                    project_name,
+                    &tag_suffix,
+                    ImageTagType::ClientFacing,
+                )
+            }
+        };
+
+        container_images.insert(spec.name.clone(), client_facing_tag);
+        resolved_specs.push(resolved);
+    }
+
+    Ok(ResolvedContainerPayload {
+        resolved_specs,
+        push_tags,
+        container_images,
+    })
+}
+
+/// Serialise the resolved multi-container side-data so it can be passed into
+/// the deployments INSERT atomically (avoids the legacy "row exists but
+/// container JSON failed to persist" hazard).
+///
+/// Backfills `replicas`/`cpu`/`memory` from the deployment-level effective
+/// values when a container leaves them unset, so the reconciler can read the
+/// JSON directly without re-deriving anything.
+#[cfg(feature = "backend")]
+fn build_container_side_data_json(
+    resolved_specs: &[crate::server::deployment::models::ContainerSpec],
+    routes: &[crate::server::deployment::models::RouteSpec],
+    effective_replicas: u32,
+    effective_cpu: &str,
+    effective_memory: &str,
+) -> Result<(serde_json::Value, Option<serde_json::Value>), ServerError> {
+    let mut backfilled = resolved_specs.to_vec();
+    for spec in &mut backfilled {
+        if spec.replicas.is_none() {
+            spec.replicas = Some(effective_replicas);
+        }
+        if spec.cpu.is_none() {
+            spec.cpu = Some(effective_cpu.to_string());
+        }
+        if spec.memory.is_none() {
+            spec.memory = Some(effective_memory.to_string());
+        }
+    }
+    // Wrap both columns in the versioned side-data envelope so the persisted
+    // shape can evolve (see `models::CONTAINER_SIDE_DATA_VERSION`).
+    let containers_json =
+        models::encode_side_data(&backfilled).internal_err("Failed to serialise containers")?;
+    let routes_json = if routes.is_empty() {
+        None
+    } else {
+        Some(models::encode_side_data(routes).internal_err("Failed to serialise routes")?)
+    };
+    Ok((containers_json, routes_json))
+}
+
+/// Inherit the source deployment's container side-data verbatim. Used by the
+/// rollback path when the redeploy request itself doesn't carry a `containers`
+/// block — without this, a redeploy of a multi-container source would silently
+/// fall back to the single-container path and the reconciler would drop every
+/// per-container K8s resource. The side-data is folded onto the source
+/// [`Deployment`] row, so this is a plain clone with no extra query.
+#[cfg(feature = "backend")]
+fn inherit_container_side_data_from_source(
+    source_deployment: &crate::db::models::Deployment,
+) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
+    (
+        source_deployment.containers.clone(),
+        source_deployment.routes.clone(),
+    )
+}
+
 async fn apply_env_overrides(
     state: &AppState,
     deployment_id: uuid::Uuid,
@@ -440,11 +604,41 @@ async fn convert_deployment(
     custom_domain_urls: Vec<String>,
     all_urls: Vec<String>,
 ) -> Deployment {
-    // Backfill image field for locally-built deployments
-    // For pre-built images, deployment.image is already set
-    // For build-from-source, calculate the internal registry tag
+    // Multi-container side-data, folded onto the row. `None` is a legacy
+    // single-container deployment — the frontend reads the flat replicas/cpu/
+    // memory fields in that case. A present-but-unparseable column is corrupt:
+    // log it (the reconciler will have marked the deployment Failed, surfacing
+    // the problem) but render best-effort rather than 500-ing a whole list
+    // because one row is bad.
+    let containers = match deployment.containers.as_ref() {
+        Some(v) => {
+            match models::decode_side_data::<crate::server::deployment::models::ContainerSpec>(v) {
+                Ok(specs) => Some(specs),
+                Err(e) => {
+                    error!(
+                        deployment_id = %deployment.deployment_id,
+                        "non-NULL `containers` column could not be decoded into \
+                         Vec<ContainerSpec>; rendering without container side-data: {:?}", e
+                    );
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    let is_multi_container = containers.as_ref().is_some_and(|c| !c.is_empty());
+
+    // Backfill the deployment-level image for display.
+    // - Pre-built single-container: `deployment.image` is already set.
+    // - Build-from-source single-container: synthesise the internal registry tag.
+    // - Multi-container: there is no single deployment-level image — the
+    //   per-container images live in `containers`. Leave it unset rather than
+    //   synthesising a `<registry>/<project>:<deployment_id>` tag that is never
+    //   pushed (which would surface a bogus image in the CLI/UI).
     let image = if deployment.image.is_some() {
         deployment.image.clone()
+    } else if is_multi_container {
+        None
     } else {
         Some(super::utils::get_deployment_image_tag(state, &deployment, project).await)
     };
@@ -487,6 +681,7 @@ async fn convert_deployment(
         replicas: deployment.replicas as u32,
         cpu: deployment.cpu,
         memory: deployment.memory,
+        containers,
         job_url: deployment.job_url,
         pull_request_url: deployment.pull_request_url,
         git_repository_url: deployment.git_repository_url,
@@ -677,13 +872,92 @@ fn validate_identity_audiences(
     Ok(())
 }
 
+/// Project the resource-check inputs for `validate_resource_constraints`.
+///
+/// For single-container requests (`containers` is `None`) returns the single
+/// effective values verbatim. For multi-container, sums replicas across
+/// containers (the platform/environment replica cap applies to the whole
+/// deployment) and collects per-container `(cpu, memory)` so range checks
+/// still run against each container individually.
+///
+/// Per-container fields that are unset inherit the deployment-wide
+/// `effective_*` defaults, matching how the reconciler resolves them.
+#[cfg(feature = "backend")]
+fn resolve_resource_check_inputs<'a>(
+    containers: Option<&'a [crate::server::deployment::models::ContainerSpec]>,
+    effective_replicas: u32,
+    effective_cpu: &'a str,
+    effective_memory: &'a str,
+) -> (u32, Vec<(&'a str, &'a str)>) {
+    match containers {
+        Some(specs) if !specs.is_empty() => {
+            let total_replicas: u32 = specs
+                .iter()
+                .map(|s| s.replicas.unwrap_or(effective_replicas))
+                .sum();
+            let per_container: Vec<(&str, &str)> = specs
+                .iter()
+                .map(|s| {
+                    let cpu = s.cpu.as_deref().unwrap_or(effective_cpu);
+                    let mem = s.memory.as_deref().unwrap_or(effective_memory);
+                    (cpu, mem)
+                })
+                .collect();
+            (total_replicas, per_container)
+        }
+        _ => (effective_replicas, vec![(effective_cpu, effective_memory)]),
+    }
+}
+
+/// Validate that the K8s resource names a deployment will generate stay within
+/// Kubernetes limits. The per-container Service name `<group>-<container>` must
+/// be a DNS-1035 label (≤ 63 chars) — the binding constraint, since the
+/// deployment group and container name share that budget. The per-container
+/// Deployment name `<project>-<deployment_id>-<container>` must be a DNS-1123
+/// subdomain (≤ 253 chars). Metacontroller surfaces no apply error for an
+/// over-limit name back to the deployment, so we reject at request time.
+#[cfg(feature = "backend")]
+fn validate_container_resource_names(
+    project_name: &str,
+    deployment_group: &str,
+    deployment_id: &str,
+    container_names: &[&str],
+) -> Result<(), ServerError> {
+    use crate::server::deployment::resource_builder::ResourceBuilder;
+    let group = ResourceBuilder::escaped_group_name(deployment_group);
+    for name in container_names {
+        let service_name = format!("{group}-{name}");
+        if service_name.len() > 63 {
+            return Err(ServerError::bad_request(format!(
+                "Container '{name}' would produce Service name '{service_name}' ({} chars), \
+                 over Kubernetes' 63-character limit. Shorten the deployment group or the container name.",
+                service_name.len()
+            )));
+        }
+        let deployment_name = format!("{project_name}-{deployment_id}-{name}");
+        if deployment_name.len() > 253 {
+            return Err(ServerError::bad_request(format!(
+                "Container '{name}' would produce Deployment name '{deployment_name}' ({} chars), \
+                 over Kubernetes' 253-character limit. Shorten the project or container name.",
+                deployment_name.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(feature = "backend")]
 fn validate_resource_constraints(
     state: &AppState,
     resolved_environment: &Option<crate::db::models::Environment>,
-    replicas: u32,
-    cpu: &str,
-    memory: &str,
+    // Total replicas across the deployment. For single-container this is the
+    // container's `replicas`; for multi-container it MUST be the sum across
+    // all containers — the limit applies to the deployment as a whole.
+    total_replicas: u32,
+    // (cpu, memory) for each container. CPU and memory ranges are enforced
+    // per-container so a worker can't dodge limits by joining a deployment
+    // alongside a tiny frontend. For single-container, pass one entry.
+    per_container_resources: &[(&str, &str)],
     is_redeploy: bool,
 ) -> Result<(), ServerError> {
     let platform_constraints = state
@@ -725,25 +999,41 @@ fn validate_resource_constraints(
         ""
     };
 
-    if replicas < eff_min_replicas || replicas > eff_max_replicas {
+    if total_replicas < eff_min_replicas || total_replicas > eff_max_replicas {
+        let summary = if per_container_resources.len() > 1 {
+            format!(
+                "Requested {} replicas total across {} containers but allowed range is [{}, {}]",
+                total_replicas,
+                per_container_resources.len(),
+                eff_min_replicas,
+                eff_max_replicas
+            )
+        } else {
+            format!(
+                "Requested {} replicas but allowed range is [{}, {}]",
+                total_replicas, eff_min_replicas, eff_max_replicas
+            )
+        };
         return Err(ServerError::bad_request(format!(
-            "Requested {} replicas but allowed range is [{}, {}]{}",
-            replicas, eff_min_replicas, eff_max_replicas, redeploy_hint
+            "{}{}",
+            summary, redeploy_hint
         )));
     }
 
-    super::quantity::validate_cpu_range(cpu, eff_min_cpu, eff_max_cpu).map_err(|e| {
-        ServerError::bad_request(format!("CPU constraint violation: {}{}", e, redeploy_hint))
-    })?;
+    for (cpu, memory) in per_container_resources {
+        super::quantity::validate_cpu_range(cpu, eff_min_cpu, eff_max_cpu).map_err(|e| {
+            ServerError::bad_request(format!("CPU constraint violation: {}{}", e, redeploy_hint))
+        })?;
 
-    super::quantity::validate_memory_range(memory, eff_min_memory, eff_max_memory).map_err(
-        |e| {
-            ServerError::bad_request(format!(
-                "Memory constraint violation: {}{}",
-                e, redeploy_hint
-            ))
-        },
-    )?;
+        super::quantity::validate_memory_range(memory, eff_min_memory, eff_max_memory).map_err(
+            |e| {
+                ServerError::bad_request(format!(
+                    "Memory constraint violation: {}{}",
+                    e, redeploy_hint
+                ))
+            },
+        )?;
+    }
 
     Ok(())
 }
@@ -799,6 +1089,23 @@ pub async fn create_deployment(
     };
 
     validate_env_overrides(&payload.env_overrides)?;
+
+    // Wire-level validation for multi-container deployments (fails fast before
+    // image resolution / registry calls / DB writes). Single-container requests
+    // (no `containers`) pass through unchanged.
+    models::validate_containers_and_routes(payload.containers.as_deref(), &payload.routes)?;
+
+    // Per-container env overrides go through the same key/`PORT`/protected
+    // validation as top-level overrides (`validate_containers_and_routes` only
+    // enforces the is_secret restriction). An invalid key would otherwise reach
+    // the pod spec and wedge the reconcile.
+    if let Some(containers) = payload.containers.as_deref() {
+        for spec in containers {
+            for over in &spec.env_overrides {
+                validate_env_override(over)?;
+            }
+        }
+    }
 
     // Parse expiration duration if provided
     let expires_at = if let Some(ref expires_in) = payload.expires_in {
@@ -897,6 +1204,24 @@ pub async fn create_deployment(
     let deployment_id = generate_deployment_id();
     debug!("Generated deployment ID: {}", deployment_id);
 
+    // Reject deployments whose generated K8s resource names would exceed K8s
+    // limits. The deployment group and container name share the 63-char
+    // Service-name budget, and the group is only known now — so this can't be
+    // validated at rise.toml parse time. Single-container uses the implicit `app`.
+    #[cfg(feature = "backend")]
+    {
+        let container_names: Vec<&str> = match payload.containers.as_deref() {
+            Some(specs) => specs.iter().map(|s| s.name.as_str()).collect(),
+            None => vec![crate::rise_toml::DEFAULT_CONTAINER_NAME],
+        };
+        validate_container_resource_names(
+            &payload.project,
+            &resolved_group,
+            &deployment_id,
+            &container_names,
+        )?;
+    }
+
     // Resolve effective http_port:
     // 1. Explicit http_port from request (if provided)
     // 2. Source deployment's http_port (if --from is used, handled below)
@@ -908,6 +1233,17 @@ pub async fn create_deployment(
         "Using http_port {} for deployment {}",
         effective_http_port, deployment_id
     );
+
+    // Resolve multi-container images before minting credentials so the mint
+    // covers every tag the CLI is going to push, and so pre-built container
+    // images are pinned to an immutable digest. Returns None for legacy
+    // single-container requests.
+    let multi_container_resolved = match payload.containers.as_ref() {
+        Some(specs) => Some(
+            resolve_multi_container_images(&state, &payload.project, &deployment_id, specs).await?,
+        ),
+        None => None,
+    };
 
     // Resolve effective deployment resources (replicas, cpu, memory)
     // Priority: request payload > platform defaults
@@ -1023,16 +1359,73 @@ pub async fn create_deployment(
             effective_identity_audiences = source_deployment.identity_audiences.clone();
         }
 
-        // Validate resources against constraints (after rollback inheritance)
+        // Validate resources against constraints (after rollback inheritance).
+        //
+        // When the redeploy request carries no `[containers]` block we must
+        // still re-validate against the SOURCE's persisted per-container specs:
+        // those replicas/cpu/memory can sum higher than the deployment-level
+        // `effective_replicas`, so a cap that tightened since the source was
+        // created would otherwise be silently bypassed on a bare redeploy.
         #[cfg(feature = "backend")]
-        validate_resource_constraints(
-            &state,
-            &resolved_environment,
-            effective_replicas,
-            &effective_cpu,
-            &effective_memory,
-            payload.from_deployment.is_some(),
-        )?;
+        let inherited_source_specs: Option<
+            Vec<crate::server::deployment::models::ContainerSpec>,
+        > = if payload.containers.is_none() {
+            match source_deployment.containers.as_ref() {
+                Some(v) => Some(models::decode_side_data(v).map_err(|e| {
+                    ServerError::internal(format!(
+                        "Source deployment {} ({}) has a non-NULL `containers` column that could \
+                         not be decoded into Vec<ContainerSpec>: {:?}",
+                        source_deployment.id, source_deployment.deployment_id, e
+                    ))
+                })?),
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        #[cfg(feature = "backend")]
+        {
+            // Prefer the request's containers; otherwise the source's inherited
+            // specs (so the across-container sum is re-checked); else single.
+            let check_specs = payload
+                .containers
+                .as_deref()
+                .or(inherited_source_specs.as_deref());
+            let (total_replicas, per_container) = resolve_resource_check_inputs(
+                check_specs,
+                effective_replicas,
+                &effective_cpu,
+                &effective_memory,
+            );
+            validate_resource_constraints(
+                &state,
+                &resolved_environment,
+                total_replicas,
+                &per_container,
+                payload.from_deployment.is_some(),
+            )?;
+        }
+
+        // Compute container side-data BEFORE the INSERT so it lands atomically
+        // with the deployments row. If the redeploy request carries its own
+        // `containers` block, use that; otherwise inherit the source's JSON
+        // verbatim so a redeploy of a multi-container source stays
+        // multi-container (the legacy fallback would drop every per-container
+        // K8s resource).
+        let (containers_json, routes_json): (Option<serde_json::Value>, Option<serde_json::Value>) =
+            if let Some(ref r) = multi_container_resolved {
+                let (c, ro) = build_container_side_data_json(
+                    &r.resolved_specs,
+                    &payload.routes,
+                    effective_replicas,
+                    &effective_cpu,
+                    &effective_memory,
+                )?;
+                (Some(c), ro)
+            } else {
+                inherit_container_side_data_from_source(&source_deployment)
+            };
 
         // Create new deployment with Pushed status and invoke extension hooks
         // Copy image and image_digest from source - the helper function will determine the tag
@@ -1060,6 +1453,8 @@ pub async fn create_deployment(
                 cpu: &effective_cpu,
                 memory: &effective_memory,
                 identity_audiences: effective_identity_audiences.clone(),
+                containers: containers_json.as_ref(),
+                routes: routes_json.as_ref(),
             },
             &project,
         )
@@ -1161,19 +1556,46 @@ pub async fn create_deployment(
                 expires_in: None,
                 auth_method: Default::default(),
             },
+            container_images: multi_container_resolved
+                .as_ref()
+                .map(|r| r.container_images.clone()),
         }));
     }
 
     // Validate resources against constraints (normal deployment path)
     #[cfg(feature = "backend")]
-    validate_resource_constraints(
-        &state,
-        &resolved_environment,
-        effective_replicas,
-        &effective_cpu,
-        &effective_memory,
-        false,
-    )?;
+    {
+        let (total_replicas, per_container) = resolve_resource_check_inputs(
+            payload.containers.as_deref(),
+            effective_replicas,
+            &effective_cpu,
+            &effective_memory,
+        );
+        validate_resource_constraints(
+            &state,
+            &resolved_environment,
+            total_replicas,
+            &per_container,
+            false,
+        )?;
+    }
+
+    // Compute container side-data once (non-rollback paths) so it can be
+    // inserted atomically with the deployments row. `None` for legacy
+    // single-container requests.
+    let (containers_json, routes_json): (Option<serde_json::Value>, Option<serde_json::Value>) =
+        if let Some(ref r) = multi_container_resolved {
+            let (c, ro) = build_container_side_data_json(
+                &r.resolved_specs,
+                &payload.routes,
+                effective_replicas,
+                &effective_cpu,
+                &effective_memory,
+            )?;
+            (Some(c), ro)
+        } else {
+            (None, None)
+        };
 
     // Branch based on whether user provided a pre-built image
     if let Some(ref user_image) = payload.image {
@@ -1188,9 +1610,12 @@ pub async fn create_deployment(
                 &deployment_id,
                 ImageTagType::ClientFacing,
             );
+            // push-image is single-container only; the multi-container CLI
+            // always sends `image: None` at the top level and uses the
+            // build-from-source branch below.
             let credentials = state
                 .registry_provider
-                .get_credentials(&payload.project, &deployment_id)
+                .get_credentials(&payload.project, &[deployment_id.as_str()])
                 .await
                 .internal_err("Failed to get credentials")?;
 
@@ -1216,6 +1641,8 @@ pub async fn create_deployment(
                     cpu: &effective_cpu,
                     memory: &effective_memory,
                     identity_audiences: effective_identity_audiences.clone(),
+                    containers: containers_json.as_ref(),
+                    routes: routes_json.as_ref(),
                 },
                 &project,
             )
@@ -1264,6 +1691,9 @@ pub async fn create_deployment(
                 deployment_id,
                 image_tag,
                 credentials,
+                container_images: multi_container_resolved
+                    .as_ref()
+                    .map(|r| r.container_images.clone()),
             }));
         }
 
@@ -1309,6 +1739,8 @@ pub async fn create_deployment(
                 cpu: &effective_cpu,
                 memory: &effective_memory,
                 identity_audiences: effective_identity_audiences.clone(),
+                containers: containers_json.as_ref(),
+                routes: routes_json.as_ref(),
             },
             &project,
         )
@@ -1379,6 +1811,9 @@ pub async fn create_deployment(
                 expires_in: None,
                 auth_method: Default::default(),
             },
+            container_images: multi_container_resolved
+                .as_ref()
+                .map(|r| r.container_images.clone()),
         }))
     } else {
         // Path 2: Build from source (current behavior)
@@ -1389,12 +1824,25 @@ pub async fn create_deployment(
             ImageTagType::ClientFacing,
         );
 
-        // Get registry credentials scoped to this exact tag
-        let credentials = state
-            .registry_provider
-            .get_credentials(&payload.project, &deployment_id)
-            .await
-            .internal_err("Failed to get credentials")?;
+        // Get registry credentials scoped to every tag that's going to be
+        // pushed. For single-container that's just the deployment ID; for
+        // multi-container it's the per-container tag list returned by
+        // `resolve_multi_container_images`, so a single mint covers every
+        // `docker push` the CLI will perform (critical for JFrog, which
+        // scopes by tag).
+        let credentials = {
+            let owned_tags: Vec<String> = multi_container_resolved
+                .as_ref()
+                .filter(|r| !r.push_tags.is_empty())
+                .map(|r| r.push_tags.clone())
+                .unwrap_or_else(|| vec![deployment_id.clone()]);
+            let tag_refs: Vec<&str> = owned_tags.iter().map(String::as_str).collect();
+            state
+                .registry_provider
+                .get_credentials(&payload.project, &tag_refs)
+                .await
+                .internal_err("Failed to get credentials")?
+        };
 
         debug!("Image tag: {}", image_tag);
 
@@ -1421,6 +1869,8 @@ pub async fn create_deployment(
                 cpu: &effective_cpu,
                 memory: &effective_memory,
                 identity_audiences: effective_identity_audiences.clone(),
+                containers: containers_json.as_ref(),
+                routes: routes_json.as_ref(),
             },
             &project,
         )
@@ -1473,6 +1923,9 @@ pub async fn create_deployment(
             deployment_id,
             image_tag,
             credentials,
+            container_images: multi_container_resolved
+                .as_ref()
+                .map(|r| r.container_images.clone()),
         }))
     }
 }
@@ -2626,12 +3079,117 @@ fn default_log_count_step_seconds() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_env_override_is_protected, validate_env_override, validate_env_override_key,
+        normalize_env_override_is_protected, resolve_resource_check_inputs,
+        validate_container_resource_names, validate_env_override, validate_env_override_key,
         validate_identity_audiences,
     };
-    use crate::server::deployment::models::EnvOverride;
+    use crate::server::deployment::models::{ContainerSpec, EnvOverride};
     use axum::http::StatusCode;
     use std::collections::BTreeMap;
+
+    fn make_spec(
+        name: &str,
+        replicas: Option<u32>,
+        cpu: Option<&str>,
+        mem: Option<&str>,
+    ) -> ContainerSpec {
+        ContainerSpec {
+            name: name.to_string(),
+            image: Some("img".to_string()),
+            port: None,
+            replicas,
+            cpu: cpu.map(str::to_string),
+            memory: mem.map(str::to_string),
+            env_overrides: vec![],
+            health_check: None,
+        }
+    }
+
+    #[test]
+    fn resource_check_inputs_single_container_passthrough() {
+        // No `containers` block → use the deployment-wide effective values.
+        let (total, per) = resolve_resource_check_inputs(None, 3, "500m", "256Mi");
+        assert_eq!(total, 3);
+        assert_eq!(per, vec![("500m", "256Mi")]);
+    }
+
+    #[test]
+    fn resource_check_inputs_sums_replicas_across_containers() {
+        // The platform/environment replica cap applies to the WHOLE
+        // deployment, so this helper must sum across containers — not
+        // check each in isolation.
+        let specs = vec![
+            make_spec("frontend", Some(2), None, None),
+            make_spec("backend", Some(3), None, None),
+            make_spec("worker", Some(4), None, None),
+        ];
+        let (total, per) = resolve_resource_check_inputs(Some(&specs), 1, "500m", "256Mi");
+        assert_eq!(
+            total, 9,
+            "expected sum across containers, not per-container"
+        );
+        assert_eq!(
+            per.len(),
+            3,
+            "per-container CPU/memory still checked individually"
+        );
+    }
+
+    #[test]
+    fn resource_check_inputs_falls_back_to_defaults_per_container() {
+        // Containers that omit replicas/cpu/memory inherit the deployment
+        // defaults — matching how the reconciler resolves them.
+        let specs = vec![
+            make_spec("api", Some(2), Some("1"), Some("512Mi")),
+            make_spec("worker", None, None, None), // inherits effective defaults
+        ];
+        let (total, per) = resolve_resource_check_inputs(Some(&specs), 5, "500m", "256Mi");
+        assert_eq!(total, 7, "2 + (default 5) = 7");
+        assert_eq!(per[0], ("1", "512Mi"));
+        assert_eq!(per[1], ("500m", "256Mi"));
+    }
+
+    #[test]
+    fn resource_check_inputs_empty_containers_treated_as_legacy() {
+        // An empty `containers` slice (shouldn't happen in practice, but
+        // defensive) falls through to the single-container path so we don't
+        // accidentally accept replicas=0 for every multi-container request.
+        let (total, per) = resolve_resource_check_inputs(Some(&[]), 4, "500m", "256Mi");
+        assert_eq!(total, 4);
+        assert_eq!(per, vec![("500m", "256Mi")]);
+    }
+
+    #[test]
+    fn container_resource_names_accepts_normal_names() {
+        validate_container_resource_names(
+            "my-app",
+            "default",
+            "20260101-000000",
+            &["app", "api", "worker"],
+        )
+        .expect("normal names should be accepted");
+    }
+
+    #[test]
+    fn container_resource_names_rejects_overlong_service_name() {
+        // The deployment group and container name share the 63-char Service-name
+        // budget. A long group + container overflows it.
+        let long_group = "g".repeat(60);
+        let err =
+            validate_container_resource_names("proj", &long_group, "20260101-000000", &["api"])
+                .unwrap_err();
+        assert!(err.message.contains("63-character"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn container_resource_names_single_container_app_is_checked() {
+        // Single-container deployments also emit a suffixed Service `<group>-app`.
+        let long_group = "g".repeat(61);
+        let err =
+            validate_container_resource_names("proj", &long_group, "20260101-000000", &["app"])
+                .unwrap_err();
+        assert!(err.message.contains("63-character"), "got: {}", err.message);
+    }
 
     #[test]
     fn env_override_key_validation_rejects_empty_keys() {

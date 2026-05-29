@@ -12,6 +12,10 @@ Simple static and dynamic applications to get started with Rise.
 - **[hello-world-js](./hello-world-js/)** - Node.js Express application
 - **[hello-world-py](./hello-world-py/)** - Python Flask application
 
+### Multi-Container Examples
+
+- **[multi-container](./multi-container/)** - Redis-backed job queue: frontend submits text, API enqueues, worker analyzes. Shows `[routes]` ingress and auto-injected `RISE_CONTAINER_HOST__<NAME>` cross-container service discovery
+
 ### AWS Examples
 
 - **[s3-file-browser](./s3-file-browser/)** - Web-based S3 file browser with upload/download/delete

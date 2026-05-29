@@ -18,8 +18,7 @@ mod ssl;
 /// Fallback target platform when nothing more specific (CLI flag, env var,
 /// rise.toml, backend hint) is provided. We default to the host architecture
 /// so local dev (e.g. ARM Mac + ARM minikube) just works; production deploys
-/// override via the backend's advertised architecture (the `runtime_arch`
-/// platform capability).
+/// override via the backend's `target_platform` hint.
 pub fn host_platform() -> String {
     let arch = match std::env::consts::ARCH {
         "x86_64" => "amd64",
@@ -464,7 +463,6 @@ mod tests {
 
     #[test]
     fn test_resolve_platform_cli_wins() {
-        // CLI flag wins over env, project, and backend hint.
         let (value, source) = resolve_platform(
             Some("linux/cli-wins"),
             Some("linux/env"),
@@ -477,9 +475,6 @@ mod tests {
 
     #[test]
     fn test_resolve_platform_env_over_project_and_backend() {
-        // With no CLI flag, RISE_PLATFORM (passed in as `env`) outranks
-        // rise.toml and the backend hint. Previously hidden behind a
-        // process-global env mutation; now exercised purely via params.
         let (value, source) = resolve_platform(
             None,
             Some("linux/env-wins"),
@@ -553,7 +548,6 @@ mod tests {
 
     #[test]
     fn test_resolve_platform_host_fallback() {
-        // All inputs None → host architecture, marked as HostFallback.
         let (value, source) = resolve_platform(None, None, None, None);
         assert_eq!(value, host_platform());
         assert_eq!(source, PlatformSource::HostFallback);

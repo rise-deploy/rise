@@ -77,12 +77,20 @@ pub async fn get_deployment_registry_credentials(
         ));
     }
 
-    // Get credentials from the registry provider
+    // Get credentials from the registry provider.
+    //
+    // For multi-container deployments the credentials need to cover every
+    // container's tag — provider-side scoping (JFrog) is per-tag, so a
+    // single-tag mint would only let the CLI push one of the N images.
+    // The persisted container list (folded onto the deployment row) drives the
+    // full tag set.
     let repository = project.name.clone();
+    let push_tags = derive_push_tags(&deployment)?;
+    let push_tag_refs: Vec<&str> = push_tags.iter().map(String::as_str).collect();
 
     let credentials = state
         .registry_provider
-        .get_credentials(&repository, &deployment_id)
+        .get_credentials(&repository, &push_tag_refs)
         .await
         .internal_err("Failed to get registry credentials")
         .map_err(|e| {
@@ -97,4 +105,48 @@ pub async fn get_deployment_registry_credentials(
         credentials,
         repository,
     }))
+}
+
+/// Resolve the full set of image tags a deployment's CLI push needs to write.
+///
+/// Single-container deployments (legacy / `containers IS NULL`) push exactly
+/// one image tagged with the deployment ID. Multi-container deployments push
+/// one image per container, all sharing the project repository and tagged
+/// `<deployment_id>-<container_name>`. The returned slice is what
+/// `RegistryProvider::get_credentials` needs in order to scope the minted
+/// credential to every push — critical for tag-scoped providers like JFrog.
+///
+/// Note: this derives a tag for *every* container, including pre-built ones the
+/// CLI never pushes. That is an accepted, minor over-grant: the extra tags only
+/// widen write access within the project's own repository, and the scope is
+/// already bounded by the client-supplied container names — a tag-scoped mint
+/// inherently trusts the client on which `<deployment_id>-<name>` tags it asks
+/// for. Filtering pre-built containers out here would not change that trust.
+fn derive_push_tags(
+    deployment: &crate::db::models::Deployment,
+) -> Result<Vec<String>, ServerError> {
+    // Container side-data is folded onto the deployment row. A NULL `containers`
+    // column is a legacy single-container deployment: one image tagged with the
+    // deployment ID. A non-NULL but undecodable column is corrupt — fail with a
+    // 500 rather than silently minting a credential scoped to the wrong tags.
+    let container_specs: Vec<crate::server::deployment::models::ContainerSpec> =
+        match deployment.containers.as_ref() {
+            Some(v) => crate::server::deployment::models::decode_side_data(v).map_err(|e| {
+                ServerError::internal(format!(
+                    "Deployment {} ({}) has a non-NULL `containers` column that could not be \
+                     decoded into Vec<ContainerSpec>: {:?}",
+                    deployment.id, deployment.deployment_id, e
+                ))
+            })?,
+            None => Vec::new(),
+        };
+
+    if container_specs.is_empty() {
+        return Ok(vec![deployment.deployment_id.clone()]);
+    }
+
+    Ok(container_specs
+        .iter()
+        .map(|c| format!("{}-{}", deployment.deployment_id, c.name))
+        .collect())
 }

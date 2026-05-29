@@ -34,6 +34,13 @@ pub struct CreateDeploymentParams<'a> {
     pub memory: &'a str,
     /// Map of { in-pod filename -> token audience } for auto-minted workload JWTs.
     pub identity_audiences: serde_json::Value,
+    /// Multi-container side-data (`Vec<ContainerSpec>` as JSONB) or `None` for legacy.
+    /// Inserted atomically with the deployments row so we can't end up with a
+    /// multi-container deployment whose container JSON failed to persist.
+    pub containers: Option<&'a serde_json::Value>,
+    /// Ingress route map (`Vec<RouteSpec>` as JSONB) or `None`. Always `None`
+    /// when `containers` is `None`.
+    pub routes: Option<&'a serde_json::Value>,
 }
 
 /// List deployments for a project
@@ -54,7 +61,9 @@ pub async fn list_for_project(pool: &PgPool, project_id: Uuid) -> Result<Vec<Dep
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
             created_at, updated_at, identity_credential_hash,
-            identity_audiences as "identity_audiences: serde_json::Value"
+            identity_audiences as "identity_audiences: serde_json::Value",
+            containers as "containers: serde_json::Value",
+            routes as "routes: serde_json::Value"
         FROM deployments
         WHERE project_id = $1
         ORDER BY created_at DESC
@@ -119,7 +128,9 @@ pub async fn list_non_terminal_for_project(
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
             created_at, updated_at, identity_credential_hash,
-            identity_audiences as "identity_audiences: serde_json::Value"
+            identity_audiences as "identity_audiences: serde_json::Value",
+            containers as "containers: serde_json::Value",
+            routes as "routes: serde_json::Value"
         FROM deployments
         WHERE project_id = $1
           AND NOT is_terminal(status)
@@ -156,7 +167,9 @@ pub async fn get_deployments_batch(
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
             created_at, updated_at, identity_credential_hash,
-            identity_audiences as "identity_audiences: serde_json::Value"
+            identity_audiences as "identity_audiences: serde_json::Value",
+            containers as "containers: serde_json::Value",
+            routes as "routes: serde_json::Value"
         FROM deployments
         WHERE id = ANY($1)
         "#,
@@ -192,7 +205,9 @@ pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Deployment>> {
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
             created_at, updated_at, identity_credential_hash,
-            identity_audiences as "identity_audiences: serde_json::Value"
+            identity_audiences as "identity_audiences: serde_json::Value",
+            containers as "containers: serde_json::Value",
+            routes as "routes: serde_json::Value"
         FROM deployments
         WHERE id = $1
         "#,
@@ -226,7 +241,9 @@ pub async fn find_by_deployment_id(
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
             created_at, updated_at, identity_credential_hash,
-            identity_audiences as "identity_audiences: serde_json::Value"
+            identity_audiences as "identity_audiences: serde_json::Value",
+            containers as "containers: serde_json::Value",
+            routes as "routes: serde_json::Value"
         FROM deployments
         WHERE deployment_id = $1 AND project_id = $2
         "#,
@@ -265,7 +282,9 @@ pub async fn find_by_deployment_id_unscoped(
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
             created_at, updated_at, identity_credential_hash,
-            identity_audiences as "identity_audiences: serde_json::Value"
+            identity_audiences as "identity_audiences: serde_json::Value",
+            containers as "containers: serde_json::Value",
+            routes as "routes: serde_json::Value"
         FROM deployments
         WHERE deployment_id = $1
         ORDER BY created_at ASC
@@ -288,8 +307,8 @@ pub async fn create(pool: &PgPool, params: CreateDeploymentParams<'_>) -> Result
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
-        INSERT INTO deployments (deployment_id, project_id, created_by_id, status, image, image_digest, rolled_back_from_deployment_id, deployment_group, environment_id, expires_at, http_port, is_active, job_url, pull_request_url, git_repository_url, replicas, cpu, memory, identity_audiences)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+        INSERT INTO deployments (deployment_id, project_id, created_by_id, status, image, image_digest, rolled_back_from_deployment_id, deployment_group, environment_id, expires_at, http_port, is_active, job_url, pull_request_url, git_repository_url, replicas, cpu, memory, identity_audiences, containers, routes)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
         RETURNING
             id, deployment_id, project_id, created_by_id,
             status as "status: DeploymentStatus",
@@ -303,7 +322,9 @@ pub async fn create(pool: &PgPool, params: CreateDeploymentParams<'_>) -> Result
             first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             created_at, updated_at, identity_credential_hash,
-            identity_audiences as "identity_audiences: serde_json::Value"
+            identity_audiences as "identity_audiences: serde_json::Value",
+            containers as "containers: serde_json::Value",
+            routes as "routes: serde_json::Value"
         "#,
         params.deployment_id,
         params.project_id,
@@ -323,7 +344,9 @@ pub async fn create(pool: &PgPool, params: CreateDeploymentParams<'_>) -> Result
         params.replicas,
         params.cpu,
         params.memory,
-        params.identity_audiences
+        params.identity_audiences,
+        params.containers,
+        params.routes,
     )
     .fetch_one(pool)
     .await
@@ -358,7 +381,9 @@ pub async fn update_status(
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
             created_at, updated_at, identity_credential_hash,
-            identity_audiences as "identity_audiences: serde_json::Value"
+            identity_audiences as "identity_audiences: serde_json::Value",
+            containers as "containers: serde_json::Value",
+            routes as "routes: serde_json::Value"
         FROM deployments
         WHERE id = $1
         "#,
@@ -408,7 +433,9 @@ pub async fn update_status(
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
             created_at, updated_at, identity_credential_hash,
-            identity_audiences as "identity_audiences: serde_json::Value"
+            identity_audiences as "identity_audiences: serde_json::Value",
+            containers as "containers: serde_json::Value",
+            routes as "routes: serde_json::Value"
         "#,
         id,
         status_str
@@ -452,7 +479,9 @@ pub async fn mark_failed(pool: &PgPool, id: Uuid, error_message: &str) -> Result
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
             created_at, updated_at, identity_credential_hash,
-            identity_audiences as "identity_audiences: serde_json::Value"
+            identity_audiences as "identity_audiences: serde_json::Value",
+            containers as "containers: serde_json::Value",
+            routes as "routes: serde_json::Value"
         "#,
         id,
         error_message
@@ -491,7 +520,9 @@ pub async fn update_controller_metadata(
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
             created_at, updated_at, identity_credential_hash,
-            identity_audiences as "identity_audiences: serde_json::Value"
+            identity_audiences as "identity_audiences: serde_json::Value",
+            containers as "containers: serde_json::Value",
+            routes as "routes: serde_json::Value"
         "#,
         id,
         metadata
@@ -540,7 +571,9 @@ pub async fn mark_cancelled(pool: &PgPool, id: Uuid) -> Result<Deployment> {
             first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             created_at, updated_at, identity_credential_hash,
-            identity_audiences as "identity_audiences: serde_json::Value"
+            identity_audiences as "identity_audiences: serde_json::Value",
+            containers as "containers: serde_json::Value",
+            routes as "routes: serde_json::Value"
         "#,
         id
     )
@@ -578,7 +611,9 @@ pub async fn mark_stopped(pool: &PgPool, id: Uuid) -> Result<Deployment> {
             first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             created_at, updated_at, identity_credential_hash,
-            identity_audiences as "identity_audiences: serde_json::Value"
+            identity_audiences as "identity_audiences: serde_json::Value",
+            containers as "containers: serde_json::Value",
+            routes as "routes: serde_json::Value"
         "#,
         id
     )
@@ -616,7 +651,9 @@ pub async fn mark_superseded(pool: &PgPool, id: Uuid) -> Result<Deployment> {
             first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             created_at, updated_at, identity_credential_hash,
-            identity_audiences as "identity_audiences: serde_json::Value"
+            identity_audiences as "identity_audiences: serde_json::Value",
+            containers as "containers: serde_json::Value",
+            routes as "routes: serde_json::Value"
         "#,
         id
     )
@@ -654,7 +691,9 @@ pub async fn mark_expired(pool: &PgPool, id: Uuid) -> Result<Deployment> {
             first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             created_at, updated_at, identity_credential_hash,
-            identity_audiences as "identity_audiences: serde_json::Value"
+            identity_audiences as "identity_audiences: serde_json::Value",
+            containers as "containers: serde_json::Value",
+            routes as "routes: serde_json::Value"
         "#,
         id
     )
@@ -691,7 +730,9 @@ pub async fn mark_healthy(pool: &PgPool, id: Uuid) -> Result<Deployment> {
             first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             created_at, updated_at, identity_credential_hash,
-            identity_audiences as "identity_audiences: serde_json::Value"
+            identity_audiences as "identity_audiences: serde_json::Value",
+            containers as "containers: serde_json::Value",
+            routes as "routes: serde_json::Value"
         "#,
         id
     )
@@ -727,7 +768,9 @@ pub async fn mark_unhealthy(pool: &PgPool, id: Uuid, reason: String) -> Result<D
             first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             created_at, updated_at, identity_credential_hash,
-            identity_audiences as "identity_audiences: serde_json::Value"
+            identity_audiences as "identity_audiences: serde_json::Value",
+            containers as "containers: serde_json::Value",
+            routes as "routes: serde_json::Value"
         "#,
         id,
         reason
@@ -767,7 +810,9 @@ pub async fn mark_terminating(
             first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             created_at, updated_at, identity_credential_hash,
-            identity_audiences as "identity_audiences: serde_json::Value"
+            identity_audiences as "identity_audiences: serde_json::Value",
+            containers as "containers: serde_json::Value",
+            routes as "routes: serde_json::Value"
         "#,
         id,
         reason as TerminationReason
@@ -803,7 +848,9 @@ pub async fn mark_cancelling(pool: &PgPool, id: Uuid) -> Result<Deployment> {
             first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             created_at, updated_at, identity_credential_hash,
-            identity_audiences as "identity_audiences: serde_json::Value"
+            identity_audiences as "identity_audiences: serde_json::Value",
+            containers as "containers: serde_json::Value",
+            routes as "routes: serde_json::Value"
         "#,
         id
     )
@@ -842,7 +889,9 @@ pub async fn get_by_identity_credential_hash(
             first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             created_at, updated_at, identity_credential_hash,
-            identity_audiences as "identity_audiences: serde_json::Value"
+            identity_audiences as "identity_audiences: serde_json::Value",
+            containers as "containers: serde_json::Value",
+            routes as "routes: serde_json::Value"
         FROM deployments
         WHERE identity_credential_hash = $1
         "#,
@@ -895,7 +944,9 @@ pub async fn find_active_for_project_and_group(
             first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             created_at, updated_at, identity_credential_hash,
-            identity_audiences as "identity_audiences: serde_json::Value"
+            identity_audiences as "identity_audiences: serde_json::Value",
+            containers as "containers: serde_json::Value",
+            routes as "routes: serde_json::Value"
         FROM deployments
         WHERE project_id = $1
           AND deployment_group = $2
@@ -935,7 +986,9 @@ pub async fn find_non_terminal_for_project_and_group(
             first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             created_at, updated_at, identity_credential_hash,
-            identity_audiences as "identity_audiences: serde_json::Value"
+            identity_audiences as "identity_audiences: serde_json::Value",
+            containers as "containers: serde_json::Value",
+            routes as "routes: serde_json::Value"
         FROM deployments
         WHERE project_id = $1
           AND deployment_group = $2
@@ -975,7 +1028,9 @@ pub async fn find_active_deployment_for_group(
             first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             created_at, updated_at, identity_credential_hash,
-            identity_audiences as "identity_audiences: serde_json::Value"
+            identity_audiences as "identity_audiences: serde_json::Value",
+            containers as "containers: serde_json::Value",
+            routes as "routes: serde_json::Value"
         FROM deployments
         WHERE project_id = $1
           AND deployment_group = $2
@@ -1015,7 +1070,9 @@ pub async fn find_last_for_project_and_group(
             first_healthy_at, job_url, pull_request_url, git_repository_url,
             replicas, cpu, memory,
             created_at, updated_at, identity_credential_hash,
-            identity_audiences as "identity_audiences: serde_json::Value"
+            identity_audiences as "identity_audiences: serde_json::Value",
+            containers as "containers: serde_json::Value",
+            routes as "routes: serde_json::Value"
         FROM deployments
         WHERE project_id = $1
           AND deployment_group = $2
@@ -1060,7 +1117,9 @@ pub async fn list_for_project_and_group(
                 first_healthy_at, job_url, pull_request_url, git_repository_url,
                 replicas, cpu, memory,
                 created_at, updated_at, identity_credential_hash,
-                identity_audiences as "identity_audiences: serde_json::Value"
+                identity_audiences as "identity_audiences: serde_json::Value",
+                containers as "containers: serde_json::Value",
+                routes as "routes: serde_json::Value"
             FROM deployments
             WHERE project_id = $1 AND deployment_group = $2
             ORDER BY created_at DESC
@@ -1091,7 +1150,9 @@ pub async fn list_for_project_and_group(
                 first_healthy_at, job_url, pull_request_url, git_repository_url,
                 replicas, cpu, memory,
                 created_at, updated_at, identity_credential_hash,
-                identity_audiences as "identity_audiences: serde_json::Value"
+                identity_audiences as "identity_audiences: serde_json::Value",
+                containers as "containers: serde_json::Value",
+                routes as "routes: serde_json::Value"
             FROM deployments
             WHERE project_id = $1
             ORDER BY created_at DESC
@@ -1233,7 +1294,9 @@ pub async fn get_active_deployments_for_project(
             replicas, cpu, memory,
             termination_reason as "termination_reason: _",
             created_at, updated_at, identity_credential_hash,
-            identity_audiences as "identity_audiences: serde_json::Value"
+            identity_audiences as "identity_audiences: serde_json::Value",
+            containers as "containers: serde_json::Value",
+            routes as "routes: serde_json::Value"
         FROM deployments
         WHERE project_id = $1 AND is_active = TRUE
         ORDER BY deployment_group, created_at DESC
@@ -1497,6 +1560,8 @@ mod tests {
                 cpu: "500m",
                 memory: "256Mi",
                 identity_audiences: serde_json::json!({}),
+                containers: None,
+                routes: None,
             },
         )
         .await
@@ -1585,6 +1650,8 @@ mod tests {
                 cpu: "500m",
                 memory: "256Mi",
                 identity_audiences: serde_json::json!({}),
+                containers: None,
+                routes: None,
             },
         )
         .await

@@ -100,7 +100,11 @@ impl GitLabRegistryProvider {
 
 #[async_trait]
 impl RegistryProvider for GitLabRegistryProvider {
-    async fn get_credentials(&self, repository: &str, _tag: &str) -> Result<RegistryCredentials> {
+    async fn get_credentials(
+        &self,
+        repository: &str,
+        _tags: &[&str],
+    ) -> Result<RegistryCredentials> {
         // JWT scope path: <namespace>[/<image_prefix>]/<repository>
         let image_path = format!("{}/{}", self.path_prefix, repository);
 
