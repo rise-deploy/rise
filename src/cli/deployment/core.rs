@@ -7,7 +7,7 @@ use serde::Deserialize;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-use crate::build::{self, BuildOptions, PlatformSource};
+use crate::build::{self, BackendPlatformHint, BuildOptions, PlatformSource};
 use crate::config::Config;
 
 // Re-export models from API module (always available)
@@ -450,13 +450,16 @@ fn log_platform_choice(platform: &str, source: PlatformSource, operation: &str) 
     match source {
         CliFlag | EnvVar | RiseToml => {} // explicit user choice, stay silent
         BackendHint => info!("{operation} for {platform} (target cluster architecture)"),
+        LegacyBackendDefault => info!(
+            "{operation} for {platform} (legacy default; this backend predates the platform capabilities endpoint)"
+        ),
         HostFallback => {
             // Reached only when a *supported* capabilities endpoint reported no
             // required architecture (a genuinely unconstrained cluster — e.g.
             // local dev). An *unsupported* endpoint (old backend → 404) does NOT
-            // land here: `fetch_backend_platform_hint` maps that to the legacy
-            // `linux/amd64` default, which resolves as `BackendHint` above. So
-            // we can state "unconstrained" here without conflating the two.
+            // land here: `fetch_backend_platform_hint` reports that as
+            // `LegacyBackendDefault` (linux/amd64). So we can state
+            // "unconstrained" here without conflating the two.
             info!(
                 "{operation} for {platform} (host architecture; target cluster is unconstrained — pass --platform to override)"
             )
@@ -515,17 +518,23 @@ async fn fetch_deployment_registry_credentials(
 const LEGACY_PLATFORM_FALLBACK: &str = "linux/amd64";
 
 /// Derive the container build platform the target cluster expects (e.g.
-/// "linux/amd64") from the platform capabilities endpoint. `None` when the
-/// cluster is unconstrained — the build then falls back to the host
-/// architecture.
+/// "linux/amd64") from the platform capabilities endpoint.
 ///
-/// For backward compatibility with backends that predate the endpoint, a 404 is
-/// treated as "use the legacy `linux/amd64` default" rather than a hard failure.
+/// Returns:
+/// - `Some(Advertised(..))` when the endpoint pins an architecture;
+/// - `Some(LegacyDefault(..))` when the endpoint is absent (404 — a backend
+///   that predates it), so the deploy keeps working with the legacy default
+///   rather than erroring;
+/// - `None` when a *supported* endpoint reports an unconstrained cluster — the
+///   build then falls back to the host architecture.
+///
+/// Any other non-success status is a hard error: without positive evidence of
+/// the target architecture we must not silently guess.
 async fn fetch_backend_platform_hint(
     http_client: &Client,
     backend_url: &str,
     token: &str,
-) -> Result<Option<String>> {
+) -> Result<Option<BackendPlatformHint>> {
     let url = format!("{}/api/v1/platform/capabilities", backend_url);
 
     let response = http_client
@@ -542,7 +551,9 @@ async fn fetch_backend_platform_hint(
             "Backend has no /platform/capabilities endpoint; falling back to legacy platform '{}'",
             LEGACY_PLATFORM_FALLBACK
         );
-        return Ok(Some(LEGACY_PLATFORM_FALLBACK.to_string()));
+        return Ok(Some(BackendPlatformHint::LegacyDefault(
+            LEGACY_PLATFORM_FALLBACK.to_string(),
+        )));
     }
 
     if !response.status().is_success() {
@@ -562,7 +573,9 @@ async fn fetch_backend_platform_hint(
         .json()
         .await
         .context("Failed to parse platform capabilities response")?;
-    Ok(caps.runtime_arch.map(|arch| format!("linux/{arch}")))
+    Ok(caps
+        .runtime_arch
+        .map(|arch| BackendPlatformHint::Advertised(format!("linux/{arch}"))))
 }
 
 /// A runtime environment variable override for a deployment
@@ -786,7 +799,7 @@ pub async fn create_deployment(
                 deploy_opts.build_args.platform.as_deref(),
                 env.as_deref(),
                 toml_platform,
-                backend_platform.as_deref(),
+                backend_platform,
             );
             log_platform_choice(&platform, source, "Pulling");
             if let Err(e) = build::docker_pull(&container_cli, source_image, &platform) {
@@ -900,7 +913,7 @@ pub async fn create_deployment(
             deploy_opts.path.to_string(),
             deploy_opts.build_args,
             deploy_opts.toml_config,
-            backend_platform.as_deref(),
+            backend_platform,
         );
         log_platform_choice(&options.platform, options.platform_source, "Building");
 
@@ -2147,5 +2160,76 @@ mod tests {
         assert_eq!(normalize_git_url(""), None);
         assert_eq!(normalize_git_url("not-a-url"), None);
         assert_eq!(normalize_git_url("/local/path/repo"), None);
+    }
+
+    /// Spawn a one-shot HTTP server that answers the first request with the
+    /// given status line (e.g. "404 Not Found") and JSON `body`, then closes.
+    /// Lets us drive `fetch_backend_platform_hint` end-to-end through reqwest
+    /// without a mock-server dependency. Returns the base URL.
+    async fn spawn_one_shot_response(status_line: &'static str, body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            // Drain the request first so the client has finished writing, then
+            // reply and close.
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn platform_hint_404_maps_to_legacy_default() {
+        // An old backend without the endpoint returns 404; we must fall back to
+        // the legacy linux/amd64 default rather than erroring or treating the
+        // cluster as unconstrained.
+        let base = spawn_one_shot_response("404 Not Found", "").await;
+        let hint = super::fetch_backend_platform_hint(&super::Client::new(), &base, "test-token")
+            .await
+            .expect("404 must not be a hard error");
+        assert_eq!(
+            hint,
+            Some(super::BackendPlatformHint::LegacyDefault(
+                "linux/amd64".to_string()
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn platform_hint_uses_advertised_arch() {
+        let base = spawn_one_shot_response(
+            "200 OK",
+            r#"{"runtime_arch":"arm64","runtime_allows_root":true}"#,
+        )
+        .await;
+        let hint = super::fetch_backend_platform_hint(&super::Client::new(), &base, "test-token")
+            .await
+            .unwrap();
+        assert_eq!(
+            hint,
+            Some(super::BackendPlatformHint::Advertised(
+                "linux/arm64".to_string()
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn platform_hint_unconstrained_cluster_is_none() {
+        // Supported endpoint, but no architecture pinned → no hint, so the
+        // build falls back to the host architecture.
+        let base = spawn_one_shot_response("200 OK", r#"{"runtime_allows_root":true}"#).await;
+        let hint = super::fetch_backend_platform_hint(&super::Client::new(), &base, "test-token")
+            .await
+            .unwrap();
+        assert_eq!(hint, None);
     }
 }
