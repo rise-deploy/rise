@@ -23,8 +23,9 @@ use std::collections::HashMap;
 /// a mistake and should fix the request.
 ///
 // TODO(#344): reserve the `RISE_` prefix here so a user-supplied env var can't
-// collide with an auto-injected `RISE_CONTAINER_HOST__<NAME>` (which, as an
-// explicit pod env, would silently shadow a same-named secret).
+// collide with the Rise-injected `RISE_*` pod env (e.g. `RISE_APP_URL`,
+// `RISE_DEPLOYMENT_GROUP`, `RISE_CONTAINER_HOST__<NAME>`), which as explicit
+// pod env would silently shadow a same-named secret.
 fn validate_env_var_key(key: &str) -> Result<(), ServerError> {
     if key != key.trim() {
         return Err(ServerError::bad_request(format!(
