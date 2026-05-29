@@ -37,10 +37,10 @@ export function useQuickstartTemplates() {
 }
 
 // Read-only properties of the deployment platform. Capability flags sit flat
-// at the top level under namespaced keys (e.g. `deployments:canRunAsRoot`).
+// at the top level (e.g. `runtime_allows_root`).
 export interface PlatformCapabilities {
     runtime_arch: string | null;
-    'deployments:canRunAsRoot': boolean;
+    runtime_allows_root: boolean;
 }
 
 export function usePlatformCapabilities() {
@@ -115,8 +115,8 @@ export function QuickstartDeployModal({ template, onClose, onDeployed }: DeployM
     // capabilities mean a privileged port (< 1024) can't be bound and the app
     // will crash-loop. This is computed client-side from the platform
     // capability rather than baked into each template's `warning`.
-    const canRunAsRoot = caps?.['deployments:canRunAsRoot'] ?? true;
-    const privilegedPortRisk = !canRunAsRoot && template.http_port < 1024;
+    const allowsRoot = caps?.runtime_allows_root ?? true;
+    const privilegedPortRisk = !allowsRoot && template.http_port < 1024;
 
     const handleDeploy = async () => {
         if (!formData.name) { showToast('Project name is required', 'error'); return; }

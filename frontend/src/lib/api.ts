@@ -233,7 +233,7 @@ class RiseAPI {
     // getLogsCapabilities, we type-guard each field and fall back to a safe,
     // permissive default on any failure so a backend change can't break the UI.
     async getPlatformCapabilities() {
-        const safeDefault = { runtime_arch: null, 'deployments:canRunAsRoot': true };
+        const safeDefault = { runtime_arch: null, runtime_allows_root: true };
         let payload;
         try {
             payload = await this.request('/platform/capabilities');
@@ -246,10 +246,10 @@ class RiseAPI {
             return safeDefault;
         }
         const runtime_arch = typeof payload.runtime_arch === 'string' ? payload.runtime_arch : null;
-        const canRunAsRoot = typeof payload['deployments:canRunAsRoot'] === 'boolean'
-            ? payload['deployments:canRunAsRoot']
+        const runtime_allows_root = typeof payload.runtime_allows_root === 'boolean'
+            ? payload.runtime_allows_root
             : true;
-        return { runtime_arch, 'deployments:canRunAsRoot': canRunAsRoot };
+        return { runtime_arch, runtime_allows_root };
     }
 
     // Service account endpoints
