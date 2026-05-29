@@ -429,17 +429,22 @@ struct GetRegistryCredsResponse {
     credentials: RegistryCredentials,
     #[allow(dead_code)]
     repository: String,
-    /// Backend-advertised container platform for the target cluster (e.g.
-    /// "linux/amd64"). Absent when the backend doesn't pin a node arch — CLI
-    /// then falls back to the host architecture.
-    #[serde(default)]
-    target_platform: Option<String>,
 }
 
-/// Registry credentials plus the backend-advertised target platform.
+/// Subset of the platform capabilities response the CLI cares about. The full
+/// response also carries a `capabilities` map (consumed by the frontend);
+/// unknown fields are ignored.
+#[derive(serde::Deserialize)]
+struct PlatformCapabilities {
+    /// Container architecture the target cluster accepts (e.g. "amd64"). Absent
+    /// when the cluster is unconstrained.
+    #[serde(default)]
+    runtime_arch: Option<String>,
+}
+
+/// Registry credentials for a deployment.
 struct DeploymentRegistryInfo {
     credentials: RegistryCredentials,
-    target_platform: Option<String>,
 }
 
 /// Log the resolved build platform and the source it was inferred from, so the
@@ -496,8 +501,54 @@ async fn fetch_deployment_registry_credentials(
 
     Ok(DeploymentRegistryInfo {
         credentials: resp.credentials,
-        target_platform: resp.target_platform,
     })
+}
+
+/// Fetch the deployment platform's capabilities (architecture, etc.).
+async fn fetch_platform_capabilities(
+    http_client: &Client,
+    backend_url: &str,
+    token: &str,
+) -> Result<PlatformCapabilities> {
+    let url = format!("{}/api/v1/platform/capabilities", backend_url);
+
+    let response = http_client
+        .get(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .context("Failed to fetch platform capabilities")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
+        bail!(
+            "Failed to fetch platform capabilities ({}): {}",
+            status,
+            error_text
+        );
+    }
+
+    response
+        .json()
+        .await
+        .context("Failed to parse platform capabilities response")
+}
+
+/// Derive the container build platform the target cluster expects (e.g.
+/// "linux/amd64") from the platform capabilities endpoint. `None` when the
+/// cluster is unconstrained — the build then falls back to the host
+/// architecture.
+async fn fetch_backend_platform_hint(
+    http_client: &Client,
+    backend_url: &str,
+    token: &str,
+) -> Result<Option<String>> {
+    let caps = fetch_platform_capabilities(http_client, backend_url, token).await?;
+    Ok(caps.runtime_arch.map(|arch| format!("linux/{arch}")))
 }
 
 /// A runtime environment variable override for a deployment
@@ -710,6 +761,8 @@ pub async fn create_deployment(
             .await?;
 
             // Pull the source image for the configured platform.
+            let backend_platform =
+                fetch_backend_platform_hint(http_client, backend_url, &token).await?;
             let toml_platform = deploy_opts
                 .toml_config
                 .as_ref()
@@ -720,7 +773,7 @@ pub async fn create_deployment(
                 deploy_opts.build_args.platform.as_deref(),
                 env.as_deref(),
                 toml_platform,
-                registry_info.target_platform.as_deref(),
+                backend_platform.as_deref(),
             );
             log_platform_choice(&platform, source, "Pulling");
             if let Err(e) = build::docker_pull(&container_cli, source_image, &platform) {
@@ -815,8 +868,10 @@ pub async fn create_deployment(
     } else {
         // Build from source path: Execute build and push.
         //
-        // Fetch credentials first so the backend's target_platform hint can
-        // feed into BuildOptions' platform precedence.
+        // Fetch the backend's architecture hint first so it can feed into
+        // BuildOptions' platform precedence.
+        let backend_platform =
+            fetch_backend_platform_hint(http_client, backend_url, &token).await?;
         let registry_info = fetch_deployment_registry_credentials(
             http_client,
             backend_url,
@@ -832,7 +887,7 @@ pub async fn create_deployment(
             deploy_opts.path.to_string(),
             deploy_opts.build_args,
             deploy_opts.toml_config,
-            registry_info.target_platform.as_deref(),
+            backend_platform.as_deref(),
         );
         log_platform_choice(&options.platform, options.platform_source, "Building");
 

@@ -13,6 +13,7 @@ pub mod extensions;
 pub mod frontend;
 pub mod middleware;
 pub mod oci;
+pub mod platform;
 pub mod project;
 pub mod quickstart;
 pub mod rate_limit;
@@ -226,7 +227,8 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         .merge(environments::routes::routes())
         .merge(extensions::routes::routes())
         .merge(encryption::routes::routes())
-        .merge(quickstart::routes::routes());
+        .merge(quickstart::routes::routes())
+        .merge(platform::routes::routes());
 
     #[cfg(feature = "backend")]
     let platform_routes = platform_routes.merge(resources::routes::routes());

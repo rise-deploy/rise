@@ -36,12 +36,6 @@ pub struct RegistryCredentials {
 pub struct GetRegistryCredsResponse {
     pub credentials: RegistryCredentials,
     pub repository: String,
-    /// Container platform the target cluster will accept (e.g. "linux/amd64").
-    /// Populated from the controller's `node_selector["kubernetes.io/arch"]`
-    /// when pinned; absent when the cluster is unconstrained, letting the CLI
-    /// fall back to host architecture.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_platform: Option<String>,
 }
 
 /// Configuration for AWS ECR registry

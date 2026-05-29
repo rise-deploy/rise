@@ -18,7 +18,8 @@ mod ssl;
 /// Fallback target platform when nothing more specific (CLI flag, env var,
 /// rise.toml, backend hint) is provided. We default to the host architecture
 /// so local dev (e.g. ARM Mac + ARM minikube) just works; production deploys
-/// override via the backend's `target_platform` hint.
+/// override via the backend's advertised architecture (the `runtime_arch`
+/// platform capability).
 pub fn host_platform() -> String {
     let arch = match std::env::consts::ARCH {
         "x86_64" => "amd64",
@@ -43,7 +44,8 @@ pub enum PlatformSource {
     EnvVar,
     /// From `[build].platform` in rise.toml.
     RiseToml,
-    /// From the backend-advertised `target_platform` hint.
+    /// From the backend-advertised architecture (`runtime_arch` platform
+    /// capability), mapped to a `linux/{arch}` platform string.
     BackendHint,
     /// Fell through to `host_platform()` / `std::env::consts::ARCH`.
     HostFallback,
