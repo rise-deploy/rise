@@ -43,10 +43,38 @@ pub enum PlatformSource {
     EnvVar,
     /// From `[build].platform` in rise.toml.
     RiseToml,
-    /// From the backend-advertised `target_platform` hint.
+    /// From the backend-advertised architecture (`runtime_arch` platform
+    /// capability), mapped to a `linux/{arch}` platform string.
     BackendHint,
+    /// Legacy `linux/amd64` default, used when the backend predates the
+    /// platform capabilities endpoint (the endpoint returned 404). Kept
+    /// distinct from [`PlatformSource::BackendHint`] so logs don't claim the
+    /// cluster actually advertised this architecture.
+    LegacyBackendDefault,
     /// Fell through to `host_platform()` / `std::env::consts::ARCH`.
     HostFallback,
+}
+
+/// The build-platform hint resolved from the backend, distinguishing a real
+/// advertised architecture (from a supported capabilities endpoint) from the
+/// legacy default used when the backend predates the endpoint. This lets
+/// [`resolve_platform`] label the [`PlatformSource`] honestly instead of
+/// passing both off as [`PlatformSource::BackendHint`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendPlatformHint {
+    /// Architecture advertised by a supported capabilities endpoint.
+    Advertised(String),
+    /// Legacy default for a backend without the capabilities endpoint.
+    LegacyDefault(String),
+}
+
+impl BackendPlatformHint {
+    fn into_resolved(self) -> (String, PlatformSource) {
+        match self {
+            BackendPlatformHint::Advertised(p) => (p, PlatformSource::BackendHint),
+            BackendPlatformHint::LegacyDefault(p) => (p, PlatformSource::LegacyBackendDefault),
+        }
+    }
 }
 
 /// Resolve the build platform from the standard precedence chain:
@@ -62,7 +90,7 @@ pub fn resolve_platform(
     cli: Option<&str>,
     env: Option<&str>,
     project: Option<&str>,
-    backend_hint: Option<&str>,
+    backend_hint: Option<BackendPlatformHint>,
 ) -> (String, PlatformSource) {
     if let Some(v) = cli {
         return (v.to_string(), PlatformSource::CliFlag);
@@ -73,8 +101,8 @@ pub fn resolve_platform(
     if let Some(v) = project {
         return (v.to_string(), PlatformSource::RiseToml);
     }
-    if let Some(v) = backend_hint {
-        return (v.to_string(), PlatformSource::BackendHint);
+    if let Some(hint) = backend_hint {
+        return hint.into_resolved();
     }
     (host_platform(), PlatformSource::HostFallback)
 }
@@ -434,12 +462,11 @@ mod tests {
 
     #[test]
     fn test_resolve_platform_cli_wins() {
-        // CLI flag wins over env, project, and backend hint.
         let (value, source) = resolve_platform(
             Some("linux/cli-wins"),
             Some("linux/env"),
             Some("linux/project"),
-            Some("linux/backend"),
+            Some(BackendPlatformHint::Advertised("linux/backend".to_string())),
         );
         assert_eq!(value, "linux/cli-wins");
         assert_eq!(source, PlatformSource::CliFlag);
@@ -447,14 +474,11 @@ mod tests {
 
     #[test]
     fn test_resolve_platform_env_over_project_and_backend() {
-        // With no CLI flag, RISE_PLATFORM (passed in as `env`) outranks
-        // rise.toml and the backend hint. Previously hidden behind a
-        // process-global env mutation; now exercised purely via params.
         let (value, source) = resolve_platform(
             None,
             Some("linux/env-wins"),
             Some("linux/project"),
-            Some("linux/backend"),
+            Some(BackendPlatformHint::Advertised("linux/backend".to_string())),
         );
         assert_eq!(value, "linux/env-wins");
         assert_eq!(source, PlatformSource::EnvVar);
@@ -462,24 +486,46 @@ mod tests {
 
     #[test]
     fn test_resolve_platform_project_over_backend() {
-        // With no CLI flag and no env, rise.toml outranks the backend hint.
-        let (value, source) =
-            resolve_platform(None, None, Some("linux/project"), Some("linux/backend"));
+        let (value, source) = resolve_platform(
+            None,
+            None,
+            Some("linux/project"),
+            Some(BackendPlatformHint::Advertised("linux/backend".to_string())),
+        );
         assert_eq!(value, "linux/project");
         assert_eq!(source, PlatformSource::RiseToml);
     }
 
     #[test]
     fn test_resolve_platform_backend_over_host() {
-        // With no user signal, the backend hint beats host arch fallback.
-        let (value, source) = resolve_platform(None, None, None, Some("linux/backend-arch"));
+        let (value, source) = resolve_platform(
+            None,
+            None,
+            None,
+            Some(BackendPlatformHint::Advertised(
+                "linux/backend-arch".to_string(),
+            )),
+        );
         assert_eq!(value, "linux/backend-arch");
         assert_eq!(source, PlatformSource::BackendHint);
     }
 
     #[test]
+    fn test_resolve_platform_legacy_backend_default() {
+        let (value, source) = resolve_platform(
+            None,
+            None,
+            None,
+            Some(BackendPlatformHint::LegacyDefault(
+                "linux/amd64".to_string(),
+            )),
+        );
+        assert_eq!(value, "linux/amd64");
+        assert_eq!(source, PlatformSource::LegacyBackendDefault);
+    }
+
+    #[test]
     fn test_resolve_platform_host_fallback() {
-        // All inputs None → host architecture, marked as HostFallback.
         let (value, source) = resolve_platform(None, None, None, None);
         assert_eq!(value, host_platform());
         assert_eq!(source, PlatformSource::HostFallback);

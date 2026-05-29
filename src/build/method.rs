@@ -135,16 +135,16 @@ impl BuildOptions {
     /// When `preloaded_config` is provided, its `.build` section is used instead
     /// of loading rise.toml from disk, avoiding duplicate file reads/warnings.
     ///
-    /// `backend_platform_hint` is the `target_platform` advertised by the
-    /// backend (from the registry-credentials response); it sits below
-    /// rise.toml in precedence but above the host-arch fallback.
+    /// `backend_platform_hint` is the architecture hint from the backend's
+    /// platform capabilities endpoint; it sits below rise.toml in precedence
+    /// but above the host-arch fallback.
     pub(crate) fn from_build_args(
         config: &Config,
         image_tag: String,
         app_path: String,
         build_args: &BuildArgs,
         preloaded_config: Option<crate::build::config::ProjectBuildConfig>,
-        backend_platform_hint: Option<&str>,
+        backend_platform_hint: Option<crate::build::BackendPlatformHint>,
     ) -> Self {
         use tracing::warn;
 
