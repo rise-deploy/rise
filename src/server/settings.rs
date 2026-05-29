@@ -583,6 +583,10 @@ fn default_metacontroller_webhook_port() -> u16 {
     3001
 }
 
+fn default_crd_upsert_interval_ms() -> u64 {
+    1000
+}
+
 fn default_custom_domain_tls_mode() -> CustomDomainTlsMode {
     CustomDomainTlsMode::PerDomain
 }
@@ -1007,6 +1011,14 @@ pub enum DeploymentControllerSettings {
         /// Defaults to "app.kubernetes.io/name=metacontroller-operator".
         #[serde(default)]
         metacontroller_pod_label_selector: Option<String>,
+
+        /// Interval in milliseconds between consecutive RiseProject CRD upserts
+        /// during the startup backfill. The backfill runs as a background task,
+        /// touching every active project's CRD at this rate so that version-label
+        /// changes (introduced by an upgrade) are propagated to Metacontroller
+        /// gradually rather than all at once. Defaults to 1000 (1 per second).
+        #[serde(default = "default_crd_upsert_interval_ms")]
+        crd_upsert_interval_ms: u64,
     },
 }
 

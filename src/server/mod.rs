@@ -111,20 +111,35 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         encryption_provider: state.encryption_provider.clone(),
     };
 
-    // Reconcile RiseProject CRDs (upgrade migration, recovery, and label
-    // backfill — see `backfill_rise_projects` doc for the full set of
-    // scenarios).
+    // Reconcile RiseProject CRDs as a background task — see
+    // `backfill_rise_projects` for the full set of scenarios. The task is
+    // non-blocking so the HTTP server starts immediately; projects are upserted
+    // at a steady rate to avoid flooding the Kubernetes API and Metacontroller.
     #[cfg(feature = "backend")]
     if let Some(ref kube_client) = state.kube_client {
-        if let Err(e) = deployment::crd::backfill_rise_projects(
-            kube_client,
-            &state.db_pool,
-            state.deployment_controller_class_name.as_deref(),
-        )
-        .await
-        {
-            tracing::warn!("Failed to backfill RiseProject CRDs: {:?}", e);
-        }
+        use settings::DeploymentControllerSettings;
+        let interval_ms = match &settings.deployment_controller {
+            Some(DeploymentControllerSettings::Kubernetes {
+                crd_upsert_interval_ms,
+                ..
+            }) => *crd_upsert_interval_ms,
+            _ => 1000,
+        };
+        let kube_client = kube_client.clone();
+        let db_pool = state.db_pool.clone();
+        let controller_class = state.deployment_controller_class_name.clone();
+        tokio::spawn(async move {
+            if let Err(e) = deployment::crd::backfill_rise_projects(
+                &kube_client,
+                &db_pool,
+                controller_class.as_deref(),
+                std::time::Duration::from_millis(interval_ms),
+            )
+            .await
+            {
+                tracing::warn!("Failed to backfill RiseProject CRDs: {:?}", e);
+            }
+        });
     }
 
     // Spawn enabled controllers as background tasks

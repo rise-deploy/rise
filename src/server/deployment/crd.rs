@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use kube::api::{Api, ListParams, Patch, PatchParams};
 use kube::Client;
@@ -51,7 +51,20 @@ const TRIGGER_ANNOTATION: &str = "rise.dev/trigger";
 /// `enforce_controller_class`; the label is the forward-compatible carrier.
 pub const CONTROLLER_CLASS_LABEL: &str = "rise.dev/controller-class";
 
+/// Label key recording the Rise server version that last upserted this CRD.
+/// When the label value changes after an upgrade, the SSA patch bumps
+/// `resourceVersion`, which Metacontroller detects as a parent-resource update
+/// and immediately triggers a sync webhook call — no explicit annotation nudge
+/// required.
+pub const RISE_VERSION_LABEL: &str = "rise.dev/version";
+
 /// Create or update a `RiseProject` CRD for the given project.
+///
+/// Always stamps the current `CARGO_PKG_VERSION` as the `rise.dev/version`
+/// label. When the label value changes (i.e. after an upgrade), the SSA patch
+/// updates `resourceVersion`, which Metacontroller detects as a parent-resource
+/// change and triggers an immediate sync webhook call — no separate annotation
+/// nudge required.
 ///
 /// `controller_class` is stamped as the `rise.dev/controller-class` label
 /// when present. `None` means "no Kubernetes deployment controller is
@@ -64,12 +77,16 @@ pub async fn ensure_rise_project(
     let api: Api<RiseProject> = Api::all(client.clone());
 
     let mut rise_project = RiseProject::new(project_name, RiseProjectSpec {});
+    let labels = rise_project
+        .metadata
+        .labels
+        .get_or_insert_with(std::collections::BTreeMap::new);
+    labels.insert(
+        RISE_VERSION_LABEL.to_string(),
+        env!("CARGO_PKG_VERSION").to_string(),
+    );
     if let Some(class) = controller_class {
-        rise_project
-            .metadata
-            .labels
-            .get_or_insert_with(std::collections::BTreeMap::new)
-            .insert(CONTROLLER_CLASS_LABEL.to_string(), class.to_string());
+        labels.insert(CONTROLLER_CLASS_LABEL.to_string(), class.to_string());
     }
 
     api.patch(
@@ -150,41 +167,70 @@ pub async fn trigger_resync(client: &Client, project_name: &str) -> anyhow::Resu
 /// Reconcile `RiseProject` CRDs for every active project in the database.
 ///
 /// Handles three scenarios in one pass:
-/// 1. **Upgrade**: When migrating to Metacontroller, no RiseProject CRDs exist yet — they're created.
+/// 1. **Upgrade**: Existing CRDs whose `rise.dev/version` label differs
+///    from the running version are patched — the label change bumps
+///    `resourceVersion`, which Metacontroller sees as a parent-resource update
+///    and immediately calls the sync webhook. No explicit `trigger_resync` call
+///    is needed.
 /// 2. **Recovery**: An accidentally deleted CRD is recreated.
-/// 3. **Relabel**: An existing CRD missing the `rise.dev/controller-class`
-///    label (created before that label existed) is patched with it.
+/// 3. **New project**: A CRD that was never created (e.g. missed during a
+///    failed earlier startup) is created now.
 ///
-/// Calls `ensure_rise_project` unconditionally for every active project;
-/// server-side apply is a no-op when the resulting object would not change,
-/// so re-applying on every startup is safe.
-///
-/// Runs once at server startup. Per-project failures are logged as warnings
-/// and do not block startup or other projects.
+/// Projects are processed sequentially with `interval` between each upsert to
+/// spread the load across the Kubernetes API server and Metacontroller rather
+/// than flooding them all at once. Runs as a background task so startup is not
+/// blocked. Per-project failures are logged as warnings and do not affect other
+/// projects.
 pub async fn backfill_rise_projects(
     client: &Client,
     db_pool: &PgPool,
     controller_class: Option<&str>,
+    interval: std::time::Duration,
 ) -> anyhow::Result<()> {
+    let current_version = env!("CARGO_PKG_VERSION");
     let api: Api<RiseProject> = Api::all(client.clone());
     let existing_crds = api.list(&ListParams::default()).await?;
-    let existing_names: HashSet<String> =
-        existing_crds.items.iter().map(|r| r.name_any()).collect();
+
+    // Build a name→version-label map so we can log how many projects are
+    // getting an upgrade-triggered resync vs. a plain no-op reconcile.
+    let existing_version_by_name: HashMap<String, Option<String>> = existing_crds
+        .items
+        .iter()
+        .map(|r| {
+            let version = r
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(RISE_VERSION_LABEL))
+                .cloned();
+            (r.name_any(), version)
+        })
+        .collect();
 
     let active_projects = crate::db::projects::list_active(db_pool).await?;
 
+    let total = active_projects.len();
+    info!(
+        "RiseProject backfill: {} active projects, {} pre-existing CRDs, interval={}ms",
+        total,
+        existing_version_by_name.len(),
+        interval.as_millis(),
+    );
+
     let mut created = 0u32;
+    let mut upgraded = 0u32;
     let mut reconciled = 0u32;
     let mut failed = 0u32;
-    for project in &active_projects {
+    for (i, project) in active_projects.iter().enumerate() {
+        if i > 0 {
+            tokio::time::sleep(interval).await;
+        }
         match ensure_rise_project(client, &project.name, controller_class).await {
-            Ok(()) => {
-                if existing_names.contains(&project.name) {
-                    reconciled += 1;
-                } else {
-                    created += 1;
-                }
-            }
+            Ok(()) => match existing_version_by_name.get(&project.name) {
+                None => created += 1,
+                Some(v) if v.as_deref() != Some(current_version) => upgraded += 1,
+                _ => reconciled += 1,
+            },
             Err(e) => {
                 warn!(
                     project = %project.name,
@@ -195,22 +241,10 @@ pub async fn backfill_rise_projects(
         }
     }
 
-    if created > 0 || failed > 0 {
-        info!(
-            "RiseProject backfill: {} created, {} reconciled, {} failed \
-             ({} active projects, {} pre-existing CRDs)",
-            created,
-            reconciled,
-            failed,
-            active_projects.len(),
-            existing_names.len()
-        );
-    } else {
-        debug!(
-            "RiseProject backfill: {} reconciled, no creates/failures",
-            reconciled
-        );
-    }
+    info!(
+        "RiseProject backfill complete: {} created, {} upgraded, {} reconciled, {} failed",
+        created, upgraded, reconciled, failed,
+    );
 
     Ok(())
 }
