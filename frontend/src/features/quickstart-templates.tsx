@@ -36,6 +36,23 @@ export function useQuickstartTemplates() {
     return { templates, error };
 }
 
+// Read-only properties of the deployment platform. Capability flags sit flat
+// at the top level (e.g. `runtime_allows_root`).
+export interface PlatformCapabilities {
+    runtime_arch: string | null;
+    runtime_allows_root: boolean;
+}
+
+export function usePlatformCapabilities() {
+    const [caps, setCaps] = useState<PlatformCapabilities | null>(null);
+    useEffect(() => {
+        api.getPlatformCapabilities()
+            .then(c => setCaps(c as PlatformCapabilities))
+            .catch(() => { /* permissive default applied in api client */ });
+    }, []);
+    return caps;
+}
+
 export function QuickstartCard({ template, onSelect }: { template: QuickstartTemplate; onSelect: () => void }) {
     return (
         <button
@@ -79,6 +96,7 @@ export function QuickstartDeployModal({ template, onClose, onDeployed }: DeployM
     const [currentUser, setCurrentUser] = useState<any>(null);
     const [formData, setFormData] = useState<{ name: string; access_class: string; owner: string }>({ name: '', access_class: 'public', owner: 'self' });
     const [saving, setSaving] = useState(false);
+    const caps = usePlatformCapabilities();
 
     useEffect(() => {
         if (!template) return;
@@ -92,6 +110,13 @@ export function QuickstartDeployModal({ template, onClose, onDeployed }: DeployM
     }, []);
 
     if (!template) return null;
+
+    // Capability-derived hint: when the platform runs apps as non-root, dropped
+    // capabilities mean a privileged port (< 1024) can't be bound and the app
+    // will crash-loop. This is computed client-side from the platform
+    // capability rather than baked into each template's `warning`.
+    const allowsRoot = caps?.runtime_allows_root ?? true;
+    const privilegedPortRisk = !allowsRoot && template.http_port < 1024;
 
     const handleDeploy = async () => {
         if (!formData.name) { showToast('Project name is required', 'error'); return; }
@@ -144,6 +169,13 @@ export function QuickstartDeployModal({ template, onClose, onDeployed }: DeployM
             {template.warning && (
                 <div style={{ marginBottom: 14 }}>
                     <Alert tone="warn" icon="info">{template.warning}</Alert>
+                </div>
+            )}
+            {privilegedPortRisk && (
+                <div style={{ marginBottom: 14 }}>
+                    <Alert tone="warn" icon="info">
+                        This platform runs apps as a non-root user, so binding port {template.http_port} (below 1024) may fail. Prefer an image that listens on a port ≥ 1024.
+                    </Alert>
                 </div>
             )}
             <div className="r-quickstart-meta">

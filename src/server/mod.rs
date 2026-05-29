@@ -13,6 +13,7 @@ pub mod extensions;
 pub mod frontend;
 pub mod middleware;
 pub mod oci;
+pub mod platform;
 pub mod project;
 pub mod quickstart;
 pub mod rate_limit;
@@ -200,6 +201,10 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
             "/schema/rise-toml/v1",
             axum::routing::get(rise_toml_schema_v1_redirect),
         )
+        // Platform capabilities are non-sensitive and must be reachable by
+        // project service accounts (which have no project context here), so the
+        // route is public.
+        .merge(platform::routes::routes())
         .merge(auth::routes::public_routes())
         .merge(workload_tokens::routes::routes());
 

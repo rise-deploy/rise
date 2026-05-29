@@ -135,9 +135,10 @@ impl BuildOptions {
     /// When `preloaded_config` is provided, its `.build` section is used instead
     /// of loading rise.toml from disk, avoiding duplicate file reads/warnings.
     ///
-    /// `backend_platform_hint` is the architecture hint from the backend's
-    /// platform capabilities endpoint; it sits below rise.toml in precedence
-    /// but above the host-arch fallback.
+    /// `backend_platform_hint` is the build platform resolved from the backend
+    /// (an advertised `runtime_arch`, or the legacy default for a backend that
+    /// predates the capabilities endpoint); it sits below rise.toml in
+    /// precedence but above the host-arch fallback.
     pub(crate) fn from_build_args(
         config: &Config,
         image_tag: String,

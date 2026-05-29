@@ -227,6 +227,31 @@ class RiseAPI {
         return this.request('/quickstart-templates');
     }
 
+    // Read-only properties of the deployment platform (architecture, whether
+    // pods may run as root, …). Lets the UI derive consequences client-side
+    // (e.g. "this template binds a privileged port and may fail here"). Like
+    // getLogsCapabilities, we type-guard each field and fall back to a safe,
+    // permissive default on any failure so a backend change can't break the UI.
+    async getPlatformCapabilities() {
+        const safeDefault = { runtime_arch: null, runtime_allows_root: true };
+        let payload;
+        try {
+            payload = await this.request('/platform/capabilities');
+        } catch (err) {
+            console.warn('getPlatformCapabilities request failed; using safe default:', err);
+            return safeDefault;
+        }
+        if (!payload || typeof payload !== 'object') {
+            console.warn('getPlatformCapabilities returned non-object payload; using safe default:', payload);
+            return safeDefault;
+        }
+        const runtime_arch = typeof payload.runtime_arch === 'string' ? payload.runtime_arch : null;
+        const runtime_allows_root = typeof payload.runtime_allows_root === 'boolean'
+            ? payload.runtime_allows_root
+            : true;
+        return { runtime_arch, runtime_allows_root };
+    }
+
     // Service account endpoints
     async getProjectServiceAccounts(projectName) {
         return this.request(`/projects/${projectName}/service-accounts`);

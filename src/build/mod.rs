@@ -69,6 +69,7 @@ pub enum BackendPlatformHint {
 }
 
 impl BackendPlatformHint {
+    /// The platform string and the source label that should be reported for it.
     fn into_resolved(self) -> (String, PlatformSource) {
         match self {
             BackendPlatformHint::Advertised(p) => (p, PlatformSource::BackendHint),
@@ -486,6 +487,7 @@ mod tests {
 
     #[test]
     fn test_resolve_platform_project_over_backend() {
+        // With no CLI flag and no env, rise.toml outranks the backend hint.
         let (value, source) = resolve_platform(
             None,
             None,
@@ -498,6 +500,8 @@ mod tests {
 
     #[test]
     fn test_resolve_platform_backend_over_host() {
+        // With no user signal, an advertised backend hint beats host fallback
+        // and is labeled BackendHint.
         let (value, source) = resolve_platform(
             None,
             None,
@@ -512,6 +516,9 @@ mod tests {
 
     #[test]
     fn test_resolve_platform_legacy_backend_default() {
+        // A legacy default (old backend without the capabilities endpoint) is
+        // used like a backend hint but labeled distinctly so logs don't claim
+        // the cluster advertised it.
         let (value, source) = resolve_platform(
             None,
             None,
@@ -522,6 +529,21 @@ mod tests {
         );
         assert_eq!(value, "linux/amd64");
         assert_eq!(source, PlatformSource::LegacyBackendDefault);
+    }
+
+    #[test]
+    fn test_resolve_platform_cli_wins_over_legacy_default() {
+        // An explicit user choice still wins over the legacy fallback.
+        let (value, source) = resolve_platform(
+            Some("linux/cli"),
+            None,
+            None,
+            Some(BackendPlatformHint::LegacyDefault(
+                "linux/amd64".to_string(),
+            )),
+        );
+        assert_eq!(value, "linux/cli");
+        assert_eq!(source, PlatformSource::CliFlag);
     }
 
     #[test]

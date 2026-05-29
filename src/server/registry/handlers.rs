@@ -98,19 +98,12 @@ pub async fn get_deployment_registry_credentials(
                 .with_context("repository", &repository)
         })?;
 
-    // If the controller pins `kubernetes.io/arch`, surface it so the CLI can
-    // build a matching image. Unset means "no constraint" — CLI falls back to
-    // host architecture, which is the right default for local-dev clusters.
-    let target_platform = state
-        .resource_builder
-        .as_ref()
-        .and_then(|rb| rb.node_selector.get("kubernetes.io/arch"))
-        .map(|arch| format!("linux/{arch}"));
-
+    // The target architecture is advertised separately via the platform
+    // capabilities endpoint (`GET /api/v1/platform/capabilities`), which the
+    // CLI consults to choose its build platform.
     Ok(Json(GetRegistryCredsResponse {
         credentials,
         repository,
-        target_platform,
     }))
 }
 
