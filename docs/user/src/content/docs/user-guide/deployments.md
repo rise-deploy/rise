@@ -239,16 +239,16 @@ name = "my-app"
 backend = "docker"
 dockerfile = "frontend/Dockerfile"
 [containers.frontend]
-http_port = 8080
+port = 8080
 replicas = 2
 
 [containers.backend.build]
 backend = "docker"
 dockerfile = "backend/Dockerfile"
 [containers.backend]
-http_port = 9090
+port = 9090
 replicas = 3
-# Override the default HTTP probe (defaults to GET / when http_port is set):
+# Routed containers get HTTP probes on `/` by default; customise here:
 health_check = { path = "/health", initial_delay_seconds = 5 }
 # Per-container env vars. Project-level env vars also apply.
 env = { LOG_LEVEL = "info" }
@@ -257,22 +257,22 @@ env = { LOG_LEVEL = "info" }
 # Pre-built image — the CLI won't try to build or push this one.
 image = "registry.example.com/my-app/worker:1.2.3"
 replicas = 4
-# Workers have no http_port → no Service, no HTTP probes.
+# Workers have no port → no Service, no HTTP probes.
 
 [routes]
 "/api" = { container = "backend" }
 "/" = { container = "frontend" }
 ```
 
-When you run `rise deploy`, the backend allocates a deployment ID and returns one image tag per container with `[build]` (shared registry, distinct tags per container). The CLI logs in once — the temporary credentials it gets back are scoped to cover every container's tag — and then builds and pushes each container in turn. Containers with a pre-built `image` are passed through unchanged.
+When you run `rise deploy`, the backend allocates a deployment ID and returns one image tag per container with `[build]` (shared registry, distinct tags per container). The credentials it returns are scoped to cover every container's tag, and the CLI builds and pushes each container in turn (re-minting credentials per container so a long build can't outlast the token). Containers with a pre-built `image` are passed through unchanged.
 
 Notes:
 
-- `[containers]` is mutually exclusive with the top-level `[build]` and `[deploy]` sections. Existing single-container projects keep working unchanged — the top-level `[build]`/`[deploy]` is treated as an implicit `app` container.
-- Containers without `http_port` get no `Service` and no HTTP probes — exactly what you want for workers / batch jobs.
-- `health_check = false` disables probes entirely on a container.
-- Routes are matched longest-prefix-first by the ingress, so `/api` shadows `/` correctly. If `[routes]` is omitted and exactly one container has `http_port`, Rise synthesises `/` → that container.
-- Each container is given a `RISE_CONTAINER_HOST__<NAME>` env var pointing at every routable sibling's in-cluster Service. See [Environment Variables](../environment-variables#auto-injected-variables).
+- `[containers]` is mutually exclusive with the top-level `[build]` and `[deploy]` sections. A single-container project uses the simple top-level `[build]`/`[deploy]` form — internally that's just one container named `app`.
+- Containers without `port` get no `Service` and no HTTP probes — exactly what you want for workers / batch jobs.
+- HTTP probes default to `GET /` only for containers that are routed (referenced by `[routes]`); a container with a `port` but no route (e.g. a database) gets a `Service` for discovery but no probe. Set a `health_check` block to force one on, or `health_check = false` to disable.
+- Routes are matched longest-prefix-first by the ingress, so `/api` shadows `/` correctly. If `[routes]` is omitted and exactly one container has a `port`, Rise synthesises `/` → that container.
+- When a deployment has two or more containers, each is given a `RISE_CONTAINER_HOST__<NAME>` env var pointing at every routable sibling's in-cluster Service. See [Environment Variables](../environment-variables#auto-injected-variables).
 
 ## CI/CD Deployments
 

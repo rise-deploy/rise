@@ -8,7 +8,7 @@ name = "multi-container"
 
 # Static frontend. Submits to `/api/jobs` and polls `/api/jobs` for status.
 [containers.frontend]
-http_port = 8080
+port = 8080
 replicas = 1
 
 [containers.frontend.build]
@@ -19,7 +19,7 @@ build_context = "frontend"
 # JSON API. Stateless — job state lives in Redis, so this scales horizontally.
 # Reads `RISE_CONTAINER_HOST__REDIS` (auto-injected by the controller).
 [containers.api]
-http_port = 8080
+port = 8080
 replicas = 2
 health_check = { path = "/api/health" }
 
@@ -29,7 +29,7 @@ dockerfile = "api/Dockerfile"
 build_context = "api"
 
 # Background worker. BRPOPs jobs from Redis, runs text analysis, writes the
-# result back. No `http_port` → no Service, no ingress route, no HTTP probes.
+# result back. No `port` → no Service, no ingress route, no HTTP probes.
 [containers.worker]
 replicas = 1
 env = { WORK_MS = "2000" }
@@ -40,12 +40,11 @@ dockerfile = "worker/Dockerfile"
 build_context = "worker"
 
 # Redis as the shared job queue. Upstream image — no [build] block.
-# `http_port` is a misnomer for Redis (it speaks RESP, not HTTP) but the K8s
-# Service routes TCP fine, and `health_check = false` skips HTTP probes.
+# `port` need not be HTTP — the K8s Service routes TCP fine, and Redis is not
+# in [routes], so it gets a Service (for discovery) but no HTTP probes by default.
 [containers.redis]
 image = "redis:7-alpine"
-http_port = 6379
-health_check = false
+port = 6379
 
 # Path-based routing. Longest-prefix wins, so `/api` shadows `/`.
 [routes]

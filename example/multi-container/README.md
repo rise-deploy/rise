@@ -2,7 +2,7 @@
 
 A working four-container app that needs every piece to do its job:
 
-| Container  | Build              | http_port | Replicas | Role                                                |
+| Container  | Build              | port      | Replicas | Role                                                |
 |------------|--------------------|-----------|----------|-----------------------------------------------------|
 | `frontend` | `frontend/`        | 8080      | 1        | Static page that submits text and polls job status  |
 | `api`      | `api/`             | 8080      | 2        | Stateless JSON API; reads/writes job state in Redis |
@@ -39,9 +39,10 @@ is host:port (no scheme), so callers add their own protocol:
 
 Longest-prefix wins, so `/api/jobs` reaches the `api` container with its
 original path (no rewrite) and everything else falls through to `frontend`.
-The `worker` container has no `http_port` — Deployment but no Service, no
-ingress route, no HTTP probes. Redis has a `http_port` (a misnomer; the
-Service routes TCP fine) and `health_check = false` to skip HTTP probes.
+The `worker` container has no `port` — Deployment but no Service, no
+ingress route, no HTTP probes. Redis has a `port` (it need not be HTTP — the
+Service routes TCP fine) but isn't in `[routes]`, so it gets a Service for
+discovery and no HTTP probes (only routed containers are probed by default).
 
 ## Deploy
 
