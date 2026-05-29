@@ -92,14 +92,18 @@ function parseMemoryToBytes(s) {
 
 function formatBytesAsMemory(bytes) {
     if (!Number.isFinite(bytes) || bytes <= 0) return '0';
-    // Prefer Gi when the value divides cleanly; else fall back to Mi rounded to
-    // the nearest integer (sub-Mi totals are unrealistic in practice).
-    if (bytes % (1024 ** 3) === 0) return `${bytes / 1024 ** 3}Gi`;
-    if (bytes >= 1024 ** 3) {
-        const gi = bytes / 1024 ** 3;
-        return `${gi.toFixed(2).replace(/\.?0+$/, '')}Gi`;
-    }
-    return `${Math.round(bytes / 1024 ** 2)}Mi`;
+    // Render in the largest IEC unit that divides the total exactly, so the
+    // breakdown stays precise (no rounding) regardless of mixed inputs. Memory
+    // specs are practically always Mi/Gi-aligned, so this is Gi or Mi in almost
+    // every case; Ki (then raw bytes) is the exact fallback for a rarer
+    // finer-grained total — never the lossy decimal-Gi the previous code used.
+    const Gi = 1024 ** 3;
+    const Mi = 1024 ** 2;
+    const Ki = 1024;
+    if (bytes % Gi === 0) return `${bytes / Gi}Gi`;
+    if (bytes % Mi === 0) return `${bytes / Mi}Mi`;
+    if (bytes % Ki === 0) return `${bytes / Ki}Ki`;
+    return `${bytes}`;
 }
 
 /** Sum (replicas × per-container cpu/memory) across the deployment's containers. */

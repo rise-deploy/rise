@@ -297,7 +297,8 @@ fn filter_env_overrides_by_environment<'a>(
 struct ResolvedContainerPayload {
     /// Containers with `image` filled in for every entry. Server-derived
     /// entries hold an internal-facing reference (what the cluster pulls);
-    /// pre-built entries keep the user-supplied value verbatim.
+    /// pre-built entries are pinned to an immutable `repo@sha256:…` digest so
+    /// a mutable tag can't drift across pod restarts.
     resolved_specs: Vec<crate::server::deployment::models::ContainerSpec>,
     /// Tag suffixes for which the server is going to derive image tags and
     /// the CLI is expected to push (i.e. containers whose request entry had
@@ -306,8 +307,8 @@ struct ResolvedContainerPayload {
     push_tags: Vec<String>,
     /// Map of container_name → fully-qualified CLIENT-facing image tag the
     /// CLI should `docker build -t` and `docker push` to. Pre-built
-    /// containers map to their original `image` so the CLI sees a uniform
-    /// view and can skip the push for those.
+    /// containers map to their resolved immutable digest (exactly what the
+    /// cluster runs) so the CLI logs the real image and can skip the push.
     container_images: std::collections::BTreeMap<String, String>,
 }
 
@@ -316,15 +317,23 @@ struct ResolvedContainerPayload {
 /// For each container with no `image` set, derive both an internal-facing
 /// tag (persisted on the row, used by the K8s controller to pull) and a
 /// client-facing tag (returned to the CLI so it knows what to push).
-/// Containers that came in with an explicit `image` are passed through
-/// unchanged and excluded from `push_tags` (no push is expected for them).
+/// Containers that came in with an explicit `image` are pre-built: their
+/// reference is resolved to an immutable `repo@sha256:…` digest (mirroring the
+/// single-container `--image` path) and persisted pinned, so a mutable tag
+/// like `redis:7-alpine` can't drift across pod restarts under
+/// `imagePullPolicy: Always`. Pre-built containers are excluded from
+/// `push_tags` (no push is expected for them).
+///
+/// Returns an error (surfaced as a `400`) if any pre-built image can't be
+/// resolved — the whole deployment is rejected rather than shipping with an
+/// unresolvable image, matching the single-container behaviour.
 #[cfg(feature = "backend")]
-fn resolve_multi_container_images(
+async fn resolve_multi_container_images(
     state: &AppState,
     project_name: &str,
     deployment_id: &str,
     specs: &[crate::server::deployment::models::ContainerSpec],
-) -> ResolvedContainerPayload {
+) -> Result<ResolvedContainerPayload, ServerError> {
     use crate::server::registry::ImageTagType;
 
     let mut resolved_specs = Vec::with_capacity(specs.len());
@@ -337,8 +346,27 @@ fn resolve_multi_container_images(
 
         let client_facing_tag = match spec.image.as_deref() {
             Some(image) if !image.is_empty() => {
-                // Pre-built — CLI doesn't push, server doesn't derive.
-                image.to_string()
+                // Pre-built — CLI doesn't push, server doesn't derive. Pin the
+                // reference to an immutable digest so `imagePullPolicy: Always`
+                // can't pull a different image on a later pod restart (matches
+                // the single-container `--image` flow). The reconciler uses
+                // `spec.image` verbatim as the pod image, so persisting the
+                // pinned ref is all that's required.
+                let pinned = resolve_image_digest(
+                    &state.oci_client,
+                    &state.registry_provider,
+                    image,
+                    project_name,
+                )
+                .await
+                .map_err(|e| {
+                    ServerError::bad_request(format!(
+                        "Failed to resolve image '{}' for container '{}': {}",
+                        image, spec.name, e
+                    ))
+                })?;
+                resolved.image = Some(pinned.clone());
+                pinned
             }
             _ => {
                 // Server-derived. Persist the internal tag (controller-facing,
@@ -362,11 +390,11 @@ fn resolve_multi_container_images(
         resolved_specs.push(resolved);
     }
 
-    ResolvedContainerPayload {
+    Ok(ResolvedContainerPayload {
         resolved_specs,
         push_tags,
         container_images,
-    }
+    })
 }
 
 /// Serialise the resolved multi-container side-data so it can be passed into
@@ -574,16 +602,6 @@ async fn convert_deployment(
     custom_domain_urls: Vec<String>,
     all_urls: Vec<String>,
 ) -> Deployment {
-    // Backfill image field for locally-built deployments
-    // For pre-built images, deployment.image is already set
-    // For build-from-source, calculate the internal registry tag
-    let image = if deployment.image.is_some() {
-        deployment.image.clone()
-    } else {
-        Some(super::utils::get_deployment_image_tag(state, &deployment, project).await)
-    };
-    let can_rollback = state_machine::can_create_from(&deployment);
-
     // Multi-container side-data, folded onto the row. `None` is a legacy
     // single-container deployment — the frontend reads the flat replicas/cpu/
     // memory fields in that case. A present-but-unparseable column is corrupt:
@@ -608,6 +626,23 @@ async fn convert_deployment(
         }
         None => None,
     };
+    let is_multi_container = containers.as_ref().is_some_and(|c| !c.is_empty());
+
+    // Backfill the deployment-level image for display.
+    // - Pre-built single-container: `deployment.image` is already set.
+    // - Build-from-source single-container: synthesise the internal registry tag.
+    // - Multi-container: there is no single deployment-level image — the
+    //   per-container images live in `containers`. Leave it unset rather than
+    //   synthesising a `<registry>/<project>:<deployment_id>` tag that is never
+    //   pushed (which would surface a bogus image in the CLI/UI).
+    let image = if deployment.image.is_some() {
+        deployment.image.clone()
+    } else if is_multi_container {
+        None
+    } else {
+        Some(super::utils::get_deployment_image_tag(state, &deployment, project).await)
+    };
+    let can_rollback = state_machine::can_create_from(&deployment);
 
     // Resolve environment name and color
     let (environment, environment_color) = if let Some(env_id) = deployment.environment_id {
@@ -1199,13 +1234,17 @@ pub async fn create_deployment(
         effective_http_port, deployment_id
     );
 
-    // Resolve multi-container images before minting credentials so the
-    // mint covers every tag the CLI is going to push. Returns None for
-    // legacy single-container requests.
+    // Resolve multi-container images before minting credentials so the mint
+    // covers every tag the CLI is going to push, and so pre-built container
+    // images are pinned to an immutable digest. Returns None for legacy
+    // single-container requests.
     #[cfg(feature = "backend")]
-    let multi_container_resolved = payload.containers.as_ref().map(|specs| {
-        resolve_multi_container_images(&state, &payload.project, &deployment_id, specs)
-    });
+    let multi_container_resolved = match payload.containers.as_ref() {
+        Some(specs) => Some(
+            resolve_multi_container_images(&state, &payload.project, &deployment_id, specs).await?,
+        ),
+        None => None,
+    };
     #[cfg(not(feature = "backend"))]
     let multi_container_resolved: Option<()> = None;
 
