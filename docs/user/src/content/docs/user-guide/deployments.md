@@ -273,6 +273,7 @@ Notes:
 - Routes are matched longest-prefix-first by the ingress, so `/api` shadows `/` correctly. If `[routes]` is omitted and exactly one container has a `port`, Rise synthesises `/` → that container.
 - Platform and environment **replica limits apply to the deployment's total** replicas summed across all containers, not per container — e.g. with a cap of 10, `frontend = 4` + `backend = 3` + `worker = 4` (sum 11) is rejected. CPU and memory limits, by contrast, are enforced per container.
 - Every container receives a `RISE_CONTAINER` env var set to its own name (e.g. `"frontend"`, `"api"`).
+- Each container's `PORT` env var is set to **that container's own `port`** (e.g. `frontend` gets `PORT=8080`, `backend` gets `PORT=9090`) — not a single deployment-wide value. Containers without a `port` (workers) get no injected `PORT`.
 - When a deployment has two or more containers, each is also given a `RISE_CONTAINER_HOST__<NAME>` env var for every sibling that exposes a `port` (including a port-having container that isn't routed, such as a database) — pointing at that sibling's in-cluster Service. See [Environment Variables](../environment-variables#auto-injected-variables).
 
 ## CI/CD Deployments

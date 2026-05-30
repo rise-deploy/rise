@@ -1577,6 +1577,10 @@ async fn compute_desired_children(
                 }
             }
 
+            // Pin `PORT` to this container's declared port (see
+            // `apply_container_port_env`).
+            apply_container_port_env(&mut per_container_env, spec.port);
+
             let health_check = spec.health_check.clone();
 
             let runtime = crate::server::deployment::resource_builder::ContainerRuntime {
@@ -1783,6 +1787,35 @@ fn any_container_deployment_observed(
         let key = format!("{}/{}-{}", namespace, base_name, spec.name);
         observed.deployments.contains_key(&key)
     })
+}
+
+/// Force the `PORT` env var to match a container's declared port.
+///
+/// Each container listens on its own declared port — the same port used for the
+/// K8s `containerPort`, the Service, the health probes, and the
+/// `RISE_CONTAINER_HOST__*` discovery vars. The `PORT` env var must therefore
+/// reflect *this* container's port, not the deployment-wide `http_port` carried
+/// by the global env vars. Without this, a multi-container app (e.g. a frontend
+/// on 3000 next to a service on 8000) would hand every process the same global
+/// `PORT` (8080 by default), so each app binds the wrong port.
+///
+/// `PORT` can't be set via per-container `env_overrides` (rejected at request
+/// time), so the declared port is the single source of truth. Containers with no
+/// declared port (workers) keep whatever global `PORT` was set, if any.
+fn apply_container_port_env(env: &mut Vec<EnvVar>, container_port: Option<u16>) {
+    let Some(container_port) = container_port else {
+        return;
+    };
+    let port_value = container_port.to_string();
+    if let Some(existing) = env.iter_mut().find(|v| v.name == "PORT") {
+        existing.value = Some(port_value);
+    } else {
+        env.push(EnvVar {
+            name: "PORT".to_string(),
+            value: Some(port_value),
+            ..Default::default()
+        });
+    }
 }
 
 /// Resolve the container + route list the reconciler should emit for a
@@ -3122,6 +3155,70 @@ mod tests {
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].path, "/");
         assert_eq!(routes[0].container, "app");
+    }
+
+    #[test]
+    fn apply_container_port_env_overrides_global_port() {
+        // The global env vars carry the deployment-wide PORT (here the 8080
+        // default). A container declaring its own port (3000) must have PORT
+        // rewritten to 3000 so the app binds the same port the Service/probes
+        // target — not the inherited 8080.
+        let mut env = vec![
+            EnvVar {
+                name: "PORT".to_string(),
+                value: Some("8080".to_string()),
+                ..Default::default()
+            },
+            EnvVar {
+                name: "FOO".to_string(),
+                value: Some("bar".to_string()),
+                ..Default::default()
+            },
+        ];
+
+        apply_container_port_env(&mut env, Some(3000));
+
+        let port = env.iter().find(|v| v.name == "PORT").unwrap();
+        assert_eq!(port.value.as_deref(), Some("3000"));
+        // Unrelated vars are untouched and PORT isn't duplicated.
+        assert_eq!(env.iter().filter(|v| v.name == "PORT").count(), 1);
+        assert_eq!(
+            env.iter()
+                .find(|v| v.name == "FOO")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("bar")
+        );
+    }
+
+    #[test]
+    fn apply_container_port_env_inserts_when_absent() {
+        // If no global PORT was set, a container with a declared port still gets
+        // one.
+        let mut env = Vec::new();
+        apply_container_port_env(&mut env, Some(9000));
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].name, "PORT");
+        assert_eq!(env[0].value.as_deref(), Some("9000"));
+    }
+
+    #[test]
+    fn apply_container_port_env_leaves_workers_untouched() {
+        // A worker (no declared port) keeps whatever global PORT was set, if any.
+        let mut env = vec![EnvVar {
+            name: "PORT".to_string(),
+            value: Some("8080".to_string()),
+            ..Default::default()
+        }];
+        apply_container_port_env(&mut env, None);
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].value.as_deref(), Some("8080"));
+
+        // ...and a portless worker with no global PORT gets none injected.
+        let mut empty = Vec::new();
+        apply_container_port_env(&mut empty, None);
+        assert!(empty.is_empty());
     }
 
     #[test]
