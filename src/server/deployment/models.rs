@@ -145,6 +145,20 @@ fn default_memory() -> String {
 pub use rise_backend_core::group::{normalize_deployment_group, DEFAULT_DEPLOYMENT_GROUP};
 pub use rise_backend_core::system_env::rise_system_env_vars;
 
+/// Prefix reserved for Rise-injected pod env vars (see `rise_system_env_vars`).
+///
+/// User-supplied env-var keys in this namespace are rejected so they cannot
+/// silently collide with / shadow a Rise-injected value (injected vars are set
+/// as explicit pod `env`, which Kubernetes resolves *after* `envFrom`).
+pub const RESERVED_ENV_VAR_PREFIX: &str = "RISE_";
+
+/// True if `key` falls in the reserved `RISE_*` namespace and must be rejected
+/// for user-supplied env vars. Case-sensitive: K8s env names are case-sensitive
+/// and the injected vars are uppercase.
+pub fn is_reserved_env_var_key(key: &str) -> bool {
+    key.starts_with(RESERVED_ENV_VAR_PREFIX)
+}
+
 /// Validate the wire-level multi-container spec (containers + routes) from a
 /// `CreateDeploymentRequest`. Returns `Ok(())` for legacy single-container
 /// requests (`containers` is `None`).
