@@ -146,6 +146,18 @@
           "$ref": "#/$defs/PlatformAccessConfig",
           "description": "Platform access control configuration"
         },
+        "scopes": {
+          "default": [
+            "openid",
+            "email",
+            "profile"
+          ],
+          "description": "OAuth2 scopes requested during login flows.\nDefaults to `[\"openid\", \"email\", \"profile\"]`. `offline_access` is not\nrequested by default (the CLI does not use refresh tokens, and the scope\nis rejected by some providers such as Google); add it here if needed.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "token_url": {
           "default": null,
           "description": "Optional custom token endpoint URL\nIf not set, will be discovered from issuer's .well-known/openid-configuration\nor default to {issuer}/token",

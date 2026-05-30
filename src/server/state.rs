@@ -334,6 +334,7 @@ impl AppState {
                 settings.auth.client_secret.clone(),
                 settings.auth.authorize_url.clone(),
                 settings.auth.token_url.clone(),
+                settings.auth.scopes.clone(),
             )
             .await?,
         );

@@ -204,6 +204,11 @@ auth:
   issuer: "http://..."          # OIDC issuer URL
   client_id: "rise-backend"     # OAuth2 client ID
   client_secret: "..."          # OAuth2 client secret
+  scopes: ["openid", "email", "profile"]
+                                # OAuth2 scopes requested at login (default shown).
+                                # offline_access is omitted by default (the CLI
+                                # does not use refresh tokens, and some providers
+                                # such as Google reject it); add it here if needed.
   admin_users: ["email@..."]    # Default-organization admin emails (array)
   operator_users: ["ops@..."]   # Operator role allowlist (array, optional)
   controllers: []               # Trusted external controller identities (array, optional)
