@@ -354,7 +354,7 @@ pub async fn authorize(
                 client_id: &state.auth_settings.client_id,
                 redirect_uri: &redirect_uri,
                 response_type: "code",
-                scope: "openid email profile offline_access",
+                scope: state.oauth_client.scopes(),
                 code_challenge: &code_challenge,
                 code_challenge_method: &code_challenge_method,
                 state: None,

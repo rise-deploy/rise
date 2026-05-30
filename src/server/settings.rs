@@ -426,6 +426,15 @@ fn default_active_sync_interval_secs() -> u64 {
     300 // 5 minutes
 }
 
+fn default_oauth_scopes() -> Vec<String> {
+    vec![
+        "openid".to_string(),
+        "email".to_string(),
+        "profile".to_string(),
+        "offline_access".to_string(),
+    ]
+}
+
 /// Supported active sync sources for pulling users and groups
 #[derive(Debug, Deserialize, Clone, JsonSchema, PartialEq)]
 pub enum ActiveSyncSource {
@@ -495,6 +504,12 @@ pub struct AuthSettings {
     /// Interval in seconds for active sync polling (default: 300 = 5 minutes)
     #[serde(default = "default_active_sync_interval_secs")]
     pub active_sync_interval_secs: u64,
+    /// OAuth2 scopes requested during login flows.
+    /// Defaults to `["openid", "email", "profile", "offline_access"]`.
+    /// Note: `offline_access` is not supported by all providers (e.g. Google),
+    /// so override this list when targeting such an issuer.
+    #[serde(default = "default_oauth_scopes")]
+    pub scopes: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize, Clone, JsonSchema)]

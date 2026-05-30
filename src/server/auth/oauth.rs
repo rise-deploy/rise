@@ -77,6 +77,8 @@ pub struct OAuthClient {
     authorize_url: String,
     token_url: String,
     device_authorization_endpoint: Option<String>,
+    /// Space-separated OAuth2 scopes requested during login flows.
+    scopes: String,
 }
 
 impl OAuthClient {
@@ -137,6 +139,7 @@ impl OAuthClient {
         client_secret: String,
         authorize_url: Option<String>,
         token_url: Option<String>,
+        scopes: Vec<String>,
     ) -> Result<Self> {
         let http_client = HttpClient::new();
 
@@ -178,7 +181,13 @@ impl OAuthClient {
             authorize_url: final_authorize_url,
             token_url: final_token_url,
             device_authorization_endpoint: device_endpoint,
+            scopes: scopes.join(" "),
         })
+    }
+
+    /// Space-separated OAuth2 scopes requested during login flows.
+    pub fn scopes(&self) -> &str {
+        &self.scopes
     }
 
     /// Initiate device authorization flow
@@ -192,7 +201,7 @@ impl OAuthClient {
 
         let mut params = HashMap::new();
         params.insert("client_id", self.client_id.as_str());
-        params.insert("scope", "openid email profile offline_access");
+        params.insert("scope", self.scopes.as_str());
 
         let response = self
             .http_client
