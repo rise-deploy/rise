@@ -957,7 +957,7 @@ pub async fn oauth_signin_start(
         client_id: &state.auth_settings.client_id,
         redirect_uri: &callback_url,
         response_type: "code",
-        scope: "openid email profile",
+        scope: state.oauth_client.scopes(),
         code_challenge: &code_challenge,
         code_challenge_method: "S256",
         state: Some(&state_token),
