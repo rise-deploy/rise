@@ -123,6 +123,10 @@ Rise automatically injects these variables into every deployment:
 
 Callers prepend their own protocol — e.g. `redis://${RISE_CONTAINER_HOST__REDIS}` or `http://${RISE_CONTAINER_HOST__API}`.
 
+:::caution[The `RISE_` prefix is reserved]
+The `RISE_` prefix is reserved for the auto-injected variables above. Setting your own variable whose name starts with `RISE_` — whether via `rise env set`, deploy-time overrides, or `[containers.<name>.env]` in `rise.toml` — is rejected. This prevents an injected value from silently shadowing your variable (or vice-versa).
+:::
+
 ## Deploy-Time Environment Overrides
 
 You can pass runtime environment variables directly when deploying:

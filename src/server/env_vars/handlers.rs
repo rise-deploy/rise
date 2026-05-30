@@ -896,8 +896,9 @@ mod tests {
             let err =
                 validate_env_var_key(key).expect_err(&format!("expected {key:?} to be rejected"));
             assert!(
-                err.to_string().contains("reserved"),
-                "unexpected error for {key:?}: {err}"
+                err.message.contains("reserved"),
+                "unexpected error for {key:?}: {}",
+                err.message
             );
         }
     }
