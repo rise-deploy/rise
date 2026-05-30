@@ -543,11 +543,6 @@ export function Combobox(props: ComboboxProps) {
     const [query, setQuery] = useState('');
     const [activeIndex, setActiveIndex] = useState(0);
     const [popRect, setPopRect] = useState<{ top: number; left: number; width: number } | null>(null);
-    // When the combobox lives inside a Modal, portaling the listbox to
-    // document.body would put it outside the modal's focus-trap root — Tab
-    // from the search input/options would escape into the modal's first
-    // focusable. Render inline in that case so the trap sees the popover.
-    const [inModal, setInModal] = useState(false);
     const wrapRef = useRef<HTMLDivElement>(null);
     const triggerRef = useRef<HTMLDivElement>(null);
     const popRef = useRef<HTMLDivElement>(null);
@@ -595,7 +590,6 @@ export function Combobox(props: ComboboxProps) {
 
     useEffect(() => {
         if (!open) { setPopRect(null); setQuery(''); return; }
-        setInModal(Boolean(wrapRef.current?.closest('.r-modal')));
         const update = () => {
             const el = triggerRef.current;
             if (!el) return;
@@ -691,13 +685,15 @@ export function Combobox(props: ComboboxProps) {
 
     // Close when focus leaves both the wrapper and the portaled popover. The
     // existing mousedown click-away handles clicks; this covers keyboard Tab.
+    // Returning focus to the trigger ensures Tab stays within a modal's focus trap.
     const handleSearchBlur = () => {
         window.setTimeout(() => {
             const active = document.activeElement as Node | null;
-            if (!active) { setOpen(false); return; }
+            if (!active) { setOpen(false); triggerRef.current?.focus(); return; }
             if (wrapRef.current?.contains(active)) return;
             if (popRef.current?.contains(active)) return;
             setOpen(false);
+            triggerRef.current?.focus();
         }, 0);
     };
 
@@ -802,10 +798,7 @@ export function Combobox(props: ComboboxProps) {
                         </div>
                     </div>
                 );
-                // Render inline (no portal) when inside a Modal so the modal's
-                // focus trap can see the popover; otherwise portal to body to
-                // escape any surrounding overflow clipping.
-                return inModal ? popover : createPortal(popover, document.body);
+                return createPortal(popover, document.body);
             })()}
         </div>
     );
