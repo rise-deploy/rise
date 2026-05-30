@@ -150,10 +150,9 @@
           "default": [
             "openid",
             "email",
-            "profile",
-            "offline_access"
+            "profile"
           ],
-          "description": "OAuth2 scopes requested during login flows.\nDefaults to `[\"openid\", \"email\", \"profile\", \"offline_access\"]`.\nNote: `offline_access` is not supported by all providers (e.g. Google),\nso override this list when targeting such an issuer.",
+          "description": "OAuth2 scopes requested during login flows.\nDefaults to `[\"openid\", \"email\", \"profile\"]`. `offline_access` is not\nrequested by default (the CLI does not use refresh tokens, and the scope\nis rejected by some providers such as Google); add it here if needed.",
           "items": {
             "type": "string"
           },
