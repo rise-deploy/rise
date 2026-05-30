@@ -69,7 +69,7 @@ mise frontend:dev  # Vite dev server only
 | Task | Purpose |
 |------|---------|
 | `setup` | One-stop dev setup: hosts + docker + cluster (interactive) |
-| `down` | Undo what `setup` did (kills port-forward, deletes cluster, strips .env block + daemon.json registries + /etc/hosts block) |
+| `down` | Undo what `setup` did (stops the hosts watcher, kills port-forward, deletes cluster, strips .env block + daemon.json registries + /etc/hosts block) |
 
 Everything is driven by `./scripts/dev-setup.sh`. `mise setup` and `mise down` are convenience wrappers; positional args pass through, so any script subcommand works as `mise setup <subcmd>`:
 
@@ -77,6 +77,8 @@ Everything is driven by `./scripts/dev-setup.sh`. `mise setup` and `mise down` a
 |------------|--------------|
 | `mise setup hosts` | Rewrite the managed `/etc/hosts` block (base hosts + `*.rise.local` ingress hosts enumerated from the current cluster) |
 | `mise setup hosts-clear` | Remove the managed `/etc/hosts` block |
+| `mise setup hosts-watch` | Start a background watcher that keeps the managed `/etc/hosts` block synced to ingress changes (event-driven; idempotent — won't double-spawn). `mise setup` offers this as an opt-in prompt when a cluster is reachable |
+| `mise setup hosts-watch-down` | Stop the `/etc/hosts` watcher |
 | `mise setup docker` | Configure Docker insecure-registries (asks to restart Docker Desktop on macOS) |
 | `mise setup docker-clear` | Remove rise registries from `daemon.json` |
 | `mise setup minikube` | Bring up Minikube + ingress/Loki port-forwards + Helm install (**preferred** on most dev machines) |

@@ -16,11 +16,11 @@ k9s = "latest"
 vault = "latest"
 
 [tasks.setup]
-description = "One-stop dev environment setup (hosts, docker, cluster). Cross-platform (Linux + macOS). Run interactively."
+description = "One-stop dev environment setup (hosts, docker, cluster, optional /etc/hosts watcher). Cross-platform (Linux + macOS). Run interactively."
 run = "./scripts/dev-setup.sh"
 
 [tasks.down]
-description = "Tear down what 'mise setup' brought up (cluster, .env block, daemon.json registries, /etc/hosts block). Interactive."
+description = "Tear down what 'mise setup' brought up (hosts watcher, cluster, .env block, daemon.json registries, /etc/hosts block). Interactive."
 run = "./scripts/dev-setup.sh down"
 
 [tasks.dev]
