@@ -1450,13 +1450,7 @@ async fn main() -> Result<()> {
                 follow,
                 timeout,
             } => {
-                let toml_config = build::config::load_full_project_config(path)?;
-                let project_name =
-                    resolve_project_name_with_config(project.clone(), path, toml_config.as_ref())?;
-                let audience_override = toml_config
-                    .as_ref()
-                    .and_then(|c| c.auth.as_ref())
-                    .and_then(|a| a.audience.as_deref());
+                let project_name = resolve_project_name(project.clone(), path)?;
                 deployment::show_deployment(
                     &http_client,
                     &backend_url,
@@ -1465,7 +1459,6 @@ async fn main() -> Result<()> {
                     deployment_id,
                     *follow,
                     timeout,
-                    audience_override,
                 )
                 .await?;
             }

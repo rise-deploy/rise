@@ -323,8 +323,7 @@ pub fn select_token_provider(
         let audience = inputs.audience.filter(|a| !a.is_empty()).ok_or_else(|| {
             anyhow::anyhow!(
                 "GitHub Actions OIDC detected but no audience configured. \
-                 Set RISE_AUDIENCE (recommended: the Rise server URL, e.g. {}) \
-                 or add `[auth] audience` to .rise.toml.",
+                 Set RISE_GHA_AUDIENCE (recommended: the Rise server URL, e.g. {}).",
                 inputs.backend_url
             )
         })?;
@@ -343,13 +342,8 @@ pub fn select_token_provider(
     bail!("Not authenticated. Run 'rise login' first.")
 }
 
-/// Read real env + config and build the token provider. `audience_override`
-/// comes from `.rise.toml [auth] audience` (deployment path only).
-pub fn resolve_token_provider(
-    http: &reqwest::Client,
-    config: &Config,
-    audience_override: Option<&str>,
-) -> Result<TokenProvider> {
+/// Read real env + config and build the token provider.
+pub fn resolve_token_provider(http: &reqwest::Client, config: &Config) -> Result<TokenProvider> {
     let command_ttl_secs = std::env::var("RISE_TOKEN_COMMAND_TTL")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -361,9 +355,7 @@ pub fn resolve_token_provider(
         rise_token_command_ttl: Duration::from_secs(command_ttl_secs),
         gha_request_url: std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL").ok(),
         gha_request_token: std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN").ok(),
-        audience: audience_override
-            .map(|s| s.to_string())
-            .or_else(|| std::env::var("RISE_AUDIENCE").ok()),
+        audience: std::env::var("RISE_GHA_AUDIENCE").ok(),
         stored_token: config.stored_token(),
         backend_url: config.get_backend_url(),
     };

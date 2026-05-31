@@ -29,10 +29,6 @@ pub struct ProjectBuildConfig {
     #[serde(default)]
     pub identity: Option<IdentityConfig>,
 
-    /// Authentication configuration for the CLI (optional)
-    #[serde(default)]
-    pub auth: Option<AuthConfig>,
-
     /// Per-environment configuration (optional)
     #[serde(default)]
     pub environments: BTreeMap<String, EnvironmentConfig>,
@@ -313,16 +309,6 @@ mod tests {
             "got: {err}"
         );
     }
-}
-
-/// CLI authentication configuration (`[auth]` in rise.toml).
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
-#[cfg_attr(feature = "backend", derive(schemars::JsonSchema))]
-pub struct AuthConfig {
-    /// OIDC audience the CLI requests when minting a token in CI (e.g. GitHub
-    /// Actions). Recommended value: the Rise server URL. Falls back to the
-    /// `RISE_AUDIENCE` environment variable when unset.
-    pub audience: Option<String>,
 }
 
 /// Workload identity configuration

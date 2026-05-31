@@ -1,18 +1,5 @@
 {
   "$defs": {
-    "AuthConfig": {
-      "description": "CLI authentication configuration (`[auth]` in rise.toml).",
-      "properties": {
-        "audience": {
-          "description": "OIDC audience the CLI requests when minting a token in CI (e.g. GitHub\nActions). Recommended value: the Rise server URL. Falls back to the\n`RISE_AUDIENCE` environment variable when unset.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "type": "object"
-    },
     "BoolFalse": {
       "const": false,
       "type": "boolean"
@@ -370,18 +357,6 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Root structure for rise.toml / .rise.toml configuration file",
   "properties": {
-    "auth": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/AuthConfig"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "description": "Authentication configuration for the CLI (optional)"
-    },
     "build": {
       "anyOf": [
         {

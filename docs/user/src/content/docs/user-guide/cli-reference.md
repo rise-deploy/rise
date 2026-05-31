@@ -44,6 +44,8 @@ rise project show
 |----------|-------------|
 | `RISE_URL` | Default backend URL |
 | `RISE_TOKEN` | Authentication token (skips interactive login) |
+| `RISE_TOKEN_COMMAND` | Shell command whose stdout is used as the bearer token. JWT output uses the embedded `exp` claim; opaque output is cached for `RISE_TOKEN_COMMAND_TTL` seconds. |
+| `RISE_GHA_AUDIENCE` | Audience for GitHub Actions OIDC token minting (auto-detected from `ACTIONS_ID_TOKEN_REQUEST_URL`). Recommended value: the Rise server URL. |
 | `RISE_CONTAINER_CLI` | Container CLI: `docker` or `podman` |
 | `RISE_MANAGED_BUILDKIT` | Enable managed BuildKit daemon (`true`/`false`) |
 | `RISE_MANAGED_BUILDKIT_NETWORK_NAME` | Docker network for managed BuildKit daemon |
