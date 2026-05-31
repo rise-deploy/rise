@@ -60,6 +60,14 @@ struct TokenClaims {
     exp: usize,
 }
 
+/// Extract the `exp` (seconds since epoch) from a JWT without validating its
+/// signature. Returns `None` if the token can't be decoded.
+pub fn read_token_exp(token: &str) -> Option<i64> {
+    jsonwebtoken::dangerous::insecure_decode::<TokenClaims>(token)
+        .ok()
+        .map(|data| data.claims.exp as i64)
+}
+
 /// Extract expiration from JWT token and format it as a human-readable string
 /// Returns formatted string like "December 16, 2025 at 14:30 UTC (in 7 days)"
 pub fn format_token_expiration(token: &str) -> Result<String> {

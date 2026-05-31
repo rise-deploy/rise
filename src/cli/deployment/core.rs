@@ -727,9 +727,16 @@ pub async fn create_deployment(
     }
 
     // Get authentication token
-    let token = config
-        .get_token()
-        .ok_or_else(|| anyhow::anyhow!("Not authenticated. Run 'rise login' first."))?;
+    // Resolve a token provider rather than a single fixed token: in CI the
+    // backend token may be a short-lived OIDC token, and a long build+push deploy
+    // can outlast it. The provider lazily re-mints/refreshes a fresh token before
+    // each request (see `token_source`). See issue #352.
+    let audience_override = toml_config
+        .and_then(|c| c.auth.as_ref())
+        .and_then(|a| a.audience.as_deref());
+    let provider =
+        crate::token_source::resolve_token_provider(http_client, config, audience_override)?;
+    let token = provider.token().await?;
 
     // Resolve job_url and pull_request_url: use explicit values, or auto-detect from CI environment
     let resolved_job_url = deploy_opts.job_url.clone().or_else(detect_ci_job_url);

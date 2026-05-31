@@ -58,6 +58,7 @@ cli = [
     "dep:url",
     "dep:webbrowser",
     "dep:serde_ignored",
+    "dep:async-trait",
 ]
 backend = [
     # Server core (former "server" feature)

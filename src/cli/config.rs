@@ -238,6 +238,11 @@ impl Config {
         self.token.clone()
     }
 
+    /// The token persisted in the config file (ignores RISE_TOKEN env).
+    pub fn stored_token(&self) -> Option<String> {
+        self.token.clone()
+    }
+
     /// Set the backend URL
     pub fn set_backend_url(&mut self, url: String) -> Result<()> {
         self.backend_url = Some(normalize_backend_url(&url));
