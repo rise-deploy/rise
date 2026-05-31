@@ -607,12 +607,14 @@ pub async fn follow_deployment_with_ui(
     project: &str,
     deployment_id: &str,
     timeout_str: &str,
+    audience_override: Option<&str>,
 ) -> Result<Deployment> {
     // The follow/poll loop can run for up to ~10 minutes, so resolve a fresh
     // token before each request rather than capturing one up front: in CI the
     // token may be a short-lived OIDC token (see #352). The provider re-mints
     // lazily within a 60s skew of expiry.
-    let provider = crate::token_source::resolve_token_provider(http_client, config, None)?;
+    let provider =
+        crate::token_source::resolve_token_provider(http_client, config, audience_override)?;
 
     let timeout = parse_duration(timeout_str)?;
     let start_time = Instant::now();

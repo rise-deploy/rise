@@ -362,6 +362,7 @@ pub async fn show_deployment(
     deployment_id: &str,
     follow: bool,
     timeout_str: &str,
+    audience_override: Option<&str>,
 ) -> Result<()> {
     if follow {
         // Use new enhanced UI for follow mode
@@ -372,6 +373,7 @@ pub async fn show_deployment(
             project,
             deployment_id,
             timeout_str,
+            audience_override,
         )
         .await?;
 
@@ -820,11 +822,12 @@ pub async fn create_deployment(
     // backend token may be a short-lived OIDC token, and a long build+push deploy
     // can outlast it. The provider lazily re-mints/refreshes a fresh token before
     // each request (see `token_source`). See issue #352.
-    let audience_override = deploy_opts
+    let audience_owned: Option<String> = deploy_opts
         .toml_config
         .as_ref()
         .and_then(|c| c.auth.as_ref())
-        .and_then(|a| a.audience.as_deref());
+        .and_then(|a| a.audience.clone());
+    let audience_override = audience_owned.as_deref();
     let provider =
         crate::token_source::resolve_token_provider(http_client, config, audience_override)?;
     debug!("Authenticating to backend using {}", provider.describe());
@@ -1187,6 +1190,7 @@ pub async fn create_deployment(
         &deployment_info.deployment_id,
         true,  // follow
         "10m", // timeout
+        audience_override,
     )
     .await?;
 
@@ -1234,7 +1238,6 @@ async fn build_and_push_multi_container(
     let token = provider.token().await?;
     let backend_platform = fetch_backend_platform_hint(http_client, backend_url, &token).await?;
 
-    let token = provider.token().await?;
     update_deployment_status(
         http_client,
         backend_url,
