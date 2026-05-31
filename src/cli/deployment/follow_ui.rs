@@ -423,7 +423,7 @@ fn should_stream_logs(status: &DeploymentStatus) -> bool {
 async fn stream_logs_with_status_polling(
     http_client: &Client,
     backend_url: &str,
-    token: &str,
+    provider: &crate::token_source::TokenProvider,
     project: &str,
     deployment_id: &str,
     timeout: Duration,
@@ -437,14 +437,27 @@ async fn stream_logs_with_status_polling(
     let mut status_interval = tokio::time::interval(Duration::from_secs(3));
     status_interval.tick().await; // consume first immediate tick
 
-    // Try initial connection
-    match open_log_stream(http_client, backend_url, token, project, deployment_id, 100).await {
+    // Try initial connection. Resolve a fresh token per request so a long poll
+    // (up to the deploy timeout) doesn't outlast a short-lived CI token (#352).
+    let token = provider.token().await?;
+    match open_log_stream(
+        http_client,
+        backend_url,
+        &token,
+        project,
+        deployment_id,
+        100,
+    )
+    .await
+    {
         Ok(s) => log_stream = Some(s),
         Err(LogStreamError::NotReady) => {
             debug!("Initial log stream connection deferred: deployment logs are not ready yet");
         }
         Err(LogStreamError::Gone) => {
-            return fetch_deployment(http_client, backend_url, token, project, deployment_id).await;
+            let token = provider.token().await?;
+            return fetch_deployment(http_client, backend_url, &token, project, deployment_id)
+                .await;
         }
         Err(e) => {
             debug!("Initial log stream connection failed: {:?}", e);
@@ -476,8 +489,9 @@ async fn stream_logs_with_status_polling(
                     }
                 }
                 _ = status_interval.tick() => {
+                    let token = provider.token().await?;
                     let deployment = fetch_deployment(
-                        http_client, backend_url, token, project, deployment_id,
+                        http_client, backend_url, &token, project, deployment_id,
                     ).await?;
                     if is_terminal_state(&deployment.status) {
                         drain_log_stream(stream).await;
@@ -492,7 +506,7 @@ async fn stream_logs_with_status_polling(
                 return status_only_polling(
                     http_client,
                     backend_url,
-                    token,
+                    provider,
                     project,
                     deployment_id,
                     timeout,
@@ -503,8 +517,9 @@ async fn stream_logs_with_status_polling(
 
             tokio::select! {
                 _ = tokio::time::sleep(RETRY_DELAY) => {
+                    let token = provider.token().await?;
                     match open_log_stream(
-                        http_client, backend_url, token, project, deployment_id, 100,
+                        http_client, backend_url, &token, project, deployment_id, 100,
                     ).await {
                         Ok(s) => {
                             log_stream = Some(s);
@@ -514,8 +529,9 @@ async fn stream_logs_with_status_polling(
                             debug!("Log stream not ready yet; will retry");
                         }
                         Err(LogStreamError::Gone) => {
+                            let token = provider.token().await?;
                             return fetch_deployment(
-                                http_client, backend_url, token, project, deployment_id,
+                                http_client, backend_url, &token, project, deployment_id,
                             ).await;
                         }
                         Err(e) => {
@@ -525,8 +541,9 @@ async fn stream_logs_with_status_polling(
                     }
                 }
                 _ = status_interval.tick() => {
+                    let token = provider.token().await?;
                     let deployment = fetch_deployment(
-                        http_client, backend_url, token, project, deployment_id,
+                        http_client, backend_url, &token, project, deployment_id,
                     ).await?;
                     if is_terminal_state(&deployment.status) {
                         return Ok(deployment);
@@ -557,15 +574,18 @@ async fn drain_log_stream(stream: &mut super::core::LogStream) {
 async fn status_only_polling(
     http_client: &Client,
     backend_url: &str,
-    token: &str,
+    provider: &crate::token_source::TokenProvider,
     project: &str,
     deployment_id: &str,
     timeout: Duration,
     start_time: Instant,
 ) -> Result<Deployment> {
     loop {
+        // Resolve a fresh token per poll so a long wait doesn't outlast a
+        // short-lived CI token (#352).
+        let token = provider.token().await?;
         let deployment =
-            fetch_deployment(http_client, backend_url, token, project, deployment_id).await?;
+            fetch_deployment(http_client, backend_url, &token, project, deployment_id).await?;
         if is_terminal_state(&deployment.status) {
             return Ok(deployment);
         }
@@ -588,9 +608,11 @@ pub async fn follow_deployment_with_ui(
     deployment_id: &str,
     timeout_str: &str,
 ) -> Result<Deployment> {
-    let token = config
-        .get_token()
-        .ok_or_else(|| anyhow::anyhow!("Not authenticated"))?;
+    // The follow/poll loop can run for up to ~10 minutes, so resolve a fresh
+    // token before each request rather than capturing one up front: in CI the
+    // token may be a short-lived OIDC token (see #352). The provider re-mints
+    // lazily within a 60s skew of expiry.
+    let provider = crate::token_source::resolve_token_provider(http_client, config, None)?;
 
     let timeout = parse_duration(timeout_str)?;
     let start_time = Instant::now();
@@ -600,7 +622,7 @@ pub async fn follow_deployment_with_ui(
         return follow_deployment_simple(
             http_client,
             backend_url,
-            &token,
+            &provider,
             project,
             deployment_id,
             timeout,
@@ -619,6 +641,7 @@ pub async fn follow_deployment_with_ui(
     // Poll until deployment reaches Deploying state (logs available) or a terminal state.
     let phase1_result: Result<Deployment> = async {
         loop {
+            let token = provider.token().await?;
             let deployment =
                 fetch_deployment(http_client, backend_url, &token, project, deployment_id).await?;
 
@@ -686,7 +709,7 @@ pub async fn follow_deployment_with_ui(
         stream_logs_with_status_polling(
             http_client,
             backend_url,
-            &token,
+            &provider,
             project,
             deployment_id,
             timeout,
@@ -703,6 +726,7 @@ pub async fn follow_deployment_with_ui(
     if final_deployment.status == DeploymentStatus::Healthy
         && final_deployment.deployment_group == "default"
     {
+        let token = provider.token().await?;
         if let Ok(project_info) =
             fetch_project_info(http_client, backend_url, &token, project).await
         {
@@ -720,7 +744,7 @@ pub async fn follow_deployment_with_ui(
 async fn follow_deployment_simple(
     http_client: &Client,
     backend_url: &str,
-    token: &str,
+    provider: &crate::token_source::TokenProvider,
     project: &str,
     deployment_id: &str,
     timeout: Duration,
@@ -730,8 +754,9 @@ async fn follow_deployment_simple(
 
     // Phase 1: Status polling (print state changes as text lines)
     let deployment = loop {
+        let token = provider.token().await?;
         let deployment =
-            fetch_deployment(http_client, backend_url, token, project, deployment_id).await?;
+            fetch_deployment(http_client, backend_url, &token, project, deployment_id).await?;
 
         let controller_phase =
             parse_controller_metadata(&deployment.controller_metadata).map(|m| m.reconcile_phase);
@@ -769,7 +794,7 @@ async fn follow_deployment_simple(
         stream_logs_with_status_polling(
             http_client,
             backend_url,
-            token,
+            provider,
             project,
             deployment_id,
             timeout,
@@ -784,7 +809,9 @@ async fn follow_deployment_simple(
     if final_deployment.status == DeploymentStatus::Healthy
         && final_deployment.deployment_group == "default"
     {
-        if let Ok(project_info) = fetch_project_info(http_client, backend_url, token, project).await
+        let token = provider.token().await?;
+        if let Ok(project_info) =
+            fetch_project_info(http_client, backend_url, &token, project).await
         {
             if let Some(url) = project_info.primary_url {
                 println!();

@@ -354,6 +354,7 @@ FOO = "bar"
             build: None,
             deploy: None,
             identity: None,
+            auth: None,
             environments: BTreeMap::from([(
                 "staging".to_string(),
                 EnvironmentConfig {

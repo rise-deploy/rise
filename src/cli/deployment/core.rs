@@ -562,7 +562,7 @@ fn log_platform_choice(platform: &str, source: PlatformSource, operation: &str) 
 async fn fetch_deployment_registry_credentials(
     http_client: &Client,
     backend_url: &str,
-    token: &str,
+    provider: &crate::token_source::TokenProvider,
     project_name: &str,
     deployment_id: &str,
 ) -> Result<RegistryCredentials> {
@@ -571,12 +571,27 @@ async fn fetch_deployment_registry_credentials(
         backend_url, project_name, deployment_id
     );
 
-    let response = http_client
+    // Resolve a fresh token immediately before the request. In a long deploy the
+    // previously-minted token may be near or past expiry; the provider re-mints
+    // lazily. On a 401 (token rejected mid-flight) force a refresh and retry once
+    // — this is the core fix for short-lived CI OIDC tokens (see #352).
+    let token = provider.token().await?;
+    let mut response = http_client
         .get(&url)
-        .bearer_auth(token)
+        .bearer_auth(&token)
         .send()
         .await
         .context("Failed to fetch registry credentials")?;
+
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        let token = provider.refresh().await?;
+        response = http_client
+            .get(&url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .context("Failed to fetch registry credentials")?;
+    }
 
     if !response.status().is_success() {
         let status = response.status();
@@ -731,11 +746,14 @@ pub async fn create_deployment(
     // backend token may be a short-lived OIDC token, and a long build+push deploy
     // can outlast it. The provider lazily re-mints/refreshes a fresh token before
     // each request (see `token_source`). See issue #352.
-    let audience_override = toml_config
+    let audience_override = deploy_opts
+        .toml_config
+        .as_ref()
         .and_then(|c| c.auth.as_ref())
         .and_then(|a| a.audience.as_deref());
     let provider =
         crate::token_source::resolve_token_provider(http_client, config, audience_override)?;
+    debug!("Authenticating to backend using {}", provider.describe());
     let token = provider.token().await?;
 
     // Resolve job_url and pull_request_url: use explicit values, or auto-detect from CI environment
@@ -813,18 +831,24 @@ pub async fn create_deployment(
     let deployment_id_clone = deployment_info.deployment_id.clone();
     let backend_url_clone = backend_url.to_string();
     let http_client_clone = http_client.clone();
-    let token_clone = token.to_string();
+    let provider_clone = provider.clone();
     let project_name_clone = deploy_opts.project_name.to_string();
 
     tokio::spawn(async move {
         if let Ok(()) = tokio::signal::ctrl_c().await {
             eprintln!("\n⚠️  Caught Ctrl+C, cancelling deployment...");
 
+            // Resolve a fresh token for the cancel request (the deploy may have
+            // run long enough that the original token expired). See #352.
+            let token = match provider_clone.token().await {
+                Ok(t) => t,
+                Err(_) => return,
+            };
             // Cancel the deployment
             if let Err(e) = cancel_deployment(
                 &http_client_clone,
                 &backend_url_clone,
-                &token_clone,
+                &token,
                 &project_name_clone,
                 &deployment_id_clone,
             )
@@ -853,11 +877,12 @@ pub async fn create_deployment(
                 None => config.get_container_cli().command().to_string(),
             };
 
-            // Fetch deployment-scoped registry credentials
+            // Fetch deployment-scoped registry credentials (provider re-resolves
+            // a fresh token and retries once on 401).
             let registry_credentials = fetch_deployment_registry_credentials(
                 http_client,
                 backend_url,
-                &token,
+                &provider,
                 deploy_opts.project_name,
                 &deployment_info.deployment_id,
             )
@@ -988,7 +1013,7 @@ pub async fn create_deployment(
         build_and_push_multi_container(
             http_client,
             backend_url,
-            &token,
+            &provider,
             config,
             &deploy_opts,
             &deployment_info,
@@ -1003,7 +1028,7 @@ pub async fn create_deployment(
         let registry_credentials = fetch_deployment_registry_credentials(
             http_client,
             backend_url,
-            &token,
+            &provider,
             deploy_opts.project_name,
             &deployment_info.deployment_id,
         )
@@ -1107,7 +1132,7 @@ pub async fn create_deployment(
 async fn build_and_push_multi_container(
     http_client: &Client,
     backend_url: &str,
-    token: &str,
+    provider: &crate::token_source::TokenProvider,
     config: &Config,
     deploy_opts: &DeploymentOptions<'_>,
     deployment_info: &CreateDeploymentResponse,
@@ -1127,14 +1152,17 @@ async fn build_and_push_multi_container(
         .map_err(|e| anyhow::anyhow!(e))?;
 
     // Fetch the backend platform hint upfront — needed for every container's
-    // BuildOptions. Credentials are minted fresh per container below so a
-    // long multi-container build can't outlast a token's expires_in.
-    let backend_platform = fetch_backend_platform_hint(http_client, backend_url, token).await?;
+    // BuildOptions. Each request below resolves a fresh token from `provider`
+    // (re-minting within a 60s skew of expiry) so a long multi-container build
+    // can't outlast a short-lived CI token. See #352.
+    let token = provider.token().await?;
+    let backend_platform = fetch_backend_platform_hint(http_client, backend_url, &token).await?;
 
+    let token = provider.token().await?;
     update_deployment_status(
         http_client,
         backend_url,
-        token,
+        &token,
         deploy_opts.project_name,
         &deployment_info.deployment_id,
         "Building",
@@ -1176,18 +1204,21 @@ async fn build_and_push_multi_container(
         .with_push(true);
 
         // Re-mint per container — long builds can outlast the token's expires_in.
+        // The registry-credential fetch resolves a fresh token and retries once
+        // on a 401; this is the critical fix for the multi-container case.
         let fresh_creds = fetch_deployment_registry_credentials(
             http_client,
             backend_url,
-            token,
+            provider,
             deploy_opts.project_name,
             &deployment_info.deployment_id,
         )
         .await?;
+        let token = provider.token().await?;
         login_to_registry(
             http_client,
             backend_url,
-            token,
+            &token,
             options.container_cli.command(),
             &fresh_creds,
             deploy_opts.project_name,
@@ -1200,10 +1231,11 @@ async fn build_and_push_multi_container(
 
         if let Err(e) = build::build_image(options) {
             let msg = format!("Build of container '{}' failed: {}", container.name, e);
+            let token = provider.token().await?;
             update_deployment_status(
                 http_client,
                 backend_url,
-                token,
+                &token,
                 deploy_opts.project_name,
                 &deployment_info.deployment_id,
                 "Failed",
@@ -1215,10 +1247,11 @@ async fn build_and_push_multi_container(
         info!("  ✓ Pushed container '{}'", container.name);
     }
 
+    let token = provider.token().await?;
     update_deployment_status(
         http_client,
         backend_url,
-        token,
+        &token,
         deploy_opts.project_name,
         &deployment_info.deployment_id,
         "Pushed",

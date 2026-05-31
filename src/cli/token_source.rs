@@ -440,7 +440,10 @@ mod tests {
         let mut i = base_inputs();
         i.gha_request_url = Some("https://gha".into());
         i.gha_request_token = Some("rt".into());
-        let err = select_token_provider(&client(), i).unwrap_err().to_string();
+        let err = match select_token_provider(&client(), i) {
+            Ok(_) => panic!("expected an error when no audience is configured"),
+            Err(e) => e.to_string(),
+        };
         assert!(err.contains("no audience"));
         assert!(err.contains("https://rise.example"));
     }
@@ -455,9 +458,10 @@ mod tests {
 
     #[test]
     fn no_source_errors() {
-        let err = select_token_provider(&client(), base_inputs())
-            .unwrap_err()
-            .to_string();
+        let err = match select_token_provider(&client(), base_inputs()) {
+            Ok(_) => panic!("expected an error when no token source is available"),
+            Err(e) => e.to_string(),
+        };
         assert!(err.contains("Not authenticated"));
     }
 }
