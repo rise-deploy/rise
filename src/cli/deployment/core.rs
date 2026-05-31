@@ -354,6 +354,7 @@ pub async fn list_deployments(
 }
 
 /// Show deployment details and optionally follow until terminal state
+#[allow(clippy::too_many_arguments)]
 pub async fn show_deployment(
     http_client: &Client,
     backend_url: &str,
