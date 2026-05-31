@@ -45,13 +45,13 @@ rise project show
 | `RISE_URL` | Default backend URL |
 | `RISE_TOKEN` | Authentication token (skips interactive login) |
 | `RISE_TOKEN_COMMAND` | Shell command whose stdout is used as the bearer token. JWT output uses the embedded `exp` claim; opaque output is cached for `RISE_TOKEN_COMMAND_TTL` seconds. |
+| `RISE_TOKEN_COMMAND_TTL` | How long (seconds) to cache an opaque token produced by `RISE_TOKEN_COMMAND` before re-running the command. JWT tokens ignore this setting and use their `exp` claim instead. Default: `600` (10 minutes). |
 | `RISE_GHA_AUDIENCE` | Audience for GitHub Actions OIDC token minting (auto-detected from `ACTIONS_ID_TOKEN_REQUEST_URL`). Recommended value: the Rise server URL. |
 | `RISE_CONTAINER_CLI` | Container CLI: `docker` or `podman` |
 | `RISE_MANAGED_BUILDKIT` | Enable managed BuildKit daemon (`true`/`false`) |
 | `RISE_MANAGED_BUILDKIT_NETWORK_NAME` | Docker network for managed BuildKit daemon |
 | `RISE_MANAGED_BUILDKIT_HOST_NETWORK` | Run managed BuildKit with host networking (`true`/`false`) |
 | `RISE_MANAGED_BUILDKIT_INSECURE_REGISTRIES` | Comma-separated list of insecure registries |
-| `RISE_TOKEN_COMMAND_TTL` | How long (seconds) to cache an opaque token produced by `RISE_TOKEN_COMMAND` before re-running the command. JWT tokens ignore this setting and use their `exp` claim instead. Default: `600` (10 minutes). |
 | `RISE_REGISTRY_CRED_MIN_LIFETIME_SECS` | Minimum remaining lifetime (seconds) that registry credentials must have to be reused across containers in a multi-container build; credentials expiring sooner are re-minted. Default: `1200` (20 minutes). |
 | `SSL_CERT_FILE` | CA certificate file for SSL builds |
 | `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` | Proxy settings (auto-injected into builds) |

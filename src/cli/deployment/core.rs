@@ -911,7 +911,13 @@ pub async fn create_deployment(
             // run long enough that the original token expired). See #352.
             let token = match provider_clone.token().await {
                 Ok(t) => t,
-                Err(_) => return,
+                Err(e) => {
+                    warn!(
+                        "Failed to resolve token for deployment cancellation: {:?}",
+                        e
+                    );
+                    return;
+                }
             };
             // Cancel the deployment
             if let Err(e) = cancel_deployment(
