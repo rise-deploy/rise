@@ -11,6 +11,7 @@
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 use crate::config::Config;
@@ -188,19 +189,38 @@ impl TokenSource for GithubActionsOidc {
     }
 }
 
+/// Default TTL for opaque (non-JWT) tokens produced by `RISE_TOKEN_COMMAND`.
+/// Overridable via `RISE_TOKEN_COMMAND_TTL` (seconds).
+const COMMAND_TOKEN_TTL_DEFAULT_SECS: u64 = 10 * 60;
+
 /// Runs a user-supplied shell command and uses its trimmed stdout as the
 /// bearer token. Generic escape hatch for any CI / identity system.
+///
+/// If the command outputs a JWT, its `exp` claim governs freshness. For opaque
+/// tokens (no decodable `exp`), the command is re-run after `ttl` elapses
+/// (default 10 minutes, overridable via `RISE_TOKEN_COMMAND_TTL`).
 pub struct CommandToken {
     command: String,
-    cache: Mutex<Option<CachedToken>>,
+    ttl: Duration,
+    cache: Mutex<Option<(CachedToken, Instant)>>,
 }
 
 impl CommandToken {
-    pub fn new(command: String) -> Self {
+    pub fn new(command: String, ttl: Duration) -> Self {
         Self {
             command,
+            ttl,
             cache: Mutex::new(None),
         }
+    }
+
+    fn is_cached_fresh(&self, cached: &CachedToken, minted_at: Instant, now_ts: i64) -> bool {
+        // JWT output: trust the embedded exp (more precise than wall-clock TTL).
+        if cached.exp.is_some() {
+            return cached.is_fresh(now_ts);
+        }
+        // Opaque output: use wall-clock TTL.
+        minted_at.elapsed() < self.ttl
     }
 
     async fn run(&self) -> Result<CachedToken> {
@@ -238,15 +258,15 @@ impl CommandToken {
 impl TokenSource for CommandToken {
     async fn token(&self) -> Result<String> {
         let mut guard = self.cache.lock().await;
-        let now = Utc::now().timestamp();
-        if let Some(cached) = guard.as_ref() {
-            if cached.is_fresh(now) {
+        let now_ts = Utc::now().timestamp();
+        if let Some((cached, minted_at)) = guard.as_ref() {
+            if self.is_cached_fresh(cached, *minted_at, now_ts) {
                 return Ok(cached.value.clone());
             }
         }
         let fresh = self.run().await?;
         let value = fresh.value.clone();
-        *guard = Some(fresh);
+        *guard = Some((fresh, Instant::now()));
         Ok(value)
     }
 
@@ -254,7 +274,7 @@ impl TokenSource for CommandToken {
         let mut guard = self.cache.lock().await;
         let fresh = self.run().await?;
         let value = fresh.value.clone();
-        *guard = Some(fresh);
+        *guard = Some((fresh, Instant::now()));
         Ok(value)
     }
 
@@ -268,6 +288,9 @@ impl TokenSource for CommandToken {
 pub struct ProviderInputs {
     pub rise_token: Option<String>,
     pub rise_token_command: Option<String>,
+    /// How long to cache an opaque (non-JWT) token from `RISE_TOKEN_COMMAND`
+    /// before re-running the command. JWT tokens use their `exp` claim instead.
+    pub rise_token_command_ttl: Duration,
     pub gha_request_url: Option<String>,
     pub gha_request_token: Option<String>,
     pub audience: Option<String>,
@@ -287,7 +310,10 @@ pub fn select_token_provider(
     }
     // 2. Generic command escape hatch.
     if let Some(cmd) = inputs.rise_token_command.filter(|c| !c.is_empty()) {
-        return Ok(Arc::new(CommandToken::new(cmd)));
+        return Ok(Arc::new(CommandToken::new(
+            cmd,
+            inputs.rise_token_command_ttl,
+        )));
     }
     // 3. GitHub Actions OIDC auto-detection.
     if let (Some(url), Some(req_token)) = (
@@ -324,9 +350,15 @@ pub fn resolve_token_provider(
     config: &Config,
     audience_override: Option<&str>,
 ) -> Result<TokenProvider> {
+    let command_ttl_secs = std::env::var("RISE_TOKEN_COMMAND_TTL")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(COMMAND_TOKEN_TTL_DEFAULT_SECS);
     let inputs = ProviderInputs {
         rise_token: std::env::var("RISE_TOKEN").ok(),
         rise_token_command: std::env::var("RISE_TOKEN_COMMAND").ok(),
+        rise_token_command_ttl: Duration::from_secs(command_ttl_secs),
         gha_request_url: std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL").ok(),
         gha_request_token: std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN").ok(),
         audience: audience_override
@@ -358,6 +390,7 @@ mod tests {
         ProviderInputs {
             rise_token: None,
             rise_token_command: None,
+            rise_token_command_ttl: Duration::from_secs(COMMAND_TOKEN_TTL_DEFAULT_SECS),
             gha_request_url: None,
             gha_request_token: None,
             audience: None,
@@ -463,5 +496,52 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("Not authenticated"));
+    }
+
+    mod command_token_ttl {
+        use super::*;
+
+        fn opaque_command_token(ttl: Duration) -> CommandToken {
+            CommandToken::new("echo opaque-key".to_string(), ttl)
+        }
+
+        #[test]
+        fn opaque_token_is_fresh_within_ttl() {
+            let ct = opaque_command_token(Duration::from_secs(600));
+            let cached = CachedToken::new("opaque-key".to_string());
+            assert!(cached.exp.is_none(), "plain string should have no exp");
+            // Fresh immediately after minting.
+            assert!(ct.is_cached_fresh(&cached, Instant::now(), Utc::now().timestamp()));
+        }
+
+        #[test]
+        fn opaque_token_is_stale_after_ttl() {
+            let ct = opaque_command_token(Duration::from_secs(1));
+            let cached = CachedToken::new("opaque-key".to_string());
+            // Simulate minted 2 seconds ago.
+            let minted_at = Instant::now() - Duration::from_secs(2);
+            assert!(!ct.is_cached_fresh(&cached, minted_at, Utc::now().timestamp()));
+        }
+
+        #[test]
+        fn jwt_token_uses_exp_not_ttl() {
+            // Very short TTL but the JWT exp is far in the future — should be fresh.
+            let ct = opaque_command_token(Duration::from_millis(1));
+            let exp = Utc::now().timestamp() + 3600;
+            let cached = CachedToken::new(jwt_with_exp(exp));
+            assert!(cached.exp.is_some());
+            // Even though TTL is 1ms (already elapsed), exp governs.
+            let minted_at = Instant::now() - Duration::from_secs(60);
+            assert!(ct.is_cached_fresh(&cached, minted_at, Utc::now().timestamp()));
+        }
+
+        #[test]
+        fn jwt_token_stale_when_exp_near() {
+            // Long TTL but JWT is near expiry — should be stale.
+            let ct = opaque_command_token(Duration::from_secs(3600));
+            let exp = Utc::now().timestamp() + EXPIRY_SKEW_SECONDS - 10; // within skew window
+            let cached = CachedToken::new(jwt_with_exp(exp));
+            assert!(!ct.is_cached_fresh(&cached, Instant::now(), Utc::now().timestamp()));
+        }
     }
 }
