@@ -1,0 +1,4 @@
+    Blocking waiting for file lock on artifact directory
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 31.61s
+     Running unittests src/main.rs (target/debug/deps/rise-487abf1be8d27808)
+error: test failed, to rerun pass `--bin rise`

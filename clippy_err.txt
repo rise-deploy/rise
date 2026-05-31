@@ -1,0 +1,2 @@
+    Checking rise-deploy v0.23.0-rc4 (/home/user/rise)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 31s

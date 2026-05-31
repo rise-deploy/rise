@@ -1,0 +1,3 @@
+   Compiling rise-deploy v0.23.0-rc4 (/home/user/rise)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 33s
+     Running unittests src/main.rs (target/debug/deps/rise-487abf1be8d27808)

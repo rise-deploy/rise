@@ -4,7 +4,7 @@ use comfy_table::{
 };
 use reqwest::Client;
 use serde::Deserialize;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use crate::build::{self, BackendPlatformHint, BuildOptions, PlatformSource};
@@ -498,10 +498,84 @@ struct RegistryCredentials {
     registry_url: String,
     username: String,
     password: String,
-    #[allow(dead_code)]
+    /// Credential lifespan in seconds, used to decide when to re-mint between
+    /// containers in a multi-container build. Absent on backends that don't
+    /// advertise it (treated as unknown → re-mint to stay safe).
     expires_in: Option<u64>,
     #[serde(default)]
     auth_method: RegistryAuthMethod,
+}
+
+/// Default minimum remaining lifespan, in seconds, that registry credentials
+/// must have to be reused for another container's login + build + push without
+/// re-minting. Overridable via `RISE_REGISTRY_CRED_MIN_LIFETIME_SECS`.
+const REGISTRY_CRED_MIN_REMAINING_DEFAULT_SECS: u64 = 20 * 60;
+
+/// Resolve the minimum-remaining-lifespan threshold for reusing registry
+/// credentials, honouring the `RISE_REGISTRY_CRED_MIN_LIFETIME_SECS` override
+/// (a non-parseable or zero value falls back to the default).
+fn registry_cred_min_remaining() -> Duration {
+    let secs = std::env::var("RISE_REGISTRY_CRED_MIN_LIFETIME_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(REGISTRY_CRED_MIN_REMAINING_DEFAULT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Registry credentials plus the moment they were fetched, so the
+/// multi-container build loop can decide whether they're still safe to reuse
+/// for the next login + build + push instead of re-minting before every
+/// container.
+struct TimedRegistryCredentials {
+    creds: RegistryCredentials,
+    fetched_at: Instant,
+}
+
+impl TimedRegistryCredentials {
+    fn new(creds: RegistryCredentials) -> Self {
+        Self {
+            creds,
+            fetched_at: Instant::now(),
+        }
+    }
+
+    /// Whether these credentials are still safe to reuse as-is (no re-mint).
+    ///
+    /// They are reused unless they're expiring soon, defined as EITHER:
+    ///   - at least 2/3 of the credential lifespan has elapsed, OR
+    ///   - fewer than `min_remaining` of lifespan is left.
+    ///
+    /// Two cases always reuse, because there is nothing better to re-mint:
+    ///   - "no remote credentials": the backend returned an empty username,
+    ///     meaning the registry is authenticated by credentials already present
+    ///     on the machine (OCI client-auth) — there is no short-lived token to
+    ///     refresh, so we never refetch.
+    ///
+    /// When the backend returns no `expires_in` (unknown lifespan) we re-mint to
+    /// stay safe, preserving the original short-lived-token fix (#352).
+    fn is_reusable(&self, min_remaining: Duration, now: Instant) -> bool {
+        // Local-machine auth: nothing to re-mint.
+        if self.creds.auth_method == RegistryAuthMethod::LoginCredentials
+            && self.creds.username.is_empty()
+        {
+            return true;
+        }
+
+        let lifespan = match self.creds.expires_in {
+            Some(secs) if secs > 0 => Duration::from_secs(secs),
+            // Unknown (or zero) lifespan: re-mint to be safe.
+            _ => return false,
+        };
+
+        let elapsed = now.saturating_duration_since(self.fetched_at);
+        // Crossed 2/3 of the lifespan?
+        if elapsed.saturating_mul(3) >= lifespan.saturating_mul(2) {
+            return false;
+        }
+        // Less than the minimum buffer left?
+        lifespan.saturating_sub(elapsed) >= min_remaining
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1125,10 +1199,12 @@ pub async fn create_deployment(
 /// backend already persisted the user-provided tag.
 ///
 /// Builds run sequentially in the iteration order of `[containers.<name>]`
-/// (BTreeMap → lexicographic). Registry credentials are re-minted per
-/// container before login + build + push, because a long multi-container
-/// build (cold BuildKit cache × N containers) can outlast the issued
-/// token's `expires_in` and cause later pushes to 401.
+/// (BTreeMap → lexicographic). Registry credentials are reused across
+/// containers and only re-minted (with a fresh login) when they're expiring
+/// soon — at least 2/3 of their lifespan elapsed, or under the minimum
+/// remaining buffer — so a long multi-container build (cold BuildKit cache × N
+/// containers) can't outlast the issued token's `expires_in` and 401 a later
+/// push, while still avoiding a needless mint + login before every container.
 async fn build_and_push_multi_container(
     http_client: &Client,
     backend_url: &str,
@@ -1170,6 +1246,13 @@ async fn build_and_push_multi_container(
     )
     .await?;
 
+    // Registry credentials are reused across containers and only re-minted when
+    // expiring soon (see `TimedRegistryCredentials::is_reusable`), so a long
+    // multi-container build can't outlast its token while we also avoid a
+    // needless mint + login before every container.
+    let min_remaining = registry_cred_min_remaining();
+    let mut cached_creds: Option<TimedRegistryCredentials> = None;
+
     for container in &resolved.containers {
         let Some(image_tag) = container_images.get(&container.name) else {
             // Shouldn't happen — the backend populates every container.
@@ -1203,28 +1286,40 @@ async fn build_and_push_multi_container(
         )
         .with_push(true);
 
-        // Re-mint per container — long builds can outlast the token's expires_in.
-        // The registry-credential fetch resolves a fresh token and retries once
-        // on a 401; this is the critical fix for the multi-container case.
-        let fresh_creds = fetch_deployment_registry_credentials(
-            http_client,
-            backend_url,
-            provider,
-            deploy_opts.project_name,
-            &deployment_info.deployment_id,
-        )
-        .await?;
-        let token = provider.token().await?;
-        login_to_registry(
-            http_client,
-            backend_url,
-            &token,
-            options.container_cli.command(),
-            &fresh_creds,
-            deploy_opts.project_name,
-            &deployment_info.deployment_id,
-        )
-        .await?;
+        // Re-mint registry credentials only when the previous container's are
+        // expiring soon (or none have been fetched yet). A long multi-container
+        // build (cold BuildKit cache × N containers) can outlast the issued
+        // token's `expires_in` and 401 a later push, but re-minting + logging in
+        // before every container is wasteful when the credentials are still
+        // good. When the backend returns no credentials (empty username) we rely
+        // on credentials already present on the machine and never refetch.
+        // See #352 and its follow-up.
+        let need_fresh = match &cached_creds {
+            Some(c) => !c.is_reusable(min_remaining, Instant::now()),
+            None => true,
+        };
+        if need_fresh {
+            let fresh_creds = fetch_deployment_registry_credentials(
+                http_client,
+                backend_url,
+                provider,
+                deploy_opts.project_name,
+                &deployment_info.deployment_id,
+            )
+            .await?;
+            let token = provider.token().await?;
+            login_to_registry(
+                http_client,
+                backend_url,
+                &token,
+                options.container_cli.command(),
+                &fresh_creds,
+                deploy_opts.project_name,
+                &deployment_info.deployment_id,
+            )
+            .await?;
+            cached_creds = Some(TimedRegistryCredentials::new(fresh_creds));
+        }
 
         log_platform_choice(&options.platform, options.platform_source, "Building");
         info!("→ Building container '{}' as {}", container.name, image_tag);
@@ -2448,5 +2543,76 @@ mod tests {
         assert_eq!(normalize_git_url(""), None);
         assert_eq!(normalize_git_url("not-a-url"), None);
         assert_eq!(normalize_git_url("/local/path/repo"), None);
+    }
+
+    mod registry_credential_reuse {
+        use super::super::{RegistryAuthMethod, RegistryCredentials, TimedRegistryCredentials};
+        use std::time::Duration;
+
+        fn timed(
+            username: &str,
+            expires_in: Option<u64>,
+            auth_method: RegistryAuthMethod,
+        ) -> TimedRegistryCredentials {
+            TimedRegistryCredentials::new(RegistryCredentials {
+                registry_url: "registry.example.com/app".to_string(),
+                username: username.to_string(),
+                password: "secret".to_string(),
+                expires_in,
+                auth_method,
+            })
+        }
+
+        #[test]
+        fn reuses_local_machine_credentials_even_without_expiry() {
+            // Empty username under LoginCredentials = OCI client-auth: nothing
+            // to re-mint, so always reuse regardless of expiry/elapsed.
+            let creds = timed("", None, RegistryAuthMethod::LoginCredentials);
+            let now = creds.fetched_at + Duration::from_secs(86_400);
+            assert!(creds.is_reusable(Duration::from_secs(20 * 60), now));
+        }
+
+        #[test]
+        fn remints_when_lifespan_unknown() {
+            // Real username but no expires_in → unknown lifespan → re-mint.
+            let creds = timed("u", None, RegistryAuthMethod::LoginCredentials);
+            assert!(!creds.is_reusable(Duration::from_secs(60), creds.fetched_at));
+        }
+
+        #[test]
+        fn reuses_fresh_long_lived_credentials() {
+            let creds = timed("u", Some(3600), RegistryAuthMethod::LoginCredentials);
+            let now = creds.fetched_at + Duration::from_secs(10);
+            assert!(creds.is_reusable(Duration::from_secs(20 * 60), now));
+        }
+
+        #[test]
+        fn remints_after_two_thirds_of_lifespan() {
+            // 2400s of a 3600s lifespan = exactly 2/3 elapsed → re-mint, even
+            // though 1200s remain against a small buffer.
+            let creds = timed("u", Some(3600), RegistryAuthMethod::LoginCredentials);
+            let now = creds.fetched_at + Duration::from_secs(2400);
+            assert!(!creds.is_reusable(Duration::from_secs(60), now));
+        }
+
+        #[test]
+        fn remints_when_under_minimum_remaining() {
+            // 30min lifespan, 700s elapsed: well under 2/3 (1200s), but only
+            // 1100s remain against a 1200s (20min) buffer → re-mint.
+            let creds = timed("u", Some(1800), RegistryAuthMethod::LoginCredentials);
+            let now = creds.fetched_at + Duration::from_secs(700);
+            assert!(!creds.is_reusable(Duration::from_secs(20 * 60), now));
+        }
+
+        #[test]
+        fn registry_token_with_empty_username_still_honours_expiry() {
+            // The empty-username shortcut only applies to LoginCredentials; a
+            // RegistryToken carries its secret in `password`, so expiry governs.
+            let creds = timed("", Some(3600), RegistryAuthMethod::RegistryToken);
+            let fresh = creds.fetched_at + Duration::from_secs(10);
+            assert!(creds.is_reusable(Duration::from_secs(20 * 60), fresh));
+            let stale = creds.fetched_at + Duration::from_secs(3000);
+            assert!(!creds.is_reusable(Duration::from_secs(20 * 60), stale));
+        }
     }
 }
