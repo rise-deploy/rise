@@ -7,7 +7,7 @@ const placeholder = 'https://rise.example.com';
 <div class="toml-schema-hint">
   <Code code={`#:schema ${placeholder}${schema}`} lang="toml" />
 </div>
-<script define:vars={{ schema, placeholder }}>
+<script is:inline define:vars={{ schema, placeholder }}>
   document.querySelectorAll('.toml-schema-hint code').forEach((el) => {
     el.innerHTML = el.innerHTML.replace(placeholder, window.location.origin);
   });
