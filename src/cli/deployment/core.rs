@@ -2563,7 +2563,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn token_with_retry_allows_initial_attempt_plus_three_retries() {
         let source = Arc::new(RetryThenSucceedTokenSource {
             attempts: AtomicUsize::new(0),

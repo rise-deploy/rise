@@ -222,24 +222,10 @@ impl Config {
         self.save()
     }
 
-    /// Get the authentication token
-    /// Checks RISE_TOKEN environment variable first, then falls back to config file
-    #[allow(dead_code)]
-    pub fn get_token(&self) -> Option<String> {
-        #[cfg(not(test))]
-        if let Ok(token) = std::env::var("RISE_TOKEN") {
-            crate::login::token_utils::log_token_debug(&token, "RISE_TOKEN environment variable");
-            return Some(token);
-        }
-
-        if let Some(token) = self.token.as_deref() {
-            crate::login::token_utils::log_token_debug(token, "~/.config/rise/config.json");
-        }
-
-        self.token.clone()
-    }
-
     /// The token persisted in the config file (ignores RISE_TOKEN env).
+    ///
+    /// Token *source* selection (RISE_TOKEN, RISE_TOKEN_COMMAND, GitHub Actions
+    /// OIDC, then this stored token) lives in [`crate::cli::token_source`].
     pub fn stored_token(&self) -> Option<String> {
         self.token.clone()
     }
@@ -373,13 +359,13 @@ mod tests {
 
     #[test]
     fn test_token_none_by_default() {
-        assert_eq!(Config::default().get_token(), None);
+        assert_eq!(Config::default().stored_token(), None);
     }
 
     #[test]
     fn test_token_from_config() {
         let c = config(|c| c.token = Some("config-token".to_string()));
-        assert_eq!(c.get_token(), Some("config-token".to_string()));
+        assert_eq!(c.stored_token(), Some("config-token".to_string()));
     }
 
     #[test]

@@ -97,6 +97,11 @@ pub fn is_no_token_source_error(error: &anyhow::Error) -> bool {
 /// Number of retry attempts after the initial token resolution attempt.
 const TOKEN_RESOLUTION_RETRIES: usize = 3;
 
+/// Base delay between token-resolution retries. Grows linearly with the attempt
+/// number (1×, 2×, 3×) so a momentarily-flaky mint endpoint gets a little
+/// breathing room instead of being hammered back-to-back.
+const TOKEN_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(500);
+
 /// Resolve a bearer token, retrying transient mint failures.
 ///
 /// Token sources own their cache/refresh policy: every attempt asks for a
@@ -109,12 +114,15 @@ pub async fn token_with_retry(provider: &TokenProvider) -> Result<String> {
             Ok(token) => return Ok(token),
             Err(e) if is_non_retryable_token_error(&e) => return Err(e),
             Err(e) if attempt < TOKEN_RESOLUTION_RETRIES => {
+                let backoff = TOKEN_RETRY_BASE_BACKOFF * (attempt as u32 + 1);
                 warn!(
-                    "Token resolution failed, retrying ({}/{}): {:?}",
+                    "Token resolution failed (attempt {}/{}), retrying in {:?}: {:?}",
                     attempt + 1,
-                    TOKEN_RESOLUTION_RETRIES,
+                    TOKEN_RESOLUTION_RETRIES + 1,
+                    backoff,
                     e
                 );
+                tokio::time::sleep(backoff).await;
             }
             Err(e) => return Err(e),
         }
@@ -130,43 +138,52 @@ pub async fn resolve_token_with_retry(http: &reqwest::Client, config: &Config) -
     token_with_retry(&provider).await
 }
 
-/// A token cached alongside its decoded `exp` (seconds since epoch). `None`
-/// expiry means the token is opaque (not a decodable JWT) and must be re-minted
-/// on every use to stay safe.
+/// A token cached alongside the lifetime derived from its JWT `exp`. The
+/// wall-clock `exp` is converted into a [`Duration`] relative to `minted_at`
+/// once, at mint time, so all subsequent freshness math runs off a single
+/// monotonic [`Instant`] clock. `lifetime` is `None` for an opaque (non-JWT)
+/// token, which must be re-minted on every use to stay safe; a JWT already past
+/// its `exp` at mint time yields `Some(Duration::ZERO)` so it's still
+/// recognisable as a JWT (distinct from opaque) while never counting as fresh.
 #[derive(Clone)]
 struct CachedToken {
     value: String,
-    exp: Option<i64>,
     minted_at: Instant,
-    minted_at_secs: i64,
+    lifetime: Option<Duration>,
 }
 
 impl CachedToken {
     fn new(value: String) -> Self {
-        let exp = read_token_exp(&value);
+        let lifetime = read_token_exp(&value).map(|exp| {
+            let remaining = exp.saturating_sub(Utc::now().timestamp());
+            Duration::from_secs(remaining.max(0) as u64)
+        });
         Self {
             value,
-            exp,
             minted_at: Instant::now(),
-            minted_at_secs: Utc::now().timestamp(),
+            lifetime,
         }
     }
 
-    fn is_fresh(&self, now_secs: i64) -> bool {
-        let Some(exp) = self.exp else {
+    /// Whether the token decoded as a JWT (has an `exp`), as opposed to an
+    /// opaque value. Used to decide whether `exp`-based or TTL-based freshness
+    /// applies.
+    fn is_jwt(&self) -> bool {
+        self.lifetime.is_some()
+    }
+
+    fn is_fresh(&self) -> bool {
+        let Some(lifetime) = self.lifetime else {
             return false;
         };
-        if exp - EXPIRY_SKEW_SECONDS <= now_secs {
+        let elapsed = self.minted_at.elapsed();
+        // Within the skew window of expiry?
+        if lifetime.saturating_sub(elapsed) <= Duration::from_secs(EXPIRY_SKEW_SECONDS as u64) {
             return false;
         }
-
-        let lifetime_secs = exp.saturating_sub(self.minted_at_secs);
-        if lifetime_secs <= 0 {
-            return false;
-        }
-        let elapsed_secs = now_secs.saturating_sub(self.minted_at_secs);
-        elapsed_secs.saturating_mul(REFRESH_FRACTION_DENOMINATOR as i64)
-            < lifetime_secs.saturating_mul(REFRESH_FRACTION_NUMERATOR as i64)
+        // Past two thirds of the lifetime?
+        elapsed.saturating_mul(REFRESH_FRACTION_DENOMINATOR)
+            < lifetime.saturating_mul(REFRESH_FRACTION_NUMERATOR)
     }
 }
 
@@ -276,9 +293,8 @@ impl GithubActionsOidc {
 impl TokenSource for GithubActionsOidc {
     async fn token(&self) -> Result<String> {
         let mut guard = self.cache.lock().await;
-        let now = Utc::now().timestamp();
         if let Some(cached) = guard.as_ref() {
-            if cached.is_fresh(now) {
+            if cached.is_fresh() {
                 return Ok(cached.value.clone());
             }
         }
@@ -323,10 +339,10 @@ impl CommandToken {
         }
     }
 
-    fn is_cached_fresh(&self, cached: &CachedToken, now_ts: i64) -> bool {
+    fn is_cached_fresh(&self, cached: &CachedToken) -> bool {
         // JWT output: trust the embedded exp (more precise than wall-clock TTL).
-        if cached.exp.is_some() {
-            return cached.is_fresh(now_ts);
+        if cached.is_jwt() {
+            return cached.is_fresh();
         }
         // Opaque output: refresh before the configured TTL is reached. The
         // external command should return tokens valid beyond this threshold.
@@ -386,9 +402,8 @@ impl CommandToken {
 impl TokenSource for CommandToken {
     async fn token(&self) -> Result<String> {
         let mut guard = self.cache.lock().await;
-        let now_ts = Utc::now().timestamp();
         if let Some(cached) = guard.as_ref() {
-            if self.is_cached_fresh(cached, now_ts) {
+            if self.is_cached_fresh(cached) {
                 return Ok(cached.value.clone());
             }
         }
@@ -527,43 +542,46 @@ mod tests {
         assert_eq!(s.token().await.unwrap(), "abc");
     }
 
+    /// Build a cached token as if it were minted `elapsed` ago with the given
+    /// total `lifetime`, bypassing wall-clock decoding so freshness boundaries
+    /// can be exercised deterministically.
+    fn aged_token(lifetime: Option<Duration>, elapsed: Duration) -> CachedToken {
+        CachedToken {
+            value: "x".into(),
+            minted_at: Instant::now() - elapsed,
+            lifetime,
+        }
+    }
+
     #[test]
     fn cached_token_freshness_respects_skew_and_lifetime_fraction() {
-        let now = 1_000_000;
-        let fresh = CachedToken {
-            value: "x".into(),
-            exp: Some(now + 300),
-            minted_at: Instant::now(),
-            minted_at_secs: now,
-        };
-        assert!(fresh.is_fresh(now));
-        let near = CachedToken {
-            value: "x".into(),
-            exp: Some(now + EXPIRY_SKEW_SECONDS - 10),
-            minted_at: Instant::now(),
-            minted_at_secs: now,
-        };
-        assert!(!near.is_fresh(now));
-        let two_thirds_elapsed = CachedToken {
-            value: "x".into(),
-            exp: Some(now + 100),
-            minted_at: Instant::now() - Duration::from_secs(200),
-            minted_at_secs: now - 200,
-        };
-        assert!(!two_thirds_elapsed.is_fresh(now));
-        let opaque = CachedToken {
-            value: "x".into(),
-            exp: None,
-            minted_at: Instant::now(),
-            minted_at_secs: now,
-        };
-        assert!(!opaque.is_fresh(now));
+        // Just minted, plenty of lifetime left → fresh.
+        let fresh = aged_token(Some(Duration::from_secs(300)), Duration::ZERO);
+        assert!(fresh.is_fresh());
+        // Within the skew window of expiry → stale.
+        let near = aged_token(
+            Some(Duration::from_secs(EXPIRY_SKEW_SECONDS as u64 - 10)),
+            Duration::ZERO,
+        );
+        assert!(!near.is_fresh());
+        // 2/3 of the lifetime elapsed → stale.
+        let two_thirds_elapsed =
+            aged_token(Some(Duration::from_secs(300)), Duration::from_secs(200));
+        assert!(!two_thirds_elapsed.is_fresh());
+        // Opaque (no lifetime) → never fresh.
+        let opaque = aged_token(None, Duration::ZERO);
+        assert!(!opaque.is_fresh());
     }
 
     #[test]
     fn cached_token_decodes_exp_from_jwt() {
+        // A JWT with an exp far in the future yields a large positive lifetime.
         let c = CachedToken::new(jwt_with_exp(4_102_444_800));
-        assert_eq!(c.exp, Some(4_102_444_800));
+        assert!(c.is_jwt());
+        assert!(c.lifetime.unwrap() > Duration::from_secs(0));
+        // An opaque (non-JWT) value has no lifetime.
+        let opaque = CachedToken::new("not-a-jwt".to_string());
+        assert!(!opaque.is_jwt());
     }
 
     #[test]
@@ -660,9 +678,9 @@ mod tests {
         fn opaque_token_is_fresh_before_two_thirds_of_ttl() {
             let ct = opaque_command_token(Duration::from_secs(600));
             let cached = CachedToken::new("opaque-key".to_string());
-            assert!(cached.exp.is_none(), "plain string should have no exp");
+            assert!(!cached.is_jwt(), "plain string should have no exp");
             // Fresh immediately after minting.
-            assert!(ct.is_cached_fresh(&cached, Utc::now().timestamp()));
+            assert!(ct.is_cached_fresh(&cached));
         }
 
         #[test]
@@ -671,7 +689,7 @@ mod tests {
             let mut cached = CachedToken::new("opaque-key".to_string());
             // Simulate minted 61 seconds ago (> 2/3 of 90s).
             cached.minted_at = Instant::now() - Duration::from_secs(61);
-            assert!(!ct.is_cached_fresh(&cached, Utc::now().timestamp()));
+            assert!(!ct.is_cached_fresh(&cached));
         }
 
         #[test]
@@ -680,8 +698,8 @@ mod tests {
             let ct = opaque_command_token(Duration::from_millis(1));
             let exp = Utc::now().timestamp() + 3600;
             let cached = CachedToken::new(jwt_with_exp(exp));
-            assert!(cached.exp.is_some());
-            assert!(ct.is_cached_fresh(&cached, Utc::now().timestamp()));
+            assert!(cached.is_jwt());
+            assert!(ct.is_cached_fresh(&cached));
         }
 
         #[test]
@@ -690,7 +708,7 @@ mod tests {
             let ct = opaque_command_token(Duration::from_secs(3600));
             let exp = Utc::now().timestamp() + EXPIRY_SKEW_SECONDS - 10; // within skew window
             let cached = CachedToken::new(jwt_with_exp(exp));
-            assert!(!ct.is_cached_fresh(&cached, Utc::now().timestamp()));
+            assert!(!ct.is_cached_fresh(&cached));
         }
 
         #[tokio::test]
