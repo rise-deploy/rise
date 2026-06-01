@@ -69,6 +69,8 @@ jobs:
         run: rise deploy --image ghcr.io/myorg/my-app:$GITHUB_SHA
 ```
 
+Because GitHub Actions OIDC auto-detection ranks above the stored login token (see [Token source precedence](./cli-reference#token-source-precedence)), a workflow with `id-token: write` and no `RISE_TOKEN`/`RISE_TOKEN_COMMAND` set will **error if `RISE_GHA_AUDIENCE` is unset** rather than fall back to another token. Setting `RISE_TOKEN` overrides this.
+
 ## Creating Service Accounts
 
 ```bash

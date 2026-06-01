@@ -649,6 +649,49 @@ async fn try_token_or_log(provider: &crate::token_source::TokenProvider) -> Opti
     }
 }
 
+/// Best-effort terminal "Failed" status report: resolve a token and update the
+/// deployment status, logging and swallowing any error so the caller can still
+/// surface the original build/push error instead of masking it.
+async fn report_failed_status(
+    http_client: &Client,
+    backend_url: &str,
+    provider: &crate::token_source::TokenProvider,
+    project_name: &str,
+    deployment_id: &str,
+    message: &str,
+) {
+    let Some(token) = try_token_or_log(provider).await else {
+        return;
+    };
+    if let Err(e) = update_deployment_status(
+        http_client,
+        backend_url,
+        &token,
+        project_name,
+        deployment_id,
+        "Failed",
+        Some(message),
+    )
+    .await
+    {
+        warn!("Failed to report terminal 'Failed' status: {:?}", e);
+    }
+}
+
+/// Resolve a bearer token, retrying once via `refresh()` on failure. Use before
+/// a REQUIRED status update that follows a long-running, already-successful step
+/// (build/push), so a transient token-mint hiccup can't fail the deploy after
+/// the image is already pushed.
+async fn token_with_retry(provider: &crate::token_source::TokenProvider) -> Result<String> {
+    match provider.token().await {
+        Ok(t) => Ok(t),
+        Err(e) => {
+            warn!("Token resolution failed, retrying once: {:?}", e);
+            provider.refresh().await
+        }
+    }
+}
+
 /// Fetch registry push credentials scoped to a specific deployment.
 async fn fetch_deployment_registry_credentials(
     http_client: &Client,
@@ -1007,18 +1050,15 @@ pub async fn create_deployment(
             );
             log_platform_choice(&platform, source, "Pulling");
             if let Err(e) = build::docker_pull(&container_cli, source_image, &platform) {
-                if let Some(token) = try_token_or_log(&provider).await {
-                    update_deployment_status(
-                        http_client,
-                        backend_url,
-                        &token,
-                        deploy_opts.project_name,
-                        &deployment_info.deployment_id,
-                        "Failed",
-                        Some(&e.to_string()),
-                    )
-                    .await?;
-                }
+                report_failed_status(
+                    http_client,
+                    backend_url,
+                    &provider,
+                    deploy_opts.project_name,
+                    &deployment_info.deployment_id,
+                    &e.to_string(),
+                )
+                .await;
                 return Err(e);
             }
 
@@ -1026,18 +1066,15 @@ pub async fn create_deployment(
             if let Err(e) =
                 build::docker_tag(&container_cli, source_image, &deployment_info.image_tag)
             {
-                if let Some(token) = try_token_or_log(&provider).await {
-                    update_deployment_status(
-                        http_client,
-                        backend_url,
-                        &token,
-                        deploy_opts.project_name,
-                        &deployment_info.deployment_id,
-                        "Failed",
-                        Some(&e.to_string()),
-                    )
-                    .await?;
-                }
+                report_failed_status(
+                    http_client,
+                    backend_url,
+                    &provider,
+                    deploy_opts.project_name,
+                    &deployment_info.deployment_id,
+                    &e.to_string(),
+                )
+                .await;
                 return Err(e);
             }
 
@@ -1056,18 +1093,15 @@ pub async fn create_deployment(
 
             // Push to Rise registry
             if let Err(e) = build::docker_push(&container_cli, &deployment_info.image_tag) {
-                if let Some(token) = try_token_or_log(&provider).await {
-                    update_deployment_status(
-                        http_client,
-                        backend_url,
-                        &token,
-                        deploy_opts.project_name,
-                        &deployment_info.deployment_id,
-                        "Failed",
-                        Some(&e.to_string()),
-                    )
-                    .await?;
-                }
+                report_failed_status(
+                    http_client,
+                    backend_url,
+                    &provider,
+                    deploy_opts.project_name,
+                    &deployment_info.deployment_id,
+                    &e.to_string(),
+                )
+                .await;
                 return Err(e);
             }
 
@@ -1171,23 +1205,20 @@ pub async fn create_deployment(
         let options = options.with_push(true);
 
         if let Err(e) = build::build_image(options) {
-            if let Some(token) = try_token_or_log(&provider).await {
-                update_deployment_status(
-                    http_client,
-                    backend_url,
-                    &token,
-                    deploy_opts.project_name,
-                    &deployment_info.deployment_id,
-                    "Failed",
-                    Some(&e.to_string()),
-                )
-                .await?;
-            }
+            report_failed_status(
+                http_client,
+                backend_url,
+                &provider,
+                deploy_opts.project_name,
+                &deployment_info.deployment_id,
+                &e.to_string(),
+            )
+            .await;
             return Err(e);
         }
 
         // Step 5: Mark as pushed (controller will take over deployment)
-        let token = provider.token().await?;
+        let token = token_with_retry(&provider).await?;
         update_deployment_status(
             http_client,
             backend_url,
@@ -1354,24 +1385,21 @@ async fn build_and_push_multi_container(
 
         if let Err(e) = build::build_image(options) {
             let msg = format!("Build of container '{}' failed: {}", container.name, e);
-            if let Some(token) = try_token_or_log(provider).await {
-                update_deployment_status(
-                    http_client,
-                    backend_url,
-                    &token,
-                    deploy_opts.project_name,
-                    &deployment_info.deployment_id,
-                    "Failed",
-                    Some(&msg),
-                )
-                .await?;
-            }
+            report_failed_status(
+                http_client,
+                backend_url,
+                provider,
+                deploy_opts.project_name,
+                &deployment_info.deployment_id,
+                &msg,
+            )
+            .await;
             return Err(e);
         }
         info!("  ✓ Pushed container '{}'", container.name);
     }
 
-    let token = provider.token().await?;
+    let token = token_with_retry(provider).await?;
     update_deployment_status(
         http_client,
         backend_url,

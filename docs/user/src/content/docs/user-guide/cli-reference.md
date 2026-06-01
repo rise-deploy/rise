@@ -56,6 +56,17 @@ rise project show
 | `SSL_CERT_FILE` | CA certificate file for SSL builds |
 | `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` | Proxy settings (auto-injected into builds) |
 
+### Token source precedence
+
+The CLI picks its backend bearer token from the first available of these sources, in this **fixed** order (not currently user-configurable):
+
+1. `RISE_TOKEN` — explicit token, always wins.
+2. `RISE_TOKEN_COMMAND` — stdout of the given shell command.
+3. GitHub Actions OIDC — auto-detected from `ACTIONS_ID_TOKEN_REQUEST_URL` / `ACTIONS_ID_TOKEN_REQUEST_TOKEN`; requires `RISE_GHA_AUDIENCE`.
+4. Stored login token from `rise login` (in the config file).
+
+Caveat: because GitHub Actions OIDC (3) is auto-detected and ranks above the stored login token (4), a workflow with `id-token: write` and no `RISE_TOKEN`/`RISE_TOKEN_COMMAND` will use OIDC and **error if `RISE_GHA_AUDIENCE` is unset** — it does not fall back to a stored token. Setting `RISE_TOKEN` overrides everything.
+
 ## Global Configuration
 
 CLI settings are stored in `~/.config/rise/config.json`, created on first `rise login`. See [Project Configuration](../configuration#global-cli-config) for details.
