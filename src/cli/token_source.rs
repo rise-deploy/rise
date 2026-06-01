@@ -5,11 +5,13 @@
 //! builds and pushes several containers can outlast a single pre-minted token,
 //! so instead of capturing one fixed token string we thread a [`TokenProvider`]
 //! through the deployment path and resolve a fresh token immediately before
-//! each request. Implementations cache the minted token and re-mint lazily as
-//! it nears expiry (or on an explicit [`TokenSource::refresh`] after a 401).
+//! each request. Implementations cache the minted token and re-mint lazily
+//! before it nears expiry.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
+use std::error::Error;
+use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -17,10 +19,13 @@ use tokio::sync::Mutex;
 use crate::config::Config;
 use crate::login::token_utils::read_token_exp;
 
-/// Re-mint a cached token once it is within this many seconds of expiry, so a
-/// request issued right after [`TokenSource::token`] still has comfortable
-/// headroom against clock skew and request latency.
+/// Re-mint cached JWTs before two thirds of their observed lifetime has elapsed
+/// and once they are within this many seconds of expiry, so a request issued
+/// right after [`TokenSource::token`] still has comfortable headroom against
+/// clock skew and request latency.
 const EXPIRY_SKEW_SECONDS: i64 = 60;
+const REFRESH_FRACTION_NUMERATOR: u32 = 2;
+const REFRESH_FRACTION_DENOMINATOR: u32 = 3;
 
 /// A source of bearer tokens for backend authentication.
 #[async_trait::async_trait]
@@ -29,16 +34,49 @@ pub trait TokenSource: Send + Sync {
     /// one is missing or within the skew window of its `exp`.
     async fn token(&self) -> Result<String>;
 
-    /// Force a re-mint, discarding any cached token. A no-op (returns the same
-    /// value) for static sources.
-    async fn refresh(&self) -> Result<String>;
-
     /// Short human label for diagnostics/tests.
     fn describe(&self) -> &'static str;
 }
 
 /// Cheaply-cloneable handle threaded through the deployment path.
 pub type TokenProvider = Arc<dyn TokenSource>;
+
+#[derive(Debug)]
+pub enum TokenSourceError {
+    Retryable(String),
+    NonRetryable(String),
+}
+
+impl TokenSourceError {
+    fn retryable(message: impl Into<String>) -> Self {
+        Self::Retryable(message.into())
+    }
+
+    fn non_retryable(message: impl Into<String>) -> Self {
+        Self::NonRetryable(message.into())
+    }
+
+    pub fn is_non_retryable(&self) -> bool {
+        matches!(self, Self::NonRetryable(_))
+    }
+}
+
+impl fmt::Display for TokenSourceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Retryable(message) | Self::NonRetryable(message) => f.write_str(message),
+        }
+    }
+}
+
+impl Error for TokenSourceError {}
+
+pub fn is_non_retryable_token_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<TokenSourceError>())
+        .is_some_and(TokenSourceError::is_non_retryable)
+}
 
 /// A token cached alongside its decoded `exp` (seconds since epoch). `None`
 /// expiry means the token is opaque (not a decodable JWT) and must be re-minted
@@ -47,19 +85,36 @@ pub type TokenProvider = Arc<dyn TokenSource>;
 struct CachedToken {
     value: String,
     exp: Option<i64>,
+    minted_at: Instant,
+    minted_at_secs: i64,
 }
 
 impl CachedToken {
     fn new(value: String) -> Self {
         let exp = read_token_exp(&value);
-        Self { value, exp }
+        Self {
+            value,
+            exp,
+            minted_at: Instant::now(),
+            minted_at_secs: Utc::now().timestamp(),
+        }
     }
 
     fn is_fresh(&self, now_secs: i64) -> bool {
-        match self.exp {
-            Some(exp) => exp - EXPIRY_SKEW_SECONDS > now_secs,
-            None => false,
+        let Some(exp) = self.exp else {
+            return false;
+        };
+        if exp - EXPIRY_SKEW_SECONDS <= now_secs {
+            return false;
         }
+
+        let lifetime_secs = exp.saturating_sub(self.minted_at_secs);
+        if lifetime_secs <= 0 {
+            return false;
+        }
+        let elapsed_secs = now_secs.saturating_sub(self.minted_at_secs);
+        elapsed_secs.saturating_mul(REFRESH_FRACTION_DENOMINATOR as i64)
+            < lifetime_secs.saturating_mul(REFRESH_FRACTION_NUMERATOR as i64)
     }
 }
 
@@ -78,9 +133,6 @@ impl StaticToken {
 #[async_trait::async_trait]
 impl TokenSource for StaticToken {
     async fn token(&self) -> Result<String> {
-        Ok(self.value.clone())
-    }
-    async fn refresh(&self) -> Result<String> {
         Ok(self.value.clone())
     }
     fn describe(&self) -> &'static str {
@@ -137,13 +189,18 @@ impl GithubActionsOidc {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            bail!(
+            let message = format!(
                 "Failed to mint GitHub Actions OIDC token (audience '{}'): {} {}. \
                  Ensure the workflow grants 'id-token: write' permission.",
-                self.audience,
-                status,
-                body
+                self.audience, status, body
             );
+            if status.is_server_error()
+                || status == reqwest::StatusCode::REQUEST_TIMEOUT
+                || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            {
+                return Err(TokenSourceError::retryable(message).into());
+            }
+            return Err(TokenSourceError::non_retryable(message).into());
         }
         #[derive(serde::Deserialize)]
         struct OidcResponse {
@@ -154,7 +211,10 @@ impl GithubActionsOidc {
             .await
             .context("Failed to parse GitHub Actions OIDC token response")?;
         if parsed.value.trim().is_empty() {
-            bail!("GitHub Actions OIDC endpoint returned an empty token");
+            return Err(TokenSourceError::non_retryable(
+                "GitHub Actions OIDC endpoint returned an empty token",
+            )
+            .into());
         }
         Ok(CachedToken::new(parsed.value))
     }
@@ -176,14 +236,6 @@ impl TokenSource for GithubActionsOidc {
         Ok(value)
     }
 
-    async fn refresh(&self) -> Result<String> {
-        let mut guard = self.cache.lock().await;
-        let fresh = self.mint().await?;
-        let value = fresh.value.clone();
-        *guard = Some(fresh);
-        Ok(value)
-    }
-
     fn describe(&self) -> &'static str {
         "GitHub Actions OIDC"
     }
@@ -197,12 +249,12 @@ const COMMAND_TOKEN_TTL_DEFAULT_SECS: u64 = 10 * 60;
 /// bearer token. Generic escape hatch for any CI / identity system.
 ///
 /// If the command outputs a JWT, its `exp` claim governs freshness. For opaque
-/// tokens (no decodable `exp`), the command is re-run after `ttl` elapses
+/// tokens (no decodable `exp`), the command is re-run before `ttl` elapses
 /// (default 10 minutes, overridable via `RISE_TOKEN_COMMAND_TTL`).
 pub struct CommandToken {
     command: String,
     ttl: Duration,
-    cache: Mutex<Option<(CachedToken, Instant)>>,
+    cache: Mutex<Option<CachedToken>>,
 }
 
 impl CommandToken {
@@ -214,15 +266,18 @@ impl CommandToken {
         }
     }
 
-    fn is_cached_fresh(&self, cached: &CachedToken, minted_at: Instant, now_ts: i64) -> bool {
+    fn is_cached_fresh(&self, cached: &CachedToken, now_ts: i64) -> bool {
         // JWT output: trust the embedded exp (more precise than wall-clock TTL).
         if cached.exp.is_some() {
             return cached.is_fresh(now_ts);
         }
-        // Opaque output: use wall-clock TTL as the refresh threshold. The
-        // external command should return tokens valid beyond this threshold by
-        // enough margin for any local work before the next backend request.
-        minted_at.elapsed() < self.ttl
+        // Opaque output: refresh before the configured TTL is reached. The
+        // external command should return tokens valid beyond this threshold.
+        cached
+            .minted_at
+            .elapsed()
+            .saturating_mul(REFRESH_FRACTION_DENOMINATOR)
+            < self.ttl.saturating_mul(REFRESH_FRACTION_NUMERATOR)
     }
 
     async fn run(&self) -> Result<CachedToken> {
@@ -238,7 +293,7 @@ impl CommandToken {
         .context("Failed to run RISE_TOKEN_COMMAND")?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!(
+            return Err(TokenSourceError::retryable(format!(
                 "RISE_TOKEN_COMMAND failed (exit {}): {}",
                 output
                     .status
@@ -246,11 +301,15 @@ impl CommandToken {
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "signal".to_string()),
                 stderr.trim()
-            );
+            ))
+            .into());
         }
         let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if token.is_empty() {
-            bail!("RISE_TOKEN_COMMAND produced no token on stdout");
+            return Err(TokenSourceError::non_retryable(
+                "RISE_TOKEN_COMMAND produced no token on stdout",
+            )
+            .into());
         }
         Ok(CachedToken::new(token))
     }
@@ -261,22 +320,14 @@ impl TokenSource for CommandToken {
     async fn token(&self) -> Result<String> {
         let mut guard = self.cache.lock().await;
         let now_ts = Utc::now().timestamp();
-        if let Some((cached, minted_at)) = guard.as_ref() {
-            if self.is_cached_fresh(cached, *minted_at, now_ts) {
+        if let Some(cached) = guard.as_ref() {
+            if self.is_cached_fresh(cached, now_ts) {
                 return Ok(cached.value.clone());
             }
         }
         let fresh = self.run().await?;
         let value = fresh.value.clone();
-        *guard = Some((fresh, Instant::now()));
-        Ok(value)
-    }
-
-    async fn refresh(&self) -> Result<String> {
-        let mut guard = self.cache.lock().await;
-        let fresh = self.run().await?;
-        let value = fresh.value.clone();
-        *guard = Some((fresh, Instant::now()));
+        *guard = Some(fresh);
         Ok(value)
     }
 
@@ -323,7 +374,7 @@ pub fn select_token_provider(
         inputs.gha_request_token.filter(|s| !s.is_empty()),
     ) {
         let audience = inputs.audience.filter(|a| !a.is_empty()).ok_or_else(|| {
-            anyhow::anyhow!(
+            anyhow!(
                 "GitHub Actions OIDC detected but no audience configured. \
                  Set RISE_GHA_AUDIENCE (recommended: the Rise server URL, e.g. {}).",
                 inputs.backend_url
@@ -394,28 +445,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn static_token_returns_and_refreshes_same_value() {
+    async fn static_token_returns_value() {
         let s = StaticToken::new("abc".to_string());
         assert_eq!(s.token().await.unwrap(), "abc");
-        assert_eq!(s.refresh().await.unwrap(), "abc");
     }
 
     #[test]
-    fn cached_token_freshness_respects_skew() {
+    fn cached_token_freshness_respects_skew_and_lifetime_fraction() {
         let now = 1_000_000;
         let fresh = CachedToken {
             value: "x".into(),
-            exp: Some(now + EXPIRY_SKEW_SECONDS + 10),
+            exp: Some(now + 300),
+            minted_at: Instant::now(),
+            minted_at_secs: now,
         };
         assert!(fresh.is_fresh(now));
         let near = CachedToken {
             value: "x".into(),
             exp: Some(now + EXPIRY_SKEW_SECONDS - 10),
+            minted_at: Instant::now(),
+            minted_at_secs: now,
         };
         assert!(!near.is_fresh(now));
+        let two_thirds_elapsed = CachedToken {
+            value: "x".into(),
+            exp: Some(now + 100),
+            minted_at: Instant::now() - Duration::from_secs(200),
+            minted_at_secs: now - 200,
+        };
+        assert!(!two_thirds_elapsed.is_fresh(now));
         let opaque = CachedToken {
             value: "x".into(),
             exp: None,
+            minted_at: Instant::now(),
+            minted_at_secs: now,
         };
         assert!(!opaque.is_fresh(now));
     }
@@ -500,21 +563,21 @@ mod tests {
         }
 
         #[test]
-        fn opaque_token_is_fresh_within_ttl() {
+        fn opaque_token_is_fresh_before_two_thirds_of_ttl() {
             let ct = opaque_command_token(Duration::from_secs(600));
             let cached = CachedToken::new("opaque-key".to_string());
             assert!(cached.exp.is_none(), "plain string should have no exp");
             // Fresh immediately after minting.
-            assert!(ct.is_cached_fresh(&cached, Instant::now(), Utc::now().timestamp()));
+            assert!(ct.is_cached_fresh(&cached, Utc::now().timestamp()));
         }
 
         #[test]
-        fn opaque_token_is_stale_after_ttl() {
-            let ct = opaque_command_token(Duration::from_secs(1));
-            let cached = CachedToken::new("opaque-key".to_string());
-            // Simulate minted 2 seconds ago.
-            let minted_at = Instant::now() - Duration::from_secs(2);
-            assert!(!ct.is_cached_fresh(&cached, minted_at, Utc::now().timestamp()));
+        fn opaque_token_is_stale_after_two_thirds_of_ttl() {
+            let ct = opaque_command_token(Duration::from_secs(90));
+            let mut cached = CachedToken::new("opaque-key".to_string());
+            // Simulate minted 61 seconds ago (> 2/3 of 90s).
+            cached.minted_at = Instant::now() - Duration::from_secs(61);
+            assert!(!ct.is_cached_fresh(&cached, Utc::now().timestamp()));
         }
 
         #[test]
@@ -524,9 +587,7 @@ mod tests {
             let exp = Utc::now().timestamp() + 3600;
             let cached = CachedToken::new(jwt_with_exp(exp));
             assert!(cached.exp.is_some());
-            // Even though TTL is 1ms (already elapsed), exp governs.
-            let minted_at = Instant::now() - Duration::from_secs(60);
-            assert!(ct.is_cached_fresh(&cached, minted_at, Utc::now().timestamp()));
+            assert!(ct.is_cached_fresh(&cached, Utc::now().timestamp()));
         }
 
         #[test]
@@ -535,7 +596,7 @@ mod tests {
             let ct = opaque_command_token(Duration::from_secs(3600));
             let exp = Utc::now().timestamp() + EXPIRY_SKEW_SECONDS - 10; // within skew window
             let cached = CachedToken::new(jwt_with_exp(exp));
-            assert!(!ct.is_cached_fresh(&cached, Instant::now(), Utc::now().timestamp()));
+            assert!(!ct.is_cached_fresh(&cached, Utc::now().timestamp()));
         }
     }
 }

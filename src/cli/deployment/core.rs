@@ -633,17 +633,45 @@ fn log_platform_choice(platform: &str, source: PlatformSource, operation: &str) 
     }
 }
 
-/// Resolve a bearer token, logging and swallowing any error instead of
-/// propagating it. Returns `None` when no token could be minted.
+/// Number of retry attempts after the initial token resolution attempt.
+const TOKEN_RESOLUTION_RETRIES: usize = 3;
+
+/// Resolve a bearer token, retrying transient mint failures.
 ///
-/// Use on best-effort paths — e.g. reporting a terminal "Failed" status — where
-/// a token-resolution error must not mask the original error the caller is about
-/// to return.
+/// Token sources own their cache/refresh policy: every attempt asks for a
+/// usable token via `token()`, and the provider decides whether to reuse or
+/// re-mint. Token sources can mark clear configuration/auth failures as
+/// non-retryable so we fail fast instead of repeating a known-bad request.
+pub(super) async fn token_with_retry(
+    provider: &crate::token_source::TokenProvider,
+) -> Result<String> {
+    for attempt in 0..=TOKEN_RESOLUTION_RETRIES {
+        match provider.token().await {
+            Ok(token) => return Ok(token),
+            Err(e) if crate::token_source::is_non_retryable_token_error(&e) => return Err(e),
+            Err(e) if attempt < TOKEN_RESOLUTION_RETRIES => {
+                warn!(
+                    "Token resolution failed, retrying ({}/{}): {:?}",
+                    attempt + 1,
+                    TOKEN_RESOLUTION_RETRIES,
+                    e
+                );
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    unreachable!("token retry loop always returns");
+}
+
+/// Resolve a bearer token with the shared retry policy, logging and swallowing
+/// any final error. Use on best-effort paths — e.g. reporting a terminal
+/// "Failed" status — where token failure must not mask the original error.
 async fn try_token_or_log(provider: &crate::token_source::TokenProvider) -> Option<String> {
-    match provider.token().await {
+    match token_with_retry(provider).await {
         Ok(token) => Some(token),
         Err(e) => {
-            warn!("Failed to resolve token: {:?}", e);
+            warn!("Failed to resolve token after retries: {:?}", e);
             None
         }
     }
@@ -678,20 +706,6 @@ async fn report_failed_status(
     }
 }
 
-/// Resolve a bearer token, retrying once via `refresh()` on failure. Use before
-/// a REQUIRED status update that follows a long-running, already-successful step
-/// (build/push), so a transient token-mint hiccup can't fail the deploy after
-/// the image is already pushed.
-async fn token_with_retry(provider: &crate::token_source::TokenProvider) -> Result<String> {
-    match provider.token().await {
-        Ok(t) => Ok(t),
-        Err(e) => {
-            warn!("Token resolution failed, retrying once: {:?}", e);
-            provider.refresh().await
-        }
-    }
-}
-
 /// Fetch registry push credentials scoped to a specific deployment.
 async fn fetch_deployment_registry_credentials(
     http_client: &Client,
@@ -707,25 +721,14 @@ async fn fetch_deployment_registry_credentials(
 
     // Resolve a fresh token immediately before the request. In a long deploy the
     // previously-minted token may be near or past expiry; the provider re-mints
-    // lazily. On a 401 (token rejected mid-flight) force a refresh and retry once
-    // — this is the core fix for short-lived CI OIDC tokens (see #352).
-    let token = provider.token().await?;
-    let mut response = http_client
+    // lazily before its freshness threshold. See #352.
+    let token = token_with_retry(provider).await?;
+    let response = http_client
         .get(&url)
         .bearer_auth(&token)
         .send()
         .await
         .context("Failed to fetch registry credentials")?;
-
-    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        let token = provider.refresh().await?;
-        response = http_client
-            .get(&url)
-            .bearer_auth(&token)
-            .send()
-            .await
-            .context("Failed to fetch registry credentials")?;
-    }
 
     if !response.status().is_success() {
         let status = response.status();
@@ -882,7 +885,7 @@ pub async fn create_deployment(
     // each request (see `token_source`). See issue #352.
     let provider = crate::token_source::resolve_token_provider(http_client, config)?;
     debug!("Authenticating to backend using {}", provider.describe());
-    let token = provider.token().await?;
+    let token = token_with_retry(&provider).await?;
 
     // Resolve job_url and pull_request_url: use explicit values, or auto-detect from CI environment
     let resolved_job_url = deploy_opts.job_url.clone().or_else(detect_ci_job_url);
@@ -1079,7 +1082,7 @@ pub async fn create_deployment(
             }
 
             // Update status to Building (reusing existing state for push phase)
-            let token = provider.token().await?;
+            let token = token_with_retry(&provider).await?;
             update_deployment_status(
                 http_client,
                 backend_url,
@@ -1106,7 +1109,7 @@ pub async fn create_deployment(
             }
 
             // Mark as pushed (controller will take over deployment)
-            let token = provider.token().await?;
+            let token = token_with_retry(&provider).await?;
             update_deployment_status(
                 http_client,
                 backend_url,
@@ -1189,7 +1192,7 @@ pub async fn create_deployment(
         .await?;
 
         // Step 3: Update status to 'building'
-        let token = provider.token().await?;
+        let token = token_with_retry(&provider).await?;
         update_deployment_status(
             http_client,
             backend_url,
@@ -1291,7 +1294,7 @@ async fn build_and_push_multi_container(
     // BuildOptions. Each request below resolves a fresh token from `provider`
     // (re-minting within a 60s skew of expiry) so a long multi-container build
     // can't outlast a short-lived CI token. See #352.
-    let token = provider.token().await?;
+    let token = token_with_retry(provider).await?;
     let backend_platform = fetch_backend_platform_hint(http_client, backend_url, &token).await?;
 
     update_deployment_status(
@@ -1366,7 +1369,7 @@ async fn build_and_push_multi_container(
                 &deployment_info.deployment_id,
             )
             .await?;
-            let token = provider.token().await?;
+            let token = token_with_retry(provider).await?;
             login_to_registry(
                 http_client,
                 backend_url,
@@ -2448,7 +2451,82 @@ pub(super) async fn open_log_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_log_event, normalize_git_url, ByteLineBuffer};
+    use super::{extract_log_event, normalize_git_url, token_with_retry, ByteLineBuffer};
+    use crate::token_source::{TokenProvider, TokenSource, TokenSourceError};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    struct RetryThenSucceedTokenSource {
+        attempts: AtomicUsize,
+        succeed_on_attempt: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl TokenSource for RetryThenSucceedTokenSource {
+        async fn token(&self) -> anyhow::Result<String> {
+            self.next()
+        }
+
+        fn describe(&self) -> &'static str {
+            "test retry source"
+        }
+    }
+
+    impl RetryThenSucceedTokenSource {
+        fn next(&self) -> anyhow::Result<String> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt >= self.succeed_on_attempt {
+                Ok(format!("token-{attempt}"))
+            } else {
+                Err(anyhow::anyhow!("temporary token mint failure"))
+            }
+        }
+    }
+
+    struct NonRetryableTokenSource {
+        attempts: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl TokenSource for NonRetryableTokenSource {
+        async fn token(&self) -> anyhow::Result<String> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            Err(TokenSourceError::NonRetryable("bad token config".to_string()).into())
+        }
+
+        fn describe(&self) -> &'static str {
+            "test non-retryable source"
+        }
+    }
+
+    #[tokio::test]
+    async fn token_with_retry_allows_initial_attempt_plus_three_retries() {
+        let source = Arc::new(RetryThenSucceedTokenSource {
+            attempts: AtomicUsize::new(0),
+            succeed_on_attempt: 4,
+        });
+        let provider: TokenProvider = source.clone();
+
+        let token = token_with_retry(&provider).await.unwrap();
+
+        assert_eq!(token, "token-4");
+        assert_eq!(source.attempts.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn token_with_retry_stops_on_non_retryable_error() {
+        let source = Arc::new(NonRetryableTokenSource {
+            attempts: AtomicUsize::new(0),
+        });
+        let provider: TokenProvider = source.clone();
+
+        let err = token_with_retry(&provider).await.unwrap_err();
+
+        assert!(crate::token_source::is_non_retryable_token_error(&err));
+        assert_eq!(source.attempts.load(Ordering::SeqCst), 1);
+    }
 
     /// Feeding a non-ASCII line one byte at a time — i.e. splitting *every*
     /// multi-byte codepoint mid-character — must still round-trip the line

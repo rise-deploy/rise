@@ -63,7 +63,7 @@ jobs:
       - name: Deploy
         env:
           # The CLI auto-detects GitHub Actions and mints an OIDC token on demand,
-          # re-minting as needed so long builds can't outlast its ~5 min lifetime.
+          # re-minting after about 2/3 of its lifetime so long builds can't outlast it.
           # Set the audience the service account expects (`--claim aud=...`).
           RISE_GHA_AUDIENCE: rise-project-my-app
         run: rise deploy --image ghcr.io/myorg/my-app:$GITHUB_SHA

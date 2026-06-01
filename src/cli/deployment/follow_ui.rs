@@ -8,7 +8,9 @@ use tracing::{debug, info};
 use crate::api::models::{Deployment, DeploymentStatus};
 use crate::config::Config;
 
-use super::core::{fetch_deployment, open_log_stream, parse_duration, LogStreamError};
+use super::core::{
+    fetch_deployment, open_log_stream, parse_duration, token_with_retry, LogStreamError,
+};
 
 // Project info for fetching project URL
 #[derive(Deserialize)]
@@ -439,7 +441,7 @@ async fn stream_logs_with_status_polling(
 
     // Try initial connection. Resolve a fresh token per request so a long poll
     // (up to the deploy timeout) doesn't outlast a short-lived CI token (#352).
-    let token = provider.token().await?;
+    let token = token_with_retry(provider).await?;
     match open_log_stream(
         http_client,
         backend_url,
@@ -455,7 +457,7 @@ async fn stream_logs_with_status_polling(
             debug!("Initial log stream connection deferred: deployment logs are not ready yet");
         }
         Err(LogStreamError::Gone) => {
-            let token = provider.token().await?;
+            let token = token_with_retry(provider).await?;
             return fetch_deployment(http_client, backend_url, &token, project, deployment_id)
                 .await;
         }
@@ -489,7 +491,7 @@ async fn stream_logs_with_status_polling(
                     }
                 }
                 _ = status_interval.tick() => {
-                    let token = provider.token().await?;
+                    let token = token_with_retry(provider).await?;
                     let deployment = fetch_deployment(
                         http_client, backend_url, &token, project, deployment_id,
                     ).await?;
@@ -517,7 +519,7 @@ async fn stream_logs_with_status_polling(
 
             tokio::select! {
                 _ = tokio::time::sleep(RETRY_DELAY) => {
-                    let token = provider.token().await?;
+                    let token = token_with_retry(provider).await?;
                     match open_log_stream(
                         http_client, backend_url, &token, project, deployment_id, 100,
                     ).await {
@@ -529,7 +531,7 @@ async fn stream_logs_with_status_polling(
                             debug!("Log stream not ready yet; will retry");
                         }
                         Err(LogStreamError::Gone) => {
-                            let token = provider.token().await?;
+                            let token = token_with_retry(provider).await?;
                             return fetch_deployment(
                                 http_client, backend_url, &token, project, deployment_id,
                             ).await;
@@ -541,7 +543,7 @@ async fn stream_logs_with_status_polling(
                     }
                 }
                 _ = status_interval.tick() => {
-                    let token = provider.token().await?;
+                    let token = token_with_retry(provider).await?;
                     let deployment = fetch_deployment(
                         http_client, backend_url, &token, project, deployment_id,
                     ).await?;
@@ -583,7 +585,7 @@ async fn status_only_polling(
     loop {
         // Resolve a fresh token per poll so a long wait doesn't outlast a
         // short-lived CI token (#352).
-        let token = provider.token().await?;
+        let token = token_with_retry(provider).await?;
         let deployment =
             fetch_deployment(http_client, backend_url, &token, project, deployment_id).await?;
         if is_terminal_state(&deployment.status) {
@@ -641,7 +643,7 @@ pub async fn follow_deployment_with_ui(
     // Poll until deployment reaches Deploying state (logs available) or a terminal state.
     let phase1_result: Result<Deployment> = async {
         loop {
-            let token = provider.token().await?;
+            let token = token_with_retry(&provider).await?;
             let deployment =
                 fetch_deployment(http_client, backend_url, &token, project, deployment_id).await?;
 
@@ -726,7 +728,7 @@ pub async fn follow_deployment_with_ui(
     if final_deployment.status == DeploymentStatus::Healthy
         && final_deployment.deployment_group == "default"
     {
-        let token = provider.token().await?;
+        let token = token_with_retry(&provider).await?;
         if let Ok(project_info) =
             fetch_project_info(http_client, backend_url, &token, project).await
         {
@@ -754,7 +756,7 @@ async fn follow_deployment_simple(
 
     // Phase 1: Status polling (print state changes as text lines)
     let deployment = loop {
-        let token = provider.token().await?;
+        let token = token_with_retry(provider).await?;
         let deployment =
             fetch_deployment(http_client, backend_url, &token, project, deployment_id).await?;
 
@@ -809,7 +811,7 @@ async fn follow_deployment_simple(
     if final_deployment.status == DeploymentStatus::Healthy
         && final_deployment.deployment_group == "default"
     {
-        let token = provider.token().await?;
+        let token = token_with_retry(provider).await?;
         if let Ok(project_info) =
             fetch_project_info(http_client, backend_url, &token, project).await
         {
