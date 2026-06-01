@@ -199,14 +199,14 @@ For automated deployments from CI/CD pipelines, use service accounts with OIDC w
 # Production: only protected branches/tags can deploy to production
 rise sa create -p my-app \
   --issuer https://gitlab.com \
-  --claim aud=rise-project-my-app \
+  --claim aud=https://rise.example.net \
   --claim project_path=myorg/my-app \
   --claim ref_protected=true
 
 # Previews: any branch can deploy, but only to the staging environment
 rise sa create -p my-app \
   --issuer https://gitlab.com \
-  --claim aud=rise-project-my-app \
+  --claim aud=https://rise.example.net \
   --claim project_path=myorg/my-app
 ```
 

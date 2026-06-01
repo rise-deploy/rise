@@ -79,9 +79,7 @@ pub async fn create_project(
     };
     use std::collections::BTreeMap;
 
-    let token = config
-        .get_token()
-        .ok_or_else(|| anyhow::anyhow!("Not logged in. Please run 'rise login' first."))?;
+    let token = crate::token_source::resolve_token_with_retry(http_client, config).await?;
 
     // Check if rise.toml already exists
     let existing_config = load_full_project_config(path)?;
@@ -209,9 +207,7 @@ pub async fn create_project(
 
 // List all projects
 pub async fn list_projects(http_client: &Client, backend_url: &str, config: &Config) -> Result<()> {
-    let token = config
-        .get_token()
-        .ok_or_else(|| anyhow::anyhow!("Not logged in. Please run 'rise login' first."))?;
+    let token = crate::token_source::resolve_token_with_retry(http_client, config).await?;
 
     let url = format!("{}/api/v1/projects", backend_url);
     let response = http_client
@@ -295,9 +291,7 @@ pub async fn show_project(
     config: &Config,
     project_identifier: &str,
 ) -> Result<()> {
-    let token = config
-        .get_token()
-        .ok_or_else(|| anyhow::anyhow!("Not logged in. Please run 'rise login' first."))?;
+    let token = crate::token_source::resolve_token_with_retry(http_client, config).await?;
 
     let url = format!("{}/api/v1/projects/{}", backend_url, project_identifier);
     let response = http_client
@@ -414,9 +408,7 @@ pub async fn update_project(
     owner: Option<String>,
     source_url: Option<Option<String>>,
 ) -> Result<()> {
-    let token = config
-        .get_token()
-        .ok_or_else(|| anyhow::anyhow!("Not logged in. Please run 'rise login' first."))?;
+    let token = crate::token_source::resolve_token_with_retry(http_client, config).await?;
 
     #[derive(Serialize)]
     #[serde(rename_all = "snake_case")]
@@ -512,9 +504,7 @@ pub async fn delete_project(
     config: &Config,
     project_identifier: &str,
 ) -> Result<()> {
-    let token = config
-        .get_token()
-        .ok_or_else(|| anyhow::anyhow!("Not logged in. Please run 'rise login' first."))?;
+    let token = crate::token_source::resolve_token_with_retry(http_client, config).await?;
 
     let url = format!("{}/api/v1/projects/{}", backend_url, project_identifier);
     let response = http_client

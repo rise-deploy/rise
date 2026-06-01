@@ -4,11 +4,12 @@ use comfy_table::{
 };
 use reqwest::Client;
 use serde::Deserialize;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-use crate::build::{self, BackendPlatformHint, BuildOptions, PlatformSource};
+use crate::build::{self, BackendPlatformHint, BuildOptions, BuildPushMode, PlatformSource};
 use crate::config::Config;
+use crate::token_source::token_with_retry;
 
 // Re-export models from API module (always available)
 pub use crate::api::models::{Deployment, DeploymentStatus};
@@ -177,9 +178,7 @@ pub async fn list_deployments(
     group: Option<&str>,
     limit: usize,
 ) -> Result<()> {
-    let token = config
-        .get_token()
-        .ok_or_else(|| anyhow::anyhow!("Not logged in. Please run 'rise login' first."))?;
+    let token = crate::token_source::resolve_token_with_retry(http_client, config).await?;
 
     if let Some(g) = group {
         info!(
@@ -354,6 +353,7 @@ pub async fn list_deployments(
 }
 
 /// Show deployment details and optionally follow until terminal state
+#[allow(clippy::too_many_arguments)]
 pub async fn show_deployment(
     http_client: &Client,
     backend_url: &str,
@@ -387,13 +387,10 @@ pub async fn show_deployment(
         Ok(())
     } else {
         // One-shot display (no follow)
-        let token = config
-            .token
-            .as_ref()
-            .context("Not logged in. Please run 'rise login' first.")?;
+        let token = crate::token_source::resolve_token_with_retry(http_client, config).await?;
 
         let deployment =
-            fetch_deployment(http_client, backend_url, token, project, deployment_id).await?;
+            fetch_deployment(http_client, backend_url, &token, project, deployment_id).await?;
 
         // Use the same UI as follow mode
         super::follow_ui::print_deployment_snapshot(&deployment);
@@ -429,9 +426,7 @@ pub async fn stop_deployments_by_group(
     project: &str,
     group: &str,
 ) -> Result<()> {
-    let token = config
-        .get_token()
-        .ok_or_else(|| anyhow::anyhow!("Not logged in. Please run 'rise login' first."))?;
+    let token = crate::token_source::resolve_token_with_retry(http_client, config).await?;
 
     info!(
         "Stopping deployments in group '{}' for project '{}'",
@@ -498,10 +493,90 @@ struct RegistryCredentials {
     registry_url: String,
     username: String,
     password: String,
-    #[allow(dead_code)]
+    /// Credential lifespan in seconds, used to decide when to re-mint between
+    /// containers in a multi-container build. Absent on backends that don't
+    /// advertise it (treated as unknown → re-mint to stay safe).
     expires_in: Option<u64>,
     #[serde(default)]
     auth_method: RegistryAuthMethod,
+}
+
+/// Default minimum remaining lifespan, in seconds, that registry credentials
+/// must have to be reused for another container's login + build + push without
+/// re-minting. Overridable via `RISE_REGISTRY_CRED_MIN_LIFETIME_SECS`.
+const REGISTRY_CRED_MIN_REMAINING_DEFAULT_SECS: u64 = 20 * 60;
+
+/// Resolve the minimum-remaining-lifespan threshold for reusing registry
+/// credentials, honouring the `RISE_REGISTRY_CRED_MIN_LIFETIME_SECS` override
+/// (a non-parseable or zero value falls back to the default).
+fn registry_cred_min_remaining() -> Duration {
+    let secs = std::env::var("RISE_REGISTRY_CRED_MIN_LIFETIME_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(REGISTRY_CRED_MIN_REMAINING_DEFAULT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Registry credentials plus the moment they were fetched, so the
+/// multi-container build loop can decide whether they're still safe to reuse
+/// for the next login + build + push instead of re-minting before every
+/// container.
+struct TimedRegistryCredentials {
+    creds: RegistryCredentials,
+    container_cli: String,
+    fetched_at: Instant,
+}
+
+impl TimedRegistryCredentials {
+    fn new(creds: RegistryCredentials, container_cli: impl Into<String>) -> Self {
+        Self {
+            creds,
+            container_cli: container_cli.into(),
+            fetched_at: Instant::now(),
+        }
+    }
+
+    /// Whether these credentials are still safe to reuse as-is (no re-mint).
+    ///
+    /// They are reused unless they're expiring soon, defined as EITHER:
+    ///   - at least 2/3 of the credential lifespan has elapsed, OR
+    ///   - fewer than `min_remaining` of lifespan is left.
+    ///
+    /// Two cases always reuse, because there is nothing better to re-mint:
+    ///   - "no remote credentials": the backend returned an empty username,
+    ///     meaning the registry is authenticated by credentials already present
+    ///     on the machine (OCI client-auth) — there is no short-lived token to
+    ///     refresh, so we never refetch.
+    ///
+    /// When the backend returns no `expires_in` (unknown lifespan) we re-mint to
+    /// stay safe, preserving the original short-lived-token fix (#352).
+    fn is_reusable(&self, container_cli: &str, min_remaining: Duration, now: Instant) -> bool {
+        if self.container_cli != container_cli {
+            return false;
+        }
+
+        // Local-machine auth: nothing to re-mint.
+        if self.creds.auth_method == RegistryAuthMethod::LoginCredentials
+            && self.creds.username.is_empty()
+        {
+            return true;
+        }
+
+        let lifespan = match self.creds.expires_in {
+            Some(secs) if secs > 0 => Duration::from_secs(secs),
+            // Unknown (or zero) lifespan: re-mint to be safe.
+            _ => return false,
+        };
+
+        let elapsed = now.saturating_duration_since(self.fetched_at);
+        // Crossed 2/3 of the lifespan?
+        if elapsed.saturating_mul(3) >= lifespan.saturating_mul(2) {
+            return false;
+        }
+        // Less than the minimum buffer left?
+        lifespan.saturating_sub(elapsed) >= min_remaining
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -558,11 +633,87 @@ fn log_platform_choice(platform: &str, source: PlatformSource, operation: &str) 
     }
 }
 
+/// Resolve a bearer token with the shared retry policy, logging and swallowing
+/// any final error. Use on best-effort paths — e.g. reporting a terminal
+/// "Failed" status — where token failure must not mask the original error.
+async fn try_token_or_log(provider: &crate::token_source::TokenProvider) -> Option<String> {
+    match token_with_retry(provider).await {
+        Ok(token) => Some(token),
+        Err(e) => {
+            warn!("Failed to resolve token after retries: {:?}", e);
+            None
+        }
+    }
+}
+
+/// Best-effort terminal "Failed" status report: resolve a token and update the
+/// deployment status, logging and swallowing any error so the caller can still
+/// surface the original build/push error instead of masking it.
+async fn report_failed_status(
+    http_client: &Client,
+    backend_url: &str,
+    provider: &crate::token_source::TokenProvider,
+    project_name: &str,
+    deployment_id: &str,
+    message: &str,
+) {
+    let Some(token) = try_token_or_log(provider).await else {
+        return;
+    };
+    if let Err(e) = update_deployment_status(
+        http_client,
+        backend_url,
+        &token,
+        project_name,
+        deployment_id,
+        "Failed",
+        Some(message),
+    )
+    .await
+    {
+        warn!("Failed to report terminal 'Failed' status: {:?}", e);
+    }
+}
+
+/// Fetch fresh deployment registry credentials, log in, and push an already
+/// local image. Used by `--separate-push` so short-lived registry credentials
+/// are minted immediately before the push rather than before a long build.
+async fn push_with_fresh_registry_credentials(
+    http_client: &Client,
+    backend_url: &str,
+    provider: &crate::token_source::TokenProvider,
+    container_cli: &str,
+    project_name: &str,
+    deployment_id: &str,
+    image_tag: &str,
+) -> Result<()> {
+    let registry_credentials = fetch_deployment_registry_credentials(
+        http_client,
+        backend_url,
+        provider,
+        project_name,
+        deployment_id,
+    )
+    .await?;
+    let token = token_with_retry(provider).await?;
+    login_to_registry(
+        http_client,
+        backend_url,
+        &token,
+        container_cli,
+        &registry_credentials,
+        project_name,
+        deployment_id,
+    )
+    .await?;
+    build::docker_push(container_cli, image_tag)
+}
+
 /// Fetch registry push credentials scoped to a specific deployment.
 async fn fetch_deployment_registry_credentials(
     http_client: &Client,
     backend_url: &str,
-    token: &str,
+    provider: &crate::token_source::TokenProvider,
     project_name: &str,
     deployment_id: &str,
 ) -> Result<RegistryCredentials> {
@@ -571,9 +722,13 @@ async fn fetch_deployment_registry_credentials(
         backend_url, project_name, deployment_id
     );
 
+    // Resolve a fresh token immediately before the request. In a long deploy the
+    // previously-minted token may be near or past expiry; the provider re-mints
+    // lazily before its freshness threshold. See #352.
+    let token = token_with_retry(provider).await?;
     let response = http_client
         .get(&url)
-        .bearer_auth(token)
+        .bearer_auth(&token)
         .send()
         .await
         .context("Failed to fetch registry credentials")?;
@@ -727,9 +882,13 @@ pub async fn create_deployment(
     }
 
     // Get authentication token
-    let token = config
-        .get_token()
-        .ok_or_else(|| anyhow::anyhow!("Not authenticated. Run 'rise login' first."))?;
+    // Resolve a token provider rather than a single fixed token: in CI the
+    // backend token may be a short-lived OIDC token, and a long build+push deploy
+    // can outlast it. The provider lazily re-mints/refreshes a fresh token before
+    // each request (see `token_source`). See issue #352.
+    let provider = crate::token_source::resolve_token_provider(http_client, config)?;
+    debug!("Authenticating to backend using {}", provider.describe());
+    let token = token_with_retry(&provider).await?;
 
     // Resolve job_url and pull_request_url: use explicit values, or auto-detect from CI environment
     let resolved_job_url = deploy_opts.job_url.clone().or_else(detect_ci_job_url);
@@ -806,18 +965,31 @@ pub async fn create_deployment(
     let deployment_id_clone = deployment_info.deployment_id.clone();
     let backend_url_clone = backend_url.to_string();
     let http_client_clone = http_client.clone();
-    let token_clone = token.to_string();
+    let provider_clone = provider.clone();
     let project_name_clone = deploy_opts.project_name.to_string();
 
     tokio::spawn(async move {
         if let Ok(()) = tokio::signal::ctrl_c().await {
             eprintln!("\n⚠️  Caught Ctrl+C, cancelling deployment...");
 
+            // Resolve a fresh token for the cancel request (the deploy may have
+            // run long enough that the original token expired). Use the shared
+            // retry policy for consistency with the rest of the deploy path. See #352.
+            let token = match token_with_retry(&provider_clone).await {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(
+                        "Failed to resolve token for deployment cancellation: {:?}",
+                        e
+                    );
+                    return;
+                }
+            };
             // Cancel the deployment
             if let Err(e) = cancel_deployment(
                 &http_client_clone,
                 &backend_url_clone,
-                &token_clone,
+                &token,
                 &project_name_clone,
                 &deployment_id_clone,
             )
@@ -846,27 +1018,6 @@ pub async fn create_deployment(
                 None => config.get_container_cli().command().to_string(),
             };
 
-            // Fetch deployment-scoped registry credentials
-            let registry_credentials = fetch_deployment_registry_credentials(
-                http_client,
-                backend_url,
-                &token,
-                deploy_opts.project_name,
-                &deployment_info.deployment_id,
-            )
-            .await?;
-
-            login_to_registry(
-                http_client,
-                backend_url,
-                &token,
-                &container_cli,
-                &registry_credentials,
-                deploy_opts.project_name,
-                &deployment_info.deployment_id,
-            )
-            .await?;
-
             // Pull the source image for the configured platform.
             let backend_platform =
                 fetch_backend_platform_hint(http_client, backend_url, &token).await?;
@@ -884,16 +1035,15 @@ pub async fn create_deployment(
             );
             log_platform_choice(&platform, source, "Pulling");
             if let Err(e) = build::docker_pull(&container_cli, source_image, &platform) {
-                update_deployment_status(
+                report_failed_status(
                     http_client,
                     backend_url,
-                    &token,
+                    &provider,
                     deploy_opts.project_name,
                     &deployment_info.deployment_id,
-                    "Failed",
-                    Some(&e.to_string()),
+                    &e.to_string(),
                 )
-                .await?;
+                .await;
                 return Err(e);
             }
 
@@ -901,20 +1051,20 @@ pub async fn create_deployment(
             if let Err(e) =
                 build::docker_tag(&container_cli, source_image, &deployment_info.image_tag)
             {
-                update_deployment_status(
+                report_failed_status(
                     http_client,
                     backend_url,
-                    &token,
+                    &provider,
                     deploy_opts.project_name,
                     &deployment_info.deployment_id,
-                    "Failed",
-                    Some(&e.to_string()),
+                    &e.to_string(),
                 )
-                .await?;
+                .await;
                 return Err(e);
             }
 
             // Update status to Building (reusing existing state for push phase)
+            let token = token_with_retry(&provider).await?;
             update_deployment_status(
                 http_client,
                 backend_url,
@@ -927,21 +1077,53 @@ pub async fn create_deployment(
             .await?;
 
             // Push to Rise registry
-            if let Err(e) = build::docker_push(&container_cli, &deployment_info.image_tag) {
-                update_deployment_status(
+            let push_result = if deploy_opts.build_args.separate_push {
+                push_with_fresh_registry_credentials(
+                    http_client,
+                    backend_url,
+                    &provider,
+                    &container_cli,
+                    deploy_opts.project_name,
+                    &deployment_info.deployment_id,
+                    &deployment_info.image_tag,
+                )
+                .await
+            } else {
+                let registry_credentials = fetch_deployment_registry_credentials(
+                    http_client,
+                    backend_url,
+                    &provider,
+                    deploy_opts.project_name,
+                    &deployment_info.deployment_id,
+                )
+                .await?;
+                login_to_registry(
                     http_client,
                     backend_url,
                     &token,
+                    &container_cli,
+                    &registry_credentials,
                     deploy_opts.project_name,
                     &deployment_info.deployment_id,
-                    "Failed",
-                    Some(&e.to_string()),
                 )
                 .await?;
+                build::docker_push(&container_cli, &deployment_info.image_tag)
+            };
+            if let Err(e) = push_result {
+                report_failed_status(
+                    http_client,
+                    backend_url,
+                    &provider,
+                    deploy_opts.project_name,
+                    &deployment_info.deployment_id,
+                    &e.to_string(),
+                )
+                .await;
                 return Err(e);
             }
 
             // Mark as pushed (controller will take over deployment)
+            let token = token_with_retry(&provider).await?;
             update_deployment_status(
                 http_client,
                 backend_url,
@@ -981,7 +1163,7 @@ pub async fn create_deployment(
         build_and_push_multi_container(
             http_client,
             backend_url,
-            &token,
+            &provider,
             config,
             &deploy_opts,
             &deployment_info,
@@ -993,15 +1175,6 @@ pub async fn create_deployment(
         // Fetch platform hint and credentials for the build-from-source path.
         let backend_platform =
             fetch_backend_platform_hint(http_client, backend_url, &token).await?;
-        let registry_credentials = fetch_deployment_registry_credentials(
-            http_client,
-            backend_url,
-            &token,
-            deploy_opts.project_name,
-            &deployment_info.deployment_id,
-        )
-        .await?;
-
         let options = BuildOptions::from_build_args(
             config,
             deployment_info.image_tag.clone(),
@@ -1012,18 +1185,30 @@ pub async fn create_deployment(
         );
         log_platform_choice(&options.platform, options.platform_source, "Building");
 
-        login_to_registry(
-            http_client,
-            backend_url,
-            &token,
-            options.container_cli.command(),
-            &registry_credentials,
-            deploy_opts.project_name,
-            &deployment_info.deployment_id,
-        )
-        .await?;
+        if !deploy_opts.build_args.separate_push {
+            let registry_credentials = fetch_deployment_registry_credentials(
+                http_client,
+                backend_url,
+                &provider,
+                deploy_opts.project_name,
+                &deployment_info.deployment_id,
+            )
+            .await?;
+            let token = token_with_retry(&provider).await?;
+            login_to_registry(
+                http_client,
+                backend_url,
+                &token,
+                options.container_cli.command(),
+                &registry_credentials,
+                deploy_opts.project_name,
+                &deployment_info.deployment_id,
+            )
+            .await?;
+        }
 
         // Step 3: Update status to 'building'
+        let token = token_with_retry(&provider).await?;
         update_deployment_status(
             http_client,
             backend_url,
@@ -1035,24 +1220,54 @@ pub async fn create_deployment(
         )
         .await?;
 
-        // Step 4: Build and push image using build module
-        let options = options.with_push(true);
+        // Step 4: Build image. In separate-push mode, the build phase only
+        // loads locally; the caller refreshes auth and pushes explicitly.
+        let options = options.with_push_mode(if deploy_opts.build_args.separate_push {
+            BuildPushMode::Deferred
+        } else {
+            BuildPushMode::Inline
+        });
+        let container_cli = options.container_cli.command().to_string();
 
         if let Err(e) = build::build_image(options) {
-            update_deployment_status(
+            report_failed_status(
                 http_client,
                 backend_url,
-                &token,
+                &provider,
                 deploy_opts.project_name,
                 &deployment_info.deployment_id,
-                "Failed",
-                Some(&e.to_string()),
+                &e.to_string(),
             )
-            .await?;
+            .await;
             return Err(e);
+        }
+        if deploy_opts.build_args.separate_push {
+            if let Err(e) = push_with_fresh_registry_credentials(
+                http_client,
+                backend_url,
+                &provider,
+                &container_cli,
+                deploy_opts.project_name,
+                &deployment_info.deployment_id,
+                &deployment_info.image_tag,
+            )
+            .await
+            {
+                report_failed_status(
+                    http_client,
+                    backend_url,
+                    &provider,
+                    deploy_opts.project_name,
+                    &deployment_info.deployment_id,
+                    &e.to_string(),
+                )
+                .await;
+                return Err(e);
+            }
         }
 
         // Step 5: Mark as pushed (controller will take over deployment)
+        let token = token_with_retry(&provider).await?;
         update_deployment_status(
             http_client,
             backend_url,
@@ -1093,14 +1308,16 @@ pub async fn create_deployment(
 /// backend already persisted the user-provided tag.
 ///
 /// Builds run sequentially in the iteration order of `[containers.<name>]`
-/// (BTreeMap → lexicographic). Registry credentials are re-minted per
-/// container before login + build + push, because a long multi-container
-/// build (cold BuildKit cache × N containers) can outlast the issued
-/// token's `expires_in` and cause later pushes to 401.
+/// (BTreeMap → lexicographic). Registry credentials are reused across
+/// containers and only re-minted (with a fresh login) when they're expiring
+/// soon — at least 2/3 of their lifespan elapsed, or under the minimum
+/// remaining buffer — so a long multi-container build (cold BuildKit cache × N
+/// containers) can't outlast the issued token's `expires_in` and 401 a later
+/// push, while still avoiding a needless mint + login before every container.
 async fn build_and_push_multi_container(
     http_client: &Client,
     backend_url: &str,
-    token: &str,
+    provider: &crate::token_source::TokenProvider,
     config: &Config,
     deploy_opts: &DeploymentOptions<'_>,
     deployment_info: &CreateDeploymentResponse,
@@ -1120,20 +1337,29 @@ async fn build_and_push_multi_container(
         .map_err(|e| anyhow::anyhow!(e))?;
 
     // Fetch the backend platform hint upfront — needed for every container's
-    // BuildOptions. Credentials are minted fresh per container below so a
-    // long multi-container build can't outlast a token's expires_in.
-    let backend_platform = fetch_backend_platform_hint(http_client, backend_url, token).await?;
+    // BuildOptions. Each request below resolves a fresh token from `provider`
+    // (re-minting within a 60s skew of expiry) so a long multi-container build
+    // can't outlast a short-lived CI token. See #352.
+    let token = token_with_retry(provider).await?;
+    let backend_platform = fetch_backend_platform_hint(http_client, backend_url, &token).await?;
 
     update_deployment_status(
         http_client,
         backend_url,
-        token,
+        &token,
         deploy_opts.project_name,
         &deployment_info.deployment_id,
         "Building",
         None,
     )
     .await?;
+
+    // Registry credentials are reused across containers and only re-minted when
+    // expiring soon (see `TimedRegistryCredentials::is_reusable`), so a long
+    // multi-container build can't outlast its token while we also avoid a
+    // needless mint + login before every container.
+    let min_remaining = registry_cred_min_remaining();
+    let mut cached_creds: Option<TimedRegistryCredentials> = None;
 
     for container in &resolved.containers {
         let Some(image_tag) = container_images.get(&container.name) else {
@@ -1166,52 +1392,99 @@ async fn build_and_push_multi_container(
             Some(per_container_toml),
             backend_platform.clone(),
         )
-        .with_push(true);
+        .with_push_mode(if deploy_opts.build_args.separate_push {
+            BuildPushMode::Deferred
+        } else {
+            BuildPushMode::Inline
+        });
+        let container_cli = options.container_cli.command().to_string();
 
-        // Re-mint per container — long builds can outlast the token's expires_in.
-        let fresh_creds = fetch_deployment_registry_credentials(
-            http_client,
-            backend_url,
-            token,
-            deploy_opts.project_name,
-            &deployment_info.deployment_id,
-        )
-        .await?;
-        login_to_registry(
-            http_client,
-            backend_url,
-            token,
-            options.container_cli.command(),
-            &fresh_creds,
-            deploy_opts.project_name,
-            &deployment_info.deployment_id,
-        )
-        .await?;
+        if !deploy_opts.build_args.separate_push {
+            // Re-mint registry credentials only when the previous container's are
+            // expiring soon (or none have been fetched yet). A long multi-container
+            // build (cold BuildKit cache × N containers) can outlast the issued
+            // token's `expires_in` and 401 a later push, but re-minting + logging in
+            // before every container is wasteful when the credentials are still
+            // good. When the backend returns no credentials (empty username) we rely
+            // on credentials already present on the machine and never refetch.
+            // See #352 and its follow-up.
+            let need_fresh = match &cached_creds {
+                Some(c) => !c.is_reusable(&container_cli, min_remaining, Instant::now()),
+                None => true,
+            };
+            if need_fresh {
+                let fresh_creds = fetch_deployment_registry_credentials(
+                    http_client,
+                    backend_url,
+                    provider,
+                    deploy_opts.project_name,
+                    &deployment_info.deployment_id,
+                )
+                .await?;
+                let token = token_with_retry(provider).await?;
+                login_to_registry(
+                    http_client,
+                    backend_url,
+                    &token,
+                    &container_cli,
+                    &fresh_creds,
+                    deploy_opts.project_name,
+                    &deployment_info.deployment_id,
+                )
+                .await?;
+                cached_creds = Some(TimedRegistryCredentials::new(fresh_creds, &container_cli));
+            }
+        }
 
         log_platform_choice(&options.platform, options.platform_source, "Building");
         info!("→ Building container '{}' as {}", container.name, image_tag);
 
         if let Err(e) = build::build_image(options) {
             let msg = format!("Build of container '{}' failed: {}", container.name, e);
-            update_deployment_status(
+            report_failed_status(
                 http_client,
                 backend_url,
-                token,
+                provider,
                 deploy_opts.project_name,
                 &deployment_info.deployment_id,
-                "Failed",
-                Some(&msg),
+                &msg,
             )
-            .await?;
+            .await;
             return Err(e);
+        }
+        if deploy_opts.build_args.separate_push {
+            if let Err(e) = push_with_fresh_registry_credentials(
+                http_client,
+                backend_url,
+                provider,
+                &container_cli,
+                deploy_opts.project_name,
+                &deployment_info.deployment_id,
+                image_tag,
+            )
+            .await
+            {
+                let msg = format!("Push of container '{}' failed: {}", container.name, e);
+                report_failed_status(
+                    http_client,
+                    backend_url,
+                    provider,
+                    deploy_opts.project_name,
+                    &deployment_info.deployment_id,
+                    &msg,
+                )
+                .await;
+                return Err(e);
+            }
         }
         info!("  ✓ Pushed container '{}'", container.name);
     }
 
+    let token = token_with_retry(provider).await?;
     update_deployment_status(
         http_client,
         backend_url,
-        token,
+        &token,
         deploy_opts.project_name,
         &deployment_info.deployment_id,
         "Pushed",
@@ -2256,7 +2529,82 @@ pub(super) async fn open_log_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_log_event, normalize_git_url, ByteLineBuffer};
+    use super::{extract_log_event, normalize_git_url, token_with_retry, ByteLineBuffer};
+    use crate::token_source::{TokenProvider, TokenSource, TokenSourceError};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    struct RetryThenSucceedTokenSource {
+        attempts: AtomicUsize,
+        succeed_on_attempt: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl TokenSource for RetryThenSucceedTokenSource {
+        async fn token(&self) -> anyhow::Result<String> {
+            self.next()
+        }
+
+        fn describe(&self) -> &'static str {
+            "test retry source"
+        }
+    }
+
+    impl RetryThenSucceedTokenSource {
+        fn next(&self) -> anyhow::Result<String> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt >= self.succeed_on_attempt {
+                Ok(format!("token-{attempt}"))
+            } else {
+                Err(anyhow::anyhow!("temporary token mint failure"))
+            }
+        }
+    }
+
+    struct NonRetryableTokenSource {
+        attempts: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl TokenSource for NonRetryableTokenSource {
+        async fn token(&self) -> anyhow::Result<String> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            Err(TokenSourceError::NonRetryable("bad token config".to_string()).into())
+        }
+
+        fn describe(&self) -> &'static str {
+            "test non-retryable source"
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn token_with_retry_allows_initial_attempt_plus_three_retries() {
+        let source = Arc::new(RetryThenSucceedTokenSource {
+            attempts: AtomicUsize::new(0),
+            succeed_on_attempt: 4,
+        });
+        let provider: TokenProvider = source.clone();
+
+        let token = token_with_retry(&provider).await.unwrap();
+
+        assert_eq!(token, "token-4");
+        assert_eq!(source.attempts.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn token_with_retry_stops_on_non_retryable_error() {
+        let source = Arc::new(NonRetryableTokenSource {
+            attempts: AtomicUsize::new(0),
+        });
+        let provider: TokenProvider = source.clone();
+
+        let err = token_with_retry(&provider).await.unwrap_err();
+
+        assert!(crate::token_source::is_non_retryable_token_error(&err));
+        assert_eq!(source.attempts.load(Ordering::SeqCst), 1);
+    }
 
     /// Feeding a non-ASCII line one byte at a time — i.e. splitting *every*
     /// multi-byte codepoint mid-character — must still round-trip the line
@@ -2408,5 +2756,86 @@ mod tests {
         assert_eq!(normalize_git_url(""), None);
         assert_eq!(normalize_git_url("not-a-url"), None);
         assert_eq!(normalize_git_url("/local/path/repo"), None);
+    }
+
+    mod registry_credential_reuse {
+        use super::super::{RegistryAuthMethod, RegistryCredentials, TimedRegistryCredentials};
+        use std::time::Duration;
+
+        fn timed(
+            username: &str,
+            expires_in: Option<u64>,
+            auth_method: RegistryAuthMethod,
+        ) -> TimedRegistryCredentials {
+            TimedRegistryCredentials::new(
+                RegistryCredentials {
+                    registry_url: "registry.example.com/app".to_string(),
+                    username: username.to_string(),
+                    password: "secret".to_string(),
+                    expires_in,
+                    auth_method,
+                },
+                "docker",
+            )
+        }
+
+        #[test]
+        fn reuses_local_machine_credentials_even_without_expiry() {
+            // Empty username under LoginCredentials = OCI client-auth: nothing
+            // to re-mint, so always reuse regardless of expiry/elapsed.
+            let creds = timed("", None, RegistryAuthMethod::LoginCredentials);
+            let now = creds.fetched_at + Duration::from_secs(86_400);
+            assert!(creds.is_reusable("docker", Duration::from_secs(20 * 60), now));
+        }
+
+        #[test]
+        fn remints_when_lifespan_unknown() {
+            // Real username but no expires_in → unknown lifespan → re-mint.
+            let creds = timed("u", None, RegistryAuthMethod::LoginCredentials);
+            assert!(!creds.is_reusable("docker", Duration::from_secs(60), creds.fetched_at));
+        }
+
+        #[test]
+        fn reuses_fresh_long_lived_credentials() {
+            let creds = timed("u", Some(3600), RegistryAuthMethod::LoginCredentials);
+            let now = creds.fetched_at + Duration::from_secs(10);
+            assert!(creds.is_reusable("docker", Duration::from_secs(20 * 60), now));
+        }
+
+        #[test]
+        fn remints_when_container_cli_changes() {
+            let creds = timed("u", Some(3600), RegistryAuthMethod::LoginCredentials);
+            let now = creds.fetched_at + Duration::from_secs(10);
+            assert!(!creds.is_reusable("podman", Duration::from_secs(20 * 60), now));
+        }
+
+        #[test]
+        fn remints_after_two_thirds_of_lifespan() {
+            // 2400s of a 3600s lifespan = exactly 2/3 elapsed → re-mint, even
+            // though 1200s remain against a small buffer.
+            let creds = timed("u", Some(3600), RegistryAuthMethod::LoginCredentials);
+            let now = creds.fetched_at + Duration::from_secs(2400);
+            assert!(!creds.is_reusable("docker", Duration::from_secs(60), now));
+        }
+
+        #[test]
+        fn remints_when_under_minimum_remaining() {
+            // 30min lifespan, 700s elapsed: well under 2/3 (1200s), but only
+            // 1100s remain against a 1200s (20min) buffer → re-mint.
+            let creds = timed("u", Some(1800), RegistryAuthMethod::LoginCredentials);
+            let now = creds.fetched_at + Duration::from_secs(700);
+            assert!(!creds.is_reusable("docker", Duration::from_secs(20 * 60), now));
+        }
+
+        #[test]
+        fn registry_token_with_empty_username_still_honours_expiry() {
+            // The empty-username shortcut only applies to LoginCredentials; a
+            // RegistryToken carries its secret in `password`, so expiry governs.
+            let creds = timed("", Some(3600), RegistryAuthMethod::RegistryToken);
+            let fresh = creds.fetched_at + Duration::from_secs(10);
+            assert!(creds.is_reusable("docker", Duration::from_secs(20 * 60), fresh));
+            let stale = creds.fetched_at + Duration::from_secs(3000);
+            assert!(!creds.is_reusable("docker", Duration::from_secs(20 * 60), stale));
+        }
     }
 }

@@ -28,6 +28,8 @@ Rise supports multiple build backends for creating container images from your ap
 "Partial" means some CLI frontends (e.g., Podman buildx) don't support the `--push` flag. Rise detects this and falls back to building with `--load` followed by a separate push step. Either way, images always get pushed when deploying — this only affects the internal mechanism.
 :::
 
+Use `--separate-push` to force the fallback mechanism even when native push is available. This builds/loads the image locally first and pushes it in a separate step, which is useful for long CI builds where short-lived registry credentials should be refreshed immediately before pushing.
+
 ## Auto-Detection
 
 When `--backend` is not specified, Rise detects the build method automatically:

@@ -58,6 +58,7 @@ cli = [
     "dep:url",
     "dep:webbrowser",
     "dep:serde_ignored",
+    "dep:async-trait",
 ]
 backend = [
     # Server core (former "server" feature)
@@ -117,7 +118,7 @@ rand = "0.10.0"
 reqwest = { version = "0.13.0", features = ["json", "stream", "form"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { version = "1.48.0", features = ["full"] }
+tokio = { version = "1.48.0", features = ["full", "test-util"] }
 tracing = "0.1.43"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 uuid = { workspace = true }

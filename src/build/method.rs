@@ -84,6 +84,11 @@ pub struct BuildArgs {
     /// `rise deploy`) or the host architecture.
     #[arg(long)]
     pub platform: Option<String>,
+
+    /// Build/load the image locally first, then push in a separate step.
+    /// Useful when registry credentials may expire during long builds.
+    #[arg(long)]
+    pub separate_push: bool,
 }
 
 /// Options for building container images
@@ -102,7 +107,7 @@ pub(crate) struct BuildOptions {
     /// Some(true) = explicitly enable managed buildkit
     /// Some(false) = explicitly disable managed buildkit
     pub managed_buildkit: Option<bool>,
-    pub push: bool,
+    pub push_mode: BuildPushMode,
     /// Path to Dockerfile (relative to app_path / rise.toml location)
     pub dockerfile: Option<String>,
     /// Default build context (relative to app_path / rise.toml location)
@@ -120,6 +125,18 @@ pub(crate) struct BuildOptions {
     /// Where `platform` was sourced from (CLI / env / rise.toml / backend / host).
     /// Lets callers report or react to the precedence level that won.
     pub platform_source: crate::build::PlatformSource,
+}
+
+/// How the build backend should handle image push output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BuildPushMode {
+    /// Build/load the image locally and do not push.
+    Disabled,
+    /// Let the build backend push as part of the build when supported, with a
+    /// backend-owned fallback push after local load where needed.
+    Inline,
+    /// Build/load the image locally so the caller can explicitly push later.
+    Deferred,
 }
 
 impl BuildOptions {
@@ -275,14 +292,23 @@ impl BuildOptions {
 
             platform,
             platform_source,
-
-            push: false,
+            push_mode: BuildPushMode::Disabled,
         }
     }
 
-    /// Builder method to set push flag
+    /// Builder method to set inline push flag.
     pub(crate) fn with_push(mut self, push: bool) -> Self {
-        self.push = push;
+        self.push_mode = if push {
+            BuildPushMode::Inline
+        } else {
+            BuildPushMode::Disabled
+        };
+        self
+    }
+
+    /// Builder method to set explicit push mode.
+    pub(crate) fn with_push_mode(mut self, push_mode: BuildPushMode) -> Self {
+        self.push_mode = push_mode;
         self
     }
 }
