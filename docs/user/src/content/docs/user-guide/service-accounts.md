@@ -60,12 +60,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Get OIDC token
-        run: |
-          TOKEN=$(curl -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-                       "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=rise-project-my-app" | jq -r .value)
-          echo "RISE_TOKEN=$TOKEN" >> $GITHUB_ENV
       - name: Deploy
+        env:
+          # The CLI auto-detects GitHub Actions and mints an OIDC token on demand,
+          # re-minting as needed so long builds can't outlast its ~5 min lifetime.
+          # Set the audience the service account expects (`--claim aud=...`).
+          RISE_GHA_AUDIENCE: rise-project-my-app
         run: rise deploy --image ghcr.io/myorg/my-app:$GITHUB_SHA
 ```
 

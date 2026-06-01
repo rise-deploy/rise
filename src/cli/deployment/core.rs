@@ -633,6 +633,22 @@ fn log_platform_choice(platform: &str, source: PlatformSource, operation: &str) 
     }
 }
 
+/// Resolve a bearer token, logging and swallowing any error instead of
+/// propagating it. Returns `None` when no token could be minted.
+///
+/// Use on best-effort paths — e.g. reporting a terminal "Failed" status — where
+/// a token-resolution error must not mask the original error the caller is about
+/// to return.
+async fn try_token_or_log(provider: &crate::token_source::TokenProvider) -> Option<String> {
+    match provider.token().await {
+        Ok(token) => Some(token),
+        Err(e) => {
+            warn!("Failed to resolve token: {:?}", e);
+            None
+        }
+    }
+}
+
 /// Fetch registry push credentials scoped to a specific deployment.
 async fn fetch_deployment_registry_credentials(
     http_client: &Client,
@@ -991,17 +1007,18 @@ pub async fn create_deployment(
             );
             log_platform_choice(&platform, source, "Pulling");
             if let Err(e) = build::docker_pull(&container_cli, source_image, &platform) {
-                let token = provider.token().await?;
-                update_deployment_status(
-                    http_client,
-                    backend_url,
-                    &token,
-                    deploy_opts.project_name,
-                    &deployment_info.deployment_id,
-                    "Failed",
-                    Some(&e.to_string()),
-                )
-                .await?;
+                if let Some(token) = try_token_or_log(&provider).await {
+                    update_deployment_status(
+                        http_client,
+                        backend_url,
+                        &token,
+                        deploy_opts.project_name,
+                        &deployment_info.deployment_id,
+                        "Failed",
+                        Some(&e.to_string()),
+                    )
+                    .await?;
+                }
                 return Err(e);
             }
 
@@ -1009,17 +1026,18 @@ pub async fn create_deployment(
             if let Err(e) =
                 build::docker_tag(&container_cli, source_image, &deployment_info.image_tag)
             {
-                let token = provider.token().await?;
-                update_deployment_status(
-                    http_client,
-                    backend_url,
-                    &token,
-                    deploy_opts.project_name,
-                    &deployment_info.deployment_id,
-                    "Failed",
-                    Some(&e.to_string()),
-                )
-                .await?;
+                if let Some(token) = try_token_or_log(&provider).await {
+                    update_deployment_status(
+                        http_client,
+                        backend_url,
+                        &token,
+                        deploy_opts.project_name,
+                        &deployment_info.deployment_id,
+                        "Failed",
+                        Some(&e.to_string()),
+                    )
+                    .await?;
+                }
                 return Err(e);
             }
 
@@ -1038,17 +1056,18 @@ pub async fn create_deployment(
 
             // Push to Rise registry
             if let Err(e) = build::docker_push(&container_cli, &deployment_info.image_tag) {
-                let token = provider.token().await?;
-                update_deployment_status(
-                    http_client,
-                    backend_url,
-                    &token,
-                    deploy_opts.project_name,
-                    &deployment_info.deployment_id,
-                    "Failed",
-                    Some(&e.to_string()),
-                )
-                .await?;
+                if let Some(token) = try_token_or_log(&provider).await {
+                    update_deployment_status(
+                        http_client,
+                        backend_url,
+                        &token,
+                        deploy_opts.project_name,
+                        &deployment_info.deployment_id,
+                        "Failed",
+                        Some(&e.to_string()),
+                    )
+                    .await?;
+                }
                 return Err(e);
             }
 
@@ -1152,17 +1171,18 @@ pub async fn create_deployment(
         let options = options.with_push(true);
 
         if let Err(e) = build::build_image(options) {
-            let token = provider.token().await?;
-            update_deployment_status(
-                http_client,
-                backend_url,
-                &token,
-                deploy_opts.project_name,
-                &deployment_info.deployment_id,
-                "Failed",
-                Some(&e.to_string()),
-            )
-            .await?;
+            if let Some(token) = try_token_or_log(&provider).await {
+                update_deployment_status(
+                    http_client,
+                    backend_url,
+                    &token,
+                    deploy_opts.project_name,
+                    &deployment_info.deployment_id,
+                    "Failed",
+                    Some(&e.to_string()),
+                )
+                .await?;
+            }
             return Err(e);
         }
 
@@ -1334,17 +1354,18 @@ async fn build_and_push_multi_container(
 
         if let Err(e) = build::build_image(options) {
             let msg = format!("Build of container '{}' failed: {}", container.name, e);
-            let token = provider.token().await?;
-            update_deployment_status(
-                http_client,
-                backend_url,
-                &token,
-                deploy_opts.project_name,
-                &deployment_info.deployment_id,
-                "Failed",
-                Some(&msg),
-            )
-            .await?;
+            if let Some(token) = try_token_or_log(provider).await {
+                update_deployment_status(
+                    http_client,
+                    backend_url,
+                    &token,
+                    deploy_opts.project_name,
+                    &deployment_info.deployment_id,
+                    "Failed",
+                    Some(&msg),
+                )
+                .await?;
+            }
             return Err(e);
         }
         info!("  ✓ Pushed container '{}'", container.name);
