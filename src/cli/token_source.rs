@@ -219,7 +219,8 @@ impl CommandToken {
         if cached.exp.is_some() {
             return cached.is_fresh(now_ts);
         }
-        // Opaque output: use wall-clock TTL.
+        // Opaque output: use wall-clock TTL. This assumes the external command
+        // returns tokens that are valid for at least the configured TTL.
         minted_at.elapsed() < self.ttl
     }
 

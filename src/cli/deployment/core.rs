@@ -991,6 +991,7 @@ pub async fn create_deployment(
             );
             log_platform_choice(&platform, source, "Pulling");
             if let Err(e) = build::docker_pull(&container_cli, source_image, &platform) {
+                let token = provider.token().await?;
                 update_deployment_status(
                     http_client,
                     backend_url,
@@ -1008,6 +1009,7 @@ pub async fn create_deployment(
             if let Err(e) =
                 build::docker_tag(&container_cli, source_image, &deployment_info.image_tag)
             {
+                let token = provider.token().await?;
                 update_deployment_status(
                     http_client,
                     backend_url,
@@ -1022,6 +1024,7 @@ pub async fn create_deployment(
             }
 
             // Update status to Building (reusing existing state for push phase)
+            let token = provider.token().await?;
             update_deployment_status(
                 http_client,
                 backend_url,
@@ -1035,6 +1038,7 @@ pub async fn create_deployment(
 
             // Push to Rise registry
             if let Err(e) = build::docker_push(&container_cli, &deployment_info.image_tag) {
+                let token = provider.token().await?;
                 update_deployment_status(
                     http_client,
                     backend_url,
@@ -1049,6 +1053,7 @@ pub async fn create_deployment(
             }
 
             // Mark as pushed (controller will take over deployment)
+            let token = provider.token().await?;
             update_deployment_status(
                 http_client,
                 backend_url,
@@ -1131,6 +1136,7 @@ pub async fn create_deployment(
         .await?;
 
         // Step 3: Update status to 'building'
+        let token = provider.token().await?;
         update_deployment_status(
             http_client,
             backend_url,
@@ -1146,6 +1152,7 @@ pub async fn create_deployment(
         let options = options.with_push(true);
 
         if let Err(e) = build::build_image(options) {
+            let token = provider.token().await?;
             update_deployment_status(
                 http_client,
                 backend_url,
@@ -1160,6 +1167,7 @@ pub async fn create_deployment(
         }
 
         // Step 5: Mark as pushed (controller will take over deployment)
+        let token = provider.token().await?;
         update_deployment_status(
             http_client,
             backend_url,
