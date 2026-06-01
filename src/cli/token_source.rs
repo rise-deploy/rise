@@ -8,10 +8,11 @@
 //! each request. Implementations cache the minted token and re-mint lazily
 //! before it nears expiry.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use std::error::Error;
 use std::fmt;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -46,6 +47,7 @@ pub type TokenProvider = Arc<dyn TokenSource>;
 pub enum TokenSourceError {
     Retryable(String),
     NonRetryable(String),
+    NoSource(String),
 }
 
 impl TokenSourceError {
@@ -60,12 +62,18 @@ impl TokenSourceError {
     pub fn is_non_retryable(&self) -> bool {
         matches!(self, Self::NonRetryable(_))
     }
+
+    pub fn is_no_source(&self) -> bool {
+        matches!(self, Self::NoSource(_))
+    }
 }
 
 impl fmt::Display for TokenSourceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Retryable(message) | Self::NonRetryable(message) => f.write_str(message),
+            Self::Retryable(message) | Self::NonRetryable(message) | Self::NoSource(message) => {
+                f.write_str(message)
+            }
         }
     }
 }
@@ -77,6 +85,13 @@ pub fn is_non_retryable_token_error(error: &anyhow::Error) -> bool {
         .chain()
         .find_map(|cause| cause.downcast_ref::<TokenSourceError>())
         .is_some_and(TokenSourceError::is_non_retryable)
+}
+
+pub fn is_no_token_source_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<TokenSourceError>())
+        .is_some_and(TokenSourceError::is_no_source)
 }
 
 /// Number of retry attempts after the initial token resolution attempt.
@@ -281,6 +296,9 @@ impl TokenSource for GithubActionsOidc {
 /// Default TTL for opaque (non-JWT) tokens produced by `RISE_TOKEN_COMMAND`.
 /// Overridable via `RISE_TOKEN_COMMAND_TTL` (seconds).
 const COMMAND_TOKEN_TTL_DEFAULT_SECS: u64 = 10 * 60;
+/// Default maximum runtime for `RISE_TOKEN_COMMAND`.
+/// Overridable via `RISE_TOKEN_COMMAND_TIMEOUT` (seconds).
+const COMMAND_TOKEN_TIMEOUT_DEFAULT_SECS: u64 = 10;
 
 /// Runs a user-supplied shell command and uses its trimmed stdout as the
 /// bearer token. Generic escape hatch for any CI / identity system.
@@ -291,14 +309,16 @@ const COMMAND_TOKEN_TTL_DEFAULT_SECS: u64 = 10 * 60;
 pub struct CommandToken {
     command: String,
     ttl: Duration,
+    timeout: Duration,
     cache: Mutex<Option<CachedToken>>,
 }
 
 impl CommandToken {
-    pub fn new(command: String, ttl: Duration) -> Self {
+    pub fn new(command: String, ttl: Duration, timeout: Duration) -> Self {
         Self {
             command,
             ttl,
+            timeout,
             cache: Mutex::new(None),
         }
     }
@@ -318,16 +338,26 @@ impl CommandToken {
     }
 
     async fn run(&self) -> Result<CachedToken> {
-        let command = self.command.clone();
-        let output = tokio::task::spawn_blocking(move || {
-            std::process::Command::new("sh")
-                .arg("-c")
-                .arg(&command)
-                .output()
-        })
-        .await
-        .context("Failed to spawn RISE_TOKEN_COMMAND")?
-        .context("Failed to run RISE_TOKEN_COMMAND")?;
+        let child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&self.command)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("Failed to spawn RISE_TOKEN_COMMAND")?;
+
+        let output = match tokio::time::timeout(self.timeout, child.wait_with_output()).await {
+            Ok(output) => output.context("Failed to run RISE_TOKEN_COMMAND")?,
+            Err(_) => {
+                return Err(TokenSourceError::retryable(format!(
+                    "RISE_TOKEN_COMMAND timed out after {} seconds",
+                    self.timeout.as_secs()
+                ))
+                .into());
+            }
+        };
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(TokenSourceError::retryable(format!(
@@ -381,6 +411,8 @@ pub struct ProviderInputs {
     /// How long to cache an opaque (non-JWT) token from `RISE_TOKEN_COMMAND`
     /// before re-running the command. JWT tokens use their `exp` claim instead.
     pub rise_token_command_ttl: Duration,
+    /// Maximum runtime for `RISE_TOKEN_COMMAND`.
+    pub rise_token_command_timeout: Duration,
     pub gha_request_url: Option<String>,
     pub gha_request_token: Option<String>,
     pub audience: Option<String>,
@@ -403,6 +435,7 @@ pub fn select_token_provider(
         return Ok(Arc::new(CommandToken::new(
             cmd,
             inputs.rise_token_command_ttl,
+            inputs.rise_token_command_timeout,
         )));
     }
     // 3. GitHub Actions OIDC auto-detection.
@@ -429,7 +462,7 @@ pub fn select_token_provider(
         return Ok(Arc::new(StaticToken::new(token)));
     }
     // 5. Nothing.
-    bail!("Not authenticated. Run 'rise login' first.")
+    Err(TokenSourceError::NoSource("Not authenticated. Run 'rise login' first.".to_string()).into())
 }
 
 /// Read real env + config and build the token provider.
@@ -439,10 +472,16 @@ pub fn resolve_token_provider(http: &reqwest::Client, config: &Config) -> Result
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|&v| v > 0)
         .unwrap_or(COMMAND_TOKEN_TTL_DEFAULT_SECS);
+    let command_timeout_secs = std::env::var("RISE_TOKEN_COMMAND_TIMEOUT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(COMMAND_TOKEN_TIMEOUT_DEFAULT_SECS);
     let inputs = ProviderInputs {
         rise_token: std::env::var("RISE_TOKEN").ok(),
         rise_token_command: std::env::var("RISE_TOKEN_COMMAND").ok(),
         rise_token_command_ttl: Duration::from_secs(command_ttl_secs),
+        rise_token_command_timeout: Duration::from_secs(command_timeout_secs),
         gha_request_url: std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL").ok(),
         gha_request_token: std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN").ok(),
         audience: std::env::var("RISE_GHA_AUDIENCE").ok(),
@@ -473,6 +512,7 @@ mod tests {
             rise_token: None,
             rise_token_command: None,
             rise_token_command_ttl: Duration::from_secs(COMMAND_TOKEN_TTL_DEFAULT_SECS),
+            rise_token_command_timeout: Duration::from_secs(COMMAND_TOKEN_TIMEOUT_DEFAULT_SECS),
             gha_request_url: None,
             gha_request_token: None,
             audience: None,
@@ -598,13 +638,22 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("Not authenticated"));
+        let err = match select_token_provider(&client(), base_inputs()) {
+            Ok(_) => panic!("expected an error when no token source is available"),
+            Err(e) => e,
+        };
+        assert!(is_no_token_source_error(&err));
     }
 
     mod command_token_ttl {
         use super::*;
 
         fn opaque_command_token(ttl: Duration) -> CommandToken {
-            CommandToken::new("echo opaque-key".to_string(), ttl)
+            CommandToken::new(
+                "echo opaque-key".to_string(),
+                ttl,
+                Duration::from_secs(COMMAND_TOKEN_TIMEOUT_DEFAULT_SECS),
+            )
         }
 
         #[test]
@@ -642,6 +691,19 @@ mod tests {
             let exp = Utc::now().timestamp() + EXPIRY_SKEW_SECONDS - 10; // within skew window
             let cached = CachedToken::new(jwt_with_exp(exp));
             assert!(!ct.is_cached_fresh(&cached, Utc::now().timestamp()));
+        }
+
+        #[tokio::test]
+        async fn command_times_out() {
+            let ct = CommandToken::new(
+                "sleep 5; echo never".to_string(),
+                Duration::from_secs(600),
+                Duration::from_millis(50),
+            );
+
+            let err = ct.token().await.unwrap_err().to_string();
+
+            assert!(err.contains("RISE_TOKEN_COMMAND timed out"));
         }
     }
 }

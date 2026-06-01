@@ -46,6 +46,7 @@ rise project show
 | `RISE_TOKEN` | Authentication token (skips interactive login) |
 | `RISE_TOKEN_COMMAND` | Shell command whose stdout is used as the bearer token. JWT output uses the embedded `exp` claim; opaque output uses `RISE_TOKEN_COMMAND_TTL` as its assumed lifetime. |
 | `RISE_TOKEN_COMMAND_TTL` | Assumed lifetime (seconds) for opaque tokens produced by `RISE_TOKEN_COMMAND`. The command is re-run after two thirds of this TTL has elapsed. JWT tokens ignore this setting and use their `exp` claim instead. Default: `600` (10 minutes). |
+| `RISE_TOKEN_COMMAND_TIMEOUT` | Maximum runtime (seconds) for `RISE_TOKEN_COMMAND` before the CLI kills it and treats the attempt as failed. Default: `10`. |
 | `RISE_GHA_AUDIENCE` | Audience for GitHub Actions OIDC token minting (auto-detected from `ACTIONS_ID_TOKEN_REQUEST_URL`). Recommended value: the Rise server URL. |
 | `RISE_CONTAINER_CLI` | Container CLI: `docker` or `podman` |
 | `RISE_MANAGED_BUILDKIT` | Enable managed BuildKit daemon (`true`/`false`) |
@@ -75,6 +76,7 @@ For token sources that can mint new tokens, the CLI refreshes proactively so lon
 - GitHub Actions OIDC: the minted token is a JWT, so it follows the JWT policy above. For a typical ~5 minute GitHub Actions ID token, the CLI refreshes after roughly 3 minutes 20 seconds.
 - `RISE_TOKEN_COMMAND` returning a JWT: the JWT `exp` policy wins; `RISE_TOKEN_COMMAND_TTL` is ignored.
 - `RISE_TOKEN_COMMAND` returning an opaque token: the CLI treats `RISE_TOKEN_COMMAND_TTL` as the token lifetime and re-runs the command after two thirds of that TTL has elapsed.
+- `RISE_TOKEN_COMMAND` must complete within `RISE_TOKEN_COMMAND_TIMEOUT` seconds on each attempt.
 - `RISE_TOKEN` and stored login tokens: these are treated as static values by the CLI and are not re-minted.
 
 ## Global Configuration

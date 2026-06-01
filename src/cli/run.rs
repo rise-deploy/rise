@@ -9,6 +9,14 @@ use crate::build::{self, BuildOptions};
 use crate::cli::env;
 use crate::config::Config;
 
+fn optional_project_env_token(token_result: anyhow::Result<String>) -> Result<Option<String>> {
+    match token_result {
+        Ok(token) => Ok(Some(token)),
+        Err(e) if crate::token_source::is_no_token_source_error(&e) => Ok(None),
+        Err(e) => Err(e).context("Failed to resolve token for project environment variables"),
+    }
+}
+
 /// Options for running a container locally
 pub struct RunOptions<'a> {
     pub project_name: Option<&'a str>,
@@ -102,62 +110,67 @@ pub async fn run_locally(
     let mut port_from_preview = false;
     if options.use_project_env {
         if let Some(project_name) = &project_name {
-            if let Ok(token) =
-                crate::token_source::resolve_token_with_retry(http_client, config).await
-            {
-                match env::fetch_preview_env_vars(
-                    http_client,
-                    &backend_url,
-                    &token,
-                    project_name,
-                    "default",
-                    options.environment,
-                )
-                .await
-                {
-                    Ok((loadable_vars, protected_keys)) => {
-                        if !loadable_vars.is_empty() {
-                            info!(
-                                "Loading {} environment variable{} from project '{}'",
-                                loadable_vars.len(),
-                                if loadable_vars.len() == 1 { "" } else { "s" },
-                                project_name
-                            );
-                            for (key, value) in &loadable_vars {
-                                // Skip PORT from preview — CLI --http-port flag takes precedence
-                                if key == "PORT" {
-                                    port_from_preview = true;
-                                    continue;
+            match optional_project_env_token(
+                crate::token_source::resolve_token_with_retry(http_client, config).await,
+            )? {
+                Some(token) => {
+                    match env::fetch_preview_env_vars(
+                        http_client,
+                        &backend_url,
+                        &token,
+                        project_name,
+                        "default",
+                        options.environment,
+                    )
+                    .await
+                    {
+                        Ok((loadable_vars, protected_keys)) => {
+                            if !loadable_vars.is_empty() {
+                                info!(
+                                    "Loading {} environment variable{} from project '{}'",
+                                    loadable_vars.len(),
+                                    if loadable_vars.len() == 1 { "" } else { "s" },
+                                    project_name
+                                );
+                                for (key, value) in &loadable_vars {
+                                    // Skip PORT from preview — CLI --http-port flag takes precedence
+                                    if key == "PORT" {
+                                        port_from_preview = true;
+                                        continue;
+                                    }
+                                    cmd.arg("-e").arg(format!("{}={}", key, value));
                                 }
-                                cmd.arg("-e").arg(format!("{}={}", key, value));
                             }
-                        }
 
-                        // Warn about protected secret variables that cannot be loaded
-                        if !protected_keys.is_empty() {
-                            warn!(
-                                "Project '{}' has {} protected secret{} that cannot be loaded locally:",
-                                project_name,
-                                protected_keys.len(),
-                                if protected_keys.len() == 1 { "" } else { "s" }
-                            );
-                            for key in &protected_keys {
-                                warn!("  - {}", key);
+                            // Warn about protected secret variables that cannot be loaded
+                            if !protected_keys.is_empty() {
+                                warn!(
+                                    "Project '{}' has {} protected secret{} that cannot be loaded locally:",
+                                    project_name,
+                                    protected_keys.len(),
+                                    if protected_keys.len() == 1 { "" } else { "s" }
+                                );
+                                for key in &protected_keys {
+                                    warn!("  - {}", key);
+                                }
+                                warn!(
+                                    "These secrets are provisioned automatically during deployment"
+                                );
                             }
-                            warn!("These secrets are provisioned automatically during deployment");
                         }
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to fetch environment variables from project '{}': {}",
-                            project_name, e
-                        );
-                        warn!("Continuing without project environment variables");
+                        Err(e) => {
+                            warn!(
+                                "Failed to fetch environment variables from project '{}': {}",
+                                project_name, e
+                            );
+                            warn!("Continuing without project environment variables");
+                        }
                     }
                 }
-            } else {
-                warn!("No usable token source - cannot load project environment variables");
-                warn!("Run 'rise login' or configure a CI token source to authenticate");
+                None => {
+                    warn!("No usable token source - cannot load project environment variables");
+                    warn!("Run 'rise login' or configure a CI token source to authenticate");
+                }
             }
         }
     }
@@ -211,4 +224,33 @@ pub async fn run_locally(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::optional_project_env_token;
+    use crate::token_source::TokenSourceError;
+
+    #[test]
+    fn project_env_token_continues_when_no_token_source_exists() {
+        let result = optional_project_env_token(Err(TokenSourceError::NoSource(
+            "Not authenticated".to_string(),
+        )
+        .into()))
+        .unwrap();
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn project_env_token_errors_when_configured_token_source_fails() {
+        let err = optional_project_env_token(Err(TokenSourceError::NonRetryable(
+            "bad token config".to_string(),
+        )
+        .into()))
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("Failed to resolve token for project environment variables"));
+    }
 }

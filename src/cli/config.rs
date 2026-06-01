@@ -224,6 +224,7 @@ impl Config {
 
     /// Get the authentication token
     /// Checks RISE_TOKEN environment variable first, then falls back to config file
+    #[allow(dead_code)]
     pub fn get_token(&self) -> Option<String> {
         #[cfg(not(test))]
         if let Ok(token) = std::env::var("RISE_TOKEN") {
