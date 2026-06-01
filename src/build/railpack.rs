@@ -11,6 +11,7 @@ use super::buildkit::ensure_buildx_builder;
 use super::proxy;
 use super::registry::docker_push;
 use super::ssl::embed_ssl_cert_in_plan;
+use super::BuildPushMode;
 
 /// BuildKit frontend type for buildctl
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -28,8 +29,7 @@ pub(crate) struct RailpackBuildOptions<'a> {
     pub container_cli: &'a str,
     pub buildx_supports_push: bool,
     pub use_buildctl: bool,
-    pub push: bool,
-    pub separate_push: bool,
+    pub push_mode: BuildPushMode,
     pub buildkit_host: Option<&'a str>,
     pub env: &'a [String],
     pub no_cache: bool,
@@ -196,7 +196,7 @@ pub(crate) fn build_image_with_railpacks(options: RailpackBuildOptions) -> Resul
             options.app_path,
             &plan_file,
             options.image_tag,
-            options.push && !options.separate_push,
+            options.push_mode == BuildPushMode::InlinePush,
             options.buildkit_host,
             &all_secrets,
             &HashMap::new(), // No local contexts for Railpack
@@ -205,9 +205,6 @@ pub(crate) fn build_image_with_railpacks(options: RailpackBuildOptions) -> Resul
             options.container_cli,
             options.platform,
         )?;
-        if options.push && options.separate_push {
-            docker_push(options.container_cli, options.image_tag)?;
-        }
     } else {
         build_with_buildx(
             options.app_path,
@@ -215,8 +212,7 @@ pub(crate) fn build_image_with_railpacks(options: RailpackBuildOptions) -> Resul
             options.image_tag,
             options.container_cli,
             options.buildx_supports_push,
-            options.push,
-            options.separate_push,
+            options.push_mode,
             options.buildkit_host,
             &all_secrets,
             options.no_cache,
@@ -235,8 +231,7 @@ fn build_with_buildx(
     image_tag: &str,
     container_cli: &str,
     buildx_supports_push: bool,
-    push: bool,
-    separate_push: bool,
+    push_mode: BuildPushMode,
     buildkit_host: Option<&str>,
     secrets: &HashMap<String, String>,
     no_cache: bool,
@@ -285,7 +280,7 @@ fn build_with_buildx(
     }
 
     let needs_fallback_push =
-        super::docker::configure_buildx_output(&mut cmd, push, buildx_supports_push, separate_push);
+        super::docker::configure_buildx_output(&mut cmd, push_mode, buildx_supports_push);
 
     // Resolve host gateway IP and rewrite proxy URLs in secrets.
     // Prefer the BuildKit container name from BUILDKIT_HOST (docker-container://...)

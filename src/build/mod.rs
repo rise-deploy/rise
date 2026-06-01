@@ -109,7 +109,7 @@ pub fn resolve_platform(
 }
 
 pub use method::BuildArgs;
-pub(crate) use method::{BuildMethod, BuildOptions};
+pub(crate) use method::{BuildMethod, BuildOptions, BuildPushMode};
 pub(crate) use railpack::{build_with_buildctl, BuildctlFrontend, RailpackBuildOptions};
 pub(crate) use registry::{
     docker_login, docker_pull, docker_push, docker_tag, inject_registry_auth,
@@ -274,8 +274,7 @@ pub(crate) fn build_image(options: BuildOptions) -> Result<()> {
                 container_cli: container_cli.command(),
                 buildx_supports_push: container_cli.buildx_supports_push(),
                 use_buildx,
-                push: options.push,
-                separate_push: options.separate_push,
+                push_mode: options.push_mode,
                 buildkit_host: buildkit_host.as_deref(),
                 env: &options.env,
                 build_context: resolved_build_context.as_deref(),
@@ -301,8 +300,9 @@ pub(crate) fn build_image(options: BuildOptions) -> Result<()> {
                 &options.platform,
             )?;
 
-            // Pack doesn't support push during build, so push separately if requested
-            if options.push {
+            // Pack doesn't support push during build, so inline push falls back
+            // to a separate push owned by the build module.
+            if options.push_mode == BuildPushMode::InlinePush {
                 registry::docker_push(container_cli.command(), &options.image_tag)?;
             }
         }
@@ -323,8 +323,7 @@ pub(crate) fn build_image(options: BuildOptions) -> Result<()> {
                 container_cli: container_cli.command(),
                 buildx_supports_push: container_cli.buildx_supports_push(),
                 use_buildctl,
-                push: options.push,
-                separate_push: options.separate_push,
+                push_mode: options.push_mode,
                 buildkit_host: buildkit_host.as_deref(),
                 env: &options.env,
                 no_cache: options.no_cache,
@@ -393,7 +392,7 @@ pub(crate) fn build_image(options: BuildOptions) -> Result<()> {
                 &options.app_path,
                 &effective_dockerfile,
                 &options.image_tag,
-                options.push && !options.separate_push,
+                options.push_mode == BuildPushMode::InlinePush,
                 buildkit_host.as_deref(),
                 &secrets,
                 &local_contexts,
@@ -402,9 +401,6 @@ pub(crate) fn build_image(options: BuildOptions) -> Result<()> {
                 container_cli.command(),
                 &options.platform,
             )?;
-            if options.push && options.separate_push {
-                registry::docker_push(container_cli.command(), &options.image_tag)?;
-            }
 
             // Note: SslCertContext cleanup is automatic via RAII when it goes out of scope
         }

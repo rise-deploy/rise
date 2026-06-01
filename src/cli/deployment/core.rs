@@ -7,7 +7,7 @@ use serde::Deserialize;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-use crate::build::{self, BackendPlatformHint, BuildOptions, PlatformSource};
+use crate::build::{self, BackendPlatformHint, BuildOptions, BuildPushMode, PlatformSource};
 use crate::config::Config;
 use crate::token_source::token_with_retry;
 
@@ -524,13 +524,15 @@ fn registry_cred_min_remaining() -> Duration {
 /// container.
 struct TimedRegistryCredentials {
     creds: RegistryCredentials,
+    container_cli: String,
     fetched_at: Instant,
 }
 
 impl TimedRegistryCredentials {
-    fn new(creds: RegistryCredentials) -> Self {
+    fn new(creds: RegistryCredentials, container_cli: impl Into<String>) -> Self {
         Self {
             creds,
+            container_cli: container_cli.into(),
             fetched_at: Instant::now(),
         }
     }
@@ -549,7 +551,11 @@ impl TimedRegistryCredentials {
     ///
     /// When the backend returns no `expires_in` (unknown lifespan) we re-mint to
     /// stay safe, preserving the original short-lived-token fix (#352).
-    fn is_reusable(&self, min_remaining: Duration, now: Instant) -> bool {
+    fn is_reusable(&self, container_cli: &str, min_remaining: Duration, now: Instant) -> bool {
+        if self.container_cli != container_cli {
+            return false;
+        }
+
         // Local-machine auth: nothing to re-mint.
         if self.creds.auth_method == RegistryAuthMethod::LoginCredentials
             && self.creds.username.is_empty()
@@ -1214,8 +1220,13 @@ pub async fn create_deployment(
         )
         .await?;
 
-        // Step 4: Build and push image using build module
-        let options = options.with_push(!deploy_opts.build_args.separate_push);
+        // Step 4: Build image. In separate-push mode, the build phase only
+        // loads locally; the caller refreshes auth and pushes explicitly.
+        let options = options.with_push_mode(if deploy_opts.build_args.separate_push {
+            BuildPushMode::LoadForLaterPush
+        } else {
+            BuildPushMode::InlinePush
+        });
         let container_cli = options.container_cli.command().to_string();
 
         if let Err(e) = build::build_image(options) {
@@ -1381,7 +1392,11 @@ async fn build_and_push_multi_container(
             Some(per_container_toml),
             backend_platform.clone(),
         )
-        .with_push(!deploy_opts.build_args.separate_push);
+        .with_push_mode(if deploy_opts.build_args.separate_push {
+            BuildPushMode::LoadForLaterPush
+        } else {
+            BuildPushMode::InlinePush
+        });
         let container_cli = options.container_cli.command().to_string();
 
         if !deploy_opts.build_args.separate_push {
@@ -1394,7 +1409,7 @@ async fn build_and_push_multi_container(
             // on credentials already present on the machine and never refetch.
             // See #352 and its follow-up.
             let need_fresh = match &cached_creds {
-                Some(c) => !c.is_reusable(min_remaining, Instant::now()),
+                Some(c) => !c.is_reusable(&container_cli, min_remaining, Instant::now()),
                 None => true,
             };
             if need_fresh {
@@ -1417,7 +1432,7 @@ async fn build_and_push_multi_container(
                     &deployment_info.deployment_id,
                 )
                 .await?;
-                cached_creds = Some(TimedRegistryCredentials::new(fresh_creds));
+                cached_creds = Some(TimedRegistryCredentials::new(fresh_creds, &container_cli));
             }
         }
 
@@ -2752,13 +2767,16 @@ mod tests {
             expires_in: Option<u64>,
             auth_method: RegistryAuthMethod,
         ) -> TimedRegistryCredentials {
-            TimedRegistryCredentials::new(RegistryCredentials {
-                registry_url: "registry.example.com/app".to_string(),
-                username: username.to_string(),
-                password: "secret".to_string(),
-                expires_in,
-                auth_method,
-            })
+            TimedRegistryCredentials::new(
+                RegistryCredentials {
+                    registry_url: "registry.example.com/app".to_string(),
+                    username: username.to_string(),
+                    password: "secret".to_string(),
+                    expires_in,
+                    auth_method,
+                },
+                "docker",
+            )
         }
 
         #[test]
@@ -2767,21 +2785,28 @@ mod tests {
             // to re-mint, so always reuse regardless of expiry/elapsed.
             let creds = timed("", None, RegistryAuthMethod::LoginCredentials);
             let now = creds.fetched_at + Duration::from_secs(86_400);
-            assert!(creds.is_reusable(Duration::from_secs(20 * 60), now));
+            assert!(creds.is_reusable("docker", Duration::from_secs(20 * 60), now));
         }
 
         #[test]
         fn remints_when_lifespan_unknown() {
             // Real username but no expires_in → unknown lifespan → re-mint.
             let creds = timed("u", None, RegistryAuthMethod::LoginCredentials);
-            assert!(!creds.is_reusable(Duration::from_secs(60), creds.fetched_at));
+            assert!(!creds.is_reusable("docker", Duration::from_secs(60), creds.fetched_at));
         }
 
         #[test]
         fn reuses_fresh_long_lived_credentials() {
             let creds = timed("u", Some(3600), RegistryAuthMethod::LoginCredentials);
             let now = creds.fetched_at + Duration::from_secs(10);
-            assert!(creds.is_reusable(Duration::from_secs(20 * 60), now));
+            assert!(creds.is_reusable("docker", Duration::from_secs(20 * 60), now));
+        }
+
+        #[test]
+        fn remints_when_container_cli_changes() {
+            let creds = timed("u", Some(3600), RegistryAuthMethod::LoginCredentials);
+            let now = creds.fetched_at + Duration::from_secs(10);
+            assert!(!creds.is_reusable("podman", Duration::from_secs(20 * 60), now));
         }
 
         #[test]
@@ -2790,7 +2815,7 @@ mod tests {
             // though 1200s remain against a small buffer.
             let creds = timed("u", Some(3600), RegistryAuthMethod::LoginCredentials);
             let now = creds.fetched_at + Duration::from_secs(2400);
-            assert!(!creds.is_reusable(Duration::from_secs(60), now));
+            assert!(!creds.is_reusable("docker", Duration::from_secs(60), now));
         }
 
         #[test]
@@ -2799,7 +2824,7 @@ mod tests {
             // 1100s remain against a 1200s (20min) buffer → re-mint.
             let creds = timed("u", Some(1800), RegistryAuthMethod::LoginCredentials);
             let now = creds.fetched_at + Duration::from_secs(700);
-            assert!(!creds.is_reusable(Duration::from_secs(20 * 60), now));
+            assert!(!creds.is_reusable("docker", Duration::from_secs(20 * 60), now));
         }
 
         #[test]
@@ -2808,9 +2833,9 @@ mod tests {
             // RegistryToken carries its secret in `password`, so expiry governs.
             let creds = timed("", Some(3600), RegistryAuthMethod::RegistryToken);
             let fresh = creds.fetched_at + Duration::from_secs(10);
-            assert!(creds.is_reusable(Duration::from_secs(20 * 60), fresh));
+            assert!(creds.is_reusable("docker", Duration::from_secs(20 * 60), fresh));
             let stale = creds.fetched_at + Duration::from_secs(3000);
-            assert!(!creds.is_reusable(Duration::from_secs(20 * 60), stale));
+            assert!(!creds.is_reusable("docker", Duration::from_secs(20 * 60), stale));
         }
     }
 }

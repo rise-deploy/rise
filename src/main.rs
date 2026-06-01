@@ -1835,6 +1835,13 @@ async fn main() -> Result<()> {
             push,
             build_args,
         } => {
+            let push_mode = if *push && build_args.separate_push {
+                build::BuildPushMode::LoadForLaterPush
+            } else if *push {
+                build::BuildPushMode::InlinePush
+            } else {
+                build::BuildPushMode::NoPush
+            };
             let options = build::BuildOptions::from_build_args(
                 &config,
                 tag.clone(),
@@ -1843,9 +1850,13 @@ async fn main() -> Result<()> {
                 None,
                 None,
             )
-            .with_push(*push);
+            .with_push_mode(push_mode);
+            let container_cli = options.container_cli.command().to_string();
 
             build::build_image(options)?;
+            if *push && build_args.separate_push {
+                build::docker_push(&container_cli, tag)?;
+            }
         }
         Commands::Run {
             project,

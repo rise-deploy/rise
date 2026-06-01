@@ -12,6 +12,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use std::error::Error;
 use std::fmt;
+use std::future::Future;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -101,6 +102,9 @@ const TOKEN_RESOLUTION_RETRIES: usize = 3;
 /// number (1×, 2×, 3×) so a momentarily-flaky mint endpoint gets a little
 /// breathing room instead of being hammered back-to-back.
 const TOKEN_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Default maximum runtime for a single GitHub Actions OIDC mint request.
+const GHA_OIDC_MINT_TIMEOUT_DEFAULT_SECS: u64 = 10;
 
 /// Resolve a bearer token, retrying transient mint failures.
 ///
@@ -216,6 +220,7 @@ pub struct GithubActionsOidc {
     request_url: String,
     request_token: String,
     audience: String,
+    mint_timeout: Duration,
     cache: Mutex<Option<CachedToken>>,
 }
 
@@ -231,11 +236,16 @@ impl GithubActionsOidc {
             request_url,
             request_token,
             audience,
+            mint_timeout: Duration::from_secs(GHA_OIDC_MINT_TIMEOUT_DEFAULT_SECS),
             cache: Mutex::new(None),
         }
     }
 
     async fn mint(&self) -> Result<CachedToken> {
+        timeout_gha_oidc_mint(self.mint_timeout, self.mint_once()).await
+    }
+
+    async fn mint_once(&self) -> Result<CachedToken> {
         // The request URL already carries query params; append the audience.
         let sep = if self.request_url.contains('?') {
             '&'
@@ -287,6 +297,24 @@ impl GithubActionsOidc {
         }
         Ok(CachedToken::new(parsed.value))
     }
+}
+
+async fn timeout_gha_oidc_mint<T, F>(timeout: Duration, mint: F) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    match tokio::time::timeout(timeout, mint).await {
+        Ok(result) => result,
+        Err(_) => Err(gha_oidc_mint_timeout_error(timeout)),
+    }
+}
+
+fn gha_oidc_mint_timeout_error(timeout: Duration) -> anyhow::Error {
+    TokenSourceError::retryable(format!(
+        "GitHub Actions OIDC token mint timed out after {} seconds",
+        timeout.as_secs()
+    ))
+    .into()
 }
 
 #[async_trait::async_trait]
@@ -510,6 +538,10 @@ pub fn resolve_token_provider(http: &reqwest::Client, config: &Config) -> Result
 mod tests {
     use super::*;
     use base64::{engine::general_purpose, Engine as _};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     fn jwt_with_exp(exp: i64) -> String {
         let header = general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#);
@@ -661,6 +693,65 @@ mod tests {
             Err(e) => e,
         };
         assert!(is_no_token_source_error(&err));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gha_oidc_mint_timeout_is_retryable() {
+        let err = match timeout_gha_oidc_mint(
+            Duration::from_secs(GHA_OIDC_MINT_TIMEOUT_DEFAULT_SECS),
+            std::future::pending::<Result<CachedToken>>(),
+        )
+        .await
+        {
+            Ok(_) => panic!("expected pending OIDC mint to time out"),
+            Err(e) => e,
+        };
+
+        assert!(err
+            .to_string()
+            .contains("GitHub Actions OIDC token mint timed out"));
+        assert!(err.chain().any(|cause| matches!(
+            cause.downcast_ref::<TokenSourceError>(),
+            Some(TokenSourceError::Retryable(_))
+        )));
+        assert!(!is_non_retryable_token_error(&err));
+    }
+
+    struct RetryAfterOidcTimeoutSource {
+        attempts: AtomicUsize,
+        succeed_on_attempt: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl TokenSource for RetryAfterOidcTimeoutSource {
+        async fn token(&self) -> Result<String> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt >= self.succeed_on_attempt {
+                Ok(format!("token-{attempt}"))
+            } else {
+                Err(gha_oidc_mint_timeout_error(Duration::from_secs(
+                    GHA_OIDC_MINT_TIMEOUT_DEFAULT_SECS,
+                )))
+            }
+        }
+
+        fn describe(&self) -> &'static str {
+            "test OIDC timeout source"
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn token_with_retry_retries_gha_oidc_timeout() {
+        let source = Arc::new(RetryAfterOidcTimeoutSource {
+            attempts: AtomicUsize::new(0),
+            succeed_on_attempt: 2,
+        });
+        let provider: TokenProvider = source.clone();
+
+        let token = token_with_retry(&provider).await.unwrap();
+
+        assert_eq!(token, "token-2");
+        assert_eq!(source.attempts.load(Ordering::SeqCst), 2);
     }
 
     mod command_token_ttl {

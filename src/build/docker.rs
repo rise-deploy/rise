@@ -9,6 +9,7 @@ use super::dockerfile_ssl::{
     preprocess_dockerfile_for_ssl, SslCertContext, SSL_CERT_BUILD_CONTEXT,
 };
 use super::registry::docker_push;
+use super::BuildPushMode;
 
 /// Configure buildx output flags (`--push` / `--load`) on a command.
 ///
@@ -16,17 +17,24 @@ use super::registry::docker_push;
 /// (i.e. push was requested but `--push` is not supported).
 pub(crate) fn configure_buildx_output(
     cmd: &mut Command,
-    push: bool,
+    push_mode: BuildPushMode,
     buildx_supports_push: bool,
-    separate_push: bool,
 ) -> bool {
-    if push && buildx_supports_push && !separate_push {
-        cmd.arg("--push");
-        false
-    } else {
-        // Without --push, load into the local daemon so a subsequent push can work.
-        cmd.arg("--load");
-        push
+    match push_mode {
+        BuildPushMode::InlinePush if buildx_supports_push => {
+            cmd.arg("--push");
+            false
+        }
+        BuildPushMode::InlinePush => {
+            cmd.arg("--load");
+            true
+        }
+        BuildPushMode::NoPush | BuildPushMode::LoadForLaterPush => {
+            // Without --push, load into the local daemon so a caller-owned
+            // later push can work.
+            cmd.arg("--load");
+            false
+        }
     }
 }
 
@@ -47,8 +55,7 @@ pub(crate) struct DockerBuildOptions<'a> {
     pub container_cli: &'a str,
     pub buildx_supports_push: bool,
     pub use_buildx: bool,
-    pub push: bool,
-    pub separate_push: bool,
+    pub push_mode: BuildPushMode,
     pub buildkit_host: Option<&'a str>,
     pub env: &'a [String],
     pub build_context: Option<&'a str>,
@@ -220,14 +227,9 @@ pub(crate) fn build_image_with_dockerfile(options: DockerBuildOptions) -> Result
     }
 
     let needs_fallback_push = if options.use_buildx {
-        configure_buildx_output(
-            &mut cmd,
-            options.push,
-            options.buildx_supports_push,
-            options.separate_push,
-        )
+        configure_buildx_output(&mut cmd, options.push_mode, options.buildx_supports_push)
     } else {
-        options.push
+        options.push_mode == BuildPushMode::InlinePush
     };
 
     debug!("Executing command: {:?}", cmd);
@@ -256,6 +258,7 @@ pub(crate) fn build_image_with_dockerfile(options: DockerBuildOptions) -> Result
 #[cfg(test)]
 mod tests {
     use super::configure_buildx_output;
+    use crate::build::BuildPushMode;
     use std::process::Command;
 
     fn args(cmd: &Command) -> Vec<String> {
@@ -268,19 +271,19 @@ mod tests {
     fn buildx_uses_native_push_when_supported_by_default() {
         let mut cmd = Command::new("docker");
 
-        let fallback = configure_buildx_output(&mut cmd, true, true, false);
+        let fallback = configure_buildx_output(&mut cmd, BuildPushMode::InlinePush, true);
 
         assert!(!fallback);
         assert_eq!(args(&cmd), vec!["--push"]);
     }
 
     #[test]
-    fn buildx_separate_push_forces_load_and_fallback_push() {
+    fn buildx_load_for_later_push_loads_without_fallback_push() {
         let mut cmd = Command::new("docker");
 
-        let fallback = configure_buildx_output(&mut cmd, true, true, true);
+        let fallback = configure_buildx_output(&mut cmd, BuildPushMode::LoadForLaterPush, true);
 
-        assert!(fallback);
+        assert!(!fallback);
         assert_eq!(args(&cmd), vec!["--load"]);
     }
 
@@ -288,9 +291,19 @@ mod tests {
     fn buildx_without_push_loads_without_fallback_push() {
         let mut cmd = Command::new("docker");
 
-        let fallback = configure_buildx_output(&mut cmd, false, true, true);
+        let fallback = configure_buildx_output(&mut cmd, BuildPushMode::NoPush, true);
 
         assert!(!fallback);
+        assert_eq!(args(&cmd), vec!["--load"]);
+    }
+
+    #[test]
+    fn buildx_inline_push_without_native_support_loads_and_fallback_pushes() {
+        let mut cmd = Command::new("docker");
+
+        let fallback = configure_buildx_output(&mut cmd, BuildPushMode::InlinePush, false);
+
+        assert!(fallback);
         assert_eq!(args(&cmd), vec!["--load"]);
     }
 }
