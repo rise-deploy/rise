@@ -1836,11 +1836,11 @@ async fn main() -> Result<()> {
             build_args,
         } => {
             let push_mode = if *push && build_args.separate_push {
-                build::BuildPushMode::LoadForLaterPush
+                build::BuildPushMode::Deferred
             } else if *push {
-                build::BuildPushMode::InlinePush
+                build::BuildPushMode::Inline
             } else {
-                build::BuildPushMode::NoPush
+                build::BuildPushMode::Disabled
             };
             let options = build::BuildOptions::from_build_args(
                 &config,

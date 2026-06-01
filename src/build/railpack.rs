@@ -196,7 +196,7 @@ pub(crate) fn build_image_with_railpacks(options: RailpackBuildOptions) -> Resul
             options.app_path,
             &plan_file,
             options.image_tag,
-            options.push_mode == BuildPushMode::InlinePush,
+            options.push_mode == BuildPushMode::Inline,
             options.buildkit_host,
             &all_secrets,
             &HashMap::new(), // No local contexts for Railpack

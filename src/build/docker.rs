@@ -21,15 +21,15 @@ pub(crate) fn configure_buildx_output(
     buildx_supports_push: bool,
 ) -> bool {
     match push_mode {
-        BuildPushMode::InlinePush if buildx_supports_push => {
+        BuildPushMode::Inline if buildx_supports_push => {
             cmd.arg("--push");
             false
         }
-        BuildPushMode::InlinePush => {
+        BuildPushMode::Inline => {
             cmd.arg("--load");
             true
         }
-        BuildPushMode::NoPush | BuildPushMode::LoadForLaterPush => {
+        BuildPushMode::Disabled | BuildPushMode::Deferred => {
             // Without --push, load into the local daemon so a caller-owned
             // later push can work.
             cmd.arg("--load");
@@ -229,7 +229,7 @@ pub(crate) fn build_image_with_dockerfile(options: DockerBuildOptions) -> Result
     let needs_fallback_push = if options.use_buildx {
         configure_buildx_output(&mut cmd, options.push_mode, options.buildx_supports_push)
     } else {
-        options.push_mode == BuildPushMode::InlinePush
+        options.push_mode == BuildPushMode::Inline
     };
 
     debug!("Executing command: {:?}", cmd);
@@ -271,7 +271,7 @@ mod tests {
     fn buildx_uses_native_push_when_supported_by_default() {
         let mut cmd = Command::new("docker");
 
-        let fallback = configure_buildx_output(&mut cmd, BuildPushMode::InlinePush, true);
+        let fallback = configure_buildx_output(&mut cmd, BuildPushMode::Inline, true);
 
         assert!(!fallback);
         assert_eq!(args(&cmd), vec!["--push"]);
@@ -281,7 +281,7 @@ mod tests {
     fn buildx_load_for_later_push_loads_without_fallback_push() {
         let mut cmd = Command::new("docker");
 
-        let fallback = configure_buildx_output(&mut cmd, BuildPushMode::LoadForLaterPush, true);
+        let fallback = configure_buildx_output(&mut cmd, BuildPushMode::Deferred, true);
 
         assert!(!fallback);
         assert_eq!(args(&cmd), vec!["--load"]);
@@ -291,7 +291,7 @@ mod tests {
     fn buildx_without_push_loads_without_fallback_push() {
         let mut cmd = Command::new("docker");
 
-        let fallback = configure_buildx_output(&mut cmd, BuildPushMode::NoPush, true);
+        let fallback = configure_buildx_output(&mut cmd, BuildPushMode::Disabled, true);
 
         assert!(!fallback);
         assert_eq!(args(&cmd), vec!["--load"]);
@@ -301,7 +301,7 @@ mod tests {
     fn buildx_inline_push_without_native_support_loads_and_fallback_pushes() {
         let mut cmd = Command::new("docker");
 
-        let fallback = configure_buildx_output(&mut cmd, BuildPushMode::InlinePush, false);
+        let fallback = configure_buildx_output(&mut cmd, BuildPushMode::Inline, false);
 
         assert!(fallback);
         assert_eq!(args(&cmd), vec!["--load"]);

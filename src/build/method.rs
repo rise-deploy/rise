@@ -131,12 +131,12 @@ pub(crate) struct BuildOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BuildPushMode {
     /// Build/load the image locally and do not push.
-    NoPush,
+    Disabled,
     /// Let the build backend push as part of the build when supported, with a
     /// backend-owned fallback push after local load where needed.
-    InlinePush,
+    Inline,
     /// Build/load the image locally so the caller can explicitly push later.
-    LoadForLaterPush,
+    Deferred,
 }
 
 impl BuildOptions {
@@ -292,16 +292,16 @@ impl BuildOptions {
 
             platform,
             platform_source,
-            push_mode: BuildPushMode::NoPush,
+            push_mode: BuildPushMode::Disabled,
         }
     }
 
     /// Builder method to set inline push flag.
     pub(crate) fn with_push(mut self, push: bool) -> Self {
         self.push_mode = if push {
-            BuildPushMode::InlinePush
+            BuildPushMode::Inline
         } else {
-            BuildPushMode::NoPush
+            BuildPushMode::Disabled
         };
         self
     }

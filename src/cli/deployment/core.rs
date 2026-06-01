@@ -1223,9 +1223,9 @@ pub async fn create_deployment(
         // Step 4: Build image. In separate-push mode, the build phase only
         // loads locally; the caller refreshes auth and pushes explicitly.
         let options = options.with_push_mode(if deploy_opts.build_args.separate_push {
-            BuildPushMode::LoadForLaterPush
+            BuildPushMode::Deferred
         } else {
-            BuildPushMode::InlinePush
+            BuildPushMode::Inline
         });
         let container_cli = options.container_cli.command().to_string();
 
@@ -1393,9 +1393,9 @@ async fn build_and_push_multi_container(
             backend_platform.clone(),
         )
         .with_push_mode(if deploy_opts.build_args.separate_push {
-            BuildPushMode::LoadForLaterPush
+            BuildPushMode::Deferred
         } else {
-            BuildPushMode::InlinePush
+            BuildPushMode::Inline
         });
         let container_cli = options.container_cli.command().to_string();
 

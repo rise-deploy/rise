@@ -302,7 +302,7 @@ pub(crate) fn build_image(options: BuildOptions) -> Result<()> {
 
             // Pack doesn't support push during build, so inline push falls back
             // to a separate push owned by the build module.
-            if options.push_mode == BuildPushMode::InlinePush {
+            if options.push_mode == BuildPushMode::Inline {
                 registry::docker_push(container_cli.command(), &options.image_tag)?;
             }
         }
@@ -392,7 +392,7 @@ pub(crate) fn build_image(options: BuildOptions) -> Result<()> {
                 &options.app_path,
                 &effective_dockerfile,
                 &options.image_tag,
-                options.push_mode == BuildPushMode::InlinePush,
+                options.push_mode == BuildPushMode::Inline,
                 buildkit_host.as_deref(),
                 &secrets,
                 &local_contexts,
