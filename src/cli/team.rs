@@ -139,9 +139,7 @@ pub async fn create_team(
     owners: Option<Vec<String>>,
     members: Vec<String>,
 ) -> Result<()> {
-    let token = config
-        .get_token()
-        .ok_or_else(|| anyhow::anyhow!("Not logged in. Please run 'rise login' first."))?;
+    let token = crate::token_source::resolve_token_with_retry(http_client, config).await?;
 
     // If no owners specified, use current user
     let owner_emails = if let Some(emails) = owners {
@@ -222,9 +220,7 @@ pub async fn create_team(
 
 // List all teams
 pub async fn list_teams(http_client: &Client, backend_url: &str, config: &Config) -> Result<()> {
-    let token = config
-        .get_token()
-        .ok_or_else(|| anyhow::anyhow!("Not logged in. Please run 'rise login' first."))?;
+    let token = crate::token_source::resolve_token_with_retry(http_client, config).await?;
 
     let url = format!("{}/api/v1/teams", backend_url);
     let response = http_client
@@ -291,9 +287,7 @@ pub async fn show_team(
     config: &Config,
     team_identifier: &str,
 ) -> Result<()> {
-    let token = config
-        .get_token()
-        .ok_or_else(|| anyhow::anyhow!("Not logged in. Please run 'rise login' first."))?;
+    let token = crate::token_source::resolve_token_with_retry(http_client, config).await?;
 
     let url = format!("{}/api/v1/teams/{}", backend_url, team_identifier);
     let response = http_client
@@ -397,9 +391,7 @@ pub async fn update_team(
     add_members: Vec<String>,
     remove_members: Vec<String>,
 ) -> Result<()> {
-    let token = config
-        .get_token()
-        .ok_or_else(|| anyhow::anyhow!("Not logged in. Please run 'rise login' first."))?;
+    let token = crate::token_source::resolve_token_with_retry(http_client, config).await?;
 
     // Convert email addresses to user IDs
     let add_owner_ids = lookup_users(http_client, backend_url, &token, add_owners).await?;
@@ -539,9 +531,7 @@ pub async fn delete_team(
     config: &Config,
     team_identifier: &str,
 ) -> Result<()> {
-    let token = config
-        .get_token()
-        .ok_or_else(|| anyhow::anyhow!("Not logged in. Please run 'rise login' first."))?;
+    let token = crate::token_source::resolve_token_with_retry(http_client, config).await?;
 
     let url = format!("{}/api/v1/teams/{}", backend_url, team_identifier);
     let response = http_client

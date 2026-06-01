@@ -27,14 +27,14 @@ The default `production` environment (mapped to the `default` group) already exi
 # Production SA: only protected refs
 rise sa create -p my-app \
   --issuer https://gitlab.com \
-  --claim aud=rise-project-my-app \
+  --claim aud=https://rise.example.net \
   --claim project_path=myorg/my-app \
   --claim ref_protected=true
 
 # Preview SA: any ref, restricted to staging in the web UI
 rise sa create -p my-app \
   --issuer https://gitlab.com \
-  --claim aud=rise-project-my-app \
+  --claim aud=https://rise.example.net \
   --claim project_path=myorg/my-app
 ```
 
@@ -48,7 +48,7 @@ deploy-production:
   only: [tags]
   id_tokens:
     RISE_TOKEN:
-      aud: rise-project-my-app
+      aud: https://rise.example.net
   script:
     - rise deploy -E production --image $CI_REGISTRY_IMAGE:$CI_COMMIT_TAG
 
@@ -56,7 +56,7 @@ deploy-preview:
   except: [tags]
   id_tokens:
     RISE_TOKEN:
-      aud: rise-project-my-app
+      aud: https://rise.example.net
   script:
     - rise deploy -E staging --group mr/$CI_MERGE_REQUEST_IID --expire 7d
 ```

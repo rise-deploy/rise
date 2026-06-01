@@ -9,6 +9,7 @@ use tracing::{debug, info, warn};
 
 use crate::build::{self, BackendPlatformHint, BuildOptions, PlatformSource};
 use crate::config::Config;
+use crate::token_source::token_with_retry;
 
 // Re-export models from API module (always available)
 pub use crate::api::models::{Deployment, DeploymentStatus};
@@ -177,9 +178,7 @@ pub async fn list_deployments(
     group: Option<&str>,
     limit: usize,
 ) -> Result<()> {
-    let token = config
-        .get_token()
-        .ok_or_else(|| anyhow::anyhow!("Not logged in. Please run 'rise login' first."))?;
+    let token = crate::token_source::resolve_token_with_retry(http_client, config).await?;
 
     if let Some(g) = group {
         info!(
@@ -388,13 +387,10 @@ pub async fn show_deployment(
         Ok(())
     } else {
         // One-shot display (no follow)
-        let token = config
-            .token
-            .as_ref()
-            .context("Not logged in. Please run 'rise login' first.")?;
+        let token = crate::token_source::resolve_token_with_retry(http_client, config).await?;
 
         let deployment =
-            fetch_deployment(http_client, backend_url, token, project, deployment_id).await?;
+            fetch_deployment(http_client, backend_url, &token, project, deployment_id).await?;
 
         // Use the same UI as follow mode
         super::follow_ui::print_deployment_snapshot(&deployment);
@@ -430,9 +426,7 @@ pub async fn stop_deployments_by_group(
     project: &str,
     group: &str,
 ) -> Result<()> {
-    let token = config
-        .get_token()
-        .ok_or_else(|| anyhow::anyhow!("Not logged in. Please run 'rise login' first."))?;
+    let token = crate::token_source::resolve_token_with_retry(http_client, config).await?;
 
     info!(
         "Stopping deployments in group '{}' for project '{}'",
@@ -631,37 +625,6 @@ fn log_platform_choice(platform: &str, source: PlatformSource, operation: &str) 
             info!("{operation} for {platform} (host architecture; target cluster is unconstrained — pass --platform to override)")
         }
     }
-}
-
-/// Number of retry attempts after the initial token resolution attempt.
-const TOKEN_RESOLUTION_RETRIES: usize = 3;
-
-/// Resolve a bearer token, retrying transient mint failures.
-///
-/// Token sources own their cache/refresh policy: every attempt asks for a
-/// usable token via `token()`, and the provider decides whether to reuse or
-/// re-mint. Token sources can mark clear configuration/auth failures as
-/// non-retryable so we fail fast instead of repeating a known-bad request.
-pub(super) async fn token_with_retry(
-    provider: &crate::token_source::TokenProvider,
-) -> Result<String> {
-    for attempt in 0..=TOKEN_RESOLUTION_RETRIES {
-        match provider.token().await {
-            Ok(token) => return Ok(token),
-            Err(e) if crate::token_source::is_non_retryable_token_error(&e) => return Err(e),
-            Err(e) if attempt < TOKEN_RESOLUTION_RETRIES => {
-                warn!(
-                    "Token resolution failed, retrying ({}/{}): {:?}",
-                    attempt + 1,
-                    TOKEN_RESOLUTION_RETRIES,
-                    e
-                );
-            }
-            Err(e) => return Err(e),
-        }
-    }
-
-    unreachable!("token retry loop always returns");
 }
 
 /// Resolve a bearer token with the shared retry policy, logging and swallowing

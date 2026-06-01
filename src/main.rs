@@ -1079,9 +1079,8 @@ async fn main() -> Result<()> {
                 project::delete_project(&http_client, &backend_url, &config, &project_name).await?;
             }
             ProjectCommands::AppUser(app_user_cmd) => {
-                let token = config.get_token().ok_or_else(|| {
-                    anyhow::anyhow!("Not authenticated. Please run 'rise login' first")
-                })?;
+                let token =
+                    cli::token_source::resolve_token_with_retry(&http_client, &config).await?;
                 match app_user_cmd {
                     AppUserCommands::Add {
                         project,
@@ -1488,9 +1487,8 @@ async fn main() -> Result<()> {
                 level,
             } => {
                 let project_name = resolve_project_name(project.clone(), path)?;
-                let token = config.get_token().ok_or_else(|| {
-                    anyhow::anyhow!("Not logged in. Please run 'rise login' first.")
-                })?;
+                let token =
+                    cli::token_source::resolve_token_with_retry(&http_client, &config).await?;
                 deployment::get_logs(
                     &http_client,
                     &backend_url,
@@ -1524,15 +1522,17 @@ async fn main() -> Result<()> {
                     eprintln!(
                         "Error: The 'aud' (audience) claim is required for service accounts."
                     );
-                    eprintln!("       Recommended format: rise-project-{{project-name}}");
-                    eprintln!("       Example: --claim aud=rise-project-{}", project_name);
+                    eprintln!("       Recommended value: https://rise.example.net");
+                    eprintln!("       Example: --claim aud=https://rise.example.net");
                     std::process::exit(1);
                 }
 
                 // Validate at least one additional claim
                 if claims_map.len() < 2 {
                     eprintln!("Error: At least one claim in addition to 'aud' is required.");
-                    eprintln!("       Example: --claim aud=... --claim project_path=myorg/myrepo");
+                    eprintln!(
+                        "       Example: --claim aud=https://rise.example.net --claim project_path=myorg/myrepo"
+                    );
                     std::process::exit(1);
                 }
 
@@ -1599,9 +1599,7 @@ async fn main() -> Result<()> {
                 .await?;
         }
         Commands::Env(env_cmd) => {
-            let token = config.get_token().ok_or_else(|| {
-                anyhow::anyhow!("Not authenticated. Please run 'rise login' first")
-            })?;
+            let token = cli::token_source::resolve_token_with_retry(&http_client, &config).await?;
             match env_cmd {
                 EnvCommands::Set {
                     project,
@@ -1735,9 +1733,7 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Domain(domain_cmd) => {
-            let token = config.get_token().ok_or_else(|| {
-                anyhow::anyhow!("Not authenticated. Please run 'rise login' first")
-            })?;
+            let token = cli::token_source::resolve_token_with_retry(&http_client, &config).await?;
             match domain_cmd {
                 DomainCommands::Add {
                     project,

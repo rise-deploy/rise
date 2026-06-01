@@ -38,12 +38,9 @@ pub async fn encrypt_command(config: &Config, plaintext: Option<String>) -> Resu
         bail!("Plaintext cannot be empty");
     }
 
-    let backend_url = config.get_backend_url();
-    let token = config
-        .get_token()
-        .ok_or_else(|| anyhow::anyhow!("Not authenticated. Please run 'rise login' first"))?;
-
     let http_client = Client::new();
+    let backend_url = config.get_backend_url();
+    let token = crate::token_source::resolve_token_with_retry(&http_client, config).await?;
     let url = format!("{}/api/v1/encrypt", backend_url);
 
     let response = http_client

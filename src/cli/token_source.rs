@@ -15,6 +15,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+use tracing::warn;
 
 use crate::config::Config;
 use crate::login::token_utils::read_token_exp;
@@ -76,6 +77,42 @@ pub fn is_non_retryable_token_error(error: &anyhow::Error) -> bool {
         .chain()
         .find_map(|cause| cause.downcast_ref::<TokenSourceError>())
         .is_some_and(TokenSourceError::is_non_retryable)
+}
+
+/// Number of retry attempts after the initial token resolution attempt.
+const TOKEN_RESOLUTION_RETRIES: usize = 3;
+
+/// Resolve a bearer token, retrying transient mint failures.
+///
+/// Token sources own their cache/refresh policy: every attempt asks for a
+/// usable token via `token()`, and the provider decides whether to reuse or
+/// re-mint. Token sources can mark clear configuration/auth failures as
+/// non-retryable so we fail fast instead of repeating a known-bad request.
+pub async fn token_with_retry(provider: &TokenProvider) -> Result<String> {
+    for attempt in 0..=TOKEN_RESOLUTION_RETRIES {
+        match provider.token().await {
+            Ok(token) => return Ok(token),
+            Err(e) if is_non_retryable_token_error(&e) => return Err(e),
+            Err(e) if attempt < TOKEN_RESOLUTION_RETRIES => {
+                warn!(
+                    "Token resolution failed, retrying ({}/{}): {:?}",
+                    attempt + 1,
+                    TOKEN_RESOLUTION_RETRIES,
+                    e
+                );
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    unreachable!("token retry loop always returns");
+}
+
+/// Resolve the configured token provider and then a bearer token with the
+/// shared retry policy. Use for one-shot backend requests.
+pub async fn resolve_token_with_retry(http: &reqwest::Client, config: &Config) -> Result<String> {
+    let provider = resolve_token_provider(http, config)?;
+    token_with_retry(&provider).await
 }
 
 /// A token cached alongside its decoded `exp` (seconds since epoch). `None`
@@ -544,6 +581,14 @@ mod tests {
         i.stored_token = Some("stored".into());
         let p = select_token_provider(&client(), i).unwrap();
         assert_eq!(p.describe(), "static token");
+    }
+
+    #[tokio::test]
+    async fn selected_provider_resolves_token_with_retry_helper() {
+        let mut i = base_inputs();
+        i.rise_token = Some("tok".into());
+        let p = select_token_provider(&client(), i).unwrap();
+        assert_eq!(token_with_retry(&p).await.unwrap(), "tok");
     }
 
     #[test]

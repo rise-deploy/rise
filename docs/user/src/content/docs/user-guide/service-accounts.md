@@ -15,7 +15,7 @@ For the recommended two-SA setup (production + preview with environment restrict
 ```bash
 rise sa create -p my-project \
   --issuer https://gitlab.com \
-  --claim aud=rise-project-my-project \
+  --claim aud=https://rise.example.net \
   --claim project_path=myorg/myrepo \
   --claim ref_protected=true
 ```
@@ -27,7 +27,7 @@ deploy:
   stage: deploy
   id_tokens:
     RISE_TOKEN:
-      aud: rise-project-my-project
+      aud: https://rise.example.net
   script:
     - rise deploy --image $CI_REGISTRY_IMAGE:$CI_COMMIT_TAG
   only:
@@ -39,7 +39,7 @@ deploy:
 ```bash
 rise sa create -p my-app \
   --issuer https://token.actions.githubusercontent.com \
-  --claim aud=rise-project-my-app \
+  --claim aud=https://rise.example.net \
   --claim repository=myorg/my-app
 ```
 
@@ -64,8 +64,8 @@ jobs:
         env:
           # The CLI auto-detects GitHub Actions and mints an OIDC token on demand,
           # re-minting after about 2/3 of its lifetime so long builds can't outlast it.
-          # Set the audience the service account expects (`--claim aud=...`).
-          RISE_GHA_AUDIENCE: rise-project-my-app
+          # Set the audience to the Rise server URL (`https://rise.example.net`).
+          RISE_GHA_AUDIENCE: https://rise.example.net
         run: rise deploy --image ghcr.io/myorg/my-app:$GITHUB_SHA
 ```
 
@@ -76,7 +76,7 @@ Because GitHub Actions OIDC auto-detection ranks above the stored login token (s
 ```bash
 rise sa create -p <project> \
   --issuer <issuer-url> \
-  --claim aud=<value> \
+  --claim aud=https://rise.example.net \
   --claim <key>=<value>
 ```
 
@@ -89,7 +89,7 @@ Requirements: an `aud` claim and at least one additional claim to narrow authori
 ```bash
 rise sa create -p my-app \
   --issuer https://gitlab.com \
-  --claim aud=rise-project-my-app \
+  --claim aud=https://rise.example.net \
   --claim project_path=myorg/app \
   --claim ref_protected=true
 ```
@@ -99,7 +99,7 @@ rise sa create -p my-app \
 ```bash
 rise sa create -p my-app \
   --issuer https://gitlab.com \
-  --claim aud=rise-project-my-app \
+  --claim aud=https://rise.example.net \
   --claim project_path=myorg/app \
   --claim ref=refs/heads/staging
 ```
@@ -109,7 +109,7 @@ rise sa create -p my-app \
 ```bash
 rise sa create -p my-app \
   --issuer https://gitlab.com \
-  --claim aud=rise-project-my-app \
+  --claim aud=https://rise.example.net \
   --claim project_path=myorg/app \
   --claim ref_type=tag
 ```
@@ -128,7 +128,7 @@ Claims support glob-style `*` wildcards:
 # Match all merge request environments
 rise sa create -p my-app \
   --issuer https://gitlab.com \
-  --claim aud=rise-project-my-app \
+  --claim aud=https://rise.example.net \
   --claim project_path=myorg/myrepo \
   --claim environment=app-mr/*
 
@@ -170,7 +170,7 @@ Create a service account using the public issuer URL:
 ```bash
 rise sa create -p my-project \
   --issuer https://<id>.oidc.pub \
-  --claim aud=test \
+  --claim aud=https://rise.example.net \
   --claim sub=dev
 ```
 
@@ -178,6 +178,6 @@ Mint a token and use it:
 
 ```bash
 export RISE_TOKEN=$(curl -s http://localhost:9229/token \
-  -d '{"aud": "test", "sub": "dev"}' | jq -r .access_token)
+  -d '{"aud": "https://rise.example.net", "sub": "dev"}' | jq -r .access_token)
 rise deploy --image my-image:latest
 ```

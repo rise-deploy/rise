@@ -56,9 +56,7 @@ pub async fn handle_environment_command(
     config: &Config,
     cmd: &crate::EnvironmentCommands,
 ) -> Result<()> {
-    let token = config
-        .get_token()
-        .ok_or_else(|| anyhow::anyhow!("Not authenticated. Please run 'rise login' first"))?;
+    let token = crate::token_source::resolve_token_with_retry(http_client, config).await?;
 
     match cmd {
         crate::EnvironmentCommands::Create {

@@ -51,11 +51,8 @@ pub async fn create_extension(
 ) -> Result<()> {
     let config = Config::load()?;
     let backend_url = config.get_backend_url();
-    let token = config
-        .get_token()
-        .ok_or_else(|| anyhow::anyhow!("Not authenticated. Please run 'rise login' first"))?;
-
     let http_client = Client::new();
+    let token = crate::token_source::resolve_token_with_retry(&http_client, &config).await?;
     let url = format!(
         "{}/api/v1/projects/{}/extensions/{}",
         backend_url, project, extension
@@ -107,11 +104,8 @@ pub async fn create_extension(
 pub async fn update_extension(project: &str, extension: &str, spec: Value) -> Result<()> {
     let config = Config::load()?;
     let backend_url = config.get_backend_url();
-    let token = config
-        .get_token()
-        .ok_or_else(|| anyhow::anyhow!("Not authenticated. Please run 'rise login' first"))?;
-
     let http_client = Client::new();
+    let token = crate::token_source::resolve_token_with_retry(&http_client, &config).await?;
     let url = format!(
         "{}/api/v1/projects/{}/extensions/{}",
         backend_url, project, extension
@@ -160,11 +154,8 @@ pub async fn update_extension(project: &str, extension: &str, spec: Value) -> Re
 pub async fn patch_extension(project: &str, extension: &str, spec: Value) -> Result<()> {
     let config = Config::load()?;
     let backend_url = config.get_backend_url();
-    let token = config
-        .get_token()
-        .ok_or_else(|| anyhow::anyhow!("Not authenticated. Please run 'rise login' first"))?;
-
     let http_client = Client::new();
+    let token = crate::token_source::resolve_token_with_retry(&http_client, &config).await?;
     let url = format!(
         "{}/api/v1/projects/{}/extensions/{}",
         backend_url, project, extension
@@ -213,11 +204,8 @@ pub async fn patch_extension(project: &str, extension: &str, spec: Value) -> Res
 pub async fn list_extensions(project: &str) -> Result<()> {
     let config = Config::load()?;
     let backend_url = config.get_backend_url();
-    let token = config
-        .get_token()
-        .ok_or_else(|| anyhow::anyhow!("Not authenticated. Please run 'rise login' first"))?;
-
     let http_client = Client::new();
+    let token = crate::token_source::resolve_token_with_retry(&http_client, &config).await?;
     let url = format!("{}/api/v1/projects/{}/extensions", backend_url, project);
 
     let response = http_client
@@ -280,11 +268,8 @@ pub async fn list_extensions(project: &str) -> Result<()> {
 pub async fn show_extension(project: &str, extension: &str) -> Result<()> {
     let config = Config::load()?;
     let backend_url = config.get_backend_url();
-    let token = config
-        .get_token()
-        .ok_or_else(|| anyhow::anyhow!("Not authenticated. Please run 'rise login' first"))?;
-
     let http_client = Client::new();
+    let token = crate::token_source::resolve_token_with_retry(&http_client, &config).await?;
     let url = format!(
         "{}/api/v1/projects/{}/extensions/{}",
         backend_url, project, extension
@@ -331,11 +316,8 @@ pub async fn show_extension(project: &str, extension: &str) -> Result<()> {
 pub async fn delete_extension(project: &str, extension: &str) -> Result<()> {
     let config = Config::load()?;
     let backend_url = config.get_backend_url();
-    let token = config
-        .get_token()
-        .ok_or_else(|| anyhow::anyhow!("Not authenticated. Please run 'rise login' first"))?;
-
     let http_client = Client::new();
+    let token = crate::token_source::resolve_token_with_retry(&http_client, &config).await?;
     let url = format!(
         "{}/api/v1/projects/{}/extensions/{}",
         backend_url, project, extension

@@ -74,7 +74,7 @@ Aliases: `rise project app-user rm`, `rise project app-user del`
 - **"Failed to start local callback server"** — ports 8765-8767 are in use
 - **"Code exchange failed"** — check that the backend and identity provider are running
 - **Token expired** — run `rise login` (tokens expire after 1 hour by default)
-- **"The 'aud' claim is required"** — add `--claim aud=<value>` to service account
+- **"The 'aud' claim is required"** — add `--claim aud=https://rise.example.net` to service account
 - **"No service account matched"** — check claims match exactly (case-sensitive), verify issuer URL has no trailing slash
 - **"Multiple service accounts matched"** — make claims more specific to avoid ambiguity
 - **"403 Forbidden"** (service account) — service accounts can only deploy, not manage projects

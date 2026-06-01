@@ -102,7 +102,9 @@ pub async fn run_locally(
     let mut port_from_preview = false;
     if options.use_project_env {
         if let Some(project_name) = &project_name {
-            if let Some(token) = config.get_token() {
+            if let Ok(token) =
+                crate::token_source::resolve_token_with_retry(http_client, config).await
+            {
                 match env::fetch_preview_env_vars(
                     http_client,
                     &backend_url,
@@ -154,8 +156,8 @@ pub async fn run_locally(
                     }
                 }
             } else {
-                warn!("Not logged in - cannot load project environment variables");
-                warn!("Run 'rise login' to authenticate");
+                warn!("No usable token source - cannot load project environment variables");
+                warn!("Run 'rise login' or configure a CI token source to authenticate");
             }
         }
     }

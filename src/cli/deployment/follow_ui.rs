@@ -8,9 +8,8 @@ use tracing::{debug, info};
 use crate::api::models::{Deployment, DeploymentStatus};
 use crate::config::Config;
 
-use super::core::{
-    fetch_deployment, open_log_stream, parse_duration, token_with_retry, LogStreamError,
-};
+use super::core::{fetch_deployment, open_log_stream, parse_duration, LogStreamError};
+use crate::token_source::token_with_retry;
 
 // Project info for fetching project URL
 #[derive(Deserialize)]

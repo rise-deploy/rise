@@ -92,12 +92,12 @@ Tokens expire after 1 hour by default.
 
 ### "The 'aud' claim is required"
 
-Add `--claim aud=<value>` when creating the service account:
+Add `--claim aud=https://rise.example.net` when creating the service account:
 
 ```bash
 rise sa create my-project \
   --issuer https://gitlab.com \
-  --claim aud=rise-project-my-project \
+  --claim aud=https://rise.example.net \
   --claim project_path=myorg/myrepo
 ```
 
