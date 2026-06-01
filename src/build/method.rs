@@ -84,6 +84,11 @@ pub struct BuildArgs {
     /// `rise deploy`) or the host architecture.
     #[arg(long)]
     pub platform: Option<String>,
+
+    /// Build/load the image locally first, then push in a separate step.
+    /// Useful when registry credentials may expire during long builds.
+    #[arg(long)]
+    pub separate_push: bool,
 }
 
 /// Options for building container images
@@ -120,6 +125,8 @@ pub(crate) struct BuildOptions {
     /// Where `platform` was sourced from (CLI / env / rise.toml / backend / host).
     /// Lets callers report or react to the precedence level that won.
     pub platform_source: crate::build::PlatformSource,
+    /// Force push to happen after the image has been built/loaded locally.
+    pub separate_push: bool,
 }
 
 impl BuildOptions {
@@ -275,6 +282,7 @@ impl BuildOptions {
 
             platform,
             platform_source,
+            separate_push: build_args.separate_push,
 
             push: false,
         }

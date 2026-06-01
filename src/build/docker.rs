@@ -18,8 +18,9 @@ pub(crate) fn configure_buildx_output(
     cmd: &mut Command,
     push: bool,
     buildx_supports_push: bool,
+    separate_push: bool,
 ) -> bool {
-    if push && buildx_supports_push {
+    if push && buildx_supports_push && !separate_push {
         cmd.arg("--push");
         false
     } else {
@@ -47,6 +48,7 @@ pub(crate) struct DockerBuildOptions<'a> {
     pub buildx_supports_push: bool,
     pub use_buildx: bool,
     pub push: bool,
+    pub separate_push: bool,
     pub buildkit_host: Option<&'a str>,
     pub env: &'a [String],
     pub build_context: Option<&'a str>,
@@ -218,7 +220,12 @@ pub(crate) fn build_image_with_dockerfile(options: DockerBuildOptions) -> Result
     }
 
     let needs_fallback_push = if options.use_buildx {
-        configure_buildx_output(&mut cmd, options.push, options.buildx_supports_push)
+        configure_buildx_output(
+            &mut cmd,
+            options.push,
+            options.buildx_supports_push,
+            options.separate_push,
+        )
     } else {
         options.push
     };
@@ -244,4 +251,46 @@ pub(crate) fn build_image_with_dockerfile(options: DockerBuildOptions) -> Result
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::configure_buildx_output;
+    use std::process::Command;
+
+    fn args(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn buildx_uses_native_push_when_supported_by_default() {
+        let mut cmd = Command::new("docker");
+
+        let fallback = configure_buildx_output(&mut cmd, true, true, false);
+
+        assert!(!fallback);
+        assert_eq!(args(&cmd), vec!["--push"]);
+    }
+
+    #[test]
+    fn buildx_separate_push_forces_load_and_fallback_push() {
+        let mut cmd = Command::new("docker");
+
+        let fallback = configure_buildx_output(&mut cmd, true, true, true);
+
+        assert!(fallback);
+        assert_eq!(args(&cmd), vec!["--load"]);
+    }
+
+    #[test]
+    fn buildx_without_push_loads_without_fallback_push() {
+        let mut cmd = Command::new("docker");
+
+        let fallback = configure_buildx_output(&mut cmd, false, true, true);
+
+        assert!(!fallback);
+        assert_eq!(args(&cmd), vec!["--load"]);
+    }
 }

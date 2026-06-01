@@ -669,6 +669,40 @@ async fn report_failed_status(
     }
 }
 
+/// Fetch fresh deployment registry credentials, log in, and push an already
+/// local image. Used by `--separate-push` so short-lived registry credentials
+/// are minted immediately before the push rather than before a long build.
+async fn push_with_fresh_registry_credentials(
+    http_client: &Client,
+    backend_url: &str,
+    provider: &crate::token_source::TokenProvider,
+    container_cli: &str,
+    project_name: &str,
+    deployment_id: &str,
+    image_tag: &str,
+) -> Result<()> {
+    let registry_credentials = fetch_deployment_registry_credentials(
+        http_client,
+        backend_url,
+        provider,
+        project_name,
+        deployment_id,
+    )
+    .await?;
+    let token = token_with_retry(provider).await?;
+    login_to_registry(
+        http_client,
+        backend_url,
+        &token,
+        container_cli,
+        &registry_credentials,
+        project_name,
+        deployment_id,
+    )
+    .await?;
+    build::docker_push(container_cli, image_tag)
+}
+
 /// Fetch registry push credentials scoped to a specific deployment.
 async fn fetch_deployment_registry_credentials(
     http_client: &Client,
@@ -977,28 +1011,6 @@ pub async fn create_deployment(
                 None => config.get_container_cli().command().to_string(),
             };
 
-            // Fetch deployment-scoped registry credentials (provider re-resolves
-            // a fresh token and retries once on 401).
-            let registry_credentials = fetch_deployment_registry_credentials(
-                http_client,
-                backend_url,
-                &provider,
-                deploy_opts.project_name,
-                &deployment_info.deployment_id,
-            )
-            .await?;
-
-            login_to_registry(
-                http_client,
-                backend_url,
-                &token,
-                &container_cli,
-                &registry_credentials,
-                deploy_opts.project_name,
-                &deployment_info.deployment_id,
-            )
-            .await?;
-
             // Pull the source image for the configured platform.
             let backend_platform =
                 fetch_backend_platform_hint(http_client, backend_url, &token).await?;
@@ -1058,7 +1070,39 @@ pub async fn create_deployment(
             .await?;
 
             // Push to Rise registry
-            if let Err(e) = build::docker_push(&container_cli, &deployment_info.image_tag) {
+            let push_result = if deploy_opts.build_args.separate_push {
+                push_with_fresh_registry_credentials(
+                    http_client,
+                    backend_url,
+                    &provider,
+                    &container_cli,
+                    deploy_opts.project_name,
+                    &deployment_info.deployment_id,
+                    &deployment_info.image_tag,
+                )
+                .await
+            } else {
+                let registry_credentials = fetch_deployment_registry_credentials(
+                    http_client,
+                    backend_url,
+                    &provider,
+                    deploy_opts.project_name,
+                    &deployment_info.deployment_id,
+                )
+                .await?;
+                login_to_registry(
+                    http_client,
+                    backend_url,
+                    &token,
+                    &container_cli,
+                    &registry_credentials,
+                    deploy_opts.project_name,
+                    &deployment_info.deployment_id,
+                )
+                .await?;
+                build::docker_push(&container_cli, &deployment_info.image_tag)
+            };
+            if let Err(e) = push_result {
                 report_failed_status(
                     http_client,
                     backend_url,
@@ -1124,15 +1168,6 @@ pub async fn create_deployment(
         // Fetch platform hint and credentials for the build-from-source path.
         let backend_platform =
             fetch_backend_platform_hint(http_client, backend_url, &token).await?;
-        let registry_credentials = fetch_deployment_registry_credentials(
-            http_client,
-            backend_url,
-            &provider,
-            deploy_opts.project_name,
-            &deployment_info.deployment_id,
-        )
-        .await?;
-
         let options = BuildOptions::from_build_args(
             config,
             deployment_info.image_tag.clone(),
@@ -1143,16 +1178,27 @@ pub async fn create_deployment(
         );
         log_platform_choice(&options.platform, options.platform_source, "Building");
 
-        login_to_registry(
-            http_client,
-            backend_url,
-            &token,
-            options.container_cli.command(),
-            &registry_credentials,
-            deploy_opts.project_name,
-            &deployment_info.deployment_id,
-        )
-        .await?;
+        if !deploy_opts.build_args.separate_push {
+            let registry_credentials = fetch_deployment_registry_credentials(
+                http_client,
+                backend_url,
+                &provider,
+                deploy_opts.project_name,
+                &deployment_info.deployment_id,
+            )
+            .await?;
+            let token = token_with_retry(&provider).await?;
+            login_to_registry(
+                http_client,
+                backend_url,
+                &token,
+                options.container_cli.command(),
+                &registry_credentials,
+                deploy_opts.project_name,
+                &deployment_info.deployment_id,
+            )
+            .await?;
+        }
 
         // Step 3: Update status to 'building'
         let token = token_with_retry(&provider).await?;
@@ -1168,7 +1214,8 @@ pub async fn create_deployment(
         .await?;
 
         // Step 4: Build and push image using build module
-        let options = options.with_push(true);
+        let options = options.with_push(!deploy_opts.build_args.separate_push);
+        let container_cli = options.container_cli.command().to_string();
 
         if let Err(e) = build::build_image(options) {
             report_failed_status(
@@ -1181,6 +1228,30 @@ pub async fn create_deployment(
             )
             .await;
             return Err(e);
+        }
+        if deploy_opts.build_args.separate_push {
+            if let Err(e) = push_with_fresh_registry_credentials(
+                http_client,
+                backend_url,
+                &provider,
+                &container_cli,
+                deploy_opts.project_name,
+                &deployment_info.deployment_id,
+                &deployment_info.image_tag,
+            )
+            .await
+            {
+                report_failed_status(
+                    http_client,
+                    backend_url,
+                    &provider,
+                    deploy_opts.project_name,
+                    &deployment_info.deployment_id,
+                    &e.to_string(),
+                )
+                .await;
+                return Err(e);
+            }
         }
 
         // Step 5: Mark as pushed (controller will take over deployment)
@@ -1309,41 +1380,44 @@ async fn build_and_push_multi_container(
             Some(per_container_toml),
             backend_platform.clone(),
         )
-        .with_push(true);
+        .with_push(!deploy_opts.build_args.separate_push);
+        let container_cli = options.container_cli.command().to_string();
 
-        // Re-mint registry credentials only when the previous container's are
-        // expiring soon (or none have been fetched yet). A long multi-container
-        // build (cold BuildKit cache × N containers) can outlast the issued
-        // token's `expires_in` and 401 a later push, but re-minting + logging in
-        // before every container is wasteful when the credentials are still
-        // good. When the backend returns no credentials (empty username) we rely
-        // on credentials already present on the machine and never refetch.
-        // See #352 and its follow-up.
-        let need_fresh = match &cached_creds {
-            Some(c) => !c.is_reusable(min_remaining, Instant::now()),
-            None => true,
-        };
-        if need_fresh {
-            let fresh_creds = fetch_deployment_registry_credentials(
-                http_client,
-                backend_url,
-                provider,
-                deploy_opts.project_name,
-                &deployment_info.deployment_id,
-            )
-            .await?;
-            let token = token_with_retry(provider).await?;
-            login_to_registry(
-                http_client,
-                backend_url,
-                &token,
-                options.container_cli.command(),
-                &fresh_creds,
-                deploy_opts.project_name,
-                &deployment_info.deployment_id,
-            )
-            .await?;
-            cached_creds = Some(TimedRegistryCredentials::new(fresh_creds));
+        if !deploy_opts.build_args.separate_push {
+            // Re-mint registry credentials only when the previous container's are
+            // expiring soon (or none have been fetched yet). A long multi-container
+            // build (cold BuildKit cache × N containers) can outlast the issued
+            // token's `expires_in` and 401 a later push, but re-minting + logging in
+            // before every container is wasteful when the credentials are still
+            // good. When the backend returns no credentials (empty username) we rely
+            // on credentials already present on the machine and never refetch.
+            // See #352 and its follow-up.
+            let need_fresh = match &cached_creds {
+                Some(c) => !c.is_reusable(min_remaining, Instant::now()),
+                None => true,
+            };
+            if need_fresh {
+                let fresh_creds = fetch_deployment_registry_credentials(
+                    http_client,
+                    backend_url,
+                    provider,
+                    deploy_opts.project_name,
+                    &deployment_info.deployment_id,
+                )
+                .await?;
+                let token = token_with_retry(provider).await?;
+                login_to_registry(
+                    http_client,
+                    backend_url,
+                    &token,
+                    &container_cli,
+                    &fresh_creds,
+                    deploy_opts.project_name,
+                    &deployment_info.deployment_id,
+                )
+                .await?;
+                cached_creds = Some(TimedRegistryCredentials::new(fresh_creds));
+            }
         }
 
         log_platform_choice(&options.platform, options.platform_source, "Building");
@@ -1361,6 +1435,31 @@ async fn build_and_push_multi_container(
             )
             .await;
             return Err(e);
+        }
+        if deploy_opts.build_args.separate_push {
+            if let Err(e) = push_with_fresh_registry_credentials(
+                http_client,
+                backend_url,
+                provider,
+                &container_cli,
+                deploy_opts.project_name,
+                &deployment_info.deployment_id,
+                image_tag,
+            )
+            .await
+            {
+                let msg = format!("Push of container '{}' failed: {}", container.name, e);
+                report_failed_status(
+                    http_client,
+                    backend_url,
+                    provider,
+                    deploy_opts.project_name,
+                    &deployment_info.deployment_id,
+                    &msg,
+                )
+                .await;
+                return Err(e);
+            }
         }
         info!("  ✓ Pushed container '{}'", container.name);
     }
