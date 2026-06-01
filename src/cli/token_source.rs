@@ -219,8 +219,9 @@ impl CommandToken {
         if cached.exp.is_some() {
             return cached.is_fresh(now_ts);
         }
-        // Opaque output: use wall-clock TTL. This assumes the external command
-        // returns tokens that are valid for at least the configured TTL.
+        // Opaque output: use wall-clock TTL as the refresh threshold. The
+        // external command should return tokens valid beyond this threshold by
+        // enough margin for any local work before the next backend request.
         minted_at.elapsed() < self.ttl
     }
 
