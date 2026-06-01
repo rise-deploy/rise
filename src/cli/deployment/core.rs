@@ -967,8 +967,9 @@ pub async fn create_deployment(
             eprintln!("\n⚠️  Caught Ctrl+C, cancelling deployment...");
 
             // Resolve a fresh token for the cancel request (the deploy may have
-            // run long enough that the original token expired). See #352.
-            let token = match provider_clone.token().await {
+            // run long enough that the original token expired). Use the shared
+            // retry policy for consistency with the rest of the deploy path. See #352.
+            let token = match token_with_retry(&provider_clone).await {
                 Ok(t) => t,
                 Err(e) => {
                     warn!(
