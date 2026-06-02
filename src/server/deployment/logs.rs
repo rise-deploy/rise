@@ -574,13 +574,15 @@ impl RuntimeLogBackend for DockerLogBackend {
             Some(t) => t.max(1).to_string(),
             None => "all".to_string(),
         };
-        let since = query.since_seconds.unwrap_or_else(|| {
-            query
-                .start_time
-                .map(|t| t.timestamp())
-                .filter(|t| *t > 0)
-                .unwrap_or(0)
-        });
+        // `since_seconds` is a *relative* "N seconds ago" value (matching the
+        // K8s/Loki backends), but bollard's `LogsOptions.since` is an *absolute*
+        // UNIX epoch timestamp. Convert relative → absolute. `start_time` is
+        // already an absolute instant, so it passes through as-is.
+        let since = query
+            .since_seconds
+            .map(|s| Utc::now().timestamp() - s)
+            .or_else(|| query.start_time.map(|t| t.timestamp()).filter(|t| *t > 0))
+            .unwrap_or(0);
 
         let options = LogsOptions::<String> {
             follow: query.follow && is_followable_status(&deployment.status),

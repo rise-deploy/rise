@@ -262,13 +262,15 @@ mod tests {
     ) -> sqlx::Result<()> {
         use uuid::Uuid;
 
+        // Election is an atomic `INSERT ... ON CONFLICT` race won by whichever
+        // `try_acquire` lands first, so spawning both tasks together and then
+        // asserting the first-spawned one wins is inherently flaky. Make it
+        // deterministic: spawn ONLY the holder, wait until it has actually
+        // acquired the lease, and THEN spawn the non-holder. Because the held
+        // lease has not expired, `try_acquire`'s `ON CONFLICT` guard
+        // (`expires_at < NOW() OR holder_id = $2`) refuses to hand the lease to
+        // a different holder_id, so the non-holder deterministically loses.
         let holder = LeaderElection::spawn(
-            pool.clone(),
-            "rise-test-as-leader-skip",
-            Uuid::new_v4(),
-            Duration::from_millis(1500),
-        );
-        let non_holder = LeaderElection::spawn(
             pool.clone(),
             "rise-test-as-leader-skip",
             Uuid::new_v4(),
@@ -279,7 +281,25 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         assert!(holder.is_leader(), "holder should win election");
-        assert!(!non_holder.is_leader(), "non-holder should not be leader");
+
+        // Only now spawn the non-holder; it contends for an already-held,
+        // unexpired lease and must fail to take over.
+        let non_holder = LeaderElection::spawn(
+            pool.clone(),
+            "rise-test-as-leader-skip",
+            Uuid::new_v4(),
+            Duration::from_millis(1500),
+        );
+        // Give the non-holder's background task a chance to attempt (and fail)
+        // its acquire, then confirm it never became leader.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while tokio::time::Instant::now() < deadline {
+            assert!(
+                !non_holder.is_leader(),
+                "non-holder must never take over the held, unexpired lease"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
 
         let s = GlobalSchedule::new(pool, "test-as-leader-skip", Duration::from_secs(60));
         assert!(

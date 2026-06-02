@@ -227,7 +227,14 @@ impl DockerReconciler {
             db_deployments::list_non_terminal_for_project(&self.db_pool, project.id).await?;
 
         // 2. Compute desired containers across all infra-bearing deployments.
+        // Track deployments whose desired computation FAILED this tick: their
+        // existing containers must be protected from GC so a transient error
+        // (e.g. a brief KMS/encryption outage, a failed DB read, or a bad
+        // runtime-container deserialization) doesn't tear down a healthy,
+        // actively-serving container. This mirrors the K8s/Metacontroller
+        // model, which leaves existing children untouched on a failed sync.
         let mut desired: Vec<DesiredContainer> = Vec::new();
+        let mut protected_deployment_ids: HashSet<String> = HashSet::new();
         for deployment in &non_terminal {
             if !should_have_infrastructure(deployment) {
                 continue;
@@ -240,15 +247,23 @@ impl DockerReconciler {
                 Err(e) => {
                     warn!(
                         deployment_id = %deployment.deployment_id,
-                        "Failed to compute desired containers: {:?}", e
+                        "Failed to compute desired containers; protecting its existing \
+                         containers from GC this tick: {:?}",
+                        e
                     );
+                    protected_deployment_ids.insert(deployment.deployment_id.clone());
                 }
             }
         }
 
         // 3. Enumerate actual Rise containers for this project, diff, apply.
         let actual = self.list_actual_containers(project).await?;
-        let actions = diff_desired_vs_actual(&desired, &actual, &self.config.container_prefix);
+        let actions = diff_desired_vs_actual(
+            &desired,
+            &actual,
+            &self.config.container_prefix,
+            &protected_deployment_ids,
+        );
         self.apply_actions(project, &desired, &actions).await?;
 
         // 4. Health → status (probe routable containers, transition).
@@ -627,6 +642,9 @@ impl DockerReconciler {
                 Some(ActualContainer {
                     id: s.id.unwrap_or_default(),
                     name,
+                    deployment_id_label: labels
+                        .get(&labels::ns_key(ns, labels::SUFFIX_DEPLOYMENT_ID))
+                        .cloned(),
                     image_label: labels.get(&labels::ns_key(ns, SUFFIX_IMAGE)).cloned(),
                     env_hash_label: labels.get(&labels::ns_key(ns, SUFFIX_ENV_HASH)).cloned(),
                     route_hash_label: labels
@@ -1055,6 +1073,11 @@ impl DockerReconciler {
 pub struct ActualContainer {
     pub id: String,
     pub name: String,
+    /// The `deployment-id` bookkeeping label stamped on the live container.
+    /// Used by the diff to protect a container from GC when its owning
+    /// deployment's desired computation failed this tick. `None` for legacy
+    /// containers created before this label was read (treated as unprotected).
+    pub deployment_id_label: Option<String>,
     pub image_label: Option<String>,
     pub env_hash_label: Option<String>,
     /// The `route-hash` bookkeeping label stamped on the live container (sha256
@@ -1095,10 +1118,20 @@ pub enum ReconcileAction {
 /// Pure: no daemon access. `container_prefix` is the configured prefix used to
 /// derive each desired container's deterministic name so it matches the names
 /// stamped by `apply_actions` / `build_container`.
+///
+/// `protected_deployment_ids` is the set of deployment-ids whose desired
+/// computation FAILED this tick. An actual container whose `deployment-id`
+/// label is in this set is never classified as `Remove`, even though it has no
+/// desired match — its absence from `desired` is an artifact of the transient
+/// failure, not a genuine orphan. This keeps healthy, actively-serving
+/// containers running across a brief KMS/DB hiccup, matching the K8s model
+/// (children untouched on a failed sync). Containers for deployments that
+/// successfully computed and are genuinely orphaned still get GC'd.
 pub fn diff_desired_vs_actual(
     desired: &[DesiredContainer],
     actual: &[ActualContainer],
     container_prefix: &str,
+    protected_deployment_ids: &HashSet<String>,
 ) -> Vec<ReconcileAction> {
     // Desired containers keyed by their deterministic name.
     let mut desired_by_name: HashMap<String, &DesiredContainer> = HashMap::new();
@@ -1152,12 +1185,22 @@ pub fn diff_desired_vs_actual(
     }
 
     for a in actual {
-        if !matched_actual.contains(&a.name) {
-            actions.push(ReconcileAction::Remove {
-                id: a.id.clone(),
-                name: a.name.clone(),
-            });
+        if matched_actual.contains(&a.name) {
+            continue;
         }
+        // Protect containers belonging to a deployment whose desired
+        // computation failed this tick: treat them as matched rather than
+        // orphaned, so a transient error can't GC a healthy container.
+        if a.deployment_id_label
+            .as_deref()
+            .is_some_and(|id| protected_deployment_ids.contains(id))
+        {
+            continue;
+        }
+        actions.push(ReconcileAction::Remove {
+            id: a.id.clone(),
+            name: a.name.clone(),
+        });
     }
 
     // Deterministic ordering for testability.
@@ -1280,6 +1323,12 @@ mod tests {
         }
     }
 
+    /// Empty protected-deployment-ids set for the common case where no
+    /// deployment failed desired computation.
+    fn no_protected() -> HashSet<String> {
+        HashSet::new()
+    }
+
     fn name_of(d: &DesiredContainer) -> String {
         container_builder::container_name(
             "rise",
@@ -1290,40 +1339,41 @@ mod tests {
         )
     }
 
+    /// A live container belonging to the `desired()` helper's deployment.
+    fn actual_for(d: &DesiredContainer, image: &str, env_hash: &str) -> ActualContainer {
+        ActualContainer {
+            id: "cid".to_string(),
+            name: name_of(d),
+            deployment_id_label: Some(d.deployment_id.clone()),
+            image_label: Some(image.to_string()),
+            env_hash_label: Some(env_hash.to_string()),
+            route_hash_label: Some("rh-active".to_string()),
+            state: Some("running".to_string()),
+        }
+    }
+
     #[test]
     fn diff_creates_missing() {
         let d = desired("app", "img:1", "h1");
-        let actions = diff_desired_vs_actual(std::slice::from_ref(&d), &[], "rise");
+        let actions =
+            diff_desired_vs_actual(std::slice::from_ref(&d), &[], "rise", &no_protected());
         assert_eq!(actions, vec![ReconcileAction::Create { name: name_of(&d) }]);
     }
 
     #[test]
     fn diff_no_action_when_matched() {
         let d = desired("app", "img:1", "h1");
-        let actual = vec![ActualContainer {
-            id: "cid".to_string(),
-            name: name_of(&d),
-            image_label: Some("img:1".to_string()),
-            env_hash_label: Some("h1".to_string()),
-            route_hash_label: Some("rh-active".to_string()),
-            state: Some("running".to_string()),
-        }];
-        let actions = diff_desired_vs_actual(&[d], &actual, "rise");
+        let actual = vec![actual_for(&d, "img:1", "h1")];
+        let actions = diff_desired_vs_actual(&[d], &actual, "rise", &no_protected());
         assert!(actions.is_empty());
     }
 
     #[test]
     fn diff_recreates_on_image_drift() {
         let d = desired("app", "img:2", "h1");
-        let actual = vec![ActualContainer {
-            id: "cid".to_string(),
-            name: name_of(&d),
-            image_label: Some("img:1".to_string()),
-            env_hash_label: Some("h1".to_string()),
-            route_hash_label: Some("rh-active".to_string()),
-            state: Some("running".to_string()),
-        }];
-        let actions = diff_desired_vs_actual(std::slice::from_ref(&d), &actual, "rise");
+        let actual = vec![actual_for(&d, "img:1", "h1")];
+        let actions =
+            diff_desired_vs_actual(std::slice::from_ref(&d), &actual, "rise", &no_protected());
         assert_eq!(
             actions,
             vec![ReconcileAction::Recreate {
@@ -1336,15 +1386,9 @@ mod tests {
     #[test]
     fn diff_recreates_on_env_hash_drift() {
         let d = desired("app", "img:1", "h2");
-        let actual = vec![ActualContainer {
-            id: "cid".to_string(),
-            name: name_of(&d),
-            image_label: Some("img:1".to_string()),
-            env_hash_label: Some("h1".to_string()),
-            route_hash_label: Some("rh-active".to_string()),
-            state: Some("running".to_string()),
-        }];
-        let actions = diff_desired_vs_actual(std::slice::from_ref(&d), &actual, "rise");
+        let actual = vec![actual_for(&d, "img:1", "h1")];
+        let actions =
+            diff_desired_vs_actual(std::slice::from_ref(&d), &actual, "rise", &no_protected());
         assert_eq!(
             actions,
             vec![ReconcileAction::Recreate {
@@ -1361,14 +1405,11 @@ mod tests {
         let d = desired("app", "img:1", "h1");
         for state in [Some("exited"), Some("created"), Some("dead"), None] {
             let actual = vec![ActualContainer {
-                id: "cid".to_string(),
-                name: name_of(&d),
-                image_label: Some("img:1".to_string()),
-                env_hash_label: Some("h1".to_string()),
-                route_hash_label: Some("rh-active".to_string()),
                 state: state.map(str::to_string),
+                ..actual_for(&d, "img:1", "h1")
             }];
-            let actions = diff_desired_vs_actual(std::slice::from_ref(&d), &actual, "rise");
+            let actions =
+                diff_desired_vs_actual(std::slice::from_ref(&d), &actual, "rise", &no_protected());
             assert_eq!(
                 actions,
                 vec![ReconcileAction::Recreate {
@@ -1385,12 +1426,13 @@ mod tests {
         let actual = vec![ActualContainer {
             id: "old".to_string(),
             name: "rise_myapp_default_oldid_app".to_string(),
+            deployment_id_label: Some("oldid".to_string()),
             image_label: Some("img:1".to_string()),
             env_hash_label: Some("h1".to_string()),
             route_hash_label: Some("rh-active".to_string()),
             state: Some("running".to_string()),
         }];
-        let actions = diff_desired_vs_actual(&[], &actual, "rise");
+        let actions = diff_desired_vs_actual(&[], &actual, "rise", &no_protected());
         assert_eq!(
             actions,
             vec![ReconcileAction::Remove {
@@ -1407,12 +1449,14 @@ mod tests {
         let actual = vec![ActualContainer {
             id: "old".to_string(),
             name: "rise_myapp_default_oldid_app".to_string(),
+            deployment_id_label: Some("oldid".to_string()),
             image_label: Some("img:1".to_string()),
             env_hash_label: Some("h1".to_string()),
             route_hash_label: Some("rh-active".to_string()),
             state: Some("running".to_string()),
         }];
-        let actions = diff_desired_vs_actual(std::slice::from_ref(&new), &actual, "rise");
+        let actions =
+            diff_desired_vs_actual(std::slice::from_ref(&new), &actual, "rise", &no_protected());
         assert_eq!(
             actions,
             vec![
@@ -1428,6 +1472,68 @@ mod tests {
     }
 
     #[test]
+    fn diff_protects_container_when_its_deployment_failed_to_compute() {
+        // A deployment whose desired computation failed this tick (e.g. a brief
+        // KMS/DB hiccup) is absent from `desired`, so its still-running container
+        // looks orphaned. With its deployment-id protected, the diff must NOT
+        // remove it — matching the K8s model (children untouched on failed sync).
+        let actual = vec![ActualContainer {
+            id: "live".to_string(),
+            name: "rise_myapp_default_protectedid_app".to_string(),
+            deployment_id_label: Some("protectedid".to_string()),
+            image_label: Some("img:1".to_string()),
+            env_hash_label: Some("h1".to_string()),
+            route_hash_label: Some("rh-active".to_string()),
+            state: Some("running".to_string()),
+        }];
+        let mut protected = HashSet::new();
+        protected.insert("protectedid".to_string());
+        let actions = diff_desired_vs_actual(&[], &actual, "rise", &protected);
+        assert!(
+            actions.is_empty(),
+            "protected deployment's container must not be GC'd"
+        );
+    }
+
+    #[test]
+    fn diff_still_gcs_unprotected_orphan_alongside_protected() {
+        // Only the failed deployment's container is protected; a genuinely
+        // orphaned container belonging to a different, successfully-computed
+        // deployment is still removed.
+        let actual = vec![
+            ActualContainer {
+                id: "protected".to_string(),
+                name: "rise_myapp_default_protectedid_app".to_string(),
+                deployment_id_label: Some("protectedid".to_string()),
+                image_label: Some("img:1".to_string()),
+                env_hash_label: Some("h1".to_string()),
+                route_hash_label: Some("rh-active".to_string()),
+                state: Some("running".to_string()),
+            },
+            ActualContainer {
+                id: "orphan".to_string(),
+                name: "rise_myapp_default_orphanid_app".to_string(),
+                deployment_id_label: Some("orphanid".to_string()),
+                image_label: Some("img:1".to_string()),
+                env_hash_label: Some("h1".to_string()),
+                route_hash_label: Some("rh-active".to_string()),
+                state: Some("running".to_string()),
+            },
+        ];
+        let mut protected = HashSet::new();
+        protected.insert("protectedid".to_string());
+        let actions = diff_desired_vs_actual(&[], &actual, "rise", &protected);
+        assert_eq!(
+            actions,
+            vec![ReconcileAction::Remove {
+                id: "orphan".to_string(),
+                name: "rise_myapp_default_orphanid_app".to_string()
+            }],
+            "only the unprotected orphan should be removed"
+        );
+    }
+
+    #[test]
     fn diff_recreates_on_route_hash_drift_active_gains_labels() {
         // A deployment that just became active: desired now carries the active
         // route-hash, but the live container was created while non-routable and
@@ -1436,15 +1542,12 @@ mod tests {
         // must be recreated WITH the Traefik labels.
         let d = desired("app", "img:1", "h1"); // route_hash = "rh-active"
         let actual = vec![ActualContainer {
-            id: "cid".to_string(),
-            name: name_of(&d),
-            image_label: Some("img:1".to_string()),
-            env_hash_label: Some("h1".to_string()),
             // Was created non-routable (empty route-hash).
             route_hash_label: Some(String::new()),
-            state: Some("running".to_string()),
+            ..actual_for(&d, "img:1", "h1")
         }];
-        let actions = diff_desired_vs_actual(std::slice::from_ref(&d), &actual, "rise");
+        let actions =
+            diff_desired_vs_actual(std::slice::from_ref(&d), &actual, "rise", &no_protected());
         assert_eq!(
             actions,
             vec![ReconcileAction::Recreate {
@@ -1466,12 +1569,14 @@ mod tests {
         let actual = vec![ActualContainer {
             id: "cid".to_string(),
             name: name_of(&d),
+            deployment_id_label: Some(d.deployment_id.clone()),
             image_label: Some("img:1".to_string()),
             env_hash_label: Some("h1".to_string()),
             route_hash_label: Some("rh-active".to_string()),
             state: Some("running".to_string()),
         }];
-        let actions = diff_desired_vs_actual(std::slice::from_ref(&d), &actual, "rise");
+        let actions =
+            diff_desired_vs_actual(std::slice::from_ref(&d), &actual, "rise", &no_protected());
         assert_eq!(
             actions,
             vec![ReconcileAction::Recreate {
@@ -1489,12 +1594,14 @@ mod tests {
         let actual = vec![ActualContainer {
             id: "cid".to_string(),
             name: name_of(&d),
+            deployment_id_label: Some(d.deployment_id.clone()),
             image_label: Some("img:1".to_string()),
             env_hash_label: Some("h1".to_string()),
             route_hash_label: Some("rh-active".to_string()),
             state: Some("running".to_string()),
         }];
-        let actions = diff_desired_vs_actual(std::slice::from_ref(&d), &actual, "rise");
+        let actions =
+            diff_desired_vs_actual(std::slice::from_ref(&d), &actual, "rise", &no_protected());
         assert!(actions.is_empty(), "matching container must not recreate");
     }
 
