@@ -1288,6 +1288,28 @@ impl AppState {
                 ingress_schema.clone(),
                 *ingress_port,
             )
+        } else if let Some(crate::server::settings::DeploymentControllerSettings::Docker {
+            access_classes,
+            production_ingress_url_template,
+            staging_ingress_url_template,
+            environment_ingress_url_template,
+            ingress_schema,
+            ingress_port,
+            ..
+        }) = &settings.deployment_controller
+        {
+            let filtered: std::collections::HashMap<_, _> = access_classes
+                .iter()
+                .filter_map(|(k, v)| v.as_ref().map(|ac| (k.clone(), ac.clone())))
+                .collect();
+            (
+                Arc::new(filtered),
+                Some(production_ingress_url_template.clone()),
+                staging_ingress_url_template.clone(),
+                environment_ingress_url_template.clone(),
+                ingress_schema.clone(),
+                *ingress_port,
+            )
         } else {
             (
                 Arc::new(std::collections::HashMap::new()),

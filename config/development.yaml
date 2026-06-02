@@ -107,6 +107,9 @@ deployment_logs:
 #   ingress_port: 80
 #   reconcile_interval_secs: 5
 #   controller_class_name: "default"
+#   # access_classes is optional; it defaults to a single permissive "public"
+#   # class. The Docker runtime does not enforce ingress auth — these only gate
+#   # the typed project API's access-class validation.
 #   # The controller stamps Traefik labels on each app container, e.g. for project
 #   # `my-app` (group `default`, container `app`, app port 8080):
 #   #   traefik.http.routers.my-app-default-app.rule=Host(`my-app.rise.localhost`)

@@ -538,6 +538,29 @@
         {
           "description": "Docker deployment controller.\n\nDeploys app containers to a single Docker host and lets Traefik's Docker\nprovider route to them via container labels Rise stamps. No Kubernetes,\nno Metacontroller — reconciliation runs in-process (see\n`controller::docker::DockerReconciler`).",
           "properties": {
+            "access_classes": {
+              "additionalProperties": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/AccessClass"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "default": {
+                "public": {
+                  "access_requirement": "None",
+                  "custom_annotations": {},
+                  "description": "Fully public — no authentication required.",
+                  "display_name": "Public",
+                  "ingress_class": "traefik"
+                }
+              },
+              "description": "Access classes defining ingress authentication levels, keyed by\nidentifier (e.g. \"public\"). Mirrors the Kubernetes variant so the\ntyped project API can validate a project's access class. The Docker\nruntime does not enforce ingress authentication, so only a permissive\n\"public\" class is provided by default; operators may override.\nUse `null` in YAML to remove an inherited access class.",
+              "type": "object"
+            },
             "container_prefix": {
               "default": "rise",
               "description": "Prefix for generated container names (`<prefix>_<project>_...`).\nDefaults to `rise`.",

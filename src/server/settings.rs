@@ -623,6 +623,22 @@ fn default_container_prefix() -> String {
 }
 
 #[cfg(feature = "backend")]
+fn default_docker_access_classes() -> std::collections::HashMap<String, Option<AccessClass>> {
+    let mut classes = std::collections::HashMap::new();
+    classes.insert(
+        "public".to_string(),
+        Some(AccessClass {
+            display_name: "Public".to_string(),
+            description: "Fully public — no authentication required.".to_string(),
+            ingress_class: "traefik".to_string(),
+            access_requirement: AccessRequirement::None,
+            custom_annotations: std::collections::HashMap::new(),
+        }),
+    );
+    classes
+}
+
+#[cfg(feature = "backend")]
 fn default_reconcile_interval_secs() -> u64 {
     5
 }
@@ -1099,6 +1115,15 @@ pub enum DeploymentControllerSettings {
         /// Must contain both `{project_name}` and `{environment}`.
         #[serde(default)]
         environment_ingress_url_template: Option<String>,
+
+        /// Access classes defining ingress authentication levels, keyed by
+        /// identifier (e.g. "public"). Mirrors the Kubernetes variant so the
+        /// typed project API can validate a project's access class. The Docker
+        /// runtime does not enforce ingress authentication, so only a permissive
+        /// "public" class is provided by default; operators may override.
+        /// Use `null` in YAML to remove an inherited access class.
+        #[serde(default = "default_docker_access_classes")]
+        access_classes: std::collections::HashMap<String, Option<AccessClass>>,
 
         /// Optional port appended to all generated ingress URLs (e.g. `8080`).
         #[serde(default)]
