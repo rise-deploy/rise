@@ -49,9 +49,20 @@ pub struct DesiredContainer {
     /// Routes for this container (empty for workers / unrouted containers).
     pub routes: Vec<DesiredRoute>,
     /// Whether this container should be routable (emit Traefik router/service
-    /// labels). `false` for superseded (`Terminating`) deployments so their
-    /// `Host(...)` rule is dropped and only the active deployment is routed.
+    /// labels). `true` only for the *active* deployment of its group (mirroring
+    /// the K8s path, which builds the Ingress from `is_active` deployments).
+    /// Everything else — `Deploying`/`Pushed`/superseded/`Terminating` — is
+    /// `false` so its `Host(...)` rule is dropped and only the active deployment
+    /// is routed.
     pub routable: bool,
+    /// sha256 of the fully-rendered Traefik label set for this container (empty
+    /// for a non-routable container). Precomputed by the reconciler via
+    /// [`route_hash_for`] so the (pure) diff can compare it against the
+    /// `route-hash` bookkeeping label stamped on the actual container, and force
+    /// a recreate when routing changes — including a deployment becoming or
+    /// ceasing to be active. Docker can't mutate a running container's labels in
+    /// place, so a routing transition must be reconciled by recreation.
+    pub route_hash: String,
 }
 
 /// Static controller configuration the builder needs.
@@ -122,7 +133,15 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
         &desired.container,
     );
 
-    // ── Labels: bookkeeping + Traefik (routable only) ──────────────────
+    // ── Labels: Traefik (routable only) ────────────────────────────────
+    // Render the Traefik label set first so its hash can be stamped as a
+    // bookkeeping label (`route-hash`). That hash lets the diff detect routing
+    // transitions — including a deployment becoming/ceasing to be active — that
+    // Docker can't apply to a running container's labels in place.
+    let traefik_labels = render_traefik_labels_for(desired, cfg);
+    let route_hash = labels::hash_traefik_labels(&traefik_labels);
+
+    // ── Labels: bookkeeping ─────────────────────────────────────────────
     let mut all_labels = BookkeepingLabels {
         label_namespace: cfg.label_namespace,
         controller_class: cfg.controller_class,
@@ -134,54 +153,10 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
         environment: desired.environment.as_deref(),
         env_hash: &desired.env_hash,
         image: &desired.image,
+        route_hash: &route_hash,
     }
     .render();
-
-    // Superseded (Terminating) deployments keep their container running until
-    // the active replacement is healthy, but must not advertise a Traefik
-    // router — otherwise two routers match the same Host during the
-    // supersession window and traffic can land on the old deployment.
-    if let Some(port) = desired.port.filter(|_| desired.routable) {
-        // One router per (host-set × route). Single-container apps have a single
-        // `/` route, so this yields exactly one router. Longest path-prefix
-        // first matches the nginx semantics used by the K8s path.
-        let mut routes = desired.routes.clone();
-        routes.sort_by(|a, b| {
-            let al = a.path_prefix.as_deref().unwrap_or("/").len();
-            let bl = b.path_prefix.as_deref().unwrap_or("/").len();
-            bl.cmp(&al)
-        });
-        for (idx, route) in routes.iter().enumerate() {
-            if route.hosts.is_empty() {
-                continue;
-            }
-            // Include the deployment id so a superseded (Terminating) container
-            // and its replacement carry distinct Traefik router/service names
-            // during a rollout — otherwise both would expose identical router
-            // labels for up to one reconcile interval and collide. The Host
-            // rule stays the same so traffic keeps resolving to the project.
-            let base = labels::sanitize_router_name(&format!(
-                "{}-{}-{}-{}",
-                desired.project, desired.deployment_group, desired.deployment_id, desired.container
-            ));
-            // Distinct router per route so multiple path prefixes don't collide.
-            let router_name = if routes.len() > 1 {
-                format!("{base}-{idx}")
-            } else {
-                base
-            };
-            let traefik = labels::render_traefik_labels(&TraefikRoute {
-                router_name: &router_name,
-                hosts: &route.hosts,
-                path_prefix: route.path_prefix.as_deref(),
-                port,
-                entrypoint: cfg.traefik_entrypoint,
-                network: cfg.traefik_network,
-                certresolver: cfg.traefik_certresolver,
-            });
-            all_labels.extend(traefik);
-        }
-    }
+    all_labels.extend(traefik_labels);
 
     // ── Env ────────────────────────────────────────────────────────────
     let env: Vec<String> = desired
@@ -235,6 +210,73 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
     BuiltContainer { name, config }
 }
 
+/// Render the full Traefik label map for a desired container.
+///
+/// Empty when the container is not routable (superseded / not-yet-active
+/// deployment), has no port (worker), or has no host to route. A
+/// not-yet-active deployment keeps its container running for health probing but
+/// must not advertise a Traefik router, otherwise two routers would match the
+/// same `Host(...)` rule and Traefik would split traffic. This mirrors the K8s
+/// path, which builds the Ingress only from the active deployment per group.
+fn render_traefik_labels_for(
+    desired: &DesiredContainer,
+    cfg: &BuilderConfig<'_>,
+) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Some(port) = desired.port.filter(|_| desired.routable) else {
+        return out;
+    };
+    // One router per (host-set × route). Single-container apps have a single
+    // `/` route, so this yields exactly one router. Longest path-prefix first
+    // matches the nginx semantics used by the K8s path.
+    let mut routes = desired.routes.clone();
+    routes.sort_by(|a, b| {
+        let al = a.path_prefix.as_deref().unwrap_or("/").len();
+        let bl = b.path_prefix.as_deref().unwrap_or("/").len();
+        bl.cmp(&al)
+    });
+    for (idx, route) in routes.iter().enumerate() {
+        if route.hosts.is_empty() {
+            continue;
+        }
+        // Include the deployment id so a superseded (Terminating) container and
+        // its replacement carry distinct Traefik router/service names during a
+        // rollout — otherwise both would expose identical router labels for up
+        // to one reconcile interval and collide. The Host rule stays the same so
+        // traffic keeps resolving to the project.
+        let base = labels::sanitize_router_name(&format!(
+            "{}-{}-{}-{}",
+            desired.project, desired.deployment_group, desired.deployment_id, desired.container
+        ));
+        // Distinct router per route so multiple path prefixes don't collide.
+        let router_name = if routes.len() > 1 {
+            format!("{base}-{idx}")
+        } else {
+            base
+        };
+        let traefik = labels::render_traefik_labels(&TraefikRoute {
+            router_name: &router_name,
+            hosts: &route.hosts,
+            path_prefix: route.path_prefix.as_deref(),
+            port,
+            entrypoint: cfg.traefik_entrypoint,
+            network: cfg.traefik_network,
+            certresolver: cfg.traefik_certresolver,
+        });
+        out.extend(traefik);
+    }
+    out
+}
+
+/// Compute the `route-hash` for a desired container without building the full
+/// create spec. Used by the reconciler's diff so a routing transition (a
+/// deployment becoming or ceasing to be active) forces a recreate that
+/// adds/removes the Traefik labels. Must stay consistent with the hash stamped
+/// by [`build_container`].
+pub fn route_hash_for(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> String {
+    labels::hash_traefik_labels(&render_traefik_labels_for(desired, cfg))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,6 +317,10 @@ mod tests {
                 path_prefix: None,
             }],
             routable: true,
+            // `build_container` recomputes the route-hash from the rendered
+            // Traefik labels, so the value stored here is irrelevant to these
+            // builder tests. `route_hash_for` is exercised separately below.
+            route_hash: String::new(),
         }
     }
 
@@ -389,6 +435,50 @@ mod tests {
             labels.get("rise.dev/container").map(String::as_str),
             Some("app")
         );
+        // The route-hash reflects the empty (non-routable) label set, so the
+        // diff sees a routing transition the moment this deployment becomes
+        // active. It must differ from a routable container's route-hash.
+        let non_routable_hash = labels.get("rise.dev/route-hash").cloned().unwrap();
+        let routable_hash = build_container(&single_container(), &test_cfg())
+            .config
+            .labels
+            .unwrap()
+            .get("rise.dev/route-hash")
+            .cloned()
+            .unwrap();
+        assert_ne!(non_routable_hash, routable_hash);
+    }
+
+    #[test]
+    fn routable_container_stamps_nonempty_route_hash_matching_route_hash_for() {
+        // A routable container carries a non-empty `route-hash`, and the diff's
+        // `route_hash_for` helper produces exactly the same value the builder
+        // stamps — so the diff comparison is exact (no spurious recreates).
+        let desired = single_container();
+        let cfg = test_cfg();
+        let built = build_container(&desired, &cfg);
+        let stamped = built
+            .config
+            .labels
+            .as_ref()
+            .unwrap()
+            .get("rise.dev/route-hash")
+            .cloned()
+            .unwrap();
+        assert!(!stamped.is_empty());
+        assert_eq!(stamped, route_hash_for(&desired, &cfg));
+    }
+
+    #[test]
+    fn route_hash_for_changes_with_routability() {
+        // Flipping `routable` (active → inactive) changes the route-hash, which
+        // is what drives the diff to recreate the container at cutover.
+        let cfg = test_cfg();
+        let mut desired = single_container();
+        let active = route_hash_for(&desired, &cfg);
+        desired.routable = false;
+        let inactive = route_hash_for(&desired, &cfg);
+        assert_ne!(active, inactive);
     }
 
     #[test]

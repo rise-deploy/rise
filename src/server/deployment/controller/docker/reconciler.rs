@@ -395,6 +395,20 @@ impl DockerReconciler {
 
     // ── Desired computation ────────────────────────────────────────────
 
+    /// Build the static [`BuilderConfig`] borrowed from this reconciler's
+    /// config. Used both to render containers and to compute the desired
+    /// `route-hash` for the diff, so the two always agree.
+    fn builder_cfg(&self) -> BuilderConfig<'_> {
+        BuilderConfig {
+            label_namespace: &self.config.label_namespace,
+            controller_class: &self.config.controller_class,
+            container_prefix: &self.config.container_prefix,
+            traefik_network: &self.config.traefik_network,
+            traefik_entrypoint: &self.config.traefik_entrypoint,
+            traefik_certresolver: self.config.traefik_certresolver.as_deref(),
+        }
+    }
+
     async fn compute_desired_for_deployment(
         &self,
         project: &Project,
@@ -480,10 +494,16 @@ impl DockerReconciler {
             source_deployment_id.as_deref(),
         );
 
-        // Superseded deployments keep their container running until the active
-        // replacement is healthy, but must not stay routable (otherwise two
-        // Traefik routers match the same Host during the supersession window).
-        let routable = deployment.status != DeploymentStatus::Terminating;
+        // A container exists (so it can be health-probed) for any infra-bearing
+        // deployment, but it is only *routable* when it is the active deployment
+        // for its group — exactly mirroring the K8s path, which builds the
+        // Ingress solely from `is_active` deployments (`active_by_group` in
+        // `webhook.rs`). `is_active` is flipped on by `mark_as_active`, which
+        // runs only after a deployment becomes Healthy. Without this gate a
+        // still-Deploying/Pushed deployment would advertise the same `Host(...)`
+        // rule as the live active one and Traefik would split production traffic
+        // onto the not-yet-healthy container.
+        let routable = deployment.is_active;
 
         // Build a desired container per spec. Clamp replicas to 1 for now.
         // TODO(replicas): run N containers sharing one Traefik service to
@@ -522,7 +542,7 @@ impl DockerReconciler {
                 })
                 .collect();
 
-            out.push(DesiredContainer {
+            let mut desired = DesiredContainer {
                 project: project.name.clone(),
                 deployment_group: deployment.deployment_group.clone(),
                 deployment_id: deployment.deployment_id.clone(),
@@ -540,7 +560,16 @@ impl DockerReconciler {
                 env_hash,
                 routes: container_routes,
                 routable,
-            });
+                // Filled in below once the container is fully described, using
+                // the same render path `build_container` stamps on the live
+                // container, so the diff's comparison is exact.
+                route_hash: String::new(),
+            };
+            // Precompute the route-hash from the same render the builder uses so
+            // the diff can detect routing transitions (active↔inactive) that
+            // Docker can't apply to a running container's labels in place.
+            desired.route_hash = container_builder::route_hash_for(&desired, &self.builder_cfg());
+            out.push(desired);
         }
 
         Ok(out)
@@ -600,6 +629,9 @@ impl DockerReconciler {
                     name,
                     image_label: labels.get(&labels::ns_key(ns, SUFFIX_IMAGE)).cloned(),
                     env_hash_label: labels.get(&labels::ns_key(ns, SUFFIX_ENV_HASH)).cloned(),
+                    route_hash_label: labels
+                        .get(&labels::ns_key(ns, labels::SUFFIX_ROUTE_HASH))
+                        .cloned(),
                     // Daemon-reported lifecycle state ("running", "exited",
                     // "created", "dead", …). Used by the diff to restart
                     // containers that exist but aren't running.
@@ -615,14 +647,7 @@ impl DockerReconciler {
         desired: &[DesiredContainer],
         actions: &[ReconcileAction],
     ) -> Result<()> {
-        let builder_cfg = BuilderConfig {
-            label_namespace: &self.config.label_namespace,
-            controller_class: &self.config.controller_class,
-            container_prefix: &self.config.container_prefix,
-            traefik_network: &self.config.traefik_network,
-            traefik_entrypoint: &self.config.traefik_entrypoint,
-            traefik_certresolver: self.config.traefik_certresolver.as_deref(),
-        };
+        let builder_cfg = self.builder_cfg();
         let by_name: HashMap<String, &DesiredContainer> = desired
             .iter()
             .map(|d| {
@@ -785,7 +810,9 @@ impl DockerReconciler {
 
         let (container_specs, _routes) = resolve_runtime_containers(deployment)?;
         // Every container must be ready for the deployment to be healthy:
-        //   - routable containers (with a port) must answer the HTTP probe;
+        //   - HTTP containers (with a port) must answer the probe — probed
+        //     directly on the container IP, independent of Traefik routing, so a
+        //     not-yet-active deployment can still become Healthy (then active);
         //   - workers (no port) must exist and be `running` on the daemon.
         // An empty spec set is never ready.
         let mut all_ready = !container_specs.is_empty();
@@ -1030,6 +1057,14 @@ pub struct ActualContainer {
     pub name: String,
     pub image_label: Option<String>,
     pub env_hash_label: Option<String>,
+    /// The `route-hash` bookkeeping label stamped on the live container (sha256
+    /// of its rendered Traefik label set; empty string when non-routable).
+    /// `None` for legacy containers created before this label existed. Compared
+    /// against the desired container's `route_hash` so a routing transition —
+    /// e.g. a deployment becoming or ceasing to be active — forces a recreate
+    /// that adds or removes the Traefik labels (Docker can't mutate them in
+    /// place on a running container).
+    pub route_hash_label: Option<String>,
     /// Daemon-reported lifecycle state (e.g. "running", "exited", "created",
     /// "dead"). `None` when the daemon didn't report it. A container that
     /// matches on image + env but is not "running" (created-but-not-started,
@@ -1091,11 +1126,22 @@ pub fn diff_desired_vs_actual(
                 matched_actual.insert(name.clone());
                 let image_drift = a.image_label.as_deref() != Some(d.image.as_str());
                 let env_drift = a.env_hash_label.as_deref() != Some(d.env_hash.as_str());
+                // Routing drift: the live container's stamped `route-hash`
+                // differs from the desired one. This is what makes routability a
+                // first-class part of the diff — when a deployment becomes active
+                // (gains Traefik labels) or stops being active (loses them) the
+                // hash changes, forcing a recreate WITH/WITHOUT the labels.
+                // Docker can't mutate a running container's labels in place, so
+                // recreation is the only way to apply the change. Idempotent:
+                // once the stamped hash equals the desired one nothing recreates.
+                // A legacy container missing the label (`None`) is recreated once
+                // to gain it, then converges.
+                let route_drift = a.route_hash_label.as_deref() != Some(d.route_hash.as_str());
                 // A container that matches on image + env but isn't running
                 // (created-but-never-started, exited, or out of restart
                 // retries) must be recreated so the deployment recovers.
                 let not_running = !a.is_running();
-                if image_drift || env_drift || not_running {
+                if image_drift || env_drift || route_drift || not_running {
                     actions.push(ReconcileAction::Recreate {
                         name: name.clone(),
                         existing_id: a.id.clone(),
@@ -1227,6 +1273,10 @@ mod tests {
                 path_prefix: None,
             }],
             routable: true,
+            // Fixed sentinel route-hash for diff tests; the reconciler computes
+            // the real value via `route_hash_for`. Tests that exercise routing
+            // drift override this and the matching actual label.
+            route_hash: "rh-active".to_string(),
         }
     }
 
@@ -1255,6 +1305,7 @@ mod tests {
             name: name_of(&d),
             image_label: Some("img:1".to_string()),
             env_hash_label: Some("h1".to_string()),
+            route_hash_label: Some("rh-active".to_string()),
             state: Some("running".to_string()),
         }];
         let actions = diff_desired_vs_actual(&[d], &actual, "rise");
@@ -1269,6 +1320,7 @@ mod tests {
             name: name_of(&d),
             image_label: Some("img:1".to_string()),
             env_hash_label: Some("h1".to_string()),
+            route_hash_label: Some("rh-active".to_string()),
             state: Some("running".to_string()),
         }];
         let actions = diff_desired_vs_actual(std::slice::from_ref(&d), &actual, "rise");
@@ -1289,6 +1341,7 @@ mod tests {
             name: name_of(&d),
             image_label: Some("img:1".to_string()),
             env_hash_label: Some("h1".to_string()),
+            route_hash_label: Some("rh-active".to_string()),
             state: Some("running".to_string()),
         }];
         let actions = diff_desired_vs_actual(std::slice::from_ref(&d), &actual, "rise");
@@ -1312,6 +1365,7 @@ mod tests {
                 name: name_of(&d),
                 image_label: Some("img:1".to_string()),
                 env_hash_label: Some("h1".to_string()),
+                route_hash_label: Some("rh-active".to_string()),
                 state: state.map(str::to_string),
             }];
             let actions = diff_desired_vs_actual(std::slice::from_ref(&d), &actual, "rise");
@@ -1333,6 +1387,7 @@ mod tests {
             name: "rise_myapp_default_oldid_app".to_string(),
             image_label: Some("img:1".to_string()),
             env_hash_label: Some("h1".to_string()),
+            route_hash_label: Some("rh-active".to_string()),
             state: Some("running".to_string()),
         }];
         let actions = diff_desired_vs_actual(&[], &actual, "rise");
@@ -1354,6 +1409,7 @@ mod tests {
             name: "rise_myapp_default_oldid_app".to_string(),
             image_label: Some("img:1".to_string()),
             env_hash_label: Some("h1".to_string()),
+            route_hash_label: Some("rh-active".to_string()),
             state: Some("running".to_string()),
         }];
         let actions = diff_desired_vs_actual(std::slice::from_ref(&new), &actual, "rise");
@@ -1369,6 +1425,77 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn diff_recreates_on_route_hash_drift_active_gains_labels() {
+        // A deployment that just became active: desired now carries the active
+        // route-hash, but the live container was created while non-routable and
+        // still bears the empty/non-routable hash. Image + env match, but the
+        // routing changed — Docker can't edit labels in place, so the container
+        // must be recreated WITH the Traefik labels.
+        let d = desired("app", "img:1", "h1"); // route_hash = "rh-active"
+        let actual = vec![ActualContainer {
+            id: "cid".to_string(),
+            name: name_of(&d),
+            image_label: Some("img:1".to_string()),
+            env_hash_label: Some("h1".to_string()),
+            // Was created non-routable (empty route-hash).
+            route_hash_label: Some(String::new()),
+            state: Some("running".to_string()),
+        }];
+        let actions = diff_desired_vs_actual(std::slice::from_ref(&d), &actual, "rise");
+        assert_eq!(
+            actions,
+            vec![ReconcileAction::Recreate {
+                name: name_of(&d),
+                existing_id: "cid".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn diff_recreates_on_route_hash_drift_deactivated_loses_labels() {
+        // A deployment that stopped being active: desired is now non-routable
+        // (empty route-hash) while the live container still carries the active
+        // routing hash. Image + env match, but its Traefik labels must be
+        // removed — force a recreate.
+        let mut d = desired("app", "img:1", "h1");
+        d.routable = false;
+        d.route_hash = String::new();
+        let actual = vec![ActualContainer {
+            id: "cid".to_string(),
+            name: name_of(&d),
+            image_label: Some("img:1".to_string()),
+            env_hash_label: Some("h1".to_string()),
+            route_hash_label: Some("rh-active".to_string()),
+            state: Some("running".to_string()),
+        }];
+        let actions = diff_desired_vs_actual(std::slice::from_ref(&d), &actual, "rise");
+        assert_eq!(
+            actions,
+            vec![ReconcileAction::Recreate {
+                name: name_of(&d),
+                existing_id: "cid".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn diff_no_action_when_route_image_env_all_match() {
+        // Idempotence: once image + env + route-hash all match and the container
+        // is running, the diff emits NO action — no recreate oscillation.
+        let d = desired("app", "img:1", "h1"); // route_hash = "rh-active"
+        let actual = vec![ActualContainer {
+            id: "cid".to_string(),
+            name: name_of(&d),
+            image_label: Some("img:1".to_string()),
+            env_hash_label: Some("h1".to_string()),
+            route_hash_label: Some("rh-active".to_string()),
+            state: Some("running".to_string()),
+        }];
+        let actions = diff_desired_vs_actual(std::slice::from_ref(&d), &actual, "rise");
+        assert!(actions.is_empty(), "matching container must not recreate");
     }
 
     #[test]

@@ -24,6 +24,10 @@ pub const SUFFIX_CONTAINER: &str = "container";
 pub const SUFFIX_ENVIRONMENT: &str = "environment";
 pub const SUFFIX_ENV_HASH: &str = "env-hash";
 pub const SUFFIX_IMAGE: &str = "image";
+/// sha256 of the fully-rendered Traefik label set (empty string when the
+/// container is not routable). Lets the diff detect routing transitions —
+/// active↔inactive — that Docker can't apply to a running container in place.
+pub const SUFFIX_ROUTE_HASH: &str = "route-hash";
 
 /// Build a namespaced bookkeeping label key, e.g. `rise.dev/project`.
 pub fn ns_key(label_namespace: &str, suffix: &str) -> String {
@@ -42,6 +46,10 @@ pub struct BookkeepingLabels<'a> {
     pub environment: Option<&'a str>,
     pub env_hash: &'a str,
     pub image: &'a str,
+    /// sha256 of the fully-rendered Traefik label set (empty string for a
+    /// non-routable container). Stamped as `{ns}/route-hash` so the reconciler
+    /// can detect when routability/routing changed and recreate the container.
+    pub route_hash: &'a str,
 }
 
 impl BookkeepingLabels<'_> {
@@ -73,8 +81,33 @@ impl BookkeepingLabels<'_> {
         }
         labels.insert(ns_key(ns, SUFFIX_ENV_HASH), self.env_hash.to_string());
         labels.insert(ns_key(ns, SUFFIX_IMAGE), self.image.to_string());
+        labels.insert(ns_key(ns, SUFFIX_ROUTE_HASH), self.route_hash.to_string());
         labels
     }
+}
+
+/// Stable sha256 of a rendered Traefik label map, used as the `route-hash`
+/// drift label. Hashes the map over a deterministically key-sorted copy with
+/// length-prefixed key/value framing so reordering can't change the digest
+/// while any add/edit/remove of a routing label does. An empty map (a
+/// non-routable container) yields the digest of the empty input, which is
+/// stable and distinct from any non-empty routing set.
+pub fn hash_traefik_labels(labels: &HashMap<String, String>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut entries: Vec<(&String, &String)> = labels.iter().collect();
+    entries.sort();
+    let mut hasher = Sha256::new();
+    for (k, v) in entries {
+        hasher.update((k.len() as u64).to_le_bytes());
+        hasher.update(k.as_bytes());
+        hasher.update((v.len() as u64).to_le_bytes());
+        hasher.update(v.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Configuration needed to render Traefik labels for one routable container.
@@ -312,5 +345,40 @@ mod tests {
             certresolver: None,
         });
         assert!(labels.is_empty());
+    }
+
+    #[test]
+    fn hash_traefik_labels_is_order_independent_and_distinguishes_content() {
+        let mut a = HashMap::new();
+        a.insert("traefik.enable".to_string(), "true".to_string());
+        a.insert(
+            "traefik.http.routers.x.rule".to_string(),
+            "Host(`a`)".to_string(),
+        );
+        // Same entries, inserted in a different order → same hash.
+        let mut b = HashMap::new();
+        b.insert(
+            "traefik.http.routers.x.rule".to_string(),
+            "Host(`a`)".to_string(),
+        );
+        b.insert("traefik.enable".to_string(), "true".to_string());
+        assert_eq!(hash_traefik_labels(&a), hash_traefik_labels(&b));
+
+        // A changed value (different Host) yields a different hash.
+        let mut c = a.clone();
+        c.insert(
+            "traefik.http.routers.x.rule".to_string(),
+            "Host(`b`)".to_string(),
+        );
+        assert_ne!(hash_traefik_labels(&a), hash_traefik_labels(&c));
+
+        // The empty (non-routable) set is stable and distinct from any non-empty
+        // set, so active↔inactive transitions always register as drift.
+        let empty = HashMap::new();
+        assert_eq!(
+            hash_traefik_labels(&empty),
+            hash_traefik_labels(&HashMap::new())
+        );
+        assert_ne!(hash_traefik_labels(&empty), hash_traefik_labels(&a));
     }
 }
