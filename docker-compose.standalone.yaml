@@ -71,8 +71,9 @@ services:
     image: postgres:18-trixie
     container_name: rise-postgres
     restart: unless-stopped
-    ports:
-      - "5432:5432"
+    # No host port published: Postgres is reachable only over the rise_default
+    # network by the backend. Nothing here is exposed to the host — all external
+    # traffic goes through Traefik (the only service that publishes ports).
     volumes:
       - postgres_data:/var/lib/postgresql
     environment:
@@ -94,8 +95,8 @@ services:
     container_name: rise-dex
     restart: unless-stopped
     user: "0:0"
-    ports:
-      - "5556:5556"
+    # No host port: the backend reaches Dex over rise_default (rise-dex:5556);
+    # browsers reach it through the dex.${RISE_DOMAIN} Traefik router below.
     volumes:
       - ./dev/dex/config.yaml:/etc/dex/config.yaml:ro
       - dex_data:/var/dex
@@ -125,14 +126,13 @@ services:
 
   # OCI registry for images pushed by the rise CLI. Exposed publicly via Traefik
   # at registry.${RISE_DOMAIN} behind a basicauth middleware (the CLI does its
-  # own `docker login`; oci-client-auth mints no credentials). The :5000 host
-  # port stays for internal/debug convenience — bind it to localhost in prod.
+  # own `docker login`; oci-client-auth mints no credentials). No host port: the
+  # backend's docker daemon pulls over rise_default (rise-registry:5000); remote
+  # `rise deploy` pushes go through the registry.${RISE_DOMAIN} Traefik router.
   registry:
     image: registry:3
     container_name: rise-registry
     restart: unless-stopped
-    ports:
-      - "5000:5000"
     volumes:
       - registry_data:/var/lib/registry
     environment:
@@ -206,13 +206,21 @@ services:
     container_name: rise-backend
     restart: unless-stopped
     command: ["backend", "server"]
-    ports:
-      - "3000:3000"
-    # Route /.rise/* to the Rise backend (login + ingress-auth), like the K8s
-    # /.rise Ingress path. priority=1000 must exceed the app routers' default
-    # (rule-length) priority so /.rise on an app host wins over the app router.
+    # No host port: the control plane (UI/API) is reached through Traefik at
+    # https://rise.${RISE_DOMAIN}; nothing is published to the host directly.
     labels:
       - "traefik.enable=true"
+      - "traefik.docker.network=rise_default"
+      # Control-plane router: the Rise UI/API at https://rise.${RISE_DOMAIN}.
+      - "traefik.http.routers.rise-cp.rule=Host(`rise.${RISE_DOMAIN}`)"
+      - "traefik.http.routers.rise-cp.entrypoints=websecure"
+      - "traefik.http.routers.rise-cp.tls=true"
+      - "traefik.http.routers.rise-cp.tls.certresolver=le"
+      - "traefik.http.routers.rise-cp.service=rise-cp"
+      - "traefik.http.services.rise-cp.loadbalancer.server.port=3000"
+      # Route /.rise/* on ANY host to the backend (login + ingress-auth), like
+      # the K8s /.rise Ingress path. priority=1000 exceeds the app routers'
+      # default (rule-length) priority so /.rise on an app host wins.
       - "traefik.http.routers.rise-dotrise.rule=PathPrefix(`/.rise`)"
       - "traefik.http.routers.rise-dotrise.entrypoints=websecure"
       - "traefik.http.routers.rise-dotrise.tls=true"
@@ -220,7 +228,6 @@ services:
       - "traefik.http.routers.rise-dotrise.priority=1000"
       - "traefik.http.routers.rise-dotrise.service=rise-dotrise"
       - "traefik.http.services.rise-dotrise.loadbalancer.server.port=3000"
-      - "traefik.docker.network=rise_default"
     environment:
       - DATABASE_URL=postgres://${POSTGRES_USER:-rise}:${POSTGRES_PASSWORD:-rise123}@rise-postgres:5432/${POSTGRES_DB:-rise}
       - RISE_CONFIG_DIR=/etc/rise-docker

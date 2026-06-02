@@ -29,17 +29,27 @@ services:
     ports:
       - "80:80"        # app traffic: http://<project>.rise.localhost
 
-  # Dex stays internal in local mode; the public dex.${RISE_DOMAIN} router is
-  # dropped (issuer is rise-dex:5556 over the compose network + host port).
+  # Dex stays internal in local mode; drop the public dex.${RISE_DOMAIN} router.
+  # Re-publish :5556 on loopback so local browser login works (issuer
+  # http://rise-dex:5556/dex -> 127.0.0.1 via the mise-managed /etc/hosts entry).
   dex:
     labels: !reset []
+    ports:
+      - "127.0.0.1:5556:5556"
 
   registry:
-    # Drop the public Traefik exposure + basicauth; keep the :5000 host port.
+    # Drop the public Traefik exposure + basicauth; re-publish :5000 on loopback
+    # for local `rise deploy` push (client_registry_url=localhost:5000).
     labels: !reset []
+    ports:
+      - "127.0.0.1:5000:5000"
 
   rise:
     image: ${RISE_IMAGE_REPOSITORY:-ghcr.io/rise-deploy/rise}:${RISE_IMAGE_TAG:-0.22.0}
+    # Re-publish the backend on loopback so the CLI/e2e reach the control plane
+    # directly at http://rise.localhost:3000 (prod goes through Traefik instead).
+    ports:
+      - "127.0.0.1:3000:3000"
     # Labels normalize to maps and MERGE across files (a sequence/!reset does
     # NOT cleanly re-add), so instead of touching the base `rise-dotrise`
     # router we ADD a sibling `rise-dotrise-web` router on the plain `web`
