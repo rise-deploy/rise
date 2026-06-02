@@ -150,13 +150,28 @@ This same line is emitted regardless of token source, so it also surfaces the
 claims of tokens **minted through the token provider** — a `RISE_TOKEN_COMMAND`
 that prints a JWT, or a GitHub Actions OIDC token minted on demand.
 
-For the *server* side of the same exchange (issuer the backend peeked at, JWKS
-validation outcome, and per-service-account claim-mismatch reasons), raise the
-backend log level instead:
+For the *server* side of the same exchange, raise the log level on the backend
+instead. Keep the general output at `info` and turn up only the auth and
+workload-token paths so the relevant lines aren't buried:
 
 ```bash
-RUST_LOG=rise=debug rise backend server
+RUST_LOG=info,rise::server::auth=debug,rise::server::workload_tokens=debug \
+  rise backend server
 ```
+
+This surfaces:
+
+- `rise::server::auth::handlers` — the OIDC ID-token claims during browser login
+  (`ID token claims: {...}`)
+- `rise::server::auth::middleware` — the issuer the backend peeked at and the
+  JWKS-validation outcome for an incoming token
+- `rise::server::auth::context` — per-service-account claim-mismatch reasons
+  (`SA <id> claim mismatch: ...`); these log at `info`, so they show even without
+  the `debug` targets above
+- `rise::server::workload_tokens::handlers` — `Issued workload identity token`
+  (project / environment / audience / ttl) when an app mints a token
+
+`RUST_LOG=rise=debug` works as a catch-all but is far noisier.
 
 See [Workload Identity Tokens](../workload-identity-tokens) for inspecting the
 Rise-signed tokens an app mints for downstream systems.
