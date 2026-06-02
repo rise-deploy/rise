@@ -13,8 +13,11 @@
 #     HTTPS redirect. The label-based routers in the base file that target the
 #     `websecure` entrypoint simply have no matching entrypoint here and are
 #     inert; the /.rise router is re-stamped onto `web` below.
-#   * rise: mounts the HTTP local config (config/compose-docker.local.yaml) and
-#     re-stamps the /.rise router onto the `web` entrypoint (no TLS).
+#   * rise: switches to RISE_CONFIG_RUN_MODE=docker, whose shipped config
+#     (config/docker.yaml at /etc/rise/docker.yaml) already defaults to the local
+#     HTTP stack (http / rise.localhost / rise-dex / localhost:5000) — so NO extra
+#     env is needed here — and re-stamps the /.rise router onto the `web`
+#     entrypoint (no TLS).
 # =============================================================================
 
 services:
@@ -62,10 +65,23 @@ services:
       - "traefik.http.routers.rise-dotrise-web.priority=1000"
       - "traefik.http.routers.rise-dotrise-web.service=rise-dotrise-web"
       - "traefik.http.services.rise-dotrise-web.loadbalancer.server.port=3000"
+    # Compose merges `environment` by variable name, so we must OVERRIDE every
+    # prod-flipping RISE_* var the base file set back to its local default
+    # (config/docker.yaml's built-in defaults are already local, but the base
+    # env would otherwise leak the prod values). Setting RISE_CONFIG_RUN_MODE
+    # alone is not enough.
     environment:
       - DATABASE_URL=postgres://${POSTGRES_USER:-rise}:${POSTGRES_PASSWORD:-rise123}@rise-postgres:5432/${POSTGRES_DB:-rise}
-      - RISE_CONFIG_DIR=/etc/rise-docker
-      - RISE_CONFIG_RUN_MODE=production
+      - RISE_CONFIG_DIR=/etc/rise
+      - RISE_CONFIG_RUN_MODE=docker
+      # Reset the base file's prod overrides to the local HTTP defaults.
+      - PUBLIC_URL=http://rise.localhost:3000
+      - RISE_INGRESS_DOMAIN=rise.localhost
+      - RISE_INGRESS_SCHEME=http
+      - RISE_CERTRESOLVER=
+      - RISE_TRAEFIK_ENTRYPOINT=web
+      - RISE_CLIENT_REGISTRY_URL=localhost:5000
+      - RISE_COOKIE_SECURE=false
+      - DEX_ISSUER=http://rise-dex:5556/dex
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./config/compose-docker.local.yaml:/etc/rise-docker/production.yaml:ro

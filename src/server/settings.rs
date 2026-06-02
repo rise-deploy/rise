@@ -244,7 +244,16 @@ pub struct ServerSettings {
     pub frontend_dev_proxy_url: Option<String>,
 
     /// Whether to set Secure flag on cookies (true for HTTPS, false for HTTP development)
-    #[serde(default = "default_cookie_secure")]
+    // Accepts a native YAML boolean or a string ("true"/"false") via
+    // deserialize_bool_flexible, so it can be driven by an env-interpolated
+    // config value (e.g. cookie_secure: "${RISE_COOKIE_SECURE:-false}"), which
+    // the loader resolves to a string before deserialization. Kept as `//` (not
+    // `///`) so the generated JSON schema description is unchanged.
+    #[serde(
+        default = "default_cookie_secure",
+        deserialize_with = "deserialize_bool_flexible"
+    )]
+    #[schemars(with = "bool")]
     pub cookie_secure: bool,
 
     /// Cookie domain for migration from deployments that previously used domain-scoped cookies.
@@ -365,6 +374,38 @@ impl Default for OAuthRateLimitSettings {
 
 fn default_cookie_secure() -> bool {
     true
+}
+
+/// Deserialize a boolean that may arrive as a native bool or as a string.
+///
+/// The settings loader interpolates `${VAR}` inside string config values and
+/// produces a JSON string, so an env-driven flag like
+/// `cookie_secure: "${RISE_COOKIE_SECURE:-false}"` reaches serde as the string
+/// `"false"`. serde does not coerce string→bool, so accept both forms here
+/// (case-insensitive `true`/`false`, plus `1`/`0`/`yes`/`no`/`on`/`off`).
+fn deserialize_bool_flexible<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BoolOrString {
+        Bool(bool),
+        Str(String),
+    }
+
+    match BoolOrString::deserialize(deserializer)? {
+        BoolOrString::Bool(b) => Ok(b),
+        BoolOrString::Str(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Ok(true),
+            "false" | "0" | "no" | "off" => Ok(false),
+            other => Err(D::Error::custom(format!(
+                "invalid boolean string {other:?}; expected true/false"
+            ))),
+        },
+    }
 }
 
 fn default_static_dir() -> Option<String> {
@@ -2421,9 +2462,131 @@ auth:
             Some(access_class(AccessRequirement::Member)),
         );
 
-        // Mirrors config/compose-docker.production.yaml (private + auth URL set).
+        // Mirrors config/docker.yaml (private + auth URL set).
         assert!(
             docker_access_classes_missing_auth_backend_url(&classes, "http://rise:3000").is_empty()
+        );
+    }
+
+    /// Stage the real shipped `config/docker.yaml` plus a minimal `default.yaml`
+    /// in a temp dir and load it through the settings overlay chain with
+    /// `run_mode=docker`, returning the parsed `Settings`. `env` supplies the
+    /// env vars the config interpolates (`${VAR}` / `${VAR:-default}`).
+    fn load_shipped_docker_config(
+        env: &std::collections::HashMap<&'static str, &'static str>,
+    ) -> Result<Settings, ConfigError> {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let docker_yaml = fs::read_to_string(format!("{manifest_dir}/config/docker.yaml"))
+            .expect("config/docker.yaml must exist");
+
+        let temp_dir = TempDir::new().unwrap();
+        // Minimal default.yaml so the overlay's first (optional) layer exists;
+        // the docker.yaml layer carries everything the assertions check.
+        fs::write(temp_dir.path().join("default.yaml"), "{}\n").unwrap();
+        fs::write(temp_dir.path().join("docker.yaml"), docker_yaml).unwrap();
+
+        let owned: std::collections::HashMap<String, String> = env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let env_lookup = move |name: &str| owned.get(name).cloned();
+
+        Settings::new_with_env(temp_dir.path().to_str().unwrap(), "docker", &env_lookup)
+    }
+
+    #[test]
+    fn shipped_docker_config_loads_with_local_defaults() {
+        // LOCAL: only DATABASE_URL set — everything else falls back to the
+        // local-friendly defaults baked into config/docker.yaml.
+        let mut env = std::collections::HashMap::new();
+        env.insert("DATABASE_URL", "postgres://u@rise-postgres/rise");
+        let settings = load_shipped_docker_config(&env)
+            .expect("shipped docker.yaml must load with only DATABASE_URL set");
+
+        assert_eq!(settings.server.public_url, "http://rise.localhost:3000");
+        assert!(!settings.server.cookie_secure, "local: cookie_secure false");
+
+        let Some(DeploymentControllerSettings::Docker {
+            ingress_schema,
+            traefik_certresolver,
+            traefik_entrypoint,
+            production_ingress_url_template,
+            ingress_port,
+            ..
+        }) = &settings.deployment_controller
+        else {
+            panic!("expected docker deployment_controller");
+        };
+        assert_eq!(ingress_schema, "http");
+        assert_eq!(traefik_entrypoint, "web");
+        // ingress_port is omitted from docker.yaml -> defaults to None.
+        assert_eq!(*ingress_port, None);
+        // Empty `${RISE_CERTRESOLVER:-}` -> after normalization this means no TLS.
+        // The raw parsed value is Some("") here; normalize_certresolver collapses
+        // it to None (asserted via the labels module test). Assert it's blank.
+        assert!(
+            traefik_certresolver
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty(),
+            "local certresolver must be blank, got {traefik_certresolver:?}"
+        );
+        assert_eq!(
+            crate::server::deployment::controller::docker::labels::normalize_certresolver(
+                traefik_certresolver.clone()
+            ),
+            None
+        );
+        // Rise's own `{project_name}` placeholder is preserved literally.
+        assert_eq!(
+            production_ingress_url_template,
+            "{project_name}.rise.localhost"
+        );
+    }
+
+    #[test]
+    fn shipped_docker_config_loads_with_prod_env() {
+        // PROD: env vars flip the same file to https / le / the real domain.
+        let mut env = std::collections::HashMap::new();
+        env.insert("DATABASE_URL", "postgres://u@rise-postgres/rise");
+        env.insert("PUBLIC_URL", "https://rise.example.com");
+        env.insert("RISE_INGRESS_DOMAIN", "example.com");
+        env.insert("RISE_INGRESS_SCHEME", "https");
+        env.insert("RISE_CERTRESOLVER", "le");
+        env.insert("RISE_TRAEFIK_ENTRYPOINT", "websecure");
+        env.insert("RISE_COOKIE_SECURE", "true");
+        let settings = load_shipped_docker_config(&env)
+            .expect("shipped docker.yaml must load with prod env set");
+
+        assert_eq!(settings.server.public_url, "https://rise.example.com");
+        assert!(settings.server.cookie_secure, "prod: cookie_secure true");
+
+        let Some(DeploymentControllerSettings::Docker {
+            ingress_schema,
+            traefik_certresolver,
+            traefik_entrypoint,
+            production_ingress_url_template,
+            ..
+        }) = &settings.deployment_controller
+        else {
+            panic!("expected docker deployment_controller");
+        };
+        assert_eq!(ingress_schema, "https");
+        assert_eq!(traefik_entrypoint, "websecure");
+        assert_eq!(
+            crate::server::deployment::controller::docker::labels::normalize_certresolver(
+                traefik_certresolver.clone()
+            ),
+            Some("le".to_string())
+        );
+        // Env-interpolated host, with `{project_name}` still literal.
+        assert_eq!(
+            production_ingress_url_template,
+            "{project_name}.example.com"
         );
     }
 

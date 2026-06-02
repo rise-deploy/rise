@@ -34,6 +34,17 @@ pub fn ns_key(label_namespace: &str, suffix: &str) -> String {
     format!("{label_namespace}/{suffix}")
 }
 
+/// Normalize a configured Traefik certresolver into the effective value the
+/// controller should use. An empty or whitespace-only string (e.g. the
+/// `${RISE_CERTRESOLVER:-}` default in the local HTTP config) means "no TLS"
+/// and collapses to `None`, so no broken `tls.certresolver=` label is stamped.
+/// A non-blank value is trimmed and kept.
+pub fn normalize_certresolver(certresolver: Option<String>) -> Option<String> {
+    certresolver
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Inputs needed to compute the bookkeeping labels for a container.
 pub struct BookkeepingLabels<'a> {
     pub label_namespace: &'a str,
@@ -247,6 +258,25 @@ pub fn render_traefik_labels(route: &TraefikRoute<'_>) -> HashMap<String, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_certresolver_blank_is_none() {
+        // None stays None; empty / whitespace-only collapse to None so the
+        // `${RISE_CERTRESOLVER:-}` local default means "no TLS".
+        assert_eq!(normalize_certresolver(None), None);
+        assert_eq!(normalize_certresolver(Some(String::new())), None);
+        assert_eq!(normalize_certresolver(Some("   ".to_string())), None);
+        assert_eq!(normalize_certresolver(Some("\t\n".to_string())), None);
+        // A real value is trimmed and kept.
+        assert_eq!(
+            normalize_certresolver(Some("le".to_string())),
+            Some("le".to_string())
+        );
+        assert_eq!(
+            normalize_certresolver(Some("  le  ".to_string())),
+            Some("le".to_string())
+        );
+    }
 
     #[test]
     fn sanitize_router_name_lowercases_and_collapses() {

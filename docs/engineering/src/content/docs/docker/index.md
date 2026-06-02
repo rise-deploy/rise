@@ -49,7 +49,7 @@ always named `rise_default` regardless of the launch directory.
 ## Two run modes
 
 The same base file serves both production and local/dev; the difference is
-whether you layer the overlay, which config the backend mounts, and which
+whether you layer the overlay, which `RISE_*` env vars are set, and which
 Traefik entrypoints exist.
 
 | | Production (base file) | Local / dev (base + overlay) |
@@ -57,7 +57,8 @@ Traefik entrypoints exist.
 | Traefik entrypoints | `web` (:80) + `websecure` (:443), 80→443 redirect | `web` (:80) only |
 | TLS | Let's Encrypt via the `le` ACME resolver (HTTP-01) | none (plain HTTP) |
 | Domain | `${RISE_DOMAIN}` | `rise.localhost` |
-| Backend config mounted | `config/compose-docker.production.yaml` | `config/compose-docker.local.yaml` |
+| Backend config | shipped `config/docker.yaml` (run_mode `docker`, baked into the image at `/etc/rise/docker.yaml`); nothing is mounted | same shipped file — its built-in defaults are already local |
+| Config differences | prod `RISE_*` env on the `rise` service flip it to https / `le` / the real domain | overlay resets those env vars to the local HTTP defaults |
 | Public registry / Dex routers | exposed via Traefik | dropped (`labels: !reset []`) |
 
 ## Quick start (local HTTP overlay)
@@ -74,6 +75,17 @@ This serves the control plane on `http://rise.localhost:3000` and apps on
 `http://{project}.rise.localhost` over plain HTTP. The `.localhost` suffix
 resolves to `127.0.0.1` in most browsers, so no `/etc/hosts` edits are needed
 for app hosts.
+
+> **Why `.localhost` here, but `.local` for Kubernetes?** The Docker backend
+> runs everything on a single host, so `*.localhost` — which RFC 6761 reserves
+> to `127.0.0.1` — is ideal: it wildcards to loopback automatically, with no
+> per-app `/etc/hosts` entries. The Kubernetes/minikube setup instead uses
+> `rise.local`, deliberately *because* it does **not** auto-resolve: it is
+> overridden (via a pod `host_aliases` entry and `/etc/hosts`) to the
+> cluster/host IP so pods and your browser can reach a **non-loopback** address.
+> Using `.localhost` there would wrongly resolve to each pod's own loopback and
+> to `127.0.0.1` in the browser. The two conventions are intentional, not a
+> drift — keep `.localhost` for Docker and `.local` for Kubernetes.
 
 > The demo secrets, passwords and the bundled Dex IdP are fine for local use but
 > **insecure for anything real** — see [Production deployment](#production-deployment).
@@ -130,17 +142,28 @@ export ACME_CA_SERVER=https://acme-staging-v02.api.letsencrypt.org/directory
 | `RISE_IMAGE_TAG` | `0.22.0` | **Manual** image pin — bump on upgrade. There is no automatic "latest released" resolution. |
 | `RISE_IMAGE_REPOSITORY` | `ghcr.io/rise-deploy/rise` | Override for a fork/mirror. |
 | `POSTGRES_PASSWORD` | `rise123` | Change it. |
+| `RISE_JWT_SIGNING_SECRET` | insecure repo placeholder | **Set it.** Overrides the demo secret baked into `config/docker.yaml`. `openssl rand -base64 32`. |
+| `RISE_ENCRYPTION_KEY` | insecure repo placeholder | **Set it.** Overrides the demo AES key. `openssl rand -base64 32`. |
+| `OIDC_CLIENT_SECRET` | `rise-backend-secret` | **Set it.** Keep in sync with the Dex client secret in `dev/dex/config.yaml`. |
+| `ADMIN_EMAIL` | `admin@example.com` | Initial admin user. |
+
+The `rise` service also sets these `RISE_*` overrides on `config/docker.yaml`
+to flip it from its local defaults to production (https / `le` resolver / the
+real domain): `PUBLIC_URL`, `RISE_INGRESS_DOMAIN`, `RISE_INGRESS_SCHEME`,
+`RISE_CERTRESOLVER`, `RISE_TRAEFIK_ENTRYPOINT`, `RISE_CLIENT_REGISTRY_URL`,
+`RISE_COOKIE_SECURE`. You normally don't touch these directly.
 
 ### 4. What to change before exposing it
 
-The shipped `config/compose-docker.production.yaml` and `dev/dex/config.yaml`
-contain **well-known placeholder secrets that provide no security**. Before any
-real use:
+The shipped `config/docker.yaml` and `dev/dex/config.yaml` contain **well-known
+placeholder secrets that provide no security** (the `RISE_*_SECRET` / `*_KEY`
+env vars default to those placeholders when unset). Before any real use:
 
-- **Regenerate every secret.** Replace `server.jwt_signing_secret`,
-  `encryption.key` (each `openssl rand -base64 32`), `auth.client_secret`, and
-  `POSTGRES_PASSWORD`. The `auth.client_secret` must stay in sync with the Dex
-  client secret in `dev/dex/config.yaml`.
+- **Regenerate every secret.** Set `RISE_JWT_SIGNING_SECRET`,
+  `RISE_ENCRYPTION_KEY` (each `openssl rand -base64 32`), `OIDC_CLIENT_SECRET`,
+  and `POSTGRES_PASSWORD`. The `OIDC_CLIENT_SECRET` must stay in sync with the
+  Dex client secret in `dev/dex/config.yaml`. These override the demo defaults
+  baked into `config/docker.yaml`.
 - **Use a real IdP.** The bundled Dex is a demo provider with static passwords —
   replace it (see below).
 - **Lock down exposed host ports.** Postgres (`5432`) and the registry (`5000`)

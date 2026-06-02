@@ -1,0 +1,101 @@
+# yaml-language-server: $schema=../docs/engineering/public/schemas/backend-settings.schema.json
+# =============================================================================
+# Single config for the standalone Docker deployment backend (run_mode: docker),
+# shipped in the image at /etc/rise/docker.yaml. The Rise backend loads it when
+# RISE_CONFIG_RUN_MODE=docker (overlaid on default.yaml).
+#
+# Production vs local differ ONLY by env vars set in the compose files
+# (docker-compose.standalone.yaml vs docker-compose.standalone.local.yaml). The
+# defaults baked in below are LOCAL-friendly, so a bare RISE_CONFIG_RUN_MODE=docker
+# with only DATABASE_URL set yields a working plain-HTTP local stack on
+# *.rise.localhost; the production compose file overrides the RISE_* env to flip
+# to TLS / Let's Encrypt on the real domain.
+#
+# The config loader interpolates ${VAR} / ${VAR:-default} but leaves Rise's own
+# {project_name} / {deployment_group} / {environment} ingress placeholders intact.
+#
+# INSECURE DEMO VALUES — REGENERATE BEFORE ANY REAL USE. The jwt_signing_secret,
+# encryption.key and auth.client_secret defaults below are well-known repo
+# placeholders and provide NO security. In production OVERRIDE them via the
+# RISE_JWT_SIGNING_SECRET / RISE_ENCRYPTION_KEY / OIDC_CLIENT_SECRET / ADMIN_EMAIL
+# env vars (see docker-compose.standalone.yaml).
+# =============================================================================
+server:
+  host: "0.0.0.0"
+  port: 3000
+  # Base public URL of the control plane. App hosts are subdomains of this host
+  # so the post-login same-host redirect validates (see validate_redirect_url in
+  # src/server/auth/handlers.rs). Prod sets PUBLIC_URL=https://rise.${RISE_DOMAIN}.
+  public_url: "${PUBLIC_URL:-http://rise.localhost:3000}"
+  cookie_secure: "${RISE_COOKIE_SECURE:-false}"
+  jwt_signing_secret: "${RISE_JWT_SIGNING_SECRET:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}"
+  jwt_claims: ["sub", "email", "name"]
+  static_dir: "${RISE_STATIC_DIR:-/var/lib/rise/static}"
+  docs_dir: "${RISE_DOCS_DIR:-/var/rise/docs}"
+  ssrf:
+    allow_private_networks: true
+    allow_http: true
+database:
+  url: "${DATABASE_URL}"
+encryption:
+  type: "aes-gcm-256"
+  key: "${RISE_ENCRYPTION_KEY:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}"
+auth:
+  # Single OIDC issuer. Local default is the internal Dex (http://rise-dex:5556/dex);
+  # prod sets DEX_ISSUER=https://dex.${RISE_DOMAIN} (computed in compose because the
+  # loader does a single, non-recursive ${VAR} pass).
+  issuer: "${DEX_ISSUER:-http://rise-dex:5556/dex}"
+  client_id: "${OIDC_CLIENT_ID:-rise-backend}"
+  client_secret: "${OIDC_CLIENT_SECRET:-rise-backend-secret}"
+  admin_users: ["${ADMIN_EMAIL:-admin@example.com}"]
+  operator_users: ["ops@example.com"]
+  allow_team_creation: true
+  allow_list_all_teams: true
+  platform_access:
+    policy: restrictive
+    allowed_user_emails: ["admin@example.com", "dev@example.com", "ops@example.com"]
+registry:
+  type: "oci-client-auth"
+  # Internal URL the server's Docker daemon uses to PULL app images.
+  registry_url: "${RISE_REGISTRY_URL:-rise-registry:5000}"
+  namespace: "rise-apps"
+  # Public URL the CLI PUSHES to. Local default is the loopback-published
+  # registry (localhost:5000); prod sets registry.${RISE_DOMAIN} (behind Traefik
+  # basicauth). The CLI does its own `docker login`; oci-client-auth mints none.
+  client_registry_url: "${RISE_CLIENT_REGISTRY_URL:-localhost:5000}"
+deployment_controller:
+  type: "docker"
+  traefik_network: "rise_default"
+  # Traefik entrypoint app routers bind to. Local: `web` (:80). Prod: `websecure`.
+  traefik_entrypoint: "${RISE_TRAEFIK_ENTRYPOINT:-web}"
+  # Optional certresolver. Empty (local) => no TLS labels; prod sets `le`. An
+  # empty/whitespace value is normalized to None by the controller (see
+  # normalize_certresolver in src/server/deployment/controller/docker/labels.rs).
+  traefik_certresolver: "${RISE_CERTRESOLVER:-}"
+  production_ingress_url_template: "{project_name}.${RISE_INGRESS_DOMAIN:-rise.localhost}"
+  staging_ingress_url_template: "{deployment_group}--{project_name}.${RISE_INGRESS_DOMAIN:-rise.localhost}"
+  environment_ingress_url_template: "{environment}--{project_name}.${RISE_INGRESS_DOMAIN:-rise.localhost}"
+  # URL scheme for generated ingress URLs. Local: http; prod: https. Ports are
+  # implicit (80/443) so no ingress_port is set.
+  ingress_schema: "${RISE_INGRESS_SCHEME:-http}"
+  reconcile_interval_secs: 5
+  controller_class_name: "default"
+  # Internal URL Traefik uses to reach the Rise backend for the forwardAuth
+  # subrequest (compose service name + port).
+  auth_backend_url: "${RISE_AUTH_BACKEND_URL:-http://rise:3000}"
+  # Browser-facing base URL for the login redirect; kept consistent with
+  # public_url's host.
+  auth_signin_url: "${PUBLIC_URL:-http://rise.localhost:3000}"
+  access_classes:
+    public:
+      display_name: Public
+      description: Public — no auth.
+      ingress_class: traefik
+      access_requirement: None
+    private:
+      display_name: Private
+      description: Requires project membership.
+      ingress_class: traefik
+      access_requirement: Member
+deployment_logs:
+  type: "docker"

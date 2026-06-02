@@ -43,7 +43,7 @@ export RISE_IMAGE_REPOSITORY RISE_IMAGE_TAG
 RISE_URL="${RISE_URL:-http://localhost:3000}"
 TRAEFIK_URL="${TRAEFIK_URL:-http://localhost:80}"
 # Must match server.public_url and server.jwt_signing_secret in
-# config/compose-docker.production.yaml. The control plane is reached on
+# config/docker.yaml (local defaults). The control plane is reached on
 # 127.0.0.1:3000 but the token iss/aud must equal public_url
 # (http://rise.localhost:3000), so app hosts ({project}.rise.localhost) are
 # subdomains of the public_url host and validate_redirect_url accepts the

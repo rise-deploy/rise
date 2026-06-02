@@ -16,8 +16,12 @@
 # provider, an OCI registry for app images, Traefik as the ingress reverse
 # proxy, and the Rise backend itself. App containers stamped by the Docker
 # controller join the `rise_default` network (see `traefik_network` in
-# config/compose-docker.production.yaml); Traefik is pinned to that same
-# network so it can route `{project}.${RISE_DOMAIN}` to them.
+# config/docker.yaml); Traefik is pinned to that same network so it can route
+# `{project}.${RISE_DOMAIN}` to them.
+#
+# The Rise backend config is NOT mounted: it ships in the image at
+# /etc/rise/docker.yaml (run_mode `docker`) and is parameterized entirely by the
+# RISE_* env vars set on the `rise` service below.
 #
 # -----------------------------------------------------------------------------
 # PRODUCTION-CAPABLE STARTING POINT — NOT PRODUCTION-READY AS-IS.
@@ -25,9 +29,11 @@
 # Treat this like a Helm `values.yaml`: a sound, working base that you are
 # expected to harden before exposing it to anyone. Before any real use:
 #
-#   * REGENERATE ALL SECRETS/KEYS. The demo jwt_signing_secret, encryption key,
-#     OAuth client_secret (config/compose-docker.production.yaml) and the
-#     Postgres password below are INSECURE PLACEHOLDERS. Replace every one.
+#   * REGENERATE ALL SECRETS/KEYS. The demo jwt_signing_secret, encryption key
+#     and OAuth client_secret (the RISE_*_SECRET/KEY env below default to insecure
+#     placeholders baked into config/docker.yaml) and the Postgres password below
+#     are INSECURE PLACEHOLDERS. Replace every one (set the RISE_JWT_SIGNING_SECRET,
+#     RISE_ENCRYPTION_KEY, OIDC_CLIENT_SECRET env to real values).
 #   * SET RISE_DOMAIN + ACME_EMAIL. TLS is on by default via the `le` ACME
 #     resolver (HTTP-01). Use the LE STAGING directory while testing (set
 #     ACME_CA_SERVER, see the traefik service) to avoid rate limits, then drop
@@ -44,9 +50,10 @@
 #   * PERSIST + BACK UP VOLUMES. The named volumes below are local; use durable
 #     storage and a backup strategy for `postgres_data`, `registry_data` and
 #     `traefik_acme`.
-#   * LOCK DOWN EXPOSED PORTS. Postgres (5432) and the registry (5000) are
-#     published to the host for convenience; bind them to localhost or drop the
-#     host port mappings in production (the registry is reachable via Traefik).
+#   * PORTS STAY INTERNAL. Only Traefik publishes host ports (80/443); Postgres,
+#     Dex, the registry and the backend are not exposed to the host — all ingress
+#     goes through Traefik. (The local overlay re-publishes them on 127.0.0.1 for
+#     direct dev access.)
 #
 # Image tag is overridable for CI via RISE_IMAGE_REPOSITORY / RISE_IMAGE_TAG.
 # =============================================================================
@@ -196,8 +203,11 @@ services:
       - default
 
   # Rise backend. Migrations auto-run on startup. Uses the Docker deployment
-  # controller (config/compose-docker.production.yaml), mounting the host Docker
-  # socket so it can create/route app containers.
+  # controller from the shipped config/docker.yaml (run_mode `docker`, baked into
+  # the image at /etc/rise/docker.yaml). Nothing is mounted: the prod RISE_* env
+  # below flips that config from its local HTTP defaults to TLS / Let's Encrypt on
+  # the real domain. The host Docker socket is mounted so it can create/route app
+  # containers.
   rise:
     # RISE_IMAGE_TAG is MANUALLY PINNED to a known-good released version; bump on
     # upgrade — there is no automatic 'latest released' resolution. Override with
@@ -230,16 +240,35 @@ services:
       - "traefik.http.services.rise-dotrise.loadbalancer.server.port=3000"
     environment:
       - DATABASE_URL=postgres://${POSTGRES_USER:-rise}:${POSTGRES_PASSWORD:-rise123}@rise-postgres:5432/${POSTGRES_DB:-rise}
-      - RISE_CONFIG_DIR=/etc/rise-docker
-      - RISE_CONFIG_RUN_MODE=production
-      - RISE_DOMAIN=${RISE_DOMAIN}
+      # Load the shipped config/docker.yaml (baked at /etc/rise/docker.yaml).
+      - RISE_CONFIG_DIR=/etc/rise
+      - RISE_CONFIG_RUN_MODE=docker
+      # --- Production overrides: flip config/docker.yaml from its local HTTP
+      # defaults to TLS / Let's Encrypt on the real domain. ---
+      - PUBLIC_URL=https://rise.${RISE_DOMAIN}
+      - RISE_INGRESS_DOMAIN=${RISE_DOMAIN}
+      - RISE_INGRESS_SCHEME=https
+      - RISE_CERTRESOLVER=le
+      - RISE_TRAEFIK_ENTRYPOINT=websecure
+      - RISE_CLIENT_REGISTRY_URL=registry.${RISE_DOMAIN}
+      - RISE_COOKIE_SECURE=true
       # Single OIDC issuer. Defaults to the public Dex router; override to point
       # at Dex fronted elsewhere. Computed here (not in the config) so the value
       # is fully resolved before the backend reads it.
       - DEX_ISSUER=${DEX_ISSUER:-https://dex.${RISE_DOMAIN}}
+      # SECRETS — MUST be set in the host environment for any real use. Passed
+      # through ONLY when set (the bare `- NAME` form omits an unset var rather
+      # than overriding the config default with an empty string); if unset they
+      # fall back to the INSECURE repo placeholders baked into config/docker.yaml.
+      # Regenerate before exposing the stack: jwt secret + encryption key via
+      # `openssl rand -base64 32`, the OAuth client_secret kept in sync with
+      # dev/dex/config.yaml.
+      - RISE_JWT_SIGNING_SECRET
+      - RISE_ENCRYPTION_KEY
+      - OIDC_CLIENT_SECRET
+      - ADMIN_EMAIL
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./config/compose-docker.production.yaml:/etc/rise-docker/production.yaml:ro
     depends_on:
       postgres:
         condition: service_healthy

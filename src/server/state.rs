@@ -394,7 +394,10 @@ async fn init_docker_backend(
             container_prefix: container_prefix.clone(),
             traefik_network: traefik_network.clone(),
             traefik_entrypoint: traefik_entrypoint.clone(),
-            traefik_certresolver: traefik_certresolver.clone(),
+            traefik_certresolver:
+                crate::server::deployment::controller::docker::labels::normalize_certresolver(
+                    traefik_certresolver.clone(),
+                ),
             reconcile_interval_secs: *reconcile_interval_secs,
             health_path,
             public_url: public_url.to_string(),

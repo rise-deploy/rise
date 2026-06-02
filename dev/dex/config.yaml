@@ -14,7 +14,7 @@ staticClients:
   # entry MUST match a public_url host used by one of the stacks.
   # Dev stack (docker-compose.yml) + legacy host dev:
   - http://rise.local:3000/api/v1/auth/callback
-  # Standalone local/e2e stack (config/compose-docker.local.yaml):
+  # Standalone local/e2e stack (config/docker.yaml, run_mode docker, local defaults):
   - http://rise.localhost:3000/api/v1/auth/callback
   # /.rise control-plane callback variant (custom-domain / ingress routing).
   - http://rise.localhost:3000/.rise/auth/callback
