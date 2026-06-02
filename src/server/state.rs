@@ -255,6 +255,7 @@ async fn init_docker_backend(
     settings: &crate::server::settings::DeploymentControllerSettings,
     registry_provider: Arc<dyn RegistryProvider>,
     encryption_provider: Option<Arc<dyn EncryptionProvider>>,
+    resource_store: Arc<dyn rise_resource_store::ResourceStore>,
     db_pool: PgPool,
     public_url: &str,
 ) -> Result<(Arc<dyn DeploymentBackend>, bollard::Docker)> {
@@ -333,12 +334,22 @@ async fn init_docker_backend(
         .as_ref()
         .map(|hp| hp.path.clone())
         .unwrap_or_else(|| "/".to_string());
+    // The Docker backend keeps secret env vars as plain KEY=VALUE entries on the
+    // container (visible via `docker inspect`) — an accepted, documented caveat.
+    // Surface it once at startup so operators are aware.
+    tracing::warn!(
+        "Docker deployment backend: secret environment variables are stored as plain \
+         container env and are visible via `docker inspect`. This is an accepted caveat \
+         of the Docker runtime; use the Kubernetes backend for secret isolation."
+    );
+
     let reconciler = DockerReconciler::new(
         docker.clone(),
         db_pool,
         resource_builder,
         registry_provider,
         encryption_provider,
+        resource_store,
         ReconcilerConfig {
             controller_class: controller_class_name.clone(),
             label_namespace: label_namespace.clone(),
@@ -942,6 +953,7 @@ impl AppState {
                         docker_settings,
                         registry_provider.clone(),
                         encryption_provider.clone(),
+                        resource_store.clone(),
                         db_pool.clone(),
                         &public_url,
                     )
@@ -957,11 +969,23 @@ impl AppState {
             }
         };
 
+        // Surface the Docker controller's configured `label_namespace` so the
+        // Docker log backend resolves containers by the same namespaced labels
+        // the reconciler stamps (rather than a hardcoded literal).
+        #[cfg(feature = "backend")]
+        let docker_label_namespace = match &settings.deployment_controller {
+            Some(crate::server::settings::DeploymentControllerSettings::Docker {
+                label_namespace,
+                ..
+            }) => Some(label_namespace.clone()),
+            _ => None,
+        };
         #[cfg(feature = "backend")]
         let runtime_log_backend = crate::server::deployment::logs::init_runtime_log_backend(
             &settings.deployment_logs,
             webhook_kube_client.clone(),
             docker_client.clone(),
+            docker_label_namespace.as_deref(),
         )
         .await?;
 

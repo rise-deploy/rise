@@ -613,7 +613,7 @@ fn default_traefik_entrypoint() -> String {
 }
 
 #[cfg(feature = "backend")]
-fn default_label_namespace() -> String {
+pub(crate) fn default_label_namespace() -> String {
     "rise.dev".to_string()
 }
 

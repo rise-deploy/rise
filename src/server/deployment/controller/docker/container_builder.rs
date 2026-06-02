@@ -148,9 +148,14 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
             if route.hosts.is_empty() {
                 continue;
             }
+            // Include the deployment id so a superseded (Terminating) container
+            // and its replacement carry distinct Traefik router/service names
+            // during a rollout — otherwise both would expose identical router
+            // labels for up to one reconcile interval and collide. The Host
+            // rule stays the same so traffic keeps resolving to the project.
             let base = labels::sanitize_router_name(&format!(
-                "{}-{}-{}",
-                desired.project, desired.deployment_group, desired.container
+                "{}-{}-{}-{}",
+                desired.project, desired.deployment_group, desired.deployment_id, desired.container
             ));
             // Distinct router per route so multiple path prefixes don't collide.
             let router_name = if routes.len() > 1 {
@@ -327,13 +332,15 @@ mod tests {
         );
         assert_eq!(
             labels
-                .get("traefik.http.routers.myapp-default-app.rule")
+                .get("traefik.http.routers.myapp-default-20260101-120000-app.rule")
                 .map(String::as_str),
             Some("Host(`myapp.rise.dev`)")
         );
         assert_eq!(
             labels
-                .get("traefik.http.services.myapp-default-app.loadbalancer.server.port")
+                .get(
+                    "traefik.http.services.myapp-default-20260101-120000-app.loadbalancer.server.port"
+                )
                 .map(String::as_str),
             Some("8080")
         );
@@ -389,13 +396,13 @@ mod tests {
         // Two routers, index suffixed. Longest prefix (/api/v1) sorts first → -0.
         assert_eq!(
             labels
-                .get("traefik.http.routers.myapp-default-api-0.rule")
+                .get("traefik.http.routers.myapp-default-20260101-120000-api-0.rule")
                 .map(String::as_str),
             Some("Host(`myapp.rise.dev`) && PathPrefix(`/api/v1`)")
         );
         assert_eq!(
             labels
-                .get("traefik.http.routers.myapp-default-api-1.rule")
+                .get("traefik.http.routers.myapp-default-20260101-120000-api-1.rule")
                 .map(String::as_str),
             Some("Host(`myapp.rise.dev`)")
         );
@@ -412,13 +419,13 @@ mod tests {
         let labels = built.config.labels.as_ref().unwrap();
         assert_eq!(
             labels
-                .get("traefik.http.routers.myapp-default-app.tls")
+                .get("traefik.http.routers.myapp-default-20260101-120000-app.tls")
                 .map(String::as_str),
             Some("true")
         );
         assert_eq!(
             labels
-                .get("traefik.http.routers.myapp-default-app.tls.certresolver")
+                .get("traefik.http.routers.myapp-default-20260101-120000-app.tls.certresolver")
                 .map(String::as_str),
             Some("le")
         );

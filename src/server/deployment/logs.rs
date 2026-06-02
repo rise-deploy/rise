@@ -188,6 +188,7 @@ pub async fn init_runtime_log_backend(
     settings: &DeploymentLogsSettings,
     kube_client: Option<kube::Client>,
     docker_client: Option<bollard::Docker>,
+    docker_label_namespace: Option<&str>,
 ) -> Result<Arc<dyn RuntimeLogBackend>> {
     match settings {
         DeploymentLogsSettings::Kubernetes { config } => {
@@ -200,7 +201,18 @@ pub async fn init_runtime_log_backend(
         DeploymentLogsSettings::Docker { .. } => {
             let docker =
                 docker_client.context("Docker log backend requires a connected Docker client")?;
-            Ok(Arc::new(DockerLogBackend { docker }))
+            // The Docker log backend resolves containers by the same
+            // bookkeeping labels the reconciler stamps, so it must use the
+            // Docker controller's configured `label_namespace` rather than a
+            // hardcoded literal. Falls back to the default when the Docker
+            // controller isn't the active deployment backend.
+            let label_namespace = docker_label_namespace
+                .map(str::to_string)
+                .unwrap_or_else(crate::server::settings::default_label_namespace);
+            Ok(Arc::new(DockerLogBackend {
+                docker,
+                label_namespace,
+            }))
         }
         DeploymentLogsSettings::Loki {
             url,
@@ -440,18 +452,23 @@ fn status_stream(status: LogStatus) -> LogEventStream {
 
 /// Runtime log backend that streams directly from the Docker daemon.
 ///
-/// Resolves the deployment's container(s) by the `rise.dev/deployment-id` label
-/// Rise stamps, then proxies `docker logs` into the shared [`LogEventStream`].
-/// Mirrors the Kubernetes backend's regex level classification and lack of
-/// historical volume support.
+/// Resolves the deployment's container(s) by the namespaced `deployment-id`
+/// label Rise stamps (using the Docker controller's configured
+/// `label_namespace`), then proxies `docker logs` into the shared
+/// [`LogEventStream`]. Mirrors the Kubernetes backend's regex level
+/// classification and lack of historical volume support.
 struct DockerLogBackend {
     docker: bollard::Docker,
+    /// Label namespace the Docker controller stamps containers with (e.g.
+    /// `rise.dev`). Used to build the `<ns>/deployment-id` filter key.
+    label_namespace: String,
 }
 
 impl DockerLogBackend {
     /// Find the most relevant container id for a deployment by its
-    /// `rise.dev/deployment-id` label. Prefers a running container.
+    /// `<label_namespace>/deployment-id` label. Prefers a running container.
     async fn resolve_container_id(&self, deployment: &Deployment) -> Result<Option<String>> {
+        use crate::server::deployment::controller::docker::labels::{self, SUFFIX_DEPLOYMENT_ID};
         use bollard::container::ListContainersOptions;
         use std::collections::HashMap as StdHashMap;
 
@@ -459,7 +476,8 @@ impl DockerLogBackend {
         filters.insert(
             "label".to_string(),
             vec![format!(
-                "rise.dev/deployment-id={}",
+                "{}={}",
+                labels::ns_key(&self.label_namespace, SUFFIX_DEPLOYMENT_ID),
                 deployment.deployment_id
             )],
         );

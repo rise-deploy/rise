@@ -66,6 +66,12 @@ pub struct DockerReconciler {
     resource_builder: Arc<ResourceBuilder>,
     registry_provider: Arc<dyn RegistryProvider>,
     encryption_provider: Option<Arc<dyn EncryptionProvider>>,
+    /// Resource store used to read each project's owning Organization so the
+    /// reconciler only ever touches projects whose `deploymentControllerClass`
+    /// matches `config.controller_class` (mirrors the K8s webhook).
+    resource_store: Arc<dyn rise_resource_store::ResourceStore>,
+    /// HTTP client reused across health probes (built once, not per-probe).
+    http_client: reqwest::Client,
     config: ReconcilerConfig,
 }
 
@@ -76,14 +82,29 @@ impl DockerReconciler {
         resource_builder: Arc<ResourceBuilder>,
         registry_provider: Arc<dyn RegistryProvider>,
         encryption_provider: Option<Arc<dyn EncryptionProvider>>,
+        resource_store: Arc<dyn rise_resource_store::ResourceStore>,
         config: ReconcilerConfig,
     ) -> Self {
+        // Built once and reused; on the (unlikely) builder failure fall back to
+        // a default client so the reconciler still functions.
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|e| {
+                warn!(
+                    "Failed to build health probe client, using default: {:?}",
+                    e
+                );
+                reqwest::Client::new()
+            });
         Self {
             docker,
             db_pool,
             resource_builder,
             registry_provider,
             encryption_provider,
+            resource_store,
+            http_client,
             config,
         }
     }
@@ -107,16 +128,70 @@ impl DockerReconciler {
         });
     }
 
-    /// Run a single reconcile pass over all projects. Errors are isolated per
-    /// project so one bad project can't stall the rest.
+    /// Run a single reconcile pass over the projects this controller owns.
+    /// Errors are isolated per project so one bad project can't stall the rest.
+    ///
+    /// Projects whose owning Organization's `deploymentControllerClass` does
+    /// not match `config.controller_class` belong to a different controller and
+    /// are skipped entirely — neither reconciled nor GC'd. This mirrors the K8s
+    /// webhook's `enforce_controller_class`.
     async fn tick(&self) -> Result<()> {
         let projects = db_projects::list(&self.db_pool, None).await?;
         for project in projects {
+            match self.owns_project(&project).await {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    warn!(
+                        project = %project.name,
+                        "Failed to resolve controller class, skipping project: {:?}", e
+                    );
+                    continue;
+                }
+            }
             if let Err(e) = self.reconcile_project(&project).await {
                 error!(project = %project.name, "Failed to reconcile project: {:?}", e);
             }
         }
         Ok(())
+    }
+
+    /// Whether this controller owns `project`, i.e. the project's Organization's
+    /// `deploymentControllerClass` matches `config.controller_class`. Reuses the
+    /// same DB linkage helper and resource store the K8s webhook reads.
+    async fn owns_project(&self, project: &Project) -> Result<bool> {
+        let org_uid =
+            crate::db::organization_links::organization_uid_for_project(&self.db_pool, project.id)
+                .await?;
+        let Some(org_uid) = org_uid else {
+            // No Organization linkage — bootstrap should have backfilled this.
+            // Treat as not-owned so we never GC containers for an unlinked
+            // project we can't attribute to this controller.
+            warn!(
+                project = %project.name,
+                "Project has no organization linkage; skipping in Docker reconciler"
+            );
+            return Ok(false);
+        };
+        let org_class = self.resolve_org_controller_class(org_uid).await?;
+        Ok(controller_class_matches(
+            &self.config.controller_class,
+            org_class.as_deref(),
+        ))
+    }
+
+    /// Read the Organization's `spec.deploymentControllerClass` from the
+    /// resource store.
+    async fn resolve_org_controller_class(&self, org_uid: uuid::Uuid) -> Result<Option<String>> {
+        let row = self
+            .resource_store
+            .get(org_uid)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to load Organization {org_uid}: {e}"))?
+            .ok_or_else(|| anyhow::anyhow!("Organization {org_uid} is missing"))?;
+        let spec: rise_resource_api::OrganizationSpec = serde_json::from_value(row.spec.clone())
+            .map_err(|e| anyhow::anyhow!("Organization {org_uid} has malformed spec: {e}"))?;
+        Ok(spec.deployment_controller_class)
     }
 
     async fn reconcile_project(&self, project: &Project) -> Result<()> {
@@ -446,10 +521,19 @@ impl DockerReconciler {
         use bollard::container::ListContainersOptions;
         let ns = &self.config.label_namespace;
         let mut filters: HashMap<String, Vec<String>> = HashMap::new();
+        // Scope the listing to *this* controller's containers: managed-by=rise,
+        // the configured controller-class, and this project. Without the
+        // controller-class filter the GC pass could remove containers another
+        // Rise controller owns on the same host.
         filters.insert(
             "label".to_string(),
             vec![
                 format!("{}={}", labels::ns_key(ns, SUFFIX_MANAGED_BY), "rise"),
+                format!(
+                    "{}={}",
+                    labels::ns_key(ns, labels::SUFFIX_CONTROLLER_CLASS),
+                    self.config.controller_class
+                ),
                 format!(
                     "{}={}",
                     labels::ns_key(ns, labels::SUFFIX_PROJECT),
@@ -481,6 +565,10 @@ impl DockerReconciler {
                     env_secret_hash_label: labels
                         .get(&labels::ns_key(ns, SUFFIX_ENV_SECRET_HASH))
                         .cloned(),
+                    // Daemon-reported lifecycle state ("running", "exited",
+                    // "created", "dead", …). Used by the diff to restart
+                    // containers that exist but aren't running.
+                    state: s.state,
                 })
             })
             .collect())
@@ -528,8 +616,27 @@ impl DockerReconciler {
                     }
                 }
                 ReconcileAction::Recreate { name, existing_id } => {
-                    self.remove_container(existing_id).await;
+                    // The replacement reuses the old container's deterministic
+                    // name, so we can't create-then-swap without a temp name.
+                    // To keep the outage window minimal we pre-pull the image
+                    // (the slowest, most failure-prone step) *before* removing
+                    // the running container — a pull failure then leaves the old
+                    // container in place rather than tearing it down first.
+                    //
+                    // TODO(create-then-swap): create the replacement under a
+                    // temporary name, confirm it started, then atomically remove
+                    // the old container and rename the new one. Requires the
+                    // diff/health paths to tolerate the transient temp name.
                     if let Some(d) = by_name.get(name.as_str()) {
+                        if let Err(e) = self.pull_image(&d.image).await {
+                            error!(
+                                project = %project.name,
+                                container = %name,
+                                "Failed to pull image for recreate; leaving existing container in place: {:?}", e
+                            );
+                            continue;
+                        }
+                        self.remove_container(existing_id).await;
                         if let Err(e) = self.create_container(d, &builder_cfg).await {
                             error!(
                                 project = %project.name,
@@ -537,6 +644,9 @@ impl DockerReconciler {
                                 "Failed to recreate container: {:?}", e
                             );
                         }
+                    } else {
+                        // No desired match (shouldn't happen for Recreate) — GC.
+                        self.remove_container(existing_id).await;
                     }
                 }
                 ReconcileAction::Remove { id, name } => {
@@ -639,15 +749,12 @@ impl DockerReconciler {
         }
 
         let (container_specs, _routes) = resolve_runtime_containers(deployment)?;
-        // Routable containers must all answer the HTTP probe for the deployment
-        // to be considered healthy. Workers (no port) count as ready.
-        let mut all_ready = true;
-        let mut probed_any = false;
+        // Every container must be ready for the deployment to be healthy:
+        //   - routable containers (with a port) must answer the HTTP probe;
+        //   - workers (no port) must exist and be `running` on the daemon.
+        // An empty spec set is never ready.
+        let mut all_ready = !container_specs.is_empty();
         for spec in &container_specs {
-            let Some(port) = spec.port else {
-                continue;
-            };
-            probed_any = true;
             let name = container_builder::container_name(
                 &self.config.container_prefix,
                 &project.name,
@@ -655,14 +762,18 @@ impl DockerReconciler {
                 &deployment.deployment_id,
                 &spec.name,
             );
-            if !self.probe_container(&name, port).await {
+            let ready = match spec.port {
+                Some(port) => self.probe_container(&name, port).await,
+                // Worker: no HTTP endpoint, so the daemon's run state is the
+                // only liveness signal we have.
+                None => self.container_is_running(&name).await,
+            };
+            if !ready {
                 all_ready = false;
                 break;
             }
         }
-        // A deployment with no routable container (all workers) is ready once
-        // its containers exist (they were created in the diff pass).
-        let is_ready = all_ready && (probed_any || !container_specs.is_empty());
+        let is_ready = all_ready;
 
         // Snapshot controller_metadata in a K8s-pod-status-shaped blob so the
         // existing status APIs/UI render.
@@ -732,25 +843,44 @@ impl DockerReconciler {
     }
 
     /// HTTP health probe over the shared Traefik network using the container's
-    /// name as hostname (Docker DNS resolves it within the network).
+    /// name as hostname (Docker DNS resolves it within the network). Reuses the
+    /// reconciler's shared `reqwest::Client`.
     async fn probe_container(&self, container_name: &str, port: u16) -> bool {
         let url = format!(
             "http://{}:{}{}",
             container_name, port, self.config.health_path
         );
-        let client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("Failed to build health probe client: {:?}", e);
-                return false;
-            }
-        };
-        match client.get(&url).send().await {
+        match self.http_client.get(&url).send().await {
             Ok(resp) => resp.status().as_u16() < 500,
             Err(_) => false,
+        }
+    }
+
+    /// Whether the named container exists and the daemon reports it `running`.
+    /// Used as the liveness signal for port-less worker containers.
+    async fn container_is_running(&self, container_name: &str) -> bool {
+        use bollard::container::ListContainersOptions;
+        let mut filters: HashMap<String, Vec<String>> = HashMap::new();
+        filters.insert("name".to_string(), vec![format!("^/{container_name}$")]);
+        match self
+            .docker
+            .list_containers(Some(ListContainersOptions {
+                all: true,
+                filters,
+                ..Default::default()
+            }))
+            .await
+        {
+            Ok(summaries) => summaries
+                .into_iter()
+                .any(|s| s.state.as_deref() == Some("running")),
+            Err(e) => {
+                warn!(
+                    container = %container_name,
+                    "Failed to inspect worker container state: {:?}", e
+                );
+                false
+            }
         }
     }
 
@@ -830,6 +960,18 @@ pub struct ActualContainer {
     pub name: String,
     pub image_label: Option<String>,
     pub env_secret_hash_label: Option<String>,
+    /// Daemon-reported lifecycle state (e.g. "running", "exited", "created",
+    /// "dead"). `None` when the daemon didn't report it. A container that
+    /// matches on image + env but is not "running" (created-but-not-started,
+    /// exited, or crash-give-up) is recreated.
+    pub state: Option<String>,
+}
+
+impl ActualContainer {
+    /// Whether the daemon reports this container as actively running.
+    fn is_running(&self) -> bool {
+        self.state.as_deref() == Some("running")
+    }
 }
 
 /// What to do with one container slot.
@@ -880,7 +1022,11 @@ pub fn diff_desired_vs_actual(
                 let image_drift = a.image_label.as_deref() != Some(d.image.as_str());
                 let env_drift =
                     a.env_secret_hash_label.as_deref() != Some(d.env_secret_hash.as_str());
-                if image_drift || env_drift {
+                // A container that matches on image + env but isn't running
+                // (created-but-never-started, exited, or out of restart
+                // retries) must be recreated so the deployment recovers.
+                let not_running = !a.is_running();
+                if image_drift || env_drift || not_running {
                     actions.push(ReconcileAction::Recreate {
                         name: name.clone(),
                         existing_id: a.id.clone(),
@@ -902,6 +1048,21 @@ pub fn diff_desired_vs_actual(
     // Deterministic ordering for testability.
     actions.sort_by_key(action_key);
     actions
+}
+
+/// Pure comparison of this controller's configured class against the
+/// project's Organization's `deploymentControllerClass`. Mirrors the K8s
+/// webhook's `check_controller_class`:
+///
+/// - An empty configured class (legacy / unconfigured Docker install) matches
+///   every project.
+/// - Otherwise the Organization must set exactly the same class; an unset or
+///   differing Org class means the project belongs to another controller.
+pub fn controller_class_matches(configured: &str, org_class: Option<&str>) -> bool {
+    if configured.is_empty() {
+        return true;
+    }
+    org_class == Some(configured)
 }
 
 fn action_key(a: &ReconcileAction) -> (u8, String) {
@@ -1002,6 +1163,7 @@ mod tests {
             name: name_of(&d),
             image_label: Some("img:1".to_string()),
             env_secret_hash_label: Some("h1".to_string()),
+            state: Some("running".to_string()),
         }];
         let actions = diff_desired_vs_actual(&[d], &actual, "rise");
         assert!(actions.is_empty());
@@ -1015,6 +1177,7 @@ mod tests {
             name: name_of(&d),
             image_label: Some("img:1".to_string()),
             env_secret_hash_label: Some("h1".to_string()),
+            state: Some("running".to_string()),
         }];
         let actions = diff_desired_vs_actual(std::slice::from_ref(&d), &actual, "rise");
         assert_eq!(
@@ -1034,6 +1197,7 @@ mod tests {
             name: name_of(&d),
             image_label: Some("img:1".to_string()),
             env_secret_hash_label: Some("h1".to_string()),
+            state: Some("running".to_string()),
         }];
         let actions = diff_desired_vs_actual(std::slice::from_ref(&d), &actual, "rise");
         assert_eq!(
@@ -1046,12 +1210,38 @@ mod tests {
     }
 
     #[test]
+    fn diff_recreates_when_matched_but_not_running() {
+        // Image + env match, but the container exited / never started — it must
+        // be recreated so the deployment recovers.
+        let d = desired("app", "img:1", "h1");
+        for state in [Some("exited"), Some("created"), Some("dead"), None] {
+            let actual = vec![ActualContainer {
+                id: "cid".to_string(),
+                name: name_of(&d),
+                image_label: Some("img:1".to_string()),
+                env_secret_hash_label: Some("h1".to_string()),
+                state: state.map(str::to_string),
+            }];
+            let actions = diff_desired_vs_actual(std::slice::from_ref(&d), &actual, "rise");
+            assert_eq!(
+                actions,
+                vec![ReconcileAction::Recreate {
+                    name: name_of(&d),
+                    existing_id: "cid".to_string()
+                }],
+                "state {state:?} should force recreate"
+            );
+        }
+    }
+
+    #[test]
     fn diff_removes_orphan() {
         let actual = vec![ActualContainer {
             id: "old".to_string(),
             name: "rise_myapp_default_oldid_app".to_string(),
             image_label: Some("img:1".to_string()),
             env_secret_hash_label: Some("h1".to_string()),
+            state: Some("running".to_string()),
         }];
         let actions = diff_desired_vs_actual(&[], &actual, "rise");
         assert_eq!(
@@ -1072,6 +1262,7 @@ mod tests {
             name: "rise_myapp_default_oldid_app".to_string(),
             image_label: Some("img:1".to_string()),
             env_secret_hash_label: Some("h1".to_string()),
+            state: Some("running".to_string()),
         }];
         let actions = diff_desired_vs_actual(std::slice::from_ref(&new), &actual, "rise");
         assert_eq!(
@@ -1086,6 +1277,24 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn controller_class_matching() {
+        // Empty configured class (legacy install) matches everything.
+        assert!(controller_class_matches("", None));
+        assert!(controller_class_matches("", Some("anything")));
+        // Configured class requires an exact Org match.
+        assert!(controller_class_matches(
+            "docker.rise.dev/default",
+            Some("docker.rise.dev/default")
+        ));
+        assert!(!controller_class_matches(
+            "docker.rise.dev/default",
+            Some("kubernetes.rise.dev/default")
+        ));
+        // Org with no class set is owned by no specific controller.
+        assert!(!controller_class_matches("docker.rise.dev/default", None));
     }
 
     #[test]
