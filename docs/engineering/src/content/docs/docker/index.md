@@ -107,9 +107,16 @@ Point these records at the host running the stack:
 | `registry.${RISE_DOMAIN}` | Container registry |
 | `dex.${RISE_DOMAIN}` | Bundled Dex IdP (only if you keep it) |
 
-App hosts must be subdomains of the control-plane host: the post-login same-host
-redirect is validated against `server.public_url`
-(`validate_redirect_url` in `src/server/auth/handlers.rs`).
+App hosts are simplest as **subdomains** of the control-plane host (e.g.
+`{project}.${RISE_DOMAIN}` under `rise.${RISE_DOMAIN}`): the post-login return
+redirect is validated against `server.public_url` (`validate_redirect_url` in
+`src/server/auth/handlers.rs`), which accepts the control-plane host and its
+subdomains, so a subdomain works with no extra setup. Apps on an unrelated or
+**custom** domain still authenticate — register the domain as a project custom
+domain and the custom-domain redirect flow (a one-time token that sets the
+session cookie on that host) handles the post-login return. Only arbitrary,
+unregistered hosts fall back to `/` after login. Traefik itself will route any
+host you configure; this is purely about where the post-login redirect may land.
 
 ### 2. TLS / Let's Encrypt
 
