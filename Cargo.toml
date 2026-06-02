@@ -59,6 +59,7 @@ cli = [
     "dep:webbrowser",
     "dep:serde_ignored",
     "dep:async-trait",
+    "dep:serde_yaml",
 ]
 backend = [
     # Server core (former "server" feature)
