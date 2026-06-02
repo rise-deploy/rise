@@ -1457,27 +1457,44 @@ where
 
 /// Build the browser-facing login redirect URL for Traefik forwardAuth mode.
 ///
-/// Reconstructs the original request URL from Traefik's forwarded headers
-/// (`X-Forwarded-Proto` + `X-Forwarded-Host` + `X-Forwarded-Uri`) and embeds it
-/// as the `redirect` parameter so the user returns to where they started after
-/// signing in. Falls back gracefully when forwarded headers are absent.
+/// Mirrors the Kubernetes `backend_address` ingress-auth flow (see
+/// `ResourceBuilder::build_ingress_annotations` in
+/// `src/server/deployment/resource_builder.rs`): the signin page must be served
+/// on the **same host** as the app so the login cookie is set on the app host
+/// that forwardAuth subsequently reads. A cross-host redirect to the control
+/// plane would set the cookie on the wrong host and loop.
+///
+/// Traefik routes `PathPrefix('/.rise')` on every host to the Rise backend, so
+/// `{X-Forwarded-Proto}://{X-Forwarded-Host}/.rise/auth/signin` is served by the
+/// backend even though the host is the app's. The original request URL is
+/// reconstructed from `X-Forwarded-Proto` + `X-Forwarded-Host` +
+/// `X-Forwarded-Uri` and embedded as `redirect` so the user returns to where
+/// they started after signing in.
+///
+/// Falls back to the control-plane `signin_base` URL only when
+/// `X-Forwarded-Host` is absent (degraded path — the same-host redirect cannot
+/// be constructed without the forwarded host).
 fn build_signin_redirect_url(signin_base: &str, project: &str, headers: &HeaderMap) -> String {
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
     let proto = header("x-forwarded-proto").unwrap_or("http");
     let host = header("x-forwarded-host");
     let uri = header("x-forwarded-uri").unwrap_or("/");
 
-    let base = signin_base.trim_end_matches('/');
-    let mut url = format!(
-        "{}/api/v1/auth/signin?project={}",
-        base,
-        urlencoding::encode(project)
-    );
+    let enc_project = urlencoding::encode(project);
+
     if let Some(host) = host {
+        // Same-host signin page (served by the backend via the /.rise router).
         let original = format!("{proto}://{host}{uri}");
-        url.push_str(&format!("&redirect={}", urlencoding::encode(&original)));
+        format!(
+            "{proto}://{host}/.rise/auth/signin?project={enc_project}&redirect={}",
+            urlencoding::encode(&original)
+        )
+    } else {
+        // Degraded fallback: no forwarded host → target the control-plane signin
+        // page on the configured base URL (cookie host may be wrong).
+        let base = signin_base.trim_end_matches('/');
+        format!("{base}/api/v1/auth/signin?project={enc_project}")
     }
-    url
 }
 
 /// Ingress auth endpoint (nginx `auth-url` / Traefik `forwardAuth`)
@@ -1524,9 +1541,16 @@ pub async fn ingress_auth(
                 redirect_path = %redirect_path,
                 "Allowing unauthenticated access to .rise path"
             );
+            // Emit BOTH identity headers (matching Traefik's authResponseHeaders
+            // list) so a client cannot smuggle a forged X-Auth-Request-User /
+            // X-Auth-Request-Email through the allowlisted /.rise path — the
+            // empty/anonymous values clobber any client-supplied ones.
             return Ok((
                 StatusCode::OK,
-                [("X-Auth-Request-User", "anonymous".to_string())],
+                [
+                    ("X-Auth-Request-User", "anonymous".to_string()),
+                    ("X-Auth-Request-Email", String::new()),
+                ],
             )
                 .into_response());
         }
@@ -1898,17 +1922,40 @@ mod tests {
         headers.insert("x-forwarded-host", "secret.rise.localhost".parse().unwrap());
         headers.insert("x-forwarded-uri", "/dashboard?tab=1".parse().unwrap());
         let url = build_signin_redirect_url("http://localhost:3000", "secret app", &headers);
-        // Base + project (URL-encoded) + redirect (full original URL, encoded).
-        assert!(url.starts_with("http://localhost:3000/api/v1/auth/signin?project=secret%20app"));
+        // Same-host signin page served by the /.rise router on the app host,
+        // project (URL-encoded), and redirect (full original URL, encoded).
+        assert!(
+            url.starts_with("https://secret.rise.localhost/.rise/auth/signin?project=secret%20app")
+        );
         assert!(url.contains("&redirect=https%3A%2F%2Fsecret.rise.localhost%2Fdashboard%3Ftab%3D1"));
+    }
+
+    #[test]
+    fn signin_redirect_url_targets_app_host_not_control_plane() {
+        // The signin page must be served on the SAME (app) host so the login
+        // cookie lands on the host forwardAuth reads — never on the control
+        // plane host from signin_base.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert("x-forwarded-host", "app.rise.localhost".parse().unwrap());
+        headers.insert("x-forwarded-uri", "/".parse().unwrap());
+        let url = build_signin_redirect_url("http://rise.localhost:3000", "app", &headers);
+        let signin_host = url_host(&url);
+        assert_eq!(signin_host, "app.rise.localhost");
+        assert_ne!(signin_host, "rise.localhost:3000");
+        assert!(url.starts_with("https://app.rise.localhost/.rise/auth/signin?project=app"));
     }
 
     #[test]
     fn signin_redirect_url_falls_back_without_forwarded_host() {
         let headers = HeaderMap::new();
-        let url = build_signin_redirect_url("http://localhost:3000/", "app", &headers);
+        let url = build_signin_redirect_url("http://rise.localhost:3000/", "app", &headers);
+        // No forwarded host → degraded fallback to the control-plane signin page.
         // Trailing slash on base is trimmed; no redirect param when host absent.
-        assert_eq!(url, "http://localhost:3000/api/v1/auth/signin?project=app");
+        assert_eq!(
+            url,
+            "http://rise.localhost:3000/api/v1/auth/signin?project=app"
+        );
     }
 
     #[test]

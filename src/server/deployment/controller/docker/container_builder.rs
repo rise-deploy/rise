@@ -243,12 +243,28 @@ fn render_traefik_labels_for(
     // address pointing at Rise's ingress-auth endpoint. `signin_redirect=1` puts
     // the handler in Traefik mode (302 to the login page on unauthenticated,
     // since Traefik has no nginx-style auth-signin). The project name is
-    // URL-encoded into the query. `None` (or a missing/unconfigured class, or no
-    // backend URL) leaves forward_auth unset → no auth enforced.
-    let requirement = cfg
-        .access_classes
-        .get(&desired.access_class)
-        .unwrap_or(&AccessRequirement::None);
+    // URL-encoded into the query. `None` leaves forward_auth unset → no auth.
+    //
+    // FAIL CLOSED on an unknown access class: a project referencing a
+    // missing/removed class must NOT silently become public (mirroring the K8s
+    // path, which errors on an unknown class — see
+    // `ResourceBuilder::build_ingress_annotations`). The builder's signature
+    // can't propagate an error (it feeds the create spec and a precomputed
+    // route hash), so we treat an unknown class as the most restrictive
+    // requirement (`Member`) rather than defaulting to public `None`. The app
+    // is then routed only behind forwardAuth — never as an open public route.
+    let requirement = match cfg.access_classes.get(&desired.access_class) {
+        Some(req) => req.clone(),
+        None => {
+            tracing::error!(
+                project = %desired.project,
+                access_class = %desired.access_class,
+                "Access class not configured — failing closed (treating as Member, \
+                 routing only behind forwardAuth) to avoid a silent public route"
+            );
+            AccessRequirement::Member
+        }
+    };
     let forward_auth_address: Option<String> = match requirement {
         AccessRequirement::None => None,
         AccessRequirement::Authenticated | AccessRequirement::Member => {
@@ -676,6 +692,39 @@ mod tests {
         let built = build_container(&desired, &cfg);
         let labels = built.config.labels.as_ref().unwrap();
         assert!(!labels.keys().any(|k| k.contains("forwardauth")));
+    }
+
+    #[test]
+    fn unknown_access_class_fails_closed_not_public() {
+        // A project whose access_class is absent from the map must NOT be served
+        // as an open public route. We fail closed: the route is stamped behind
+        // forwardAuth (most-restrictive) rather than defaulting to None/public.
+        let map = public_private_map(); // does not contain "ghost"
+        let cfg = BuilderConfig {
+            auth_backend_url: "http://rise:3000",
+            access_classes: &map,
+            ..test_cfg()
+        };
+        let mut desired = single_container();
+        desired.access_class = "ghost".to_string();
+        let built = build_container(&desired, &cfg);
+        let labels = built.config.labels.as_ref().unwrap();
+        let r = "myapp-default-20260101-120000-app";
+        // forwardAuth middleware IS stamped (route is protected, not open).
+        assert_eq!(
+            labels
+                .get(&format!(
+                    "traefik.http.middlewares.{r}-auth.forwardauth.address"
+                ))
+                .map(String::as_str),
+            Some("http://rise:3000/api/v1/auth/ingress?project=myapp&signin_redirect=1")
+        );
+        assert_eq!(
+            labels
+                .get(&format!("traefik.http.routers.{r}.middlewares"))
+                .map(String::as_str),
+            Some(format!("{r}-auth@docker").as_str())
+        );
     }
 
     #[test]

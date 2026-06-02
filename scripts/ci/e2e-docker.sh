@@ -14,9 +14,11 @@ set -euo pipefail
 #       controller-class stamping and Traefik v3.7.1 negotiating the host
 #       Docker API directly (no socket-proxy/relay).
 #   (b) private — a `private` (access_requirement Member) project deploys,
-#       gets Traefik forwardAuth middleware labels stamped, blocks an
-#       unauthenticated request (302/401) and allows a request carrying a
-#       valid Rise JWT session cookie (HTTP 200).
+#       gets Traefik forwardAuth middleware labels stamped, redirects an
+#       unauthenticated request with exactly 302 to the SAME (app) host's
+#       /.rise/auth/signin page, has its /.rise/* path served by the rise
+#       backend (not the app), and allows a request carrying a valid Rise JWT
+#       session cookie (HTTP 200).
 #
 # Auth for the test is an HS256 JWT minted from the config's
 # jwt_signing_secret (email=admin@example.com → admin), mirroring
@@ -35,8 +37,12 @@ export RISE_IMAGE_REPOSITORY RISE_IMAGE_TAG
 RISE_URL="${RISE_URL:-http://localhost:3000}"
 TRAEFIK_URL="${TRAEFIK_URL:-http://localhost:80}"
 # Must match server.public_url and server.jwt_signing_secret in
-# config/compose-docker.production.yaml.
-RISE_PUBLIC_URL="http://localhost:3000"
+# config/compose-docker.production.yaml. The control plane is reached on
+# 127.0.0.1:3000 but the token iss/aud must equal public_url
+# (http://rise.localhost:3000), so app hosts ({project}.rise.localhost) are
+# subdomains of the public_url host and validate_redirect_url accepts the
+# same-host post-login redirect.
+RISE_PUBLIC_URL="http://rise.localhost:3000"
 RISE_JWT_SIGNING_SECRET_B64="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 
 RUN_ID="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
@@ -258,17 +264,62 @@ fi
 log "forwardAuth labels present on ${priv_container}"
 printf '%s' "${labels}" | tr ',' '\n' | grep -iE "forwardauth.address|routers\..*\.middlewares" | sed 's/^[[:space:]]*/[e2e-docker]   /'
 
-log "Asserting unauthenticated request is blocked"
+log "Asserting unauthenticated request returns a same-host signin redirect"
+priv_app_host="${PRIV_PROJECT}.rise.localhost"
 priv_hdrs="${E2E_TMPDIR}/priv_hdrs.txt"
-code="$(curl_through_traefik "${PRIV_PROJECT}.rise.localhost" /dev/null -D "${priv_hdrs}")"
-if [[ "${code}" != "302" && "${code}" != "401" ]]; then
-  log "ERROR: expected 302/401 for unauthenticated private request, got ${code}"
+# Traefik forwardAuth mode (signin_redirect=1): unauthenticated MUST be exactly
+# 302 (not 401) with a Location pointing at the SAME (app) host's
+# /.rise/auth/signin page for this project — proving the cookie is set on the
+# app host that forwardAuth reads (no cross-host control-plane redirect loop).
+code="$(curl_through_traefik "${priv_app_host}" /dev/null -D "${priv_hdrs}")"
+if [[ "${code}" != "302" ]]; then
+  log "ERROR: expected exactly 302 for unauthenticated private request, got ${code}"
+  cat "${priv_hdrs}" || true
   exit 1
 fi
-log "Unauthenticated private request blocked (${code})"
-if [[ "${code}" == "302" ]]; then
-  grep -i '^location:' "${priv_hdrs}" | sed 's/^/[e2e-docker]   /' || true
+priv_location="$(grep -i '^location:' "${priv_hdrs}" | head -1 | tr -d '\r' | sed 's/^[Ll]ocation:[[:space:]]*//')"
+log "Unauthenticated private request redirected (302) to: ${priv_location}"
+# Location must be on the APP host and hit the /.rise/auth/signin page for this
+# project (URL-encoded project name appears as project=<priv project>).
+if ! printf '%s' "${priv_location}" | grep -q "//${priv_app_host}/.rise/auth/signin"; then
+  log "ERROR: redirect Location is not the same-host /.rise/auth/signin page on ${priv_app_host}"
+  exit 1
 fi
+if ! printf '%s' "${priv_location}" | grep -q "project=${PRIV_PROJECT}"; then
+  log "ERROR: redirect Location does not carry project=${PRIV_PROJECT}"
+  exit 1
+fi
+log "Redirect targets the same-host signin page for ${PRIV_PROJECT}"
+
+log "Asserting /.rise/* on the private app host is served by the BACKEND"
+# Traefik routes PathPrefix('/.rise') on every host to the rise-backend
+# container (added to the compose by the deployment owner). The signin page
+# there is allowlisted by ingress_auth (returns 200, not the app and not a
+# forwardAuth block), proving the /.rise→backend route closes the bypass.
+rise_path_body="${E2E_TMPDIR}/priv_rise_path_body.txt"
+rise_path_code=000
+for _ in $(seq 1 30); do
+  rise_path_code="$(curl -sS -o "${rise_path_body}" -w '%{http_code}' \
+    -H "Host: ${priv_app_host}" \
+    "${TRAEFIK_URL}/.rise/auth/signin?project=${PRIV_PROJECT}" 2>/dev/null || echo 000)"
+  if [[ "${rise_path_code}" != "404" ]]; then
+    break
+  fi
+  sleep 2
+done
+if [[ "${rise_path_code}" != "200" ]]; then
+  log "ERROR: expected 200 for /.rise/auth/signin on app host (backend-served), got ${rise_path_code}"
+  cat "${rise_path_body}" || true
+  exit 1
+fi
+# The whoami app would echo "Hostname:"; the signin page must NOT, proving the
+# backend (not the app) served it.
+if grep -qi "Hostname:" "${rise_path_body}"; then
+  log "ERROR: /.rise path was served by the app (whoami), not the backend"
+  cat "${rise_path_body}" || true
+  exit 1
+fi
+log "/.rise/* on the app host is served by the backend (200, not the app)"
 
 log "Asserting authenticated request (rise_jwt cookie) is allowed"
 priv_body="${E2E_TMPDIR}/priv_body.txt"
