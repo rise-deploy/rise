@@ -1,13 +1,13 @@
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::interval;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::db::projects as db_projects;
 use crate::server::ecr::{EcrRepoManager, ECR_FINALIZER};
 use crate::server::state::ControllerState;
-use rise_runtime_sync::{GlobalSchedule, LeaderElection};
+use rise_runtime_sync::{leader_controller, LeaderElection};
+use tokio_util::sync::CancellationToken;
 
 /// ECR Controller manages ECR repository lifecycle
 ///
@@ -24,104 +24,42 @@ use rise_runtime_sync::{GlobalSchedule, LeaderElection};
 pub struct EcrController {
     state: Arc<ControllerState>,
     manager: Arc<EcrRepoManager>,
-    election: LeaderElection,
-    provision_interval: Duration,
-    cleanup_interval: Duration,
-    drift_interval: Duration,
-    provision_schedule: GlobalSchedule,
-    cleanup_schedule: GlobalSchedule,
-    drift_schedule: GlobalSchedule,
 }
 
 impl EcrController {
-    /// Create a new ECR controller
-    pub fn new(state: Arc<ControllerState>, manager: Arc<EcrRepoManager>) -> Self {
-        let provision_interval = Duration::from_secs(10);
-        let cleanup_interval = Duration::from_secs(5);
-        let drift_interval = Duration::from_secs(60);
-        let election = LeaderElection::spawn(
-            state.db_pool.clone(),
-            "rise-ecr-controller",
-            Uuid::new_v4(),
-            Duration::from_secs(60),
-        );
-        // One schedule per loop: the three loops share a lease but have
-        // independent cadences. The 60s drift schedule is the most
-        // bursting-sensitive — short cadences (5s/10s) make transition
-        // bursts harder to notice but the gate is still cheap.
-        let provision_schedule = GlobalSchedule::new(
-            state.db_pool.clone(),
-            "rise-ecr-provision",
-            provision_interval,
-        );
-        let cleanup_schedule =
-            GlobalSchedule::new(state.db_pool.clone(), "rise-ecr-cleanup", cleanup_interval);
-        let drift_schedule =
-            GlobalSchedule::new(state.db_pool.clone(), "rise-ecr-drift", drift_interval);
-        Self {
-            state,
-            manager,
-            election,
-            provision_interval,
-            cleanup_interval,
-            drift_interval,
-            provision_schedule,
-            cleanup_schedule,
-            drift_schedule,
-        }
-    }
-
-    /// Start provision, cleanup, and drift detection loops
-    pub fn start(self: Arc<Self>) {
-        let provision_self = Arc::clone(&self);
-        tokio::spawn(async move {
-            provision_self.provision_loop().await;
-        });
-
-        let cleanup_self = Arc::clone(&self);
-        tokio::spawn(async move {
-            cleanup_self.cleanup_loop().await;
-        });
-
-        let drift_self = Arc::clone(&self);
-        tokio::spawn(async move {
-            drift_self.drift_detection_loop().await;
-        });
-    }
-
-    /// Provision loop - creates ECR repos for active projects
+    /// Run the ECR controller's provision/cleanup/drift loops under a single
+    /// leader election until `shutdown` is cancelled, releasing the lease on exit.
     ///
-    /// Runs every 10 seconds and:
-    /// 1. Lists all active projects (not Deleting/Terminated)
-    /// 2. For each project without the ECR finalizer, creates the repo
-    /// 3. Adds the ECR finalizer to track that cleanup is needed
-    async fn provision_loop(&self) {
-        info!("ECR provision loop started");
-        let mut ticker = interval(self.provision_interval);
-
-        loop {
-            ticker.tick().await;
-
-            if !self.election.is_leader() {
-                continue;
-            }
-
-            if !self
-                .provision_schedule
-                .try_claim_or_skip_as_leader("ECR provision", &self.election)
-                .await
-            {
-                continue;
-            }
-
-            if let Err(e) = self.provision_repositories().await {
-                error!("Error in ECR provision loop: {}", e);
-            }
+    /// The three loops share one lease but have independent cadences (the
+    /// `leader_schedules` rows gate each one's global cadence across replicas).
+    pub async fn run(
+        state: Arc<ControllerState>,
+        manager: Arc<EcrRepoManager>,
+        shutdown: CancellationToken,
+    ) -> anyhow::Result<()> {
+        let controller = Arc::new(EcrController { state, manager });
+        let pool = controller.state.db_pool.clone();
+        leader_controller! {
+            pool: pool,
+            lease: "rise-ecr-controller",
+            holder: Uuid::new_v4(),
+            ttl: Duration::from_secs(60),
+            shutdown: shutdown,
+            election: election,
+            schedules: {
+                provision { name: "rise-ecr-provision", interval: Duration::from_secs(10) }
+                    => controller.provision_repositories(&election).await,
+                cleanup { name: "rise-ecr-cleanup", interval: Duration::from_secs(5) }
+                    => controller.cleanup_repositories(&election).await,
+                drift { name: "rise-ecr-drift", interval: Duration::from_secs(60) }
+                    => controller.detect_repository_drift(&election).await,
+            },
         }
+        .await
     }
 
     /// Process provisioning for all active projects
-    async fn provision_repositories(&self) -> anyhow::Result<()> {
+    async fn provision_repositories(&self, election: &LeaderElection) -> anyhow::Result<()> {
         // Get all active projects
         let projects = db_projects::list_active(&self.state.db_pool).await?;
 
@@ -146,7 +84,7 @@ impl EcrController {
                     }
 
                     // Add finalizer to indicate ECR cleanup is needed on deletion
-                    self.election.assert_leader().await?;
+                    election.assert_leader().await?;
                     db_projects::add_finalizer(&self.state.db_pool, project.id, ECR_FINALIZER)
                         .await?;
                     debug!("Added ECR finalizer to project: {}", project.name);
@@ -164,39 +102,8 @@ impl EcrController {
         Ok(())
     }
 
-    /// Cleanup loop - handles ECR repo cleanup for deleted projects
-    ///
-    /// Runs every 5 seconds and:
-    /// 1. Finds projects in Deleting status with ECR finalizer
-    /// 2. Deletes or tags the ECR repo based on auto_remove setting
-    /// 3. Removes the ECR finalizer so project can be fully deleted
-    async fn cleanup_loop(&self) {
-        info!("ECR cleanup loop started");
-        let mut ticker = interval(self.cleanup_interval);
-
-        loop {
-            ticker.tick().await;
-
-            if !self.election.is_leader() {
-                continue;
-            }
-
-            if !self
-                .cleanup_schedule
-                .try_claim_or_skip_as_leader("ECR cleanup", &self.election)
-                .await
-            {
-                continue;
-            }
-
-            if let Err(e) = self.cleanup_repositories().await {
-                error!("Error in ECR cleanup loop: {}", e);
-            }
-        }
-    }
-
     /// Process cleanup for all deleting projects with ECR finalizer
-    async fn cleanup_repositories(&self) -> anyhow::Result<()> {
+    async fn cleanup_repositories(&self, election: &LeaderElection) -> anyhow::Result<()> {
         // Find projects marked for deletion that still have ECR finalizer
         let projects =
             db_projects::find_deleting_with_finalizer(&self.state.db_pool, ECR_FINALIZER, 10)
@@ -246,7 +153,7 @@ impl EcrController {
             match cleanup_result {
                 Ok(()) => {
                     // Remove finalizer so project can be deleted
-                    self.election.assert_leader().await?;
+                    election.assert_leader().await?;
                     db_projects::remove_finalizer(&self.state.db_pool, project.id, ECR_FINALIZER)
                         .await?;
                     info!(
@@ -267,39 +174,8 @@ impl EcrController {
         Ok(())
     }
 
-    /// Drift detection loop - checks for missing ECR repositories
-    ///
-    /// Runs every 60 seconds and:
-    /// 1. Lists all active projects WITH the ECR finalizer
-    /// 2. Checks if the ECR repository actually exists
-    /// 3. If missing, removes finalizer so provision loop can recreate it
-    async fn drift_detection_loop(&self) {
-        info!("ECR drift detection loop started");
-        let mut ticker = interval(self.drift_interval);
-
-        loop {
-            ticker.tick().await;
-
-            if !self.election.is_leader() {
-                continue;
-            }
-
-            if !self
-                .drift_schedule
-                .try_claim_or_skip_as_leader("ECR drift", &self.election)
-                .await
-            {
-                continue;
-            }
-
-            if let Err(e) = self.detect_repository_drift().await {
-                error!("Error in ECR drift detection loop: {}", e);
-            }
-        }
-    }
-
     /// Detect and fix ECR repository drift
-    async fn detect_repository_drift(&self) -> anyhow::Result<()> {
+    async fn detect_repository_drift(&self, election: &LeaderElection) -> anyhow::Result<()> {
         // Get all active projects
         let projects = db_projects::list_active(&self.state.db_pool).await?;
 
@@ -319,7 +195,7 @@ impl EcrController {
                         );
 
                         // Remove finalizer so provision loop will recreate the repository
-                        self.election.assert_leader().await?;
+                        election.assert_leader().await?;
                         db_projects::remove_finalizer(
                             &self.state.db_pool,
                             project.id,

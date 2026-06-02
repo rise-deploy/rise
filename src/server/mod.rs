@@ -145,12 +145,20 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
     // Spawn enabled controllers as background tasks
     let mut controller_handles = vec![];
 
+    // Cooperative shutdown signal for all background controllers and extension
+    // loops. Created in `AppState::new` (extensions start there) and shared here;
+    // cancelled once the server has received SIGINT/SIGTERM, so each loop exits
+    // and releases its leader lease promptly instead of waiting out the TTL.
+    let shutdown = state.shutdown.clone();
+
     // Start project controller (always enabled)
     info!("Starting project controller");
-    let settings_clone = settings.clone();
     let controller_state_clone = controller_state.clone();
+    let shutdown_clone = shutdown.clone();
     let handle = tokio::spawn(async move {
-        if let Err(e) = run_project_controller_loop(controller_state_clone, settings_clone).await {
+        if let Err(e) =
+            project::ProjectController::run(Arc::new(controller_state_clone), shutdown_clone).await
+        {
             tracing::error!("Project controller error: {:#}", e);
         }
     });
@@ -162,8 +170,12 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         info!("Starting ECR controller");
         let settings_clone = settings.clone();
         let controller_state_clone = controller_state.clone();
+        let shutdown_clone = shutdown.clone();
         let handle = tokio::spawn(async move {
-            if let Err(e) = run_ecr_controller_loop(controller_state_clone, settings_clone).await {
+            if let Err(e) =
+                run_ecr_controller_loop(controller_state_clone, settings_clone, shutdown_clone)
+                    .await
+            {
                 tracing::error!("ECR controller error: {:#}", e);
             }
         });
@@ -181,16 +193,14 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         let store = state.resource_store.clone();
         let pool = state.db_pool.clone();
         let gc_settings = settings.resource_gc.clone().unwrap_or_default();
-        let controller = Arc::new(resources::gc::ResourceGcController::new(
-            pool,
-            store,
-            gc_settings,
-        ));
-        controller.clone().start();
+        let shutdown_clone = shutdown.clone();
         let handle = tokio::spawn(async move {
-            shutdown_signal().await;
-            info!("Resource GC controller shutting down");
-            controller.shutdown().await;
+            if let Err(e) =
+                resources::gc::ResourceGcController::run(pool, store, gc_settings, shutdown_clone)
+                    .await
+            {
+                tracing::error!("Resource GC controller error: {:#}", e);
+            }
         });
         controller_handles.push(handle);
     }
@@ -201,9 +211,15 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         let pool = state.db_pool.clone();
         let auth_settings = settings.auth.clone();
         let default_organization_uid = state.default_organization_uid;
+        let shutdown_clone = shutdown.clone();
         let handle = tokio::spawn(async move {
-            auth::entra_sync::run_entra_sync_loop(pool, auth_settings, default_organization_uid)
-                .await;
+            auth::entra_sync::run_entra_sync_loop(
+                pool,
+                auth_settings,
+                default_organization_uid,
+                shutdown_clone,
+            )
+            .await;
         });
         controller_handles.push(handle);
     }
@@ -323,6 +339,10 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
+    // The server stopped because we received a shutdown signal — tell the
+    // background controllers to stop and release their leader leases.
+    shutdown.cancel();
+
     #[cfg(feature = "backend")]
     if let Some(handle) = webhook_handle {
         let _ = handle.await;
@@ -338,21 +358,6 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
     Ok(())
 }
 
-/// Run the project controller loop (for embedding in server process)
-async fn run_project_controller_loop(
-    controller_state: ControllerState,
-    _settings: settings::Settings,
-) -> Result<()> {
-    let controller = Arc::new(project::ProjectController::new(Arc::new(controller_state)));
-    controller.start();
-    info!("Project controller started");
-
-    // Wait for shutdown signal
-    shutdown_signal().await;
-    info!("Project controller shutdown complete");
-    Ok(())
-}
-
 /// Run the ECR controller loop (for embedding in server process)
 ///
 /// Manages ECR repository lifecycle:
@@ -362,6 +367,7 @@ async fn run_project_controller_loop(
 async fn run_ecr_controller_loop(
     controller_state: ControllerState,
     settings: settings::Settings,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     use crate::server::registry::models::EcrConfig;
     use crate::server::settings::RegistrySettings;
@@ -391,14 +397,8 @@ async fn run_ecr_controller_loop(
     };
     let manager = Arc::new(ecr::EcrRepoManager::new(ecr_config).await?);
 
-    let controller = Arc::new(ecr::EcrController::new(Arc::new(controller_state), manager));
-    controller.start();
     info!("ECR controller started");
-
-    // Wait for shutdown signal
-    shutdown_signal().await;
-    info!("ECR controller shutdown complete");
-    Ok(())
+    ecr::EcrController::run(Arc::new(controller_state), manager, shutdown).await
 }
 
 async fn health_check() -> &'static str {

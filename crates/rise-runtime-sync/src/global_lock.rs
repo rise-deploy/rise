@@ -5,6 +5,9 @@
 //! held by a single dedicated [`PoolConnection`] for the lifetime of the
 //! [`GlobalLock`] value.
 //!
+//! Prefer the scoped [`with_global_lock`](crate::safe::with_global_lock) wrapper
+//! over driving `acquire` / `release` by hand.
+//!
 //! # Release semantics
 //!
 //! Postgres session-scoped advisory locks are released only when the SQL
@@ -23,30 +26,17 @@
 //! the lock-holding connection to the pool on a forgotten `release()`, which
 //! could leak the lock until the pool happened to evict that connection.)
 //!
-//! Because every code path now frees the lock, [`with_global_lock`] can offer a
-//! scoped API that callers can't misuse:
-//!
-//! ```ignore
-//! with_global_lock(&pool, "bootstrap/default-organization", || async move {
-//!     // ... critical section ...
-//!     Ok(())
-//! })
-//! .await?;
-//! ```
-//!
 //! For a critical section that fits in a single transaction, prefer
 //! `pg_advisory_xact_lock` directly — Postgres releases transaction-scoped
 //! locks on commit/rollback. That doesn't suit callers (e.g. bootstrap) that
 //! invoke non-transactional APIs across the locked region, which is why this
 //! session-scoped helper exists.
 
-use std::future::Future;
-
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use sqlx::pool::PoolConnection;
 use sqlx::{PgPool, Postgres};
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Derive a stable `i64` key from a human-readable lock name.
 ///
@@ -67,7 +57,8 @@ fn hash_key(name: &str) -> i64 {
 /// [`try_acquire`](Self::try_acquire) (non-blocking). Prefer
 /// [`release`](Self::release) to free the lock promptly and recycle the
 /// connection; if the value is dropped without it, [`Drop`] still frees the
-/// lock by closing the connection. [`with_global_lock`] wraps both for you.
+/// lock by closing the connection. [`with_global_lock`](crate::safe::with_global_lock)
+/// wraps both for you.
 pub struct GlobalLock {
     /// `Some` while the lock is held. [`release`](Self::release) takes it and
     /// returns the connection to the pool; [`Drop`] detaches and closes it if
@@ -170,34 +161,6 @@ impl Drop for GlobalLock {
     }
 }
 
-/// Run `f` while holding the install-wide lock `name`, releasing it afterwards.
-///
-/// Acquires (blocking), awaits `f`, then [`release`](GlobalLock::release)s. The
-/// lock is freed on every exit path: a normal return and an early `?` inside
-/// `f` both go through `release()`; a panic unwinds through [`GlobalLock`]'s
-/// [`Drop`], which closes the connection to free the lock. `f`'s result is
-/// always returned as-is — a release error can't leak the lock (the connection
-/// is closed on that path), so it's logged rather than propagated.
-pub async fn with_global_lock<T, Fut>(
-    pool: &PgPool,
-    name: &str,
-    f: impl FnOnce() -> Fut,
-) -> Result<T>
-where
-    Fut: Future<Output = Result<T>>,
-{
-    let lock = GlobalLock::acquire(pool, name).await?;
-    let result = f().await;
-    if let Err(release_err) = lock.release().await {
-        warn!(
-            lock = %name,
-            error = ?release_err,
-            "GlobalLock release reported an error (lock freed via connection close)"
-        );
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,39 +244,5 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-    }
-
-    #[sqlx::test]
-    async fn with_global_lock_runs_body_then_releases(pool: PgPool) {
-        let out = with_global_lock(&pool, "test/with-ok", || async { Ok(42_i32) })
-            .await
-            .unwrap();
-        assert_eq!(out, 42);
-
-        // The lock was released, so a fresh acquire succeeds immediately.
-        GlobalLock::acquire(&pool, "test/with-ok")
-            .await
-            .unwrap()
-            .release()
-            .await
-            .unwrap();
-    }
-
-    #[sqlx::test]
-    async fn with_global_lock_releases_on_body_error(pool: PgPool) {
-        let err = with_global_lock(&pool, "test/with-err", || async {
-            Err::<(), _>(anyhow::anyhow!("boom"))
-        })
-        .await
-        .unwrap_err();
-        assert!(err.to_string().contains("boom"));
-
-        // Despite the body error, the lock must be free for the next caller.
-        GlobalLock::acquire(&pool, "test/with-err")
-            .await
-            .unwrap()
-            .release()
-            .await
-            .unwrap();
     }
 }

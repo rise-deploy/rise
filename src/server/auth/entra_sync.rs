@@ -27,7 +27,8 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::db::{models::TeamRole, teams, users};
-use rise_runtime_sync::{GlobalSchedule, LeaderElection};
+use rise_runtime_sync::{with_leader_election, GlobalSchedule, LeaderElection};
+use tokio_util::sync::CancellationToken;
 
 // ============================================================================
 // Microsoft Graph API types
@@ -566,6 +567,7 @@ pub async fn run_entra_sync_loop(
     pool: PgPool,
     auth_settings: crate::server::settings::AuthSettings,
     default_organization_uid: Uuid,
+    shutdown: CancellationToken,
 ) {
     let tenant_id = match extract_tenant_id(&auth_settings.issuer) {
         Ok(t) => t,
@@ -581,7 +583,6 @@ pub async fn run_entra_sync_loop(
         &auth_settings.client_id,
         &auth_settings.client_secret,
     );
-    let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
 
     tracing::info!(
         "Entra active sync started (tenant={}, interval={}s)",
@@ -589,70 +590,62 @@ pub async fn run_entra_sync_loop(
         interval_secs
     );
 
-    let mut shutdown = std::pin::pin!(async {
-        let ctrl_c = tokio::signal::ctrl_c();
-
-        #[cfg(unix)]
-        let terminate = async {
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("failed to install SIGTERM handler")
-                .recv()
-                .await;
-        };
-
-        #[cfg(not(unix))]
-        let terminate = std::future::pending::<()>();
-
-        tokio::select! {
-            _ = ctrl_c => {}
-            _ = terminate => {}
-        }
-    });
-
-    let election = LeaderElection::spawn(
-        pool.clone(),
-        "rise-entra-sync",
-        Uuid::new_v4(),
-        Duration::from_secs(interval_secs + 30),
-    );
     let schedule = GlobalSchedule::new(
         pool.clone(),
         "rise-entra-sync-cycle",
         Duration::from_secs(interval_secs),
     );
 
-    loop {
-        tokio::select! {
-            _ = interval.tick() => {}
-            _ = &mut shutdown => {
-                tracing::info!("Entra active sync shutting down");
-                break;
+    let result = with_leader_election(
+        pool.clone(),
+        "rise-entra-sync",
+        Uuid::new_v4(),
+        Duration::from_secs(interval_secs + 30),
+        move |election| async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        tracing::info!("Entra active sync shutting down");
+                        break;
+                    }
+                    _ = interval.tick() => {}
+                }
+
+                if !election.is_leader() {
+                    tracing::debug!("Skipping Entra sync cycle — another replica is the leader");
+                    continue;
+                }
+
+                // Global cadence gate: see `GlobalSchedule` docs. Long sync
+                // intervals (often 1h+) make leader-transition bursts much more
+                // visible than for short-cadence workers, so this matters
+                // especially here. `_as_leader` re-verifies leadership against
+                // the DB before the schedule UPSERT, so a stale-cached
+                // non-leader cannot poison `last_run_at` and delay the true
+                // leader by the full interval.
+                if !schedule
+                    .try_claim_or_skip_as_leader("Entra sync", &election)
+                    .await
+                {
+                    continue;
+                }
+
+                tracing::debug!("Running Entra active sync cycle");
+                if let Err(e) =
+                    sync_once(&pool, &mut client, &election, default_organization_uid).await
+                {
+                    tracing::error!("Entra active sync failed: {:?}", e);
+                }
+                tracing::info!("Next Entra active sync in {}s", interval_secs);
             }
-        }
+            Ok(())
+        },
+    )
+    .await;
 
-        if !election.is_leader() {
-            tracing::debug!("Skipping Entra sync cycle — another replica is the leader");
-            continue;
-        }
-
-        // Global cadence gate: see `GlobalSchedule` docs. Long sync intervals
-        // (often 1h+) make leader-transition bursts much more visible than
-        // for short-cadence workers, so this matters especially here.
-        // `_as_leader` re-verifies leadership against the DB before the
-        // schedule UPSERT, so a stale-cached non-leader cannot poison
-        // `last_run_at` and delay the true leader by the full interval.
-        if !schedule
-            .try_claim_or_skip_as_leader("Entra sync", &election)
-            .await
-        {
-            continue;
-        }
-
-        tracing::debug!("Running Entra active sync cycle");
-        if let Err(e) = sync_once(&pool, &mut client, &election, default_organization_uid).await {
-            tracing::error!("Entra active sync failed: {:?}", e);
-        }
-        tracing::info!("Next Entra active sync in {}s", interval_secs);
+    if let Err(e) = result {
+        tracing::error!("Entra active sync loop error: {:?}", e);
     }
 }
 

@@ -11,7 +11,8 @@ use crate::db::{
 };
 use crate::server::deployment::state_machine;
 use crate::server::state::ControllerState;
-use rise_runtime_sync::{GlobalSchedule, LeaderElection};
+use rise_runtime_sync::{with_leader_election, GlobalSchedule, LeaderElection};
+use tokio_util::sync::CancellationToken;
 
 /// Project controller handles project lifecycle operations
 ///
@@ -26,34 +27,36 @@ pub struct ProjectController {
 }
 
 impl ProjectController {
-    /// Create a new project controller
-    pub fn new(state: Arc<ControllerState>) -> Self {
+    /// Run the project controller under a leader election until `shutdown` is
+    /// cancelled, then release the lease so a peer can take over promptly.
+    pub async fn run(
+        state: Arc<ControllerState>,
+        shutdown: CancellationToken,
+    ) -> anyhow::Result<()> {
         let deletion_interval = Duration::from_secs(5);
-        let election = LeaderElection::spawn(
-            state.db_pool.clone(),
+        let pool = state.db_pool.clone();
+        with_leader_election(
+            pool.clone(),
             "rise-project-controller",
             Uuid::new_v4(),
             Duration::from_secs(60),
-        );
-        let deletion_schedule = GlobalSchedule::new(
-            state.db_pool.clone(),
-            "rise-project-deletion",
-            deletion_interval,
-        );
-        Self {
-            state,
-            deletion_interval,
-            cleanup_tick: AtomicU64::new(1),
-            election,
-            deletion_schedule,
-        }
-    }
-
-    /// Start deletion loop
-    pub fn start(self: Arc<Self>) {
-        tokio::spawn(async move {
-            self.deletion_loop().await;
-        });
+            move |election| async move {
+                let controller = ProjectController {
+                    state,
+                    deletion_interval,
+                    cleanup_tick: AtomicU64::new(1),
+                    election,
+                    deletion_schedule: GlobalSchedule::new(
+                        pool,
+                        "rise-project-deletion",
+                        deletion_interval,
+                    ),
+                };
+                controller.deletion_loop(shutdown).await;
+                Ok(())
+            },
+        )
+        .await
     }
 
     /// Deletion loop - processes projects in Deleting status
@@ -64,12 +67,15 @@ impl ProjectController {
     /// 3. Cancels pre-infrastructure deployments (Pending/Building/Pushing)
     /// 4. Terminates post-infrastructure deployments (Deploying/Healthy/Unhealthy)
     /// 5. Once all deployments are terminal, deletes the project
-    async fn deletion_loop(&self) {
+    async fn deletion_loop(&self, shutdown: CancellationToken) {
         info!("Project deletion loop started");
         let mut ticker = interval(self.deletion_interval);
 
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = ticker.tick() => {}
+            }
 
             if !self.election.is_leader() {
                 continue;
@@ -96,6 +102,7 @@ impl ProjectController {
                 warn!("Error cleaning up expired transient state: {:?}", e);
             }
         }
+        info!("Project deletion loop stopped");
     }
 
     /// Periodically clean up expired OAuth transient state rows (runs on leader only)

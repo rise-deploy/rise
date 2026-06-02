@@ -71,6 +71,7 @@ backend = [
     "dep:sqlx",
     "dep:tower",
     "dep:tower-http",
+    "dep:tokio-util",
     "dep:regex",
     "dep:aes-gcm",
     "dep:moka",
@@ -148,6 +149,7 @@ openssl = { version = "0.10.75", features = ["vendored"], optional = true }
 sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "postgres", "uuid", "chrono", "migrate"], optional = true }
 tower = { version = "0.5.2", optional = true }
 tower-http = { version = "0.6.7", features = ["trace", "cors"], optional = true }
+tokio-util = { version = "0.7", optional = true }
 regex = { version = "1.11", optional = true }
 rsa = { version = "0.9", optional = true }
 
