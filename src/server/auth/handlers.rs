@@ -1900,9 +1900,7 @@ mod tests {
         let url = build_signin_redirect_url("http://localhost:3000", "secret app", &headers);
         // Base + project (URL-encoded) + redirect (full original URL, encoded).
         assert!(url.starts_with("http://localhost:3000/api/v1/auth/signin?project=secret%20app"));
-        assert!(url.contains(
-            "&redirect=https%3A%2F%2Fsecret.rise.localhost%2Fdashboard%3Ftab%3D1"
-        ));
+        assert!(url.contains("&redirect=https%3A%2F%2Fsecret.rise.localhost%2Fdashboard%3Ftab%3D1"));
     }
 
     #[test]
