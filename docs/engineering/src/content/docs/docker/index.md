@@ -108,15 +108,21 @@ Point these records at the host running the stack:
 | `dex.${RISE_DOMAIN}` | Bundled Dex IdP (only if you keep it) |
 
 App hosts are simplest as **subdomains** of the control-plane host (e.g.
-`{project}.${RISE_DOMAIN}` under `rise.${RISE_DOMAIN}`): the post-login return
-redirect is validated against `server.public_url` (`validate_redirect_url` in
-`src/server/auth/handlers.rs`), which accepts the control-plane host and its
-subdomains, so a subdomain works with no extra setup. Apps on an unrelated or
-**custom** domain still authenticate — register the domain as a project custom
-domain and the custom-domain redirect flow (a one-time token that sets the
-session cookie on that host) handles the post-login return. Only arbitrary,
-unregistered hosts fall back to `/` after login. Traefik itself will route any
-host you configure; this is purely about where the post-login redirect may land.
+`{project}.${RISE_DOMAIN}` under `rise.${RISE_DOMAIN}`): for a subdomain, the
+post-login deep-link `redirect` is validated against `server.public_url`
+(`validate_redirect_url` in `src/server/auth/handlers.rs`) and accepted, so the
+user returns to the exact page they started on with no extra setup.
+
+Apps on an unrelated or **custom** domain also work, but the domain must be
+**registered as a project custom domain** — that registration is what makes the
+Docker controller emit the Traefik `Host(...)` rule (with forwardAuth) that
+routes the domain to the app and serves `/.rise/auth/*` from the backend
+(`reconciler.rs`). Login then succeeds: the session cookie is set on the custom
+host via the one-time-token `/.rise/auth/complete` flow, independent of
+`validate_redirect_url`. One caveat — the original deep-link is still validated
+against `public_url`, so on a custom domain the user returns to the app **root**
+(`/`) rather than the specific path requested. An **unregistered** host isn't
+routed at all (Traefik returns 404); it doesn't reach login.
 
 ### 2. TLS / Let's Encrypt
 
