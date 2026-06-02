@@ -4,6 +4,12 @@ mod kubernetes;
 #[cfg(feature = "backend")]
 pub use kubernetes::KubernetesBackend;
 
+#[cfg(feature = "backend")]
+pub mod docker;
+
+#[cfg(feature = "backend")]
+pub use docker::DockerBackend;
+
 use async_trait::async_trait;
 
 use crate::db::models::{Deployment, Project};

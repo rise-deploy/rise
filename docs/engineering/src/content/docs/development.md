@@ -191,6 +191,33 @@ Host Machine (127.0.0.1)
   dev Loki/Alloy chart components and forwards Loki to `localhost:3100`, which
   `config/development.yaml` reads through `RISE_LOKI_URL`.
 
+## Docker runtime (local)
+
+As an alternative to the Kubernetes controller, Rise can deploy to a single Docker
+host with Traefik for routing. This is the lightest local setup — no cluster.
+
+1. Bring up Traefik (joins the `rise_default` network): `docker compose up -d traefik`.
+   The dashboard is at <http://localhost:8090>.
+2. Point the backend at the Docker controller: in `config/development.yaml`, comment
+   out the `deployment_controller: type: kubernetes` block and uncomment the
+   `type: docker` block above it. Also switch logs to `deployment_logs: type: docker`.
+
+How it works:
+
+- The backend runs an **in-process reconcile loop** (replacing Metacontroller): it
+  enumerates projects, drives deployment state transitions, diffs the desired state
+  against the actual Rise-labelled containers, creates/recreates/garbage-collects
+  them, and HTTP-probes for health — all on the shared `rise_default` network. There
+  is **no webhook listener** and no cluster.
+- **`replicas=1` caveat**: the Docker runtime clamps every deployment to a single
+  container; horizontal scaling is a follow-up.
+- Env vars are passed as plain `KEY=VALUE` and are therefore visible via
+  `docker inspect <container>` (Docker has no secret primitive) — acceptable for the
+  single-host scope.
+- Apps are reachable at `http://<project>.rise.localhost` (and the
+  `<group>--<project>` / `<env>--<project>` variants) with no DNS or `/etc/hosts`
+  edits, since `*.localhost` resolves to `127.0.0.1`.
+
 ## Troubleshooting
 
 **`http: server gave HTTP response to HTTPS client`** — insecure registries not configured. Run `./scripts/dev-setup.sh docker`.

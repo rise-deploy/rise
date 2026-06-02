@@ -110,9 +110,9 @@ const SECRET_REFRESH_HOURS: i64 = 6;
 const MAX_INACTIVE_PODS: usize = 5;
 
 #[derive(Debug, Default)]
-struct ResolvedDeploymentEnvVars {
-    plain_env_vars: Vec<EnvVar>,
-    secret_env_vars: BTreeMap<String, ByteString>,
+pub(crate) struct ResolvedDeploymentEnvVars {
+    pub(crate) plain_env_vars: Vec<EnvVar>,
+    pub(crate) secret_env_vars: BTreeMap<String, ByteString>,
 }
 
 #[derive(Debug)]
@@ -1831,7 +1831,7 @@ fn apply_container_port_env(env: &mut Vec<EnvVar>, container_port: Option<u16>) 
 /// the synthesised `app`. A `Some` column that fails to deserialize is treated
 /// as a hard error for *this* deployment (returned `Err`): silently collapsing
 /// it to the single-container fallback would drop every per-container resource.
-fn resolve_runtime_containers(
+pub(crate) fn resolve_runtime_containers(
     deployment: &Deployment,
 ) -> anyhow::Result<(
     Vec<crate::server::deployment::models::ContainerSpec>,
@@ -2372,7 +2372,7 @@ async fn load_env_vars(
     resolve_deployment_env_vars(env_vars, state.encryption_provider.as_deref()).await
 }
 
-async fn resolve_deployment_env_vars(
+pub(crate) async fn resolve_deployment_env_vars(
     env_vars: Vec<DeploymentEnvVar>,
     encryption_provider: Option<&dyn crate::server::encryption::EncryptionProvider>,
 ) -> anyhow::Result<ResolvedDeploymentEnvVars> {

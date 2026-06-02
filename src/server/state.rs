@@ -243,6 +243,120 @@ async fn init_kubernetes_backend(
     Ok(Arc::new(backend) as Arc<dyn DeploymentBackend>)
 }
 
+/// Initialize the Docker deployment backend.
+///
+/// Builds a `ResourceBuilder` from the Docker variant's URL templates (the
+/// Kubernetes-only fields are left empty/None), connects bollard, constructs the
+/// `DockerBackend`, tests connectivity, and spawns the in-process
+/// `DockerReconciler`. Returns the backend plus the bollard client so the log
+/// backend can reuse it.
+#[cfg(feature = "backend")]
+async fn init_docker_backend(
+    settings: &crate::server::settings::DeploymentControllerSettings,
+    registry_provider: Arc<dyn RegistryProvider>,
+    encryption_provider: Option<Arc<dyn EncryptionProvider>>,
+    db_pool: PgPool,
+    public_url: &str,
+) -> Result<(Arc<dyn DeploymentBackend>, bollard::Docker)> {
+    use crate::server::deployment::controller::docker::reconciler::{
+        DockerReconciler, ReconcilerConfig,
+    };
+    use crate::server::deployment::controller::{docker::client, DockerBackend};
+    use crate::server::deployment::resource_builder::ResourceBuilder;
+    use crate::server::settings::DeploymentControllerSettings;
+
+    let DeploymentControllerSettings::Docker {
+        docker_host,
+        production_ingress_url_template,
+        staging_ingress_url_template,
+        environment_ingress_url_template,
+        ingress_port,
+        ingress_schema,
+        traefik_network,
+        traefik_entrypoint,
+        traefik_certresolver,
+        label_namespace,
+        container_prefix,
+        controller_class_name,
+        reconcile_interval_secs,
+        health_probes,
+        ..
+    } = settings
+    else {
+        return Err(anyhow::anyhow!(
+            "init_docker_backend called with a non-Docker controller variant"
+        ));
+    };
+
+    // ResourceBuilder for the Docker runtime. The Kubernetes-only fields are
+    // empty/None — `compute_*_urls` and `primary_ingress_hosts` only read the
+    // URL templates, schema, port and registry provider.
+    let resource_builder = Arc::new(ResourceBuilder {
+        production_ingress_url_template: production_ingress_url_template.clone(),
+        staging_ingress_url_template: staging_ingress_url_template.clone(),
+        environment_ingress_url_template: environment_ingress_url_template.clone(),
+        ingress_port: *ingress_port,
+        ingress_schema: ingress_schema.clone(),
+        registry_provider: registry_provider.clone(),
+        auth_backend_url: String::new(),
+        auth_signin_url: String::new(),
+        backend_address: None,
+        namespace_labels: HashMap::new(),
+        namespace_annotations: HashMap::new(),
+        ingress_annotations: HashMap::new(),
+        ingress_tls_secret_name: None,
+        custom_domain_tls_mode: crate::server::settings::CustomDomainTlsMode::PerDomain,
+        custom_domain_ingress_annotations: HashMap::new(),
+        node_selector: HashMap::new(),
+        image_pull_secret_name: None,
+        access_classes: HashMap::new(),
+        host_aliases: HashMap::new(),
+        extra_service_token_audiences: HashMap::new(),
+        use_default_service_account_for_production: true,
+        network_policy: crate::server::settings::NetworkPolicyConfig {
+            ingress: Vec::new(),
+            egress: None,
+        },
+        pod_security_enabled: true,
+        health_probes: health_probes.clone(),
+    });
+
+    // Connect bollard.
+    let docker = client::connect(docker_host.as_deref())?;
+
+    let backend = DockerBackend::new(docker.clone(), resource_builder.clone(), db_pool.clone());
+    backend.test_connection().await?;
+    tracing::info!("Docker deployment backend initialized and connection tested");
+
+    // Spawn the in-process reconciler.
+    let health_path = health_probes
+        .as_ref()
+        .map(|hp| hp.path.clone())
+        .unwrap_or_else(|| "/".to_string());
+    let reconciler = DockerReconciler::new(
+        docker.clone(),
+        db_pool,
+        resource_builder,
+        registry_provider,
+        encryption_provider,
+        ReconcilerConfig {
+            controller_class: controller_class_name.clone(),
+            label_namespace: label_namespace.clone(),
+            container_prefix: container_prefix.clone(),
+            traefik_network: traefik_network.clone(),
+            traefik_entrypoint: traefik_entrypoint.clone(),
+            traefik_certresolver: traefik_certresolver.clone(),
+            reconcile_interval_secs: *reconcile_interval_secs,
+            health_path,
+            public_url: public_url.to_string(),
+        },
+    );
+    reconciler.spawn();
+    tracing::info!("Docker reconcile loop spawned");
+
+    Ok((Arc::new(backend) as Arc<dyn DeploymentBackend>, docker))
+}
+
 impl AppState {
     /// Check if a user is an admin (case-insensitive email match)
     pub fn is_admin(&self, user_email: &str) -> bool {
@@ -777,27 +891,77 @@ impl AppState {
                     *identity_token_ttl_seconds,
                     Some(controller_class_name.clone()),
                 )
+            } else if let Some(DeploymentControllerSettings::Docker {
+                deployment_defaults,
+                deployment_constraints,
+                identity_token_ttl_seconds,
+                controller_class_name,
+                ..
+            }) = &settings.deployment_controller
+            {
+                // Docker mode: no K8s ResourceBuilder / kube client / webhook,
+                // but surface the deployment defaults/constraints/class so
+                // request validation and identity-token minting behave the same.
+                (
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(deployment_defaults.clone()),
+                    Some(deployment_constraints.clone()),
+                    *identity_token_ttl_seconds,
+                    Some(controller_class_name.clone()),
+                )
             } else {
                 (None, None, None, None, None, None, 3600, None)
             }
         };
 
-        // Initialize deployment backend (slim wrapper around ResourceBuilder + kube client)
+        // Initialize the deployment backend by matching on the configured
+        // controller variant. Kubernetes uses the slim Metacontroller-backed
+        // backend; Docker connects bollard, builds its own ResourceBuilder, and
+        // spawns the in-process reconcile loop.
         #[cfg(feature = "backend")]
-        let deployment_backend = {
-            let rb = resource_builder.clone().ok_or_else(|| {
-                anyhow::anyhow!("Deployment controller not configured. Please add deployment_controller configuration with type: kubernetes")
-            })?;
-            let kc = webhook_kube_client
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("Kubernetes client not initialized"))?;
-            init_kubernetes_backend(rb, kc, db_pool.clone()).await?
+        let (deployment_backend, docker_client) = {
+            use crate::server::settings::DeploymentControllerSettings;
+            match &settings.deployment_controller {
+                Some(DeploymentControllerSettings::Kubernetes { .. }) => {
+                    let rb = resource_builder.clone().ok_or_else(|| {
+                        anyhow::anyhow!("Deployment controller not configured. Please add deployment_controller configuration with type: kubernetes")
+                    })?;
+                    let kc = webhook_kube_client
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("Kubernetes client not initialized"))?;
+                    (
+                        init_kubernetes_backend(rb, kc, db_pool.clone()).await?,
+                        None,
+                    )
+                }
+                Some(docker_settings @ DeploymentControllerSettings::Docker { .. }) => {
+                    let (backend, docker) = init_docker_backend(
+                        docker_settings,
+                        registry_provider.clone(),
+                        encryption_provider.clone(),
+                        db_pool.clone(),
+                        &public_url,
+                    )
+                    .await?;
+                    (backend, Some(docker))
+                }
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "Deployment controller not configured. Please add a deployment_controller \
+                         configuration block (type: kubernetes or type: docker)."
+                    ));
+                }
+            }
         };
 
         #[cfg(feature = "backend")]
         let runtime_log_backend = crate::server::deployment::logs::init_runtime_log_backend(
             &settings.deployment_logs,
             webhook_kube_client.clone(),
+            docker_client.clone(),
         )
         .await?;
 

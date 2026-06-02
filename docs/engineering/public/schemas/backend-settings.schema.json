@@ -534,6 +534,130 @@
             "network_policy"
           ],
           "type": "object"
+        },
+        {
+          "description": "Docker deployment controller.\n\nDeploys app containers to a single Docker host and lets Traefik's Docker\nprovider route to them via container labels Rise stamps. No Kubernetes,\nno Metacontroller — reconciliation runs in-process (see\n`controller::docker::DockerReconciler`).",
+          "properties": {
+            "container_prefix": {
+              "default": "rise",
+              "description": "Prefix for generated container names (`<prefix>_<project>_...`).\nDefaults to `rise`.",
+              "type": "string"
+            },
+            "controller_class_name": {
+              "default": "default",
+              "description": "Stable identifier for this deployment controller. The reconciler only\nreconciles projects matching this class. Defaults to `default`.",
+              "type": "string"
+            },
+            "deployment_constraints": {
+              "$ref": "#/$defs/DeploymentConstraints",
+              "description": "Platform-level constraints for deployment resources."
+            },
+            "deployment_defaults": {
+              "$ref": "#/$defs/DeploymentDefaults",
+              "description": "Default resource values for new deployments when not specified."
+            },
+            "docker_host": {
+              "default": null,
+              "description": "Docker daemon connection. `None` uses bollard's local defaults\n(unix socket / npipe, or `DOCKER_HOST`). May be a unix socket path\n(`unix:///var/run/docker.sock`) or a TCP URL (`tcp://host:2375`).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "environment_ingress_url_template": {
+              "default": null,
+              "description": "Ingress URL template for named environments.\nMust contain both `{project_name}` and `{environment}`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "health_probes": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/HealthProbeConfig"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Health probe configuration. The reconciler probes routable\ncontainers over the shared network using these settings."
+            },
+            "identity_token_ttl_seconds": {
+              "default": 3600,
+              "description": "Lifetime in seconds of workload identity tokens minted for\ndeployments. Default: 3600 (1 hour).",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "ingress_port": {
+              "default": null,
+              "description": "Optional port appended to all generated ingress URLs (e.g. `8080`).",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "ingress_schema": {
+              "default": "https",
+              "description": "URL scheme for generated ingress URLs (`http` or `https`).\nDefaults to `https`.",
+              "type": "string"
+            },
+            "label_namespace": {
+              "default": "rise.dev",
+              "description": "Label namespace prefix for Rise bookkeeping labels\n(e.g. `rise.dev/managed-by`). Defaults to `rise.dev`.",
+              "type": "string"
+            },
+            "production_ingress_url_template": {
+              "description": "Ingress URL template for the production (default) deployment group.\nSame semantics as the Kubernetes variant. Must contain\n`{project_name}`. Drives both the computed app URLs and the Traefik\n`Host(...)` router rules.",
+              "type": "string"
+            },
+            "reconcile_interval_secs": {
+              "default": 5,
+              "description": "Interval in seconds between reconcile ticks. Defaults to 5.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "staging_ingress_url_template": {
+              "default": null,
+              "description": "Ingress URL template for staging (non-default) deployment groups.\nMust contain both `{project_name}` and `{deployment_group}`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "traefik_certresolver": {
+              "default": null,
+              "description": "Optional Traefik certresolver name. When set, routers get\n`tls=true` + `tls.certresolver=<name>` labels for automatic TLS.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "traefik_entrypoint": {
+              "default": "web",
+              "description": "Traefik entrypoint name routers bind to (e.g. `web`, `websecure`).\nDefaults to `web`.",
+              "type": "string"
+            },
+            "traefik_network": {
+              "description": "Docker network shared with Traefik. App containers are attached to\nthis network so Traefik can reach them, and it is emitted as the\n`traefik.docker.network` label.",
+              "type": "string"
+            },
+            "type": {
+              "const": "docker",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "production_ingress_url_template",
+            "traefik_network"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -572,6 +696,19 @@
             },
             "type": {
               "const": "kubernetes",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Stream logs directly from the Docker daemon (`docker logs`). Used with\nthe Docker deployment controller. Requires no kube client — the bollard\nclient is shared from the Docker deployment controller, so this variant\ncarries no connection fields of its own.",
+          "properties": {
+            "type": {
+              "const": "docker",
               "type": "string"
             }
           },

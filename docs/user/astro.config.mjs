@@ -46,6 +46,7 @@ export default defineConfig({
             { label: 'Environment Variables', slug: 'user-guide/environment-variables' },
             { label: 'Custom Domains', slug: 'user-guide/custom-domains' },
             { label: 'Local Development', slug: 'user-guide/local-development' },
+            { label: 'Docker Runtime', slug: 'user-guide/docker-runtime' },
           ],
         },
         {

@@ -75,6 +75,27 @@ services:
     depends_on:
       - registry
 
+  # Traefik reverse proxy for the Docker deployment controller (type: docker).
+  # Routes *.rise.localhost to app containers via the Docker provider, reading the
+  # Traefik labels the Rise controller stamps on each app container. Only used when
+  # deployment_controller.type = "docker" (see config/development.yaml).
+  traefik:
+    image: traefik:v3.3
+    container_name: rise-traefik
+    restart: unless-stopped
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=rise_default"
+      - "--entrypoints.web.address=:80"
+      - "--api.dashboard=true"
+      - "--api.insecure=true"
+    ports:
+      - "80:80"        # app traffic: http://<project>.rise.localhost
+      - "8090:8080"    # Traefik dashboard: http://localhost:8090
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
   # HashiCorp Vault with JFrog Artifactory secrets plugin.
   # Automatically configures itself and JFrog on startup.
   # Access: VAULT_ADDR=http://localhost:8200 VAULT_TOKEN=root

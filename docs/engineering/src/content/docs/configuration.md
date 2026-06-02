@@ -392,6 +392,46 @@ expiration_interval_secs = 60
 secret_refresh_interval_secs = 3600
 ```
 
+### Deployment Controller (Docker)
+
+As an alternative to the Kubernetes controller, the Docker controller deploys apps as
+containers on a single Docker host, routed by Traefik. Select it with
+`deployment_controller.type: "docker"`. Supported fields:
+
+- `type: "docker"` — required discriminator.
+- `traefik_network` — Docker network Traefik watches (e.g. `rise_default`).
+- `traefik_entrypoint` — Traefik entrypoint name (default `web`).
+- `traefik_certresolver?` — optional Traefik certresolver for TLS (omit for plain HTTP).
+- `production_ingress_url_template` — host template for production deployments.
+- `staging_ingress_url_template?` / `environment_ingress_url_template?` — host
+  templates for staging / per-environment deployments.
+- `ingress_schema` — `http` or `https` (default `https`).
+- `ingress_port?` — external port apps are served on (e.g. `80` locally).
+- `controller_class_name` — controller ownership class (default `default`).
+- `reconcile_interval_secs` — in-process reconcile loop interval in seconds (default `5`).
+
+Kubernetes-only fields (namespace prefix, ingress annotations, network policies, host
+aliases, node selectors, etc.) do not apply to the Docker variant.
+
+Example:
+
+```yaml
+deployment_controller:
+  type: "docker"
+  traefik_network: "rise_default"
+  traefik_entrypoint: "web"
+  production_ingress_url_template: "{project_name}.rise.localhost"
+  staging_ingress_url_template: "{deployment_group}--{project_name}.rise.localhost"
+  environment_ingress_url_template: "{environment}--{project_name}.rise.localhost"
+  ingress_schema: "http"
+  ingress_port: 80
+  reconcile_interval_secs: 5
+  controller_class_name: "default"
+```
+
+The configuration schema is regenerated via `mise run config:schema:generate`, and CI
+verifies it is up to date on every PR.
+
 ## Validation
 
 The backend validates configuration on startup:

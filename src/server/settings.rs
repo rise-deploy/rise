@@ -202,6 +202,11 @@ pub enum DeploymentLogsSettings {
         #[serde(flatten)]
         config: KubernetesLogBackendSettings,
     },
+    /// Stream logs directly from the Docker daemon (`docker logs`). Used with
+    /// the Docker deployment controller. Requires no kube client — the bollard
+    /// client is shared from the Docker deployment controller, so this variant
+    /// carries no connection fields of its own.
+    Docker {},
     Loki {
         url: String,
         #[serde(default)]
@@ -600,6 +605,28 @@ fn default_metacontroller_webhook_port() -> u16 {
     3001
 }
 
+// ── Docker deployment controller defaults ──────────────────────────────
+
+#[cfg(feature = "backend")]
+fn default_traefik_entrypoint() -> String {
+    "web".to_string()
+}
+
+#[cfg(feature = "backend")]
+fn default_label_namespace() -> String {
+    "rise.dev".to_string()
+}
+
+#[cfg(feature = "backend")]
+fn default_container_prefix() -> String {
+    "rise".to_string()
+}
+
+#[cfg(feature = "backend")]
+fn default_reconcile_interval_secs() -> u64 {
+    5
+}
+
 fn default_crd_upsert_interval_ms() -> u64 {
     1000
 }
@@ -824,6 +851,11 @@ fn default_failure_threshold() -> i32 {
 }
 
 /// Deployment controller configuration
+// Config enums are read once at startup, never stored in hot collections, so the
+// size disparity between the (large) Kubernetes variant and the (small) Docker
+// variant doesn't matter — boxing every Kubernetes field would only obscure the
+// settings schema.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum DeploymentControllerSettings {
@@ -1036,6 +1068,98 @@ pub enum DeploymentControllerSettings {
         /// gradually rather than all at once. Defaults to 1000 (1 per second).
         #[serde(default = "default_crd_upsert_interval_ms")]
         crd_upsert_interval_ms: u64,
+    },
+
+    /// Docker deployment controller.
+    ///
+    /// Deploys app containers to a single Docker host and lets Traefik's Docker
+    /// provider route to them via container labels Rise stamps. No Kubernetes,
+    /// no Metacontroller — reconciliation runs in-process (see
+    /// `controller::docker::DockerReconciler`).
+    #[cfg(feature = "backend")]
+    Docker {
+        /// Docker daemon connection. `None` uses bollard's local defaults
+        /// (unix socket / npipe, or `DOCKER_HOST`). May be a unix socket path
+        /// (`unix:///var/run/docker.sock`) or a TCP URL (`tcp://host:2375`).
+        #[serde(default)]
+        docker_host: Option<String>,
+
+        /// Ingress URL template for the production (default) deployment group.
+        /// Same semantics as the Kubernetes variant. Must contain
+        /// `{project_name}`. Drives both the computed app URLs and the Traefik
+        /// `Host(...)` router rules.
+        production_ingress_url_template: String,
+
+        /// Ingress URL template for staging (non-default) deployment groups.
+        /// Must contain both `{project_name}` and `{deployment_group}`.
+        #[serde(default)]
+        staging_ingress_url_template: Option<String>,
+
+        /// Ingress URL template for named environments.
+        /// Must contain both `{project_name}` and `{environment}`.
+        #[serde(default)]
+        environment_ingress_url_template: Option<String>,
+
+        /// Optional port appended to all generated ingress URLs (e.g. `8080`).
+        #[serde(default)]
+        ingress_port: Option<u16>,
+
+        /// URL scheme for generated ingress URLs (`http` or `https`).
+        /// Defaults to `https`.
+        #[serde(default = "default_ingress_schema")]
+        ingress_schema: String,
+
+        /// Docker network shared with Traefik. App containers are attached to
+        /// this network so Traefik can reach them, and it is emitted as the
+        /// `traefik.docker.network` label.
+        traefik_network: String,
+
+        /// Traefik entrypoint name routers bind to (e.g. `web`, `websecure`).
+        /// Defaults to `web`.
+        #[serde(default = "default_traefik_entrypoint")]
+        traefik_entrypoint: String,
+
+        /// Optional Traefik certresolver name. When set, routers get
+        /// `tls=true` + `tls.certresolver=<name>` labels for automatic TLS.
+        #[serde(default)]
+        traefik_certresolver: Option<String>,
+
+        /// Label namespace prefix for Rise bookkeeping labels
+        /// (e.g. `rise.dev/managed-by`). Defaults to `rise.dev`.
+        #[serde(default = "default_label_namespace")]
+        label_namespace: String,
+
+        /// Prefix for generated container names (`<prefix>_<project>_...`).
+        /// Defaults to `rise`.
+        #[serde(default = "default_container_prefix")]
+        container_prefix: String,
+
+        /// Stable identifier for this deployment controller. The reconciler only
+        /// reconciles projects matching this class. Defaults to `default`.
+        #[serde(default = "default_controller_class_name")]
+        controller_class_name: String,
+
+        /// Interval in seconds between reconcile ticks. Defaults to 5.
+        #[serde(default = "default_reconcile_interval_secs")]
+        reconcile_interval_secs: u64,
+
+        /// Default resource values for new deployments when not specified.
+        #[serde(default)]
+        deployment_defaults: DeploymentDefaults,
+
+        /// Platform-level constraints for deployment resources.
+        #[serde(default)]
+        deployment_constraints: DeploymentConstraints,
+
+        /// Health probe configuration. The reconciler probes routable
+        /// containers over the shared network using these settings.
+        #[serde(default)]
+        health_probes: Option<HealthProbeConfig>,
+
+        /// Lifetime in seconds of workload identity tokens minted for
+        /// deployments. Default: 3600 (1 hour).
+        #[serde(default = "default_identity_token_ttl_seconds")]
+        identity_token_ttl_seconds: u64,
     },
 }
 
