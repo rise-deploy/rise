@@ -210,7 +210,12 @@ sufficient on its own: there is **no `#[serde(deny_unknown_fields)]` anywhere in
 fallback path. "Try `verify_access_jwt`, fall back to `verify_user_jwt`" is therefore unsafe.
 The **primary** discriminator must be the **JWT-header `typ`** (e.g. `typ: "rise-access+jwt"`
 for `AccessClaims`, distinct from the session token's `typ`): `verify_access_jwt` accepts only
-its own `typ`, `verify_user_jwt`/`verify_jwt_skip_aud` reject it. Additionally, add
+its own `typ`, `verify_user_jwt`/`verify_jwt_skip_aud` reject it. **Implementation note (L4):**
+jsonwebtoken's `Validation` does **not** check the header `typ`, and today `verify_user_jwt` /
+`verify_jwt_skip_aud` only `decode_header` for the alg check (jwt_signer.rs ~481, ~508) and never
+read `header.typ` — so this requires adding **explicit `header.typ` rejection** to those two verify
+functions; it is not free from `Validation`. (Session tokens get the default `typ:"JWT"` via
+`Header::new`, jwt_signer.rs ~348; the access token uses a distinct custom `typ`.) Additionally, add
 `#[serde(deny_unknown_fields)]` to **both** `AccessClaims` and `RiseClaims` (note: adding it to
 `RiseClaims` is a migration risk — any older session token carrying an extra claim would stop
 verifying; roll it out behind a flag / session-key cutover, coordinated with the §9 key-rotation window).
@@ -272,7 +277,15 @@ legacy path in Phase 3.
 **Note on users:** users are *already* exchanged — OIDC login mints an HS256 `RiseClaims`
 today. We **keep the user login flow on `RiseClaims`** for this scope; the SA access token is
 its analogue. Unifying user login onto `AccessClaims::User` is a larger change (cookies,
-ingress, `verify_jwt_skip_aud`) and is deferred (§9).
+ingress, `verify_jwt_skip_aud`) and is deferred (§9). **`PrincipalClaims::User` is therefore
+reserved (L5):** the §5 pipeline mints only `ServiceAccount` / `Controller` and **never** `User` —
+the variant exists solely for that deferred user-login unification, so an implementer must **not**
+wire a User-minting exchange path in this scope. **Field asymmetry that makes this safe:**
+`require_operator` / the resources API needs only `user.email` (resources/handlers.rs ~88-90),
+which an `AccessClaims::User` *would* carry; but the deployment/registry user path needs `user.id`
+for `projects::user_can_access` (project/handlers.rs ~1175), which an access token does **not**
+carry. This is fine **only because** user tokens never become `AccessClaims` in this scope — user
+requests still arrive as `RiseClaims` and resolve to a `db::User` (with `id`) exactly as today.
 
 ## 5. The exchange endpoint (RFC 8693)
 
@@ -322,9 +335,13 @@ ingress, `verify_jwt_skip_aud`) and is deferred (§9).
    `resolve_for_project`** (controller rejection, `find_by_project_and_issuer`, per-SA
    `validate_custom_claims`, 0→401 / >1→409). On a single match, read the SA's
    `allowed_environment_ids`, compute scopes, and mint `AccessClaims::ServiceAccount`.
-5. Else if the token matches a controller identity (`match_controller_identity` → `Single`):
-   mint `AccessClaims::Controller` (this enables the capabilities-while-controller case).
+5. Else match the token against controller identities (`match_controller_identity`): `Single` →
+   mint `AccessClaims::Controller` (this enables the capabilities-while-controller case);
+   `Multiple` → ambiguous configuration, reject (`invalid_grant` / 409-equivalent, per the §5.1
+   taxonomy), mirroring the ambiguous-SA handling and `resolve_for_project`'s current 409 on
+   multi-controller match (context.rs ~81-92); `Unmatched` → fall through.
 6. Otherwise → `401`.
+7. On **every successful mint**, emit a structured audit log (M5) — see §5.1.
 
 **Cross-cutting:**
 
@@ -348,8 +365,18 @@ ingress, `verify_jwt_skip_aud`) and is deferred (§9).
 - **Error bodies** follow RFC 8693 / 6749 OAuth shapes, not Rise's ad-hoc strings:
   `invalid_request` (missing/duplicate `grant_type`/`subject_token`, unsupported `subject_token_type`),
   `invalid_grant` (signature/expiry/issuer-guard failure, 0-match SA, controller-token-as-SA),
-  `invalid_target` (unknown `rise_project`). The >1-match SA case stays a `409`-equivalent
-  (`invalid_grant` with a distinguishing description). Avoid leaking unknown-issuer vs no-match (above).
+  `invalid_target` (unknown `rise_project`). The >1-match SA case **and** the >1-match controller
+  case (step 5, `ControllerMatch::Multiple`) both stay a `409`-equivalent (`invalid_grant` with a
+  distinguishing description). Avoid leaking unknown-issuer vs no-match (above).
+- **Audit log (M5).** The exchange is the **only** place an external CI identity (`iss`+`sub`) maps
+  to a Rise principal: downstream, a deployment's `created_by_id` is the opaque SA synthetic-user
+  UUID (deployment/handlers.rs ~662) and tracing logs only the synthetic email, so nothing links a
+  synthetic user back to the originating CI identity. Therefore every **successful** mint MUST emit a
+  structured audit log recording the resolved `service_account_id` / controller `identity_id`, the
+  `project` (for SA exchanges), the source `iss`, the source-token `sub`, and the minted `jti`. This
+  makes a later `created_by` synthetic user traceable to the CI identity that authorized it. `jti`
+  need **not** be persisted in Phase 1 (the deny-list is deferred, §10) — but it must appear in this
+  log now so an operator can correlate an issued token with the request that minted it.
 - **Input bound:** cap `subject_token` length before any parse (the workload endpoint already bounds
   its `audience` to 1024 chars, handlers.rs:37 — set an analogous inbound-JWT bound, e.g. ≤8 KiB, to
   blunt oversized-token CPU/DoS). Reject empty/oversized before touching JWKS.
@@ -406,6 +433,17 @@ auth docs under `docs/`), and only advertise it via a discovery field if/when a 
   `auth_only_routes`. Project SAs reach it because their token now carries the project binding
   and is recognized by the middleware — the "can't recognize a project SA without scanning all
   projects" problem dissolves.
+- **`platform_access_middleware` must recognize `AccessPrincipal` (H1 — PHASE-1 ordering
+  dependency, not deferred to Phase 3).** Today the gate has two paths only: skip if a
+  `VerifiedExternalToken` extension is present (middleware.rs:306), else require a `User` extension
+  or **500** (middleware.rs:312-313). The moment the middleware can inject an `AccessPrincipal`
+  (Phase 1), a Rise access token is **neither** a `VerifiedExternalToken` (that branch is gone in
+  the end-state) **nor** a `User` — so every SA deploy and every controller resource-status call
+  (deployments/registry/resources all stay under `platform_routes`, mod.rs:236-260) would **500**.
+  The gate must inspect the `AccessPrincipal` extension: **SA and Controller principals bypass** the
+  email/group allowlist (their authz is the embedded project binding / controller identity, just as
+  external tokens bypass it today), while **`User` principals are gated exactly as now**. This edit
+  ships with the Phase-1 middleware change that first injects `AccessPrincipal`, not later.
 
 ## 7. Phased migration (transparent fallback)
 
@@ -451,7 +489,9 @@ so we phase it.
 - `src/server/auth/jwt_signer.rs` — add `sign_access_jwt` (HS256) and `verify_access_jwt`
   (HS256-only, `aud == public_url`). Do **not** touch `RiseClaims` / `WorkloadClaims`.
 - `src/server/auth/middleware.rs` — Phase 1 adds `AccessClaims` recognition; Phase 3 deletes the
-  external branch and its guard.
+  external branch and its guard. **Same Phase-1 edit (H1):** `platform_access_middleware` must
+  recognize the `AccessPrincipal` extension (SA/Controller bypass the allowlist, `User` gated as
+  today) or it 500s on every access-token request the moment the middleware injects one — see §6.
 - `src/server/mod.rs` — register `auth::exchange::routes()` under `public_routes`; (Phase 3)
   move `platform::routes()` into `auth_only_routes`.
 - **Mechanical handler edits** (one pattern, ~10 project-scoped sites): `src/server/deployment/handlers.rs`
