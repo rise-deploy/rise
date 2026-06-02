@@ -4,10 +4,12 @@
 > current request-time authentication patterns and proposes a token-exchange
 > mechanism that turns Rise into the single trusted issuer for request-time auth.
 >
-> **Confirmed decisions:** access tokens are HS256 and separate from existing claim
-> types; migration is phased with a transparent fallback (no breakage for existing
-> raw-token CI); controller identities are folded into the new model now; the
-> exchange endpoint follows RFC 8693 token-exchange.
+> **Confirmed decisions:** all token parsing / verification / signing is centralized in a new
+> **pure-core workspace crate** (`rise-backend-auth`) exposing exactly **two** verify entry points —
+> one for arbitrary external JWTs, one for Rise-issued JWTs (§3); access tokens are HS256 and
+> separate from existing claim types; migration is phased with a transparent fallback (no breakage
+> for existing raw-token CI); controller identities are folded into the new model now; the exchange
+> endpoint follows RFC 8693 token-exchange.
 
 ## 1. Motivation
 
@@ -157,6 +159,106 @@ Rise-issued tokens and populates a rich principal; handlers inspect that princip
 decide instantly. All the claim-matching / DB-resolution / context-gathering logic lives
 in exactly one place: the exchange endpoint.
 
+Underpinning that, the **token logic itself** must have one home. Today verification is
+scattered — `JwtValidator::validate_token` (external, jwt.rs), `verify_user_jwt` /
+`verify_jwt_skip_aud` (Rise HS256/RS256, jwt_signer.rs), and workload verification — each a
+separate path that can drift independently. We collapse this to **two non-negotiable code
+paths**, owned by a dedicated crate (§3.3).
+
+### 3.1 The two code paths (non-negotiable)
+
+**Path A — arbitrary external JWT → typed claims.** Exactly one function turns an untrusted,
+externally-issued JWT into a validated, typed claims structure usable for SA / controller
+matching:
+
+```rust
+// the ONLY entry point for external tokens
+async fn verify_external_jwt(token: &str, keys: &impl JwksKeySource)
+    -> Result<ExternalClaims, AuthError>;
+
+/// Opaque proof that signature + expiry were checked via JWKS. No public constructor —
+/// the only way to obtain one is `verify_external_jwt`.
+struct ExternalClaims { issuer: String, /* private */ claims: serde_json::Value }
+```
+
+`JwksKeySource` is a trait (JWKS discovery + key fetch); rise-deploy supplies the reqwest +
+SSRF + cache implementation (§3.3). The matchers (`match_service_account_claims`,
+`match_controller_identity`, glob) are pure functions over `&ExternalClaims` — they **cannot**
+be called on un-verified input because the type can't be constructed any other way.
+
+**Path B — Rise-issued JWT → typed token enum.** Exactly one function verifies a Rise-issued
+JWT and returns a value that **wholly models** every kind of Rise token:
+
+```rust
+// the ONLY entry point for Rise-issued tokens
+fn verify_rise_jwt(token: &str, keys: &RiseKeys) -> Result<RiseToken, AuthError>;
+
+enum RiseToken {
+    Session(RiseClaims),     // HS256, aud = public_url   (UI / CLI login)
+    Ingress(RiseClaims),     // RS256, aud = project_url  (deployed-app ingress auth)
+    Access(AccessClaims),    // HS256, aud = public_url   (exchanged SA / controller — §4)
+    Workload(WorkloadClaims),// RS256, arbitrary aud      (outbound federation)
+}
+```
+
+`verify_rise_jwt` performs the alg / header-`typ` / `aud` disambiguation **once, centrally**
+(the §4.1 discriminator rules live here, not smeared across call sites). Today's
+`verify_user_jwt`, `verify_jwt_skip_aud`, and workload verification become thin shims over this
+single path (or are deleted). Callers `match` on `RiseToken` and get a **compile error** if they
+forget a variant — the type system enforces exhaustive handling, so a new token kind can't
+silently fall through a stale check. This structurally subsumes the earlier C2 "try-then-fallback"
+hazard: there is no fallback, only one verifier returning a typed sum.
+
+### 3.2 The complete token model
+
+Every JWT Rise issues or accepts, in one table (Verify = which of the two paths):
+
+| Token (type) | Direction | Alg | Issuer | Audience | Verify | Purpose |
+|---|---|---|---|---|---|---|
+| Session (`RiseClaims`) | Rise-issued | HS256 | public_url | public_url | B → `Session` | UI / CLI user login |
+| Ingress (`RiseClaims`) | Rise-issued | RS256 | public_url | project_url | B → `Ingress` | deployed-app ingress auth |
+| Access (`AccessClaims`) | Rise-issued | HS256 | public_url | public_url | B → `Access` | exchanged SA / controller principal (§4) |
+| Workload (`WorkloadClaims`) | Rise-issued | RS256 | public_url | caller-supplied | B → `Workload` | outbound federation (AWS/GCP/Vault) |
+| External OIDC (SA) | inbound | RS256 | external IdP | SA-matched | A → `ExternalClaims` | CI service-account source token |
+| External OIDC (controller) | inbound | RS256 | external IdP | controller-matched | A → `ExternalClaims` | controller source token |
+
+Rise-issued tokens never flow through Path A and external tokens never through Path B; the
+`is_rise_issued_jwt` issuer peek (§2.1, §5 step 1) is the *only* branch that routes a raw token
+between the two.
+
+### 3.3 The `rise-backend-auth` crate
+
+The repo is **already a Cargo workspace** (`crates/rise-resource-store`,
+`crates/rise-resource-api`), so a new member `crates/rise-backend-auth` fits the existing
+structure — the "single consolidated crate" line in `CLAUDE.md` is outdated and must be updated
+when this lands.
+
+**Pure core — no I/O, no framework, no DB.** The crate depends only on `jsonwebtoken`,
+`serde`/`serde_json`, `uuid`, and (for the trait) `async-trait`. It does **not** depend on
+`reqwest`, `axum`, or `sqlx`:
+- JWKS fetching is abstracted behind the `JwksKeySource` trait; the reqwest + `ssrf` + cache
+  implementation stays in rise-deploy (today's `JwtValidator` *becomes* that impl). SSRF/HTTP
+  policy stays in the app.
+- No SQLX in the crate (consistent with `CLAUDE.md`: SQLX only in `src/db`). DB resolution
+  (finding SAs, synthetic users, projects) stays in rise-deploy; the crate's matchers are pure and
+  take already-fetched rows / claims.
+- The crate is **deterministically unit-testable** with no network or DB — the bulk of the
+  high-value auth tests (glob matching, disambiguation, alg/typ/aud rejection, claim round-trips)
+  live here.
+
+**In the crate:** all claim types (`RiseClaims`, `AccessClaims` / `PrincipalClaims` / `Scope`,
+`WorkloadClaims`, `ExternalClaims`), the two verify entry points + signing (`RiseTokenSigner`),
+the pure matchers, `is_rise_issued_jwt`, and `AuthError`.
+
+**Stays in rise-deploy:** the axum `AccessPrincipal` extractor + middleware, the `JwksKeySource`
+impl, OAuth handlers, cookie helpers, the exchange HTTP handler, and all DB access.
+
+**Anti-drift guarantee ("parse, don't validate").** `ExternalClaims` and `RiseToken` have private
+fields and no public constructor — the *only* way to obtain one is through the two verify
+functions. rise-deploy therefore **cannot** fabricate a "verified" value or hand-roll a second
+validation path; the compiler enforces that every auth decision flows through the crate. This is
+the systemic property the centralization buys, and the direct answer to the two MUSTs.
+
 ## 4. The Rise access-token model
 
 ### 4.1 `AccessClaims` (new, HS256)
@@ -203,8 +305,9 @@ impossible for a third party to verify it and enforces the boundary in the key s
 `verify_access_jwt` must reject non-HS256 algorithms (mirroring `verify_user_jwt`) so an
 RS256 ingress/workload token can never be parsed as an access token.
 
-**Discriminator (mandatory, type-safe).** A body-level `principal.kind` tag is *not*
-sufficient on its own: there is **no `#[serde(deny_unknown_fields)]` anywhere in
+**Discriminator (mandatory, type-safe).** These rules are implemented **once**, inside
+`verify_rise_jwt` (§3.1, Path B); no call site re-derives them. A body-level `principal.kind` tag
+is *not* sufficient on its own: there is **no `#[serde(deny_unknown_fields)]` anywhere in
 `src/server/auth/`**, `RiseClaims.email` is required while `name`/`groups` are optional, so an
 `AccessClaims::User` carrying an `email` could deserialize cleanly as `RiseClaims` on any
 fallback path. "Try `verify_access_jwt`, fall back to `verify_user_jwt`" is therefore unsafe.
@@ -398,10 +501,11 @@ auth docs under `docs/`), and only advertise it via a discovery field if/when a 
 ## 6. Middleware & handler simplification (end-state)
 
 - `auth_middleware` validates **only Rise tokens**. After `is_rise_issued_jwt`, it
-  distinguishes `RiseClaims` (user/UI — unchanged) from `AccessClaims` (inject
-  `AccessPrincipal`). Disambiguation is by the **JWT-header `typ` discriminator** (§4.1) —
-  *not* by trial deserialization. The external branch, the `issuer_exists` DB round-trip, and
-  the `controllers_by_issuer` lookup all **leave the request hot path** — the core win.
+  calls `verify_rise_jwt` (§3.1, Path B) and **matches the returned `RiseToken`**: `Session` →
+  inject `db::User` (user/UI, unchanged); `Access` → inject `AccessPrincipal`. Disambiguation
+  happens once inside the verifier (header-`typ`/alg/aud), *not* by trial deserialization at the
+  call site. The external branch, the `issuer_exists` DB round-trip, and the `controllers_by_issuer`
+  lookup all **leave the request hot path** — the core win.
 - The `resolve_for_project` call sites collapse to `auth.require_project(project.id)?` plus a
   `has_scope(...)` check — **with one exception**: the deprecated unscoped
   `update_deployment_status` discovers its project from `deployment_id` (§4.3) and must compare
@@ -451,6 +555,16 @@ The risk: existing CI sends a **raw external OIDC token** directly to `POST /dep
 (project in body) through a refreshing provider. A hard cutover would break every pipeline,
 so we phase it.
 
+- **Phase 0 — extract `rise-backend-auth`, no behavior change.** Move the claim types, the two
+  verify entry points (§3.1), signing, and the pure matchers into the new crate; introduce the
+  `JwksKeySource` trait and reimplement today's `JwtValidator` as its rise-deploy impl. Replace the
+  scattered verifiers (`verify_user_jwt`, `verify_jwt_skip_aud`, `validate_token`, workload
+  verification) with shims over `verify_rise_jwt` / `verify_external_jwt`, and adopt them at all
+  current call sites. This is a **pure refactor** — identical behavior, no new endpoints, no
+  `AccessClaims` yet — establishing the single home *before* any new surface is built. Land and merge
+  it on its own (it touches many files but changes no behavior, so it reviews cleanly and de-risks the
+  later phases). The `Access` variant of `RiseToken` and `verify_external_jwt`'s use by the exchange
+  arrive in Phase 1.
 - **Phase 1 — additive, no removals.** Ship the exchange endpoint, `AccessClaims`, and the
   signer methods. Keep the middleware's external branch and `resolve_for_project` in place.
   The new `AccessPrincipal` extractor, when it finds **no** `AccessClaims`, **falls back** to
@@ -481,13 +595,25 @@ so we phase it.
 
 ## 8. Files to change (for the eventual implementation)
 
+- **New crate** `crates/rise-backend-auth/` (Phase 0) — claim types (`RiseClaims`, `AccessClaims` /
+  `PrincipalClaims` / `Scope`, `WorkloadClaims`, `ExternalClaims`), the two entry points
+  `verify_external_jwt` / `verify_rise_jwt` (`RiseToken`), `RiseTokenSigner`, the pure matchers,
+  `is_rise_issued_jwt`, the `JwksKeySource` trait, and `AuthError`. Add it as a workspace member in
+  the root `Cargo.toml`; `rise-deploy` depends on it. No `reqwest`/`axum`/`sqlx`. **Update the
+  `CLAUDE.md` "single consolidated crate" note** to reflect the auth crate.
+- `src/server/auth/jwt.rs` (Phase 0) — `JwtValidator` becomes the rise-deploy `JwksKeySource`
+  implementation (reqwest + `ssrf` + JWKS cache) that backs `verify_external_jwt`; its pure
+  claim-matching moves into the crate.
 - **New module** `src/server/auth/exchange/` (`mod.rs`, `handlers.rs`, `models.rs`, `routes.rs`)
-  — the `POST /api/v1/auth/token` handler; relocate `resolve_for_project`'s body here; reuse
-  `jwt_validator`, `match_controller_identity`, `oauth_rate_limiter`, `extract_bearer_token`.
-- **New** `src/server/auth/access.rs` — `AccessClaims`, `PrincipalClaims`, `Scope`, and the
-  `AccessPrincipal` extractor.
-- `src/server/auth/jwt_signer.rs` — add `sign_access_jwt` (HS256) and `verify_access_jwt`
-  (HS256-only, `aud == public_url`). Do **not** touch `RiseClaims` / `WorkloadClaims`.
+  — the `POST /api/v1/auth/token` handler; relocate `resolve_for_project`'s body here; reuse the
+  crate's `verify_external_jwt` + matchers, plus `oauth_rate_limiter`, `extract_bearer_token`.
+- **New** `src/server/auth/access.rs` — the axum `AccessPrincipal` extractor (the `AccessClaims` /
+  `PrincipalClaims` / `Scope` *types* live in the crate; only the extractor is rise-deploy-side).
+- Access-token signing/verification land **in the crate**: a `sign_access` method on
+  `RiseTokenSigner` and the `RiseToken::Access` arm of `verify_rise_jwt` (HS256-only,
+  `aud == public_url`). `src/server/auth/jwt_signer.rs` becomes a thin wrapper over the crate's
+  signer (or is removed once Phase 0 relocates signing); `RiseClaims` / `WorkloadClaims` behavior is
+  preserved, not changed.
 - `src/server/auth/middleware.rs` — Phase 1 adds `AccessClaims` recognition; Phase 3 deletes the
   external branch and its guard. **Same Phase-1 edit (H1):** `platform_access_middleware` must
   recognize the `AccessPrincipal` extension (SA/Controller bypass the allowlist, `User` gated as
