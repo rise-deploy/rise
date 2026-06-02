@@ -1117,13 +1117,32 @@ pub enum DeploymentControllerSettings {
         environment_ingress_url_template: Option<String>,
 
         /// Access classes defining ingress authentication levels, keyed by
-        /// identifier (e.g. "public"). Mirrors the Kubernetes variant so the
-        /// typed project API can validate a project's access class. The Docker
-        /// runtime does not enforce ingress authentication, so only a permissive
-        /// "public" class is provided by default; operators may override.
+        /// identifier (e.g. "public", "private"). Mirrors the Kubernetes variant
+        /// so the typed project API can validate a project's access class. For
+        /// access classes whose `access_requirement` is `Authenticated`/`Member`,
+        /// the Docker controller stamps Traefik forwardAuth middleware labels
+        /// (requires `auth_backend_url` to be set). A permissive "public" class
+        /// is provided by default; operators may override.
         /// Use `null` in YAML to remove an inherited access class.
         #[serde(default = "default_docker_access_classes")]
         access_classes: std::collections::HashMap<String, Option<AccessClass>>,
+
+        /// Internal URL Traefik uses to reach the Rise backend for the
+        /// forwardAuth subrequest (e.g. `http://rise:3000` on the compose
+        /// network). Used to build the `forwardauth.address` middleware label
+        /// pointing at `/api/v1/auth/ingress`. If empty, ingress authentication
+        /// is disabled even for non-`None` access classes (a warning is logged
+        /// when such an access class is used without it).
+        #[serde(default)]
+        auth_backend_url: String,
+
+        /// Browser-facing base URL for the login redirect (e.g. the public URL
+        /// `http://localhost:3000`). Traefik forwardAuth has no nginx-style
+        /// `auth-signin`, so the `ingress_auth` handler 302-redirects
+        /// unauthenticated browsers to `{auth_signin_url}/api/v1/auth/signin`.
+        /// If empty, falls back to the server `public_url`.
+        #[serde(default)]
+        auth_signin_url: String,
 
         /// Optional port appended to all generated ingress URLs (e.g. `8080`).
         #[serde(default)]

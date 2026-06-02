@@ -1433,13 +1433,64 @@ pub async fn oauth_complete(
 #[derive(Debug, Deserialize)]
 pub struct IngressAuthQuery {
     pub project: String,
+    /// Traefik mode. Traefik forwardAuth has no nginx-style `auth-signin`: on a
+    /// non-2xx auth response it returns that response (status + Location) to the
+    /// browser. When set (`signin_redirect=1`), an unauthenticated/invalid
+    /// session yields a `302 Found` to the login page instead of a bare `401`,
+    /// so the browser is sent to sign in. Unset (nginx) keeps the `401` behavior
+    /// byte-identical — nginx itself performs the auth-signin redirect.
+    #[serde(default, deserialize_with = "deserialize_bool_flag")]
+    pub signin_redirect: bool,
 }
 
-/// Nginx ingress auth endpoint
+/// Deserialize a query flag that may be `1`/`true`/`0`/`false` (or absent).
+fn deserialize_bool_flag<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+    Ok(matches!(
+        opt.as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    ))
+}
+
+/// Build the browser-facing login redirect URL for Traefik forwardAuth mode.
 ///
-/// This handler is called by Nginx for every request to a private project.
-/// It validates the session cookie, checks JWT validity, and verifies
-/// project access authorization.
+/// Reconstructs the original request URL from Traefik's forwarded headers
+/// (`X-Forwarded-Proto` + `X-Forwarded-Host` + `X-Forwarded-Uri`) and embeds it
+/// as the `redirect` parameter so the user returns to where they started after
+/// signing in. Falls back gracefully when forwarded headers are absent.
+fn build_signin_redirect_url(signin_base: &str, project: &str, headers: &HeaderMap) -> String {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let proto = header("x-forwarded-proto").unwrap_or("http");
+    let host = header("x-forwarded-host");
+    let uri = header("x-forwarded-uri").unwrap_or("/");
+
+    let base = signin_base.trim_end_matches('/');
+    let mut url = format!(
+        "{}/api/v1/auth/signin?project={}",
+        base,
+        urlencoding::encode(project)
+    );
+    if let Some(host) = host {
+        let original = format!("{proto}://{host}{uri}");
+        url.push_str(&format!("&redirect={}", urlencoding::encode(&original)));
+    }
+    url
+}
+
+/// Ingress auth endpoint (nginx `auth-url` / Traefik `forwardAuth`)
+///
+/// Called by the ingress proxy for every request to a project whose access
+/// class requires authentication. It validates the session cookie, checks JWT
+/// validity, and verifies project access authorization.
+///
+/// Two modes, selected by the `signin_redirect` query flag:
+/// - **nginx** (flag unset): unauthenticated → `401`; nginx redirects to
+///   `auth-signin` itself.
+/// - **Traefik** (`signin_redirect=1`): unauthenticated → `302` to the login
+///   page, since Traefik forwardAuth has no `auth-signin`.
 #[instrument(skip(state, params, headers))]
 pub async fn ingress_auth(
     State(state): State<AppState>,
@@ -1458,13 +1509,15 @@ pub async fn ingress_auth(
         "Ingress auth check"
     );
 
-    // Allow access to /.rise/* paths without authentication (login page, static assets)
-    // This prevents redirect loops when users try to access the signin page
-    // Use x-auth-request-redirect header which contains the request path
-    if let Some(redirect_path) = headers
+    // Allow access to /.rise/* paths without authentication (login page, static
+    // assets). This prevents redirect loops when users try to access the signin
+    // page. nginx forwards the request path in `x-auth-request-redirect`; Traefik
+    // forwardAuth forwards it in `x-forwarded-uri`. Read either.
+    let allowlist_path = headers
         .get("x-auth-request-redirect")
-        .and_then(|v| v.to_str().ok())
-    {
+        .or_else(|| headers.get("x-forwarded-uri"))
+        .and_then(|v| v.to_str().ok());
+    if let Some(redirect_path) = allowlist_path {
         if redirect_path.starts_with("/.rise/") {
             tracing::debug!(
                 project = %params.project,
@@ -1479,22 +1532,40 @@ pub async fn ingress_auth(
         }
     }
 
-    // Extract and validate Rise JWT (required)
-    let rise_jwt = cookie_helpers::extract_rise_jwt_cookie(&headers).ok_or_else(|| {
-        tracing::debug!("No Rise JWT cookie found");
-        (StatusCode::UNAUTHORIZED, "No session cookie".to_string())
-    })?;
+    // Helper: build the unauthenticated response. In Traefik mode
+    // (`signin_redirect=1`) return a 302 to the login page (Traefik relays it to
+    // the browser); otherwise keep the bare 401 nginx expects.
+    let unauthenticated = |reason: &str| -> Response {
+        if params.signin_redirect {
+            let location =
+                build_signin_redirect_url(&state.signin_base_url, &params.project, &headers);
+            tracing::debug!(
+                project = %params.project,
+                location = %location,
+                "Unauthenticated ingress request — redirecting to signin (Traefik mode)"
+            );
+            (StatusCode::FOUND, [("Location", location)]).into_response()
+        } else {
+            (StatusCode::UNAUTHORIZED, reason.to_string()).into_response()
+        }
+    };
 
-    let ingress_claims = state
-        .jwt_signer
-        .verify_jwt_skip_aud(&rise_jwt)
-        .map_err(|e| {
+    // Extract and validate Rise JWT (required)
+    let rise_jwt = match cookie_helpers::extract_rise_jwt_cookie(&headers) {
+        Some(jwt) => jwt,
+        None => {
+            tracing::debug!("No Rise JWT cookie found");
+            return Ok(unauthenticated("No session cookie"));
+        }
+    };
+
+    let ingress_claims = match state.jwt_signer.verify_jwt_skip_aud(&rise_jwt) {
+        Ok(claims) => claims,
+        Err(e) => {
             tracing::warn!("Invalid or expired ingress JWT: {:#}", e);
-            (
-                StatusCode::UNAUTHORIZED,
-                "Invalid or expired session".to_string(),
-            )
-        })?;
+            return Ok(unauthenticated("Invalid or expired session"));
+        }
+    };
 
     let email = ingress_claims.email;
 
@@ -1819,6 +1890,40 @@ pub async fn openid_configuration(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signin_redirect_url_reconstructs_from_forwarded_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert("x-forwarded-host", "secret.rise.localhost".parse().unwrap());
+        headers.insert("x-forwarded-uri", "/dashboard?tab=1".parse().unwrap());
+        let url = build_signin_redirect_url("http://localhost:3000", "secret app", &headers);
+        // Base + project (URL-encoded) + redirect (full original URL, encoded).
+        assert!(url.starts_with("http://localhost:3000/api/v1/auth/signin?project=secret%20app"));
+        assert!(url.contains(
+            "&redirect=https%3A%2F%2Fsecret.rise.localhost%2Fdashboard%3Ftab%3D1"
+        ));
+    }
+
+    #[test]
+    fn signin_redirect_url_falls_back_without_forwarded_host() {
+        let headers = HeaderMap::new();
+        let url = build_signin_redirect_url("http://localhost:3000/", "app", &headers);
+        // Trailing slash on base is trimmed; no redirect param when host absent.
+        assert_eq!(url, "http://localhost:3000/api/v1/auth/signin?project=app");
+    }
+
+    #[test]
+    fn ingress_auth_query_parses_signin_redirect_flag() {
+        let q: IngressAuthQuery =
+            serde_urlencoded::from_str("project=app&signin_redirect=1").unwrap();
+        assert!(q.signin_redirect);
+        let q: IngressAuthQuery = serde_urlencoded::from_str("project=app").unwrap();
+        assert!(!q.signin_redirect);
+        let q: IngressAuthQuery =
+            serde_urlencoded::from_str("project=app&signin_redirect=0").unwrap();
+        assert!(!q.signin_redirect);
+    }
 
     #[test]
     fn test_validate_redirect_url_relative_paths() {

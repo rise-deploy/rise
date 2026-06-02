@@ -10,8 +10,9 @@ use std::collections::HashMap;
 use bollard::container::Config;
 use bollard::secret::{EndpointSettings, HostConfig, RestartPolicy, RestartPolicyNameEnum};
 
-use super::labels::{self, BookkeepingLabels, TraefikRoute};
+use super::labels::{self, BookkeepingLabels, ForwardAuth, TraefikRoute};
 use crate::server::deployment::quantity::{parse_cpu_millicores, parse_memory_bytes};
+use crate::server::settings::AccessRequirement;
 
 /// One ingress route attached to a routable container.
 #[derive(Debug, Clone)]
@@ -28,6 +29,10 @@ pub struct DesiredRoute {
 #[derive(Debug, Clone)]
 pub struct DesiredContainer {
     pub project: String,
+    /// Name of the project's access class (looked up in
+    /// [`BuilderConfig::access_classes`] to decide whether to stamp Traefik
+    /// forwardAuth middleware labels).
+    pub access_class: String,
     pub deployment_group: String,
     pub deployment_id: String,
     pub deployment_uuid: String,
@@ -73,6 +78,12 @@ pub struct BuilderConfig<'a> {
     pub traefik_network: &'a str,
     pub traefik_entrypoint: &'a str,
     pub traefik_certresolver: Option<&'a str>,
+    /// Internal URL Traefik uses to reach the Rise backend for the forwardAuth
+    /// subrequest (e.g. `http://rise:3000`). Empty disables forwardAuth.
+    pub auth_backend_url: &'a str,
+    /// Access-class name → access requirement. Used to resolve a project's
+    /// access requirement and decide whether to stamp forwardAuth labels.
+    pub access_classes: &'a HashMap<String, AccessRequirement>,
 }
 
 /// Result of building one container: the deterministic name and the bollard
@@ -226,6 +237,33 @@ fn render_traefik_labels_for(
     let Some(port) = desired.port.filter(|_| desired.routable) else {
         return out;
     };
+
+    // Resolve the project's access requirement. For Authenticated/Member, and
+    // when an internal backend URL is configured, build the Traefik forwardAuth
+    // address pointing at Rise's ingress-auth endpoint. `signin_redirect=1` puts
+    // the handler in Traefik mode (302 to the login page on unauthenticated,
+    // since Traefik has no nginx-style auth-signin). The project name is
+    // URL-encoded into the query. `None` (or a missing/unconfigured class, or no
+    // backend URL) leaves forward_auth unset → no auth enforced.
+    let requirement = cfg
+        .access_classes
+        .get(&desired.access_class)
+        .unwrap_or(&AccessRequirement::None);
+    let forward_auth_address: Option<String> = match requirement {
+        AccessRequirement::None => None,
+        AccessRequirement::Authenticated | AccessRequirement::Member => {
+            if cfg.auth_backend_url.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "{}/api/v1/auth/ingress?project={}&signin_redirect=1",
+                    cfg.auth_backend_url.trim_end_matches('/'),
+                    urlencoding::encode(&desired.project)
+                ))
+            }
+        }
+    };
+
     // One router per (host-set × route). Single-container apps have a single
     // `/` route, so this yields exactly one router. Longest path-prefix first
     // matches the nginx semantics used by the K8s path.
@@ -262,6 +300,10 @@ fn render_traefik_labels_for(
             entrypoint: cfg.traefik_entrypoint,
             network: cfg.traefik_network,
             certresolver: cfg.traefik_certresolver,
+            forward_auth: forward_auth_address.as_deref().map(|address| ForwardAuth {
+                address,
+                auth_response_headers: "X-Auth-Request-Email,X-Auth-Request-User",
+            }),
         });
         out.extend(traefik);
     }
@@ -281,6 +323,15 @@ pub fn route_hash_for(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> St
 mod tests {
     use super::*;
 
+    use std::sync::OnceLock;
+
+    /// Shared empty access-class map (no forwardAuth) for tests that don't
+    /// exercise authentication.
+    fn empty_access_classes() -> &'static HashMap<String, AccessRequirement> {
+        static MAP: OnceLock<HashMap<String, AccessRequirement>> = OnceLock::new();
+        MAP.get_or_init(HashMap::new)
+    }
+
     fn test_cfg() -> BuilderConfig<'static> {
         BuilderConfig {
             label_namespace: "rise.dev",
@@ -289,12 +340,15 @@ mod tests {
             traefik_network: "rise_default",
             traefik_entrypoint: "web",
             traefik_certresolver: None,
+            auth_backend_url: "",
+            access_classes: empty_access_classes(),
         }
     }
 
     fn single_container() -> DesiredContainer {
         DesiredContainer {
             project: "myapp".to_string(),
+            access_class: "public".to_string(),
             deployment_group: "default".to_string(),
             deployment_id: "20260101-120000".to_string(),
             deployment_uuid: "11111111-1111-1111-1111-111111111111".to_string(),
@@ -532,6 +586,105 @@ mod tests {
                 .get("traefik.http.routers.myapp-default-20260101-120000-app.tls.certresolver")
                 .map(String::as_str),
             Some("le")
+        );
+    }
+
+    /// An access-class map where `public` is `None` and `private` is `Member`.
+    fn public_private_map() -> HashMap<String, AccessRequirement> {
+        let mut map = HashMap::new();
+        map.insert("public".to_string(), AccessRequirement::None);
+        map.insert("private".to_string(), AccessRequirement::Member);
+        map
+    }
+
+    #[test]
+    fn private_access_class_stamps_forward_auth_labels() {
+        let map = public_private_map();
+        let cfg = BuilderConfig {
+            auth_backend_url: "http://rise:3000",
+            access_classes: &map,
+            ..test_cfg()
+        };
+        let mut desired = single_container();
+        desired.access_class = "private".to_string();
+        let built = build_container(&desired, &cfg);
+        let labels = built.config.labels.as_ref().unwrap();
+        let r = "myapp-default-20260101-120000-app";
+        assert_eq!(
+            labels
+                .get(&format!(
+                    "traefik.http.middlewares.{r}-auth.forwardauth.address"
+                ))
+                .map(String::as_str),
+            Some("http://rise:3000/api/v1/auth/ingress?project=myapp&signin_redirect=1")
+        );
+        assert_eq!(
+            labels
+                .get(&format!(
+                    "traefik.http.middlewares.{r}-auth.forwardauth.authResponseHeaders"
+                ))
+                .map(String::as_str),
+            Some("X-Auth-Request-Email,X-Auth-Request-User")
+        );
+        assert_eq!(
+            labels
+                .get(&format!("traefik.http.routers.{r}.middlewares"))
+                .map(String::as_str),
+            Some(format!("{r}-auth@docker").as_str())
+        );
+    }
+
+    #[test]
+    fn public_access_class_stamps_no_forward_auth() {
+        let map = public_private_map();
+        let cfg = BuilderConfig {
+            auth_backend_url: "http://rise:3000",
+            access_classes: &map,
+            ..test_cfg()
+        };
+        let mut desired = single_container();
+        desired.access_class = "public".to_string();
+        let built = build_container(&desired, &cfg);
+        let labels = built.config.labels.as_ref().unwrap();
+        assert!(!labels
+            .keys()
+            .any(|k| k.contains("forwardauth") || k.ends_with(".middlewares")));
+    }
+
+    #[test]
+    fn private_access_class_without_backend_url_stamps_no_forward_auth() {
+        // Member requirement but no auth_backend_url → forwardAuth disabled
+        // (project served publicly; startup logs a warning).
+        let mut map = HashMap::new();
+        map.insert("private".to_string(), AccessRequirement::Member);
+        let cfg = BuilderConfig {
+            auth_backend_url: "",
+            access_classes: &map,
+            ..test_cfg()
+        };
+        let mut desired = single_container();
+        desired.access_class = "private".to_string();
+        let built = build_container(&desired, &cfg);
+        let labels = built.config.labels.as_ref().unwrap();
+        assert!(!labels.keys().any(|k| k.contains("forwardauth")));
+    }
+
+    #[test]
+    fn forward_auth_changes_route_hash() {
+        let map = public_private_map();
+        let cfg = BuilderConfig {
+            auth_backend_url: "http://rise:3000",
+            access_classes: &map,
+            ..test_cfg()
+        };
+        let mut public_c = single_container();
+        public_c.access_class = "public".to_string();
+        let mut private_c = single_container();
+        private_c.access_class = "private".to_string();
+        assert_ne!(
+            route_hash_for(&public_c, &cfg),
+            route_hash_for(&private_c, &cfg),
+            "access-class change must change the route hash to trigger recreate"
         );
     }
 }

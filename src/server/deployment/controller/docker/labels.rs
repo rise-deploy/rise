@@ -110,6 +110,21 @@ pub fn hash_traefik_labels(labels: &HashMap<String, String>) -> String {
         .collect()
 }
 
+/// forwardAuth middleware spec for a routable container. Mirrors the
+/// Kubernetes nginx `auth-url`/`auth-response-headers` annotations: Traefik
+/// issues a subrequest to `address` before proxying, and copies the named
+/// response headers (`auth_response_headers`) from a 2xx auth response onto the
+/// forwarded request.
+pub struct ForwardAuth<'a> {
+    /// URL Traefik calls for the auth subrequest (Rise's
+    /// `/api/v1/auth/ingress`). Includes the `signin_redirect=1` query so the
+    /// handler 302-redirects unauthenticated browsers to the login page.
+    pub address: &'a str,
+    /// Comma-separated response headers copied from the auth response onto the
+    /// proxied request (e.g. `X-Auth-Request-Email,X-Auth-Request-User`).
+    pub auth_response_headers: &'a str,
+}
+
 /// Configuration needed to render Traefik labels for one routable container.
 pub struct TraefikRoute<'a> {
     /// Sanitized, unique router/service name (see [`sanitize_router_name`]).
@@ -126,6 +141,9 @@ pub struct TraefikRoute<'a> {
     pub network: &'a str,
     /// Optional certresolver — when set the router gets TLS labels.
     pub certresolver: Option<&'a str>,
+    /// Optional forwardAuth middleware — when set the router gets a
+    /// `{router}-auth` middleware enforcing ingress authentication.
+    pub forward_auth: Option<ForwardAuth<'a>>,
 }
 
 /// Build a Traefik `Host(...)` (+ optional `PathPrefix(...)`) rule string.
@@ -209,6 +227,20 @@ pub fn render_traefik_labels(route: &TraefikRoute<'_>) -> HashMap<String, String
             certresolver.to_string(),
         );
     }
+    if let Some(fa) = &route.forward_auth {
+        labels.insert(
+            format!("traefik.http.middlewares.{r}-auth.forwardauth.address"),
+            fa.address.to_string(),
+        );
+        labels.insert(
+            format!("traefik.http.middlewares.{r}-auth.forwardauth.authResponseHeaders"),
+            fa.auth_response_headers.to_string(),
+        );
+        labels.insert(
+            format!("traefik.http.routers.{r}.middlewares"),
+            format!("{r}-auth@docker"),
+        );
+    }
     labels
 }
 
@@ -283,6 +315,7 @@ mod tests {
             entrypoint: "web",
             network: "rise_default",
             certresolver: None,
+            forward_auth: None,
         });
         assert_eq!(
             labels.get("traefik.enable").map(String::as_str),
@@ -318,6 +351,7 @@ mod tests {
             entrypoint: "websecure",
             network: "rise_default",
             certresolver: Some("le"),
+            forward_auth: None,
         });
         assert_eq!(
             labels
@@ -343,8 +377,88 @@ mod tests {
             entrypoint: "web",
             network: "rise_default",
             certresolver: None,
+            forward_auth: None,
         });
         assert!(labels.is_empty());
+    }
+
+    #[test]
+    fn traefik_labels_without_forward_auth_emit_no_middleware() {
+        let labels = render_traefik_labels(&TraefikRoute {
+            router_name: "app",
+            hosts: &["app.rise.dev".to_string()],
+            path_prefix: None,
+            port: 8080,
+            entrypoint: "web",
+            network: "rise_default",
+            certresolver: None,
+            forward_auth: None,
+        });
+        assert!(!labels
+            .keys()
+            .any(|k| k.contains("forwardauth") || k.ends_with(".middlewares")));
+    }
+
+    #[test]
+    fn traefik_labels_with_forward_auth_emit_middleware() {
+        let labels = render_traefik_labels(&TraefikRoute {
+            router_name: "app",
+            hosts: &["app.rise.dev".to_string()],
+            path_prefix: None,
+            port: 8080,
+            entrypoint: "web",
+            network: "rise_default",
+            certresolver: None,
+            forward_auth: Some(ForwardAuth {
+                address: "http://rise:3000/api/v1/auth/ingress?project=app&signin_redirect=1",
+                auth_response_headers: "X-Auth-Request-Email,X-Auth-Request-User",
+            }),
+        });
+        assert_eq!(
+            labels
+                .get("traefik.http.middlewares.app-auth.forwardauth.address")
+                .map(String::as_str),
+            Some("http://rise:3000/api/v1/auth/ingress?project=app&signin_redirect=1")
+        );
+        assert_eq!(
+            labels
+                .get("traefik.http.middlewares.app-auth.forwardauth.authResponseHeaders")
+                .map(String::as_str),
+            Some("X-Auth-Request-Email,X-Auth-Request-User")
+        );
+        assert_eq!(
+            labels
+                .get("traefik.http.routers.app.middlewares")
+                .map(String::as_str),
+            Some("app-auth@docker")
+        );
+    }
+
+    #[test]
+    fn route_hash_differs_with_and_without_forward_auth() {
+        let base = TraefikRoute {
+            router_name: "app",
+            hosts: &["app.rise.dev".to_string()],
+            path_prefix: None,
+            port: 8080,
+            entrypoint: "web",
+            network: "rise_default",
+            certresolver: None,
+            forward_auth: None,
+        };
+        let without = render_traefik_labels(&base);
+        let with = render_traefik_labels(&TraefikRoute {
+            forward_auth: Some(ForwardAuth {
+                address: "http://rise:3000/api/v1/auth/ingress?project=app&signin_redirect=1",
+                auth_response_headers: "X-Auth-Request-Email,X-Auth-Request-User",
+            }),
+            ..base
+        });
+        assert_ne!(
+            hash_traefik_labels(&without),
+            hash_traefik_labels(&with),
+            "forward_auth must change the route hash so access-class changes trigger recreate"
+        );
     }
 
     #[test]

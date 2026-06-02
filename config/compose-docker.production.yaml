@@ -1,0 +1,62 @@
+server:
+  host: "0.0.0.0"
+  port: 3000
+  public_url: "http://localhost:3000"
+  cookie_secure: false
+  jwt_signing_secret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  jwt_claims: ["sub", "email", "name"]
+  static_dir: "${RISE_STATIC_DIR:-/var/lib/rise/static}"
+  docs_dir: "${RISE_DOCS_DIR:-/var/rise/docs}"
+  ssrf:
+    allow_private_networks: true
+    allow_http: true
+database:
+  url: "${DATABASE_URL}"
+encryption:
+  type: "aes-gcm-256"
+  key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+auth:
+  issuer: "http://dex:5556/dex"
+  client_id: "rise-backend"
+  client_secret: "rise-backend-secret"
+  admin_users: ["admin@example.com"]
+  operator_users: ["ops@example.com"]
+  allow_team_creation: true
+  allow_list_all_teams: true
+  platform_access:
+    policy: restrictive
+    allowed_user_emails: ["admin@example.com", "dev@example.com", "ops@example.com"]
+registry:
+  type: "oci-client-auth"
+  registry_url: "rise-registry:5000"
+  namespace: "rise-apps"
+  client_registry_url: "localhost:5000"
+deployment_controller:
+  type: "docker"
+  traefik_network: "rise_default"
+  traefik_entrypoint: "web"
+  production_ingress_url_template: "{project_name}.rise.localhost"
+  staging_ingress_url_template: "{deployment_group}--{project_name}.rise.localhost"
+  environment_ingress_url_template: "{environment}--{project_name}.rise.localhost"
+  ingress_schema: "http"
+  ingress_port: 80
+  reconcile_interval_secs: 5
+  controller_class_name: "default"
+  # Internal URL Traefik uses to reach the Rise backend for the forwardAuth
+  # subrequest (compose service name + port).
+  auth_backend_url: "http://rise:3000"
+  # Browser-facing base URL for the login redirect (Traefik has no auth-signin).
+  auth_signin_url: "http://localhost:3000"
+  access_classes:
+    public:
+      display_name: Public
+      description: Public — no auth.
+      ingress_class: traefik
+      access_requirement: None
+    private:
+      display_name: Private
+      description: Requires project membership.
+      ingress_class: traefik
+      access_requirement: Member
+deployment_logs:
+  type: "docker"

@@ -96,6 +96,11 @@ pub struct AppState {
     pub oauth_rate_limiter: Arc<crate::server::rate_limit::OAuthRateLimiter>,
     pub access_classes:
         Arc<std::collections::HashMap<String, crate::server::settings::AccessClass>>,
+    /// Browser-facing base URL used to build the login redirect when the
+    /// `ingress_auth` handler runs in Traefik mode (`signin_redirect=1`).
+    /// Sourced from the Docker controller's `auth_signin_url` (falling back to
+    /// `public_url`); for other backends it is just `public_url`.
+    pub signin_base_url: String,
     /// Production ingress URL template (for custom domain validation)
     pub production_ingress_url_template: Option<String>,
     /// Staging ingress URL template (for custom domain validation)
@@ -281,6 +286,8 @@ async fn init_docker_backend(
         controller_class_name,
         reconcile_interval_secs,
         health_probes,
+        access_classes,
+        auth_backend_url,
         ..
     } = settings
     else {
@@ -343,6 +350,34 @@ async fn init_docker_backend(
          of the Docker runtime; use the Kubernetes backend for secret isolation."
     );
 
+    // Flatten the configured access classes to name → access requirement for
+    // the container builder, which only needs the requirement to decide whether
+    // to stamp Traefik forwardAuth middleware. `None`-valued entries (used to
+    // delete inherited classes) are skipped.
+    let access_requirements: HashMap<String, crate::server::settings::AccessRequirement> =
+        access_classes
+            .iter()
+            .filter_map(|(name, ac)| {
+                ac.as_ref()
+                    .map(|ac| (name.clone(), ac.access_requirement.clone()))
+            })
+            .collect();
+
+    // Warn if any non-`None` access class is configured but forwardAuth can't be
+    // wired because the internal backend URL is missing.
+    if auth_backend_url.trim().is_empty()
+        && access_requirements
+            .values()
+            .any(|r| *r != crate::server::settings::AccessRequirement::None)
+    {
+        tracing::warn!(
+            "Docker deployment backend: one or more access classes require authentication \
+             (Authenticated/Member) but `deployment_controller.auth_backend_url` is empty. \
+             Traefik forwardAuth will NOT be enforced for those projects — they will be served \
+             publicly. Set auth_backend_url to enable ingress authentication."
+        );
+    }
+
     let reconciler = DockerReconciler::new(
         docker.clone(),
         db_pool,
@@ -360,6 +395,8 @@ async fn init_docker_backend(
             reconcile_interval_secs: *reconcile_interval_secs,
             health_path,
             public_url: public_url.to_string(),
+            auth_backend_url: auth_backend_url.clone(),
+            access_classes: access_requirements,
         },
     );
     reconciler.spawn();
@@ -1266,6 +1303,7 @@ impl AppState {
             environment_ingress_url_template,
             ingress_schema,
             ingress_port,
+            signin_base_url,
         ) = if let Some(crate::server::settings::DeploymentControllerSettings::Kubernetes {
             access_classes,
             production_ingress_url_template,
@@ -1287,6 +1325,10 @@ impl AppState {
                 environment_ingress_url_template.clone(),
                 ingress_schema.clone(),
                 *ingress_port,
+                // K8s uses nginx auth-signin (built in ResourceBuilder), so the
+                // handler's Traefik signin-redirect mode is never engaged; default
+                // to public_url for completeness.
+                public_url.clone(),
             )
         } else if let Some(crate::server::settings::DeploymentControllerSettings::Docker {
             access_classes,
@@ -1295,6 +1337,7 @@ impl AppState {
             environment_ingress_url_template,
             ingress_schema,
             ingress_port,
+            auth_signin_url,
             ..
         }) = &settings.deployment_controller
         {
@@ -1302,6 +1345,13 @@ impl AppState {
                 .iter()
                 .filter_map(|(k, v)| v.as_ref().map(|ac| (k.clone(), ac.clone())))
                 .collect();
+            // Browser-facing signin base URL for the Traefik forwardAuth redirect.
+            // Falls back to public_url when auth_signin_url is empty.
+            let signin_base = if auth_signin_url.trim().is_empty() {
+                public_url.clone()
+            } else {
+                auth_signin_url.clone()
+            };
             (
                 Arc::new(filtered),
                 Some(production_ingress_url_template.clone()),
@@ -1309,6 +1359,7 @@ impl AppState {
                 environment_ingress_url_template.clone(),
                 ingress_schema.clone(),
                 *ingress_port,
+                signin_base,
             )
         } else {
             (
@@ -1318,6 +1369,7 @@ impl AppState {
                 None,
                 "https".to_string(),
                 None,
+                public_url.clone(),
             )
         };
 
@@ -1353,6 +1405,7 @@ impl AppState {
             encrypt_rate_limiter,
             oauth_rate_limiter,
             access_classes,
+            signin_base_url,
             production_ingress_url_template,
             staging_ingress_url_template,
             environment_ingress_url_template,

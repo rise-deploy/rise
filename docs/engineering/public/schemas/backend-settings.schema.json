@@ -558,8 +558,18 @@
                   "ingress_class": "traefik"
                 }
               },
-              "description": "Access classes defining ingress authentication levels, keyed by\nidentifier (e.g. \"public\"). Mirrors the Kubernetes variant so the\ntyped project API can validate a project's access class. The Docker\nruntime does not enforce ingress authentication, so only a permissive\n\"public\" class is provided by default; operators may override.\nUse `null` in YAML to remove an inherited access class.",
+              "description": "Access classes defining ingress authentication levels, keyed by\nidentifier (e.g. \"public\", \"private\"). Mirrors the Kubernetes variant\nso the typed project API can validate a project's access class. For\naccess classes whose `access_requirement` is `Authenticated`/`Member`,\nthe Docker controller stamps Traefik forwardAuth middleware labels\n(requires `auth_backend_url` to be set). A permissive \"public\" class\nis provided by default; operators may override.\nUse `null` in YAML to remove an inherited access class.",
               "type": "object"
+            },
+            "auth_backend_url": {
+              "default": "",
+              "description": "Internal URL Traefik uses to reach the Rise backend for the\nforwardAuth subrequest (e.g. `http://rise:3000` on the compose\nnetwork). Used to build the `forwardauth.address` middleware label\npointing at `/api/v1/auth/ingress`. If empty, ingress authentication\nis disabled even for non-`None` access classes (a warning is logged\nwhen such an access class is used without it).",
+              "type": "string"
+            },
+            "auth_signin_url": {
+              "default": "",
+              "description": "Browser-facing base URL for the login redirect (e.g. the public URL\n`http://localhost:3000`). Traefik forwardAuth has no nginx-style\n`auth-signin`, so the `ingress_auth` handler 302-redirects\nunauthenticated browsers to `{auth_signin_url}/api/v1/auth/signin`.\nIf empty, falls back to the server `public_url`.",
+              "type": "string"
             },
             "container_prefix": {
               "default": "rise",

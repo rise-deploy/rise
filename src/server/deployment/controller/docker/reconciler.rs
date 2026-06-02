@@ -56,6 +56,13 @@ pub struct ReconcilerConfig {
     pub reconcile_interval_secs: u64,
     pub health_path: String,
     pub public_url: String,
+    /// Internal URL Traefik uses to reach the Rise backend for the forwardAuth
+    /// subrequest (e.g. `http://rise:3000`). Empty disables forwardAuth.
+    pub auth_backend_url: String,
+    /// Access-class name → access requirement, derived from the configured
+    /// `access_classes`. The container builder reads this to decide whether to
+    /// stamp Traefik forwardAuth middleware labels for a project's access class.
+    pub access_classes: HashMap<String, crate::server::settings::AccessRequirement>,
 }
 
 /// Background reconciler. Holds everything needed to converge Docker state with
@@ -421,6 +428,8 @@ impl DockerReconciler {
             traefik_network: &self.config.traefik_network,
             traefik_entrypoint: &self.config.traefik_entrypoint,
             traefik_certresolver: self.config.traefik_certresolver.as_deref(),
+            auth_backend_url: &self.config.auth_backend_url,
+            access_classes: &self.config.access_classes,
         }
     }
 
@@ -559,6 +568,7 @@ impl DockerReconciler {
 
             let mut desired = DesiredContainer {
                 project: project.name.clone(),
+                access_class: project.access_class.clone(),
                 deployment_group: deployment.deployment_group.clone(),
                 deployment_id: deployment.deployment_id.clone(),
                 deployment_uuid: deployment.id.to_string(),
@@ -1300,6 +1310,7 @@ mod tests {
     fn desired(container: &str, image: &str, hash: &str) -> DesiredContainer {
         DesiredContainer {
             project: "myapp".to_string(),
+            access_class: "public".to_string(),
             deployment_group: "default".to_string(),
             deployment_id: "20260101-120000".to_string(),
             deployment_uuid: "11111111-1111-1111-1111-111111111111".to_string(),
