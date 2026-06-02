@@ -146,32 +146,15 @@ account configuration (`rise sa list -p <project>`). They must match exactly —
 `RUST_LOG=debug rise <command>` works too but is much noisier; the
 `rise::cli::login::token_utils=debug` target isolates just the token line.
 
-This same line is emitted regardless of token source, so it also surfaces the
-claims of tokens **minted through the token provider** — a `RISE_TOKEN_COMMAND`
-that prints a JWT, or a GitHub Actions OIDC token minted on demand.
+The line is emitted whether the token is static or **minted on demand through
+the token provider** (a `RISE_TOKEN_COMMAND` that prints a JWT, or a GitHub
+Actions OIDC token), so it always reflects the token actually sent.
 
-For the *server* side of the same exchange, raise the log level on the backend
-instead. Keep the general output at `info` and turn up only the auth and
-workload-token paths so the relevant lines aren't buried:
-
-```bash
-RUST_LOG=info,rise::server::auth=debug,rise::server::workload_tokens=debug \
-  rise backend server
-```
-
-This surfaces:
-
-- `rise::server::auth::handlers` — the OIDC ID-token claims during browser login
-  (`ID token claims: {...}`)
-- `rise::server::auth::middleware` — the issuer the backend peeked at and the
-  JWKS-validation outcome for an incoming token
-- `rise::server::auth::context` — per-service-account claim-mismatch reasons
-  (`SA <id> claim mismatch: ...`); these log at `info`, so they show even without
-  the `debug` targets above
-- `rise::server::workload_tokens::handlers` — `Issued workload identity token`
-  (project / environment / audience / ttl) when an app mints a token
-
-`RUST_LOG=rise=debug` works as a catch-all but is far noisier.
+The *server* side of the same exchange — the issuer the backend peeked at, JWKS
+validation outcomes, and per-service-account claim-mismatch reasons — is only
+visible to whoever operates your Rise backend. If you run it yourself, see
+[Debugging Authentication and Token Claims](https://rise-deploy.github.io/rise/operator/configuration/#debugging-authentication-and-token-claims)
+in the operator docs.
 
 See [Workload Identity Tokens](../workload-identity-tokens) for inspecting the
 Rise-signed tokens an app mints for downstream systems.
