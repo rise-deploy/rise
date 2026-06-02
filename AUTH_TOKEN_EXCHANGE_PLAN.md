@@ -188,17 +188,31 @@ SSRF + cache implementation (§3.3). The matchers (`match_service_account_claims
 be called on un-verified input because the type can't be constructed any other way.
 
 **Path B — Rise-issued JWT → typed token enum.** Exactly one function verifies a Rise-issued
-JWT and returns a value that **wholly models** every kind of Rise token:
+JWT. Its **output type models only what the verifier can ever return** — and `Workload` is **not**
+in it, because workload tokens are **sign-only**: Rise mints them (jwt_signer.rs:432) but **never
+verifies them inbound** (confirmed — the only `decode::<WorkloadClaims>` in the tree is a unit test,
+jwt_signer.rs:732; AWS STS / GCP / Vault verify them via the published JWKS, never Rise). So the
+**signer** and the **verifier** have **different** kind sets:
 
 ```rust
-// the ONLY entry point for Rise-issued tokens
+// the ONLY entry point for Rise-issued tokens.
+// Note the return enum has NO Workload variant — see below.
 fn verify_rise_jwt(token: &str, keys: &RiseKeys) -> Result<RiseToken, AuthError>;
 
+// Verifier output — only the kinds Rise actually classifies on the inbound path.
 enum RiseToken {
     Session(RiseClaims),     // HS256, aud = public_url   (UI / CLI login)
     Ingress(RiseClaims),     // RS256, aud = project_url  (deployed-app ingress auth)
     Access(AccessClaims),    // HS256, aud = public_url   (exchanged SA / controller — §4)
-    Workload(WorkloadClaims),// RS256, arbitrary aud      (outbound federation)
+}
+
+// Signer input — the signer (RiseTokenSigner) can mint all four kinds, including
+// the outbound-only Workload token that Rise never verifies.
+enum RiseTokenKind {
+    Session(RiseClaims),
+    Ingress(RiseClaims),
+    Access(AccessClaims),
+    Workload(WorkloadClaims), // RS256, arbitrary aud — outbound federation, verified externally
 }
 ```
 
@@ -213,7 +227,14 @@ live here, not smeared across call sites). The discriminators are **algorithm** 
   (or is not enforced at this layer, exactly as today's ingress-auth handler, which only reads `email`
   and never checks `aud`, handlers.rs:1488-1499).
 - `Session` vs `Access` (both HS256) is decided by the **header-`typ`** (§4.1).
-- `Workload` is RS256 with its own `typ` / claim shape.
+- **The RS256 verify branch always yields `Ingress`.** `verify_rise_jwt` **never returns `Workload`**:
+  workload tokens are sign-only, so nothing inbound classifies a token as `Workload`, and there is no
+  inbound Ingress-vs-Workload decision to make. (`sign_workload_jwt` and `sign_ingress_jwt` both emit
+  `Header::new(Algorithm::RS256)` + `kid` only today, jwt_signer.rs:415-416 / 460-461, so both carry the
+  default `typ:"JWT"` and would be **indistinguishable** on an RS256 verify path anyway — which is moot
+  precisely because that path is `Ingress`-only. If a future inbound workload-verify path is ever wanted,
+  it would first require giving `sign_workload_jwt` a distinct custom `typ` — a behavior change, Phase 1+,
+  explicitly out of scope here.)
 
 Today's `verify_user_jwt`, `verify_jwt_skip_aud`, and workload verification become thin shims over this
 single path (or are deleted). Callers `match` on `RiseToken` and get a **compile error** if they
@@ -229,14 +250,17 @@ taking a `JwksKeySource` (external IdP keys are fetched over the network).
 
 ### 3.2 The complete token model
 
-Every JWT Rise issues or accepts, in one table (Verify = which of the two paths):
+Every JWT Rise issues or accepts, in one table (Verify = which of the two paths, or `n/a` for the
+sign-only Workload token). The **Workload row is kept for completeness** — it is part of the full
+token model the signer mints — but it is **not** a `verify_rise_jwt` output (§3.1): nothing inbound
+ever classifies a token as `Workload`.
 
 | Token (type) | Direction | Alg | Issuer | Audience | Verify | Purpose |
 |---|---|---|---|---|---|---|
 | Session (`RiseClaims`) | Rise-issued | HS256 | public_url | public_url | B → `Session` | UI / CLI user login |
 | Ingress (`RiseClaims`) | Rise-issued | RS256 | public_url | project_url (alg-discriminated; aud not checked by the verifier, as today) | B → `Ingress` | deployed-app ingress auth |
 | Access (`AccessClaims`) | Rise-issued | HS256 | public_url | public_url | B → `Access` | exchanged SA / controller principal (§4) |
-| Workload (`WorkloadClaims`) | Rise-issued | RS256 | public_url | caller-supplied | B → `Workload` | outbound federation (AWS/GCP/Vault) |
+| Workload (`WorkloadClaims`) | Rise-issued | RS256 | public_url | caller-supplied | n/a — sign-only; verified externally via JWKS (AWS/GCP/Vault), never by Rise | outbound federation (AWS/GCP/Vault) |
 | External OIDC (SA) | inbound | RS256 | external IdP | SA-matched | A → `ExternalClaims` | CI service-account source token |
 | External OIDC (controller) | inbound | RS256 | external IdP | controller-matched | A → `ExternalClaims` | controller source token |
 
@@ -261,11 +285,26 @@ The repo is **already a Cargo workspace** with multiple member crates, so a new 
 `crates/rise-resource-api` (deps: `chrono`/`schemars`/`serde`/`serde_json`/`uuid` — no `axum`/`sqlx`/
 `reqwest`); note `crates/rise-resource-store` is **not** a pure precedent (it depends on `sqlx`).
 
-**Pure core — no I/O, no framework, no DB.** The crate depends only on `jsonwebtoken`,
+**Pure core — no I/O, no framework, no DB.** The crate depends on `jsonwebtoken`,
 `serde`/`serde_json`, `uuid`, `schemars` (already a workspace dep — needed because
 `ControllerIdentity` derives `JsonSchema` and is embedded in settings, controller.rs:30 /
-settings.rs:475, and moves into the crate with the matchers, H1), and (for the trait) `async-trait`.
-It does **not** depend on `reqwest`, `axum`, or `sqlx`:
+settings.rs:475, and moves into the crate with the matchers, H1), `async-trait` (for the trait),
+and `tracing` (lightweight, pure — the relocated `match_controller_identity` logs unmatched-claim
+diagnostics, controller.rs:92/103). It does **not** depend on `reqwest`, `axum`, or `sqlx` — **nor
+on `anyhow` or `regex`**, even though the matchers being relocated use them today:
+- **`anyhow` is dropped via refactor.** The matchers (`match_controller_identity`,
+  `build_controller_indexes`, `validate_controller_id`, controller.rs:146/236/293-318;
+  `validate_custom_claims`, jwt.rs:234-262) currently return `anyhow::Result` and use
+  `anyhow!`/`bail!`/`Context`. On relocation they are **refactored to return the crate's `AuthError`**
+  (replacing `anyhow::Result`), so `anyhow` is not pulled into the pure core. **This is a small,
+  deliberate behavior-adjacent refactor:** the matcher signatures change from `anyhow::Result` to
+  `AuthError`, and today's callers consume `anyhow::Result` — so it is a reviewed delta, **not** covered
+  by the Phase-0 "byte-for-byte identical" guarantee that applies to the verifier shims (§7).
+- **`regex` is dropped by hand-rolling.** `validate_controller_id` matches `CONTROLLER_ID_RE`
+  (controller.rs:16/129-133/171). The relocated validator is **hand-rolled (no `regex`)** — it already
+  does most of its checks (length, DNS-label, name-segment caps) with plain string ops at
+  controller.rs:147-170; the final regex `is_match` is replaced with an equivalent hand-rolled
+  character-class check, keeping `regex` out of the crate.
 - JWKS fetching is abstracted behind the `JwksKeySource` trait; the reqwest + `ssrf` + cache
   implementation stays in rise-deploy (today's `JwtValidator` *becomes* that impl). SSRF/HTTP
   policy stays in the app.
@@ -589,25 +628,33 @@ The risk: existing CI sends a **raw external OIDC token** directly to `POST /dep
 (project in body) through a refreshing provider. A hard cutover would break every pipeline,
 so we phase it.
 
-- **Phase 0 — extract `rise-backend-auth`, no behavior change.** Move the claim types, the two
-  verify entry points (§3.1), signing, and the pure matchers into the new crate; introduce the
-  `JwksKeySource` trait and reimplement today's `JwtValidator` as its rise-deploy impl. Replace the
-  scattered verifiers with shims over `verify_rise_jwt` / `verify_external_jwt`, and adopt them at all
-  current call sites. **Each shim must reproduce its legacy verifier's exact alg-set and aud posture
-  byte-for-byte:** `verify_user_jwt` (HS256 only, `aud` checked, jwt_signer.rs:476-492);
-  `verify_jwt_skip_aud` (HS256 **and** RS256, `aud` skipped, jwt_signer.rs:507-535); `validate_token`
-  (RS256-only, `aud` skipped, jwt.rs:358-361). **Signing's JWK publication moves too:** the `jwks`
-  and `openid_configuration` handlers call `jwt_signer.generate_jwks()` (handlers.rs:1780, 1796), so
-  RS256-public-key → JWK generation relocates to the crate's `RiseTokenSigner`. This is a **pure
-  refactor** — identical behavior, no new endpoints, no `AccessClaims` yet. The §4.1 hardening
+- **Phase 0 — extract `rise-backend-auth`, behavior-preserving (two small reviewed deltas).** Move
+  the claim types, the two verify entry points (§3.1), signing, and the pure matchers into the new
+  crate; introduce the `JwksKeySource` trait and reimplement today's `JwtValidator` as its rise-deploy
+  impl. Replace the scattered verifiers with shims over `verify_rise_jwt` / `verify_external_jwt`, and
+  adopt them at all current call sites. **Each verifier shim must reproduce its legacy verifier's exact
+  alg-set and aud posture byte-for-byte:** `verify_user_jwt` (HS256 only, `aud` checked,
+  jwt_signer.rs:476-492); `verify_jwt_skip_aud` (HS256 **and** RS256, `aud` skipped,
+  jwt_signer.rs:507-535); `validate_token` (RS256-only, `aud` skipped, jwt.rs:358-361). **Signing's
+  JWK publication moves too:** the `jwks` and `openid_configuration` handlers call
+  `jwt_signer.generate_jwks()` (handlers.rs:1780, 1796), so RS256-public-key → JWK generation relocates
+  to the crate's `RiseTokenSigner`. The **verifier shims** are a **pure refactor** — identical behavior,
+  no new endpoints, no `AccessClaims` yet. **Two deltas are deliberate and reviewed, NOT covered by the
+  byte-for-byte guarantee** (which applies only to the verifier shims): (1) the relocated **matchers'
+  signatures change** from `anyhow::Result` to the crate's `AuthError` (§3.3, C2) — a behavior-adjacent
+  refactor of `match_controller_identity` / `build_controller_indexes` / `validate_controller_id` /
+  `validate_custom_claims`, with `validate_controller_id` additionally hand-rolled off `regex`; (2) the
+  verifier's **RS256 branch is `Ingress`-only** and the output enum has **no `Workload` variant** (§3.1,
+  C1/C3) — which matches today's behavior (nothing inbound ever verified a workload token), so it is a
+  modeling clarification rather than a runtime change. The §4.1 hardening
   (`header.typ` rejection and `#[serde(deny_unknown_fields)]`) is **Phase 1, NOT Phase 0** — Phase 0
   preserves today's exact posture (no `typ` check, no `deny_unknown_fields`), so "pure refactor,
   identical behavior" does not contradict §4.1. **Scoped out:** the CLI's unverified client-side `exp`
   peek — `read_token_exp` (`src/cli/login/token_utils.rs:65`, used by `token_source.rs`) decodes `exp`
   via `insecure_decode` **without** signature verification; it is **not** one of the two verify paths
   and stays in the CLI. "Centralize all token parsing" means *verification*, not unverified client-side
-  decode. Land and merge Phase 0 on its own (it touches many files but changes no behavior, so it
-  reviews cleanly and de-risks the later phases). The `Access` variant of `RiseToken` and
+  decode. Land and merge Phase 0 on its own (it touches many files but preserves request-time auth
+  behavior — modulo the two reviewed deltas above — so it reviews cleanly and de-risks the later phases). The `Access` variant of `RiseToken` and
   `verify_external_jwt`'s use by the exchange arrive in Phase 1.
 - **Phase 1 — additive, no removals.** Ship the exchange endpoint, `AccessClaims`, and the
   signer methods. Keep the middleware's external branch and `resolve_for_project` in place.
