@@ -6,13 +6,24 @@ name = "multi-container"
 
 [project.env]
 
+# Top-level [build] defaults. Every container that builds from source inherits
+# these field-by-field and overrides only what it needs (here: the Dockerfile
+# and context). A container with `image` ignores [build] entirely.
+[build]
+backend = "docker"
+
+# Top-level [deploy] defaults. Each [containers.<name>.deploy] inherits these
+# per field, so a container only declares the values it wants to change.
+# `cpu = "128m-500m"` requests 128m and caps the limit at 500m.
+[deploy]
+replicas = 1
+cpu = "128m-500m"
+
 # Static frontend. Submits to `/api/jobs` and polls `/api/jobs` for status.
+# Inherits backend = "docker" and the default deploy (1 replica, 128m-500m CPU).
 [containers.frontend]
 port = 8080
-replicas = 1
-
 [containers.frontend.build]
-backend = "docker"
 dockerfile = "frontend/Dockerfile"
 build_context = "frontend"
 
@@ -20,26 +31,25 @@ build_context = "frontend"
 # Reads `RISE_CONTAINER_HOST__REDIS` (auto-injected by the controller).
 [containers.api]
 port = 8080
-replicas = 2
-health_check = { path = "/api/health" }
-
 [containers.api.build]
-backend = "docker"
 dockerfile = "api/Dockerfile"
 build_context = "api"
+[containers.api.deploy]
+replicas = 2                              # override the default replica count
+health_check = { path = "/api/health" }
 
 # Background worker. BRPOPs jobs from Redis, runs text analysis, writes the
 # result back. No `port` → no Service, no ingress route, no HTTP probes.
 [containers.worker]
-replicas = 1
 env = { WORK_MS = "2000" }
-
 [containers.worker.build]
-backend = "docker"
 dockerfile = "worker/Dockerfile"
 build_context = "worker"
+[containers.worker.deploy]
+cpu = "256m"                              # fixed: request == limit == 256m
 
-# Redis as the shared job queue. Upstream image — no [build] block.
+# Redis as the shared job queue. Upstream image — no [build] block, so it
+# ignores the top-level [build] default. Inherits the default [deploy].
 # `port` need not be HTTP — the K8s Service routes TCP fine, and Redis is not
 # in [routes], so it gets a Service (for discovery) but no HTTP probes by default.
 [containers.redis]

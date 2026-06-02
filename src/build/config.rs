@@ -89,11 +89,17 @@ pub fn load_full_project_config(app_path: &str) -> Result<Option<ProjectBuildCon
 /// Cross-field validation for `[containers]` and `[routes]`.
 ///
 /// Rules:
-/// - `[containers]` and top-level `[build]`/`[deploy]` are mutually exclusive.
+/// - The top-level `[build]`/`[deploy]` tables act as per-field defaults that
+///   each container inherits (build merges field-by-field; deploy fields fall
+///   back individually).
 /// - Container names must match `^[a-z][a-z0-9-]{0,14}$` (max 15 chars to keep
 ///   `<project>-<deployment_id(15)>-<container>` under the 63-char K8s limit).
-/// - Each container must have exactly one of `image` / `build`.
-/// - Each container declaring a `health_check` block must also set `port`.
+/// - Each container must resolve to exactly one of `image` / `build`. A
+///   container may not set both `image` and its own `[build]`, and a container
+///   with no `image` must resolve to a build (its own `[build]` and/or the
+///   inherited top-level `[build]`).
+/// - Each container with an explicit `[deploy].health_check` must also set
+///   `port` (an inherited default probe only applies to containers with a port).
 /// - Each route's `container` must exist and must have `port` set.
 /// - Each route's `path` must start with `/`, must not use the reserved
 ///   `/.rise` platform prefix, and must match a conservative URL-path charset.
@@ -105,12 +111,7 @@ fn validate_containers_and_routes(config: &ProjectBuildConfig) -> Result<()> {
         return Ok(());
     }
 
-    if config.build.is_some() || config.deploy.is_some() {
-        anyhow::bail!(
-            "Top-level [build]/[deploy] cannot be combined with [containers.<name>]. \
-             Move the top-level [build]/[deploy] settings into a [containers.app] entry."
-        );
-    }
+    let top_build_present = config.build.is_some();
 
     for (name, container) in &config.containers {
         if !is_valid_container_name(name) {
@@ -124,14 +125,20 @@ fn validate_containers_and_routes(config: &ProjectBuildConfig) -> Result<()> {
                 "[containers.{}] cannot set both 'image' and [build]; pick one",
                 name
             ),
-            (None, None) => {
-                anyhow::bail!("[containers.{}] must set either 'image' or [build]", name)
-            }
+            (None, None) if !top_build_present => anyhow::bail!(
+                "[containers.{}] must set either 'image' or [build] \
+                 (or inherit a top-level [build])",
+                name
+            ),
             _ => {}
         }
-        if container.health_check.is_some() && container.port.is_none() {
+        let container_health_check = container
+            .deploy
+            .as_ref()
+            .and_then(|d| d.health_check.as_ref());
+        if container_health_check.is_some() && container.port.is_none() {
             anyhow::bail!(
-                "[containers.{}] has health_check but no port; \
+                "[containers.{}] has a [deploy].health_check but no port; \
                  set port or remove health_check",
                 name
             );
@@ -494,11 +501,13 @@ name = "my-app"
 [containers.frontend]
 image = "registry.example.com/myapp/frontend:latest"
 port = 8080
+[containers.frontend.deploy]
 replicas = 2
 
 [containers.backend]
 image = "registry.example.com/myapp/backend:latest"
 port = 9090
+[containers.backend.deploy]
 replicas = 3
 health_check = { path = "/health" }
 
@@ -523,20 +532,55 @@ image = "registry.example.com/myapp/worker:latest"
     }
 
     #[test]
-    fn test_multi_container_rejects_top_level_build() {
+    fn test_multi_container_top_level_build_deploy_as_defaults() {
+        // Top-level [build]/[deploy] now coexist with [containers] and act as
+        // per-field defaults that each container inherits.
         let dir = write_toml(
             r#"
 [build]
 backend = "docker"
 
-[containers.app]
-image = "foo:bar"
+[deploy]
+replicas = 2
+cpu = "250m"
+
+[containers.web]
 port = 8080
+[containers.web.build]
+dockerfile = "web/Dockerfile"
+
+[containers.worker]
+[containers.worker.deploy]
+cpu = "500m"
 "#,
         );
-        let err = load_full_project_config(dir.path().to_str().unwrap())
-            .expect_err("expected mutual-exclusion error");
-        assert!(err.to_string().contains("Top-level [build]"), "got: {err}");
+        let config = load_full_project_config(dir.path().to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        let resolved = config.resolve_deploy().unwrap();
+
+        let web = resolved
+            .containers
+            .iter()
+            .find(|c| c.name == "web")
+            .unwrap();
+        let web_build = web.build.as_ref().expect("web inherits a build");
+        assert_eq!(web_build.backend.as_deref(), Some("docker")); // inherited
+        assert_eq!(web_build.dockerfile.as_deref(), Some("web/Dockerfile")); // own
+        assert_eq!(web.replicas, Some(2)); // inherited deploy
+        assert_eq!(web.cpu.as_deref(), Some("250m")); // inherited deploy
+
+        let worker = resolved
+            .containers
+            .iter()
+            .find(|c| c.name == "worker")
+            .unwrap();
+        assert_eq!(
+            worker.build.as_ref().and_then(|b| b.backend.as_deref()),
+            Some("docker") // worker has no own build → inherits the whole top-level build
+        );
+        assert_eq!(worker.cpu.as_deref(), Some("500m")); // own override
+        assert_eq!(worker.replicas, Some(2)); // inherited deploy
     }
 
     #[test]
@@ -583,6 +627,7 @@ image = "foo:bar"
 [containers.api]
 image = "foo:bar"
 port = 8080
+[containers.api.deploy]
 health_check = false
 "#,
         );
@@ -591,7 +636,7 @@ health_check = false
             .unwrap();
         let api = config.containers.get("api").unwrap();
         assert!(matches!(
-            api.health_check,
+            api.deploy.as_ref().and_then(|d| d.health_check.as_ref()),
             Some(crate::rise_toml::HealthCheckSetting::Disabled(_))
         ));
     }
@@ -603,6 +648,7 @@ health_check = false
 [containers.api]
 image = "foo:bar"
 port = 8080
+[containers.api.deploy]
 health_check = true
 "#,
         );
@@ -728,6 +774,7 @@ port = 8080
             r#"
 [containers.app]
 image = "foo:bar"
+[containers.app.deploy]
 health_check = { path = "/health" }
 "#,
         );
