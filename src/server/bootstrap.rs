@@ -31,11 +31,11 @@ use rise_resource_store::{
 use sqlx::PgPool;
 use tracing::{info, warn};
 
-use crate::db::global_lock::GlobalLock;
 use crate::db::organization_links;
 use crate::server::settings::{
     DefaultOrganizationSettings, DeploymentControllerSettings, Settings,
 };
+use rise_runtime_sync::GlobalLock;
 
 /// Annotation key on the default Organization that the Kubernetes controller
 /// reads to determine its per-project namespace prefix.

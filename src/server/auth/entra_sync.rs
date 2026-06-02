@@ -26,9 +26,8 @@ use std::collections::HashSet;
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::db::leader_leases::LeaderElection;
-use crate::db::leader_schedules::GlobalSchedule;
 use crate::db::{models::TeamRole, teams, users};
+use rise_runtime_sync::{GlobalSchedule, LeaderElection};
 
 // ============================================================================
 // Microsoft Graph API types

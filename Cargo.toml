@@ -3,6 +3,7 @@ members = [
     ".",
     "crates/rise-resource-api",
     "crates/rise-resource-store",
+    "crates/rise-runtime-sync",
 ]
 resolver = "2"
 
@@ -63,6 +64,7 @@ backend = [
     # Server core (former "server" feature)
     "dep:rise-resource-api", # strip-on-publish
     "dep:rise-resource-store", # strip-on-publish
+    "dep:rise-runtime-sync", # strip-on-publish
     "dep:config",
     "dep:openssl",
     "dep:rsa",
@@ -104,6 +106,7 @@ backend = [
 # Workspace crates (backend only)
 rise-resource-api = { path = "crates/rise-resource-api", optional = true }
 rise-resource-store = { path = "crates/rise-resource-store", optional = true }
+rise-runtime-sync = { path = "crates/rise-runtime-sync", optional = true }
 # --- END BACKEND ---
 
 # Common (always enabled - shared across features)

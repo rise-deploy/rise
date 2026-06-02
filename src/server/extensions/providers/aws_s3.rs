@@ -15,7 +15,7 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::db::leader_leases::LeaderElection;
+use rise_runtime_sync::LeaderElection;
 
 const ENV_VAR_BUCKET_NAME: &str = "S3_BUCKET_NAME";
 const ENV_VAR_ACCESS_KEY_ID: &str = "AWS_ACCESS_KEY_ID";

@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO runtime_sync.leader_leases (name, holder_id, heartbeat_at, expires_at)\n         VALUES ($1, $2, NOW(), NOW() + ($3 * INTERVAL '1 second'))\n         ON CONFLICT (name) DO UPDATE\n           SET holder_id = $2, heartbeat_at = NOW(), expires_at = NOW() + ($3 * INTERVAL '1 second')\n           WHERE runtime_sync.leader_leases.expires_at < NOW()\n              OR runtime_sync.leader_leases.holder_id = $2\n         RETURNING holder_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "holder_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Uuid",
+        "Float8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "f1054ed3e79088f9515d0d99ea7cdb4b4d8533cca6ec9b93f408bdd2d965cc57"
+}

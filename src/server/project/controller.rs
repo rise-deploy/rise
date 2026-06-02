@@ -7,11 +7,11 @@ use uuid::Uuid;
 
 use crate::db::models::DeploymentStatus;
 use crate::db::{
-    deployments as db_deployments, extensions as db_extensions, leader_leases::LeaderElection,
-    leader_schedules::GlobalSchedule, projects as db_projects,
+    deployments as db_deployments, extensions as db_extensions, projects as db_projects,
 };
 use crate::server::deployment::state_machine;
 use crate::server::state::ControllerState;
+use rise_runtime_sync::{GlobalSchedule, LeaderElection};
 
 /// Project controller handles project lifecycle operations
 ///

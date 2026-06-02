@@ -1,12 +1,11 @@
-use crate::db::{
-    extensions as db_extensions, leader_leases::LeaderElection, projects as db_projects,
-};
+use crate::db::{extensions as db_extensions, projects as db_projects};
 use crate::server::encryption::EncryptionProvider;
 use crate::server::extensions::{Extension, InjectedEnvVar};
 use crate::server::settings::{PrivateKeySource, SnowflakeAuth};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
+use rise_runtime_sync::LeaderElection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::PgPool;

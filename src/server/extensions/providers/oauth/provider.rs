@@ -1,4 +1,4 @@
-use crate::db::{env_vars as db_env_vars, leader_leases::LeaderElection};
+use crate::db::env_vars as db_env_vars;
 use crate::server::encryption::EncryptionProvider;
 use crate::server::extensions::providers::oauth::models::{
     OAuthExtensionSpec, OAuthExtensionStatus, TokenResponse,
@@ -6,6 +6,7 @@ use crate::server::extensions::providers::oauth::models::{
 use crate::server::extensions::{Extension, InjectedEnvVar, InjectedEnvVarValue};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use rise_runtime_sync::LeaderElection;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::sync::Arc;

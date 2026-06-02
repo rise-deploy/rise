@@ -52,9 +52,8 @@ use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::db::leader_leases::{LeaderElection, LeaderStatus, LeaseError, LEASE_DURATION};
-use crate::db::leader_schedules::GlobalSchedule;
 use crate::server::settings::ResourceGcSettings;
+use rise_runtime_sync::{GlobalSchedule, LeaderElection, LeaderStatus, LeaseError, LEASE_DURATION};
 
 const ACTOR: &str = "system:resource-gc";
 const LEASE_NAME: &str = "rise-resource-gc";

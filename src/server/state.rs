@@ -289,6 +289,11 @@ impl AppState {
             .await
             .context("Failed to run resource store migrations")?;
 
+        // Run runtime-sync migrations (leader leases, schedules) in their own schema
+        rise_runtime_sync::run_migrations(&db_pool)
+            .await
+            .context("Failed to run runtime-sync migrations")?;
+
         // Initialize the generic-resource store now that its schema exists. The
         // store is cheap to construct (it caches compiled JSON schemas lazily),
         // so we instantiate it once and clone the Arc into every handler.

@@ -1,6 +1,6 @@
 use crate::db::{
-    self, deployments as db_deployments, extensions as db_extensions,
-    leader_leases::LeaderElection, postgres_admin, projects as db_projects,
+    self, deployments as db_deployments, extensions as db_extensions, postgres_admin,
+    projects as db_projects,
 };
 use crate::server::encryption::EncryptionProvider;
 use crate::server::extensions::{Extension, InjectedEnvVar, InjectedEnvVarValue};
@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use aws_sdk_rds::Client as RdsClient;
 use chrono::{DateTime, Duration, Utc};
+use rise_runtime_sync::LeaderElection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::PgPool;

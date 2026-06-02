@@ -4,11 +4,10 @@ use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::db::leader_leases::LeaderElection;
-use crate::db::leader_schedules::GlobalSchedule;
 use crate::db::projects as db_projects;
 use crate::server::ecr::{EcrRepoManager, ECR_FINALIZER};
 use crate::server::state::ControllerState;
+use rise_runtime_sync::{GlobalSchedule, LeaderElection};
 
 /// ECR Controller manages ECR repository lifecycle
 ///

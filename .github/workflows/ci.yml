@@ -186,6 +186,12 @@ jobs:
         run: |
           sqlx database create
           sqlx migrate run
+          # rise-runtime-sync owns its migrations in the dedicated `runtime_sync`
+          # schema (mirrors rise_runtime_sync::run_migrations at server startup).
+          # Applying them here lets that crate's compile-time query macros verify
+          # against the live DB during the test build.
+          psql "$DATABASE_URL" -c 'CREATE SCHEMA IF NOT EXISTS runtime_sync'
+          PGOPTIONS='-c search_path=runtime_sync,public' sqlx migrate run --source crates/rise-runtime-sync/migrations
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/rise_test
 
