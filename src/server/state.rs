@@ -248,6 +248,71 @@ async fn init_kubernetes_backend(
     Ok(Arc::new(backend) as Arc<dyn DeploymentBackend>)
 }
 
+/// Extract the bare host from an `auth_backend_url` like `http://rise:3000`
+/// (→ `rise`). Strips an optional `scheme://`, then a trailing `:port` and any
+/// path. Returns `None` for an empty/host-less value. Kept dependency-free (no
+/// `url` crate, which is `cli`-feature-gated) since the value is a simple
+/// internal service URL.
+#[cfg(feature = "backend")]
+fn backend_host_from_url(auth_backend_url: &str) -> Option<String> {
+    let trimmed = auth_backend_url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Drop scheme.
+    let after_scheme = match trimmed.split_once("://") {
+        Some((_scheme, rest)) => rest,
+        None => trimmed,
+    };
+    // Authority ends at the first '/'.
+    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+    // Strip userinfo if present.
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    // Strip the port. Naive on bracketed IPv6 literals, which we don't expect
+    // for an internal service URL.
+    let host = host_port.split(':').next().unwrap_or(host_port);
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
+/// LOCAL-DEV helper: resolve the Rise backend's IP on the shared Docker network
+/// by extracting the host from `auth_backend_url` (e.g. `http://rise:3000` →
+/// `rise`) and looking it up via the system resolver from inside this container.
+///
+/// Inside the rise-backend container, Docker DNS resolves the backend's service
+/// name (`rise`) to its address on `traefik_network` — exactly the IP app
+/// containers must alias the public issuer host to. Returns `None` on any parse
+/// or resolution failure so the caller can skip injection gracefully.
+#[cfg(feature = "backend")]
+async fn resolve_backend_ip(auth_backend_url: &str) -> Option<String> {
+    let host = backend_host_from_url(auth_backend_url)?;
+
+    // Resolve via the system resolver. Append a dummy port so `lookup_host`
+    // accepts the input; we only care about the IP. Prefer the first IPv4
+    // address (Docker's default bridge networks are IPv4).
+    let lookup = tokio::net::lookup_host((host.as_str(), 0)).await;
+    match lookup {
+        Ok(addrs) => {
+            let mut first: Option<String> = None;
+            for addr in addrs {
+                let ip = addr.ip();
+                if ip.is_ipv4() {
+                    return Some(ip.to_string());
+                }
+                first.get_or_insert_with(|| ip.to_string());
+            }
+            first
+        }
+        Err(e) => {
+            tracing::debug!(host = %host, "DNS lookup for backend IP failed: {:?}", e);
+            None
+        }
+    }
+}
+
 /// Initialize the Docker deployment backend.
 ///
 /// Builds a `ResourceBuilder` from the Docker variant's URL templates (the
@@ -288,6 +353,7 @@ async fn init_docker_backend(
         health_probes,
         access_classes,
         auth_backend_url,
+        app_backend_host_aliases,
         ..
     } = settings
     else {
@@ -381,6 +447,41 @@ async fn init_docker_backend(
         );
     }
 
+    // LOCAL-DEV ONLY: resolve the backend's IP on the shared Traefik network so
+    // the reconciler can stamp `extra_hosts` (alias → backend IP) on managed app
+    // containers. We resolve the host from `auth_backend_url` (e.g. `rise` in
+    // `http://rise:3000`) via DNS from inside this container — that yields the
+    // backend's address on `traefik_network`. Empty alias list (the default /
+    // production) → skip resolution entirely so no override is injected.
+    //
+    // Resolution failure is non-fatal: we log and leave the IP unset, which
+    // disables injection (apps fall back to whatever the alias host resolves to)
+    // rather than crashing the backend at startup.
+    let app_backend_host_aliases = app_backend_host_aliases.clone();
+    let app_backend_ip = if app_backend_host_aliases.is_empty() {
+        None
+    } else {
+        match resolve_backend_ip(auth_backend_url).await {
+            Some(ip) => {
+                tracing::info!(
+                    backend_ip = %ip,
+                    aliases = ?app_backend_host_aliases,
+                    "Resolved Rise backend IP for app container host aliases (local dev)"
+                );
+                Some(ip)
+            }
+            None => {
+                tracing::warn!(
+                    auth_backend_url = %auth_backend_url,
+                    aliases = ?app_backend_host_aliases,
+                    "Could not resolve Rise backend IP for app container host aliases; \
+                     skipping extra_hosts injection (apps may fail to reach the issuer in local dev)"
+                );
+                None
+            }
+        }
+    };
+
     let reconciler = DockerReconciler::new(
         docker.clone(),
         db_pool,
@@ -403,6 +504,8 @@ async fn init_docker_backend(
             public_url: public_url.to_string(),
             auth_backend_url: auth_backend_url.clone(),
             access_classes: access_requirements,
+            app_backend_host_aliases,
+            app_backend_ip,
         },
     );
     reconciler.spawn();
@@ -1435,5 +1538,47 @@ impl AppState {
                 settings.quickstart.as_ref(),
             )),
         })
+    }
+}
+
+#[cfg(all(test, feature = "backend"))]
+mod backend_host_tests {
+    use super::backend_host_from_url;
+
+    #[test]
+    fn parses_scheme_host_port() {
+        assert_eq!(
+            backend_host_from_url("http://rise:3000").as_deref(),
+            Some("rise")
+        );
+    }
+
+    #[test]
+    fn parses_https_and_path() {
+        assert_eq!(
+            backend_host_from_url("https://rise.example.com:8443/api").as_deref(),
+            Some("rise.example.com")
+        );
+    }
+
+    #[test]
+    fn parses_bare_host_port() {
+        assert_eq!(backend_host_from_url("rise:3000").as_deref(), Some("rise"));
+        assert_eq!(backend_host_from_url("rise").as_deref(), Some("rise"));
+    }
+
+    #[test]
+    fn strips_userinfo() {
+        assert_eq!(
+            backend_host_from_url("http://user:pass@rise:3000").as_deref(),
+            Some("rise")
+        );
+    }
+
+    #[test]
+    fn empty_or_hostless_is_none() {
+        assert_eq!(backend_host_from_url(""), None);
+        assert_eq!(backend_host_from_url("   "), None);
+        assert_eq!(backend_host_from_url("http://"), None);
     }
 }

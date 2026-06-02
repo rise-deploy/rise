@@ -84,6 +84,17 @@ pub struct BuilderConfig<'a> {
     /// Access-class name → access requirement. Used to resolve a project's
     /// access requirement and decide whether to stamp forwardAuth labels.
     pub access_classes: &'a HashMap<String, AccessRequirement>,
+    /// **LOCAL-DEV ONLY.** Hostname(s) to alias to `app_backend_ip` via the
+    /// container's `HostConfig.extra_hosts`, so an app can reach the public
+    /// issuer host (e.g. `rise.localhost`) at the Rise backend to validate the
+    /// `rise_jwt` cookie / perform OIDC discovery. Empty in production, where
+    /// public DNS + Traefik resolve the issuer (with correct TLS). Injection
+    /// only happens when this is non-empty AND `app_backend_ip` is set.
+    pub app_backend_host_aliases: &'a [String],
+    /// The Rise backend's IP on the shared network (resolved at reconcile
+    /// startup). Paired with `app_backend_host_aliases` to build `extra_hosts`.
+    /// `None` disables injection.
+    pub app_backend_ip: Option<&'a str>,
 }
 
 /// Result of building one container: the deterministic name and the bollard
@@ -196,6 +207,29 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
     let mut endpoints = HashMap::new();
     endpoints.insert(cfg.traefik_network.to_string(), EndpointSettings::default());
 
+    // ── Local app→backend host aliases (extra_hosts) ───────────────────
+    // LOCAL-DEV ONLY: map the configured alias host(s) (e.g. `rise.localhost`)
+    // to the Rise backend's IP on the shared network so apps can reach the
+    // public issuer/control-plane host to validate the `rise_jwt` cookie or do
+    // OIDC discovery. Without this the public host resolves to the app
+    // container's own loopback in local dev. Production leaves the alias list
+    // empty (public DNS + Traefik handle the issuer host with correct TLS), so
+    // `extra_hosts` stays `None` there.
+    //
+    // Staleness caveat: the backend IP is captured at container-create time. If
+    // the backend container restarts and changes IP, existing app containers
+    // keep the stale entry until recreated. Acceptable for local dev — we do
+    // NOT track backend-IP drift.
+    let extra_hosts = match cfg.app_backend_ip {
+        Some(ip) if !cfg.app_backend_host_aliases.is_empty() => Some(
+            cfg.app_backend_host_aliases
+                .iter()
+                .map(|alias| format!("{alias}:{ip}"))
+                .collect::<Vec<String>>(),
+        ),
+        _ => None,
+    };
+
     let host_config = HostConfig {
         nano_cpus,
         memory,
@@ -204,6 +238,7 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
             maximum_retry_count: None,
         }),
         network_mode: Some(cfg.traefik_network.to_string()),
+        extra_hosts,
         ..Default::default()
     };
 
@@ -365,6 +400,8 @@ mod tests {
             traefik_certresolver: None,
             auth_backend_url: "",
             access_classes: empty_access_classes(),
+            app_backend_host_aliases: &[],
+            app_backend_ip: None,
         }
     }
 
@@ -476,6 +513,93 @@ mod tests {
             hc.restart_policy.as_ref().and_then(|r| r.name),
             Some(RestartPolicyNameEnum::UNLESS_STOPPED)
         );
+    }
+
+    #[test]
+    fn extra_hosts_injected_when_aliases_and_backend_ip_present() {
+        // LOCAL-DEV: aliases configured + a resolved backend IP → the container's
+        // HostConfig.extra_hosts maps each alias to the backend IP.
+        let aliases = ["rise.localhost".to_string()];
+        let cfg = BuilderConfig {
+            app_backend_host_aliases: &aliases,
+            app_backend_ip: Some("172.20.0.5"),
+            ..test_cfg()
+        };
+        let built = build_container(&single_container(), &cfg);
+        let hc = built.config.host_config.as_ref().unwrap();
+        let extra = hc.extra_hosts.as_ref().expect("extra_hosts must be set");
+        assert!(
+            extra.contains(&"rise.localhost:172.20.0.5".to_string()),
+            "extra_hosts {extra:?} must contain rise.localhost:<ip>"
+        );
+    }
+
+    #[test]
+    fn extra_hosts_supports_multiple_aliases() {
+        let aliases = ["rise.localhost".to_string(), "rise.local".to_string()];
+        let cfg = BuilderConfig {
+            app_backend_host_aliases: &aliases,
+            app_backend_ip: Some("10.0.0.9"),
+            ..test_cfg()
+        };
+        let built = build_container(&single_container(), &cfg);
+        let extra = built
+            .config
+            .host_config
+            .as_ref()
+            .unwrap()
+            .extra_hosts
+            .as_ref()
+            .unwrap();
+        assert!(extra.contains(&"rise.localhost:10.0.0.9".to_string()));
+        assert!(extra.contains(&"rise.local:10.0.0.9".to_string()));
+    }
+
+    #[test]
+    fn extra_hosts_none_when_aliases_empty() {
+        // PROD: no aliases → extra_hosts stays None even if an IP were present.
+        let built = build_container(&single_container(), &test_cfg());
+        assert!(built
+            .config
+            .host_config
+            .as_ref()
+            .unwrap()
+            .extra_hosts
+            .is_none());
+
+        // An IP without aliases also yields None (the alias list gates it).
+        let cfg = BuilderConfig {
+            app_backend_ip: Some("172.20.0.5"),
+            ..test_cfg()
+        };
+        let built = build_container(&single_container(), &cfg);
+        assert!(built
+            .config
+            .host_config
+            .as_ref()
+            .unwrap()
+            .extra_hosts
+            .is_none());
+    }
+
+    #[test]
+    fn extra_hosts_none_when_backend_ip_unresolved() {
+        // Aliases configured but the backend IP couldn't be resolved → skip
+        // injection rather than emit a broken `alias:` entry.
+        let aliases = ["rise.localhost".to_string()];
+        let cfg = BuilderConfig {
+            app_backend_host_aliases: &aliases,
+            app_backend_ip: None,
+            ..test_cfg()
+        };
+        let built = build_container(&single_container(), &cfg);
+        assert!(built
+            .config
+            .host_config
+            .as_ref()
+            .unwrap()
+            .extra_hosts
+            .is_none());
     }
 
     #[test]

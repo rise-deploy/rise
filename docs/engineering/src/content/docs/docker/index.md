@@ -246,6 +246,27 @@ the app. This mirrors the Kubernetes `/.rise` Ingress path. In the local overlay
 the same router is re-stamped as `rise-dotrise-web` on the plain `web`
 entrypoint (since `websecure`/`le` do not exist there).
 
+### App → backend resolution (local dev)
+
+Apps that validate the `rise_jwt` cookie or perform OIDC discovery against the
+public issuer/control-plane host (e.g. `rise.localhost`) must be able to reach
+the Rise backend at that host. In a **local** stack the public host resolves to
+the app container's *own* loopback, not the backend — so those calls would fail.
+
+To fix this locally the Docker controller stamps `HostConfig.extra_hosts` on
+every managed app container, mapping the configured alias host to the backend's
+IP on the shared `rise_default` network. The backend IP is resolved at reconcile
+startup from the `auth_backend_url` host (e.g. `rise`) via Docker DNS. The local
+overlay enables it by setting `RISE_APP_BACKEND_HOST_ALIAS=rise.localhost`, which
+populates `deployment_controller.app_backend_host_aliases`.
+
+**Production needs nothing here** — and the alias list is empty by default.
+Public DNS resolves `rise.${RISE_DOMAIN}` to Traefik, which terminates TLS and
+forwards to the backend; injecting an `extra_hosts` override in production would
+wrongly bypass Traefik and break TLS. (The captured backend IP is fixed at
+container-create time; if the backend restarts with a new IP, existing app
+containers keep the old entry until recreated — acceptable for local dev.)
+
 ## Authentication / Dex
 
 The backend uses a **single OIDC issuer** for both server-side token exchange and

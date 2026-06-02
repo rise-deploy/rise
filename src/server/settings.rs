@@ -378,6 +378,23 @@ fn default_cookie_secure() -> bool {
 
 /// Deserialize a boolean that may arrive as a native bool or as a string.
 ///
+/// Deserialize a list of host aliases, dropping blank/whitespace-only entries.
+///
+/// The settings loader interpolates `${VAR}` per string element, so an
+/// env-driven single-element list like
+/// `app_backend_host_aliases: ["${RISE_APP_BACKEND_HOST_ALIAS:-}"]` reaches
+/// serde as `[""]` when the env var is unset (production) and `["rise.localhost"]`
+/// when set (local). Filtering blanks turns the unset case into an empty list
+/// (→ no `extra_hosts` injection) while preserving real aliases — sidestepping
+/// the inability to express an *empty* YAML list via a scalar env var.
+fn deserialize_host_aliases<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Vec::<String>::deserialize(deserializer)?;
+    Ok(raw.into_iter().filter(|s| !s.trim().is_empty()).collect())
+}
+
 /// The settings loader interpolates `${VAR}` inside string config values and
 /// produces a JSON string, so an env-driven flag like
 /// `cookie_secure: "${RISE_COOKIE_SECURE:-false}"` reaches serde as the string
@@ -1242,6 +1259,33 @@ pub enum DeploymentControllerSettings {
         /// `tls=true` + `tls.certresolver=<name>` labels for automatic TLS.
         #[serde(default)]
         traefik_certresolver: Option<String>,
+
+        /// **LOCAL-DEV ONLY.** Hostname(s) to alias to the Rise backend's IP on
+        /// the shared `traefik_network`, injected as `extra_hosts` on every
+        /// managed app container the controller creates.
+        ///
+        /// Apps that validate the `rise_jwt` cookie or perform OIDC discovery
+        /// against the public issuer host (e.g. `rise.localhost`) must be able
+        /// to reach the Rise backend at that host. In a local stack the public
+        /// host resolves to the container's own loopback, not the backend, so
+        /// the controller stamps `HostConfig.extra_hosts` mapping each alias to
+        /// the backend's reachable IP (resolved at reconcile time from the
+        /// `auth_backend_url` host via Docker DNS).
+        ///
+        /// **Leave empty in production.** Production relies on public DNS +
+        /// Traefik for the issuer host (with correct TLS termination); injecting
+        /// an `extra_hosts` override there would wrongly bypass Traefik and break
+        /// TLS. Empty/absent (the default) → no injection.
+        ///
+        /// Mirrors the Kubernetes `host_aliases` mechanism (see
+        /// `resource_builder.rs`, which injects `rise.local → host IP` into pods).
+        ///
+        /// Blank entries are filtered out at load time, so an env-driven
+        /// single-element list (`["${RISE_APP_BACKEND_HOST_ALIAS:-}"]`) collapses
+        /// to an empty list — and no injection — when the env var is unset
+        /// (production).
+        #[serde(default, deserialize_with = "deserialize_host_aliases")]
+        app_backend_host_aliases: Vec<String>,
 
         /// Label namespace prefix for Rise bookkeeping labels
         /// (e.g. `rise.dev/managed-by`). Defaults to `rise.dev`.
@@ -2503,6 +2547,9 @@ auth:
         // local-friendly defaults baked into config/docker.yaml.
         let mut env = std::collections::HashMap::new();
         env.insert("DATABASE_URL", "postgres://u@rise-postgres/rise");
+        // The local overlay sets this so app containers get rise.localhost ->
+        // backend via extra_hosts.
+        env.insert("RISE_APP_BACKEND_HOST_ALIAS", "rise.localhost");
         let settings = load_shipped_docker_config(&env)
             .expect("shipped docker.yaml must load with only DATABASE_URL set");
 
@@ -2515,11 +2562,19 @@ auth:
             traefik_entrypoint,
             production_ingress_url_template,
             ingress_port,
+            app_backend_host_aliases,
             ..
         }) = &settings.deployment_controller
         else {
             panic!("expected docker deployment_controller");
         };
+        // LOCAL: alias populated so the controller injects rise.localhost ->
+        // backend into app containers.
+        assert_eq!(
+            app_backend_host_aliases,
+            &vec!["rise.localhost".to_string()],
+            "local: app_backend_host_aliases must contain the issuer host"
+        );
         assert_eq!(ingress_schema, "http");
         assert_eq!(traefik_entrypoint, "web");
         // ingress_port is omitted from docker.yaml -> defaults to None.
@@ -2570,11 +2625,19 @@ auth:
             traefik_certresolver,
             traefik_entrypoint,
             production_ingress_url_template,
+            app_backend_host_aliases,
             ..
         }) = &settings.deployment_controller
         else {
             panic!("expected docker deployment_controller");
         };
+        // PROD: RISE_APP_BACKEND_HOST_ALIAS unset -> the single blank entry is
+        // filtered out -> empty list -> NO extra_hosts injection (public DNS +
+        // Traefik handle the issuer host with correct TLS).
+        assert!(
+            app_backend_host_aliases.is_empty(),
+            "prod: app_backend_host_aliases must be empty, got {app_backend_host_aliases:?}"
+        );
         assert_eq!(ingress_schema, "https");
         assert_eq!(traefik_entrypoint, "websecure");
         assert_eq!(

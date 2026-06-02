@@ -231,6 +231,30 @@ if ! grep -qi "Hostname:" "${pub_body}"; then
 fi
 log "Public project reachable (200, whoami output)"
 
+log "Asserting app container has the local rise.localhost->backend extra_hosts entry"
+# LOCAL-DEV: the controller injects `rise.localhost:<backend-ip>` into every app
+# container's HostConfig.ExtraHosts so apps can reach the issuer/control plane
+# (validate rise_jwt, OIDC discovery). The container can be (re)created across a
+# reconcile tick, so poll until the entry appears.
+pub_extra_hosts=""
+pub_container=""
+for _ in $(seq 1 30); do
+  pub_container="$(docker ps --filter "name=rise_${PUB_PROJECT}" --format '{{.Names}}' | head -1)"
+  if [[ -n "${pub_container}" ]]; then
+    pub_extra_hosts="$(docker inspect "${pub_container}" --format '{{.HostConfig.ExtraHosts}}')"
+    if printf '%s' "${pub_extra_hosts}" | grep -q "rise.localhost:"; then
+      break
+    fi
+  fi
+  sleep 2
+done
+if ! printf '%s' "${pub_extra_hosts}" | grep -q "rise.localhost:"; then
+  log "ERROR: app container ${pub_container} is missing the rise.localhost extra_hosts entry"
+  printf 'ExtraHosts: %s\n' "${pub_extra_hosts}"
+  exit 1
+fi
+log "extra_hosts present on ${pub_container}: ${pub_extra_hosts}"
+
 ############################################
 # (b) PRIVATE: forwardAuth — blocks unauth, allows authed cookie.
 ############################################

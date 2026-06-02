@@ -86,6 +86,15 @@ deployment_controller:
   # Browser-facing base URL for the login redirect; kept consistent with
   # public_url's host.
   auth_signin_url: "${PUBLIC_URL:-http://rise.localhost:3000}"
+  # LOCAL-DEV ONLY: hostname(s) to alias to the Rise backend's IP on rise_default,
+  # injected as `extra_hosts` on managed app containers so apps can reach the
+  # public issuer host (e.g. rise.localhost) to validate the rise_jwt cookie / do
+  # OIDC discovery. Blank entries are dropped at load time, so the default (env
+  # unset) is an EMPTY list and NO override is injected — which is exactly what
+  # production wants (public DNS + Traefik resolve the issuer with correct TLS).
+  # The local overlay sets RISE_APP_BACKEND_HOST_ALIAS=rise.localhost to enable it.
+  app_backend_host_aliases:
+    - "${RISE_APP_BACKEND_HOST_ALIAS:-}"
   access_classes:
     public:
       display_name: Public

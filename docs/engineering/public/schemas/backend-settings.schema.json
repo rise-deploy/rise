@@ -561,6 +561,14 @@
               "description": "Access classes defining ingress authentication levels, keyed by\nidentifier (e.g. \"public\", \"private\"). Mirrors the Kubernetes variant\nso the typed project API can validate a project's access class. For\naccess classes whose `access_requirement` is `Authenticated`/`Member`,\nthe Docker controller stamps Traefik forwardAuth middleware labels\n(requires `auth_backend_url` to be set). A permissive \"public\" class\nis provided by default; operators may override.\nUse `null` in YAML to remove an inherited access class.",
               "type": "object"
             },
+            "app_backend_host_aliases": {
+              "default": [],
+              "description": "**LOCAL-DEV ONLY.** Hostname(s) to alias to the Rise backend's IP on\nthe shared `traefik_network`, injected as `extra_hosts` on every\nmanaged app container the controller creates.\n\nApps that validate the `rise_jwt` cookie or perform OIDC discovery\nagainst the public issuer host (e.g. `rise.localhost`) must be able\nto reach the Rise backend at that host. In a local stack the public\nhost resolves to the container's own loopback, not the backend, so\nthe controller stamps `HostConfig.extra_hosts` mapping each alias to\nthe backend's reachable IP (resolved at reconcile time from the\n`auth_backend_url` host via Docker DNS).\n\n**Leave empty in production.** Production relies on public DNS +\nTraefik for the issuer host (with correct TLS termination); injecting\nan `extra_hosts` override there would wrongly bypass Traefik and break\nTLS. Empty/absent (the default) → no injection.\n\nMirrors the Kubernetes `host_aliases` mechanism (see\n`resource_builder.rs`, which injects `rise.local → host IP` into pods).\n\nBlank entries are filtered out at load time, so an env-driven\nsingle-element list (`[\"${RISE_APP_BACKEND_HOST_ALIAS:-}\"]`) collapses\nto an empty list — and no injection — when the env var is unset\n(production).",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
             "auth_backend_url": {
               "default": "",
               "description": "Internal URL Traefik uses to reach the Rise backend for the\nforwardAuth subrequest (e.g. `http://rise:3000` on the compose\nnetwork). Used to build the `forwardauth.address` middleware label\npointing at `/api/v1/auth/ingress`. Required when any configured\naccess class has a non-`None` access requirement\n(`Authenticated`/`Member`); the backend refuses to start otherwise,\nto avoid serving those projects publicly with no auth enforced.",

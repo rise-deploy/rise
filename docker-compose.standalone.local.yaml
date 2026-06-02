@@ -83,5 +83,10 @@ services:
       - RISE_CLIENT_REGISTRY_URL=localhost:5000
       - RISE_COOKIE_SECURE=false
       - DEX_ISSUER=http://rise-dex:5556/dex
+      # LOCAL ONLY: alias the public issuer host to the Rise backend's IP inside
+      # app containers (via extra_hosts) so apps can reach the issuer/control
+      # plane (validate rise_jwt, OIDC discovery). Prod leaves this unset — public
+      # DNS + Traefik resolve rise.${RISE_DOMAIN} with correct TLS.
+      - RISE_APP_BACKEND_HOST_ALIAS=rise.localhost
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock

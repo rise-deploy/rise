@@ -63,6 +63,18 @@ pub struct ReconcilerConfig {
     /// `access_classes`. The container builder reads this to decide whether to
     /// stamp Traefik forwardAuth middleware labels for a project's access class.
     pub access_classes: HashMap<String, crate::server::settings::AccessRequirement>,
+    /// **LOCAL-DEV ONLY.** Hostname(s) to alias to `app_backend_ip` via
+    /// `extra_hosts` on each managed app container, so apps can reach the public
+    /// issuer host (e.g. `rise.localhost`) at the Rise backend. Empty in
+    /// production (public DNS + Traefik handle it). See the `Docker` settings
+    /// variant's `app_backend_host_aliases`.
+    pub app_backend_host_aliases: Vec<String>,
+    /// The Rise backend's resolved IP on `traefik_network`, captured once at
+    /// startup. `None` (or empty aliases) disables `extra_hosts` injection.
+    /// Staleness caveat: if the backend container restarts and gets a new IP,
+    /// existing app containers keep the old alias entry until recreated — fine
+    /// for local dev (see `container_builder::build_container`).
+    pub app_backend_ip: Option<String>,
 }
 
 /// Background reconciler. Holds everything needed to converge Docker state with
@@ -430,6 +442,8 @@ impl DockerReconciler {
             traefik_certresolver: self.config.traefik_certresolver.as_deref(),
             auth_backend_url: &self.config.auth_backend_url,
             access_classes: &self.config.access_classes,
+            app_backend_host_aliases: &self.config.app_backend_host_aliases,
+            app_backend_ip: self.config.app_backend_ip.as_deref(),
         }
     }
 
