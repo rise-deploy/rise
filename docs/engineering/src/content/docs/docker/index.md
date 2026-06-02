@@ -12,8 +12,8 @@ A complete, runnable reference stack ships in the repository as
 [`docker-compose.standalone.yaml`](https://github.com/NiklasRosenstein/rise/blob/main/docker-compose.standalone.yaml)
 with a local/dev overlay
 [`docker-compose.standalone.local.yaml`](https://github.com/NiklasRosenstein/rise/blob/main/docker-compose.standalone.local.yaml).
-This guide documents how that stack is wired so the Compose files themselves can
-stay lean — prefer linking to them over copying their contents.
+This guide explains how the stack is wired and how to run it locally or in
+production.
 
 ## Overview / architecture
 
