@@ -1,0 +1,47 @@
+issuer: http://dex:5556/dex
+
+storage:
+  type: memory
+
+web:
+  http: 0.0.0.0:5556
+
+staticClients:
+- id: rise-backend
+  redirectURIs:
+  # Server-side OAuth callback (UI and ingress auth)
+  - http://rise.local:3000/api/v1/auth/callback
+  # CLI Auth
+  - http://localhost:8765/callback
+  - http://localhost:8766/callback
+  - http://localhost:8767/callback
+  # OAuth extension callbacks (for examples)
+  - http://rise.local:3000/oidc/oauth-demo/oauth-dex/callback
+  name: 'Rise Backend'
+  secret: rise-backend-secret
+
+enablePasswordDB: true
+staticPasswords:
+- email: admin@example.com
+  hash: $2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W  # password
+  username: admin
+  userID: 08a8684b-db88-4b73-90a9-3cd1661f5466
+
+- email: dev@example.com
+  hash: $2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W  # password
+  username: dev
+  userID: f4d1c5e1-3c6e-4d2a-9f4b-2e5d7c8e9f01
+
+- email: user@example.com
+  hash: $2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W  # password
+  username: user
+  userID: a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d
+
+- email: ops@example.com
+  hash: $2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W  # password
+  username: ops
+  userID: b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e
+
+oauth2:
+  skipApprovalScreen: true
+  passwordConnector: local

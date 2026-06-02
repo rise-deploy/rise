@@ -1,0 +1,142 @@
+# Reference standalone Docker Compose deployment of Rise (Rise + Postgres + Dex +
+# registry + Traefik) using the Docker deployment backend.
+#
+#   docker compose -f docker-compose.standalone.yaml up -d
+#
+# This file is fully self-contained — it does NOT layer on top of the dev
+# docker-compose.yml. It brings up everything Rise needs to deploy apps through
+# the `docker` deployment controller: Postgres for state, Dex as the OIDC
+# provider, an OCI registry for app images, Traefik as the ingress reverse
+# proxy, and the Rise backend itself. App containers stamped by the Docker
+# controller join the `rise_default` network (see `traefik_network` in
+# config/compose-docker.production.yaml); Traefik is pinned to that same
+# network so it can route `*.rise.localhost` to them.
+#
+# Image tag is overridable for CI via RISE_IMAGE_REPOSITORY / RISE_IMAGE_TAG.
+
+# Fixed project name so the network is always "rise_default", regardless of the
+# directory the stack is launched from. The Docker controller attaches app
+# containers to this network and Traefik is pinned to it.
+name: rise
+
+networks:
+  default:
+    name: rise_default
+
+volumes:
+  postgres_data:
+  registry_data:
+  dex_data:
+
+services:
+  postgres:
+    image: postgres:18-trixie
+    container_name: rise-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-rise}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-rise123}
+      - POSTGRES_DB=${POSTGRES_DB:-rise}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rise"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # OIDC provider. Serves the Docker-flavoured config (issuer http://dex:5556/dex)
+  # with staticPasswords admin@example.com/"password" and the rise-backend client.
+  dex:
+    image: dexidp/dex:v2.45.1
+    container_name: rise-dex
+    restart: unless-stopped
+    user: "0:0"
+    ports:
+      - "5556:5556"
+    volumes:
+      - ./dev/dex/config.docker.yaml:/etc/dex/config.docker.yaml:ro
+      - dex_data:/var/dex
+    entrypoint: ["/usr/local/bin/dex"]
+    command: ["serve", "/etc/dex/config.docker.yaml"]
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:5556/dex/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # OCI registry for images pushed by the rise CLI.
+  registry:
+    image: registry:3
+    container_name: rise-registry
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    volumes:
+      - registry_data:/var/lib/registry
+    environment:
+      - REGISTRY_STORAGE_DELETE_ENABLED=true
+
+  # Traefik reverse proxy for the Docker deployment controller (type: docker).
+  # Routes *.rise.localhost to app containers via the Docker provider, reading
+  # the Traefik labels the Rise controller stamps on each app container.
+  #
+  # Must be v3.7.1: the host Docker daemon (29.x, API 1.54) requires a Traefik
+  # build new enough to negotiate that API version. Older v3.x ship a Docker
+  # client that pins client version 1.24, which the daemon rejects ("client
+  # version 1.24 is too old"), and Traefik then 404s every route. v3.7.1
+  # negotiates the API directly over the raw socket — no socket-proxy/relay.
+  traefik:
+    image: traefik:v3.7.1
+    container_name: rise-traefik
+    restart: unless-stopped
+    command:
+      # DEBUG surfaces the provider-negotiation line ("Provider connection
+      # established with docker <version> (API <ver>)") so an operator can
+      # confirm Traefik successfully negotiated the host Docker API version —
+      # the symptom of a too-old Traefik is "client version 1.24 is too old".
+      - "--log.level=DEBUG"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=rise_default"
+      - "--entrypoints.web.address=:80"
+      - "--api.dashboard=true"
+      - "--api.insecure=true"
+    ports:
+      - "80:80"        # app traffic: http://<project>.rise.localhost
+      - "8090:8080"    # Traefik dashboard: http://localhost:8090
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - default
+
+  # Rise backend. Migrations auto-run on startup. Uses the Docker deployment
+  # controller (config/compose-docker.production.yaml), mounting the host Docker
+  # socket so it can create/route app containers.
+  rise:
+    image: ${RISE_IMAGE_REPOSITORY:-ghcr.io/rise-deploy/rise}:${RISE_IMAGE_TAG:-pr-358-b98adea}
+    container_name: rise-backend
+    restart: unless-stopped
+    command: ["backend", "server"]
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=postgres://${POSTGRES_USER:-rise}:${POSTGRES_PASSWORD:-rise123}@rise-postgres:5432/${POSTGRES_DB:-rise}
+      - RISE_CONFIG_DIR=/etc/rise-docker
+      - RISE_CONFIG_RUN_MODE=production
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./config/compose-docker.production.yaml:/etc/rise-docker/production.yaml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      dex:
+        condition: service_started
+      registry:
+        condition: service_started
+      traefik:
+        condition: service_started
+    networks:
+      - default
