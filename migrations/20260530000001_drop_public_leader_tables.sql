@@ -8,5 +8,8 @@
 -- schedules re-initialize within one interval, so there is no data to preserve.
 -- `oauth_transient_state` (also created by the ha_support migration) is
 -- intentionally left in place — it remains owned by the main crate.
-DROP TABLE IF EXISTS leader_schedules;
-DROP TABLE IF EXISTS leader_leases;
+--
+-- Schema-qualified to `public` so the drop targets the old tables regardless of
+-- the session `search_path` — never the new `runtime_sync.leader_*` tables.
+DROP TABLE IF EXISTS public.leader_schedules;
+DROP TABLE IF EXISTS public.leader_leases;
