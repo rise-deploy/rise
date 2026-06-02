@@ -36,6 +36,20 @@ fn build_multi_container_payload(
     let resolved = cfg.resolve_deploy().map_err(|e| anyhow::anyhow!(e))?;
     if resolved.containers.is_empty() {
         // Single-container project; let the existing image flow handle it.
+        // A top-level `[deploy].health_check` has no effect here — health checks
+        // for a single app are configured by declaring `[containers.<name>]`
+        // (which inherits the top-level `[build]`/`[deploy]` defaults).
+        if cfg
+            .deploy
+            .as_ref()
+            .and_then(|d| d.health_check.as_ref())
+            .is_some()
+        {
+            warn!(
+                "[deploy].health_check is ignored for a single-container project; \
+                 declare [containers.<name>] (with a port) to configure health checks"
+            );
+        }
         return Ok((None, Vec::new()));
     }
 

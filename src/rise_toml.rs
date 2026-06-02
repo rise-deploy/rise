@@ -33,8 +33,9 @@ pub struct ProjectBuildConfig {
     #[serde(default)]
     pub environments: BTreeMap<String, EnvironmentConfig>,
 
-    /// Multi-container configuration. When non-empty, top-level `[build]` and
-    /// `[deploy]` must not be set. Each container becomes a separate K8s
+    /// Multi-container configuration. When non-empty, the top-level `[build]`
+    /// and `[deploy]` tables act as defaults that each container inherits per
+    /// field (see `ContainerConfig`). Each container becomes a separate K8s
     /// Deployment so replica counts scale independently.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub containers: BTreeMap<String, ContainerConfig>,
@@ -62,25 +63,16 @@ pub struct ContainerConfig {
     /// is plain TCP. Omit for workers.
     pub port: Option<u16>,
 
-    /// Number of replicas.
-    pub replicas: Option<u32>,
-
-    /// CPU allocation (e.g. "500m", "1") — sets both request and limit.
-    pub cpu: Option<String>,
-
-    /// Memory allocation (e.g. "256Mi", "1Gi") — sets both request and limit.
-    pub memory: Option<String>,
-
     /// Plain-text environment variables scoped to this container. Merged on top
     /// of any project-level env vars; container-scoped values win on conflict.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
 
-    /// Health check configuration. HTTP liveness+readiness probes are disabled
-    /// by default — they must be explicitly configured here. Set a config block
-    /// to enable probes with a custom path/timing, or `health_check = false` to
-    /// explicitly mark them disabled. Requires `port` to be set.
-    pub health_check: Option<HealthCheckSetting>,
+    /// Deployment resource configuration (replicas, cpu, memory, health_check).
+    /// Mirrors the top-level `[deploy]` table; unset fields inherit the
+    /// top-level `[deploy]` defaults.
+    #[serde(default)]
+    pub deploy: Option<DeployConfig>,
 }
 
 /// `health_check` may either be `false` (probes disabled) or a config block.
@@ -221,16 +213,48 @@ impl ProjectBuildConfig {
         let containers: Vec<ResolvedContainer> = self
             .containers
             .iter()
-            .map(|(name, c)| ResolvedContainer {
-                name: name.clone(),
-                image: c.image.clone(),
-                build: c.build.clone(),
-                port: c.port,
-                replicas: c.replicas,
-                cpu: c.cpu.clone(),
-                memory: c.memory.clone(),
-                env: c.env.clone(),
-                health_check: c.health_check.clone(),
+            .map(|(name, c)| {
+                let c_deploy = c.deploy.clone().unwrap_or_default();
+                let top_deploy = self.deploy.clone().unwrap_or_default();
+
+                // Build: field-level merge of the container's `[build]` over the
+                // top-level `[build]` defaults. A container with `image` takes no
+                // build at all.
+                let build = if c.image.is_some() {
+                    None
+                } else {
+                    match (self.build.clone(), c.build.clone()) {
+                        (Some(top), Some(own)) => Some(own.merge_over(&top)),
+                        (Some(top), None) => Some(top),
+                        (None, own) => own,
+                    }
+                };
+
+                // Deploy: each field falls back to the top-level default.
+                // `health_check` only inherits when the container has a port —
+                // a port-less worker silently skips an inherited default probe.
+                let health_check = c_deploy.health_check.clone().or_else(|| {
+                    if c.port.is_some() {
+                        top_deploy.health_check.clone()
+                    } else {
+                        None
+                    }
+                });
+
+                ResolvedContainer {
+                    name: name.clone(),
+                    image: c.image.clone(),
+                    build,
+                    port: c.port,
+                    replicas: c_deploy.replicas.or(top_deploy.replicas),
+                    cpu: c_deploy.cpu.clone().or_else(|| top_deploy.cpu.clone()),
+                    memory: c_deploy
+                        .memory
+                        .clone()
+                        .or_else(|| top_deploy.memory.clone()),
+                    env: c.env.clone(),
+                    health_check,
+                }
             })
             .collect();
 
@@ -309,6 +333,162 @@ mod tests {
             "got: {err}"
         );
     }
+
+    fn resolved_named<'a>(rd: &'a ResolvedDeploy, name: &str) -> &'a ResolvedContainer {
+        rd.containers
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("container '{name}' not resolved"))
+    }
+
+    /// Build a `ProjectBuildConfig` from top-level build/deploy defaults and a
+    /// set of named containers (struct-literal init to satisfy clippy).
+    fn config_with(
+        build: Option<BuildConfig>,
+        deploy: Option<DeployConfig>,
+        containers: Vec<(&str, ContainerConfig)>,
+    ) -> ProjectBuildConfig {
+        ProjectBuildConfig {
+            build,
+            deploy,
+            containers: containers
+                .into_iter()
+                .map(|(n, c)| (n.to_string(), c))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolve_deploy_inherits_top_level_deploy_per_field() {
+        // `api` overrides only cpu; everything else inherits the top-level deploy.
+        let config = config_with(
+            None,
+            Some(DeployConfig {
+                replicas: Some(3),
+                cpu: Some("250m".to_string()),
+                memory: Some("256Mi".to_string()),
+                health_check: None,
+            }),
+            vec![(
+                "api",
+                ContainerConfig {
+                    image: Some("nginx:latest".to_string()),
+                    port: Some(8080),
+                    deploy: Some(DeployConfig {
+                        cpu: Some("500m".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )],
+        );
+
+        let rd = config.resolve_deploy().expect("resolve");
+        let api = resolved_named(&rd, "api");
+        assert_eq!(api.cpu.as_deref(), Some("500m")); // override wins
+        assert_eq!(api.memory.as_deref(), Some("256Mi")); // inherited
+        assert_eq!(api.replicas, Some(3)); // inherited
+    }
+
+    #[test]
+    fn resolve_deploy_merges_build_field_by_field() {
+        let config = config_with(
+            Some(BuildConfig {
+                backend: Some("docker".to_string()),
+                ..Default::default()
+            }),
+            None,
+            vec![
+                // Container with its own [build] overriding only the Dockerfile.
+                (
+                    "web",
+                    ContainerConfig {
+                        port: Some(8080),
+                        build: Some(BuildConfig {
+                            dockerfile: Some("web/Dockerfile".to_string()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ),
+                // Container that builds but declares no [build]: inherits all.
+                ("worker", ContainerConfig::default()),
+            ],
+        );
+
+        let rd = config.resolve_deploy().expect("resolve");
+        let web = resolved_named(&rd, "web").build.as_ref().expect("build");
+        assert_eq!(web.backend.as_deref(), Some("docker")); // inherited
+        assert_eq!(web.dockerfile.as_deref(), Some("web/Dockerfile")); // override
+        let worker = resolved_named(&rd, "worker").build.as_ref().expect("build");
+        assert_eq!(worker.backend.as_deref(), Some("docker")); // inherited whole
+    }
+
+    #[test]
+    fn resolve_deploy_image_container_takes_no_build() {
+        let config = config_with(
+            Some(BuildConfig {
+                backend: Some("docker".to_string()),
+                ..Default::default()
+            }),
+            None,
+            vec![(
+                "redis",
+                ContainerConfig {
+                    image: Some("redis:7".to_string()),
+                    port: Some(6379),
+                    ..Default::default()
+                },
+            )],
+        );
+
+        let rd = config.resolve_deploy().expect("resolve");
+        let redis = resolved_named(&rd, "redis");
+        assert!(redis.build.is_none(), "image container must take no build");
+        assert_eq!(redis.image.as_deref(), Some("redis:7"));
+    }
+
+    #[test]
+    fn resolve_deploy_inherits_health_check_only_with_port() {
+        let config = config_with(
+            None,
+            Some(DeployConfig {
+                health_check: Some(HealthCheckSetting::Config(HealthCheckConfig {
+                    path: Some("/healthz".to_string()),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }),
+            vec![
+                (
+                    "web",
+                    ContainerConfig {
+                        image: Some("nginx".to_string()),
+                        port: Some(8080),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "worker",
+                    ContainerConfig {
+                        image: Some("busybox".to_string()),
+                        ..Default::default()
+                    },
+                ),
+            ],
+        );
+
+        let rd = config.resolve_deploy().expect("resolve");
+        assert!(
+            resolved_named(&rd, "web").health_check.is_some(),
+            "port-having container inherits the default probe"
+        );
+        assert!(
+            resolved_named(&rd, "worker").health_check.is_none(),
+            "port-less container does not inherit a default probe"
+        );
+    }
 }
 
 /// Workload identity configuration
@@ -338,18 +518,34 @@ pub struct EnvironmentConfig {
     pub deploy: Option<DeployConfig>,
 }
 
-/// Deployment resource configuration
+/// Deployment resource configuration.
+///
+/// Shared by the top-level `[deploy]`, per-environment `[environments.<name>.deploy]`,
+/// and per-container `[containers.<name>.deploy]` tables. Top-level values act as
+/// defaults that each container inherits per field.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[cfg_attr(feature = "backend", derive(schemars::JsonSchema))]
 pub struct DeployConfig {
     /// Number of replicas
     pub replicas: Option<u32>,
 
-    /// CPU allocation (e.g., "500m", "1") — sets both K8s request and limit
+    /// CPU allocation. Either a fixed value that sets both the K8s request and
+    /// limit (e.g. `"500m"`, `"1"`), or a `request-limit` range (e.g. `"128m-1"`
+    /// → request `128m`, limit `1`). The request may not exceed the limit, and
+    /// the limit is validated against the environment/platform allowed range.
     pub cpu: Option<String>,
 
-    /// Memory allocation (e.g., "256Mi", "1Gi") — sets both K8s request and limit
+    /// Memory allocation. Either a fixed value that sets both the K8s request
+    /// and limit (e.g. `"256Mi"`, `"1Gi"`), or a `request-limit` range (e.g.
+    /// `"64Mi-256Mi"`). Same request/limit and range rules as `cpu`.
     pub memory: Option<String>,
+
+    /// Health check configuration. HTTP liveness+readiness probes are disabled
+    /// by default — they must be explicitly configured here. Set a config block
+    /// to enable probes with a custom path/timing, or `health_check = false` to
+    /// explicitly mark them disabled. At the container level this requires the
+    /// container to have a `port`.
+    pub health_check: Option<HealthCheckSetting>,
 }
 
 /// Project metadata configuration
@@ -407,4 +603,40 @@ pub struct BuildConfig {
     /// Target platform for the container image build (e.g., "linux/amd64", "linux/arm64").
     /// Defaults to linux/amd64.
     pub platform: Option<String>,
+}
+
+impl BuildConfig {
+    /// Merge `self` over `default`, field by field. Fields set on `self` win;
+    /// unset fields fall back to `default`. Used to apply a top-level `[build]`
+    /// table as defaults under each container's own `[build]`.
+    pub fn merge_over(&self, default: &BuildConfig) -> BuildConfig {
+        BuildConfig {
+            backend: self.backend.clone().or_else(|| default.backend.clone()),
+            builder: self.builder.clone().or_else(|| default.builder.clone()),
+            buildpacks: self
+                .buildpacks
+                .clone()
+                .or_else(|| default.buildpacks.clone()),
+            args: self.args.clone().or_else(|| default.args.clone()),
+            container_cli: self
+                .container_cli
+                .clone()
+                .or_else(|| default.container_cli.clone()),
+            managed_buildkit: self.managed_buildkit.or(default.managed_buildkit),
+            dockerfile: self
+                .dockerfile
+                .clone()
+                .or_else(|| default.dockerfile.clone()),
+            build_context: self
+                .build_context
+                .clone()
+                .or_else(|| default.build_context.clone()),
+            build_contexts: self
+                .build_contexts
+                .clone()
+                .or_else(|| default.build_contexts.clone()),
+            no_cache: self.no_cache.or(default.no_cache),
+            platform: self.platform.clone().or_else(|| default.platform.clone()),
+        }
+    }
 }

@@ -70,24 +70,76 @@ pub fn parse_memory_bytes(s: &str) -> Result<u64> {
         .with_context(|| format!("memory quantity too large: {s}"))
 }
 
-/// Validate that a CPU value (as a string) falls within [min, max].
+/// Split a resource value into its `(request, limit)` strings.
+///
+/// Accepts either a fixed value (`"256m"`), where request == limit, or a
+/// `request-limit` range (`"128m-1"`). Both sides must parse with `parse`, and
+/// the request may not exceed the limit. `kind` names the resource in errors.
+fn split_request_limit(
+    value: &str,
+    kind: &str,
+    parse: impl Fn(&str) -> Result<u64>,
+) -> Result<(String, String)> {
+    let value = value.trim();
+    let (req, lim) = match value.split('-').collect::<Vec<_>>().as_slice() {
+        [single] => (single.trim().to_string(), single.trim().to_string()),
+        [req, lim] => (req.trim().to_string(), lim.trim().to_string()),
+        _ => bail!("invalid {kind} value '{value}': expected 'value' or 'request-limit'"),
+    };
+    let req_v = parse(&req).with_context(|| format!("invalid {kind} request: {req}"))?;
+    let lim_v = parse(&lim).with_context(|| format!("invalid {kind} limit: {lim}"))?;
+    if req_v > lim_v {
+        bail!("{kind} request {req} exceeds limit {lim}");
+    }
+    Ok((req, lim))
+}
+
+/// Parse a CPU value into `(request, limit)` strings (see [`split_request_limit`]).
+pub fn parse_cpu_request_limit(value: &str) -> Result<(String, String)> {
+    split_request_limit(value, "CPU", parse_cpu_millicores)
+}
+
+/// Parse a memory value into `(request, limit)` strings (see [`split_request_limit`]).
+pub fn parse_memory_request_limit(value: &str) -> Result<(String, String)> {
+    split_request_limit(value, "memory", parse_memory_bytes)
+}
+
+/// Validate a CPU value (fixed or `request-limit` range) against `[min, max]`.
+///
+/// Enforces `min <= request <= limit <= max` (the request/limit ordering is
+/// checked by [`parse_cpu_request_limit`]).
 pub fn validate_cpu_range(value: &str, min: &str, max: &str) -> Result<()> {
-    let v = parse_cpu_millicores(value).with_context(|| format!("invalid CPU value: {value}"))?;
+    let (req, lim) =
+        parse_cpu_request_limit(value).with_context(|| format!("invalid CPU value: {value}"))?;
+    let req_v = parse_cpu_millicores(&req)?;
+    let lim_v = parse_cpu_millicores(&lim)?;
     let lo = parse_cpu_millicores(min).with_context(|| format!("invalid min CPU: {min}"))?;
     let hi = parse_cpu_millicores(max).with_context(|| format!("invalid max CPU: {max}"))?;
-    if v < lo || v > hi {
-        bail!("CPU value {value} is outside the allowed range [{min}, {max}]");
+    if req_v < lo {
+        bail!("CPU request {req} is below the allowed minimum {min}");
+    }
+    if lim_v > hi {
+        bail!("CPU limit {lim} is above the allowed maximum {max}");
     }
     Ok(())
 }
 
-/// Validate that a memory value (as a string) falls within [min, max].
+/// Validate a memory value (fixed or `request-limit` range) against `[min, max]`.
+///
+/// Enforces `min <= request <= limit <= max` (the request/limit ordering is
+/// checked by [`parse_memory_request_limit`]).
 pub fn validate_memory_range(value: &str, min: &str, max: &str) -> Result<()> {
-    let v = parse_memory_bytes(value).with_context(|| format!("invalid memory value: {value}"))?;
+    let (req, lim) = parse_memory_request_limit(value)
+        .with_context(|| format!("invalid memory value: {value}"))?;
+    let req_v = parse_memory_bytes(&req)?;
+    let lim_v = parse_memory_bytes(&lim)?;
     let lo = parse_memory_bytes(min).with_context(|| format!("invalid min memory: {min}"))?;
     let hi = parse_memory_bytes(max).with_context(|| format!("invalid max memory: {max}"))?;
-    if v < lo || v > hi {
-        bail!("Memory value {value} is outside the allowed range [{min}, {max}]");
+    if req_v < lo {
+        bail!("Memory request {req} is below the allowed minimum {min}");
+    }
+    if lim_v > hi {
+        bail!("Memory limit {lim} is above the allowed maximum {max}");
     }
     Ok(())
 }
@@ -156,5 +208,70 @@ mod tests {
 
         assert!(validate_memory_range("32Mi", "64Mi", "2Gi").is_err());
         assert!(validate_memory_range("4Gi", "64Mi", "2Gi").is_err());
+    }
+
+    #[test]
+    fn test_parse_cpu_request_limit() {
+        // Fixed value: request == limit.
+        assert_eq!(
+            parse_cpu_request_limit("256m").unwrap(),
+            ("256m".to_string(), "256m".to_string())
+        );
+        // Range: request and limit differ.
+        assert_eq!(
+            parse_cpu_request_limit("128m-1").unwrap(),
+            ("128m".to_string(), "1".to_string())
+        );
+        // Whitespace is tolerated around the separator.
+        assert_eq!(
+            parse_cpu_request_limit(" 128m - 500m ").unwrap(),
+            ("128m".to_string(), "500m".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_cpu_request_limit_errors() {
+        // Request exceeds limit.
+        assert!(parse_cpu_request_limit("1-128m").is_err());
+        // Empty sides.
+        assert!(parse_cpu_request_limit("-1").is_err());
+        assert!(parse_cpu_request_limit("128m-").is_err());
+        // Too many separators.
+        assert!(parse_cpu_request_limit("128m-256m-1").is_err());
+        // Unparseable side.
+        assert!(parse_cpu_request_limit("abc-1").is_err());
+    }
+
+    #[test]
+    fn test_parse_memory_request_limit() {
+        assert_eq!(
+            parse_memory_request_limit("256Mi").unwrap(),
+            ("256Mi".to_string(), "256Mi".to_string())
+        );
+        assert_eq!(
+            parse_memory_request_limit("64Mi-256Mi").unwrap(),
+            ("64Mi".to_string(), "256Mi".to_string())
+        );
+        assert!(parse_memory_request_limit("256Mi-64Mi").is_err());
+    }
+
+    #[test]
+    fn test_validate_cpu_range_with_ranges() {
+        // request >= min, limit <= max, request <= limit.
+        assert!(validate_cpu_range("128m-1", "100m", "2").is_ok());
+        assert!(validate_cpu_range("100m-2", "100m", "2").is_ok());
+        // Limit above max.
+        assert!(validate_cpu_range("128m-3", "100m", "2").is_err());
+        // Request below min.
+        assert!(validate_cpu_range("50m-1", "100m", "2").is_err());
+    }
+
+    #[test]
+    fn test_validate_memory_range_with_ranges() {
+        assert!(validate_memory_range("64Mi-1Gi", "64Mi", "2Gi").is_ok());
+        // Limit above max.
+        assert!(validate_memory_range("64Mi-4Gi", "64Mi", "2Gi").is_err());
+        // Request below min.
+        assert!(validate_memory_range("32Mi-1Gi", "64Mi", "2Gi").is_err());
     }
 }

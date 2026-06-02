@@ -232,31 +232,42 @@ A single Rise deployment can run multiple containers — for example a frontend,
 [project]
 name = "my-app"
 
+# Top-level [build] and [deploy] act as defaults that every container inherits.
+# [build] merges field-by-field (set the backend once, override only the
+# Dockerfile per container); [deploy] fields fall back individually.
+[build]
+backend = "docker"
+
+[deploy]
+replicas = 1
+cpu = "128m-500m"   # request 128m, cap the limit at 500m (see "CPU & memory" below)
+
 # Each container declares exactly one of `image` (pre-built reference) or
 # a `[containers.<name>.build]` block (the CLI builds and pushes for you).
 
-[containers.frontend.build]
-backend = "docker"
-dockerfile = "frontend/Dockerfile"
 [containers.frontend]
 port = 8080
-replicas = 2
+[containers.frontend.build]
+dockerfile = "frontend/Dockerfile"     # inherits backend = "docker"
+[containers.frontend.deploy]
+replicas = 2                           # override just the replica count
 
-[containers.backend.build]
-backend = "docker"
-dockerfile = "backend/Dockerfile"
 [containers.backend]
 port = 9090
-replicas = 3
-health_check = { path = "/health", initial_delay_seconds = 5 }
 # Per-container env vars. Project-level env vars also apply.
 env = { LOG_LEVEL = "info" }
+[containers.backend.build]
+dockerfile = "backend/Dockerfile"
+[containers.backend.deploy]
+replicas = 3
+health_check = { path = "/health", initial_delay_seconds = 5 }
 
 [containers.worker]
-# Pre-built image — the CLI won't try to build or push this one.
+# Pre-built image — the CLI won't try to build or push this one, and it ignores
+# the top-level [build] default. Workers have no port → no Service, no probes.
 image = "registry.example.com/my-app/worker:1.2.3"
+[containers.worker.deploy]
 replicas = 4
-# Workers have no port → no Service, no HTTP probes.
 
 [routes]
 "/api" = { container = "backend" }
@@ -267,14 +278,26 @@ When you run `rise deploy`, the backend allocates a deployment ID and returns on
 
 Notes:
 
-- `[containers]` is mutually exclusive with the top-level `[build]` and `[deploy]` sections. A single-container project uses the simple top-level `[build]`/`[deploy]` form — internally that's just one container named `app`.
+- The top-level `[build]` and `[deploy]` tables are **per-field defaults** for every container. `[build]` merges field-by-field under each container's own `[build]` (so a container with `image` ignores it); each `[deploy]` field (`replicas`, `cpu`, `memory`, `health_check`) falls back to the top-level value when the container omits it. A single-container project — top-level `[build]`/`[deploy]` with no `[containers]` — is internally just one container named `app`.
+- A container's resource settings live in `[containers.<name>.deploy]`, mirroring the top-level `[deploy]` table exactly (same fields, same syntax).
 - Containers without `port` get no `Service` and no HTTP probes — exactly what you want for workers / batch jobs.
-- HTTP probes are **disabled by default**. Set a `health_check` block to enable them (with a path and optional timing), or `health_check = false` to explicitly mark them disabled. Containers with a `port` but no `health_check` get a `Service` but no probe.
+- HTTP probes are **disabled by default**. Set a `[containers.<name>.deploy].health_check` block to enable them (with a path and optional timing), or `health_check = false` to explicitly mark them disabled. A `health_check` default set at the top level only applies to containers that have a `port`; port-less workers never get a probe. Containers with a `port` but no `health_check` get a `Service` but no probe.
 - Routes are matched longest-prefix-first by the ingress, so `/api` shadows `/` correctly. If `[routes]` is omitted and exactly one container has a `port`, Rise synthesises `/` → that container.
 - Platform and environment **replica limits apply to the deployment's total** replicas summed across all containers, not per container — e.g. with a cap of 10, `frontend = 4` + `backend = 3` + `worker = 4` (sum 11) is rejected. CPU and memory limits, by contrast, are enforced per container.
 - Every container receives a `RISE_CONTAINER` env var set to its own name (e.g. `"frontend"`, `"api"`).
 - Each container's `PORT` env var is set to **that container's own `port`** (e.g. `frontend` gets `PORT=8080`, `backend` gets `PORT=9090`) — not a single deployment-wide value. Containers without a `port` (workers) keep whatever deployment-wide `PORT` was set, if any.
 - When a deployment has two or more containers, each is also given a `RISE_CONTAINER_HOST__<NAME>` env var for every sibling that exposes a `port` (including a port-having container that isn't routed, such as a database) — pointing at that sibling's in-cluster Service. See [Environment Variables](../environment-variables#auto-injected-variables).
+
+## CPU & Memory
+
+The `cpu` and `memory` fields in any `[deploy]` table (top-level or per-container) accept two forms:
+
+| Form | Example | Effect |
+|---|---|---|
+| Fixed | `cpu = "256m"`, `memory = "512Mi"` | Sets the Kubernetes request **and** limit to the same value. |
+| Range | `cpu = "128m-1"`, `memory = "256Mi-1Gi"` | `request-limit` — the first value is the request, the second the limit. |
+
+CPU is expressed in cores (`1`, `2.5`) or millicores (`500m`); memory in bytes or binary-suffixed units (`512Mi`, `1Gi`). The request may not exceed the limit, and both are validated against the allowed range for the target environment/platform: `min ≤ request ≤ limit ≤ max`. A limit above the platform/environment maximum, or a request below its minimum, is rejected at deploy time with a clear message. Ranges let you reserve a small guaranteed amount (the request) while allowing bursts up to the limit.
 
 ## CI/CD Deployments
 
