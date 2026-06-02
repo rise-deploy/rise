@@ -69,6 +69,73 @@ rise run --backend docker --dockerfile Dockerfile.dev
 
 All standard [build flags](../builds) are supported.
 
+## Multi-Container Projects
+
+`rise run` runs a **single** container. For a project that declares a
+[`[containers]`](../deployments#multi-container-deployments) table you have two
+options.
+
+### Run one container
+
+Pick which container to build and run with `--container`:
+
+```bash
+rise run --container api
+```
+
+The container's own `port` sets `PORT` and the host mapping, and its
+`[containers.api.env]` overrides are layered on top of the project env vars.
+Running `rise run` without `--container` on a multi-container project errors and
+lists the available container names.
+
+### Run them all together — `rise compose`
+
+`rise compose` builds every container locally and runs them together via Docker
+Compose, mirroring production: siblings reach each other by service name and
+receive the same `RISE_CONTAINER_HOST__<NAME>` variables, and path-based
+`[routes]` are replicated by a [Traefik](https://traefik.io/) router published
+on a single host port.
+
+```bash
+# Build all containers and run them (Ctrl+C tears the stack down)
+rise compose up
+
+# Publish the router on a different host port
+rise compose up --router-port 3000
+
+# Run in the background, then stop later
+rise compose up --detach
+rise compose down
+```
+
+Inspect a running stack without dropping to the Docker CLI:
+
+```bash
+rise compose ps                       # list the stack's containers
+rise compose logs                     # show logs from all containers
+rise compose logs -f                  # follow
+rise compose logs -c api --tail 100   # just the api container, last 100 lines
+```
+
+Routing is label-driven (no config file is mounted); the router needs access to
+the Docker socket (`/var/run/docker.sock`). Because the Traefik router mounts
+this socket, `rise compose` assumes a Docker-compatible runtime — podman users
+may need additional socket configuration (e.g. enabling the podman socket and
+pointing it at `/var/run/docker.sock`). Containers with a `port` but no route
+(e.g. a database) are reachable by siblings on the internal network but are not
+published to the host.
+
+To customize the Compose file, write it to disk instead of running it:
+
+```bash
+rise compose generate                 # writes ./compose.yaml
+rise compose generate --stdout        # print to stdout
+rise compose generate -o my-compose.yaml
+```
+
+Then run it yourself with `docker compose -f compose.yaml up` after the images
+are built (`rise compose up` builds them for you).
+
 ## Standalone Image Build
 
 Build an image without running it:
