@@ -292,19 +292,25 @@ settings.rs:475, and moves into the crate with the matchers, H1), `async-trait` 
 and `tracing` (lightweight, pure — the relocated `match_controller_identity` logs unmatched-claim
 diagnostics, controller.rs:92/103). It does **not** depend on `reqwest`, `axum`, or `sqlx` — **nor
 on `anyhow` or `regex`**, even though the matchers being relocated use them today:
-- **`anyhow` is dropped via refactor.** The matchers (`match_controller_identity`,
-  `build_controller_indexes`, `validate_controller_id`, controller.rs:146/236/293-318;
-  `validate_custom_claims`, jwt.rs:234-262) currently return `anyhow::Result` and use
+- **`anyhow` is dropped via refactor.** Three of the relocated matchers —
+  `build_controller_indexes`, `validate_controller_id` (controller.rs:293/146) and
+  `validate_custom_claims` (jwt.rs:234-262) — currently return `anyhow::Result` and use
   `anyhow!`/`bail!`/`Context`. On relocation they are **refactored to return the crate's `AuthError`**
   (replacing `anyhow::Result`), so `anyhow` is not pulled into the pure core. **This is a small,
-  deliberate behavior-adjacent refactor:** the matcher signatures change from `anyhow::Result` to
+  deliberate behavior-adjacent refactor:** their signatures change from `anyhow::Result` to
   `AuthError`, and today's callers consume `anyhow::Result` — so it is a reviewed delta, **not** covered
   by the Phase-0 "byte-for-byte identical" guarantee that applies to the verifier shims (§7).
+  `match_controller_identity` (controller.rs:236) is **already infallible** — it returns the
+  `ControllerMatch { Single, Multiple, Unmatched }` enum and uses no `anyhow` — so it relocates
+  **unchanged** (its internal call to `validate_custom_claims` simply consumes the new `AuthError`).
 - **`regex` is dropped by hand-rolling.** `validate_controller_id` matches `CONTROLLER_ID_RE`
-  (controller.rs:16/129-133/171). The relocated validator is **hand-rolled (no `regex`)** — it already
-  does most of its checks (length, DNS-label, name-segment caps) with plain string ops at
-  controller.rs:147-170; the final regex `is_match` is replaced with an equivalent hand-rolled
-  character-class check, keeping `regex` out of the crate.
+  (controller.rs:16/130-131/171). The relocated validator is **hand-rolled (no `regex`)**. The plain
+  string ops at controller.rs:147-170 only cover the length caps; the regex itself carries the
+  structural rules the hand-roll **must** reproduce exactly — **lowercase-only** host labels, the
+  **mandatory dot** between host labels, **no leading/trailing hyphen** per label, and the
+  case-sensitivity split between host (`[a-z0-9]`) and the optional `/name` segment (`[A-Za-z0-9]`).
+  A crate unit test must port the existing `controller.rs` id-validation cases to lock equivalence;
+  treat this as a reviewed delta (like the `anyhow` change), not byte-for-byte.
 - JWKS fetching is abstracted behind the `JwksKeySource` trait; the reqwest + `ssrf` + cache
   implementation stays in rise-deploy (today's `JwtValidator` *becomes* that impl). SSRF/HTTP
   policy stays in the app.
@@ -640,10 +646,11 @@ so we phase it.
   `jwt_signer.generate_jwks()` (handlers.rs:1780, 1796), so RS256-public-key → JWK generation relocates
   to the crate's `RiseTokenSigner`. The **verifier shims** are a **pure refactor** — identical behavior,
   no new endpoints, no `AccessClaims` yet. **Two deltas are deliberate and reviewed, NOT covered by the
-  byte-for-byte guarantee** (which applies only to the verifier shims): (1) the relocated **matchers'
+  byte-for-byte guarantee** (which applies only to the verifier shims): (1) **three relocated matchers'
   signatures change** from `anyhow::Result` to the crate's `AuthError` (§3.3, C2) — a behavior-adjacent
-  refactor of `match_controller_identity` / `build_controller_indexes` / `validate_controller_id` /
-  `validate_custom_claims`, with `validate_controller_id` additionally hand-rolled off `regex`; (2) the
+  refactor of `build_controller_indexes` / `validate_controller_id` / `validate_custom_claims`, with
+  `validate_controller_id` additionally hand-rolled off `regex` (`match_controller_identity` is already
+  infallible — it returns `ControllerMatch` — and relocates unchanged); (2) the
   verifier's **RS256 branch is `Ingress`-only** and the output enum has **no `Workload` variant** (§3.1,
   C1/C3) — which matches today's behavior (nothing inbound ever verified a workload token), so it is a
   modeling clarification rather than a runtime change. The §4.1 hardening
