@@ -49,6 +49,12 @@ export default defineConfig({
               ],
             },
             {
+              label: 'Docker',
+              items: [
+                { label: 'Overview', slug: 'docker' },
+              ],
+            },
+            {
               label: 'Persistent Logs',
               items: [
                 { label: 'Overview', slug: 'persistent-logs' },
