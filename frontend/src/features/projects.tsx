@@ -353,20 +353,23 @@ export function AppUsersList({ projectName, project, accessClasses, currentUserE
                     : removeAction(() => setConfirmRemove({ kind: 'team', teamId: t.id, name: t.name })),
             };
         }),
-        ...serviceAccounts.map(sa => ({
-            key: `sa-${sa.id}`,
-            kind: 'sa',
-            icon: KIND_META.sa.icon,
-            name: <span style={{ fontWeight: 500 }}>{sa.email}</span>,
-            kindLabel: KIND_META.sa.label,
-            extra: null,
-            actions: (
-                <>
-                    <RButton size="sm" icon="edit" onClick={() => openEditSa(sa)}>Edit</RButton>
-                    {removeAction(() => setConfirmRemove({ kind: 'sa', sa, name: sa.email }))}
-                </>
-            ),
-        })),
+        ...serviceAccounts.map(sa => {
+            const claimCount = Object.keys(sa.claims || {}).length;
+            return {
+                key: `sa-${sa.id}`,
+                kind: 'sa',
+                icon: KIND_META.sa.icon,
+                name: <span style={{ fontWeight: 500 }}>{sa.email}</span>,
+                kindLabel: [KIND_META.sa.label, `${claimCount} ${claimCount === 1 ? 'claim' : 'claims'}`],
+                extra: null,
+                actions: (
+                    <>
+                        <RButton size="sm" icon="edit" onClick={() => openEditSa(sa)}>Edit</RButton>
+                        {removeAction(() => setConfirmRemove({ kind: 'sa', sa, name: sa.email }))}
+                    </>
+                ),
+            };
+        }),
     ];
 
     const filterMap = { all: null, users: 'user', teams: 'team', sas: 'sa' };
