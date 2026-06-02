@@ -253,6 +253,13 @@ fn render_traefik_labels_for(
         AccessRequirement::None => None,
         AccessRequirement::Authenticated | AccessRequirement::Member => {
             if cfg.auth_backend_url.is_empty() {
+                // Invariant: startup (`init_docker_backend`) fails CLOSED when a
+                // non-`None` access class is configured without an
+                // `auth_backend_url` (see
+                // `settings::docker_access_classes_missing_auth_backend_url`),
+                // so this branch is unreachable in a running backend. We still
+                // refuse to stamp a half-broken (auth-less) middleware here
+                // rather than silently emit an open route.
                 None
             } else {
                 Some(format!(
@@ -653,8 +660,10 @@ mod tests {
 
     #[test]
     fn private_access_class_without_backend_url_stamps_no_forward_auth() {
-        // Member requirement but no auth_backend_url → forwardAuth disabled
-        // (project served publicly; startup logs a warning).
+        // Member requirement but no auth_backend_url → forwardAuth disabled.
+        // In a running backend this state is unreachable because startup fails
+        // closed (see settings::docker_access_classes_missing_auth_backend_url);
+        // the builder still refuses to stamp an auth-less middleware here.
         let mut map = HashMap::new();
         map.insert("private".to_string(), AccessRequirement::Member);
         let cfg = BuilderConfig {

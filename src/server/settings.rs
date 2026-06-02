@@ -683,6 +683,39 @@ pub struct AccessClass {
     pub custom_annotations: std::collections::HashMap<String, String>,
 }
 
+/// Validate that a Docker deployment controller can actually enforce the
+/// authentication required by its configured access classes.
+///
+/// The Docker backend wires ingress authentication via a Traefik forwardAuth
+/// middleware whose address is derived from `auth_backend_url`. If that URL is
+/// empty/blank, no middleware is stamped and any access class requiring
+/// `Authenticated`/`Member` would be served PUBLICLY — failing open. To fail
+/// closed instead, this rejects the configuration up-front, naming the
+/// offending access class(es).
+///
+/// `null`-valued access classes (used to remove inherited entries) are ignored.
+/// Returns the names of offending access classes (sorted) when the config is
+/// invalid, or an empty `Vec` when it is acceptable.
+pub fn docker_access_classes_missing_auth_backend_url(
+    access_classes: &std::collections::HashMap<String, Option<AccessClass>>,
+    auth_backend_url: &str,
+) -> Vec<String> {
+    if !auth_backend_url.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let mut offending: Vec<String> = access_classes
+        .iter()
+        .filter_map(|(name, ac)| {
+            ac.as_ref().and_then(|ac| {
+                (ac.access_requirement != AccessRequirement::None).then(|| name.clone())
+            })
+        })
+        .collect();
+    offending.sort();
+    offending
+}
+
 /// Default resource values for new deployments when not specified by the user
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct DeploymentDefaults {
@@ -1130,9 +1163,10 @@ pub enum DeploymentControllerSettings {
         /// Internal URL Traefik uses to reach the Rise backend for the
         /// forwardAuth subrequest (e.g. `http://rise:3000` on the compose
         /// network). Used to build the `forwardauth.address` middleware label
-        /// pointing at `/api/v1/auth/ingress`. If empty, ingress authentication
-        /// is disabled even for non-`None` access classes (a warning is logged
-        /// when such an access class is used without it).
+        /// pointing at `/api/v1/auth/ingress`. Required when any configured
+        /// access class has a non-`None` access requirement
+        /// (`Authenticated`/`Member`); the backend refuses to start otherwise,
+        /// to avoid serving those projects publicly with no auth enforced.
         #[serde(default)]
         auth_backend_url: String,
 
@@ -2320,6 +2354,91 @@ auth:
             Settings::new_with_env(temp_dir.path().to_str().unwrap(), "development", &|_| None)
                 .expect("config should load without resource_gc section");
         assert!(settings.resource_gc.is_none());
+    }
+
+    fn access_class(req: AccessRequirement) -> AccessClass {
+        AccessClass {
+            display_name: "Disp".to_string(),
+            description: "Desc".to_string(),
+            ingress_class: "traefik".to_string(),
+            access_requirement: req,
+            custom_annotations: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn docker_controller_with_member_class_and_empty_auth_backend_url_is_rejected() {
+        let mut classes = std::collections::HashMap::new();
+        classes.insert(
+            "public".to_string(),
+            Some(access_class(AccessRequirement::None)),
+        );
+        classes.insert(
+            "private".to_string(),
+            Some(access_class(AccessRequirement::Member)),
+        );
+
+        let offending = docker_access_classes_missing_auth_backend_url(&classes, "");
+        assert_eq!(offending, vec!["private".to_string()]);
+
+        // Whitespace-only is treated as blank.
+        let offending_ws = docker_access_classes_missing_auth_backend_url(&classes, "   ");
+        assert_eq!(offending_ws, vec!["private".to_string()]);
+    }
+
+    #[test]
+    fn docker_controller_with_authenticated_class_and_empty_auth_backend_url_is_rejected() {
+        let mut classes = std::collections::HashMap::new();
+        classes.insert(
+            "authed".to_string(),
+            Some(access_class(AccessRequirement::Authenticated)),
+        );
+
+        let offending = docker_access_classes_missing_auth_backend_url(&classes, "");
+        assert_eq!(offending, vec!["authed".to_string()]);
+    }
+
+    #[test]
+    fn docker_controller_with_only_public_class_is_accepted() {
+        let mut classes = std::collections::HashMap::new();
+        classes.insert(
+            "public".to_string(),
+            Some(access_class(AccessRequirement::None)),
+        );
+
+        assert!(docker_access_classes_missing_auth_backend_url(&classes, "").is_empty());
+    }
+
+    #[test]
+    fn docker_controller_with_member_class_and_auth_backend_url_is_accepted() {
+        let mut classes = std::collections::HashMap::new();
+        classes.insert(
+            "public".to_string(),
+            Some(access_class(AccessRequirement::None)),
+        );
+        classes.insert(
+            "private".to_string(),
+            Some(access_class(AccessRequirement::Member)),
+        );
+
+        // Mirrors config/compose-docker.production.yaml (private + auth URL set).
+        assert!(
+            docker_access_classes_missing_auth_backend_url(&classes, "http://rise:3000").is_empty()
+        );
+    }
+
+    #[test]
+    fn docker_controller_ignores_null_access_classes() {
+        // A `null` entry (used to remove an inherited class) must not trip the
+        // check even when auth_backend_url is empty.
+        let mut classes = std::collections::HashMap::new();
+        classes.insert(
+            "public".to_string(),
+            Some(access_class(AccessRequirement::None)),
+        );
+        classes.insert("private".to_string(), None);
+
+        assert!(docker_access_classes_missing_auth_backend_url(&classes, "").is_empty());
     }
 }
 

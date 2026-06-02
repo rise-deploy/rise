@@ -563,7 +563,7 @@
             },
             "auth_backend_url": {
               "default": "",
-              "description": "Internal URL Traefik uses to reach the Rise backend for the\nforwardAuth subrequest (e.g. `http://rise:3000` on the compose\nnetwork). Used to build the `forwardauth.address` middleware label\npointing at `/api/v1/auth/ingress`. If empty, ingress authentication\nis disabled even for non-`None` access classes (a warning is logged\nwhen such an access class is used without it).",
+              "description": "Internal URL Traefik uses to reach the Rise backend for the\nforwardAuth subrequest (e.g. `http://rise:3000` on the compose\nnetwork). Used to build the `forwardauth.address` middleware label\npointing at `/api/v1/auth/ingress`. Required when any configured\naccess class has a non-`None` access requirement\n(`Authenticated`/`Member`); the backend refuses to start otherwise,\nto avoid serving those projects publicly with no auth enforced.",
               "type": "string"
             },
             "auth_signin_url": {

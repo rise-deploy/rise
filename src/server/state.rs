@@ -363,18 +363,21 @@ async fn init_docker_backend(
             })
             .collect();
 
-    // Warn if any non-`None` access class is configured but forwardAuth can't be
-    // wired because the internal backend URL is missing.
-    if auth_backend_url.trim().is_empty()
-        && access_requirements
-            .values()
-            .any(|r| *r != crate::server::settings::AccessRequirement::None)
-    {
-        tracing::warn!(
-            "Docker deployment backend: one or more access classes require authentication \
+    // Fail CLOSED: refuse to start if any non-`None` access class is configured
+    // but forwardAuth cannot be wired because the internal backend URL is
+    // missing. Otherwise such projects would be served publicly with no auth.
+    let offending = crate::server::settings::docker_access_classes_missing_auth_backend_url(
+        access_classes,
+        auth_backend_url,
+    );
+    if !offending.is_empty() {
+        anyhow::bail!(
+            "Docker deployment backend: access class(es) [{}] require authentication \
              (Authenticated/Member) but `deployment_controller.auth_backend_url` is empty. \
-             Traefik forwardAuth will NOT be enforced for those projects — they will be served \
-             publicly. Set auth_backend_url to enable ingress authentication."
+             Traefik forwardAuth cannot be enforced, so those projects would be served \
+             publicly. Set `deployment_controller.auth_backend_url` (e.g. http://rise:3000) \
+             to enable ingress authentication, or change the access requirement to None.",
+            offending.join(", ")
         );
     }
 
