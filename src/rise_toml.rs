@@ -210,12 +210,16 @@ impl ProjectBuildConfig {
             return Ok(ResolvedDeploy::default());
         }
 
+        // Hoisted top-level defaults: these are identical for every container,
+        // so compute the clones once instead of per-iteration inside `.map()`.
+        let top_deploy = self.deploy.clone().unwrap_or_default();
+        let top_build = self.build.clone();
+
         let containers: Vec<ResolvedContainer> = self
             .containers
             .iter()
             .map(|(name, c)| {
                 let c_deploy = c.deploy.clone().unwrap_or_default();
-                let top_deploy = self.deploy.clone().unwrap_or_default();
 
                 // Build: field-level merge of the container's `[build]` over the
                 // top-level `[build]` defaults. A container with `image` takes no
@@ -223,7 +227,7 @@ impl ProjectBuildConfig {
                 let build = if c.image.is_some() {
                     None
                 } else {
-                    match (self.build.clone(), c.build.clone()) {
+                    match (top_build.clone(), c.build.clone()) {
                         (Some(top), Some(own)) => Some(own.merge_over(&top)),
                         (Some(top), None) => Some(top),
                         (None, own) => own,

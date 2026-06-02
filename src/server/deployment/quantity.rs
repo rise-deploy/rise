@@ -81,6 +81,10 @@ fn split_request_limit(
     parse: impl Fn(&str) -> Result<u64>,
 ) -> Result<(String, String)> {
     let value = value.trim();
+    // Realistic CPU/memory quantities never contain a `-` (suffixes are
+    // Ki/Mi/Gi/… and `m`, never signs or exponents), so splitting on `-` is
+    // safe. An exotic value like `"1e-3"` would split into `["1e", "3"]` and
+    // error in `parse` below rather than silently mis-parsing — acceptable.
     let (req, lim) = match value.split('-').collect::<Vec<_>>().as_slice() {
         [single] => (single.trim().to_string(), single.trim().to_string()),
         [req, lim] => (req.trim().to_string(), lim.trim().to_string()),
