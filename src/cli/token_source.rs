@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::config::Config;
-use crate::login::token_utils::read_token_exp;
+use crate::login::token_utils::{log_token_debug, read_token_exp};
 
 /// Re-mint cached JWTs before two thirds of their observed lifetime has elapsed
 /// and once they are within this many seconds of expiry, so a request issued
@@ -115,7 +115,14 @@ const GHA_OIDC_MINT_TIMEOUT_DEFAULT_SECS: u64 = 10;
 pub async fn token_with_retry(provider: &TokenProvider) -> Result<String> {
     for attempt in 0..=TOKEN_RESOLUTION_RETRIES {
         match provider.token().await {
-            Ok(token) => return Ok(token),
+            Ok(token) => {
+                // Surface the resolved token's claims at debug so operators can
+                // confirm what identity a command (e.g. `rise deploy` from CI)
+                // is presenting — the OIDC token in RISE_TOKEN, a minted GitHub
+                // Actions OIDC token, etc. Signature is never logged.
+                log_token_debug(&token, provider.describe());
+                return Ok(token);
+            }
             Err(e) if is_non_retryable_token_error(&e) => return Err(e),
             Err(e) if attempt < TOKEN_RESOLUTION_RETRIES => {
                 let backoff = TOKEN_RETRY_BASE_BACKOFF * (attempt as u32 + 1);
@@ -192,14 +199,16 @@ impl CachedToken {
 }
 
 /// A fixed token (from `RISE_TOKEN` or the stored login config). Never expires
-/// from the CLI's perspective; `refresh` returns the same value.
+/// from the CLI's perspective; `refresh` returns the same value. `source` is a
+/// short label naming where the token came from, surfaced in debug logs.
 pub struct StaticToken {
     value: String,
+    source: &'static str,
 }
 
 impl StaticToken {
-    pub fn new(value: String) -> Self {
-        Self { value }
+    pub fn new(value: String, source: &'static str) -> Self {
+        Self { value, source }
     }
 }
 
@@ -209,7 +218,7 @@ impl TokenSource for StaticToken {
         Ok(self.value.clone())
     }
     fn describe(&self) -> &'static str {
-        "static token"
+        self.source
     }
 }
 
@@ -471,7 +480,10 @@ pub fn select_token_provider(
 ) -> Result<TokenProvider> {
     // 1. Explicit RISE_TOKEN wins (backward compatible).
     if let Some(token) = inputs.rise_token.filter(|t| !t.is_empty()) {
-        return Ok(Arc::new(StaticToken::new(token)));
+        return Ok(Arc::new(StaticToken::new(
+            token,
+            "RISE_TOKEN environment variable",
+        )));
     }
     // 2. Generic command escape hatch.
     if let Some(cmd) = inputs.rise_token_command.filter(|c| !c.is_empty()) {
@@ -502,7 +514,7 @@ pub fn select_token_provider(
     }
     // 4. Stored login token.
     if let Some(token) = inputs.stored_token.filter(|t| !t.is_empty()) {
-        return Ok(Arc::new(StaticToken::new(token)));
+        return Ok(Arc::new(StaticToken::new(token, "stored login token")));
     }
     // 5. Nothing.
     Err(TokenSourceError::NoSource("Not authenticated. Run 'rise login' first.".to_string()).into())
@@ -570,7 +582,7 @@ mod tests {
 
     #[tokio::test]
     async fn static_token_returns_value() {
-        let s = StaticToken::new("abc".to_string());
+        let s = StaticToken::new("abc".to_string(), "static token");
         assert_eq!(s.token().await.unwrap(), "abc");
     }
 
@@ -626,7 +638,7 @@ mod tests {
         i.audience = Some("aud".into());
         i.stored_token = Some("stored".into());
         let p = select_token_provider(&client(), i).unwrap();
-        assert_eq!(p.describe(), "static token");
+        assert_eq!(p.describe(), "RISE_TOKEN environment variable");
     }
 
     #[test]
@@ -670,7 +682,7 @@ mod tests {
         let mut i = base_inputs();
         i.stored_token = Some("stored".into());
         let p = select_token_provider(&client(), i).unwrap();
-        assert_eq!(p.describe(), "static token");
+        assert_eq!(p.describe(), "stored login token");
     }
 
     #[tokio::test]
