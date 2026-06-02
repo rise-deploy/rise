@@ -230,21 +230,6 @@ cargo test --all-features      # Unit tests
 
 The `mise run lint` task runs: `cargo all-features check`, `cargo all-features clippy -- -D warnings`, `cargo fmt --check`, `mise sqlx:check`, and `helm lint helm/rise`.
 
-## Future Enhancements
+## Ingress Authentication
 
-### Ingress Authentication (Kubernetes Controller)
-
-The project `visibility` field (Public/Private) is currently stored but not enforced at the ingress level. This field is intended for ingress-level authentication:
-
-- **Public projects**: The ingress will serve the application without requiring authentication
-- **Private projects**: The ingress will require user authentication AND verify project access authorization before serving the application
-
-**Current State**: The visibility field is stored in the database and returned via the API, but does NOT affect:
-- API authorization (all projects require ownership/team membership to access via API)
-- Ingress routing (authentication not yet configured in ingress annotations)
-
-**Implementation Plan**:
-- The Kubernetes controller will configure ingress resources based on the visibility field
-- Public projects will have standard ingress rules
-- Private projects will have OAuth2 proxy or similar authentication middleware configured in the ingress
-- The authentication layer will validate both user identity AND project access permissions before proxying requests to the application
+Ingress-level authentication is driven by each project's **access class** (`access_requirement`: `None` / `Authenticated` / `Member`), not the legacy `visibility` field. The Kubernetes controller is fully wired: for non-`None` access requirements it stamps nginx auth annotations (`nginx.ingress.kubernetes.io/auth-url` → `/api/v1/auth/ingress`, `auth-signin`, `auth-response-headers`) — see `ResourceBuilder::build_ingress_annotations` in `src/server/deployment/resource_builder.rs`. The subrequest is served by the `ingress_auth` handler in `src/server/auth/handlers.rs`, which validates the Rise JWT session cookie, then enforces `Authenticated` (any logged-in user) or `Member` (project owner/team member) and returns `X-Auth-Request-Email`/`X-Auth-Request-User` on success.
