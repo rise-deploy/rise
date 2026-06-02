@@ -9,7 +9,16 @@ web:
 staticClients:
 - id: rise-backend
   redirectURIs:
-  # Server-side OAuth callback (UI and ingress auth)
+  # Server-side OAuth callback for the control plane. The backend always builds
+  # this from server.public_url (`{public_url}/api/v1/auth/callback`), so it
+  # MUST match public_url's host in config/compose-docker.production.yaml
+  # (http://rise.localhost:3000). The /.rise/auth/complete step that sets the
+  # cookie on an app host is reached via an internal one-time-token redirect
+  # AFTER this callback, so only the control-plane callback is registered here.
+  - http://rise.localhost:3000/api/v1/auth/callback
+  # /.rise control-plane callback variant (custom-domain / ingress routing).
+  - http://rise.localhost:3000/.rise/auth/callback
+  # Legacy dev host (kept so the dev compose / older setups keep working).
   - http://rise.local:3000/api/v1/auth/callback
   # CLI Auth
   - http://localhost:8765/callback

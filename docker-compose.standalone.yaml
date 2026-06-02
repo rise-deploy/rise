@@ -1,3 +1,4 @@
+# =============================================================================
 # Reference standalone Docker Compose deployment of Rise (Rise + Postgres + Dex +
 # registry + Traefik) using the Docker deployment backend.
 #
@@ -12,7 +13,35 @@
 # config/compose-docker.production.yaml); Traefik is pinned to that same
 # network so it can route `*.rise.localhost` to them.
 #
+# -----------------------------------------------------------------------------
+# PRODUCTION-CAPABLE STARTING POINT — NOT PRODUCTION-READY AS-IS.
+#
+# Treat this like a Helm `values.yaml`: a sound, working base that you are
+# expected to harden before exposing it to anyone. Before any real use:
+#
+#   * REGENERATE ALL SECRETS/KEYS. The demo jwt_signing_secret, encryption key,
+#     OAuth client_secret (config/compose-docker.production.yaml) and the
+#     Postgres password below are INSECURE PLACEHOLDERS. Replace every one.
+#   * SET REAL DOMAINS + TLS. Replace `rise.localhost` with your domain, point
+#     Traefik at an ACME/cert resolver (e.g. add a `websecure` entrypoint on
+#     :443 and `--certificatesresolvers.<name>...`), set the controller's
+#     `traefik_certresolver`, and flip `cookie_secure: true` + `ingress_schema:
+#     https` in the production config.
+#   * PIN A REAL IMAGE TAG. Set RISE_IMAGE_TAG to a released version (see the
+#     `rise` service default below); do not float on `latest` in production.
+#   * REVIEW RESOURCE LIMITS. Add `deploy.resources` / ulimits per service to
+#     fit your host; none are set here.
+#   * PERSIST + BACK UP VOLUMES. The named volumes below are local; use durable
+#     storage and a backup strategy for `postgres_data` and `registry_data`.
+#   * DO NOT EXPOSE THE DEBUG DASHBOARD. The Traefik API/dashboard and DEBUG
+#     logging are OFF by default here and gated behind the `debug` profile —
+#     never enable that profile on a reachable network.
+#   * LOCK DOWN EXPOSED PORTS. Postgres (5432), the registry (5000) and Dex
+#     (5556) are published to the host for convenience; bind them to localhost
+#     or drop the host port mappings in production.
+#
 # Image tag is overridable for CI via RISE_IMAGE_REPOSITORY / RISE_IMAGE_TAG.
+# =============================================================================
 
 # Fixed project name so the network is always "rise_default", regardless of the
 # directory the stack is launched from. The Docker controller attaches app
@@ -93,10 +122,40 @@ services:
     container_name: rise-traefik
     restart: unless-stopped
     command:
-      # DEBUG surfaces the provider-negotiation line ("Provider connection
-      # established with docker <version> (API <ver>)") so an operator can
-      # confirm Traefik successfully negotiated the host Docker API version —
-      # the symptom of a too-old Traefik is "client version 1.24 is too old".
+      # Default to INFO and NO insecure API/dashboard for the reference. The
+      # insecure dashboard + DEBUG logging live in the optional `traefik-debug`
+      # service below (profile: ["debug"]) — opt in only on a trusted host.
+      #
+      # NOTE for debugging: DEBUG surfaces the provider-negotiation line
+      # ("Provider connection established with docker <version> (API <ver>)"),
+      # which confirms Traefik negotiated the host Docker API version. The
+      # symptom of a too-old Traefik is "client version 1.24 is too old"; if you
+      # see that, the v3.7.1 pin above has regressed.
+      - "--log.level=INFO"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=rise_default"
+      - "--entrypoints.web.address=:80"
+    ports:
+      - "80:80"        # app traffic: http://<project>.rise.localhost
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - default
+
+  # OPTIONAL debug Traefik (opt-in): same image/socket, but with DEBUG logging
+  # and the insecure API/dashboard on :8090. Enable ONLY on a trusted host:
+  #
+  #   docker compose -f docker-compose.standalone.yaml --profile debug up -d traefik-debug
+  #
+  # Run it INSTEAD OF the default `traefik` (it binds the same :80), e.g. stop
+  # `traefik` first, or scale it to 0. Never expose :8090 on a reachable net.
+  traefik-debug:
+    image: traefik:v3.7.1
+    container_name: rise-traefik-debug
+    restart: unless-stopped
+    profiles: ["debug"]
+    command:
       - "--log.level=DEBUG"
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"
@@ -106,7 +165,7 @@ services:
       - "--api.insecure=true"
     ports:
       - "80:80"        # app traffic: http://<project>.rise.localhost
-      - "8090:8080"    # Traefik dashboard: http://localhost:8090
+      - "8090:8080"    # Traefik dashboard: http://localhost:8090 (INSECURE)
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
@@ -116,12 +175,35 @@ services:
   # controller (config/compose-docker.production.yaml), mounting the host Docker
   # socket so it can create/route app containers.
   rise:
-    image: ${RISE_IMAGE_REPOSITORY:-ghcr.io/rise-deploy/rise}:${RISE_IMAGE_TAG:-pr-358-b98adea}
+    # Defaults to the latest released tag; override with RISE_IMAGE_TAG (CI/e2e
+    # does this) or RISE_IMAGE_REPOSITORY for a fork/mirror. Pin a specific tag
+    # in production — do not float on `latest`.
+    image: ${RISE_IMAGE_REPOSITORY:-ghcr.io/rise-deploy/rise}:${RISE_IMAGE_TAG:-0.22.1}
     container_name: rise-backend
     restart: unless-stopped
     command: ["backend", "server"]
     ports:
       - "3000:3000"
+    # The rise-backend is on `rise_default` already; these labels publish a
+    # high-priority Traefik router that catches PathPrefix(`/.rise`) on EVERY
+    # host and routes it to this backend on :3000. This mirrors the Kubernetes
+    # `/.rise -> rise-backend` Ingress path (see ResourceBuilder in
+    # src/server/deployment/resource_builder.rs) and is REQUIRED for private
+    # (forwardAuth) access classes to work: it lets the same-host
+    # /.rise/auth/signin page be served by the backend on the APP host, so the
+    # login cookie lands on the host forwardAuth reads — and it closes the
+    # auth-bypass where an app could otherwise shadow /.rise.
+    #
+    # priority=1000 must EXCEED the app routers' default (rule-length) priority
+    # so /.rise on an app host wins over the app's Host(...) router.
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.rise-dotrise.rule=PathPrefix(`/.rise`)"
+      - "traefik.http.routers.rise-dotrise.entrypoints=web"
+      - "traefik.http.routers.rise-dotrise.priority=1000"
+      - "traefik.http.routers.rise-dotrise.service=rise-dotrise"
+      - "traefik.http.services.rise-dotrise.loadbalancer.server.port=3000"
+      - "traefik.docker.network=rise_default"
     environment:
       - DATABASE_URL=postgres://${POSTGRES_USER:-rise}:${POSTGRES_PASSWORD:-rise123}@rise-postgres:5432/${POSTGRES_DB:-rise}
       - RISE_CONFIG_DIR=/etc/rise-docker

@@ -1,7 +1,29 @@
+# =============================================================================
+# INSECURE DEMO VALUES — REGENERATE BEFORE ANY REAL USE.
+#
+# This file is the reference production config for the standalone Docker Compose
+# stack. The jwt_signing_secret, encryption.key and auth.client_secret below are
+# well-known placeholders shared in the repo and provide NO security. Before
+# exposing this to anyone:
+#   * jwt_signing_secret  — replace with 32 random bytes, base64-encoded
+#                           (e.g. `openssl rand -base64 32`).
+#   * encryption.key      — replace with a fresh AES-256 key (same generation).
+#   * auth.client_secret  — replace and keep it in sync with the Dex client
+#                           secret in dev/dex/config.docker.yaml.
+#   * Postgres password   — set POSTGRES_PASSWORD in the compose env.
+# Also set real domains + TLS (cookie_secure: true, ingress_schema: https) and
+# review admin_users / platform_access for your tenancy. Do NOT rename this
+# file — docker-compose.standalone.yaml mounts it by name.
+# =============================================================================
 server:
   host: "0.0.0.0"
   port: 3000
-  public_url: "http://localhost:3000"
+  # Base public URL of the control plane. App hosts ({project}.rise.localhost)
+  # are subdomains of this host so the post-login same-host redirect validates
+  # (see validate_redirect_url in src/server/auth/handlers.rs). The control
+  # plane is still reachable on 127.0.0.1:3000; add `rise.localhost` to /etc/
+  # hosts (or rely on the .localhost → 127.0.0.1 resolver) for browser logins.
+  public_url: "http://rise.localhost:3000"
   cookie_secure: false
   jwt_signing_secret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
   jwt_claims: ["sub", "email", "name"]
@@ -45,8 +67,12 @@ deployment_controller:
   # Internal URL Traefik uses to reach the Rise backend for the forwardAuth
   # subrequest (compose service name + port).
   auth_backend_url: "http://rise:3000"
-  # Browser-facing base URL for the login redirect (Traefik has no auth-signin).
-  auth_signin_url: "http://localhost:3000"
+  # Browser-facing base URL for the login redirect. With the /.rise->backend
+  # Traefik router in place, forwardAuth builds a SAME-HOST signin redirect and
+  # this value is only the degraded fallback when X-Forwarded-Host is absent
+  # (see build_signin_redirect_url in src/server/auth/handlers.rs). Kept
+  # consistent with public_url's host.
+  auth_signin_url: "http://rise.localhost:3000"
   access_classes:
     public:
       display_name: Public
