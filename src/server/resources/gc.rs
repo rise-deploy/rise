@@ -459,13 +459,18 @@ mod tests {
         panic!("resource GC election did not acquire leadership within 5s");
     }
 
-    /// Layer the resource-store schema on top of the root migrations that
-    /// `#[sqlx::test]` already ran, mirroring the pattern in
-    /// `src/server/resources/handlers.rs` tests.
+    /// Layer the resource-store and runtime-sync schemas on top of the root
+    /// migrations that `#[sqlx::test]` already ran, mirroring the pattern in
+    /// `src/server/resources/handlers.rs` tests. The runtime-sync schema is
+    /// required because `ResourceGcController::new` spawns a `LeaderElection`
+    /// that writes to `runtime_sync.leader_leases`.
     async fn store_for(pool: PgPool) -> Arc<dyn ResourceStore> {
         rise_resource_store::run_migrations(&pool)
             .await
             .expect("resource store migrations");
+        rise_runtime_sync::run_migrations(&pool)
+            .await
+            .expect("runtime sync migrations");
         Arc::new(PgResourceStore::new(pool))
     }
 
