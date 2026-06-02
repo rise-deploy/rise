@@ -20,7 +20,7 @@ use sqlx::PgPool;
 use tracing::{debug, error, info, warn};
 
 use super::container_builder::{self, BuilderConfig, DesiredContainer, DesiredRoute};
-use super::labels::{self, SUFFIX_ENV_SECRET_HASH, SUFFIX_IMAGE, SUFFIX_MANAGED_BY};
+use super::labels::{self, SUFFIX_ENV_HASH, SUFFIX_IMAGE, SUFFIX_MANAGED_BY};
 use crate::db::models::{Deployment, DeploymentStatus, Project, TerminationReason};
 use crate::server::deployment::models::rise_system_env_vars;
 use crate::server::deployment::resource_builder::ResourceBuilder;
@@ -137,8 +137,11 @@ impl DockerReconciler {
     /// webhook's `enforce_controller_class`.
     async fn tick(&self) -> Result<()> {
         let projects = db_projects::list(&self.db_pool, None).await?;
+        // Memoize org_uid → controller-class for the duration of this tick so N
+        // projects sharing one Organization don't each trigger a store read.
+        let mut org_class_cache: HashMap<uuid::Uuid, Option<String>> = HashMap::new();
         for project in projects {
-            match self.owns_project(&project).await {
+            match self.owns_project(&project, &mut org_class_cache).await {
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(e) => {
@@ -159,7 +162,11 @@ impl DockerReconciler {
     /// Whether this controller owns `project`, i.e. the project's Organization's
     /// `deploymentControllerClass` matches `config.controller_class`. Reuses the
     /// same DB linkage helper and resource store the K8s webhook reads.
-    async fn owns_project(&self, project: &Project) -> Result<bool> {
+    async fn owns_project(
+        &self,
+        project: &Project,
+        org_class_cache: &mut HashMap<uuid::Uuid, Option<String>>,
+    ) -> Result<bool> {
         let org_uid =
             crate::db::organization_links::organization_uid_for_project(&self.db_pool, project.id)
                 .await?;
@@ -173,7 +180,9 @@ impl DockerReconciler {
             );
             return Ok(false);
         };
-        let org_class = self.resolve_org_controller_class(org_uid).await?;
+        let org_class = self
+            .resolve_org_controller_class(org_uid, org_class_cache)
+            .await?;
         Ok(controller_class_matches(
             &self.config.controller_class,
             org_class.as_deref(),
@@ -181,8 +190,16 @@ impl DockerReconciler {
     }
 
     /// Read the Organization's `spec.deploymentControllerClass` from the
-    /// resource store.
-    async fn resolve_org_controller_class(&self, org_uid: uuid::Uuid) -> Result<Option<String>> {
+    /// resource store, memoized per tick via `org_class_cache` so multiple
+    /// projects sharing one Organization only hit the store once.
+    async fn resolve_org_controller_class(
+        &self,
+        org_uid: uuid::Uuid,
+        org_class_cache: &mut HashMap<uuid::Uuid, Option<String>>,
+    ) -> Result<Option<String>> {
+        if let Some(cached) = org_class_cache.get(&org_uid) {
+            return Ok(cached.clone());
+        }
         let row = self
             .resource_store
             .get(org_uid)
@@ -191,7 +208,9 @@ impl DockerReconciler {
             .ok_or_else(|| anyhow::anyhow!("Organization {org_uid} is missing"))?;
         let spec: rise_resource_api::OrganizationSpec = serde_json::from_value(row.spec.clone())
             .map_err(|e| anyhow::anyhow!("Organization {org_uid} has malformed spec: {e}"))?;
-        Ok(spec.deployment_controller_class)
+        let class = spec.deployment_controller_class;
+        org_class_cache.insert(org_uid, class.clone());
+        Ok(class)
     }
 
     async fn reconcile_project(&self, project: &Project) -> Result<()> {
@@ -431,21 +450,13 @@ impl DockerReconciler {
             base_env.push((ev.name.clone(), ev.value.clone().unwrap_or_default()));
         }
         // Secret env vars become plain KEY=VALUE entries (documented caveat:
-        // visible in `docker inspect`). Hash them for drift detection.
-        let mut secret_hasher = Sha256::new();
+        // visible in `docker inspect`). They're included in the per-container
+        // env hash below alongside plain + system vars so drift in any kind of
+        // variable forces recreation.
         for (key, value) in &resolved.secret_env_vars {
             let plain = String::from_utf8_lossy(&value.0).to_string();
-            secret_hasher.update((key.len() as u64).to_le_bytes());
-            secret_hasher.update(key.as_bytes());
-            secret_hasher.update((value.0.len() as u64).to_le_bytes());
-            secret_hasher.update(&value.0);
             base_env.push((key.clone(), plain));
         }
-        let env_secret_hash: String = secret_hasher
-            .finalize()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
 
         let system_env = rise_system_env_vars(
             &self.config.public_url,
@@ -469,16 +480,36 @@ impl DockerReconciler {
             source_deployment_id.as_deref(),
         );
 
+        // Superseded deployments keep their container running until the active
+        // replacement is healthy, but must not stay routable (otherwise two
+        // Traefik routers match the same Host during the supersession window).
+        let routable = deployment.status != DeploymentStatus::Terminating;
+
         // Build a desired container per spec. Clamp replicas to 1 for now.
         // TODO(replicas): run N containers sharing one Traefik service to
         // load-balance. Until then a single container serves each spec.
         let mut out = Vec::with_capacity(container_specs.len());
         for spec in &container_specs {
+            // A Docker deployment runs exactly one container per spec; requested
+            // replicas>1 are silently served by a single container today. Warn so
+            // users aren't unknowingly under-provisioned.
+            if spec.replicas.is_some_and(|r| r > 1) {
+                warn!(
+                    deployment_id = %deployment.deployment_id,
+                    container = %spec.name,
+                    requested = spec.replicas.unwrap_or(1),
+                    "Docker backend does not support replicas>1; running a single container"
+                );
+            }
             let mut env = merge_container_env(&base_env, &system_env, spec, env_name.as_deref());
             // Pin PORT to this container's declared port.
             if let Some(port) = spec.port {
                 upsert_env(&mut env, "PORT", &port.to_string());
             }
+            // Hash the *entire* final merged env (plain + system + secret), over
+            // a deterministically-sorted copy, so drift in any variable forces
+            // recreation. PORT is already pinned above so it participates too.
+            let env_hash = hash_env(&env);
 
             // Routes for this container: the route specs targeting it × the
             // project's primary hosts. A single-container app has a `/` route.
@@ -506,9 +537,9 @@ impl DockerReconciler {
                     .clone()
                     .unwrap_or_else(|| deployment.memory.clone()),
                 env,
-                env_secret_hash: env_secret_hash.clone(),
+                env_hash,
                 routes: container_routes,
-                health_path: Some(self.config.health_path.clone()),
+                routable,
             });
         }
 
@@ -525,6 +556,12 @@ impl DockerReconciler {
         // the configured controller-class, and this project. Without the
         // controller-class filter the GC pass could remove containers another
         // Rise controller owns on the same host.
+        //
+        // NOTE: containers carry the controller-class they were created under as
+        // a label. Renaming an Organization's `deploymentControllerClass` (or
+        // this controller's configured class) leaves previously-created
+        // containers under the old class invisible to this filter — they are
+        // neither reconciled nor GC'd and must be cleaned up manually.
         filters.insert(
             "label".to_string(),
             vec![
@@ -562,9 +599,7 @@ impl DockerReconciler {
                     id: s.id.unwrap_or_default(),
                     name,
                     image_label: labels.get(&labels::ns_key(ns, SUFFIX_IMAGE)).cloned(),
-                    env_secret_hash_label: labels
-                        .get(&labels::ns_key(ns, SUFFIX_ENV_SECRET_HASH))
-                        .cloned(),
+                    env_hash_label: labels.get(&labels::ns_key(ns, SUFFIX_ENV_HASH)).cloned(),
                     // Daemon-reported lifecycle state ("running", "exited",
                     // "created", "dead", …). Used by the diff to restart
                     // containers that exist but aren't running.
@@ -842,18 +877,53 @@ impl DockerReconciler {
         Ok(())
     }
 
-    /// HTTP health probe over the shared Traefik network using the container's
-    /// name as hostname (Docker DNS resolves it within the network). Reuses the
-    /// reconciler's shared `reqwest::Client`.
+    /// HTTP health probe against the container's IP on the configured Traefik
+    /// network. The reconciler runs in the rise server process (on the host in
+    /// the documented dev setup), where the container *name* only resolves via
+    /// Docker DNS from inside `traefik_network` — not from the host. So we
+    /// inspect the container and probe its network IP directly. Reuses the
+    /// reconciler's shared `reqwest::Client` and its `status < 500` semantics.
+    /// A missing IP (container not yet attached/started) is treated as
+    /// not-ready rather than an error.
     async fn probe_container(&self, container_name: &str, port: u16) -> bool {
-        let url = format!(
-            "http://{}:{}{}",
-            container_name, port, self.config.health_path
-        );
+        let ip = match self.container_network_ip(container_name).await {
+            Some(ip) => ip,
+            None => {
+                debug!(
+                    container = %container_name,
+                    network = %self.config.traefik_network,
+                    "Container has no IP on the Traefik network yet; treating as not-ready"
+                );
+                return false;
+            }
+        };
+        let url = format!("http://{}:{}{}", ip, port, self.config.health_path);
         match self.http_client.get(&url).send().await {
             Ok(resp) => resp.status().as_u16() < 500,
             Err(_) => false,
         }
+    }
+
+    /// Resolve the container's IPv4 address on the configured Traefik network
+    /// via `inspect_container`. Returns `None` if the container is missing, not
+    /// attached to the network, or has no address assigned yet.
+    async fn container_network_ip(&self, container_name: &str) -> Option<String> {
+        let inspect = match self.docker.inspect_container(container_name, None).await {
+            Ok(inspect) => inspect,
+            Err(e) => {
+                debug!(
+                    container = %container_name,
+                    "Failed to inspect container for health probe: {:?}", e
+                );
+                return None;
+            }
+        };
+        inspect
+            .network_settings
+            .and_then(|ns| ns.networks)
+            .and_then(|mut nets| nets.remove(&self.config.traefik_network))
+            .and_then(|ep| ep.ip_address)
+            .filter(|ip| !ip.is_empty())
     }
 
     /// Whether the named container exists and the daemon reports it `running`.
@@ -959,7 +1029,7 @@ pub struct ActualContainer {
     pub id: String,
     pub name: String,
     pub image_label: Option<String>,
-    pub env_secret_hash_label: Option<String>,
+    pub env_hash_label: Option<String>,
     /// Daemon-reported lifecycle state (e.g. "running", "exited", "created",
     /// "dead"). `None` when the daemon didn't report it. A container that
     /// matches on image + env but is not "running" (created-but-not-started,
@@ -979,7 +1049,7 @@ impl ActualContainer {
 pub enum ReconcileAction {
     /// No matching actual container — create + start it.
     Create { name: String },
-    /// Actual exists but drifted (image or env-secret-hash) — replace it.
+    /// Actual exists but drifted (image or env-hash) — replace it.
     Recreate { name: String, existing_id: String },
     /// Actual exists with no desired match — garbage-collect it.
     Remove { id: String, name: String },
@@ -1020,8 +1090,7 @@ pub fn diff_desired_vs_actual(
             Some(a) => {
                 matched_actual.insert(name.clone());
                 let image_drift = a.image_label.as_deref() != Some(d.image.as_str());
-                let env_drift =
-                    a.env_secret_hash_label.as_deref() != Some(d.env_secret_hash.as_str());
+                let env_drift = a.env_hash_label.as_deref() != Some(d.env_hash.as_str());
                 // A container that matches on image + env but isn't running
                 // (created-but-never-started, exited, or out of restart
                 // retries) must be recreated so the deployment recovers.
@@ -1111,6 +1180,29 @@ fn upsert_env(env: &mut Vec<(String, String)>, key: &str, value: &str) {
     }
 }
 
+/// Stable sha256 of a merged env vector, used as the drift label. Hashes the
+/// *entire* set (plain + system/RISE_* + secret) over a deterministically
+/// key-sorted copy with length-prefixed key/value framing, so reordering can't
+/// change the digest while any add/edit/delete of any variable does. Editing or
+/// deleting any env var therefore changes the `env-hash` label and forces the
+/// reconciler to recreate the container.
+pub fn hash_env(env: &[(String, String)]) -> String {
+    let mut sorted: Vec<&(String, String)> = env.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let mut hasher = Sha256::new();
+    for (k, v) in sorted {
+        hasher.update((k.len() as u64).to_le_bytes());
+        hasher.update(k.as_bytes());
+        hasher.update((v.len() as u64).to_le_bytes());
+        hasher.update(v.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1129,12 +1221,12 @@ mod tests {
             cpu: "500m".to_string(),
             memory: "256Mi".to_string(),
             env: vec![],
-            env_secret_hash: hash.to_string(),
+            env_hash: hash.to_string(),
             routes: vec![DesiredRoute {
                 hosts: vec!["myapp.rise.dev".to_string()],
                 path_prefix: None,
             }],
-            health_path: Some("/".to_string()),
+            routable: true,
         }
     }
 
@@ -1162,7 +1254,7 @@ mod tests {
             id: "cid".to_string(),
             name: name_of(&d),
             image_label: Some("img:1".to_string()),
-            env_secret_hash_label: Some("h1".to_string()),
+            env_hash_label: Some("h1".to_string()),
             state: Some("running".to_string()),
         }];
         let actions = diff_desired_vs_actual(&[d], &actual, "rise");
@@ -1176,7 +1268,7 @@ mod tests {
             id: "cid".to_string(),
             name: name_of(&d),
             image_label: Some("img:1".to_string()),
-            env_secret_hash_label: Some("h1".to_string()),
+            env_hash_label: Some("h1".to_string()),
             state: Some("running".to_string()),
         }];
         let actions = diff_desired_vs_actual(std::slice::from_ref(&d), &actual, "rise");
@@ -1196,7 +1288,7 @@ mod tests {
             id: "cid".to_string(),
             name: name_of(&d),
             image_label: Some("img:1".to_string()),
-            env_secret_hash_label: Some("h1".to_string()),
+            env_hash_label: Some("h1".to_string()),
             state: Some("running".to_string()),
         }];
         let actions = diff_desired_vs_actual(std::slice::from_ref(&d), &actual, "rise");
@@ -1219,7 +1311,7 @@ mod tests {
                 id: "cid".to_string(),
                 name: name_of(&d),
                 image_label: Some("img:1".to_string()),
-                env_secret_hash_label: Some("h1".to_string()),
+                env_hash_label: Some("h1".to_string()),
                 state: state.map(str::to_string),
             }];
             let actions = diff_desired_vs_actual(std::slice::from_ref(&d), &actual, "rise");
@@ -1240,7 +1332,7 @@ mod tests {
             id: "old".to_string(),
             name: "rise_myapp_default_oldid_app".to_string(),
             image_label: Some("img:1".to_string()),
-            env_secret_hash_label: Some("h1".to_string()),
+            env_hash_label: Some("h1".to_string()),
             state: Some("running".to_string()),
         }];
         let actions = diff_desired_vs_actual(&[], &actual, "rise");
@@ -1261,7 +1353,7 @@ mod tests {
             id: "old".to_string(),
             name: "rise_myapp_default_oldid_app".to_string(),
             image_label: Some("img:1".to_string()),
-            env_secret_hash_label: Some("h1".to_string()),
+            env_hash_label: Some("h1".to_string()),
             state: Some("running".to_string()),
         }];
         let actions = diff_desired_vs_actual(std::slice::from_ref(&new), &actual, "rise");
@@ -1354,5 +1446,44 @@ mod tests {
         assert!(!merged.iter().any(|(k, _)| k == "ONLY_PROD"));
         let merged_prod = merge_container_env(&[], &[], &spec, Some("production"));
         assert!(merged_prod.iter().any(|(k, _)| k == "ONLY_PROD"));
+    }
+
+    #[test]
+    fn hash_env_is_order_independent_but_value_sensitive() {
+        let a = vec![
+            ("A".to_string(), "1".to_string()),
+            ("B".to_string(), "2".to_string()),
+        ];
+        let b = vec![
+            ("B".to_string(), "2".to_string()),
+            ("A".to_string(), "1".to_string()),
+        ];
+        // Reordering the same set yields the same hash.
+        assert_eq!(hash_env(&a), hash_env(&b));
+        // Changing a value changes the hash.
+        let changed = vec![
+            ("A".to_string(), "1".to_string()),
+            ("B".to_string(), "3".to_string()),
+        ];
+        assert_ne!(hash_env(&a), hash_env(&changed));
+        // Deleting a var changes the hash.
+        let deleted = vec![("A".to_string(), "1".to_string())];
+        assert_ne!(hash_env(&a), hash_env(&deleted));
+        // Adding a plain var changes the hash (the core drift bug this fixes).
+        let mut added = a.clone();
+        added.push(("C".to_string(), "3".to_string()));
+        assert_ne!(hash_env(&a), hash_env(&added));
+    }
+
+    #[test]
+    fn hash_env_avoids_delimiter_collisions() {
+        // Length-prefixed framing means `{A:"B", : "C"}`-style splits can't
+        // collide with `{A:"BC"}`-style merges.
+        let split = vec![
+            ("A".to_string(), "B".to_string()),
+            ("C".to_string(), "D".to_string()),
+        ];
+        let merged = vec![("A".to_string(), "BCD".to_string())];
+        assert_ne!(hash_env(&split), hash_env(&merged));
     }
 }

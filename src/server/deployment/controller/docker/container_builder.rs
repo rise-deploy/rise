@@ -8,9 +8,7 @@
 use std::collections::HashMap;
 
 use bollard::container::Config;
-use bollard::secret::{
-    EndpointSettings, HealthConfig, HostConfig, RestartPolicy, RestartPolicyNameEnum,
-};
+use bollard::secret::{EndpointSettings, HostConfig, RestartPolicy, RestartPolicyNameEnum};
 
 use super::labels::{self, BookkeepingLabels, TraefikRoute};
 use crate::server::deployment::quantity::{parse_cpu_millicores, parse_memory_bytes};
@@ -43,12 +41,17 @@ pub struct DesiredContainer {
     pub memory: String,
     /// Merged env vars as `(KEY, VALUE)` pairs, already in final precedence.
     pub env: Vec<(String, String)>,
-    /// sha256 of the secret env material; drift here forces recreation.
-    pub env_secret_hash: String,
+    /// sha256 of the *entire* merged env (plain + system/RISE_* + secret),
+    /// computed over a deterministically-sorted copy. Drift here forces
+    /// recreation, so editing/deleting any env var of any kind recreates the
+    /// container. See [`super::reconciler::hash_env`].
+    pub env_hash: String,
     /// Routes for this container (empty for workers / unrouted containers).
     pub routes: Vec<DesiredRoute>,
-    /// Health-probe path used for the optional Docker HEALTHCHECK.
-    pub health_path: Option<String>,
+    /// Whether this container should be routable (emit Traefik router/service
+    /// labels). `false` for superseded (`Terminating`) deployments so their
+    /// `Host(...)` rule is dropped and only the active deployment is routed.
+    pub routable: bool,
 }
 
 /// Static controller configuration the builder needs.
@@ -129,12 +132,16 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
         deployment_uuid: &desired.deployment_uuid,
         container: &desired.container,
         environment: desired.environment.as_deref(),
-        env_secret_hash: &desired.env_secret_hash,
+        env_hash: &desired.env_hash,
         image: &desired.image,
     }
     .render();
 
-    if let Some(port) = desired.port {
+    // Superseded (Terminating) deployments keep their container running until
+    // the active replacement is healthy, but must not advertise a Traefik
+    // router — otherwise two routers match the same Host during the
+    // supersession window and traffic can land on the old deployment.
+    if let Some(port) = desired.port.filter(|_| desired.routable) {
         // One router per (host-set × route). Single-container apps have a single
         // `/` route, so this yields exactly one router. Longest path-prefix
         // first matches the nginx semantics used by the K8s path.
@@ -192,24 +199,12 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
         .ok()
         .map(|bytes| bytes as i64);
 
-    // ── Health check (best-effort Docker HEALTHCHECK) ──────────────────
-    // The reconciler's HTTP probe is the source of truth; this is a bonus so
-    // `docker ps` shows health. We use wget/curl-free shell-less form when we
-    // only have a path: prefer a simple TCP-ish check via the shell.
-    let healthcheck = match (desired.port, desired.health_path.as_deref()) {
-        (Some(port), Some(path)) => Some(HealthConfig {
-            test: Some(vec![
-                "CMD-SHELL".to_string(),
-                format!("wget -q -O /dev/null http://127.0.0.1:{port}{path} || exit 1"),
-            ]),
-            interval: Some(10_000_000_000), // 10s
-            timeout: Some(5_000_000_000),   // 5s
-            retries: Some(3),
-            start_period: Some(10_000_000_000), // 10s
-            start_interval: None,
-        }),
-        _ => None,
-    };
+    // ── Health check ────────────────────────────────────────────────────
+    // We deliberately inject *no* Docker HEALTHCHECK. The reconciler's HTTP
+    // probe (over the Traefik network) is the single source of truth for
+    // deployment health. A baked-in `wget`/`curl` check breaks on the many
+    // images that ship neither (distroless / scratch / slim), surfacing a
+    // misleading `unhealthy` status in `docker ps` with no bearing on routing.
 
     // ── Network attachment ─────────────────────────────────────────────
     let mut endpoints = HashMap::new();
@@ -230,7 +225,6 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
         image: Some(desired.image.clone()),
         env: if env.is_empty() { None } else { Some(env) },
         labels: Some(all_labels),
-        healthcheck,
         host_config: Some(host_config),
         networking_config: Some(bollard::container::NetworkingConfig {
             endpoints_config: endpoints,
@@ -275,12 +269,12 @@ mod tests {
                     "https://myapp.rise.dev".to_string(),
                 ),
             ],
-            env_secret_hash: "abc123".to_string(),
+            env_hash: "abc123".to_string(),
             routes: vec![DesiredRoute {
                 hosts: vec!["myapp.rise.dev".to_string()],
                 path_prefix: None,
             }],
-            health_path: Some("/".to_string()),
+            routable: true,
         }
     }
 
@@ -318,7 +312,7 @@ mod tests {
             Some("myapp")
         );
         assert_eq!(
-            labels.get("rise.dev/env-secret-hash").map(String::as_str),
+            labels.get("rise.dev/env-hash").map(String::as_str),
             Some("abc123")
         );
         assert_eq!(
@@ -374,6 +368,26 @@ mod tests {
         assert_eq!(
             labels.get("rise.dev/container").map(String::as_str),
             Some("worker")
+        );
+    }
+
+    #[test]
+    fn non_routable_container_drops_traefik_labels() {
+        // A superseded (Terminating) deployment keeps its container running but
+        // must not advertise a Traefik router, so only the active deployment is
+        // routable for the shared Host during the supersession window.
+        let mut desired = single_container();
+        desired.routable = false;
+        let built = build_container(&desired, &test_cfg());
+        let labels = built.config.labels.as_ref().unwrap();
+        assert!(!labels.contains_key("traefik.enable"));
+        assert!(!labels
+            .keys()
+            .any(|k| k.starts_with("traefik.http.routers.")));
+        // Bookkeeping labels still present so GC/diff can find the container.
+        assert_eq!(
+            labels.get("rise.dev/container").map(String::as_str),
+            Some("app")
         );
     }
 

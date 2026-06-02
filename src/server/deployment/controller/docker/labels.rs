@@ -4,7 +4,7 @@
 //!
 //! 1. **Bookkeeping** — `{ns}/managed-by=rise`, `/controller-class`,
 //!    `/project`, `/deployment-group`, `/deployment-id`, `/deployment-uuid`,
-//!    `/container`, `/environment`, `/env-secret-hash`, `/image`. Used by the
+//!    `/container`, `/environment`, `/env-hash`, `/image`. Used by the
 //!    reconciler to find Rise containers, detect drift (image / env hash), and
 //!    GC orphans.
 //! 2. **Traefik** — `traefik.enable`, the per-router `Host(...)` rule,
@@ -22,7 +22,7 @@ pub const SUFFIX_DEPLOYMENT_ID: &str = "deployment-id";
 pub const SUFFIX_DEPLOYMENT_UUID: &str = "deployment-uuid";
 pub const SUFFIX_CONTAINER: &str = "container";
 pub const SUFFIX_ENVIRONMENT: &str = "environment";
-pub const SUFFIX_ENV_SECRET_HASH: &str = "env-secret-hash";
+pub const SUFFIX_ENV_HASH: &str = "env-hash";
 pub const SUFFIX_IMAGE: &str = "image";
 
 /// Build a namespaced bookkeeping label key, e.g. `rise.dev/project`.
@@ -40,7 +40,7 @@ pub struct BookkeepingLabels<'a> {
     pub deployment_uuid: &'a str,
     pub container: &'a str,
     pub environment: Option<&'a str>,
-    pub env_secret_hash: &'a str,
+    pub env_hash: &'a str,
     pub image: &'a str,
 }
 
@@ -71,10 +71,7 @@ impl BookkeepingLabels<'_> {
         if let Some(env) = self.environment {
             labels.insert(ns_key(ns, SUFFIX_ENVIRONMENT), env.to_string());
         }
-        labels.insert(
-            ns_key(ns, SUFFIX_ENV_SECRET_HASH),
-            self.env_secret_hash.to_string(),
-        );
+        labels.insert(ns_key(ns, SUFFIX_ENV_HASH), self.env_hash.to_string());
         labels.insert(ns_key(ns, SUFFIX_IMAGE), self.image.to_string());
         labels
     }
