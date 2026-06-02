@@ -3,10 +3,12 @@ set -euo pipefail
 
 # End-to-end smoke test for the Rise Docker deployment backend.
 #
-# Brings up the reference standalone stack (docker-compose.standalone.yaml:
-# Rise + Postgres + Dex + registry + Traefik), then exercises the Docker
-# deployment controller end to end against a FRESH database (volumes are
-# removed on teardown), proving no manual workarounds are needed:
+# Brings up the reference standalone stack with the local/e2e overlay
+# (docker-compose.standalone.yaml + docker-compose.standalone.local.yaml:
+# Rise + Postgres + Dex + registry + Traefik over plain HTTP on rise.localhost),
+# then exercises the Docker deployment controller end to end against a FRESH
+# database (volumes are removed on teardown), proving no manual workarounds are
+# needed:
 #
 #   (a) public  — a `public` (access_requirement None) project deploys, the
 #       Rise API reports it Healthy WITHOUT any manual SQL, and it is
@@ -27,9 +29,13 @@ set -euo pipefail
 # cookie (the ingress handler validates it via verify_jwt_skip_aud).
 #
 # Image is overridable via RISE_IMAGE_REPOSITORY / RISE_IMAGE_TAG (consumed by
-# docker-compose.standalone.yaml); defaults match the compose file.
+# both compose files); CI sets RISE_IMAGE_TAG to the built image.
 
+# Base file + local/e2e overlay (HTTP on rise.localhost; no TLS/ACME). Both -f
+# files are passed to every compose invocation via COMPOSE_ARGS.
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.standalone.yaml}"
+COMPOSE_LOCAL_OVERLAY="${COMPOSE_LOCAL_OVERLAY:-docker-compose.standalone.local.yaml}"
+COMPOSE_ARGS=(-f "${COMPOSE_FILE}" -f "${COMPOSE_LOCAL_OVERLAY}")
 RISE_IMAGE_REPOSITORY="${RISE_IMAGE_REPOSITORY:-ghcr.io/rise-deploy/rise}"
 RISE_IMAGE_TAG="${RISE_IMAGE_TAG:-pr-358-b98adea}"
 export RISE_IMAGE_REPOSITORY RISE_IMAGE_TAG
@@ -140,7 +146,7 @@ cleanup() {
   local exit_code=$?
   if [[ ${exit_code} -ne 0 ]]; then
     log "Failure (exit ${exit_code}) — dumping diagnostics"
-    docker compose -f "${COMPOSE_FILE}" ps || true
+    docker compose "${COMPOSE_ARGS[@]}" ps || true
     docker logs rise-backend --tail 100 2>&1 || true
     docker logs rise-traefik --tail 50 2>&1 || true
   fi
@@ -155,7 +161,7 @@ cleanup() {
     # shellcheck disable=SC2086
     docker rm -f ${app_containers} >/dev/null 2>&1 || true
   fi
-  docker compose -f "${COMPOSE_FILE}" down -v || true
+  docker compose "${COMPOSE_ARGS[@]}" down -v || true
   rm -rf "${E2E_TMPDIR}" || true
 }
 trap cleanup EXIT
@@ -165,8 +171,8 @@ mkdir -p "${E2E_TMPDIR}"
 log "Bringing up standalone stack (${RISE_IMAGE_REPOSITORY}:${RISE_IMAGE_TAG})"
 # Fresh volumes: a clean Postgres proves the org's deploymentControllerClass is
 # stamped automatically at bootstrap (no manual SQL).
-docker compose -f "${COMPOSE_FILE}" down -v || true
-docker compose -f "${COMPOSE_FILE}" up -d
+docker compose "${COMPOSE_ARGS[@]}" down -v || true
+docker compose "${COMPOSE_ARGS[@]}" up -d
 
 log "Waiting for Rise /health"
 for _ in $(seq 1 60); do

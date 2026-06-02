@@ -1,0 +1,61 @@
+# =============================================================================
+# Local / e2e overlay for the standalone Rise stack. Layer it ON TOP of
+# docker-compose.standalone.yaml:
+#
+#   docker compose -f docker-compose.standalone.yaml \
+#                  -f docker-compose.standalone.local.yaml up -d
+#
+# Effect: plain HTTP on *.rise.localhost, no TLS, no Let's Encrypt. This is what
+# the e2e (scripts/ci/e2e-docker.sh) and a quick local try use. No RISE_DOMAIN /
+# ACME_EMAIL needed.
+#
+#   * Traefik: single `web` (:80) entrypoint — NO websecure, NO ACME, NO HTTP->
+#     HTTPS redirect. The label-based routers in the base file that target the
+#     `websecure` entrypoint simply have no matching entrypoint here and are
+#     inert; the /.rise router is re-stamped onto `web` below.
+#   * rise: mounts the HTTP local config (config/compose-docker.local.yaml) and
+#     re-stamps the /.rise router onto the `web` entrypoint (no TLS).
+# =============================================================================
+
+services:
+  traefik:
+    command:
+      - "--log.level=INFO"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=rise_default"
+      - "--entrypoints.web.address=:80"
+    # Sequences are replaced (not merged) on override, so this drops 443.
+    ports:
+      - "80:80"        # app traffic: http://<project>.rise.localhost
+
+  # Dex stays internal in local mode; the public dex.${RISE_DOMAIN} router is
+  # dropped (issuer is rise-dex:5556 over the compose network + host port).
+  dex:
+    labels: !reset []
+
+  registry:
+    # Drop the public Traefik exposure + basicauth; keep the :5000 host port.
+    labels: !reset []
+
+  rise:
+    image: ${RISE_IMAGE_REPOSITORY:-ghcr.io/rise-deploy/rise}:${RISE_IMAGE_TAG:-0.22.0}
+    # Labels normalize to maps and MERGE across files (a sequence/!reset does
+    # NOT cleanly re-add), so instead of touching the base `rise-dotrise`
+    # router we ADD a sibling `rise-dotrise-web` router on the plain `web`
+    # entrypoint with no TLS. The base `rise-dotrise` router targets the
+    # `websecure` entrypoint + `le` resolver, neither of which exists in the
+    # local overlay, so it is inert here.
+    labels:
+      - "traefik.http.routers.rise-dotrise-web.rule=PathPrefix(`/.rise`)"
+      - "traefik.http.routers.rise-dotrise-web.entrypoints=web"
+      - "traefik.http.routers.rise-dotrise-web.priority=1000"
+      - "traefik.http.routers.rise-dotrise-web.service=rise-dotrise-web"
+      - "traefik.http.services.rise-dotrise-web.loadbalancer.server.port=3000"
+    environment:
+      - DATABASE_URL=postgres://${POSTGRES_USER:-rise}:${POSTGRES_PASSWORD:-rise123}@rise-postgres:5432/${POSTGRES_DB:-rise}
+      - RISE_CONFIG_DIR=/etc/rise-docker
+      - RISE_CONFIG_RUN_MODE=production
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./config/compose-docker.local.yaml:/etc/rise-docker/production.yaml:ro

@@ -1,4 +1,4 @@
-issuer: http://localhost:5556/dex
+issuer: http://rise-dex:5556/dex
 
 storage:
   type: memory
@@ -9,8 +9,15 @@ web:
 staticClients:
 - id: rise-backend
   redirectURIs:
-  # Server-side OAuth callback (UI and ingress auth)
+  # Server-side OAuth callback for the control plane. The backend always builds
+  # this from server.public_url (`{public_url}/api/v1/auth/callback`), so each
+  # entry MUST match a public_url host used by one of the stacks.
+  # Dev stack (docker-compose.yml) + legacy host dev:
   - http://rise.local:3000/api/v1/auth/callback
+  # Standalone local/e2e stack (config/compose-docker.local.yaml):
+  - http://rise.localhost:3000/api/v1/auth/callback
+  # /.rise control-plane callback variant (custom-domain / ingress routing).
+  - http://rise.localhost:3000/.rise/auth/callback
   # CLI Auth
   - http://localhost:8765/callback
   - http://localhost:8766/callback

@@ -26,7 +26,7 @@ run = "./scripts/dev-setup.sh down"
 [tasks.dev]
 run = """
 issues=""
-for h in rise-registry rise-jfrog rise.local; do
+for h in rise-registry rise-jfrog rise.local rise-dex; do
   if ! awk -v h="$h" '{for(i=1;i<=NF;i++) if($i==h){found=1;exit}} END{exit !found}' /etc/hosts 2>/dev/null; then
     issues="${issues}\n  - /etc/hosts missing '$h'  →  mise setup hosts"
   fi

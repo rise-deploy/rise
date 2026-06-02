@@ -30,7 +30,7 @@ encryption:
   key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" # Generate with: openssl rand -base64 32
 
 auth:
-  issuer: "http://localhost:5556/dex"
+  issuer: "http://rise-dex:5556/dex"
   client_id: "rise-backend"
   client_secret: "rise-backend-secret"
   admin_users:
