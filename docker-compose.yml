@@ -95,6 +95,12 @@ services:
       - "8090:8080"    # Traefik dashboard: http://localhost:8090
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+    # Join the compose default network ("rise_default") explicitly so Traefik is
+    # on the same network as the app containers it routes to. The Docker provider
+    # is pinned to this network via --providers.docker.network=rise_default, so
+    # Traefik must be a member to reach the backends.
+    networks:
+      - default
 
   # HashiCorp Vault with JFrog Artifactory secrets plugin.
   # Automatically configures itself and JFrog on startup.

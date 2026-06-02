@@ -466,20 +466,40 @@ struct DockerLogBackend {
 
 impl DockerLogBackend {
     /// Find the most relevant container id for a deployment by its
-    /// `<label_namespace>/deployment-id` label. Prefers a running container.
-    async fn resolve_container_id(&self, deployment: &Deployment) -> Result<Option<String>> {
-        use crate::server::deployment::controller::docker::labels::{self, SUFFIX_DEPLOYMENT_ID};
+    /// `<label_namespace>/deployment-id` label, scoped to the owning project.
+    /// Prefers a running container.
+    ///
+    /// `deployment_id` is a `YYYYMMDD-HHMMSS` timestamp that is unique only
+    /// *per project* (DB constraint `UNIQUE (deployment_id, project_id)`), so
+    /// filtering on it alone could resolve to another project's container —
+    /// a tenant-isolation breach. We therefore also scope by the `project`
+    /// label (matching `project.name`, exactly as the reconciler stamps it)
+    /// plus `managed-by=rise` for defense-in-depth, mirroring
+    /// `list_actual_containers`.
+    async fn resolve_container_id(
+        &self,
+        deployment: &Deployment,
+        project: &Project,
+    ) -> Result<Option<String>> {
+        use crate::server::deployment::controller::docker::labels::{
+            self, SUFFIX_DEPLOYMENT_ID, SUFFIX_MANAGED_BY, SUFFIX_PROJECT,
+        };
         use bollard::container::ListContainersOptions;
         use std::collections::HashMap as StdHashMap;
 
+        let ns = &self.label_namespace;
         let mut filters: StdHashMap<String, Vec<String>> = StdHashMap::new();
         filters.insert(
             "label".to_string(),
-            vec![format!(
-                "{}={}",
-                labels::ns_key(&self.label_namespace, SUFFIX_DEPLOYMENT_ID),
-                deployment.deployment_id
-            )],
+            vec![
+                format!("{}={}", labels::ns_key(ns, SUFFIX_MANAGED_BY), "rise"),
+                format!("{}={}", labels::ns_key(ns, SUFFIX_PROJECT), project.name),
+                format!(
+                    "{}={}",
+                    labels::ns_key(ns, SUFFIX_DEPLOYMENT_ID),
+                    deployment.deployment_id
+                ),
+            ],
         );
         let summaries = self
             .docker
@@ -517,7 +537,7 @@ impl RuntimeLogBackend for DockerLogBackend {
     async fn stream_logs(
         &self,
         deployment: &Deployment,
-        _project: &Project,
+        project: &Project,
         query: LogQuery,
     ) -> Result<LogEventStream> {
         use bollard::container::LogsOptions;
@@ -538,7 +558,7 @@ impl RuntimeLogBackend for DockerLogBackend {
             }));
         }
 
-        let Some(container_id) = self.resolve_container_id(deployment).await? else {
+        let Some(container_id) = self.resolve_container_id(deployment, project).await? else {
             return Ok(status_stream(LogStatus {
                 reason: LogStatusReason::HistoricalBackendNotConfigured,
                 message: Some(
