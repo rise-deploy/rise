@@ -29,21 +29,21 @@ use rise_resource_store::{
     CreateResourceParams, OrganizationValidator, ResourceRow, ResourceStore, UpdateResourceParams,
 };
 use sqlx::PgPool;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::db::organization_links;
 use crate::server::settings::{
     DefaultOrganizationSettings, DeploymentControllerSettings, Settings,
 };
-use rise_runtime_sync::GlobalLock;
+use rise_runtime_sync::with_global_lock;
 
 /// Annotation key on the default Organization that the Kubernetes controller
 /// reads to determine its per-project namespace prefix.
 pub const NAMESPACE_PREFIX_ANNOTATION: &str = "kubernetes.rise.dev/namespace-prefix";
 
-/// Name of the install-wide [`GlobalLock`] that serializes the bootstrap pass
-/// across replicas. Scoped string ("subsystem/purpose") to avoid colliding
-/// with other `GlobalLock` callers.
+/// Name of the install-wide advisory lock (taken via [`with_global_lock`]) that
+/// serializes the bootstrap pass across replicas. Scoped string
+/// ("subsystem/purpose") to avoid colliding with other lock callers.
 const BOOTSTRAP_LOCK_NAME: &str = "bootstrap/default-organization";
 
 /// Result of the bootstrap pass — surfaced for tests and so the rest of the
@@ -78,15 +78,12 @@ pub async fn run(
     info!("Running default-Organization bootstrap");
 
     // Serialize bootstrap across replicas via a session-scoped advisory lock.
-    // Bind the outcome before releasing so a failure in `run_inner` still
-    // hits the explicit release path — see `GlobalLock` docs for why Drop
-    // alone is not sufficient.
-    let lock = GlobalLock::acquire(pool, BOOTSTRAP_LOCK_NAME).await?;
-    let outcome = run_inner(pool, store, settings).await;
-    if let Err(e) = lock.release().await {
-        warn!("Failed to release bootstrap GlobalLock: {:?}", e);
-    }
-    outcome
+    // `with_global_lock` frees the lock on every exit path — including an error
+    // or panic inside `run_inner` — so there's no manual release to forget.
+    with_global_lock(pool, BOOTSTRAP_LOCK_NAME, || async move {
+        run_inner(pool, store, settings).await
+    })
+    .await
 }
 
 async fn run_inner(

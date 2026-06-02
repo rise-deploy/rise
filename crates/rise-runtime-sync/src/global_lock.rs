@@ -3,32 +3,50 @@
 //! Wraps `pg_advisory_lock` / `pg_advisory_unlock` so callers don't have to
 //! manage connections, hash keys, or release paths themselves. The lock is
 //! held by a single dedicated [`PoolConnection`] for the lifetime of the
-//! [`GlobalLock`] value; [`GlobalLock::release`] performs the explicit
-//! `pg_advisory_unlock` before returning the connection to the pool.
+//! [`GlobalLock`] value.
 //!
-//! # Why the explicit `release()` is required
+//! # Release semantics
 //!
 //! Postgres session-scoped advisory locks are released only when the SQL
-//! session ends. `sqlx`'s [`PoolConnection::Drop`] does **not** close the
-//! session — it returns the connection to the pool, where the next checkout
-//! reuses the same session and inherits the lock. If a caller drops a
-//! `GlobalLock` without calling [`release`](Self::release), the lock can
-//! persist until the pool evicts the connection, which on a busy backend may
-//! be never. Other replicas waiting on the same lock would then deadlock.
+//! *session* ends. There are two ways that happens here:
 //!
-//! `Drop` can't `await`, so the only enforcement is a logged error. Callers
-//! must always `release().await` explicitly. If you find yourself wanting
-//! true RAII semantics, consider wrapping the critical section in a
-//! transaction and using `pg_advisory_xact_lock` directly — Postgres
-//! releases transaction-scoped locks on commit/rollback. That doesn't suit
-//! bootstrap (which calls non-transactional resource-store APIs), so it's
-//! not provided here.
+//! - [`GlobalLock::release`] runs an explicit `pg_advisory_unlock` and returns
+//!   the connection to the pool — the fast, efficient path. Prefer it.
+//! - If a `GlobalLock` is dropped **without** `release()` (an early `?`, a
+//!   panic, or a forgotten call), [`Drop`] *detaches* the pooled connection and
+//!   closes it. Postgres then releases the advisory lock server-side when the
+//!   session ends. This sacrifices one pooled connection (it is closed rather
+//!   than recycled) but guarantees the lock cannot leak — and needs no `await`.
+//!
+//! `Drop` can't `await`, so it can't run `pg_advisory_unlock` itself; closing
+//! the connection is the async-free equivalent. (The previous design returned
+//! the lock-holding connection to the pool on a forgotten `release()`, which
+//! could leak the lock until the pool happened to evict that connection.)
+//!
+//! Because every code path now frees the lock, [`with_global_lock`] can offer a
+//! scoped API that callers can't misuse:
+//!
+//! ```ignore
+//! with_global_lock(&pool, "bootstrap/default-organization", || async move {
+//!     // ... critical section ...
+//!     Ok(())
+//! })
+//! .await?;
+//! ```
+//!
+//! For a critical section that fits in a single transaction, prefer
+//! `pg_advisory_xact_lock` directly — Postgres releases transaction-scoped
+//! locks on commit/rollback. That doesn't suit callers (e.g. bootstrap) that
+//! invoke non-transactional APIs across the locked region, which is why this
+//! session-scoped helper exists.
+
+use std::future::Future;
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use sqlx::pool::PoolConnection;
 use sqlx::{PgPool, Postgres};
-use tracing::error;
+use tracing::{debug, warn};
 
 /// Derive a stable `i64` key from a human-readable lock name.
 ///
@@ -46,13 +64,17 @@ fn hash_key(name: &str) -> i64 {
 /// Install-wide mutex held for the lifetime of this value.
 ///
 /// Constructed via [`acquire`](Self::acquire) (blocking) or
-/// [`try_acquire`](Self::try_acquire) (non-blocking). Always finish with
-/// [`release`](Self::release).
+/// [`try_acquire`](Self::try_acquire) (non-blocking). Prefer
+/// [`release`](Self::release) to free the lock promptly and recycle the
+/// connection; if the value is dropped without it, [`Drop`] still frees the
+/// lock by closing the connection. [`with_global_lock`] wraps both for you.
 pub struct GlobalLock {
-    conn: PoolConnection<Postgres>,
+    /// `Some` while the lock is held. [`release`](Self::release) takes it and
+    /// returns the connection to the pool; [`Drop`] detaches and closes it if
+    /// it's still present.
+    conn: Option<PoolConnection<Postgres>>,
     key: i64,
     name: String,
-    released: bool,
 }
 
 impl GlobalLock {
@@ -70,10 +92,9 @@ impl GlobalLock {
             .await
             .with_context(|| format!("Failed to acquire GlobalLock '{name}'"))?;
         Ok(Self {
-            conn,
+            conn: Some(conn),
             key,
             name: name.to_string(),
-            released: false,
         })
     }
 
@@ -95,45 +116,92 @@ impl GlobalLock {
             return Ok(None);
         }
         Ok(Some(Self {
-            conn,
+            conn: Some(conn),
             key,
             name: name.to_string(),
-            released: false,
         }))
     }
 
-    /// Release the lock and return the underlying connection to the pool.
+    /// Release the lock with an explicit `pg_advisory_unlock` and return the
+    /// connection to the pool — the preferred path.
     ///
-    /// Always call this — see the module docs for why `Drop` can't substitute.
-    /// On unlock failure `released` stays `false` so `Drop` still emits the
-    /// safety log; the caller is expected to handle the returned `Err`.
+    /// If the unlock query fails, the connection is *closed* instead of
+    /// recycled (so a possibly-still-locked connection never re-enters the
+    /// pool); Postgres then releases the lock when that session ends. The
+    /// caller still receives the error for visibility.
     pub async fn release(mut self) -> Result<()> {
-        sqlx::query("SELECT pg_advisory_unlock($1)")
+        let Some(mut conn) = self.conn.take() else {
+            return Ok(());
+        };
+        match sqlx::query("SELECT pg_advisory_unlock($1)")
             .bind(self.key)
-            .execute(&mut *self.conn)
+            .execute(&mut *conn)
             .await
-            .with_context(|| format!("Failed to release GlobalLock '{}'", self.name))?;
-        self.released = true;
-        Ok(())
+        {
+            // Unlocked cleanly: `conn` returns to the pool here, reusable.
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // Don't recycle a connection that may still hold the lock —
+                // detach and close it so the session (and the lock) ends.
+                drop(conn.detach());
+                Err(e).with_context(|| format!("Failed to release GlobalLock '{}'", self.name))
+            }
+        }
     }
 }
 
 impl Drop for GlobalLock {
     fn drop(&mut self) {
-        if !self.released {
-            error!(
+        if let Some(conn) = self.conn.take() {
+            // `release()` wasn't called (early `?`, panic, or forgotten). We
+            // can't `await` `pg_advisory_unlock` here, so detach the pooled
+            // connection and drop it: closing the SQL session releases the
+            // advisory lock server-side. The connection is sacrificed rather
+            // than recycled — acceptable for the rare, coarse locks this type
+            // is meant for.
+            drop(conn.detach());
+            debug!(
                 lock = %self.name,
-                "GlobalLock dropped without release() — session-scoped advisory lock \
-                 may persist until the pool evicts this connection. This is a programmer \
-                 error: always call release().await."
+                "GlobalLock dropped without release(); closed its connection to \
+                 free the advisory lock server-side (prefer release() to recycle \
+                 the connection)"
             );
         }
     }
 }
 
+/// Run `f` while holding the install-wide lock `name`, releasing it afterwards.
+///
+/// Acquires (blocking), awaits `f`, then [`release`](GlobalLock::release)s. The
+/// lock is freed on every exit path: a normal return and an early `?` inside
+/// `f` both go through `release()`; a panic unwinds through [`GlobalLock`]'s
+/// [`Drop`], which closes the connection to free the lock. `f`'s result is
+/// always returned as-is — a release error can't leak the lock (the connection
+/// is closed on that path), so it's logged rather than propagated.
+pub async fn with_global_lock<T, Fut>(
+    pool: &PgPool,
+    name: &str,
+    f: impl FnOnce() -> Fut,
+) -> Result<T>
+where
+    Fut: Future<Output = Result<T>>,
+{
+    let lock = GlobalLock::acquire(pool, name).await?;
+    let result = f().await;
+    if let Err(release_err) = lock.release().await {
+        warn!(
+            lock = %name,
+            error = ?release_err,
+            "GlobalLock release reported an error (lock freed via connection close)"
+        );
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn hash_key_is_deterministic() {
@@ -185,5 +253,67 @@ mod tests {
         assert!(b.is_some(), "distinct names must not contend");
         a.release().await.unwrap();
         b.unwrap().release().await.unwrap();
+    }
+
+    /// Dropping a held lock *without* calling `release()` must still free it:
+    /// `Drop` closes the connection, and Postgres releases the session-scoped
+    /// advisory lock when that session ends. The release isn't synchronous
+    /// (the closed backend is reaped shortly after), so we poll.
+    #[sqlx::test]
+    async fn drop_without_release_frees_lock(pool: PgPool) {
+        {
+            let _lock = GlobalLock::acquire(&pool, "test/drop-frees").await.unwrap();
+            // Intentionally no release() — fall off the scope and let Drop run.
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(reacquired) = GlobalLock::try_acquire(&pool, "test/drop-frees")
+                .await
+                .unwrap()
+            {
+                reacquired.release().await.unwrap();
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "advisory lock was not freed within 5s of dropping the GlobalLock"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[sqlx::test]
+    async fn with_global_lock_runs_body_then_releases(pool: PgPool) {
+        let out = with_global_lock(&pool, "test/with-ok", || async { Ok(42_i32) })
+            .await
+            .unwrap();
+        assert_eq!(out, 42);
+
+        // The lock was released, so a fresh acquire succeeds immediately.
+        GlobalLock::acquire(&pool, "test/with-ok")
+            .await
+            .unwrap()
+            .release()
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test]
+    async fn with_global_lock_releases_on_body_error(pool: PgPool) {
+        let err = with_global_lock(&pool, "test/with-err", || async {
+            Err::<(), _>(anyhow::anyhow!("boom"))
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("boom"));
+
+        // Despite the body error, the lock must be free for the next caller.
+        GlobalLock::acquire(&pool, "test/with-err")
+            .await
+            .unwrap()
+            .release()
+            .await
+            .unwrap();
     }
 }

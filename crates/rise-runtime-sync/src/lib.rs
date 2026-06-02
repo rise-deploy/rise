@@ -15,7 +15,7 @@ pub mod global_lock;
 pub mod leader_leases;
 pub mod leader_schedules;
 
-pub use global_lock::GlobalLock;
+pub use global_lock::{with_global_lock, GlobalLock};
 pub use leader_leases::{LeaderElection, LeaderStatus, LeaseError, LEASE_DURATION};
 pub use leader_schedules::GlobalSchedule;
 
