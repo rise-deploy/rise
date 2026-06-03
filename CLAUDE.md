@@ -100,7 +100,7 @@ cargo build --all-features     # Full build with CLI + backend
 
 ## Implementation Steps
 
-**Project Structure**: Consolidated into single `rise-deploy` crate (formerly separate `rise-backend` and `rise-cli` crates)
+**Project Structure**: A Cargo workspace whose primary crate `rise-deploy` carries both CLI and backend (feature-gated). Focused, backend-only support crates live under `crates/` — `rise-resource-api` / `rise-resource-store` and the pure-core `rise-backend-auth` (the single home for auth-token signing, verification, and matching).
 
 ### Completed Implementation
 

@@ -15,15 +15,12 @@ algorithm/claim disambiguation rules, see the engineering reference in
 | Token | Direction | Algorithm | Audience (`aud`) | Verified by | Governed by |
 |---|---|---|---|---|---|
 | **[Session](#session-hs256)** | Issued | HS256 | Rise `public_url` | Rise API middleware | `server.jwt_signing_secret`, `server.jwt_expiry_seconds` |
+| **[Access](#access-hs256--token-exchange)** | Issued | HS256 | Rise `public_url` | Rise API middleware | `server.auth_token_max_ttl_seconds`, `auth.allow_raw_external_tokens` |
 | **[Ingress](#ingress-rs256)** | Issued | RS256 | Project URL | Nginx/ingress via Rise JWKS | `server.rs256_private_key_pem` |
 | **[Workload identity](#workload-identity-rs256)** | Issued | RS256 | Caller-supplied (e.g. `sts.amazonaws.com`) | External system via Rise JWKS | `server.rs256_private_key_pem`, `deployment_controller.identity_token_ttl_seconds` |
 | **[User login (OIDC)](#user-login-oidc)** | Accepted | per IdP | — | Rise (JWKS of `auth.issuer`) | `auth.issuer`, `auth.client_id`, `auth.client_secret` |
 | **[Service account](#service-accounts-cicd)** | Accepted | RS256 (JWKS) | project-scoped | Rise (JWKS of the SA issuer) | per-project (CLI/API managed) |
 | **[Controller](#controllers)** | Accepted | RS256 (JWKS) | per identity | Rise (JWKS of controller issuer) | `auth.controllers[]` |
-
-> **Access tokens** (a Rise-issued, exchange-minted token for delegated access)
-> are planned but **not yet available** — see
-> [Forthcoming](#forthcoming-access-tokens--token-exchange).
 
 ## Tokens Rise issues
 
@@ -42,6 +39,62 @@ to the Rise API and UI. It is symmetric (HS256), signed with
 `public_url` audience, and carries the claims listed in `server.jwt_claims`.
 Lifetime is `server.jwt_expiry_seconds` (default 24h). Session tokens are an
 internal concern — they are never verified outside Rise.
+
+### Access (HS256) — token exchange
+
+A short-lived, Rise-issued token that encodes a **fully-resolved principal** (a
+service account or a controller). It is minted by the RFC 8693 token-exchange
+endpoint and is symmetric (HS256, `aud` = Rise `public_url`), so — like Session
+tokens — it is verified only inside Rise and never by external parties. It is
+distinguished from a Session token by its JWT header `typ` (`rise-access+jwt`).
+
+**Why it exists.** Without it, a CI service account presents its external OIDC
+token on *every* request and Rise re-resolves the service account per request
+(claim matching + DB lookups in the hot path). With token exchange, the caller
+resolves once, up front, and every subsequent request is a snap decision on the
+embedded principal.
+
+**Exchange endpoint:** `POST /api/v1/auth/token` (public — the subject token is
+the credential). It follows RFC 8693:
+
+```jsonc
+// request
+{
+  "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+  "subject_token": "<external OIDC JWT>",
+  "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+  "rise_project": "my-project"   // required for project service-account exchange;
+                                  // "resource" is accepted as an alias
+}
+// response
+{
+  "access_token": "<rise HS256 jwt>",
+  "token_type": "Bearer",
+  "issued_token_type": "urn:ietf:params:oauth:token-type:jwt",
+  "expires_in": 600
+}
+```
+
+The exchange verifies the inner OIDC token exactly as the accept paths below do
+(issuer guard → JWKS signature + `exp` → per-identity claim matching), then mints
+the access token. With `rise_project` it resolves a **project service account**;
+without it, a **controller** identity. Lifetime is clamped to
+`server.auth_token_max_ttl_seconds` (default 600s) — deliberately short, because
+an exchanged token cannot be revoked mid-life (deleting the SA or tightening its
+environment restrictions only takes effect once it expires).
+
+> This STS-style endpoint is **distinct** from the OIDC `token_endpoint` (the
+> authorization-code exchange at `/api/v1/auth/code/exchange`); the discovery
+> document continues to advertise the latter.
+
+**Migrating off raw tokens (`auth.allow_raw_external_tokens`).** Defaults to
+`true`: a service account may still present its raw external OIDC token directly
+to project-scoped endpoints (the legacy per-request path), which Rise resolves as
+before. Set it to `false` to require pre-exchange — callers must obtain an access
+token from `/api/v1/auth/token` first. While it is `true`, every raw-token
+request is logged as deprecated (keyed by issuer) so you can see who still needs
+migrating; leaving it `true` forfeits the security benefits above. It is slated
+to default to `false` in a future release.
 
 ### Ingress (RS256)
 
@@ -115,13 +168,6 @@ unambiguous.
 > (`/api/v1/resources`). Today, built-in resources do not yet grant controllers
 > write access (their `allowed_status_controller_ids` is empty), so configuring
 > controllers is currently forward-looking — it is safe to set up ahead of time.
-
-## Forthcoming: Access tokens & token exchange
-
-A Rise-issued **Access token** minted through an RFC 8693 token-exchange
-endpoint is planned but not yet available. When it lands, this page will gain an
-Access row and an "exchange" section. Design details live in
-`AUTH_TOKEN_EXCHANGE_PLAN.md`.
 
 ## Security checklist
 

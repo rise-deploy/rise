@@ -299,6 +299,13 @@ pub struct ServerSettings {
     /// Default: 900 (15 minutes).
     #[serde(default = "default_workload_token_max_ttl_seconds")]
     pub workload_token_max_ttl_seconds: u64,
+
+    /// Maximum TTL in seconds for Rise access tokens minted by the auth
+    /// token-exchange endpoint (`POST /api/v1/auth/token`). Requests that specify
+    /// a higher TTL are silently capped to this value. Kept short because an
+    /// exchanged token cannot be revoked mid-life. Default: 600 (10 minutes).
+    #[serde(default = "default_auth_token_max_ttl_seconds")]
+    pub auth_token_max_ttl_seconds: u64,
 }
 
 /// Rate limiting configuration for OAuth endpoints (authorize, callback, token).
@@ -380,6 +387,14 @@ fn default_jwt_expiry_seconds() -> u64 {
 
 fn default_workload_token_max_ttl_seconds() -> u64 {
     900 // 15 minutes
+}
+
+fn default_auth_token_max_ttl_seconds() -> u64 {
+    600 // 10 minutes
+}
+
+fn default_allow_raw_external_tokens() -> bool {
+    true
 }
 
 fn default_identity_token_ttl_seconds() -> u64 {
@@ -476,6 +491,21 @@ pub struct AuthSettings {
     /// Platform access control configuration
     #[serde(default)]
     pub platform_access: PlatformAccessConfig,
+    /// Accept raw external OIDC tokens directly at request time (default: true).
+    ///
+    /// When `true`, a CI service account may present its external OIDC token
+    /// directly to project-scoped endpoints, and Rise resolves the service
+    /// account per request (the legacy two-phase path). When `false`, callers
+    /// must first exchange their token at `POST /api/v1/auth/token` for a Rise
+    /// access token.
+    ///
+    /// Leaving this `true` keeps the legacy attack surface and forfeits the
+    /// security benefits of the exchange (no service-account DB lookups in the
+    /// request hot path, and an authenticated `platform/capabilities`). It is
+    /// slated to default to `false` in a future release; migrate CI to
+    /// pre-exchange before then.
+    #[serde(default = "default_allow_raw_external_tokens")]
+    pub allow_raw_external_tokens: bool,
     /// Allow regular users to create teams (default: true).
     /// When false, only admin users can create teams.
     #[serde(default = "default_allow_team_creation")]
