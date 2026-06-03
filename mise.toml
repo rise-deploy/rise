@@ -219,6 +219,57 @@ alias = "br"
 env.https_proxy = ""
 env.HTTPS_PROXY = ""
 
+[tasks."backend:run-docker"]
+description = "Run Rise on the host with the Docker deployment backend against the compose support services (no image build)."
+run = """
+set -e
+
+# Preflight: warn (don't fail) if the dev /etc/hosts aliases are missing — the
+# host-side Rise resolves the Dex/registry hosts via /etc/hosts (→ 127.0.0.1).
+for h in rise-dex rise-registry; do
+  if ! awk -v h="$h" '{for(i=1;i<=NF;i++) if($i==h){found=1;exit}} END{exit !found}' /etc/hosts 2>/dev/null; then
+    printf "Hint: /etc/hosts is missing '%s' (→ 127.0.0.1). Run 'mise setup hosts'.\n" "$h" >&2
+  fi
+done
+
+# Bring up ONLY the support services (NOT the Rise container — there is none in
+# docker-compose.yml). vault/jfrog are profile-gated and excluded automatically.
+docker compose up -d postgres dex registry traefik
+
+# Wait briefly for Postgres to accept connections (migrations auto-run at startup).
+for _ in $(seq 1 30); do
+  if docker compose exec -T postgres pg_isready -U rise >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+
+# The rise_default bridge gateway IP is the host's address on that network, so
+# containers (Traefik forwardAuth, app containers) reach host-Rise through it.
+GW="$(docker network inspect rise_default -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)"
+if [ -z "$GW" ]; then
+  printf "Error: could not determine the rise_default bridge gateway IP. Is the network up?\n" >&2
+  exit 1
+fi
+echo "Rise runs on the HOST; containers reach it at http://$GW:3000 (rise_default gateway)."
+
+RISE_CONFIG_RUN_MODE=docker \
+DATABASE_URL=postgres://rise:rise123@localhost:5432/rise \
+PUBLIC_URL=http://rise.localhost:3000 \
+DEX_ISSUER=http://rise-dex:5556/dex \
+RISE_REGISTRY_URL=localhost:5000 \
+RISE_CLIENT_REGISTRY_URL=localhost:5000 \
+RISE_AUTH_BACKEND_URL=http://$GW:3000 \
+RISE_APP_BACKEND_HOST_ALIAS=rise.localhost \
+RISE_STATIC_DIR=$PWD/static \
+RISE_SSRF_ALLOW_PRIVATE=true \
+RISE_SSRF_ALLOW_HTTP=true \
+cargo run --features cli,backend -- backend server
+"""
+alias = "br-docker"
+env.https_proxy = ""
+env.HTTPS_PROXY = ""
+
 [tasks."backend:run-container"]
 description = "Build and run the backend server in its container (host network). Useful to validate the containerized version works as intended."
 depends = ["backend:deps", "db:migrate"]

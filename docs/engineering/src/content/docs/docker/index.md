@@ -90,6 +90,38 @@ for app hosts.
 > The demo secrets, passwords and the bundled Dex IdP are fine for local use but
 > **insecure for anything real** — see [Production deployment](#production-deployment).
 
+### Local development (run Rise on the host, no image)
+
+For the inner-loop while hacking on the backend you don't need to build the Rise
+image at all. `mise br-docker` brings up only the support services from the dev
+`docker-compose.yml` (Postgres, Dex, registry, Traefik — **not** a Rise
+container) and runs Rise on the host via `cargo run --features cli,backend --
+backend server`, reusing the env-driven `config/docker.yaml` (run_mode `docker`)
+with host-facing overrides (`DATABASE_URL`/`DEX_ISSUER`/`RISE_REGISTRY_URL`
+pointed at `localhost` / the `/etc/hosts` aliases). It is the Docker-backend
+analog of `mise br` (which runs the host backend against the Kubernetes dev
+config). Migrations auto-run on startup, so no `db:migrate` step is needed.
+
+The twist is **container→host reachability**: Traefik's forwardAuth and the app
+containers run in containers but must reach Rise on the host. On Linux the
+`rise_default` bridge **gateway IP** is the host's address on that network, so
+the task computes it and sets `RISE_AUTH_BACKEND_URL=http://$GW:3000`:
+
+```bash
+GW=$(docker network inspect rise_default -f '{{(index .IPAM.Config 0).Gateway}}')
+```
+
+Rise's `app_backend_host_aliases` machinery then resolves that `auth_backend_url`
+host (here the gateway IP) and injects `rise.localhost:<GW>` into every managed
+app container's `extra_hosts`, so apps can reach host-Rise (validate the
+`rise_jwt` cookie, OIDC discovery) and Traefik's forwardAuth address becomes
+`http://$GW:3000/...`.
+
+> This is **Linux-oriented**: the bridge gateway resolves to the host. On Docker
+> Desktop (macOS/Windows) the gateway differs and the host is instead reachable
+> at `host.docker.internal`; override `RISE_AUTH_BACKEND_URL` (and, if needed,
+> `RISE_APP_BACKEND_HOST_ALIAS`) accordingly.
+
 ## Production deployment
 
 The base file alone is production-*shaped* (TLS on by default) but not
