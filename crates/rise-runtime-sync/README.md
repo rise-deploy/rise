@@ -83,6 +83,23 @@ leader_controller! {
 .await
 ```
 
+### Held lease, not per-tick election
+
+`leader_controller!` elects one replica for the whole process: the lease is won
+once and held continuously (heartbeated), so the same replica runs every tick
+until it crashes, shuts down, or stalls past the TTL — it does **not** re-elect a
+leader per tick. This suits long-running, multi-step, destructive controller
+work: the held lease can be re-verified mid-work (`assert_leader()` /
+`ensure_leader_for()`) before each irreversible write to fence split-brain, a
+single elected replica can't overlap a sweep that outlasts its interval, and the
+cadence-table sees ~one claim per interval rather than one per replica.
+
+The per-tick alternative ("whoever wins this slot runs it") is `GlobalSchedule`
+used **standalone** (`try_claim`, no lease) — appropriate for short, stateless,
+idempotent ticks where any replica may run the work and nothing needs in-flight
+authority. `leader_controller!` deliberately pairs the two; a bare
+`GlobalSchedule` is available for the simpler case.
+
 ## Storage model
 
 The crate owns its own migrations in the dedicated `runtime_sync` Postgres

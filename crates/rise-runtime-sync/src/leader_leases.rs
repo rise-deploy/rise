@@ -77,9 +77,11 @@ impl Drop for TaskGuard {
 
 /// Persistent leader election service backed by the `leader_leases` PostgreSQL table.
 ///
-/// Holds the lease for its entire lifetime via a single background heartbeat task.
-/// Clone-safe: all clones share the same task and `is_leader` state; the task is
-/// aborted when the last clone is dropped.
+/// Once it wins the lease the holder keeps it for the lifetime of this value (the
+/// whole process, for a controller) via a single background heartbeat task;
+/// leadership changes only on crash, shutdown, or a stall past the TTL — not per
+/// scheduled tick. Clone-safe: all clones share the same task and `is_leader`
+/// state; the task is aborted when the last clone is dropped.
 #[derive(Clone)]
 pub struct LeaderElection {
     is_leader: Arc<AtomicBool>,
