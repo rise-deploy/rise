@@ -36,7 +36,7 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use sqlx::pool::PoolConnection;
 use sqlx::{PgPool, Postgres};
-use tracing::debug;
+use tracing::warn;
 
 /// Derive a stable `i64` key from a human-readable lock name.
 ///
@@ -91,7 +91,6 @@ impl GlobalLock {
 
     /// Try to acquire the lock without blocking. Returns `Ok(None)` when the
     /// lock is held by another session.
-    #[allow(dead_code)]
     pub async fn try_acquire(pool: &PgPool, name: &str) -> Result<Option<Self>> {
         let key = hash_key(name);
         let mut conn = pool
@@ -151,7 +150,7 @@ impl Drop for GlobalLock {
             // than recycled — acceptable for the rare, coarse locks this type
             // is meant for.
             drop(conn.detach());
-            debug!(
+            warn!(
                 lock = %self.name,
                 "GlobalLock dropped without release(); closed its connection to \
                  free the advisory lock server-side (prefer release() to recycle \
