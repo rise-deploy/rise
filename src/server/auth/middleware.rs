@@ -39,7 +39,7 @@ struct MinimalClaims {
 /// Authentication middleware that validates JWT and injects User or VerifiedExternalToken
 /// into request extensions.
 ///
-/// For Rise-issued JWTs: validates with JwtSigner and injects `User`.
+/// For Rise-issued JWTs: validates with `RiseTokenSigner` and injects `User`.
 /// For external JWTs: validates signature + expiry via JWKS (phase 1) and injects
 /// `VerifiedExternalToken`. Claim validation against project-scoped service accounts
 /// happens in phase 2 (inside handlers via `AuthContext::resolve_for_project`).
@@ -193,9 +193,7 @@ pub async fn auth_middleware(
         }
 
         // Validate signature + expiry via JWKS (no custom claim validation)
-        let claims = state
-            .jwt_validator
-            .validate_token(&token, &issuer)
+        let claims = rise_backend_auth::verify_external_jwt(&token, &issuer, &*state.jwt_validator)
             .await
             .map_err(|e| {
                 tracing::warn!(
@@ -204,7 +202,9 @@ pub async fn auth_middleware(
                     e
                 );
                 (StatusCode::UNAUTHORIZED, format!("Invalid token: {}", e))
-            })?;
+            })?
+            .claims()
+            .clone();
 
         tracing::debug!(
             "Auth middleware: external JWT JWKS-validated for issuer '{}'",

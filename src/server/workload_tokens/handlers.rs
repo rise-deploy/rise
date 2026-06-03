@@ -3,7 +3,6 @@ use axum::{extract::State, http::HeaderMap, response::IntoResponse, Json};
 use crate::db::{
     deployments as db_deployments, environments as db_environments, projects as db_projects,
 };
-use crate::server::auth::jwt_signer::WorkloadSubjectInfo;
 use crate::server::auth::middleware::extract_bearer_token;
 use crate::server::deployment::webhook::should_have_infrastructure;
 use crate::server::error::{ServerError, ServerErrorExt};
@@ -11,6 +10,7 @@ use crate::server::rate_limit::{extract_client_ip, rate_limit_response};
 use crate::server::state::AppState;
 use crate::server::workload_tokens::models::{ExchangeTokenRequest, ExchangeTokenResponse};
 use crate::server::workload_tokens::{sha256_hex, workload_subject, NO_ENVIRONMENT};
+use rise_backend_auth::WorkloadSubjectInfo;
 
 /// Exchange a deployment's bootstrap credential for a workload identity token.
 ///

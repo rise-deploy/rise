@@ -488,8 +488,8 @@ pub async fn code_exchange(
         )
     })?;
 
-    // Resolve the user's team memberships for the groups claim (None on DB error,
-    // preserving the signer's previous internal `.ok()` semantics).
+    // Resolve the user's team memberships for the groups claim; on a DB error,
+    // fall back to no groups rather than failing the login.
     let groups = crate::db::teams::get_team_names_for_user(&state.db_pool, user.id)
         .await
         .ok();
@@ -596,8 +596,8 @@ pub async fn device_exchange(
                 }
             };
 
-            // Resolve the user's team memberships for the groups claim (None on
-            // DB error, preserving the signer's previous internal `.ok()`).
+            // Resolve the user's team memberships for the groups claim; on a DB
+            // error, fall back to no groups rather than failing the login.
             let groups = crate::db::teams::get_team_names_for_user(&state.db_pool, user.id)
                 .await
                 .ok();
@@ -1116,8 +1116,8 @@ pub async fn oauth_callback(
             .or_else(|| build_project_url(&state, project))
             .unwrap_or_else(|| state.public_url.trim_end_matches('/').to_string());
 
-        // Resolve the user's team memberships for the groups claim (None on DB
-        // error, preserving the signer's previous internal `.ok()` semantics).
+        // Resolve the user's team memberships for the groups claim; on a DB
+        // error, fall back to no groups rather than failing the login.
         let groups = crate::db::teams::get_team_names_for_user(&state.db_pool, user.id)
             .await
             .ok();
@@ -1244,8 +1244,8 @@ pub async fn oauth_callback(
     // Sync groups after login
     sync_groups_after_login(&state, &token_info.id_token).await?;
 
-    // Resolve the user's team memberships for the groups claim (None on DB error,
-    // preserving the signer's previous internal `.ok()` semantics).
+    // Resolve the user's team memberships for the groups claim; on a DB error,
+    // fall back to no groups rather than failing the login.
     let groups = crate::db::teams::get_team_names_for_user(&state.db_pool, user.id)
         .await
         .ok();

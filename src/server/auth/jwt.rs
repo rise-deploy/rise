@@ -214,37 +214,11 @@ impl JwtValidator {
         Ok(keys)
     }
 
-    /// Validate custom claims (supports exact matching and wildcard patterns).
-    ///
-    /// Thin wrapper over [`rise_backend_auth::validate_custom_claims`], preserved
-    /// here so existing `JwtValidator::validate_custom_claims` call sites stay
-    /// unchanged.
-    pub fn validate_custom_claims(
-        jwt_claims: &serde_json::Value,
-        expected_claims: &HashMap<String, String>,
-    ) -> Result<()> {
-        rise_backend_auth::validate_custom_claims(jwt_claims, expected_claims)
-            .map_err(|e| anyhow!("{}", e))
-    }
-
-    /// Validate a JWT token's signature and expiry against an issuer (JWKS only).
-    ///
-    /// Thin wrapper over [`rise_backend_auth::verify_external_jwt`] (this type is
-    /// the [`JwksKeySource`]). Custom claim validation is NOT performed here.
-    ///
-    /// # Returns
-    /// The full JWT claims as a `serde_json::Value` on success
-    pub async fn validate_token(&self, token: &str, issuer_url: &str) -> Result<serde_json::Value> {
-        let verified = rise_backend_auth::verify_external_jwt(token, issuer_url, self)
-            .await
-            .map_err(|e| anyhow!("{}", e))?;
-        Ok(verified.claims().clone())
-    }
-
     /// Validate a JWT token against an issuer with expected claims.
     ///
-    /// Calls [`Self::validate_token`] for signature/expiry validation, then
-    /// `validate_custom_claims` for claim matching.
+    /// Verifies the signature/expiry via [`rise_backend_auth::verify_external_jwt`]
+    /// (this type is the [`JwksKeySource`]), then matches claims via
+    /// [`rise_backend_auth::validate_custom_claims`].
     ///
     /// # Returns
     /// The full JWT claims as a `serde_json::Value` on success
@@ -254,8 +228,13 @@ impl JwtValidator {
         issuer_url: &str,
         expected_claims: &HashMap<String, String>,
     ) -> Result<serde_json::Value> {
-        let claims = self.validate_token(token, issuer_url).await?;
-        Self::validate_custom_claims(&claims, expected_claims)?;
+        let claims = rise_backend_auth::verify_external_jwt(token, issuer_url, self)
+            .await
+            .map_err(|e| anyhow!("{}", e))?
+            .claims()
+            .clone();
+        rise_backend_auth::validate_custom_claims(&claims, expected_claims)
+            .map_err(|e| anyhow!("{}", e))?;
         Ok(claims)
     }
 }

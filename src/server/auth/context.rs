@@ -3,7 +3,6 @@ use crate::db::service_accounts;
 use crate::server::auth::controller::{
     match_controller_identity, ControllerAuthContext, ControllerIdentity, ControllerMatch,
 };
-use crate::server::auth::jwt::JwtValidator;
 use crate::server::error::{ServerError, ServerErrorExt};
 use crate::server::state::AppState;
 use axum::{extract::FromRequestParts, http::request::Parts, http::StatusCode};
@@ -126,7 +125,8 @@ impl AuthContext {
                             }
                         };
 
-                    match JwtValidator::validate_custom_claims(&token.claims, &expected_claims) {
+                    match rise_backend_auth::validate_custom_claims(&token.claims, &expected_claims)
+                    {
                         Ok(()) => {
                             matching_sas.push(sa);
                         }

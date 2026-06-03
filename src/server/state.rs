@@ -1,7 +1,6 @@
 use crate::server::auth::{
     cookie_helpers::CookieSettings,
     jwt::JwtValidator,
-    jwt_signer::JwtSigner,
     oauth::OAuthClient,
     token_storage::{DbTokenStore, TokenStore},
 };
@@ -9,6 +8,7 @@ use crate::server::encryption::EncryptionProvider;
 use crate::server::registry::{
     models::OciClientAuthConfig, providers::OciClientAuthProvider, RegistryProvider,
 };
+use rise_backend_auth::RiseTokenSigner;
 
 use crate::server::auth::controller::ControllerIdentity;
 #[cfg(feature = "backend")]
@@ -42,7 +42,7 @@ pub struct ControllerState {
 pub struct AppState {
     pub db_pool: PgPool,
     pub jwt_validator: Arc<JwtValidator>,
-    pub jwt_signer: Arc<JwtSigner>,
+    pub jwt_signer: Arc<RiseTokenSigner>,
     pub oauth_client: Arc<OAuthClient>,
     pub registry_provider: Arc<dyn RegistryProvider>,
     pub oci_client: Arc<crate::server::oci::OciClient>,
@@ -311,7 +311,7 @@ impl AppState {
 
         // Initialize JWT signer for ingress authentication (required)
         let jwt_signer = Arc::new(
-            JwtSigner::new(
+            RiseTokenSigner::new(
                 &settings.server.jwt_signing_secret,
                 settings.server.public_url.clone(),
                 settings.server.jwt_expiry_seconds,
