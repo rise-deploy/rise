@@ -251,7 +251,7 @@ pub struct ServerSettings {
     // `///`) so the generated JSON schema description is unchanged.
     #[serde(
         default = "default_cookie_secure",
-        deserialize_with = "deserialize_bool_flexible"
+        deserialize_with = "crate::server::ssrf::deserialize_bool_flexible"
     )]
     #[schemars(with = "bool")]
     pub cookie_secure: bool,
@@ -394,36 +394,6 @@ where
     Ok(raw.into_iter().filter(|s| !s.trim().is_empty()).collect())
 }
 
-/// The settings loader interpolates `${VAR}` inside string config values and
-/// produces a JSON string, so an env-driven flag like
-/// `cookie_secure: "${RISE_COOKIE_SECURE:-false}"` reaches serde as the string
-/// `"false"`. serde does not coerce string→bool, so accept both forms here
-/// (case-insensitive `true`/`false`, plus `1`/`0`/`yes`/`no`/`on`/`off`).
-fn deserialize_bool_flexible<'de, D>(deserializer: D) -> Result<bool, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error;
-
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum BoolOrString {
-        Bool(bool),
-        Str(String),
-    }
-
-    match BoolOrString::deserialize(deserializer)? {
-        BoolOrString::Bool(b) => Ok(b),
-        BoolOrString::Str(s) => match s.trim().to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" | "on" => Ok(true),
-            "false" | "0" | "no" | "off" => Ok(false),
-            other => Err(D::Error::custom(format!(
-                "invalid boolean string {other:?}; expected true/false"
-            ))),
-        },
-    }
-}
-
 fn default_static_dir() -> Option<String> {
     std::env::var("RISE_STATIC_DIR").ok()
 }
@@ -527,8 +497,9 @@ pub struct AuthSettings {
     pub admin_users: Vec<String>,
     /// List of Operator user emails. Operators have full access to generic
     /// resource storage and built-in resource management. This is a separate
-    /// role from `admin_users`. Matching is case-insensitive.
-    #[serde(default)]
+    /// role from `admin_users`. Matching is case-insensitive. Blank entries are
+    /// filtered out so an unset `${VAR}` default collapses to an empty list.
+    #[serde(default, deserialize_with = "deserialize_blank_filtered_list")]
     pub operator_users: Vec<String>,
     /// Trusted external controller identities. Each entry binds a stable
     /// controller ID to an OIDC issuer plus required claim constraints.

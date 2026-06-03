@@ -256,6 +256,11 @@ services:
       - RISE_CERTRESOLVER=le
       - RISE_TRAEFIK_ENTRYPOINT=websecure
       - RISE_CLIENT_REGISTRY_URL=registry.${RISE_DOMAIN}
+      # Registry URL the backend PULLS from (host Docker daemon). Defaults to
+      # rise-registry:5000 (config/docker.yaml); override to a host-published
+      # loopback (127.0.0.1:5000) or the public registry.${RISE_DOMAIN} per the
+      # "Pull" section in docs/.../docker/index.md. Passed through only when set.
+      - RISE_REGISTRY_URL
       - RISE_COOKIE_SECURE=true
       # Single OIDC issuer. Defaults to dex.${RISE_DOMAIN} — which is only
       # reachable if you opt into the demo-idp overlay (the base file does NOT
@@ -274,6 +279,10 @@ services:
       - RISE_ENCRYPTION_KEY
       - OIDC_CLIENT_SECRET
       - ADMIN_EMAIL
+      # Operator access to the generic resource API (/api/v1/resources). Defaults
+      # to none — set RISE_OPERATOR_EMAIL to grant a single operator (mount a
+      # config override for several). Passed through only when set.
+      - RISE_OPERATOR_EMAIL
       # Platform access. Default is allow_all (any authenticated user may use the
       # CLI/API/dashboard). Set RISE_PLATFORM_ACCESS_POLICY=restrictive to lock
       # the platform to an allowlist, then grant a user via RISE_PLATFORM_ALLOWED_EMAIL

@@ -211,7 +211,11 @@ forwardAuth-protected app. It is controlled by `auth.platform_access` in
   else authenticates fine but receives a 403 ("configured for application access
   only") from the platform-access middleware.
 
-`admin_users` (`ADMIN_EMAIL`) and `operator_users` always bypass this check.
+`admin_users` (`ADMIN_EMAIL`) and `operator_users` (`RISE_OPERATOR_EMAIL`)
+always bypass this check. `operator_users` defaults to none — no operator is
+configured unless you set `RISE_OPERATOR_EMAIL` (a single email; mount a config
+override for several). Operators have full access to the generic resource API
+(`/api/v1/resources`), so grant the role deliberately.
 
 To run a restricted stack via env, set `RISE_PLATFORM_ACCESS_POLICY=restrictive`
 and grant one user with `RISE_PLATFORM_ALLOWED_EMAIL=you@example.com`. To grant
@@ -356,9 +360,10 @@ each independently:
    `https://rise.${RISE_DOMAIN}/api/v1/auth/callback` in production. Dex rejects
    any `redirect_uri` not in `staticClients[rise-backend].redirectURIs`, which
    only lists the local hosts. **Add** `https://rise.${RISE_DOMAIN}/api/v1/auth/callback`
-   (and `https://rise.${RISE_DOMAIN}/.rise/auth/callback` if you use the `/.rise`
-   control-plane callback) to that list. Without this, login fails with
-   `invalid redirect_uri` even after fixing the issuer.
+   to that list — this is the only redirect URI the backend registers, including
+   for the custom-domain `/.rise` flow (the IdP callback always lands here, after
+   which the backend redirects internally to `/.rise/auth/complete`). Without
+   this, login fails with `invalid redirect_uri` even after fixing the issuer.
 
 ## Container registry (push/pull close-the-loop)
 

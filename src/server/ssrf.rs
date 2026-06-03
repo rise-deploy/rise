@@ -56,7 +56,7 @@ impl SsrfConfig {
 /// `allow_private_networks: "${RISE_SSRF_ALLOW_PRIVATE:-false}"` reaches serde as
 /// the string `"false"`. serde does not coerce string→bool, so accept both forms
 /// (case-insensitive `true`/`false`, plus `1`/`0`/`yes`/`no`/`on`/`off`).
-fn deserialize_bool_flexible<'de, D>(deserializer: D) -> Result<bool, D::Error>
+pub(crate) fn deserialize_bool_flexible<'de, D>(deserializer: D) -> Result<bool, D::Error>
 where
     D: serde::Deserializer<'de>,
 {

@@ -136,7 +136,7 @@
         },
         "operator_users": {
           "default": [],
-          "description": "List of Operator user emails. Operators have full access to generic\nresource storage and built-in resource management. This is a separate\nrole from `admin_users`. Matching is case-insensitive.",
+          "description": "List of Operator user emails. Operators have full access to generic\nresource storage and built-in resource management. This is a separate\nrole from `admin_users`. Matching is case-insensitive. Blank entries are\nfiltered out so an unset `${VAR}` default collapses to an empty list.",
           "items": {
             "type": "string"
           },

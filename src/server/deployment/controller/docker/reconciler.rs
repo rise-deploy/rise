@@ -1113,16 +1113,31 @@ pub struct ActualContainer {
     /// place on a running container).
     pub route_hash_label: Option<String>,
     /// Daemon-reported lifecycle state (e.g. "running", "exited", "created",
-    /// "dead"). `None` when the daemon didn't report it. A container that
-    /// matches on image + env but is not "running" (created-but-not-started,
-    /// exited, or crash-give-up) is recreated.
+    /// "dead", "restarting", "paused"). `None` when the daemon didn't report
+    /// it. A container that matches on image + env but is in a terminal-ish
+    /// state (`exited`/`created`/`dead`/`None`) is recreated; transient managed
+    /// states (`running`/`restarting`/`paused`) are left alone — see
+    /// `ActualContainer::needs_recreate`.
     pub state: Option<String>,
 }
 
 impl ActualContainer {
-    /// Whether the daemon reports this container as actively running.
-    fn is_running(&self) -> bool {
-        self.state.as_deref() == Some("running")
+    /// Whether the daemon reports this container in a terminal-ish state that
+    /// won't self-recover, so the reconciler must recreate it.
+    ///
+    /// Only `exited`/`created`/`dead` (and an unreported state, `None`) qualify:
+    /// these never start serving again on their own. Transient daemon-managed
+    /// states — `running`, `restarting` (Docker's restart policy applying
+    /// backoff after a crash) and `paused` (operator-initiated) — must NOT be
+    /// force-recreated: doing so every reconcile tick would reset Docker's
+    /// restart history and fight its exponential backoff. The health probe
+    /// drives the Unhealthy status independently, so a crash-looping container
+    /// is reflected in status without the reconciler churning it.
+    fn needs_recreate(&self) -> bool {
+        matches!(
+            self.state.as_deref(),
+            Some("exited") | Some("created") | Some("dead") | None
+        )
     }
 }
 
@@ -1194,10 +1209,12 @@ pub fn diff_desired_vs_actual(
                 // A legacy container missing the label (`None`) is recreated once
                 // to gain it, then converges.
                 let route_drift = a.route_hash_label.as_deref() != Some(d.route_hash.as_str());
-                // A container that matches on image + env but isn't running
-                // (created-but-never-started, exited, or out of restart
-                // retries) must be recreated so the deployment recovers.
-                let not_running = !a.is_running();
+                // A container that matches on image + env but is in a
+                // terminal-ish state (created-but-never-started, exited, or
+                // crash-give-up `dead`) must be recreated so the deployment
+                // recovers. Transient managed states (`restarting`, `paused`)
+                // are left to Docker's restart policy so its backoff can settle.
+                let not_running = a.needs_recreate();
                 if image_drift || env_drift || route_drift || not_running {
                     actions.push(ReconcileAction::Recreate {
                         name: name.clone(),
@@ -1442,6 +1459,29 @@ mod tests {
                     existing_id: "cid".to_string()
                 }],
                 "state {state:?} should force recreate"
+            );
+        }
+    }
+
+    #[test]
+    fn diff_leaves_transient_states_to_docker() {
+        // Image + env match and the container is in a daemon-managed transient
+        // state: `running` (healthy), `restarting` (Docker's restart policy
+        // applying backoff after a crash) or `paused` (operator-initiated).
+        // None of these may be force-recreated — doing so each tick would reset
+        // Docker's restart backoff. The health probe drives Unhealthy status
+        // independently.
+        let d = desired("app", "img:1", "h1");
+        for state in [Some("running"), Some("restarting"), Some("paused")] {
+            let actual = vec![ActualContainer {
+                state: state.map(str::to_string),
+                ..actual_for(&d, "img:1", "h1")
+            }];
+            let actions =
+                diff_desired_vs_actual(std::slice::from_ref(&d), &actual, "rise", &no_protected());
+            assert!(
+                actions.is_empty(),
+                "state {state:?} must not force a recreate"
             );
         }
     }

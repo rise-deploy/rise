@@ -55,7 +55,13 @@ fn build_project_url(state: &AppState, project_name: &str) -> Option<String> {
 /// Returns `None` when no template is configured, the host has no `.`-separated
 /// suffix after the placeholder, or the suffix would be empty.
 fn ingress_domain_suffix(state: &AppState) -> Option<String> {
-    let template = state.production_ingress_url_template.as_ref()?;
+    ingress_domain_suffix_from_template(state.production_ingress_url_template.as_deref()?)
+}
+
+/// Pure helper backing [`ingress_domain_suffix`]: derive the trusted domain
+/// suffix from an ingress URL template string (no `AppState` coupling so it is
+/// unit-testable). See [`ingress_domain_suffix`] for the rationale.
+fn ingress_domain_suffix_from_template(template: &str) -> Option<String> {
     // Host is everything before an optional `/path` prefix.
     let host = template.split('/').next().unwrap_or(template);
     // Strip the leading `{project_name}.` (or any leading placeholder label) to
@@ -2221,6 +2227,37 @@ mod tests {
             validate_redirect_url("https://notexample.com/", public_url, suffix),
             "/"
         );
+    }
+
+    #[test]
+    fn test_ingress_domain_suffix_from_template() {
+        // Happy path: leading `{project_name}.` placeholder → shared parent domain.
+        assert_eq!(
+            ingress_domain_suffix_from_template("{project_name}.example.com").as_deref(),
+            Some("example.com")
+        );
+        // Path-prefix template: the suffix is derived from the host part only.
+        assert_eq!(
+            ingress_domain_suffix_from_template("{project_name}.example.com/apps").as_deref(),
+            Some("example.com")
+        );
+        // No placeholder, plain host: falls back to the first label boundary.
+        assert_eq!(
+            ingress_domain_suffix_from_template("apps.example.com").as_deref(),
+            Some("example.com")
+        );
+        // Non-leading placeholder (e.g. `app.{project_name}.example.com`): the
+        // first-label fallback leaves `{project_name}` in the suffix, which the
+        // `{`-guard rejects to avoid trusting a literal-brace "domain".
+        assert_eq!(
+            ingress_domain_suffix_from_template("app.{project_name}.example.com"),
+            None
+        );
+        // Single-label host (no `.` after the placeholder strip / no fallback
+        // boundary) → no suffix.
+        assert_eq!(ingress_domain_suffix_from_template("localhost"), None);
+        // Empty suffix after the placeholder is rejected.
+        assert_eq!(ingress_domain_suffix_from_template("{project_name}."), None);
     }
 
     #[test]
