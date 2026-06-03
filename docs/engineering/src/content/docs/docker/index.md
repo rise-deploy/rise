@@ -160,10 +160,13 @@ App hosts in the standard layout are **subdomains of the ingress domain**
 (`{project}.${RISE_DOMAIN}`), which makes them *siblings* of the control-plane
 host `rise.${RISE_DOMAIN}` rather than subdomains of it. The post-login deep-link
 `redirect` is validated by `validate_redirect_url` (in
-`src/server/auth/handlers.rs`) against both `server.public_url`'s host **and** the
-configured ingress domain (derived from `production_ingress_url_template`), so an
-app host like `secret.${RISE_DOMAIN}` is accepted and the user returns to the
-exact page they started on with no extra setup.
+`src/server/auth/handlers.rs`) against `server.public_url`'s host **and the
+specific project's own resolved hosts** (its canonical ingress host plus any
+active-deployment/custom-domain hosts), so an app host like `secret.${RISE_DOMAIN}`
+is accepted and the user returns to the exact page they started on with no extra
+setup. The match is scoped to *that* project rather than the whole parent domain,
+so a redirect to a **different** project's host is rejected (no cross-project
+open redirect).
 
 Apps on an unrelated or **custom** domain also work, but the domain must be
 **registered as a project custom domain** — that registration is what makes the
