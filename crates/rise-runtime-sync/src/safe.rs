@@ -92,14 +92,14 @@ where
 /// Run a leader-elected controller loop over one or more globally-scheduled
 /// work items, releasing the lease when `shutdown` is cancelled.
 ///
-/// Expands to a [`with_leader_election`] call whose body is a `tokio::select!`
-/// loop. Each schedule gets its own ticker plus a [`GlobalSchedule`](crate::GlobalSchedule);
-/// on each tick the work runs only if this replica is the leader *and* the
-/// global schedule grants the slot (which also fences peers across a leadership
-/// handover). The work body must evaluate to a `Result` — its `Err` is logged
-/// and the loop continues. Cancelling `shutdown` (a
-/// `tokio_util::sync::CancellationToken`) breaks the loop, so the lease is
-/// released deterministically.
+/// Expands to a [`with_leader_election`] call whose body sleeps until the next
+/// due schedule, then runs each schedule that's due — but only if this replica
+/// is the leader *and* the schedule's [`GlobalSchedule`](crate::GlobalSchedule)
+/// grants the slot (which also fences peers across a leadership handover). Each
+/// schedule fires on its own cadence, independent of the others' intervals. The
+/// work body must evaluate to a `Result` — its `Err` is logged and the loop
+/// continues. Cancelling `shutdown` (a `tokio_util::sync::CancellationToken`)
+/// breaks the loop, so the lease is released deterministically.
 ///
 /// Each schedule is a string `name` (the `leader_schedules` row key and log
 /// label), the keyword `every`, an `interval`, and a `=> work` body. The
@@ -121,11 +121,6 @@ where
 ///     },
 /// }
 /// ```
-///
-/// The loop wakes at the shortest schedule interval; each schedule's
-/// [`GlobalSchedule`](crate::GlobalSchedule) enforces its own cadence across
-/// replicas, so the per-tick `try_claim` is the real gate — a tick that isn't
-/// yet due for a given schedule is a cheap no-op.
 #[macro_export]
 macro_rules! leader_controller {
     (
@@ -148,42 +143,52 @@ macro_rules! leader_controller {
             $ttl,
             ::std::clone::Clone::clone(&__shutdown),
             move |$election| async move {
-                // Wake at the shortest schedule interval; each GlobalSchedule
-                // gates its own cadence, so longer schedules simply no-op on the
-                // ticks that aren't yet due for them.
-                let mut __ticker = ::tokio::time::interval(
-                    [$($interval),+]
-                        .into_iter()
-                        .min()
-                        .expect("leader_controller requires at least one schedule"),
-                );
-                __ticker.set_missed_tick_behavior(::tokio::time::MissedTickBehavior::Delay);
+                // Per-schedule next-fire deadlines; the loop sleeps until the
+                // earliest, so each schedule fires on its own cadence regardless
+                // of the others' intervals.
+                let __start = ::tokio::time::Instant::now();
+                let mut __deadlines = [$(__start + $interval),+];
                 loop {
+                    let __next = *__deadlines
+                        .iter()
+                        .min()
+                        .expect("leader_controller requires at least one schedule");
                     ::tokio::select! {
                         _ = __shutdown.cancelled() => break,
-                        _ = __ticker.tick() => {}
+                        _ = ::tokio::time::sleep_until(__next) => {}
                     }
-                    if !$election.is_leader() {
-                        continue;
-                    }
+                    let __now = ::tokio::time::Instant::now();
+                    let mut __idx = 0usize;
                     $(
-                        if $crate::GlobalSchedule::new(
-                            ::std::clone::Clone::clone(&__pool),
-                            $name,
-                            $interval,
-                        )
-                        .try_claim_or_skip_as_leader($name, &$election)
-                        .await
-                        {
-                            if let ::core::result::Result::Err(__err) = $work {
-                                ::tracing::error!(
-                                    schedule = $name,
-                                    error = ?__err,
-                                    "leader_controller work item failed"
-                                );
+                        if __now >= __deadlines[__idx] {
+                            // Advance one interval (drift-free); if we fell behind
+                            // by more than one, re-anchor to now instead of
+                            // bursting to catch up.
+                            __deadlines[__idx] += $interval;
+                            if __deadlines[__idx] <= __now {
+                                __deadlines[__idx] = __now + $interval;
+                            }
+                            if $election.is_leader()
+                                && $crate::GlobalSchedule::new(
+                                    ::std::clone::Clone::clone(&__pool),
+                                    $name,
+                                    $interval,
+                                )
+                                .try_claim_or_skip_as_leader($name, &$election)
+                                .await
+                            {
+                                if let ::core::result::Result::Err(__err) = $work {
+                                    ::tracing::error!(
+                                        schedule = $name,
+                                        error = ?__err,
+                                        "leader_controller work item failed"
+                                    );
+                                }
                             }
                         }
+                        __idx += 1;
                     )+
+                    let _ = __idx; // silence unused-assignment on the final bump
                 }
                 ::core::result::Result::Ok(())
             },
