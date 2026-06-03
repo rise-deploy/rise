@@ -47,11 +47,11 @@ impl EcrController {
             shutdown: shutdown,
             election: election,
             schedules: {
-                provision { name: "rise-ecr-provision", interval: Duration::from_secs(10) }
+                "rise-ecr-provision" every Duration::from_secs(10)
                     => controller.provision_repositories(&election).await,
-                cleanup { name: "rise-ecr-cleanup", interval: Duration::from_secs(5) }
+                "rise-ecr-cleanup" every Duration::from_secs(5)
                     => controller.cleanup_repositories(&election).await,
-                drift { name: "rise-ecr-drift", interval: Duration::from_secs(60) }
+                "rise-ecr-drift" every Duration::from_secs(60)
                     => controller.detect_repository_drift(&election).await,
             },
         }

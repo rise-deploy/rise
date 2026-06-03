@@ -26,25 +26,23 @@ pub use safe::{with_global_lock, with_leader_election};
 /// isolated from the root rise-deploy crate, which owns its own migrations
 /// against the same database.
 ///
-/// sqlx 0.8 hard-codes the unqualified `_sqlx_migrations` name, so we acquire a
-/// dedicated connection, ensure the schema exists, switch `search_path` so the
-/// migrator resolves `_sqlx_migrations` inside `runtime_sync`, run migrations,
-/// then reset `search_path` before the connection returns to the pool.
+/// sqlx 0.8 hard-codes the unqualified `_sqlx_migrations` name, so we switch
+/// `search_path` to make the migrator resolve it inside `runtime_sync`. That
+/// mutates session state, so we run on a *detached* connection — closed when
+/// we're done rather than returned to the pool — which guarantees the modified
+/// `search_path` can never leak to another pool consumer (no best-effort reset
+/// that a failure could skip).
 pub async fn run_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::migrate::MigrateError> {
     use sqlx::Executor;
 
-    let mut conn = pool.acquire().await?;
+    // Detach from the pool: this connection is sacrificed (closed on drop), so
+    // the `SET search_path` below cannot poison a recycled connection.
+    let mut conn = pool.acquire().await?.detach();
 
     conn.execute("CREATE SCHEMA IF NOT EXISTS runtime_sync")
         .await?;
     conn.execute("SET search_path TO runtime_sync, public")
         .await?;
 
-    let result = sqlx::migrate!("./migrations").run(&mut *conn).await;
-
-    // Reset before the connection returns to the pool so other consumers see the
-    // default search_path. Best-effort: if migrate failed we still try to reset.
-    let _ = conn.execute("RESET search_path").await;
-
-    result
+    sqlx::migrate!("./migrations").run(&mut conn).await
 }

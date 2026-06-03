@@ -101,13 +101,10 @@ where
 /// `tokio_util::sync::CancellationToken`) breaks the loop, so the lease is
 /// released deterministically.
 ///
-/// Each schedule is introduced by a unique identifier (used internally for its
-/// ticker/schedule bindings — these must be distinct across schedules, as a
-/// duplicate would silently shadow an earlier one), a string `name` (the
-/// `leader_schedules` row key and log label), and an `interval`. The
-/// `election:` binding names the
-/// [`LeaderElection`] handle so work bodies can reference it (e.g. to
-/// `assert_leader()` before a destructive write):
+/// Each schedule is a string `name` (the `leader_schedules` row key and log
+/// label), the keyword `every`, an `interval`, and a `=> work` body. The
+/// `election:` binding names the [`LeaderElection`] handle so work bodies can
+/// reference it (e.g. to `assert_leader()` before a destructive write):
 ///
 /// ```ignore
 /// leader_controller! {
@@ -118,12 +115,17 @@ where
 ///     shutdown: shutdown_token,
 ///     election: election,
 ///     schedules: {
-///         provision { name: "rise-ecr-provision", interval: provision_interval } => self.provision(&election).await,
-///         cleanup   { name: "rise-ecr-cleanup",   interval: cleanup_interval }   => self.cleanup(&election).await,
-///         drift     { name: "rise-ecr-drift",     interval: drift_interval }     => self.drift(&election).await,
+///         "rise-ecr-provision" every provision_interval => self.provision(&election).await,
+///         "rise-ecr-cleanup"   every cleanup_interval   => self.cleanup(&election).await,
+///         "rise-ecr-drift"     every drift_interval     => self.drift(&election).await,
 ///     },
 /// }
 /// ```
+///
+/// The loop wakes at the shortest schedule interval; each schedule's
+/// [`GlobalSchedule`](crate::GlobalSchedule) enforces its own cadence across
+/// replicas, so the per-tick `try_claim` is the real gate — a tick that isn't
+/// yet due for a given schedule is a cheap no-op.
 #[macro_export]
 macro_rules! leader_controller {
     (
@@ -134,7 +136,7 @@ macro_rules! leader_controller {
         shutdown: $shutdown:expr,
         election: $election:ident,
         schedules: {
-            $( $sched:ident { name: $name:expr, interval: $interval:expr } => $work:expr ),+ $(,)?
+            $( $name:literal every $interval:expr => $work:expr ),+ $(,)?
         } $(,)?
     ) => {{
         let __pool = $pool;
@@ -146,47 +148,42 @@ macro_rules! leader_controller {
             $ttl,
             ::std::clone::Clone::clone(&__shutdown),
             move |$election| async move {
-                $(
-                    let mut $sched = {
-                        let mut __ticker = ::tokio::time::interval($interval);
-                        // Skip queued ticks after a long work item rather than
-                        // firing them back-to-back; the GlobalSchedule is the
-                        // real cadence gate, this just avoids tick bursts.
-                        __ticker.set_missed_tick_behavior(
-                            ::tokio::time::MissedTickBehavior::Delay,
-                        );
-                        (
-                            __ticker,
-                            $crate::GlobalSchedule::new(
-                                ::std::clone::Clone::clone(&__pool),
-                                $name,
-                                $interval,
-                            ),
-                        )
-                    };
-                )+
+                // Wake at the shortest schedule interval; each GlobalSchedule
+                // gates its own cadence, so longer schedules simply no-op on the
+                // ticks that aren't yet due for them.
+                let mut __ticker = ::tokio::time::interval(
+                    [$($interval),+]
+                        .into_iter()
+                        .min()
+                        .expect("leader_controller requires at least one schedule"),
+                );
+                __ticker.set_missed_tick_behavior(::tokio::time::MissedTickBehavior::Delay);
                 loop {
                     ::tokio::select! {
                         _ = __shutdown.cancelled() => break,
-                        $(
-                            _ = $sched.0.tick() => {
-                                if $election.is_leader()
-                                    && $sched
-                                        .1
-                                        .try_claim_or_skip_as_leader($name, &$election)
-                                        .await
-                                {
-                                    if let ::core::result::Result::Err(__err) = $work {
-                                        ::tracing::error!(
-                                            schedule = $name,
-                                            error = ?__err,
-                                            "leader_controller work item failed"
-                                        );
-                                    }
-                                }
-                            }
-                        )+
+                        _ = __ticker.tick() => {}
                     }
+                    if !$election.is_leader() {
+                        continue;
+                    }
+                    $(
+                        if $crate::GlobalSchedule::new(
+                            ::std::clone::Clone::clone(&__pool),
+                            $name,
+                            $interval,
+                        )
+                        .try_claim_or_skip_as_leader($name, &$election)
+                        .await
+                        {
+                            if let ::core::result::Result::Err(__err) = $work {
+                                ::tracing::error!(
+                                    schedule = $name,
+                                    error = ?__err,
+                                    "leader_controller work item failed"
+                                );
+                            }
+                        }
+                    )+
                 }
                 ::core::result::Result::Ok(())
             },
