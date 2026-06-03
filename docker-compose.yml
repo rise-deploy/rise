@@ -87,6 +87,11 @@ services:
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"
       - "--providers.docker.network=rise_default"
+      # File provider: routes /.rise/* on app hosts to the host-run Rise backend
+      # (see dev/traefik/dynamic/rise-dotrise.yml). The backend isn't a container
+      # here, so a Docker-provider label can't target it.
+      - "--providers.file.directory=/etc/traefik/dynamic"
+      - "--providers.file.watch=true"
       - "--entrypoints.web.address=:80"
       - "--api.dashboard=true"
       - "--api.insecure=true"
@@ -95,6 +100,7 @@ services:
       - "8090:8080"    # Traefik dashboard: http://localhost:8090
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./dev/traefik/dynamic:/etc/traefik/dynamic:ro
     # Make `host.docker.internal` resolve to the host gateway so Traefik's
     # forwardAuth can reach a host-run backend (`mise br docker`, which sets
     # RISE_AUTH_BACKEND_URL=http://host.docker.internal:3000) on Linux too.

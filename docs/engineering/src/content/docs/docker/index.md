@@ -143,6 +143,18 @@ The new `deployment_controller.app_backend_ip` setting (env
 verbatim, bypassing the DNS resolution used for a containerized backend. It is
 **local-dev only** — leave it unset in production.
 
+- **`/.rise/*` → backend (login on app hosts):** for a **private** app the
+  forwardAuth handler 302-redirects unauthenticated requests to
+  `{app-host}/.rise/auth/signin`, which must be served by the **backend** (to set
+  the session cookie on the app's host). The standalone compose does this with a
+  high-priority `PathPrefix(`/.rise`)` router as a **label on the `rise-backend`
+  container** — but the dev stack has no backend container (Rise runs on the
+  host), so a Docker-provider label can't target it. Instead the dev Traefik runs
+  a **file provider** (`dev/traefik/dynamic/rise-dotrise.yml`, mounted at
+  `/etc/traefik/dynamic`) defining a `priority=1000` `/.rise` router whose service
+  URL is `http://host.docker.internal:3000`. Without it, `/.rise/auth/signin` on
+  an app host falls through to the app router and is (wrongly) served by the app.
+
 ## Production deployment
 
 The base file alone is production-*shaped* (TLS on by default) but not
