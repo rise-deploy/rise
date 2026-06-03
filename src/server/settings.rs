@@ -376,18 +376,17 @@ fn default_cookie_secure() -> bool {
     true
 }
 
-/// Deserialize a boolean that may arrive as a native bool or as a string.
-///
-/// Deserialize a list of host aliases, dropping blank/whitespace-only entries.
+/// Deserialize a list of strings, dropping blank/whitespace-only entries.
 ///
 /// The settings loader interpolates `${VAR}` per string element, so an
 /// env-driven single-element list like
 /// `app_backend_host_aliases: ["${RISE_APP_BACKEND_HOST_ALIAS:-}"]` reaches
 /// serde as `[""]` when the env var is unset (production) and `["rise.localhost"]`
 /// when set (local). Filtering blanks turns the unset case into an empty list
-/// (→ no `extra_hosts` injection) while preserving real aliases — sidestepping
-/// the inability to express an *empty* YAML list via a scalar env var.
-fn deserialize_host_aliases<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+/// while preserving real entries — sidestepping the inability to express an
+/// *empty* YAML list via a scalar env var. Reused for any env-driven list whose
+/// "off" state must be an empty list (host aliases, platform-access allowlists).
+fn deserialize_blank_filtered_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -1284,7 +1283,7 @@ pub enum DeploymentControllerSettings {
         /// single-element list (`["${RISE_APP_BACKEND_HOST_ALIAS:-}"]`) collapses
         /// to an empty list — and no injection — when the env var is unset
         /// (production).
-        #[serde(default, deserialize_with = "deserialize_host_aliases")]
+        #[serde(default, deserialize_with = "deserialize_blank_filtered_list")]
         app_backend_host_aliases: Vec<String>,
 
         /// Label namespace prefix for Rise bookkeeping labels
@@ -1791,6 +1790,56 @@ impl Settings {
                         id
                     )));
                 }
+            }
+        }
+
+        // Validate the Docker deployment controller variant with the same
+        // contract as the Kubernetes variant: the ingress templates must carry
+        // their placeholders (otherwise every project collides on one Traefik
+        // Host(...) rule) and the controller class name must be a valid label.
+        if let Some(DeploymentControllerSettings::Docker {
+            ref production_ingress_url_template,
+            ref staging_ingress_url_template,
+            ref environment_ingress_url_template,
+            ref controller_class_name,
+            ..
+        }) = settings.deployment_controller
+        {
+            Self::validate_format_string(
+                production_ingress_url_template,
+                "production_ingress_url_template",
+                "{project_name}",
+            )?;
+
+            Self::validate_label_value(
+                controller_class_name,
+                "deployment_controller.controller_class_name",
+            )?;
+
+            if let Some(ref staging_template) = staging_ingress_url_template {
+                Self::validate_format_string(
+                    staging_template,
+                    "staging_ingress_url_template",
+                    "{project_name}",
+                )?;
+                Self::validate_format_string(
+                    staging_template,
+                    "staging_ingress_url_template",
+                    "{deployment_group}",
+                )?;
+            }
+
+            if let Some(ref environment_template) = environment_ingress_url_template {
+                Self::validate_format_string(
+                    environment_template,
+                    "environment_ingress_url_template",
+                    "{project_name}",
+                )?;
+                Self::validate_format_string(
+                    environment_template,
+                    "environment_ingress_url_template",
+                    "{environment}",
+                )?;
             }
         }
 
@@ -2550,11 +2599,35 @@ auth:
         // The local overlay sets this so app containers get rise.localhost ->
         // backend via extra_hosts.
         env.insert("RISE_APP_BACKEND_HOST_ALIAS", "rise.localhost");
+        // The local overlay opens the SSRF guard to reach the internal
+        // http://rise-dex:5556 issuer. Set as string "true" (env-interpolated) to
+        // exercise the string->bool flexible deserialization.
+        env.insert("RISE_SSRF_ALLOW_PRIVATE", "true");
+        env.insert("RISE_SSRF_ALLOW_HTTP", "true");
         let settings = load_shipped_docker_config(&env)
             .expect("shipped docker.yaml must load with only DATABASE_URL set");
 
         assert_eq!(settings.server.public_url, "http://rise.localhost:3000");
         assert!(!settings.server.cookie_secure, "local: cookie_secure false");
+        // LOCAL: SSRF guard opened via the overlay's string "true" env values.
+        assert!(
+            settings.server.ssrf.allow_private_networks,
+            "local: ssrf.allow_private_networks must be true via overlay env"
+        );
+        assert!(
+            settings.server.ssrf.allow_http,
+            "local: ssrf.allow_http must be true via overlay env"
+        );
+        // trusted_hosts allowlists the internal services regardless of mode.
+        assert!(
+            settings
+                .server
+                .ssrf
+                .trusted_hosts
+                .iter()
+                .any(|h| h == "rise-dex"),
+            "ssrf.trusted_hosts must include rise-dex"
+        );
 
         let Some(DeploymentControllerSettings::Docker {
             ingress_schema,
@@ -2619,6 +2692,16 @@ auth:
 
         assert_eq!(settings.server.public_url, "https://rise.example.com");
         assert!(settings.server.cookie_secure, "prod: cookie_secure true");
+        // PROD: SSRF guard is fail-closed by default (the local overlay sets
+        // RISE_SSRF_ALLOW_PRIVATE / RISE_SSRF_ALLOW_HTTP=true, neither set here).
+        assert!(
+            !settings.server.ssrf.allow_private_networks,
+            "prod: ssrf.allow_private_networks must default closed"
+        );
+        assert!(
+            !settings.server.ssrf.allow_http,
+            "prod: ssrf.allow_http must default closed"
+        );
 
         let Some(DeploymentControllerSettings::Docker {
             ingress_schema,
@@ -2877,11 +2960,11 @@ pub struct PlatformAccessConfig {
     pub policy: PlatformAccessPolicy,
 
     /// User emails explicitly granted platform access
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_blank_filtered_list")]
     pub allowed_user_emails: Vec<String>,
 
     /// IdP groups whose members get platform access
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_blank_filtered_list")]
     pub allowed_idp_groups: Vec<String>,
 }
 

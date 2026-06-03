@@ -107,11 +107,14 @@ Point these records at the host running the stack:
 | `registry.${RISE_DOMAIN}` | Container registry |
 | `dex.${RISE_DOMAIN}` | Bundled Dex IdP (only if you keep it) |
 
-App hosts are simplest as **subdomains** of the control-plane host (e.g.
-`{project}.${RISE_DOMAIN}` under `rise.${RISE_DOMAIN}`): for a subdomain, the
-post-login deep-link `redirect` is validated against `server.public_url`
-(`validate_redirect_url` in `src/server/auth/handlers.rs`) and accepted, so the
-user returns to the exact page they started on with no extra setup.
+App hosts in the standard layout are **subdomains of the ingress domain**
+(`{project}.${RISE_DOMAIN}`), which makes them *siblings* of the control-plane
+host `rise.${RISE_DOMAIN}` rather than subdomains of it. The post-login deep-link
+`redirect` is validated by `validate_redirect_url` (in
+`src/server/auth/handlers.rs`) against both `server.public_url`'s host **and** the
+configured ingress domain (derived from `production_ingress_url_template`), so an
+app host like `secret.${RISE_DOMAIN}` is accepted and the user returns to the
+exact page they started on with no extra setup.
 
 Apps on an unrelated or **custom** domain also work, but the domain must be
 **registered as a project custom domain** — that registration is what makes the
@@ -159,6 +162,8 @@ export ACME_CA_SERVER=https://acme-staging-v02.api.letsencrypt.org/directory
 | `RISE_ENCRYPTION_KEY` | insecure repo placeholder | **Set it.** Overrides the demo AES key. `openssl rand -base64 32`. |
 | `OIDC_CLIENT_SECRET` | `rise-backend-secret` | **Set it.** Keep in sync with the Dex client secret in `dev/dex/config.yaml`. |
 | `ADMIN_EMAIL` | `admin@example.com` | Initial admin user. |
+| `RISE_PLATFORM_ACCESS_POLICY` | `allow_all` | Who may use the CLI/API/dashboard. `allow_all` = any authenticated user; `restrictive` = allowlist only (see [Platform access](#platform-access)). |
+| `RISE_PLATFORM_ALLOWED_EMAIL` | empty | A single email granted platform access when the policy is `restrictive`. For several users, mount a config override. |
 
 The `rise` service also sets these `RISE_*` overrides on `config/docker.yaml`
 to flip it from its local defaults to production (https / `le` resolver / the
@@ -177,8 +182,12 @@ env vars default to those placeholders when unset). Before any real use:
   and `POSTGRES_PASSWORD`. The `OIDC_CLIENT_SECRET` must stay in sync with the
   Dex client secret in `dev/dex/config.yaml`. These override the demo defaults
   baked into `config/docker.yaml`.
-- **Use a real IdP.** The bundled Dex is a demo provider with static passwords —
-  replace it (see below).
+- **Use a real IdP.** The bundled Dex is a demo provider with static passwords
+  (`admin@example.com` / `password`) that grant a Rise admin session. The base
+  Compose file therefore does **not** publish Dex to the internet — it is only
+  reachable internally by the backend. Replace it with a proper IdP (see below).
+  Do **not** layer `docker-compose.standalone.demo-idp.yaml` (which exposes Dex
+  publicly at `dex.${RISE_DOMAIN}`) outside a throwaway demo.
 - **Lock down exposed host ports.** Postgres (`5432`) and the registry (`5000`)
   are published to the host for convenience; bind them to localhost or drop the
   mappings (the registry is reachable through Traefik).
@@ -186,6 +195,29 @@ env vars default to those placeholders when unset). Before any real use:
   `traefik_acme` are local volumes — use durable storage and a backup strategy.
 - **Set resource limits** per service to fit your host (none are set in the
   reference file).
+- **Decide platform access.** By default any authenticated user may use the
+  platform; lock it down if that is not what you want (see [Platform access](#platform-access)).
+
+### Platform access
+
+"Platform access" gates who may use the **control plane** — the `rise` CLI, the
+API, and the dashboard — as distinct from merely logging in to a
+forwardAuth-protected app. It is controlled by `auth.platform_access` in
+`config/docker.yaml`:
+
+- **`allow_all`** (the shipped default): any user who authenticates via the IdP
+  may use the platform. Suitable when the IdP already restricts who can sign in.
+- **`restrictive`**: only users on the allowlist may use the platform. Everyone
+  else authenticates fine but receives a 403 ("configured for application access
+  only") from the platform-access middleware.
+
+`admin_users` (`ADMIN_EMAIL`) and `operator_users` always bypass this check.
+
+To run a restricted stack via env, set `RISE_PLATFORM_ACCESS_POLICY=restrictive`
+and grant one user with `RISE_PLATFORM_ALLOWED_EMAIL=you@example.com`. To grant
+several users (or IdP groups via `allowed_idp_groups`), mount a config override
+that replaces the `auth.platform_access` block instead of relying on the single
+env var.
 
 ## Access classes & ingress authentication
 
@@ -295,17 +327,38 @@ issuer URL.
 
 ### Production caveat (important)
 
-Dex validates that the issuer it *serves* equals its configured `issuer`. The
-shipped `dev/dex/config.yaml` advertises `http://rise-dex:5556/dex`. If a
-production operator points `DEX_ISSUER` at `https://dex.${RISE_DOMAIN}` (the
-default in the base Compose file), they **must also** change Dex's served
-`issuer` in `dev/dex/config.yaml` to match — otherwise Dex rejects the
-discovery/token requests.
+The bundled Dex is a **demo IdP** (in-memory storage, static passwords —
+`admin@example.com` / `password`). For production, prefer an external IdP: set
+`auth.issuer`, `auth.client_id` and `auth.client_secret` to the external
+provider's values and drop the `dex` service from the stack.
 
-The bundled Dex is a **demo IdP** (in-memory storage, static passwords). For
-production, prefer an external IdP: set `auth.issuer`, `auth.client_id` and
-`auth.client_secret` to the external provider's values and drop the `dex`
-service (and its public router) from the stack.
+The base Compose file does **not** publish Dex publicly; the backend reaches it
+only over the internal `rise_default` network. Exposing the demo IdP at
+`dex.${RISE_DOMAIN}` is opt-in via the `docker-compose.standalone.demo-idp.yaml`
+overlay, intended only for a throwaway demo/evaluation stack:
+
+```bash
+docker compose -f docker-compose.standalone.yaml \
+               -f docker-compose.standalone.demo-idp.yaml up -d
+```
+
+If you do run the **bundled Dex in production** (demo overlay layered), two
+config changes in `dev/dex/config.yaml` are **both** required — Dex enforces
+each independently:
+
+1. **Issuer.** Dex validates that the issuer it *serves* equals its configured
+   `issuer`. The shipped config advertises `http://rise-dex:5556/dex`; when
+   `DEX_ISSUER` points at `https://dex.${RISE_DOMAIN}` (the base file's default),
+   change the served `issuer` in `dev/dex/config.yaml` to match — otherwise Dex
+   rejects the discovery/token requests.
+2. **Redirect URI.** The backend builds the OAuth callback as
+   `{public_url}/api/v1/auth/callback`, i.e.
+   `https://rise.${RISE_DOMAIN}/api/v1/auth/callback` in production. Dex rejects
+   any `redirect_uri` not in `staticClients[rise-backend].redirectURIs`, which
+   only lists the local hosts. **Add** `https://rise.${RISE_DOMAIN}/api/v1/auth/callback`
+   (and `https://rise.${RISE_DOMAIN}/.rise/auth/callback` if you use the `/.rise`
+   control-plane callback) to that list. Without this, login fails with
+   `invalid redirect_uri` even after fixing the issuer.
 
 ## Container registry (push/pull close-the-loop)
 
@@ -355,18 +408,36 @@ The push targets `client_registry_url` (`registry.${RISE_DOMAIN}`).
 
 ### 3. Pull (Rise host's Docker daemon)
 
-The Rise server's Docker daemon pulls images using `registry_url`:
+The Rise backend mounts the **host** Docker socket, so every image pull is
+executed by the **host's** Docker daemon — not from inside the Compose network.
+That daemon resolves `registry_url`'s host with the **host's** resolver, which
+does **not** consult Docker's embedded DNS on `rise_default`. The default
+`registry_url=rise-registry:5000` therefore does **not** work out of the box on a
+production host: `rise-registry` is only resolvable inside the Compose network,
+and `:5000` is plain HTTP, which the daemon rejects unless told otherwise. Pick
+one of:
 
-- **Internal path (default).** When pulling via `rise-registry:5000` on the same
-  host/network, **no auth is needed** — it never crosses the authenticated
-  Traefik edge.
-- **Public path.** If the daemon must pull via the public
-  `registry.${RISE_DOMAIN}` (e.g. a remote/multi-host setup), the **daemon**
-  itself needs credentials too: run `docker login registry.${RISE_DOMAIN}` on the
+- **Internal path (default `registry_url=rise-registry:5000`).** Two host-daemon
+  prerequisites:
+  1. Make `rise-registry` resolvable by the host daemon — add a host entry
+     (e.g. `127.0.0.1 rise-registry` in `/etc/hosts`, or an `extra_hosts` /
+     published-port mapping) so it reaches the registry container, **and**
+  2. Mark it insecure (plain HTTP): add `"rise-registry:5000"` to the daemon's
+     `insecure-registries` in `/etc/docker/daemon.json` and restart Docker.
+
+  No auth is needed on this path — it never crosses the authenticated Traefik
+  edge.
+- **Host-published loopback.** Publish the registry on a host loopback port (as
+  the local overlay does, `127.0.0.1:5000:5000`) and set
+  `RISE_REGISTRY_URL=127.0.0.1:5000`. Still requires the matching
+  `insecure-registries` entry for `127.0.0.1:5000`.
+- **Public path.** Point `RISE_REGISTRY_URL` at the public
+  `registry.${RISE_DOMAIN}` (TLS, no insecure-registry needed). The **daemon**
+  then needs credentials too: run `docker login registry.${RISE_DOMAIN}` on the
   Rise host, or add a matching entry to the daemon's `~/.docker/config.json`.
 
-Because both URLs reference the same registry, an image pushed to
-`registry.${RISE_DOMAIN}` is the exact image pulled via `rise-registry:5000`.
+Because all three URLs reference the same registry content, an image pushed to
+`registry.${RISE_DOMAIN}` is the exact image the daemon pulls.
 
 ## Troubleshooting
 

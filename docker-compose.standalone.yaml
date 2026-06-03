@@ -45,6 +45,11 @@
 #     creds). See the operator docs for the full login/push flow.
 #   * PIN A REAL IMAGE TAG. RISE_IMAGE_TAG below is a manual pin; bump it on
 #     upgrade (there is no automatic 'latest released' resolution).
+#   * PLATFORM ACCESS. By default any authenticated IdP user may use the
+#     CLI/API/dashboard (platform_access.policy=allow_all). To restrict the
+#     platform to an allowlist, set RISE_PLATFORM_ACCESS_POLICY=restrictive and
+#     grant users via RISE_PLATFORM_ALLOWED_EMAIL (single email) or by mounting
+#     a config override for several. admin_users/operator_users always bypass.
 #   * REVIEW RESOURCE LIMITS. Add `deploy.resources` / ulimits per service to
 #     fit your host; none are set here.
 #   * PERSIST + BACK UP VOLUMES. The named volumes below are local; use durable
@@ -95,15 +100,25 @@ services:
 
   # OIDC provider. Serves dev/dex/config.yaml (issuer http://rise-dex:5556/dex)
   # with staticPasswords admin@example.com/"password" and the rise-backend client.
-  # The issuer host `rise-dex` is the single issuer used everywhere (host dev
-  # backend, containerized backend, and the prod dex.${RISE_DOMAIN} router).
+  # The issuer host `rise-dex` is the issuer the bundled config actually serves
+  # and resolves identically for the host dev backend and the containerized
+  # backend over rise_default.
+  #
+  # SAFE-BY-DEFAULT: Dex is NOT published to the internet here. It ships static
+  # DEMO passwords (admin@example.com/"password") that grant a Rise admin
+  # session, so the production base file keeps it internal-only (the backend
+  # reaches it over rise_default at rise-dex:5556). To expose it publicly at
+  # dex.${RISE_DOMAIN} for a throwaway demo, opt in by layering
+  # docker-compose.standalone.demo-idp.yaml. For real use, replace Dex with a
+  # proper IdP (see the operator docs "Production caveat").
   dex:
     image: dexidp/dex:v2.45.1
     container_name: rise-dex
     restart: unless-stopped
     user: "0:0"
-    # No host port: the backend reaches Dex over rise_default (rise-dex:5556);
-    # browsers reach it through the dex.${RISE_DOMAIN} Traefik router below.
+    # No host port and no public Traefik router: the backend reaches Dex over
+    # rise_default (rise-dex:5556). Browser access (for the demo IdP) is opt-in
+    # via the demo-idp overlay; the local overlay re-publishes :5556 on loopback.
     volumes:
       - ./dev/dex/config.yaml:/etc/dex/config.yaml:ro
       - dex_data:/var/dex
@@ -120,16 +135,6 @@ services:
         # containerized backend resolves `rise-dex` on rise_default regardless.
         aliases:
           - rise-dex
-    # Expose Dex publicly at dex.${RISE_DOMAIN} (TLS) so browsers can reach the
-    # OIDC issuer when DEX_ISSUER points there. The local overlay drops these.
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.rise-dex.rule=Host(`dex.${RISE_DOMAIN}`)"
-      - "traefik.http.routers.rise-dex.entrypoints=websecure"
-      - "traefik.http.routers.rise-dex.tls=true"
-      - "traefik.http.routers.rise-dex.tls.certresolver=le"
-      - "traefik.http.services.rise-dex.loadbalancer.server.port=5556"
-      - "traefik.docker.network=rise_default"
 
   # OCI registry for images pushed by the rise CLI. Exposed publicly via Traefik
   # at registry.${RISE_DOMAIN} behind a basicauth middleware (the CLI does its
@@ -252,9 +257,11 @@ services:
       - RISE_TRAEFIK_ENTRYPOINT=websecure
       - RISE_CLIENT_REGISTRY_URL=registry.${RISE_DOMAIN}
       - RISE_COOKIE_SECURE=true
-      # Single OIDC issuer. Defaults to the public Dex router; override to point
-      # at Dex fronted elsewhere. Computed here (not in the config) so the value
-      # is fully resolved before the backend reads it.
+      # Single OIDC issuer. Defaults to dex.${RISE_DOMAIN} — which is only
+      # reachable if you opt into the demo-idp overlay (the base file does NOT
+      # publish Dex publicly). For a real IdP, override DEX_ISSUER to the
+      # external provider's issuer. Computed here (not in the config) so the
+      # value is fully resolved before the backend reads it.
       - DEX_ISSUER=${DEX_ISSUER:-https://dex.${RISE_DOMAIN}}
       # SECRETS — MUST be set in the host environment for any real use. Passed
       # through ONLY when set (the bare `- NAME` form omits an unset var rather
@@ -267,6 +274,13 @@ services:
       - RISE_ENCRYPTION_KEY
       - OIDC_CLIENT_SECRET
       - ADMIN_EMAIL
+      # Platform access. Default is allow_all (any authenticated user may use the
+      # CLI/API/dashboard). Set RISE_PLATFORM_ACCESS_POLICY=restrictive to lock
+      # the platform to an allowlist, then grant a user via RISE_PLATFORM_ALLOWED_EMAIL
+      # (single email; mount a config override for several). Passed through only
+      # when set so they fall back to the config defaults otherwise.
+      - RISE_PLATFORM_ACCESS_POLICY
+      - RISE_PLATFORM_ALLOWED_EMAIL
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:

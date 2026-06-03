@@ -18,6 +18,11 @@ staticClients:
   - http://rise.localhost:3000/api/v1/auth/callback
   # /.rise control-plane callback variant (custom-domain / ingress routing).
   - http://rise.localhost:3000/.rise/auth/callback
+  # PRODUCTION (bundled Dex only): if you run this demo Dex in production you
+  # MUST also add the prod callback here, or login fails with `invalid
+  # redirect_uri`. See the operator docs "Production caveat". e.g.:
+  #   - https://rise.example.com/api/v1/auth/callback
+  #   - https://rise.example.com/.rise/auth/callback
   # CLI Auth
   - http://localhost:8765/callback
   - http://localhost:8766/callback

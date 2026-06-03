@@ -23,18 +23,33 @@
 server:
   host: "0.0.0.0"
   port: 3000
-  # Base public URL of the control plane. App hosts are subdomains of this host
-  # so the post-login same-host redirect validates (see validate_redirect_url in
-  # src/server/auth/handlers.rs). Prod sets PUBLIC_URL=https://rise.${RISE_DOMAIN}.
+  # Base public URL of the control plane. App hosts ({project}.${RISE_INGRESS_DOMAIN})
+  # are siblings of this host, not subdomains of it, so the post-login deep-link
+  # redirect is validated against BOTH this host and the ingress domain suffix
+  # (see validate_redirect_url in src/server/auth/handlers.rs). Prod sets
+  # PUBLIC_URL=https://rise.${RISE_DOMAIN}.
   public_url: "${PUBLIC_URL:-http://rise.localhost:3000}"
   cookie_secure: "${RISE_COOKIE_SECURE:-false}"
   jwt_signing_secret: "${RISE_JWT_SIGNING_SECRET:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}"
   jwt_claims: ["sub", "email", "name"]
   static_dir: "${RISE_STATIC_DIR:-/var/lib/rise/static}"
   docs_dir: "${RISE_DOCS_DIR:-/var/rise/docs}"
+  # SSRF guard for server-side URL fetches (OIDC discovery, OAuth extension
+  # issuer/token endpoints, etc.). Default CLOSED for production: private/loopback
+  # IPs and plain HTTP are rejected. `trusted_hosts` ONLY exempts the listed hosts
+  # from the private-IP block — it does NOT relax the HTTPS requirement, which is
+  # enforced globally. Reaching a plain-HTTP internal issuer therefore also needs
+  # allow_http=true; that is why the local overlay sets RISE_SSRF_ALLOW_HTTP=true
+  # (alongside RISE_SSRF_ALLOW_PRIVATE=true) to reach the internal
+  # http://rise-dex:5556 issuer. For production, prefer an HTTPS internal/issuer
+  # endpoint so the guard can stay fully closed. Add your own internal hosts as needed.
   ssrf:
-    allow_private_networks: true
-    allow_http: true
+    allow_private_networks: "${RISE_SSRF_ALLOW_PRIVATE:-false}"
+    allow_http: "${RISE_SSRF_ALLOW_HTTP:-false}"
+    trusted_hosts:
+      - "rise-dex"
+      - "rise-registry"
+      - "rise"
 database:
   url: "${DATABASE_URL}"
 encryption:
@@ -51,12 +66,26 @@ auth:
   operator_users: ["ops@example.com"]
   allow_team_creation: true
   allow_list_all_teams: true
+  # Who may use the CLI/API/dashboard (the "platform"), as opposed to merely
+  # logging in to a forwardAuth-protected app. Defaults to `allow_all` so any
+  # authenticated IdP user can use the platform — operators opt into a locked-
+  # down stack with RISE_PLATFORM_ACCESS_POLICY=restrictive and then grant
+  # specific users via RISE_PLATFORM_ALLOWED_EMAILS (comma/space-separated is
+  # NOT supported; pass a single email, or override this block in a mounted
+  # config for multiple). admin_users / operator_users always bypass this.
   platform_access:
-    policy: restrictive
-    allowed_user_emails: ["admin@example.com", "dev@example.com", "ops@example.com"]
+    policy: "${RISE_PLATFORM_ACCESS_POLICY:-allow_all}"
+    allowed_user_emails:
+      - "${RISE_PLATFORM_ALLOWED_EMAIL:-}"
 registry:
   type: "oci-client-auth"
-  # Internal URL the server's Docker daemon uses to PULL app images.
+  # Internal URL the HOST Docker daemon uses to PULL app images (the backend
+  # mounts the host socket, so the host resolver — not Docker's embedded DNS —
+  # resolves this host). For the default `rise-registry:5000` to work the host
+  # daemon must be able to resolve `rise-registry` AND list `rise-registry:5000`
+  # in its insecure-registries (plain HTTP). See the registry "Pull" section in
+  # docs/.../docker/index.md; override with RISE_REGISTRY_URL (e.g. a published
+  # 127.0.0.1:5000 or the public TLS registry.${RISE_DOMAIN}).
   registry_url: "${RISE_REGISTRY_URL:-rise-registry:5000}"
   namespace: "rise-apps"
   # Public URL the CLI PUSHES to. Local default is the loopback-published

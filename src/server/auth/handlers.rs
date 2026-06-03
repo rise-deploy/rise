@@ -39,6 +39,36 @@ fn build_project_url(state: &AppState, project_name: &str) -> Option<String> {
     }
 }
 
+/// Derive the trusted ingress domain suffix from the production ingress URL
+/// template, for use as an additional trusted redirect domain.
+///
+/// In the standard project-subdomain layout the app host (e.g.
+/// `secret.example.com`, from `production_ingress_url_template =
+/// {project_name}.example.com`) is a **sibling** of the control-plane host
+/// (`rise.example.com`), not a subdomain of it — so the post-login deep-link
+/// `redirect` would otherwise fail `validate_redirect_url` (which only trusts
+/// `public_url`'s host and its subdomains) and drop to `/`. Returning the
+/// template's host suffix (everything after the leading `{project_name}.`
+/// placeholder, e.g. `example.com`) lets the caller trust `{project}.example.com`
+/// app deep-links so the user returns to the exact page they requested.
+///
+/// Returns `None` when no template is configured, the host has no `.`-separated
+/// suffix after the placeholder, or the suffix would be empty.
+fn ingress_domain_suffix(state: &AppState) -> Option<String> {
+    let template = state.production_ingress_url_template.as_ref()?;
+    // Host is everything before an optional `/path` prefix.
+    let host = template.split('/').next().unwrap_or(template);
+    // Strip the leading `{project_name}.` (or any leading placeholder label) to
+    // get the shared parent domain. Fall back to the first label boundary.
+    let suffix = host
+        .strip_prefix("{project_name}.")
+        .or_else(|| host.split_once('.').map(|(_, rest)| rest))?;
+    if suffix.is_empty() || suffix.contains('{') {
+        return None;
+    }
+    Some(suffix.to_string())
+}
+
 /// Validate and sanitize a redirect URL to prevent open redirect vulnerabilities
 ///
 /// This function ensures that redirect URLs are safe before using them in templates
@@ -51,6 +81,10 @@ fn build_project_url(state: &AppState, project_name: &str) -> Option<String> {
 /// # Arguments
 /// * `redirect_url` - The redirect URL from user input (query params)
 /// * `public_url` - The Rise public URL (trusted domain)
+/// * `trusted_suffix` - Optional additional trusted domain suffix (e.g. the
+///   ingress domain `example.com`), so app subdomains that are *siblings* of the
+///   control-plane host (`{project}.example.com` vs `rise.example.com`) are also
+///   accepted. The redirect host must equal it or be a subdomain of it.
 ///
 /// # Returns
 /// A safe redirect URL, or "/" if the input is invalid
@@ -58,10 +92,14 @@ fn build_project_url(state: &AppState, project_name: &str) -> Option<String> {
 /// # Security
 /// - Relative paths starting with "/" are always allowed
 /// - Absolute URLs must be HTTPS (or HTTP for localhost/development)
-/// - Absolute URLs must match the Rise public domain
+/// - Absolute URLs must match the Rise public domain (or the trusted ingress suffix)
 /// - All dangerous schemes (javascript:, data:, vbscript:, etc.) are blocked
 /// - Invalid or suspicious URLs default to "/"
-fn validate_redirect_url(redirect_url: &str, public_url: &str) -> String {
+fn validate_redirect_url(
+    redirect_url: &str,
+    public_url: &str,
+    trusted_suffix: Option<&str>,
+) -> String {
     const SAFE_FALLBACK: &str = "/";
 
     // Empty or whitespace-only URLs default to safe fallback
@@ -152,6 +190,21 @@ fn validate_redirect_url(redirect_url: &str, public_url: &str) -> String {
     // e.g., if public_url is "https://rise.dev", allow "https://app.rise.dev"
     if redirect_host.ends_with(&format!(".{}", public_host)) {
         return redirect_url.to_string();
+    }
+
+    // Allow redirects to the configured ingress domain (or its subdomains). In
+    // the standard project-subdomain layout app hosts are siblings of the
+    // control-plane host (e.g. `secret.example.com` vs `rise.example.com`), so
+    // they match neither check above; trusting the ingress domain suffix lets
+    // those deep-links through. e.g. trusted_suffix="example.com" accepts
+    // "secret.example.com".
+    if let Some(suffix) = trusted_suffix {
+        let suffix = suffix.trim_matches('.');
+        if !suffix.is_empty()
+            && (redirect_host == suffix || redirect_host.ends_with(&format!(".{}", suffix)))
+        {
+            return redirect_url.to_string();
+        }
     }
 
     // Allow localhost and 127.0.0.1 for development (only if public_url is also local)
@@ -766,7 +819,11 @@ pub async fn signin_page(
         .unwrap_or_else(|| "/".to_string());
 
     // Validate and sanitize the redirect URL to prevent open redirects
-    let redirect_url = validate_redirect_url(&raw_redirect_url, &state.public_url);
+    let redirect_url = validate_redirect_url(
+        &raw_redirect_url,
+        &state.public_url,
+        ingress_domain_suffix(&state).as_deref(),
+    );
 
     tracing::info!(
         project = %project_name,
@@ -884,7 +941,9 @@ pub async fn oauth_signin_start(
     let raw_redirect_url = params.rd.as_ref().or(params.redirect.as_ref());
 
     // Validate and sanitize redirect URL if provided
-    let redirect_url = raw_redirect_url.map(|url| validate_redirect_url(url, &state.public_url));
+    let trusted_suffix = ingress_domain_suffix(&state);
+    let redirect_url = raw_redirect_url
+        .map(|url| validate_redirect_url(url, &state.public_url, trusted_suffix.as_deref()));
 
     tracing::info!(
         project = ?params.project,
@@ -1455,6 +1514,24 @@ where
     ))
 }
 
+/// Select the trusted request-path header for the `/.rise/*` allowlist by proxy
+/// mode.
+///
+/// nginx authoritatively sets `x-auth-request-redirect` (inbound client copies
+/// are stripped), while Traefik forwardAuth (`signin_redirect=true`)
+/// authoritatively overwrites `x-forwarded-uri` with the real request URI. Only
+/// the mode-appropriate header is read: reading the other would trust a
+/// client-controllable value (e.g. under Traefik a client can spoof
+/// `x-auth-request-redirect: /.rise/x` to bypass auth on an arbitrary path).
+fn allowlist_path(headers: &HeaderMap, traefik_mode: bool) -> Option<&str> {
+    if traefik_mode {
+        headers.get("x-forwarded-uri")
+    } else {
+        headers.get("x-auth-request-redirect")
+    }
+    .and_then(|v| v.to_str().ok())
+}
+
 /// Build the browser-facing login redirect URL for Traefik forwardAuth mode.
 ///
 /// Mirrors the Kubernetes `backend_address` ingress-auth flow (see
@@ -1528,13 +1605,13 @@ pub async fn ingress_auth(
 
     // Allow access to /.rise/* paths without authentication (login page, static
     // assets). This prevents redirect loops when users try to access the signin
-    // page. nginx forwards the request path in `x-auth-request-redirect`; Traefik
-    // forwardAuth forwards it in `x-forwarded-uri`. Read either.
-    let allowlist_path = headers
-        .get("x-auth-request-redirect")
-        .or_else(|| headers.get("x-forwarded-uri"))
-        .and_then(|v| v.to_str().ok());
-    if let Some(redirect_path) = allowlist_path {
+    // page. The trusted path header is selected by proxy mode: nginx authoritatively
+    // sets `x-auth-request-redirect` (inbound client copies are stripped), while
+    // Traefik forwardAuth authoritatively overwrites `x-forwarded-uri` with the real
+    // request URI. Read ONLY the mode-appropriate header — reading the other would
+    // trust a client-controllable value (e.g. under Traefik a client can spoof
+    // `x-auth-request-redirect: /.rise/x` to bypass auth on an arbitrary path).
+    if let Some(redirect_path) = allowlist_path(&headers, params.signin_redirect) {
         if redirect_path.starts_with("/.rise/") {
             tracing::debug!(
                 project = %params.project,
@@ -1971,23 +2048,58 @@ mod tests {
     }
 
     #[test]
+    fn allowlist_path_ignores_spoofable_header_in_traefik_mode() {
+        // In Traefik forwardAuth mode (signin_redirect=true) only the
+        // authoritative `x-forwarded-uri` is trusted. A client spoofing
+        // `x-auth-request-redirect: /.rise/x` while the real request is `/admin`
+        // must NOT be allowlisted.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-uri", "/admin".parse().unwrap());
+        headers.insert("x-auth-request-redirect", "/.rise/x".parse().unwrap());
+
+        let path = allowlist_path(&headers, true);
+        assert_eq!(path, Some("/admin"));
+        assert!(!path.unwrap().starts_with("/.rise/"));
+    }
+
+    #[test]
+    fn allowlist_path_trusts_forwarded_uri_in_traefik_mode() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-uri", "/.rise/auth/signin".parse().unwrap());
+        assert_eq!(allowlist_path(&headers, true), Some("/.rise/auth/signin"));
+    }
+
+    #[test]
+    fn allowlist_path_uses_auth_request_redirect_in_nginx_mode() {
+        // In nginx mode (signin_redirect=false) the server-set
+        // `x-auth-request-redirect` is authoritative; `x-forwarded-uri` is ignored.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-auth-request-redirect", "/.rise/login".parse().unwrap());
+        headers.insert("x-forwarded-uri", "/admin".parse().unwrap());
+        assert_eq!(allowlist_path(&headers, false), Some("/.rise/login"));
+    }
+
+    #[test]
     fn test_validate_redirect_url_relative_paths() {
         let public_url = "https://rise.dev";
 
         // Valid relative paths
-        assert_eq!(validate_redirect_url("/", public_url), "/");
+        assert_eq!(validate_redirect_url("/", public_url, None), "/");
         assert_eq!(
-            validate_redirect_url("/dashboard", public_url),
+            validate_redirect_url("/dashboard", public_url, None),
             "/dashboard"
         );
         assert_eq!(
-            validate_redirect_url("/app/project/123", public_url),
+            validate_redirect_url("/app/project/123", public_url, None),
             "/app/project/123"
         );
 
         // Protocol-relative URLs should be blocked
-        assert_eq!(validate_redirect_url("//evil.com", public_url), "/");
-        assert_eq!(validate_redirect_url("//evil.com/path", public_url), "/");
+        assert_eq!(validate_redirect_url("//evil.com", public_url, None), "/");
+        assert_eq!(
+            validate_redirect_url("//evil.com/path", public_url, None),
+            "/"
+        );
     }
 
     #[test]
@@ -1996,19 +2108,23 @@ mod tests {
 
         // JavaScript URLs should be blocked
         assert_eq!(
-            validate_redirect_url("javascript:alert('xss')", public_url),
+            validate_redirect_url("javascript:alert('xss')", public_url, None),
             "/"
         );
 
         // Data URLs should be blocked
         assert_eq!(
-            validate_redirect_url("data:text/html,<script>alert('xss')</script>", public_url),
+            validate_redirect_url(
+                "data:text/html,<script>alert('xss')</script>",
+                public_url,
+                None
+            ),
             "/"
         );
 
         // vbscript URLs should be blocked
         assert_eq!(
-            validate_redirect_url("vbscript:msgbox('xss')", public_url),
+            validate_redirect_url("vbscript:msgbox('xss')", public_url, None),
             "/"
         );
     }
@@ -2019,13 +2135,13 @@ mod tests {
 
         // Same domain should be allowed
         assert_eq!(
-            validate_redirect_url("https://rise.dev/dashboard", public_url),
+            validate_redirect_url("https://rise.dev/dashboard", public_url, None),
             "https://rise.dev/dashboard"
         );
 
         // Same domain with port should be allowed
         assert_eq!(
-            validate_redirect_url("https://rise.dev:8080/dashboard", public_url),
+            validate_redirect_url("https://rise.dev:8080/dashboard", public_url, None),
             "https://rise.dev:8080/dashboard"
         );
     }
@@ -2036,18 +2152,18 @@ mod tests {
 
         // Subdomain should be allowed
         assert_eq!(
-            validate_redirect_url("https://app.rise.dev/dashboard", public_url),
+            validate_redirect_url("https://app.rise.dev/dashboard", public_url, None),
             "https://app.rise.dev/dashboard"
         );
 
         assert_eq!(
-            validate_redirect_url("https://staging.rise.dev/dashboard", public_url),
+            validate_redirect_url("https://staging.rise.dev/dashboard", public_url, None),
             "https://staging.rise.dev/dashboard"
         );
 
         // Multi-level subdomain should be allowed
         assert_eq!(
-            validate_redirect_url("https://my-project.app.rise.dev/", public_url),
+            validate_redirect_url("https://my-project.app.rise.dev/", public_url, None),
             "https://my-project.app.rise.dev/"
         );
     }
@@ -2057,16 +2173,52 @@ mod tests {
         let public_url = "https://rise.dev";
 
         // External domains should be blocked
-        assert_eq!(validate_redirect_url("https://evil.com", public_url), "/");
+        assert_eq!(
+            validate_redirect_url("https://evil.com", public_url, None),
+            "/"
+        );
 
         assert_eq!(
-            validate_redirect_url("https://phishing.site/login", public_url),
+            validate_redirect_url("https://phishing.site/login", public_url, None),
             "/"
         );
 
         // Domains that look similar but are not subdomains should be blocked
         assert_eq!(
-            validate_redirect_url("https://rise.dev.evil.com", public_url),
+            validate_redirect_url("https://rise.dev.evil.com", public_url, None),
+            "/"
+        );
+    }
+
+    #[test]
+    fn test_validate_redirect_url_trusted_ingress_suffix() {
+        // Control plane is rise.example.com; apps are siblings under example.com
+        // (e.g. secret.example.com), not subdomains of the control-plane host.
+        let public_url = "https://rise.example.com";
+        let suffix = Some("example.com");
+
+        // Sibling app subdomain is accepted via the trusted ingress suffix.
+        assert_eq!(
+            validate_redirect_url("https://secret.example.com/dashboard", public_url, suffix),
+            "https://secret.example.com/dashboard"
+        );
+        // The bare ingress domain itself is accepted.
+        assert_eq!(
+            validate_redirect_url("https://example.com/x", public_url, suffix),
+            "https://example.com/x"
+        );
+        // Without the suffix it would drop to "/".
+        assert_eq!(
+            validate_redirect_url("https://secret.example.com/dashboard", public_url, None),
+            "/"
+        );
+        // Lookalike domains are still blocked.
+        assert_eq!(
+            validate_redirect_url("https://secret.example.com.evil.com/", public_url, suffix),
+            "/"
+        );
+        assert_eq!(
+            validate_redirect_url("https://notexample.com/", public_url, suffix),
             "/"
         );
     }
@@ -2077,24 +2229,27 @@ mod tests {
 
         // localhost to localhost should be allowed
         assert_eq!(
-            validate_redirect_url("http://localhost:3000/dashboard", public_url),
+            validate_redirect_url("http://localhost:3000/dashboard", public_url, None),
             "http://localhost:3000/dashboard"
         );
 
         assert_eq!(
-            validate_redirect_url("http://127.0.0.1:3000/dashboard", public_url),
+            validate_redirect_url("http://127.0.0.1:3000/dashboard", public_url, None),
             "http://127.0.0.1:3000/dashboard"
         );
 
         // Malicious localhost URLs with invalid ports should be rejected during parsing
         // The URL parser will fail to parse "localhost:evil.com" as a valid port
         assert_eq!(
-            validate_redirect_url("http://localhost:evil.com/path", public_url),
+            validate_redirect_url("http://localhost:evil.com/path", public_url, None),
             "/"
         );
 
         // But external URLs should still be blocked even when public_url is localhost
-        assert_eq!(validate_redirect_url("https://evil.com", public_url), "/");
+        assert_eq!(
+            validate_redirect_url("https://evil.com", public_url, None),
+            "/"
+        );
     }
 
     #[test]
@@ -2103,12 +2258,12 @@ mod tests {
 
         // localhost should be blocked when public_url is not localhost
         assert_eq!(
-            validate_redirect_url("http://localhost:3000/dashboard", public_url),
+            validate_redirect_url("http://localhost:3000/dashboard", public_url, None),
             "/"
         );
 
         assert_eq!(
-            validate_redirect_url("http://127.0.0.1:3000/dashboard", public_url),
+            validate_redirect_url("http://127.0.0.1:3000/dashboard", public_url, None),
             "/"
         );
     }
@@ -2118,13 +2273,13 @@ mod tests {
         let public_url = "https://rise.dev";
 
         // Empty string should return fallback
-        assert_eq!(validate_redirect_url("", public_url), "/");
+        assert_eq!(validate_redirect_url("", public_url, None), "/");
 
         // Whitespace only should return fallback
-        assert_eq!(validate_redirect_url("   ", public_url), "/");
+        assert_eq!(validate_redirect_url("   ", public_url, None), "/");
 
         // Invalid URLs should return fallback
-        assert_eq!(validate_redirect_url("not a url", public_url), "/");
+        assert_eq!(validate_redirect_url("not a url", public_url, None), "/");
     }
 
     #[test]
@@ -2133,13 +2288,13 @@ mod tests {
 
         // HTTP URLs should be allowed for same domain
         assert_eq!(
-            validate_redirect_url("http://rise.dev/dashboard", public_url),
+            validate_redirect_url("http://rise.dev/dashboard", public_url, None),
             "http://rise.dev/dashboard"
         );
 
         // HTTPS URLs should be allowed for same domain
         assert_eq!(
-            validate_redirect_url("https://rise.dev/dashboard", public_url),
+            validate_redirect_url("https://rise.dev/dashboard", public_url, None),
             "https://rise.dev/dashboard"
         );
     }
