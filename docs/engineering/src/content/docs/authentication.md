@@ -14,12 +14,12 @@ algorithm/claim disambiguation rules, see the engineering reference in
 
 | Token | Direction | Algorithm | Audience (`aud`) | Verified by | Governed by |
 |---|---|---|---|---|---|
-| **Session** | Issued | HS256 | Rise `public_url` | Rise API middleware | `server.jwt_signing_secret`, `server.jwt_expiry_seconds` |
-| **Ingress** | Issued | RS256 | Project URL | Nginx/ingress via Rise JWKS | `server.rs256_private_key_pem` |
-| **Workload identity** | Issued | RS256 | Caller-supplied (e.g. `sts.amazonaws.com`) | External system via Rise JWKS | `server.rs256_private_key_pem`, `deployment.identity_token_ttl_seconds` |
-| **User login (OIDC)** | Accepted | per IdP | — | Rise (JWKS of `auth.issuer`) | `auth.issuer`, `auth.client_id`, `auth.client_secret` |
-| **Service account** | Accepted | RS256 (JWKS) | project-scoped | Rise (JWKS of the SA issuer) | per-project (CLI/API managed) |
-| **Controller** | Accepted | RS256 (JWKS) | per identity | Rise (JWKS of controller issuer) | `auth.controllers[]` |
+| **[Session](#session-hs256)** | Issued | HS256 | Rise `public_url` | Rise API middleware | `server.jwt_signing_secret`, `server.jwt_expiry_seconds` |
+| **[Ingress](#ingress-rs256)** | Issued | RS256 | Project URL | Nginx/ingress via Rise JWKS | `server.rs256_private_key_pem` |
+| **[Workload identity](#workload-identity-rs256)** | Issued | RS256 | Caller-supplied (e.g. `sts.amazonaws.com`) | External system via Rise JWKS | `server.rs256_private_key_pem`, `deployment.identity_token_ttl_seconds` |
+| **[User login (OIDC)](#user-login-oidc)** | Accepted | per IdP | — | Rise (JWKS of `auth.issuer`) | `auth.issuer`, `auth.client_id`, `auth.client_secret` |
+| **[Service account](#service-accounts-cicd)** | Accepted | RS256 (JWKS) | project-scoped | Rise (JWKS of the SA issuer) | per-project (CLI/API managed) |
+| **[Controller](#controllers)** | Accepted | RS256 (JWKS) | per identity | Rise (JWKS of controller issuer) | `auth.controllers[]` |
 
 > **Access tokens** (a Rise-issued, exchange-minted token for delegated access)
 > are planned but **not yet available** — see
