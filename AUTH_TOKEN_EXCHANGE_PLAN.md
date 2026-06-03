@@ -746,6 +746,14 @@ so we phase it.
   (b) commit to a **target version** at which the default flips to `false` (call it out in the
   changelog/settings doc when the toggle lands); (c) state plainly in the setting's doc-comment that
   leaving it `true` forfeits the security benefits above.
+
+  **Operator docs (required).** Update the operator "Authentication & Tokens" page
+  (`docs/engineering/src/content/docs/authentication.md`) as part of this phase: add the **Access**
+  token to the at-a-glance table, replace the "Forthcoming: Access tokens & token exchange" section
+  with the real exchange endpoint (request/response, how it relates to the inner OIDC token, the
+  `header.typ` discriminator) and the `auth.allow_raw_external_tokens` toggle (including the H4
+  deprecation guidance above). Keep it operator-facing and cross-link the design doc — do not
+  duplicate the `crates/rise-backend-auth/README.md` disambiguation matrix.
 - **Phase 2 — CLI auto-exchange.** Add an `ExchangingTokenSource` decorator in
   `cli/token_source.rs` that wraps the existing provider: on `token()` it calls the exchange
   endpoint with the inner OIDC token + project name and caches the returned Rise access token,
