@@ -81,9 +81,11 @@ run = """
 cargo all-features check --all-targets
 cargo check --package rise-resource-api --all-targets
 cargo check --package rise-resource-store --all-targets
+cargo check --package rise-backend-auth --all-targets
 cargo all-features clippy --all-targets -- -D warnings
 cargo clippy --package rise-resource-api --all-targets -- -D warnings
 cargo clippy --package rise-resource-store --all-targets -- -D warnings
+cargo clippy --package rise-backend-auth --all-targets -- -D warnings
 cargo fmt --all -- --check
 mise sqlx:check
 mise resource:schema:check

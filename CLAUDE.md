@@ -53,7 +53,7 @@ Let's outline the architecture and components needed for this Rust-based project
 
 ## Architecture Overview
 
-**Note**: The project is structured as a **single consolidated Rust crate** (`rise-deploy`) that produces the `rise` binary with both CLI and server capabilities enabled via feature flags.
+**Note**: The project is a Cargo **workspace**. The primary crate `rise-deploy` produces the `rise` binary with both CLI and server capabilities enabled via feature flags. A few focused, backend-only support crates live under `crates/` and are depended on as optional, `backend`-feature-gated path deps: `rise-resource-api` / `rise-resource-store` (generic resource API), and `rise-backend-auth` (pure-core token signing, verification, and matching — the single home for auth-token logic; see `AUTH_TOKEN_EXCHANGE_PLAN.md`).
 
 ### Crate Structure (`rise-deploy`)
 

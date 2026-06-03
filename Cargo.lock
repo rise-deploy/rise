@@ -4106,6 +4106,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "rise-backend-auth"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "jsonwebtoken 10.4.0",
+ "rand 0.10.1",
+ "rsa",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.18",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "rise-deploy"
 version = "0.23.0-rc4"
 dependencies = [
@@ -4140,6 +4158,7 @@ dependencies = [
  "rand 0.10.1",
  "regex",
  "reqwest 0.13.4",
+ "rise-backend-auth",
  "rise-resource-api",
  "rise-resource-store",
  "rsa",
