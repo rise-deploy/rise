@@ -29,11 +29,18 @@ pub const SUFFIX_IMAGE: &str = "image";
 /// active↔inactive — that Docker can't apply to a running container in place.
 pub const SUFFIX_ROUTE_HASH: &str = "route-hash";
 /// Monotonic generation counter for a container slot's identity tuple
-/// (project, group, deployment-id, container). Starts at 1; bumped on every
-/// recreate so the new container's NAME (`..._g{n}`) is visibly newer than the
-/// one it replaced. NOT part of any matching key or hash — purely cosmetic plus
-/// the source for computing the next generation.
+/// (project, group, deployment-id, container, replica). Starts at 1; bumped on
+/// every recreate so the new container's NAME (`..._g{n}`) is visibly newer than
+/// the one it replaced. NOT part of any matching key or hash — purely cosmetic
+/// plus the source for computing the next generation.
 pub const SUFFIX_GENERATION: &str = "generation";
+/// Zero-based replica index for a container slot. Part of the stable identity
+/// tuple so each replica of a spec is matched/recreated independently, but
+/// deliberately NOT part of the network alias / `RISE_CONTAINER_HOST__` discovery
+/// host (all replicas share one replica-free alias so Docker DNS round-robins)
+/// and NOT part of the Traefik labels (all replicas share one router+service so
+/// Traefik load-balances across them).
+pub const SUFFIX_REPLICA: &str = "replica";
 
 /// Build a namespaced bookkeeping label key, e.g. `rise.dev/project`.
 pub fn ns_key(label_namespace: &str, suffix: &str) -> String {
@@ -70,6 +77,11 @@ pub struct BookkeepingLabels<'a> {
     /// Monotonic generation of this container; rendered as `{ns}/generation`.
     /// Drives the `..._g{n}` name suffix. NOT fed into any hash or matching key.
     pub generation: u32,
+    /// Zero-based replica index of this container within its spec; rendered as
+    /// `{ns}/replica`. Part of the stable identity tuple (so each replica is
+    /// reconciled independently) and folded into the `..._r{n}` name segment, but
+    /// NOT fed into any hash, the network alias, or the Traefik labels.
+    pub replica: u32,
 }
 
 impl BookkeepingLabels<'_> {
@@ -106,6 +118,10 @@ impl BookkeepingLabels<'_> {
         // `hash_recreate_signature`, so the generation never affects the
         // recreate signature (no per-generation recreate loop).
         labels.insert(ns_key(ns, SUFFIX_GENERATION), self.generation.to_string());
+        // Replica index — part of the identity tuple, read back in
+        // `list_actual_containers`. Like the generation it is never fed into any
+        // routing/recreate hash.
+        labels.insert(ns_key(ns, SUFFIX_REPLICA), self.replica.to_string());
         labels
     }
 }

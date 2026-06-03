@@ -58,7 +58,7 @@ Legend: ✅ supported · ⚠️ partial / with caveats · ❌ not supported (see
 | Private image pull | registry config | ✅ | ✅ | imagePullSecret (K8s) vs. host-daemon `docker login` (Docker). |
 | Workload identity tokens | token-exchange API | ✅ | ✅ | Backend-agnostic (issued by the control plane). |
 | Secret env-var isolation | `rise env set --secret` | ✅ | ⚠️ | K8s stores secret env in a per-project Secret; Docker flattens them into plain container env (visible to `docker inspect`). Use the Kubernetes backend where at-rest env isolation matters. |
-| Replicas > 1 (horizontal scale) | `replicas` | ✅ | ❌ | **Docker limitation:** one container per spec today; `replicas>1` runs a single container (warned). |
+| Replicas > 1 (horizontal scale) | `replicas` | ✅ | ✅ | Docker runs N containers per spec (clamped to 50) behind ONE Traefik service (round-robin LB) and ONE shared, replica-free network alias (Docker DNS round-robins). Recreates roll one replica at a time — a running, drifted replica is replaced only while every other replica is healthy, so capacity never drops by more than one. K8s uses a Deployment's `replicas`. |
 | Zero-downtime active switch | implicit (blue/green) | ✅ | ⚠️ | Service selector flip (K8s) is atomic; Docker recreates the container, so there is a brief routing gap. |
 | Per-group network isolation | implicit | ✅ | ❌ | **Docker limitation:** NetworkPolicy (K8s) has no single-host equivalent; all app containers share `rise_default`. |
 

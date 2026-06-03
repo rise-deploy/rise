@@ -77,6 +77,20 @@ pub struct DesiredContainer {
     /// diff resolves the real value before apply: a brand-new slot → `1`, a
     /// recreate → live `g{n}` + 1.
     pub generation: u32,
+    /// Zero-based replica index of this container within its spec (`0..N`). IS an
+    /// identity field (folded into [`identity_key`] and the `..._r{n}` name
+    /// segment) so each replica is matched/recreated independently. Deliberately
+    /// NOT fed into routing/recreate hashes, the network alias, or the Traefik
+    /// labels: all replicas of a spec carry one replica-free alias (Docker DNS
+    /// round-robins) and one router+service (Traefik load-balances).
+    pub replica: u32,
+    /// Effective HTTP health-probe path for this container (already resolved from
+    /// the spec's `health_check`): `Some("/healthz")` to probe, or `None` when the
+    /// probe is disabled or the container is a port-less worker. Used by the
+    /// rolling-recreate throttle to gate a running drifted replica's recreate on
+    /// every OTHER replica being healthy. NOT an identity field and NOT fed into
+    /// any hash (so it never causes drift on its own).
+    pub health_path: Option<String>,
 }
 
 /// Static controller configuration the builder needs.
@@ -124,34 +138,40 @@ pub struct BuiltContainer {
 const MAX_NAME_LEN: usize = 63;
 
 /// Compute the live container's `--name`:
-/// `<prefix>_<project>_<group>_<deploymentid>_<container>_g<generation>`,
+/// `<prefix>_<project>_<group>_<deploymentid>_<container>_r<replica>_g<generation>`,
 /// sanitized to `[a-zA-Z0-9_.-]`, hash-suffixed when longer than
-/// [`MAX_NAME_LEN`]. The `_g{n}` suffix is folded into the raw string BEFORE the
-/// length cap, so the >63-char hash-truncation branch still caps the whole
-/// string (suffix included). The generation makes a recreated container's name
-/// visibly newer than the one it replaced; matching is by bookkeeping LABELS
-/// (the stable identity tuple), never by this name — see
-/// [`stable_identity_name`] for the generation-free identity used by DNS / env.
+/// [`MAX_NAME_LEN`]. The `_r{n}_g{n}` suffix is folded into the raw string BEFORE
+/// the length cap, so the >63-char hash-truncation branch still caps the whole
+/// string (suffix included). The replica index keeps each replica's name
+/// distinct; the generation makes a recreated container's name visibly newer
+/// than the one it replaced. Matching is by bookkeeping LABELS (the stable
+/// identity tuple including the replica), never by this name — see
+/// [`stable_identity_name`] for the replica- and generation-free identity used by
+/// DNS / env.
 pub fn container_name(
     prefix: &str,
     project: &str,
     deployment_group: &str,
     deployment_id: &str,
     container: &str,
+    replica: u32,
     generation: u32,
 ) -> String {
-    let raw =
-        format!("{prefix}_{project}_{deployment_group}_{deployment_id}_{container}_g{generation}");
+    let raw = format!(
+        "{prefix}_{project}_{deployment_group}_{deployment_id}_{container}_r{replica}_g{generation}"
+    );
     sanitize_and_cap(&raw)
 }
 
-/// Generation-FREE stable identity name:
+/// Replica- and generation-FREE stable identity name:
 /// `<prefix>_<project>_<group>_<deploymentid>_<container>`, sanitized + capped
-/// the same way as [`container_name`] but with no `_g{n}` suffix. Used where a
-/// name must stay constant across generations — the network alias and the
-/// injected `RISE_CONTAINER_HOST__<NAME>` service-discovery hostname — so
-/// Docker's embedded DNS keeps resolving siblings and the env hash doesn't drift
-/// every recreate.
+/// the same way as [`container_name`] but with no `_r{n}` / `_g{n}` suffix. Used
+/// where a name must stay constant across replicas AND generations — the shared
+/// network alias and the injected `RISE_CONTAINER_HOST__<NAME>` service-discovery
+/// hostname. Because EVERY replica of a container attaches this same alias,
+/// Docker's embedded DNS ROUND-ROBINS the alias across all running replicas, and
+/// the discovery host points at that one shared name; the env hash also doesn't
+/// drift per replica or per recreate.
 pub fn stable_identity_name(
     prefix: &str,
     project: &str,
@@ -202,6 +222,7 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
         &desired.deployment_group,
         &desired.deployment_id,
         &desired.container,
+        desired.replica,
         desired.generation,
     );
 
@@ -231,6 +252,7 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
         image: &desired.image,
         route_hash: &route_hash,
         generation: desired.generation,
+        replica: desired.replica,
     }
     .render();
     all_labels.extend(traefik_labels);
@@ -548,15 +570,28 @@ mod tests {
             // builder tests. `route_hash_for` is exercised separately below.
             route_hash: String::new(),
             generation: 1,
+            replica: 0,
+            health_path: Some("/".to_string()),
         }
     }
 
     #[test]
     fn deterministic_name() {
-        let n1 = container_name("rise", "myapp", "default", "20260101-120000", "app", 1);
-        let n2 = container_name("rise", "myapp", "default", "20260101-120000", "app", 1);
+        let n1 = container_name("rise", "myapp", "default", "20260101-120000", "app", 0, 1);
+        let n2 = container_name("rise", "myapp", "default", "20260101-120000", "app", 0, 1);
         assert_eq!(n1, n2);
-        assert_eq!(n1, "rise_myapp_default_20260101-120000_app_g1");
+        assert_eq!(n1, "rise_myapp_default_20260101-120000_app_r0_g1");
+    }
+
+    #[test]
+    fn container_name_includes_replica_index() {
+        // Each replica gets a distinct `_r{n}` segment so its live `--name` is
+        // unique, even though they share the identity tuple's other fields.
+        let r0 = container_name("rise", "myapp", "default", "20260101-120000", "app", 0, 1);
+        let r1 = container_name("rise", "myapp", "default", "20260101-120000", "app", 1, 1);
+        assert_eq!(r0, "rise_myapp_default_20260101-120000_app_r0_g1");
+        assert_eq!(r1, "rise_myapp_default_20260101-120000_app_r1_g1");
+        assert_ne!(r0, r1);
     }
 
     #[test]
@@ -568,6 +603,7 @@ mod tests {
             "default",
             "20260101-120000",
             "app",
+            0,
             1,
         );
         let n2 = container_name(
@@ -576,6 +612,7 @@ mod tests {
             "default",
             "20260101-120000",
             "app",
+            0,
             1,
         );
         assert_eq!(n1, n2);
@@ -600,8 +637,8 @@ mod tests {
         let mut desired = single_container();
         desired.generation = 7;
         let built = build_container(&desired, &test_cfg());
-        // The container NAME carries the generation suffix...
-        assert_eq!(built.name, "rise_myapp_default_20260101-120000_app_g7");
+        // The container NAME carries the replica + generation suffix...
+        assert_eq!(built.name, "rise_myapp_default_20260101-120000_app_r0_g7");
         let aliases = built
             .config
             .networking_config
@@ -625,11 +662,86 @@ mod tests {
     }
 
     #[test]
+    fn replicas_share_one_replica_free_network_alias() {
+        // Two replicas of the same spec must attach the IDENTICAL, replica-free
+        // network alias so Docker's embedded DNS round-robins the alias across
+        // both running replicas (and the sibling-discovery host points at it).
+        let cfg = test_cfg();
+        let mut r0 = single_container();
+        r0.replica = 0;
+        let mut r1 = single_container();
+        r1.replica = 1;
+
+        let alias_of = |d: &DesiredContainer| -> Vec<String> {
+            build_container(d, &cfg)
+                .config
+                .networking_config
+                .unwrap()
+                .endpoints_config
+                .get("rise_default")
+                .unwrap()
+                .aliases
+                .clone()
+                .unwrap()
+        };
+        let a0 = alias_of(&r0);
+        let a1 = alias_of(&r1);
+        assert_eq!(a0, a1, "replicas must share one network alias");
+        assert_eq!(
+            a0,
+            vec!["rise_myapp_default_20260101-120000_app".to_string()]
+        );
+        assert!(
+            !a0[0].contains("_r"),
+            "shared alias must not carry a _r replica suffix"
+        );
+    }
+
+    #[test]
+    fn replicas_render_identical_traefik_labels_one_service() {
+        // All Traefik labels (router rule/entrypoint, service loadbalancer port,
+        // service/router NAMES) must be identical across replicas so Traefik's
+        // Docker provider registers each replica container as a SERVER of the ONE
+        // service → round-robin load balancing. Only the `replica` field (→ the
+        // `--name` and the `replica` bookkeeping label) differs.
+        let cfg = test_cfg();
+        let mut r0 = single_container();
+        r0.replica = 0;
+        let mut r1 = single_container();
+        r1.replica = 1;
+
+        let traefik_of = |d: &DesiredContainer| -> std::collections::BTreeMap<String, String> {
+            build_container(d, &cfg)
+                .config
+                .labels
+                .unwrap()
+                .into_iter()
+                .filter(|(k, _)| k.starts_with("traefik."))
+                .collect()
+        };
+        let t0 = traefik_of(&r0);
+        let t1 = traefik_of(&r1);
+        assert_eq!(
+            t0, t1,
+            "replicas must render identical Traefik labels (shared router+service)"
+        );
+        // Spot-check the shared service/router name is replica-free.
+        assert!(t0.contains_key(
+            "traefik.http.services.myapp-default-20260101-120000-app.loadbalancer.server.port"
+        ));
+        assert!(t0.contains_key("traefik.http.routers.myapp-default-20260101-120000-app.rule"));
+        assert!(
+            !t0.keys().any(|k| k.contains("-r0") || k.contains("-r1")),
+            "Traefik router/service names must not include a replica index"
+        );
+    }
+
+    #[test]
     fn single_container_maps_labels_env_resources() {
         let desired = single_container();
         let built = build_container(&desired, &test_cfg());
 
-        assert_eq!(built.name, "rise_myapp_default_20260101-120000_app_g1");
+        assert_eq!(built.name, "rise_myapp_default_20260101-120000_app_r0_g1");
 
         let labels = built.config.labels.as_ref().unwrap();
         assert_eq!(

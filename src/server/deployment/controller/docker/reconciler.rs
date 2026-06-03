@@ -44,6 +44,12 @@ const DEPLOYING_TIMEOUT_MINUTES: i64 = 5;
 /// Mirrors `webhook::PRE_PUSHED_TIMEOUT_MINUTES`.
 const PRE_PUSHED_TIMEOUT_MINUTES: i64 = 10;
 
+/// Upper bound on the number of replicas the Docker backend will run for a
+/// single container spec. A single-host daemon can run many containers behind
+/// one Traefik LB service, but we cap it to avoid a runaway spec exhausting the
+/// host; requests above this are clamped (with a warning).
+const MAX_REPLICAS: u32 = 50;
+
 /// Owned controller configuration the reconciler carries.
 #[derive(Clone)]
 pub struct ReconcilerConfig {
@@ -313,7 +319,10 @@ impl DockerReconciler {
             }
         }
 
-        // 3. Enumerate actual Rise containers for this project, diff, apply.
+        // 3. Enumerate actual Rise containers for this project, diff, throttle,
+        // apply. The throttle enforces ROLLING recreate for replicas>1: a running
+        // drifted replica is recreated one-at-a-time, only while its siblings are
+        // healthy, so a rollout never drops more than one replica of capacity.
         let actual = self.list_actual_containers(project).await?;
         let actions = diff_desired_vs_actual(
             &desired,
@@ -321,6 +330,18 @@ impl DockerReconciler {
             &self.config.container_prefix,
             &protected_deployment_ids,
         );
+        // Probe each running replica's HTTP health once for the rolling gate.
+        // Skipped entirely when there are no rollout (running+drifted) recreates,
+        // so single-replica deployments and steady state pay no probe cost.
+        let actions = if actions
+            .iter()
+            .any(|a| matches!(a, ReconcileAction::Recreate { .. }))
+        {
+            let healthy_by_identity = self.probe_health_by_identity(&desired, &actual).await;
+            filter_rolling_actions(actions, &actual, &healthy_by_identity)
+        } else {
+            actions
+        };
         self.apply_actions(project, &desired, &actions).await?;
 
         // 4. Health → status (probe routable containers, transition).
@@ -620,22 +641,31 @@ impl DockerReconciler {
             Vec::new()
         };
 
-        // Build a desired container per spec. Clamp replicas to 1 for now.
-        // TODO(replicas): run N containers sharing one Traefik service to
-        // load-balance. Until then a single container serves each spec.
+        // Build N desired containers per spec — one per replica. All replicas of
+        // a spec are IDENTICAL except their `replica` index (and thus the live
+        // `--name` + the `replica` bookkeeping label): same image, env, env_hash,
+        // routes, route_hash, routable, generation seed. They share ONE Traefik
+        // router+service (router naming excludes the replica → Traefik
+        // load-balances) and ONE replica-free network alias (Docker DNS
+        // round-robins). Recreates are rolled one replica at a time by the
+        // rolling throttle (`filter_rolling_actions`) before apply.
         let mut out = Vec::with_capacity(container_specs.len());
         for spec in &container_specs {
-            // A Docker deployment runs exactly one container per spec; requested
-            // replicas>1 are silently served by a single container today. Warn so
-            // users aren't unknowingly under-provisioned.
-            if spec.replicas.is_some_and(|r| r > 1) {
+            // Resolve the replica count, clamped to [1, MAX_REPLICAS]. A
+            // single-host Docker daemon can run N containers behind one Traefik
+            // LB service, so replicas>1 ARE supported here (unlike before).
+            let requested = spec.replicas.unwrap_or(1);
+            if requested > MAX_REPLICAS {
                 warn!(
                     deployment_id = %deployment.deployment_id,
                     container = %spec.name,
-                    requested = spec.replicas.unwrap_or(1),
-                    "Docker backend does not support replicas>1; running a single container"
+                    requested,
+                    max = MAX_REPLICAS,
+                    "Requested replicas exceeds MAX_REPLICAS; clamping"
                 );
             }
+            let replica_count = clamp_replicas(spec.replicas);
+
             let mut env = merge_container_env(
                 &base_env,
                 &system_env,
@@ -663,7 +693,11 @@ impl DockerReconciler {
                 })
                 .collect();
 
-            let mut desired = DesiredContainer {
+            // Base container (replica 0). All replicas are clones of this with
+            // only their `replica` index differing — same image/env/routes, so
+            // they share one Traefik service and one DNS alias, and the route-hash
+            // (which never depends on the replica) is computed once below.
+            let mut base = DesiredContainer {
                 project: project.name.clone(),
                 access_class: project.access_class.clone(),
                 deployment_group: deployment.deployment_group.clone(),
@@ -691,12 +725,28 @@ impl DockerReconciler {
                 // generation), so the diff resolves it before apply: a brand-new
                 // slot stays `1`, a recreate bumps to the live `g{n}` + 1.
                 generation: 1,
+                replica: 0,
+                // Effective health path: a port-less worker has no HTTP probe
+                // (None → gated on run-state); an HTTP container honors its
+                // `health_check` spec (disabled → None). Used by the rolling
+                // throttle's health gate.
+                health_path: spec
+                    .port
+                    .and_then(|_| effective_health_path(spec, &self.config.health_path)),
             };
             // Precompute the route-hash from the same render the builder uses so
             // the diff can detect routing transitions (active↔inactive) that
-            // Docker can't apply to a running container's labels in place.
-            desired.route_hash = container_builder::route_hash_for(&desired, &self.builder_cfg());
-            out.push(desired);
+            // Docker can't apply to a running container's labels in place. The
+            // replica index never feeds the route-hash, so one value serves all
+            // replicas.
+            base.route_hash = container_builder::route_hash_for(&base, &self.builder_cfg());
+
+            // Emit one identical DesiredContainer per replica index 0..N.
+            for replica in 0..replica_count {
+                let mut desired = base.clone();
+                desired.replica = replica;
+                out.push(desired);
+            }
         }
 
         Ok(out)
@@ -772,6 +822,12 @@ impl DockerReconciler {
                         .get(&labels::ns_key(ns, labels::SUFFIX_GENERATION))
                         .and_then(|g| g.parse::<u32>().ok())
                         .unwrap_or(0),
+                    // Parse the replica label; default 0 (legacy/missing) so a
+                    // pre-replica container maps onto replica 0 of its spec.
+                    replica: labels
+                        .get(&labels::ns_key(ns, labels::SUFFIX_REPLICA))
+                        .and_then(|r| r.parse::<u32>().ok())
+                        .unwrap_or(0),
                     image_label: labels.get(&labels::ns_key(ns, SUFFIX_IMAGE)).cloned(),
                     env_hash_label: labels.get(&labels::ns_key(ns, SUFFIX_ENV_HASH)).cloned(),
                     route_hash_label: labels
@@ -804,6 +860,7 @@ impl DockerReconciler {
                     &d.deployment_group,
                     &d.deployment_id,
                     &d.container,
+                    d.replica,
                 );
                 (key, d)
             })
@@ -984,15 +1041,13 @@ impl DockerReconciler {
             .iter()
             .filter_map(|a| a.identity().map(|id| (id, a)))
             .collect();
-        // Inspect each container ONCE and reuse the result for both the health
-        // probe (Issue 1) and the pod_status metadata builder (Issue 2). The
-        // map is keyed by the actual container's real (generation-ful) name.
-        let mut inspected_by_name: HashMap<String, Option<InspectedContainer>> = HashMap::new();
-        // spec name → the resolved name we keyed `inspected_by_name` under, so
-        // `build_controller_metadata` reuses the same inspection (and shows the
-        // real generation-ful pod name where the container exists).
-        let mut resolved_name_by_spec: HashMap<String, String> = HashMap::new();
-        // Every container must be ready for the deployment to be healthy:
+        // One pod entry per REPLICA container, in (spec, replica) order. Each
+        // carries the live container's REAL (generation-ful) name where present,
+        // else a replica-distinct stable fallback for a not-yet-created replica.
+        // Fed straight into `build_controller_metadata` (no re-derivation).
+        let mut pods: Vec<(String, Option<InspectedContainer>)> = Vec::new();
+        // Every REPLICA of every spec must be ready for the deployment to be
+        // healthy:
         //   - HTTP containers (with a port) must answer the probe — a real HTTP
         //     GET to the app (loopback published port when `publish_app_ports`
         //     is on, else the container IP), independent of Traefik routing, so
@@ -1007,90 +1062,102 @@ impl DockerReconciler {
         let running_of =
             |i: &Option<InspectedContainer>| i.as_ref().map(|i| i.running).unwrap_or(false);
         for spec in &container_specs {
-            let identity = identity_key(
-                &project.name,
-                &deployment.deployment_group,
-                &deployment.deployment_id,
-                &spec.name,
-            );
-            // Resolve this spec to its live container. When present, inspect by
-            // the actual generation-ful name; when absent (not yet created /
-            // mid-recreate), use the generation-free stable name as a stable map
-            // key and skip the inspect (yields None → not-ready below).
-            let actual = actual_by_identity.get(&identity).copied();
-            let name = match actual {
-                Some(a) => a.name.clone(),
-                None => container_builder::stable_identity_name(
-                    &self.config.container_prefix,
+            let replica_count = clamp_replicas(spec.replicas);
+            for replica in 0..replica_count {
+                // Label each container with its replica index only when there is
+                // more than one, so single-replica diagnostics read unchanged.
+                let label = if replica_count > 1 {
+                    format!("{}[{}]", spec.name, replica)
+                } else {
+                    spec.name.clone()
+                };
+                let identity = identity_key(
                     &project.name,
                     &deployment.deployment_group,
                     &deployment.deployment_id,
                     &spec.name,
-                ),
-            };
-            let inspected = match actual {
-                Some(a) => self.inspect_for_reconcile(&a.name, spec.port).await,
-                None => None,
-            };
-            let ready = if actual.is_none() {
-                // No live container matches this spec's identity (not yet
-                // created, or briefly absent mid-recreate) — definitively
-                // not-ready, with a clear reason in the existing diagnostic
-                // style. Skip probing (there's nothing to probe).
-                not_ready_reasons.push(format!("'{}' container not found", spec.name));
-                false
-            } else {
-                match spec.port {
-                    // HTTP container: honor the per-container `health_check` spec.
-                    // `disabled` (→ `effective_health_path` returns None) removes the
-                    // probe, so a *running* container is ready — mirroring K8s, where
-                    // `health_check = false` removes the probes. Otherwise probe the
-                    // container's `health_check.path` (or the controller default).
-                    Some(port) => match effective_health_path(spec, &self.config.health_path) {
-                        Some(path) => {
-                            match self.probe_container(inspected.as_ref(), port, &path).await {
-                                Ok(()) => true,
-                                Err(reason) => {
-                                    // Per-tick at debug to avoid noise while an app is
-                                    // still warming up; the reason is also folded into the
-                                    // user-visible Unhealthy status below.
-                                    debug!(
-                                        deployment_id = %deployment.deployment_id,
-                                        container = %spec.name,
-                                        "Health probe failed: {reason}"
-                                    );
-                                    not_ready_reasons.push(format!("'{}' {reason}", spec.name));
-                                    false
+                    replica,
+                );
+                // Resolve this replica to its live container. When present,
+                // inspect by the actual generation-ful name; when absent (not yet
+                // created / mid-recreate), synthesize a replica-distinct pod name
+                // (the replica-free stable name + `_r{n}`) and skip the inspect.
+                let actual = actual_by_identity.get(&identity).copied();
+                let name = match actual {
+                    Some(a) => a.name.clone(),
+                    None => format!(
+                        "{}_r{replica}",
+                        container_builder::stable_identity_name(
+                            &self.config.container_prefix,
+                            &project.name,
+                            &deployment.deployment_group,
+                            &deployment.deployment_id,
+                            &spec.name,
+                        )
+                    ),
+                };
+                let inspected = match actual {
+                    Some(a) => self.inspect_for_reconcile(&a.name, spec.port).await,
+                    None => None,
+                };
+                let ready = if actual.is_none() {
+                    // No live container matches this replica's identity (not yet
+                    // created, or briefly absent mid-recreate) — definitively
+                    // not-ready, with a clear reason.
+                    not_ready_reasons.push(format!("'{label}' container not found"));
+                    false
+                } else {
+                    match spec.port {
+                        // HTTP container: honor the per-container `health_check`
+                        // spec. `disabled` (→ `effective_health_path` returns None)
+                        // removes the probe, so a *running* container is ready —
+                        // mirroring K8s, where `health_check = false` removes the
+                        // probes. Otherwise probe `health_check.path` (or default).
+                        Some(port) => match effective_health_path(spec, &self.config.health_path) {
+                            Some(path) => {
+                                match self.probe_container(inspected.as_ref(), port, &path).await {
+                                    Ok(()) => true,
+                                    Err(reason) => {
+                                        // Per-tick at debug to avoid noise while an
+                                        // app is still warming up; the reason is
+                                        // also folded into the Unhealthy status.
+                                        debug!(
+                                            deployment_id = %deployment.deployment_id,
+                                            container = %label,
+                                            "Health probe failed: {reason}"
+                                        );
+                                        not_ready_reasons.push(format!("'{label}' {reason}"));
+                                        false
+                                    }
                                 }
                             }
-                        }
+                            None => {
+                                let running = running_of(&inspected);
+                                if !running {
+                                    not_ready_reasons
+                                        .push(format!("'{label}' not running (probe disabled)"));
+                                }
+                                running
+                            }
+                        },
+                        // Worker: no HTTP endpoint, so the daemon's run state is
+                        // the only liveness signal we have.
                         None => {
                             let running = running_of(&inspected);
                             if !running {
-                                not_ready_reasons
-                                    .push(format!("'{}' not running (probe disabled)", spec.name));
+                                not_ready_reasons.push(format!("worker '{label}' not running"));
                             }
                             running
                         }
-                    },
-                    // Worker: no HTTP endpoint, so the daemon's run state is the
-                    // only liveness signal we have.
-                    None => {
-                        let running = running_of(&inspected);
-                        if !running {
-                            not_ready_reasons.push(format!("worker '{}' not running", spec.name));
-                        }
-                        running
                     }
+                };
+                pods.push((name, inspected));
+                if !ready {
+                    all_ready = false;
+                    // Keep inspecting the remaining replicas so the pod_status
+                    // snapshot stays complete; only the readiness verdict short-
+                    // circuits below via `all_ready`.
                 }
-            };
-            resolved_name_by_spec.insert(spec.name.clone(), name.clone());
-            inspected_by_name.insert(name, inspected);
-            if !ready {
-                all_ready = false;
-                // Keep inspecting the remaining containers so the pod_status
-                // snapshot stays complete; only the readiness verdict short-
-                // circuits below via `all_ready`.
             }
         }
         let is_ready = all_ready;
@@ -1105,16 +1172,9 @@ impl DockerReconciler {
         };
 
         // Snapshot controller_metadata in a K8s-pod-status-shaped blob so the
-        // existing status APIs/UI render unchanged. Built from the inspections
-        // captured above (no second inspect).
-        let metadata = self.build_controller_metadata(
-            project,
-            deployment,
-            &container_specs,
-            &resolved_name_by_spec,
-            &inspected_by_name,
-            is_ready,
-        );
+        // existing status APIs/UI render unchanged. Built from the per-replica
+        // inspections captured above (no second inspect).
+        let metadata = build_controller_metadata(&pods, &deployment.status, is_ready);
         if let Err(e) =
             db_deployments::update_controller_metadata(&self.db_pool, deployment.id, &metadata)
                 .await
@@ -1155,6 +1215,65 @@ impl DockerReconciler {
         }
 
         Ok(())
+    }
+
+    /// Probe each live replica's HTTP health for the rolling-recreate throttle,
+    /// returning `identity_key(...) → healthy`. A replica is healthy when, per its
+    /// desired spec, either:
+    ///
+    /// - it has a `health_path` (HTTP container with the probe enabled) and the
+    ///   probe to its live container succeeds (`< 500`); or
+    /// - it has no `health_path` (worker, or probe disabled) and its live
+    ///   container is `running`.
+    ///
+    /// Containers with no desired match, or that aren't inspectable, are omitted
+    /// (the throttle treats an absent entry as NOT healthy). Each container is
+    /// inspected once. This is a SEPARATE pass from `reconcile_health` (which runs
+    /// after apply); duplicating it keeps the throttle self-contained and only
+    /// runs when a rollout recreate is actually pending.
+    async fn probe_health_by_identity(
+        &self,
+        desired: &[DesiredContainer],
+        actual: &[ActualContainer],
+    ) -> HashMap<String, bool> {
+        // identity → desired (for port + effective health path).
+        let desired_by_identity: HashMap<String, &DesiredContainer> = desired
+            .iter()
+            .map(|d| {
+                (
+                    identity_key(
+                        &d.project,
+                        &d.deployment_group,
+                        &d.deployment_id,
+                        &d.container,
+                        d.replica,
+                    ),
+                    d,
+                )
+            })
+            .collect();
+
+        let mut healthy: HashMap<String, bool> = HashMap::new();
+        for a in actual {
+            let Some(identity) = a.identity() else {
+                continue;
+            };
+            let Some(d) = desired_by_identity.get(&identity) else {
+                continue;
+            };
+            let inspected = self.inspect_for_reconcile(&a.name, d.port).await;
+            let is_healthy = match (d.port, d.health_path.as_deref()) {
+                // HTTP container with the probe enabled → real GET.
+                (Some(port), Some(path)) => self
+                    .probe_container(inspected.as_ref(), port, path)
+                    .await
+                    .is_ok(),
+                // Worker, or probe disabled → run-state is the only signal.
+                _ => inspected.as_ref().map(|i| i.running).unwrap_or(false),
+            };
+            healthy.insert(identity, is_healthy);
+        }
+        healthy
     }
 
     /// HTTP health probe against the app, using a single inspection captured by
@@ -1302,66 +1421,6 @@ impl DockerReconciler {
         })
     }
 
-    /// Assemble the `controller_metadata` JSON for the deployment: a
-    /// K8s-pod-status-shaped `pod_status` block (so the Pods tab renders
-    /// unchanged — see `frontend/src/features/deployments.tsx`) plus the legacy
-    /// sibling `health` block. The container readiness verdict (`is_ready`) is
-    /// the same one driving the status transitions.
-    fn build_controller_metadata(
-        &self,
-        project: &Project,
-        deployment: &Deployment,
-        container_specs: &[crate::server::deployment::models::ContainerSpec],
-        resolved_name_by_spec: &HashMap<String, String>,
-        inspected_by_name: &HashMap<String, Option<InspectedContainer>>,
-        is_ready: bool,
-    ) -> serde_json::Value {
-        // Map each spec to its (name, inspection) so the pure builder can
-        // produce the pod_status without touching `self`. The name is the live
-        // container's REAL (generation-ful) name where one exists — resolved by
-        // `reconcile_health` from the actual containers — else the generation-
-        // free stable name for a not-yet-created container. The reconstructed
-        // generation-ful name can't be derived from the spec alone, so we reuse
-        // the resolution computed during the probe loop.
-        let named: Vec<(String, Option<InspectedContainer>)> = container_specs
-            .iter()
-            .map(|s| {
-                let name = resolved_name_by_spec
-                    .get(&s.name)
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        container_builder::stable_identity_name(
-                            &self.config.container_prefix,
-                            &project.name,
-                            &deployment.deployment_group,
-                            &deployment.deployment_id,
-                            &s.name,
-                        )
-                    });
-                let inspected = inspected_by_name.get(&name).cloned().flatten();
-                (name, inspected)
-            })
-            .collect();
-
-        let pod_status = build_pod_status(&named, is_ready);
-        let desired = container_specs.len();
-        let ready_replicas = pod_status
-            .get("ready_replicas")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
-
-        serde_json::json!({
-            "pod_status": pod_status,
-            "health": {
-                "last_check": Utc::now().to_rfc3339(),
-                // Healthy only when every desired container is ready AND the
-                // deployment isn't currently flagged Unhealthy.
-                "healthy": ready_replicas == desired
-                    && deployment.status != DeploymentStatus::Unhealthy,
-            },
-        })
-    }
-
     /// Port of `webhook::handle_deployment_became_healthy`: mark healthy,
     /// supersede the prior active deployment, mark this one active.
     async fn handle_deployment_became_healthy(
@@ -1430,6 +1489,38 @@ impl DockerReconciler {
 }
 
 // ── Pure pod_status builder ───────────────────────────────────────────────
+
+/// Assemble the `controller_metadata` JSON for the deployment: a
+/// K8s-pod-status-shaped `pod_status` block (so the Pods tab renders unchanged —
+/// see `frontend/src/features/deployments.tsx`) plus the legacy sibling `health`
+/// block. `pods` is one (name, inspection) entry PER REPLICA container across all
+/// specs (so `desired_replicas` = sum of N over specs, `current_replicas` =
+/// running count, `ready_replicas` = healthy count). Pure so it can be
+/// unit-tested without a daemon. The container readiness verdict (`is_ready`) is
+/// the same one driving the status transitions.
+fn build_controller_metadata(
+    pods: &[(String, Option<InspectedContainer>)],
+    status: &DeploymentStatus,
+    is_ready: bool,
+) -> serde_json::Value {
+    let pod_status = build_pod_status(pods, is_ready);
+    let desired = pods.len();
+    let ready_replicas = pod_status
+        .get("ready_replicas")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+
+    serde_json::json!({
+        "pod_status": pod_status,
+        "health": {
+            "last_check": Utc::now().to_rfc3339(),
+            // Healthy only when EVERY replica of EVERY spec is ready AND the
+            // deployment isn't currently flagged Unhealthy.
+            "healthy": ready_replicas == desired
+                && *status != DeploymentStatus::Unhealthy,
+        },
+    })
+}
 
 /// Build the K8s-pod-status-shaped `pod_status` JSON from each container's
 /// (name, inspection). Pure so it can be unit-tested without a daemon: one
@@ -1575,6 +1666,11 @@ pub struct ActualContainer {
     /// label is missing/legacy/unparseable, so the first recreate of a legacy
     /// container yields generation `1`.
     pub generation: u32,
+    /// Zero-based replica index parsed from the `replica` label. Member of the
+    /// stable identity tuple, so each replica is matched/recreated independently.
+    /// Defaults to `0` when the label is missing/legacy/unparseable, so a
+    /// pre-replica container maps onto replica 0 of its spec.
+    pub replica: u32,
     pub image_label: Option<String>,
     pub env_hash_label: Option<String>,
     /// The `route-hash` recreate-signature label stamped on the live container
@@ -1604,6 +1700,19 @@ impl ActualContainer {
     /// protected).
     fn identity(&self) -> Option<String> {
         Some(identity_key(
+            self.project.as_deref()?,
+            self.deployment_group.as_deref()?,
+            self.deployment_id_label.as_deref()?,
+            self.container.as_deref()?,
+            self.replica,
+        ))
+    }
+
+    /// Spec-level key (identity minus replica) for grouping replicas of a spec.
+    /// `None` when any spec-identity label is missing (a legacy/foreign
+    /// container that can't be grouped).
+    fn spec_identity(&self) -> Option<String> {
+        Some(spec_key(
             self.project.as_deref()?,
             self.deployment_group.as_deref()?,
             self.deployment_id_label.as_deref()?,
@@ -1689,6 +1798,7 @@ pub fn diff_desired_vs_actual(
             &d.deployment_group,
             &d.deployment_id,
             &d.container,
+            d.replica,
         );
         desired_by_identity.insert(key, d);
     }
@@ -1717,6 +1827,7 @@ pub fn diff_desired_vs_actual(
                         &d.deployment_group,
                         &d.deployment_id,
                         &d.container,
+                        d.replica,
                         1,
                     ),
                     generation: 1,
@@ -1761,6 +1872,7 @@ pub fn diff_desired_vs_actual(
                             &d.deployment_group,
                             &d.deployment_id,
                             &d.container,
+                            d.replica,
                             generation,
                         ),
                         existing_id: a.id.clone(),
@@ -1795,6 +1907,111 @@ pub fn diff_desired_vs_actual(
     actions
 }
 
+/// Apply the ROLLING-RECREATE throttle to a diff's actions, run AFTER
+/// [`diff_desired_vs_actual`] and BEFORE `apply_actions`. Enforces, per spec
+/// (grouped by the spec key = identity minus replica), that a *running but
+/// drifted* replica is recreated at most ONE-AT-A-TIME and only while every
+/// OTHER replica of that spec is currently HEALTHY — so a rollout never drops
+/// more than one replica of capacity at once.
+///
+/// Pass-through rules (PER SPEC):
+/// - **Create** / **Remove** → ALWAYS pass (initial rollout / scale-up add
+///   capacity; scale-down / GC remove it). Never throttled.
+/// - **Recreate** of a recovery replica — the matched live container's `state`
+///   is NOT "running" (crashed / exited / created / missing) → ALWAYS pass; it's
+///   already down, so recreating only restores capacity.
+/// - **Recreate** of a rollout replica — the matched live container IS "running"
+///   but drifted → emit AT MOST ONE per spec this tick, the lowest replica index,
+///   and ONLY IF every OTHER replica of the spec is HEALTHY
+///   (`healthy_by_identity`). If ANY sibling is unhealthy/starting, defer ALL
+///   rollout recreates for the spec this tick.
+///
+/// INVARIANT: for a single spec with R running+drifted+healthy replicas this
+/// yields exactly ONE rollout Recreate; with any sibling unhealthy it yields
+/// ZERO; recovery Recreates and all Creates/Removes pass regardless.
+///
+/// `actual` provides each container's run state + identity (to map an action's
+/// identity → its spec + replica index + run state). `healthy_by_identity` maps
+/// an `identity_key(...)` to whether that live replica passed the HTTP health
+/// probe this tick (absent → treated as NOT healthy).
+fn filter_rolling_actions(
+    actions: Vec<ReconcileAction>,
+    actual: &[ActualContainer],
+    healthy_by_identity: &HashMap<String, bool>,
+) -> Vec<ReconcileAction> {
+    // identity → the live container (for run state + replica/spec grouping).
+    let actual_by_identity: HashMap<String, &ActualContainer> = actual
+        .iter()
+        .filter_map(|a| a.identity().map(|id| (id, a)))
+        .collect();
+
+    // Collect rollout-recreate candidates per spec; pass everything else through.
+    // A candidate is (replica_index, action) where the matched live container is
+    // running. We then admit at most one per spec, gated on sibling health.
+    let mut passed: Vec<ReconcileAction> = Vec::new();
+    // spec_key → Vec<(replica, identity, action)> of running+drifted recreates.
+    let mut rollout_candidates: HashMap<String, Vec<(u32, String, ReconcileAction)>> =
+        HashMap::new();
+
+    for action in actions {
+        match &action {
+            ReconcileAction::Create { .. } | ReconcileAction::Remove { .. } => {
+                // Unthrottled: capacity add (Create) / scale-down or GC (Remove).
+                passed.push(action);
+            }
+            ReconcileAction::Recreate { identity, .. } => {
+                match actual_by_identity.get(identity) {
+                    Some(a) if a.state.as_deref() == Some("running") => {
+                        // Rollout candidate: a running, drifted replica. Defer the
+                        // admission decision until we've seen all of them per spec.
+                        let key = a.spec_identity().unwrap_or_else(|| identity.clone());
+                        rollout_candidates.entry(key).or_default().push((
+                            a.replica,
+                            identity.clone(),
+                            action,
+                        ));
+                    }
+                    // Recovery (not running) OR no matched live container (already
+                    // gone) → pass unthrottled: recreating restores capacity.
+                    _ => passed.push(action),
+                }
+            }
+        }
+    }
+
+    // Admit at most one rollout recreate per spec, the lowest replica index, and
+    // only when every OTHER replica of the spec is healthy.
+    for (spec, mut candidates) in rollout_candidates {
+        candidates.sort_by_key(|(replica, _, _)| *replica);
+        // Identities of this spec's replicas slated for a rollout recreate — they
+        // don't count as "must be healthy" siblings (they're already drifted and
+        // about to be replaced), so a uniform drift across all replicas still
+        // rolls one-by-one rather than deadlocking.
+        let candidate_identities: HashSet<String> =
+            candidates.iter().map(|(_, id, _)| id.clone()).collect();
+
+        // Gate: every OTHER replica of this spec (a live replica NOT itself a
+        // rollout candidate) must be healthy. If any such sibling is
+        // unhealthy/starting, defer ALL rollout recreates for this spec.
+        let siblings_healthy = actual
+            .iter()
+            .filter(|a| a.spec_identity().as_deref() == Some(spec.as_str()))
+            .filter_map(|a| a.identity())
+            .filter(|id| !candidate_identities.contains(id))
+            .all(|id| healthy_by_identity.get(&id).copied().unwrap_or(false));
+
+        if siblings_healthy {
+            if let Some((_, _, action)) = candidates.into_iter().next() {
+                passed.push(action);
+            }
+        }
+        // else: defer ALL of this spec's rollout recreates this tick.
+    }
+
+    passed.sort_by_key(action_key);
+    passed
+}
+
 /// Pure comparison of this controller's configured class against the
 /// project's Organization's `deploymentControllerClass`. Mirrors the K8s
 /// webhook's `check_controller_class`:
@@ -1819,11 +2036,33 @@ fn action_key(a: &ReconcileAction) -> (u8, String) {
 }
 
 /// Stable identity key for a container slot, joining the identity tuple
-/// (project, deployment_group, deployment_id, container) with a NUL separator
-/// (which can't appear in any of these names). Built from desired fields and
-/// from actual bookkeeping labels so the two match across name generations.
-fn identity_key(project: &str, group: &str, deployment_id: &str, container: &str) -> String {
+/// (project, deployment_group, deployment_id, container, replica) with a NUL
+/// separator (which can't appear in any of these names). Built from desired
+/// fields and from actual bookkeeping labels so the two match across name
+/// generations. The replica index is the matching unit: each replica of a spec
+/// is reconciled independently.
+fn identity_key(
+    project: &str,
+    group: &str,
+    deployment_id: &str,
+    container: &str,
+    replica: u32,
+) -> String {
+    format!("{project}\u{0}{group}\u{0}{deployment_id}\u{0}{container}\u{0}{replica}")
+}
+
+/// Spec-level key = the identity tuple MINUS the replica index
+/// (project, group, deployment_id, container). Groups all replicas of a single
+/// spec together — used by the rolling-recreate throttle to reason per-spec.
+fn spec_key(project: &str, group: &str, deployment_id: &str, container: &str) -> String {
     format!("{project}\u{0}{group}\u{0}{deployment_id}\u{0}{container}")
+}
+
+/// Resolve a spec's requested replica count to the actual number of containers
+/// to run: default 1 (unset), clamped to `[1, MAX_REPLICAS]`. Shared by desired
+/// computation and health aggregation so both always agree on the replica count.
+fn clamp_replicas(requested: Option<u32>) -> u32 {
+    requested.unwrap_or(1).clamp(1, MAX_REPLICAS)
 }
 
 // ── Env merge helpers ─────────────────────────────────────────────────
@@ -1973,6 +2212,8 @@ mod tests {
             route_hash: "rh-active".to_string(),
             // Seed generation (the diff resolves the real value before apply).
             generation: 1,
+            replica: 0,
+            health_path: Some("/".to_string()),
         }
     }
 
@@ -1984,6 +2225,7 @@ mod tests {
             &d.deployment_group,
             &d.deployment_id,
             &d.container,
+            d.replica,
         )
     }
 
@@ -2002,6 +2244,7 @@ mod tests {
             &d.deployment_group,
             &d.deployment_id,
             &d.container,
+            d.replica,
             generation,
         )
     }
@@ -2023,6 +2266,7 @@ mod tests {
             container: Some(d.container.clone()),
             deployment_id_label: Some(d.deployment_id.clone()),
             generation,
+            replica: d.replica,
             image_label: Some(image.to_string()),
             env_hash_label: Some(env_hash.to_string()),
             route_hash_label: Some("rh-active".to_string()),
@@ -2150,6 +2394,7 @@ mod tests {
             container: Some("app".to_string()),
             deployment_id_label: Some("oldid".to_string()),
             generation: 1,
+            replica: 0,
             image_label: Some("img:1".to_string()),
             env_hash_label: Some("h1".to_string()),
             route_hash_label: Some("rh-active".to_string()),
@@ -2177,6 +2422,7 @@ mod tests {
             container: Some("app".to_string()),
             deployment_id_label: Some("oldid".to_string()),
             generation: 1,
+            replica: 0,
             image_label: Some("img:1".to_string()),
             env_hash_label: Some("h1".to_string()),
             route_hash_label: Some("rh-active".to_string()),
@@ -2214,6 +2460,7 @@ mod tests {
             container: Some("app".to_string()),
             deployment_id_label: Some("protectedid".to_string()),
             generation: 1,
+            replica: 0,
             image_label: Some("img:1".to_string()),
             env_hash_label: Some("h1".to_string()),
             route_hash_label: Some("rh-active".to_string()),
@@ -2242,6 +2489,7 @@ mod tests {
                 container: Some("app".to_string()),
                 deployment_id_label: Some("protectedid".to_string()),
                 generation: 1,
+                replica: 0,
                 image_label: Some("img:1".to_string()),
                 env_hash_label: Some("h1".to_string()),
                 route_hash_label: Some("rh-active".to_string()),
@@ -2255,6 +2503,7 @@ mod tests {
                 container: Some("app".to_string()),
                 deployment_id_label: Some("orphanid".to_string()),
                 generation: 1,
+                replica: 0,
                 image_label: Some("img:1".to_string()),
                 env_hash_label: Some("h1".to_string()),
                 route_hash_label: Some("rh-active".to_string()),
@@ -2726,5 +2975,313 @@ mod tests {
         assert_eq!(ps["current_replicas"], 1);
         assert_eq!(ps["ready_replicas"], 0);
         assert_eq!(ps["pods"][0]["containers"][0]["ready"], false);
+    }
+
+    // ── Replicas: diff scale up/down + rolling-recreate throttle ───────────
+
+    /// Build the `desired()` slot for a specific replica index.
+    fn desired_replica(replica: u32) -> DesiredContainer {
+        let mut d = desired("app", "img:1", "h1");
+        d.replica = replica;
+        d
+    }
+
+    /// A live (matched) container for the given replica/state/image. Carries the
+    /// full identity-label set including the replica so the diff matches it.
+    fn actual_replica(replica: u32, state: &str, image: &str) -> ActualContainer {
+        let d = desired_replica(replica);
+        ActualContainer {
+            id: format!("cid-r{replica}"),
+            state: Some(state.to_string()),
+            ..actual_for(&d, image, "h1")
+        }
+    }
+
+    #[test]
+    fn diff_scale_up_creates_new_replica_indices() {
+        // Desired 3 replicas (r0..r2); only r0 exists → r1 and r2 are Created,
+        // r0 is left untouched (image/env/route all match).
+        let desired_all = vec![desired_replica(0), desired_replica(1), desired_replica(2)];
+        let actual = vec![actual_replica(0, "running", "img:1")];
+        let actions = diff_desired_vs_actual(&desired_all, &actual, "rise", &no_protected());
+        let creates: Vec<u32> = actions
+            .iter()
+            .filter_map(|a| match a {
+                ReconcileAction::Create { name, .. } if name.contains("_r1_") => Some(1),
+                ReconcileAction::Create { name, .. } if name.contains("_r2_") => Some(2),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            creates,
+            vec![1, 2],
+            "scale-up creates the new replica slots"
+        );
+        assert!(
+            !actions.iter().any(|a| matches!(
+                a,
+                ReconcileAction::Recreate { .. } | ReconcileAction::Remove { .. }
+            )),
+            "scale-up must not recreate or remove the existing replica"
+        );
+    }
+
+    #[test]
+    fn diff_scale_down_removes_surplus_replicas() {
+        // Desired 1 replica (r0); r0..r2 exist → r1 and r2 are surplus → Removed.
+        let desired_all = vec![desired_replica(0)];
+        let actual = vec![
+            actual_replica(0, "running", "img:1"),
+            actual_replica(1, "running", "img:1"),
+            actual_replica(2, "running", "img:1"),
+        ];
+        let actions = diff_desired_vs_actual(&desired_all, &actual, "rise", &no_protected());
+        let mut removed: Vec<String> = actions
+            .iter()
+            .filter_map(|a| match a {
+                ReconcileAction::Remove { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        removed.sort();
+        assert_eq!(removed, vec!["cid-r1".to_string(), "cid-r2".to_string()]);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, ReconcileAction::Create { .. })),
+            "scale-down adds no containers"
+        );
+    }
+
+    #[test]
+    fn diff_scale_down_respects_protected_deployment_ids() {
+        // A surplus replica whose deployment-id is protected is NOT removed.
+        let desired_all = vec![desired_replica(0)];
+        let actual = vec![
+            actual_replica(0, "running", "img:1"),
+            actual_replica(1, "running", "img:1"),
+        ];
+        let mut protected = HashSet::new();
+        protected.insert("20260101-120000".to_string()); // desired()'s deployment_id
+        let actions = diff_desired_vs_actual(&desired_all, &actual, "rise", &protected);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, ReconcileAction::Remove { .. })),
+            "protected surplus replica must not be GC'd"
+        );
+    }
+
+    /// Health map marking every given identity healthy.
+    fn all_healthy(actual: &[ActualContainer]) -> HashMap<String, bool> {
+        actual
+            .iter()
+            .filter_map(|a| a.identity().map(|id| (id, true)))
+            .collect()
+    }
+
+    #[test]
+    fn rolling_throttle_running_drifted_emits_exactly_one_recreate() {
+        // INVARIANT (a): 3 running + drifted (image) + healthy replicas →
+        // the diff produces 3 Recreates, but the rolling throttle admits exactly
+        // ONE (the lowest replica index, r0).
+        let desired_all = vec![desired_replica(0), desired_replica(1), desired_replica(2)];
+        let actual = vec![
+            actual_replica(0, "running", "img:OLD"),
+            actual_replica(1, "running", "img:OLD"),
+            actual_replica(2, "running", "img:OLD"),
+        ];
+        let raw = diff_desired_vs_actual(&desired_all, &actual, "rise", &no_protected());
+        assert_eq!(
+            raw.iter()
+                .filter(|a| matches!(a, ReconcileAction::Recreate { .. }))
+                .count(),
+            3,
+            "diff alone wants to recreate all three"
+        );
+        let healthy = all_healthy(&actual);
+        let throttled = filter_rolling_actions(raw, &actual, &healthy);
+        let recreates: Vec<&ReconcileAction> = throttled
+            .iter()
+            .filter(|a| matches!(a, ReconcileAction::Recreate { .. }))
+            .collect();
+        assert_eq!(recreates.len(), 1, "rolling admits exactly one per spec");
+        match recreates[0] {
+            ReconcileAction::Recreate { name, .. } => {
+                assert!(
+                    name.contains("_r0_"),
+                    "lowest replica index rolls first: {name}"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn rolling_throttle_defers_all_when_a_sibling_is_unhealthy() {
+        // INVARIANT (b): mid-rollout. r0 was already recreated (now matches
+        // desired, so it is NOT a candidate) but is still STARTING (unhealthy);
+        // r1 and r2 are still drifted (running, img:OLD → rollout candidates).
+        // Because the non-candidate sibling r0 is unhealthy, ALL rollout recreates
+        // for the spec are deferred this tick → ZERO Recreates. This is the gate
+        // that makes the rollout wait for the previous replica to come back up.
+        let desired_all = vec![desired_replica(0), desired_replica(1), desired_replica(2)];
+        let actual = vec![
+            actual_replica(0, "running", "img:1"), // already updated, matches
+            actual_replica(1, "running", "img:OLD"), // drifted → candidate
+            actual_replica(2, "running", "img:OLD"), // drifted → candidate
+        ];
+        let raw = diff_desired_vs_actual(&desired_all, &actual, "rise", &no_protected());
+        // r0 (the just-recreated, non-candidate sibling) is still unhealthy.
+        let mut healthy = all_healthy(&actual);
+        healthy.insert(actual[0].identity().unwrap(), false);
+        let throttled = filter_rolling_actions(raw, &actual, &healthy);
+        assert_eq!(
+            throttled
+                .iter()
+                .filter(|a| matches!(a, ReconcileAction::Recreate { .. }))
+                .count(),
+            0,
+            "an unhealthy (still-starting) sibling defers ALL rollout recreates"
+        );
+    }
+
+    #[test]
+    fn rolling_throttle_uniform_drift_rolls_one_at_a_time() {
+        // When EVERY replica is drifted (all candidates), there are no
+        // non-candidate siblings to gate on, so the rollout begins: exactly one
+        // (r0) is recreated this tick. On the next tick r0 matches desired and
+        // becomes the sibling whose health gates the rest — yielding the
+        // one-at-a-time roll across ticks.
+        let desired_all = vec![desired_replica(0), desired_replica(1), desired_replica(2)];
+        let actual = vec![
+            actual_replica(0, "running", "img:OLD"),
+            actual_replica(1, "running", "img:OLD"),
+            actual_replica(2, "running", "img:OLD"),
+        ];
+        let raw = diff_desired_vs_actual(&desired_all, &actual, "rise", &no_protected());
+        let healthy = all_healthy(&actual);
+        let throttled = filter_rolling_actions(raw, &actual, &healthy);
+        assert_eq!(
+            throttled
+                .iter()
+                .filter(|a| matches!(a, ReconcileAction::Recreate { .. }))
+                .count(),
+            1,
+            "uniform drift still rolls one replica at a time"
+        );
+    }
+
+    #[test]
+    fn rolling_throttle_recovery_recreate_passes_even_with_unhealthy_sibling() {
+        // INVARIANT (c): a CRASHED (state != running) replica's Recreate is a
+        // recovery — it passes UNTHROTTLED even though a sibling is unhealthy.
+        // Here r0 has exited; r1 is running-drifted-unhealthy. Only r0's recovery
+        // recreate is admitted (r1's rollout recreate is gated out).
+        let desired_all = vec![desired_replica(0), desired_replica(1)];
+        let actual = vec![
+            actual_replica(0, "exited", "img:1"),    // crashed → recovery
+            actual_replica(1, "running", "img:OLD"), // running-drifted → rollout
+        ];
+        let raw = diff_desired_vs_actual(&desired_all, &actual, "rise", &no_protected());
+        // The crashed r0 is (realistically) unhealthy; it is r1's only sibling, so
+        // r1's rollout recreate is GATED OUT. r0's recovery recreate still passes.
+        let mut healthy = all_healthy(&actual);
+        healthy.insert(actual[0].identity().unwrap(), false);
+        let throttled = filter_rolling_actions(raw, &actual, &healthy);
+        let recreates: Vec<&ReconcileAction> = throttled
+            .iter()
+            .filter(|a| matches!(a, ReconcileAction::Recreate { .. }))
+            .collect();
+        assert_eq!(recreates.len(), 1, "only the recovery recreate passes");
+        match recreates[0] {
+            ReconcileAction::Recreate { name, .. } => {
+                assert!(
+                    name.contains("_r0_"),
+                    "recovery (crashed) replica passes: {name}"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn rolling_throttle_creates_and_removes_always_pass() {
+        // INVARIANT (d): Create (scale-up) and Remove (scale-down/GC) actions are
+        // never throttled — capacity changes apply immediately. Mix a Create
+        // (r2 missing), a Remove (surplus r3), and a running-drifted r0 (rollout)
+        // with r1 healthy. The Create + Remove pass; exactly one rollout recreate
+        // passes too (r0, siblings healthy).
+        let desired_all = vec![desired_replica(0), desired_replica(1), desired_replica(2)];
+        let actual = vec![
+            actual_replica(0, "running", "img:OLD"), // rollout recreate
+            actual_replica(1, "running", "img:1"),   // matches → no action
+            actual_replica(3, "running", "img:1"),   // surplus → Remove
+        ];
+        let raw = diff_desired_vs_actual(&desired_all, &actual, "rise", &no_protected());
+        let healthy = all_healthy(&actual);
+        let throttled = filter_rolling_actions(raw, &actual, &healthy);
+        assert!(
+            throttled.iter().any(
+                |a| matches!(a, ReconcileAction::Create { name, .. } if name.contains("_r2_"))
+            ),
+            "scale-up Create passes"
+        );
+        assert!(
+            throttled
+                .iter()
+                .any(|a| matches!(a, ReconcileAction::Remove { id, .. } if id == "cid-r3")),
+            "scale-down Remove passes"
+        );
+        assert_eq!(
+            throttled
+                .iter()
+                .filter(|a| matches!(a, ReconcileAction::Recreate { .. }))
+                .count(),
+            1,
+            "exactly one rollout recreate (r0) admitted"
+        );
+    }
+
+    #[test]
+    fn clamp_replicas_defaults_and_clamps() {
+        assert_eq!(clamp_replicas(None), 1, "unset → 1");
+        assert_eq!(clamp_replicas(Some(0)), 1, "0 → floored to 1");
+        assert_eq!(clamp_replicas(Some(1)), 1);
+        assert_eq!(clamp_replicas(Some(3)), 3, "in-range passes through");
+        assert_eq!(clamp_replicas(Some(MAX_REPLICAS)), MAX_REPLICAS);
+        assert_eq!(
+            clamp_replicas(Some(MAX_REPLICAS + 100)),
+            MAX_REPLICAS,
+            "above max → clamped to MAX_REPLICAS"
+        );
+    }
+
+    #[test]
+    fn build_controller_metadata_aggregates_across_replicas() {
+        // 3 replicas: 2 running+ready, 1 exited → desired=3, current=2, ready=2,
+        // and three pod entries (one per replica container).
+        let pods = vec![
+            (
+                "rise_myapp_default_d_app_r0_g1".to_string(),
+                Some(inspected_running()),
+            ),
+            (
+                "rise_myapp_default_d_app_r1_g1".to_string(),
+                Some(inspected_running()),
+            ),
+            (
+                "rise_myapp_default_d_app_r2_g1".to_string(),
+                Some(inspected_exited(1)),
+            ),
+        ];
+        // Not fully ready (one replica down).
+        let meta = build_controller_metadata(&pods, &DeploymentStatus::Deploying, false);
+        let ps = &meta["pod_status"];
+        assert_eq!(ps["desired_replicas"], 3);
+        assert_eq!(ps["current_replicas"], 2);
+        assert_eq!(ps["ready_replicas"], 0); // is_ready=false → no container ready
+        assert_eq!(ps["pods"].as_array().unwrap().len(), 3);
+        assert_eq!(meta["health"]["healthy"], false);
     }
 }
