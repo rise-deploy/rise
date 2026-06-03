@@ -4,6 +4,7 @@ members = [
     "crates/rise-backend-auth",
     "crates/rise-resource-api",
     "crates/rise-resource-store",
+    "crates/rise-runtime-sync",
 ]
 resolver = "2"
 
@@ -70,12 +71,14 @@ backend = [
     "dep:rise-backend-auth", # strip-on-publish
     "dep:rise-resource-api", # strip-on-publish
     "dep:rise-resource-store", # strip-on-publish
+    "dep:rise-runtime-sync", # strip-on-publish
     "dep:config",
     "dep:openssl",
     "dep:rsa",
     "dep:sqlx",
     "dep:tower",
     "dep:tower-http",
+    "dep:tokio-util",
     "dep:regex",
     "dep:aes-gcm",
     "dep:moka",
@@ -112,6 +115,7 @@ backend = [
 rise-backend-auth = { path = "crates/rise-backend-auth", optional = true }
 rise-resource-api = { path = "crates/rise-resource-api", optional = true }
 rise-resource-store = { path = "crates/rise-resource-store", optional = true }
+rise-runtime-sync = { path = "crates/rise-runtime-sync", optional = true }
 # --- END BACKEND ---
 
 # Common (always enabled - shared across features)
@@ -153,6 +157,7 @@ openssl = { version = "0.10.75", features = ["vendored"], optional = true }
 sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "postgres", "uuid", "chrono", "migrate"], optional = true }
 tower = { version = "0.5.2", optional = true }
 tower-http = { version = "0.6.7", features = ["trace", "cors"], optional = true }
+tokio-util = { version = "0.7", optional = true }
 regex = { version = "1.11", optional = true }
 rsa = { workspace = true, optional = true }
 

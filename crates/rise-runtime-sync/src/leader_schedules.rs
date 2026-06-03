@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use sqlx::PgPool;
 
-use crate::db::leader_leases::{LeaderElection, LeaderStatus, LeaseError};
+use crate::leader_leases::{LeaderElection, LeaderStatus, LeaseError};
 
 /// Per-task globally-coordinated cadence gate. Cheap to clone (`PgPool` is
 /// reference-counted, `name` is owned). Construct one per loop.
@@ -81,11 +81,11 @@ impl GlobalSchedule {
         // the interval has not elapsed, no row is updated and `RETURNING`
         // yields nothing.
         let row = sqlx::query_scalar!(
-            "INSERT INTO leader_schedules (name, last_run_at)
+            "INSERT INTO runtime_sync.leader_schedules (name, last_run_at)
              VALUES ($1, NOW())
              ON CONFLICT (name) DO UPDATE
                SET last_run_at = NOW()
-               WHERE leader_schedules.last_run_at + ($2 * INTERVAL '1 second') <= NOW()
+               WHERE runtime_sync.leader_schedules.last_run_at + ($2 * INTERVAL '1 second') <= NOW()
              RETURNING name",
             &self.name,
             interval_secs,

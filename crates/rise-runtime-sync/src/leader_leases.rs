@@ -77,9 +77,11 @@ impl Drop for TaskGuard {
 
 /// Persistent leader election service backed by the `leader_leases` PostgreSQL table.
 ///
-/// Holds the lease for its entire lifetime via a single background heartbeat task.
-/// Clone-safe: all clones share the same task and `is_leader` state; the task is
-/// aborted when the last clone is dropped.
+/// Once it wins the lease the holder keeps it for the lifetime of this value (the
+/// whole process, for a controller) via a single background heartbeat task;
+/// leadership changes only on crash, shutdown, or a stall past the TTL — not per
+/// scheduled tick. Clone-safe: all clones share the same task and `is_leader`
+/// state; the task is aborted when the last clone is dropped.
 #[derive(Clone)]
 pub struct LeaderElection {
     is_leader: Arc<AtomicBool>,
@@ -235,7 +237,7 @@ impl LeaderElection {
     /// row a peer has since acquired (concurrency safe).
     pub async fn release(&self) -> Result<(), sqlx::Error> {
         sqlx::query!(
-            "DELETE FROM leader_leases WHERE name = $1 AND holder_id = $2",
+            "DELETE FROM runtime_sync.leader_leases WHERE name = $1 AND holder_id = $2",
             self.name,
             self.holder_id,
         )
@@ -372,12 +374,12 @@ async fn try_acquire(
 ) -> Result<bool> {
     let lease_secs = lease_duration.as_secs_f64();
     let result = sqlx::query_scalar!(
-        "INSERT INTO leader_leases (name, holder_id, heartbeat_at, expires_at)
+        "INSERT INTO runtime_sync.leader_leases (name, holder_id, heartbeat_at, expires_at)
          VALUES ($1, $2, NOW(), NOW() + ($3 * INTERVAL '1 second'))
          ON CONFLICT (name) DO UPDATE
            SET holder_id = $2, heartbeat_at = NOW(), expires_at = NOW() + ($3 * INTERVAL '1 second')
-           WHERE leader_leases.expires_at < NOW()
-              OR leader_leases.holder_id = $2
+           WHERE runtime_sync.leader_leases.expires_at < NOW()
+              OR runtime_sync.leader_leases.holder_id = $2
          RETURNING holder_id",
         name,
         holder_id,
@@ -417,7 +419,7 @@ async fn renew(
 ) -> Result<RenewOutcome> {
     let lease_secs = lease_duration.as_secs_f64();
     let updated = sqlx::query_scalar!(
-        "UPDATE leader_leases
+        "UPDATE runtime_sync.leader_leases
          SET heartbeat_at = NOW(), expires_at = NOW() + ($3 * INTERVAL '1 second')
          WHERE name = $1 AND holder_id = $2 AND expires_at > NOW()
          RETURNING holder_id",
@@ -434,7 +436,7 @@ async fn renew(
     // Renewal failed — one extra round-trip to determine why so the log line
     // is accurate. This path is rare (only on stepdown), so the cost is fine.
     let current = sqlx::query!(
-        r#"SELECT holder_id, expires_at, NOW() AS "now!" FROM leader_leases WHERE name = $1"#,
+        r#"SELECT holder_id, expires_at, NOW() AS "now!" FROM runtime_sync.leader_leases WHERE name = $1"#,
         name,
     )
     .fetch_optional(pool)
@@ -455,7 +457,7 @@ async fn renew(
 
 async fn is_held_db_raw(pool: &PgPool, name: &str, holder_id: Uuid) -> Result<bool, sqlx::Error> {
     let row = sqlx::query_scalar!(
-        "SELECT holder_id FROM leader_leases WHERE name = $1 AND expires_at > NOW()",
+        "SELECT holder_id FROM runtime_sync.leader_leases WHERE name = $1 AND expires_at > NOW()",
         name,
     )
     .fetch_optional(pool)
