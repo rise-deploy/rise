@@ -1128,7 +1128,7 @@ impl Extension for AwsS3Provisioner {
         Ok(())
     }
 
-    fn start(&self, shutdown: CancellationToken) {
+    fn start(&self, shutdown: CancellationToken) -> tokio::task::JoinHandle<()> {
         let provisioner = Self {
             s3_client: self.s3_client.clone(),
             iam_client: self.iam_client.clone(),
@@ -1152,6 +1152,7 @@ impl Extension for AwsS3Provisioner {
                 "rise-ext-s3",
                 Uuid::new_v4(),
                 std::time::Duration::from_secs(60),
+                shutdown.clone(),
                 move |election| async move {
             let mut error_state: HashMap<Uuid, (usize, DateTime<Utc>)> = HashMap::new();
 
@@ -1269,7 +1270,7 @@ impl Extension for AwsS3Provisioner {
             if let Err(e) = result {
                 error!("AWS S3 extension reconciliation loop error: {:?}", e);
             }
-        });
+        })
     }
 
     async fn before_deployment(

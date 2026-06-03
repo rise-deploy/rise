@@ -40,6 +40,7 @@ impl ProjectController {
             "rise-project-controller",
             Uuid::new_v4(),
             Duration::from_secs(60),
+            shutdown.clone(),
             move |election| async move {
                 let controller = ProjectController {
                     state,

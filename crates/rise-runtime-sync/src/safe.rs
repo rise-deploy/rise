@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use sqlx::PgPool;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -46,30 +47,38 @@ where
 }
 
 /// Run `f` for the duration of a leader election, releasing the lease when `f`
-/// returns.
+/// returns or `shutdown` is cancelled.
 ///
 /// Spawns a [`LeaderElection`] for `name`, passes a handle to `f` (typically a
 /// controller run-loop), and — once `f` returns — deletes the lease row so a
 /// peer can take over immediately instead of waiting out the TTL.
 ///
-/// `f` must be able to *exit* for the release to run: drive its loop off a
-/// shutdown signal (see [`leader_controller!`](crate::leader_controller)). If
-/// `f` panics instead, the lease isn't deleted here, but it still can't leak —
-/// the heartbeat stops and the lease lapses within its TTL, after which a peer
-/// acquires. A release error is likewise non-fatal (TTL reclaims it), so it's
-/// logged, never propagated.
-pub async fn with_leader_election<T, Fut>(
+/// Release is **structural**: `f` is raced against `shutdown.cancelled()`, so
+/// even if `f` never observes the token (or hangs mid-work), cancelling it
+/// drops `f` and the lease is still released. `f` should still observe
+/// `shutdown` itself for a clean exit at a safe point (see
+/// [`leader_controller!`](crate::leader_controller)); the race is the
+/// can't-forget safety net.
+///
+/// A panic in `f` does not delete the lease here, but it still can't leak — the
+/// heartbeat stops and the lease lapses within its TTL. A release error is
+/// likewise non-fatal (TTL reclaims it), so it's logged, never propagated.
+pub async fn with_leader_election<Fut>(
     pool: PgPool,
     name: &str,
     holder_id: Uuid,
     lease_duration: Duration,
+    shutdown: CancellationToken,
     f: impl FnOnce(LeaderElection) -> Fut,
-) -> Result<T>
+) -> Result<()>
 where
-    Fut: Future<Output = Result<T>>,
+    Fut: Future<Output = Result<()>>,
 {
     let election = LeaderElection::spawn(pool, name, holder_id, lease_duration);
-    let result = f(election.clone()).await;
+    let result = tokio::select! {
+        r = f(election.clone()) => r,
+        _ = shutdown.cancelled() => Ok(()),
+    };
     if let Err(e) = election.release().await {
         warn!(
             lease = %name,
@@ -93,8 +102,10 @@ where
 /// released deterministically.
 ///
 /// Each schedule is introduced by a unique identifier (used internally for its
-/// ticker/schedule bindings), a string `name` (the `leader_schedules` row key
-/// and log label), and an `interval`. The `election:` binding names the
+/// ticker/schedule bindings — these must be distinct across schedules, as a
+/// duplicate would silently shadow an earlier one), a string `name` (the
+/// `leader_schedules` row key and log label), and an `interval`. The
+/// `election:` binding names the
 /// [`LeaderElection`] handle so work bodies can reference it (e.g. to
 /// `assert_leader()` before a destructive write):
 ///
@@ -133,16 +144,26 @@ macro_rules! leader_controller {
             $lease,
             $holder,
             $ttl,
+            ::std::clone::Clone::clone(&__shutdown),
             move |$election| async move {
                 $(
-                    let mut $sched = (
-                        ::tokio::time::interval($interval),
-                        $crate::GlobalSchedule::new(
-                            ::std::clone::Clone::clone(&__pool),
-                            $name,
-                            $interval,
-                        ),
-                    );
+                    let mut $sched = {
+                        let mut __ticker = ::tokio::time::interval($interval);
+                        // Skip queued ticks after a long work item rather than
+                        // firing them back-to-back; the GlobalSchedule is the
+                        // real cadence gate, this just avoids tick bursts.
+                        __ticker.set_missed_tick_behavior(
+                            ::tokio::time::MissedTickBehavior::Delay,
+                        );
+                        (
+                            __ticker,
+                            $crate::GlobalSchedule::new(
+                                ::std::clone::Clone::clone(&__pool),
+                                $name,
+                                $interval,
+                            ),
+                        )
+                    };
                 )+
                 loop {
                     ::tokio::select! {
@@ -222,6 +243,7 @@ mod tests {
             "test/wle",
             Uuid::new_v4(),
             Duration::from_secs(60),
+            CancellationToken::new(),
             |election| async move {
                 // Wait until we actually hold the lease before returning.
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -249,6 +271,46 @@ mod tests {
         assert!(
             next.is_leader(),
             "peer should acquire immediately after with_leader_election released the lease"
+        );
+        next.release().await.unwrap();
+    }
+
+    /// Even if the body never observes shutdown, cancelling the token must drop
+    /// the body and still release the lease (the structural release guarantee).
+    #[sqlx::test]
+    async fn with_leader_election_releases_when_body_ignores_shutdown(pool: PgPool) {
+        let shutdown = CancellationToken::new();
+        let handle = tokio::spawn(with_leader_election(
+            pool.clone(),
+            "test/wle-ignore",
+            Uuid::new_v4(),
+            Duration::from_secs(60),
+            shutdown.clone(),
+            // Never observes shutdown — would hold the lease forever on its own.
+            |_election| async move {
+                std::future::pending::<()>().await;
+                Ok(())
+            },
+        ));
+
+        // Let it become leader, then cancel; the helper must drop the body and release.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        shutdown.cancel();
+        handle.await.unwrap().unwrap();
+
+        let next = LeaderElection::spawn(
+            pool.clone(),
+            "test/wle-ignore",
+            Uuid::new_v4(),
+            Duration::from_secs(60),
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !next.is_leader() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            next.is_leader(),
+            "peer should acquire after cancellation released the lease"
         );
         next.release().await.unwrap();
     }

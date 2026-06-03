@@ -601,6 +601,7 @@ pub async fn run_entra_sync_loop(
         "rise-entra-sync",
         Uuid::new_v4(),
         Duration::from_secs(interval_secs + 30),
+        shutdown.clone(),
         move |election| async move {
             let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
             loop {

@@ -1392,7 +1392,7 @@ Deletion removes all resources: Snowflake integration and OAuth extension.
         Ok(vec![])
     }
 
-    fn start(&self, shutdown: CancellationToken) {
+    fn start(&self, shutdown: CancellationToken) -> tokio::task::JoinHandle<()> {
         let provisioner = self.clone();
 
         tokio::spawn(async move {
@@ -1404,6 +1404,7 @@ Deletion removes all resources: Snowflake integration and OAuth extension.
                 "rise-ext-snowflake",
                 Uuid::new_v4(),
                 std::time::Duration::from_secs(60),
+                shutdown.clone(),
                 move |election| async move {
                     let mut error_state: HashMap<Uuid, (usize, DateTime<Utc>)> = HashMap::new();
 
@@ -1479,6 +1480,6 @@ Deletion removes all resources: Snowflake integration and OAuth extension.
                     e
                 );
             }
-        });
+        })
     }
 }

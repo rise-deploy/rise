@@ -350,7 +350,13 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
 
     info!("HTTP server shutdown complete");
 
-    // Wait for all controller tasks to complete
+    // Wait for all controller tasks AND the extension reconciliation tasks to
+    // complete. Each observes the cancelled token, breaks its loop, and releases
+    // its leader lease before its handle resolves — so a peer replica can take
+    // over promptly instead of waiting out the lease TTL.
+    controller_handles.extend(std::mem::take(
+        &mut *state.extension_handles.lock().unwrap(),
+    ));
     for handle in controller_handles {
         let _ = handle.await;
     }

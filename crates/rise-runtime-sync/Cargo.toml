@@ -11,6 +11,7 @@ sha2 = "0.11"
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-util = "0.7"
 tracing = { workspace = true }
 uuid = { workspace = true }
 

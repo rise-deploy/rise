@@ -1322,7 +1322,7 @@ impl Extension for AwsRdsProvisioner {
         Ok(())
     }
 
-    fn start(&self, shutdown: CancellationToken) {
+    fn start(&self, shutdown: CancellationToken) -> tokio::task::JoinHandle<()> {
         let provisioner = Self {
             rds_client: self.rds_client.clone(),
             db_pool: self.db_pool.clone(),
@@ -1352,6 +1352,7 @@ impl Extension for AwsRdsProvisioner {
                 "rise-ext-rds",
                 Uuid::new_v4(),
                 std::time::Duration::from_secs(60),
+                shutdown.clone(),
                 move |election| async move {
             // Track error counts and last error times for exponential backoff
             let mut error_state: HashMap<Uuid, (usize, DateTime<Utc>)> = HashMap::new();
@@ -1462,7 +1463,7 @@ impl Extension for AwsRdsProvisioner {
             if let Err(e) = result {
                 error!("AWS RDS extension reconciliation loop error: {:?}", e);
             }
-        });
+        })
     }
 
     async fn before_deployment(

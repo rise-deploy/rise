@@ -45,6 +45,10 @@ pub struct AppState {
     /// reconciliation loops. Cancelled by `run_server` once a SIGINT/SIGTERM is
     /// received, so each leader-elected loop exits and releases its lease.
     pub shutdown: tokio_util::sync::CancellationToken,
+    /// JoinHandles of the extension reconciliation tasks (started here), so
+    /// `run_server` can await their graceful lease release on shutdown alongside
+    /// the core controllers. `Arc<Mutex<…>>` because `AppState` is `Clone`.
+    pub extension_handles: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     pub jwt_validator: Arc<JwtValidator>,
     pub jwt_signer: Arc<JwtSigner>,
     pub oauth_client: Arc<OAuthClient>,
@@ -817,6 +821,10 @@ impl AppState {
         // and the background controllers (see `run_server`). Cancelling it stops
         // every leader-elected loop and releases its lease.
         let shutdown = tokio_util::sync::CancellationToken::new();
+        // Collect the extension tasks' handles so `run_server` can await their
+        // graceful lease release on shutdown.
+        let extension_handles: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
 
         // Register extensions from configuration
         if let Some(ref extensions_config) = settings.extensions {
@@ -895,7 +903,10 @@ impl AppState {
                         extension_registry.register_type(aws_rds_arc.clone());
 
                         // Start the extension's reconciliation loop
-                        aws_rds_arc.start(shutdown.clone());
+                        extension_handles
+                            .lock()
+                            .unwrap()
+                            .push(aws_rds_arc.start(shutdown.clone()));
 
                         tracing::info!("AWS RDS extension provider initialized and started");
                     }
@@ -953,7 +964,10 @@ impl AppState {
                         let aws_s3_arc: Arc<dyn crate::server::extensions::Extension> =
                             Arc::new(aws_s3_provisioner);
                         extension_registry.register_type(aws_s3_arc.clone());
-                        aws_s3_arc.start(shutdown.clone());
+                        extension_handles
+                            .lock()
+                            .unwrap()
+                            .push(aws_s3_arc.start(shutdown.clone()));
 
                         tracing::info!("AWS S3 bucket extension provider initialized and started");
                     }
@@ -986,7 +1000,10 @@ impl AppState {
         let oauth_provider_arc: Arc<dyn crate::server::extensions::Extension> =
             Arc::new(oauth_provider);
         extension_registry.register_type(oauth_provider_arc.clone());
-        oauth_provider_arc.start(shutdown.clone());
+        extension_handles
+            .lock()
+            .unwrap()
+            .push(oauth_provider_arc.start(shutdown.clone()));
         tracing::info!("OAuth extension provider initialized and started");
 
         // Register Snowflake OAuth provisioner (if configured)
@@ -1040,7 +1057,7 @@ impl AppState {
                     let snowflake_oauth_arc: Arc<dyn crate::server::extensions::Extension> =
                         Arc::new(snowflake_oauth_provisioner);
                     extension_registry.register_type(snowflake_oauth_arc.clone());
-                    snowflake_oauth_arc.start(shutdown.clone());
+                    extension_handles.lock().unwrap().push(snowflake_oauth_arc.start(shutdown.clone()));
                     tracing::info!("Snowflake OAuth provisioner initialized and started");
                 }
             }
@@ -1127,6 +1144,7 @@ impl AppState {
         Ok(Self {
             db_pool,
             shutdown,
+            extension_handles,
             jwt_validator,
             jwt_signer,
             oauth_client,

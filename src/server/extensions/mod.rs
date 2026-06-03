@@ -96,18 +96,19 @@ pub trait Extension: Send + Sync {
 
     /// Start the extension's background reconciliation loop(s).
     ///
-    /// This method should spawn a background task (via `tokio::spawn`) that runs
-    /// its reconciliation loop under a leader election, exiting and releasing the
-    /// lease when `shutdown` is cancelled. Prefer `rise_runtime_sync::with_leader_election`
-    /// so the lease release is handled for you.
+    /// Spawn a background task (via `tokio::spawn`) that runs its reconciliation
+    /// loop under a leader election, exiting and releasing the lease when
+    /// `shutdown` is cancelled. Prefer `rise_runtime_sync::with_leader_election`
+    /// so the lease release is handled for you. Return the task's `JoinHandle`
+    /// so the server can await graceful lease release on shutdown.
     ///
     /// Example implementation:
     /// ```ignore
-    /// fn start(&self, shutdown: CancellationToken) {
+    /// fn start(&self, shutdown: CancellationToken) -> tokio::task::JoinHandle<()> {
     ///     let me = Arc::clone(self);
     ///     tokio::spawn(async move {
     ///         let _ = with_leader_election(me.db_pool.clone(), "rise-ext-foo", Uuid::new_v4(),
-    ///             Duration::from_secs(60), |election| async move {
+    ///             Duration::from_secs(60), shutdown, |election| async move {
     ///             loop {
     ///                 tokio::select! {
     ///                     _ = shutdown.cancelled() => break,
@@ -118,10 +119,10 @@ pub trait Extension: Send + Sync {
     ///             }
     ///             Ok(())
     ///         }).await;
-    ///     });
+    ///     })
     /// }
     /// ```
-    fn start(&self, shutdown: CancellationToken);
+    fn start(&self, shutdown: CancellationToken) -> tokio::task::JoinHandle<()>;
 
     /// Hook called before deployment creation
     ///

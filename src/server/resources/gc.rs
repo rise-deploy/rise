@@ -93,6 +93,7 @@ impl ResourceGcController {
             LEASE_NAME,
             Uuid::new_v4(),
             LEASE_DURATION,
+            shutdown.clone(),
             move |election| async move {
                 let controller = Arc::new(ResourceGcController {
                     store,

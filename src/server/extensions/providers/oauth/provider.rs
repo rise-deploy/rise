@@ -523,7 +523,7 @@ impl Extension for OAuthProvider {
         Ok(())
     }
 
-    fn start(&self, shutdown: CancellationToken) {
+    fn start(&self, shutdown: CancellationToken) -> tokio::task::JoinHandle<()> {
         let provider = self.clone();
 
         tokio::spawn(async move {
@@ -535,6 +535,7 @@ impl Extension for OAuthProvider {
                 "rise-ext-oauth",
                 Uuid::new_v4(),
                 std::time::Duration::from_secs(60),
+                shutdown.clone(),
                 move |election| async move {
             loop {
                 if !election.is_leader() {
@@ -592,7 +593,7 @@ impl Extension for OAuthProvider {
             if let Err(e) = result {
                 error!("OAuth extension reconciliation loop error: {:?}", e);
             }
-        });
+        })
     }
 
     async fn before_deployment(
