@@ -1,6 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub mod registry;
@@ -93,27 +94,35 @@ pub trait Extension: Send + Sync {
         Ok(())
     }
 
-    /// Start the extension's background reconciliation loop(s)
+    /// Start the extension's background reconciliation loop(s).
     ///
-    /// This method should spawn background tasks via `tokio::spawn` that run
-    /// indefinitely until the process exits. The tasks will be automatically
-    /// cleaned up when the process receives SIGTERM/SIGINT.
+    /// Spawn a background task (via `tokio::spawn`) that runs its reconciliation
+    /// loop under a leader election, exiting and releasing the lease when
+    /// `shutdown` is cancelled. Prefer `rise_runtime_sync::with_leader_election`
+    /// so the lease release is handled for you. Return the task's `JoinHandle`
+    /// so the server can await graceful lease release on shutdown.
     ///
     /// Example implementation:
     /// ```ignore
-    /// fn start(&self) {
-    ///     let self_clone = Arc::clone(self);
+    /// fn start(&self, shutdown: CancellationToken) -> tokio::task::JoinHandle<()> {
+    ///     let me = Arc::clone(self);
     ///     tokio::spawn(async move {
-    ///         let mut interval = tokio::time::interval(Duration::from_secs(30));
-    ///         loop {
-    ///             interval.tick().await;
-    ///             self_clone.reconcile().await;
-    ///         }
-    ///     });
+    ///         let _ = with_leader_election(me.db_pool.clone(), "rise-ext-foo", Uuid::new_v4(),
+    ///             Duration::from_secs(60), shutdown, |election| async move {
+    ///             loop {
+    ///                 tokio::select! {
+    ///                     _ = shutdown.cancelled() => break,
+    ///                     _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+    ///                 }
+    ///                 if !election.is_leader() { continue; }
+    ///                 me.reconcile().await;
+    ///             }
+    ///             Ok(())
+    ///         }).await;
+    ///     })
     /// }
     /// ```
-    #[allow(dead_code)]
-    fn start(&self);
+    fn start(&self, shutdown: CancellationToken) -> tokio::task::JoinHandle<()>;
 
     /// Hook called before deployment creation
     ///

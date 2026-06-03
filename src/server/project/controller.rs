@@ -1,118 +1,76 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::interval;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::db::models::DeploymentStatus;
 use crate::db::{
-    deployments as db_deployments, extensions as db_extensions, leader_leases::LeaderElection,
-    leader_schedules::GlobalSchedule, projects as db_projects,
+    deployments as db_deployments, extensions as db_extensions, projects as db_projects,
 };
 use crate::server::deployment::state_machine;
 use crate::server::state::ControllerState;
+use rise_runtime_sync::{leader_controller, LeaderElection};
+use tokio_util::sync::CancellationToken;
 
-/// Project controller handles project lifecycle operations
+/// Project controller handles project lifecycle operations.
 ///
-/// Currently implements:
-/// - Deletion loop: processes projects in Deleting status
+/// Runs two leader-gated, globally-scheduled passes (see [`Self::run`]):
+/// - **Deletion** (every 5s): advances projects in `Deleting` status toward
+///   removal — cancelling/terminating their deployments, then deleting the
+///   project once all are terminal and no finalizers/extensions remain.
+/// - **Cleanup** (hourly): drops expired OAuth transient-state rows.
 pub struct ProjectController {
     state: Arc<ControllerState>,
-    deletion_interval: Duration,
-    cleanup_tick: AtomicU64,
-    election: LeaderElection,
-    deletion_schedule: GlobalSchedule,
 }
 
 impl ProjectController {
-    /// Create a new project controller
-    pub fn new(state: Arc<ControllerState>) -> Self {
-        let deletion_interval = Duration::from_secs(5);
-        let election = LeaderElection::spawn(
-            state.db_pool.clone(),
-            "rise-project-controller",
-            Uuid::new_v4(),
-            Duration::from_secs(60),
-        );
-        let deletion_schedule = GlobalSchedule::new(
-            state.db_pool.clone(),
-            "rise-project-deletion",
-            deletion_interval,
-        );
-        Self {
-            state,
-            deletion_interval,
-            cleanup_tick: AtomicU64::new(1),
-            election,
-            deletion_schedule,
+    /// Run the project controller under a leader election until `shutdown` is
+    /// cancelled, then release the lease so a peer can take over promptly.
+    pub async fn run(
+        state: Arc<ControllerState>,
+        shutdown: CancellationToken,
+    ) -> anyhow::Result<()> {
+        let pool = state.db_pool.clone();
+        let controller = ProjectController { state };
+        leader_controller! {
+            pool: pool,
+            lease: "rise-project-controller",
+            holder: Uuid::new_v4(),
+            ttl: Duration::from_secs(60),
+            shutdown: shutdown,
+            election: election,
+            schedules: {
+                // Deletion pass: process projects in `Deleting` status. Each
+                // destructive write re-verifies leadership against the DB — see
+                // `process_deleting_projects`.
+                "rise-project-deletion" every Duration::from_secs(5)
+                    => controller.process_deleting_projects(&election).await,
+                // Hourly housekeeping. Using a `GlobalSchedule` keeps the
+                // cadence globally coordinated across replicas and survives
+                // leadership handovers (the cadence is anchored on the shared
+                // `last_run_at`, not on any single replica's local state).
+                "rise-project-cleanup" every Duration::from_secs(3600)
+                    => controller.cleanup_expired_transient_state().await,
+            },
         }
+        .await
     }
 
-    /// Start deletion loop
-    pub fn start(self: Arc<Self>) {
-        tokio::spawn(async move {
-            self.deletion_loop().await;
-        });
-    }
-
-    /// Deletion loop - processes projects in Deleting status
-    ///
-    /// Runs every 5 seconds and:
-    /// 1. Finds projects marked as Deleting
-    /// 2. For each project, checks all deployments
-    /// 3. Cancels pre-infrastructure deployments (Pending/Building/Pushing)
-    /// 4. Terminates post-infrastructure deployments (Deploying/Healthy/Unhealthy)
-    /// 5. Once all deployments are terminal, deletes the project
-    async fn deletion_loop(&self) {
-        info!("Project deletion loop started");
-        let mut ticker = interval(self.deletion_interval);
-
-        loop {
-            ticker.tick().await;
-
-            if !self.election.is_leader() {
-                continue;
-            }
-
-            // Global cadence gate: ensures the new leader's first deletion
-            // pass after a transition waits the full interval since the
-            // previous leader's last pass. `_as_leader` re-verifies
-            // leadership against the DB (fast-path on the cached lease
-            // horizon) before the schedule UPSERT — see `GlobalSchedule` docs.
-            if !self
-                .deletion_schedule
-                .try_claim_or_skip_as_leader("project deletion", &self.election)
-                .await
-            {
-                continue;
-            }
-
-            if let Err(e) = self.process_deleting_projects().await {
-                error!("Error in deletion loop: {}", e);
-            }
-
-            if let Err(e) = self.cleanup_expired_transient_state().await {
-                warn!("Error cleaning up expired transient state: {:?}", e);
-            }
-        }
-    }
-
-    /// Periodically clean up expired OAuth transient state rows (runs on leader only)
+    /// Clean up expired OAuth transient state rows (leader-gated, hourly).
     async fn cleanup_expired_transient_state(&self) -> anyhow::Result<()> {
-        // Run cleanup roughly once per hour (every 720 ticks × 5s = 3600s)
-        let tick = self.cleanup_tick.fetch_add(1, Ordering::Relaxed);
-        if tick.is_multiple_of(720) {
-            let n = crate::db::oauth_transient_state::delete_expired(&self.state.db_pool).await?;
-            if n > 0 {
-                debug!("Cleaned up {} expired OAuth transient state rows", n);
-            }
+        let n = crate::db::oauth_transient_state::delete_expired(&self.state.db_pool).await?;
+        if n > 0 {
+            debug!("Cleaned up {} expired OAuth transient state rows", n);
         }
         Ok(())
     }
 
-    /// Process all projects in Deleting status
-    async fn process_deleting_projects(&self) -> anyhow::Result<()> {
+    /// Process all projects in Deleting status.
+    ///
+    /// Leadership is re-verified against the DB (`election.assert_leader()`)
+    /// immediately before every destructive write, so a replica that lost the
+    /// lease mid-pass cannot mutate alongside the new leader.
+    async fn process_deleting_projects(&self, election: &LeaderElection) -> anyhow::Result<()> {
         let deleting = db_projects::find_deleting(&self.state.db_pool, 10).await?;
 
         for project in deleting {
@@ -144,7 +102,7 @@ impl ProjectController {
                     // Cancel pre-infrastructure deployments
                     // These haven't provisioned resources yet
                     if deployment.status != DeploymentStatus::Cancelling {
-                        self.election.assert_leader().await?;
+                        election.assert_leader().await?;
                         info!(
                             "Cancelling pre-infrastructure deployment {} (status={:?})",
                             deployment.deployment_id, deployment.status
@@ -155,7 +113,7 @@ impl ProjectController {
                     // Terminate post-infrastructure deployments
                     // These have containers/resources that need cleanup
                     if deployment.status != DeploymentStatus::Terminating {
-                        self.election.assert_leader().await?;
+                        election.assert_leader().await?;
                         info!(
                             "Terminating post-infrastructure deployment {} (status={:?})",
                             deployment.deployment_id, deployment.status
@@ -200,7 +158,7 @@ impl ProjectController {
                 );
 
                 // Transition to Terminated status before removal
-                self.election.assert_leader().await?;
+                election.assert_leader().await?;
                 db_projects::update_status(
                     &self.state.db_pool,
                     project.id,
@@ -213,7 +171,7 @@ impl ProjectController {
                     project.name
                 );
 
-                self.election.assert_leader().await?;
+                election.assert_leader().await?;
                 db_projects::delete(&self.state.db_pool, project.id).await?;
             } else {
                 debug!(

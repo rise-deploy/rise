@@ -4142,6 +4142,7 @@ dependencies = [
  "reqwest 0.13.4",
  "rise-resource-api",
  "rise-resource-store",
+ "rise-runtime-sync",
  "rsa",
  "rustls",
  "schemars",
@@ -4159,6 +4160,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
+ "tokio-util",
  "toml",
  "tower",
  "tower-http",
@@ -4196,6 +4198,21 @@ dependencies = [
  "sqlx",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rise-runtime-sync"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "sha2 0.11.0",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]

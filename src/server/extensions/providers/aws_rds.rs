@@ -1,6 +1,6 @@
 use crate::db::{
-    self, deployments as db_deployments, extensions as db_extensions,
-    leader_leases::LeaderElection, postgres_admin, projects as db_projects,
+    self, deployments as db_deployments, extensions as db_extensions, postgres_admin,
+    projects as db_projects,
 };
 use crate::server::encryption::EncryptionProvider;
 use crate::server::extensions::{Extension, InjectedEnvVar, InjectedEnvVarValue};
@@ -8,12 +8,14 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use aws_sdk_rds::Client as RdsClient;
 use chrono::{DateTime, Duration, Utc};
+use rise_runtime_sync::{with_leader_election, LeaderElection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -1320,7 +1322,7 @@ impl Extension for AwsRdsProvisioner {
         Ok(())
     }
 
-    fn start(&self) {
+    fn start(&self, shutdown: CancellationToken) -> tokio::task::JoinHandle<()> {
         let provisioner = Self {
             rds_client: self.rds_client.clone(),
             db_pool: self.db_pool.clone(),
@@ -1344,19 +1346,23 @@ impl Extension for AwsRdsProvisioner {
                 provisioner.extension_type()
             );
 
-            let election = LeaderElection::spawn(
-                provisioner.db_pool.clone(),
+            let pool = provisioner.db_pool.clone();
+            let result = with_leader_election(
+                pool,
                 "rise-ext-rds",
                 Uuid::new_v4(),
                 std::time::Duration::from_secs(60),
-            );
-
+                shutdown.clone(),
+                move |election| async move {
             // Track error counts and last error times for exponential backoff
             let mut error_state: HashMap<Uuid, (usize, DateTime<Utc>)> = HashMap::new();
 
             loop {
                 if !election.is_leader() {
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                    }
                     continue;
                 }
 
@@ -1445,9 +1451,19 @@ impl Extension for AwsRdsProvisioner {
                 };
 
                 let wait_time = if needs_active_polling { 2 } else { 5 };
-                sleep(std::time::Duration::from_secs(wait_time)).await;
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = sleep(std::time::Duration::from_secs(wait_time)) => {}
+                }
             }
-        });
+            Ok(())
+                },
+            )
+            .await;
+            if let Err(e) = result {
+                error!("AWS RDS extension reconciliation loop error: {:?}", e);
+            }
+        })
     }
 
     async fn before_deployment(
