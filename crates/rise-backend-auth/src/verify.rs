@@ -119,9 +119,8 @@ pub async fn verify_external_jwt(
     validation.validate_aud = false;
 
     // Validate and decode the token. `exp` is enforced by `Validation`
-    // (`validate_exp` is true by default) with jsonwebtoken's default 60s
-    // clock-skew leeway — intentionally replacing the previous strict (zero-leeway)
-    // manual `now > exp` recheck.
+    // (`validate_exp` is true by default), with jsonwebtoken's default 60s
+    // clock-skew leeway.
     let token_data = decode::<serde_json::Value>(token, key, &validation)?;
 
     Ok(ExternalClaims::new(issuer.to_string(), token_data.claims))
