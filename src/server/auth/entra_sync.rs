@@ -27,7 +27,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::db::{models::TeamRole, teams, users};
-use rise_runtime_sync::{leader_controller, LeaderElection};
+use rise_runtime_sync::{leader_controller, LeaderElection, LEASE_DURATION};
 use tokio_util::sync::CancellationToken;
 
 // ============================================================================
@@ -590,15 +590,22 @@ pub async fn run_entra_sync_loop(
         interval_secs
     );
 
-    // Single leader-gated, globally-scheduled cycle. The lease TTL is sized to
-    // span a full sync interval (often 1h+) with headroom. The `GlobalSchedule`
-    // (named below) is what fences leader-transition bursts — important here
-    // because long intervals make a duplicate cycle very visible.
+    // Single leader-gated, globally-scheduled cycle. The lease TTL is the
+    // standard fixed `LEASE_DURATION`, deliberately independent of the sync
+    // interval: the interval is the *pause between* syncs (owned by the
+    // `GlobalSchedule` named below), while the TTL governs failover latency and
+    // the background heartbeat cadence (~TTL/3). The heartbeat keeps the lease
+    // alive continuously across those pauses and during a long sync (it runs on
+    // its own task), so there's no need to size the TTL to the interval — and a
+    // fixed 60s TTL means a crashed leader is replaced within ~60s rather than
+    // up to a full (often 1h+) interval. The `GlobalSchedule` also fences
+    // leader-transition bursts, important here since long intervals make a
+    // duplicate cycle very visible.
     let result = leader_controller! {
         pool: pool.clone(),
         lease: "rise-entra-sync",
         holder: Uuid::new_v4(),
-        ttl: Duration::from_secs(interval_secs + 30),
+        ttl: LEASE_DURATION,
         shutdown: shutdown,
         election: election,
         schedules: {
