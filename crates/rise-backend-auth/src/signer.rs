@@ -11,9 +11,19 @@ use rsa::traits::PublicKeyParts;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::claims::{RiseClaims, WorkloadClaims, WorkloadSubjectInfo};
+use crate::claims::{
+    AccessClaims, PrincipalClaims, RiseClaims, WorkloadClaims, WorkloadSubjectInfo,
+};
 use crate::error::JwtSignerError;
 use crate::verify::RiseToken;
+
+/// JWT header `typ` for Rise access tokens.
+///
+/// This is the **primary discriminator** between a session token and an access
+/// token (both HS256): `verify_rise_jwt` routes a token carrying this `typ` to
+/// [`RiseToken::Access`], and the legacy `verify_user_jwt` / `verify_jwt_skip_aud`
+/// adapters reject it. Session tokens carry the default `"JWT"` `typ`.
+pub const RISE_ACCESS_TYP: &str = "rise-access+jwt";
 
 /// JWT signer supporting both HS256 (symmetric) and RS256 (asymmetric) algorithms
 ///
@@ -373,6 +383,50 @@ impl RiseTokenSigner {
         Ok(token)
     }
 
+    /// Sign a Rise access token (HS256) for an exchanged principal.
+    ///
+    /// Minted by the token-exchange endpoint. The signer stamps `iss` (this
+    /// signer's issuer), `aud`, `iat`/`exp`, and a random `jti`, and sets the
+    /// header `typ` to [`RISE_ACCESS_TYP`] so `verify_rise_jwt` classifies it as
+    /// [`RiseToken::Access`] (and the session/ingress adapters reject it).
+    ///
+    /// # Arguments
+    /// * `sub` - stable principal id (`rise:sa:<id>`, `rise:ctrl:<id>`, ...)
+    /// * `principal` - the fully-resolved principal to embed
+    /// * `aud` - the `aud` claim (the Rise public URL)
+    /// * `ttl_secs` - token lifetime in seconds (caller clamps to the max TTL)
+    pub fn sign_access_jwt(
+        &self,
+        sub: &str,
+        principal: PrincipalClaims,
+        aud: &str,
+        ttl_secs: u64,
+    ) -> Result<(String, AccessClaims), JwtSignerError> {
+        use rand::Rng;
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+
+        let mut jti_bytes = [0u8; 16];
+        rand::rng().fill_bytes(&mut jti_bytes);
+        let jti = BASE64URL.encode(jti_bytes);
+
+        let claims = AccessClaims {
+            iss: self.issuer.clone(),
+            aud: aud.to_string(),
+            sub: sub.to_string(),
+            iat: now,
+            exp: now + ttl_secs,
+            jti,
+            principal,
+        };
+
+        let mut header = Header::new(Algorithm::HS256);
+        header.typ = Some(RISE_ACCESS_TYP.to_string());
+        let token = encode(&header, &claims, &self.hs256_encoding_key)?;
+
+        Ok((token, claims))
+    }
+
     /// Verify and decode a Rise user JWT (HS256 only) with audience validation.
     ///
     /// Adapter over [`Self::verify_rise_jwt`] for the API authentication path:
@@ -392,9 +446,9 @@ impl RiseTokenSigner {
             // A correctly-signed HS256 session token with the wrong audience:
             // labeled distinctly as an audience mismatch (still rejected).
             RiseToken::Session(_) => Err(JwtSignerError::AudienceMismatch),
-            // An RS256 ingress token — genuinely the wrong token kind on the API
-            // path, so reject it as an algorithm error.
-            RiseToken::Ingress(_) => Err(JwtSignerError::SigningFailed(
+            // An RS256 ingress token, or an exchanged access token — genuinely the
+            // wrong token kind on the user-login path, so reject as an alg error.
+            RiseToken::Ingress(_) | RiseToken::Access(_) => Err(JwtSignerError::SigningFailed(
                 jsonwebtoken::errors::ErrorKind::InvalidAlgorithm.into(),
             )),
         }
@@ -407,10 +461,49 @@ impl RiseTokenSigner {
     /// does not check `aud`. Project access is validated separately via database
     /// checks.
     pub fn verify_jwt_skip_aud(&self, token: &str) -> Result<RiseClaims, JwtSignerError> {
-        match self.verify_rise_jwt(token)? {
-            RiseToken::Session(claims) | RiseToken::Ingress(claims) => Ok(claims),
+        let claims = match self.verify_rise_jwt(token)? {
+            RiseToken::Session(claims) | RiseToken::Ingress(claims) => claims,
+            // An exchanged access token must never be honored on the ingress path.
+            RiseToken::Access(_) => {
+                return Err(JwtSignerError::SigningFailed(
+                    jsonwebtoken::errors::ErrorKind::InvalidAlgorithm.into(),
+                ))
+            }
+        };
+
+        // Defense-in-depth (§4.1 ingress hardening): the `typ` discriminator above
+        // already routes a Rise access token to `RiseToken::Access`, but because
+        // `RiseClaims` intentionally does NOT use `deny_unknown_fields`, a token
+        // *without* the access `typ` that nonetheless carries a `principal` claim
+        // would deserialize cleanly as a session/ingress token (extra field
+        // ignored). Reject any such token outright so an access-shaped payload can
+        // never be accepted on the ingress path. The payload was just
+        // signature-verified, so this peek reads authenticated bytes.
+        if rise_jwt_payload_has_principal(token) {
+            return Err(JwtSignerError::SigningFailed(
+                jsonwebtoken::errors::ErrorKind::InvalidAlgorithm.into(),
+            ));
         }
+
+        Ok(claims)
     }
+}
+
+/// Whether a (already signature-verified) JWT's payload carries a top-level
+/// `principal` claim. Used to fail-close the ingress path against access-shaped
+/// tokens (§4.1). Returns `false` if the payload cannot be parsed (the caller has
+/// already verified the signature, so this only guards the claim shape).
+fn rise_jwt_payload_has_principal(token: &str) -> bool {
+    let Some(payload_b64) = token.split('.').nth(1) else {
+        return false;
+    };
+    let Ok(payload) = BASE64URL.decode(payload_b64) else {
+        return false;
+    };
+    serde_json::from_slice::<serde_json::Value>(&payload)
+        .ok()
+        .and_then(|v| v.as_object().map(|obj| obj.contains_key("principal")))
+        .unwrap_or(false)
 }
 
 // Tests live alongside the verifier in `verify.rs` and exercise both the

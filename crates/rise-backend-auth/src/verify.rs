@@ -10,22 +10,25 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 
-use crate::claims::{ExternalClaims, RiseClaims};
+use crate::claims::{AccessClaims, ExternalClaims, RiseClaims};
 use crate::error::AuthError;
-use crate::signer::RiseTokenSigner;
+use crate::signer::{RiseTokenSigner, RISE_ACCESS_TYP};
 
 /// A verified Rise-issued token. The output type models only what the verifier
-/// can ever return: `Session` (HS256, UI/CLI login) and `Ingress` (RS256,
-/// deployed-app ingress auth). Workload tokens are sign-only and never appear
-/// here.
+/// can ever return: `Session` (HS256 session, UI/CLI login), `Access` (HS256
+/// exchanged SA / controller principal), and `Ingress` (RS256, deployed-app
+/// ingress auth). Workload tokens are sign-only and never appear here.
 ///
-/// The variants carry [`RiseClaims`]; there is no public constructor other than
-/// [`RiseTokenSigner::verify_rise_jwt`], so a caller cannot fabricate a verified
-/// token.
+/// The variants carry their claim types; there is no public constructor other
+/// than [`RiseTokenSigner::verify_rise_jwt`], so a caller cannot fabricate a
+/// verified token.
 #[derive(Debug, Clone)]
 pub enum RiseToken {
-    /// HS256, aud = public_url — UI / CLI user login.
+    /// HS256, `typ = "JWT"`, aud = public_url — UI / CLI user login.
     Session(RiseClaims),
+    /// HS256, `typ = "rise-access+jwt"`, aud = public_url — exchanged SA /
+    /// controller principal (RFC 8693 token exchange).
+    Access(AccessClaims),
     /// RS256, aud = project_url — deployed-app ingress auth (aud not checked here).
     Ingress(RiseClaims),
 }
@@ -33,11 +36,18 @@ pub enum RiseToken {
 impl RiseTokenSigner {
     /// Verify a Rise-issued JWT and classify it into a typed [`RiseToken`].
     ///
-    /// Verifies the signature and `iss`, then disambiguates by **algorithm**:
-    /// HS256 → [`RiseToken::Session`], RS256 → [`RiseToken::Ingress`]. No `aud`
-    /// check is performed here — callers enforce audience per context (the API
-    /// middleware requires `Session` with `aud == public_url`; ingress accepts
-    /// either variant and ignores `aud`, exactly as today).
+    /// Verifies the signature and `iss`, then disambiguates:
+    /// - **RS256** → [`RiseToken::Ingress`].
+    /// - **HS256** → branch on the header `typ`: the access `typ`
+    ///   ([`RISE_ACCESS_TYP`]) → [`RiseToken::Access`]; anything else (the default
+    ///   `"JWT"`, a missing or unknown `typ`) → [`RiseToken::Session`]. Legacy
+    ///   session tokens carry the default `"JWT"`, so the access `typ` is matched
+    ///   *exclusively* — never requiring a session-specific `typ` that would break
+    ///   existing sessions.
+    ///
+    /// No `aud` check is performed here — callers enforce audience per context
+    /// (the API middleware requires `aud == public_url` for `Session` and
+    /// `Access`; ingress ignores `aud`, exactly as today).
     ///
     /// This is the single inbound verification path for Rise tokens. The legacy
     /// `verify_user_jwt` / `verify_jwt_skip_aud` methods are thin adapters over
@@ -52,9 +62,18 @@ impl RiseTokenSigner {
                 // No aud check at this layer.
                 validation.validate_aud = false;
 
-                let token_data =
-                    decode::<RiseClaims>(token, self.hs256_decoding_key(), &validation)?;
-                Ok(RiseToken::Session(token_data.claims))
+                // Branch on the header `typ` FIRST: the access token and the
+                // session token are both HS256, so the `typ` is the only safe
+                // discriminator (`RiseClaims` has no `deny_unknown_fields`).
+                if header.typ.as_deref() == Some(RISE_ACCESS_TYP) {
+                    let token_data =
+                        decode::<AccessClaims>(token, self.hs256_decoding_key(), &validation)?;
+                    Ok(RiseToken::Access(token_data.claims))
+                } else {
+                    let token_data =
+                        decode::<RiseClaims>(token, self.hs256_decoding_key(), &validation)?;
+                    Ok(RiseToken::Session(token_data.claims))
+                }
             }
             Algorithm::RS256 => {
                 let mut validation = Validation::new(Algorithm::RS256);
@@ -300,6 +319,183 @@ mod tests {
             result,
             Err(crate::error::JwtSignerError::AudienceMismatch)
         ));
+    }
+
+    /// The test signer is built from a known HS256 secret (`[0u8; 32]`), so a key
+    /// reconstructed from the same bytes signs tokens that verify against it. This
+    /// lets the tests hand-craft HS256 tokens with arbitrary `typ` / payloads.
+    fn hs256_key() -> jsonwebtoken::EncodingKey {
+        jsonwebtoken::EncodingKey::from_secret(&[0u8; 32])
+    }
+
+    fn session_claims() -> RiseClaims {
+        RiseClaims {
+            sub: "u".to_string(),
+            email: "u@example.com".to_string(),
+            name: None,
+            groups: None,
+            iat: now(),
+            exp: now() + 3600,
+            iss: "https://rise.test".to_string(),
+            aud: "https://rise.test".to_string(),
+        }
+    }
+
+    fn controller_principal() -> crate::PrincipalClaims {
+        crate::PrincipalClaims::Controller {
+            identity_id: "controller.example.com".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_verify_rise_jwt_access_round_trip() {
+        let signer = create_test_signer();
+        let (token, minted) = signer
+            .sign_access_jwt(
+                "rise:ctrl:controller.example.com",
+                controller_principal(),
+                "https://rise.test",
+                600,
+            )
+            .unwrap();
+
+        // Header carries the access typ.
+        let header = jsonwebtoken::decode_header(&token).unwrap();
+        assert_eq!(header.alg, Algorithm::HS256);
+        assert_eq!(header.typ.as_deref(), Some(crate::RISE_ACCESS_TYP));
+
+        match signer.verify_rise_jwt(&token).unwrap() {
+            RiseToken::Access(c) => {
+                assert_eq!(c.sub, "rise:ctrl:controller.example.com");
+                assert_eq!(c.aud, "https://rise.test");
+                assert_eq!(c.iss, "https://rise.test");
+                assert_eq!(c.jti, minted.jti);
+                assert!(matches!(
+                    c.principal,
+                    crate::PrincipalClaims::Controller { .. }
+                ));
+            }
+            other => panic!("expected Access, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_access_token_rejected_by_legacy_adapters() {
+        let signer = create_test_signer();
+        let (token, _) = signer
+            .sign_access_jwt(
+                "rise:ctrl:x",
+                controller_principal(),
+                "https://rise.test",
+                600,
+            )
+            .unwrap();
+
+        assert!(
+            signer.verify_user_jwt(&token, "https://rise.test").is_err(),
+            "access token must not verify as a user/session token"
+        );
+        assert!(
+            signer.verify_jwt_skip_aud(&token).is_err(),
+            "access token must not verify on the ingress path"
+        );
+    }
+
+    #[test]
+    fn test_verify_jwt_skip_aud_rejects_principal_claim() {
+        // A token WITHOUT the access typ (default "JWT") but carrying a `principal`
+        // claim deserializes as a session token (extra field ignored), so the typ
+        // discriminator alone would not catch it. The ingress path must still
+        // reject it (§4.1 hardening).
+        let claims = serde_json::json!({
+            "sub": "u",
+            "email": "u@example.com",
+            "iss": "https://rise.test",
+            "aud": "https://rise.test",
+            "iat": now(),
+            "exp": now() + 3600,
+            "principal": { "kind": "controller", "identity_id": "x" },
+        });
+        let header = Header::new(Algorithm::HS256); // default typ "JWT"
+        let token = encode(&header, &claims, &hs256_key()).unwrap();
+
+        let signer = create_test_signer();
+        // It classifies as a Session (typ is "JWT", principal ignored)...
+        assert!(matches!(
+            signer.verify_rise_jwt(&token).unwrap(),
+            RiseToken::Session(_)
+        ));
+        // ...but the ingress adapter rejects the principal-shaped payload.
+        assert!(
+            signer.verify_jwt_skip_aud(&token).is_err(),
+            "a principal-carrying token must be rejected on the ingress path"
+        );
+    }
+
+    /// Anti-drift: assert the `(alg, header-typ) → RiseToken variant / rejection`
+    /// matrix against the real `verify_rise_jwt`, keeping the crate README table
+    /// and the code from silently diverging.
+    #[test]
+    fn rise_token_disambiguation_matrix() {
+        let signer = create_test_signer();
+        let key = hs256_key();
+
+        // Helper: encode session-shaped claims under HS256 with a chosen `typ`.
+        let encode_hs256 = |typ: Option<&str>| {
+            let mut header = Header::new(Algorithm::HS256);
+            header.typ = typ.map(|t| t.to_string());
+            encode(&header, &session_claims(), &key).unwrap()
+        };
+
+        // HS256 + access typ → Access (use the real signer so the payload is
+        // AccessClaims-shaped).
+        let (access_token, _) = signer
+            .sign_access_jwt(
+                "rise:ctrl:x",
+                controller_principal(),
+                "https://rise.test",
+                600,
+            )
+            .unwrap();
+        assert!(matches!(
+            signer.verify_rise_jwt(&access_token).unwrap(),
+            RiseToken::Access(_)
+        ));
+
+        // HS256 + default "JWT" / missing / unknown typ → Session.
+        for typ in [Some("JWT"), None, Some("unknown+jwt")] {
+            let token = encode_hs256(typ);
+            assert!(
+                matches!(
+                    signer.verify_rise_jwt(&token).unwrap(),
+                    RiseToken::Session(_)
+                ),
+                "HS256 typ={typ:?} should classify as Session"
+            );
+        }
+
+        // RS256 (any typ) → Ingress.
+        let ingress = signer
+            .sign_ingress_jwt(
+                &serde_json::json!({"sub": "u", "email": "u@example.com"}),
+                None,
+                "https://myapp.apps.rise.dev",
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            signer.verify_rise_jwt(&ingress).unwrap(),
+            RiseToken::Ingress(_)
+        ));
+
+        // HS384 → rejected (unsupported alg).
+        let hs384 = encode(
+            &Header::new(Algorithm::HS384),
+            &session_claims(),
+            &jsonwebtoken::EncodingKey::from_secret(&[0u8; 32]),
+        )
+        .unwrap();
+        assert!(signer.verify_rise_jwt(&hs384).is_err());
     }
 
     #[test]

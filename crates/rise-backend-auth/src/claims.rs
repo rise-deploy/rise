@@ -1,6 +1,7 @@
 //! Claim types for Rise-issued and external JWTs.
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// Claims for Rise-issued JWTs (both UI and ingress authentication)
 ///
@@ -46,6 +47,124 @@ impl std::fmt::Debug for RiseClaims {
             .field("aud", &self.aud)
             .finish()
     }
+}
+
+/// Coarse capability scopes embedded in a Rise access token.
+///
+/// Scopes let handlers gate on `has_scope(..)` with zero DB work; the source of
+/// truth at exchange time remains the service-account row. The set is
+/// intentionally coarse — per-SA configurable scopes are deferred (they need a
+/// DB column + migration). Service-account exchanges currently receive the full
+/// set (matching what an SA can do today).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Scope {
+    /// Create / manage deployments for the bound project.
+    Deploy,
+    /// Obtain temporary registry-push credentials for the bound project.
+    RegistryPush,
+    /// Read the bound project's deployments / metadata.
+    ReadProject,
+}
+
+/// The resolved principal embedded in a Rise [`AccessClaims`] token.
+///
+/// Internally tagged on `kind` (`user` / `service_account` / `controller`). The
+/// `User` variant is **reserved**: the Phase-1 exchange pipeline mints only
+/// `ServiceAccount` / `Controller`. It exists for a future unification of the
+/// user OIDC login flow onto access tokens.
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PrincipalClaims {
+    /// A Rise user principal (reserved — not minted by the Phase-1 exchange).
+    User {
+        email: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        groups: Option<Vec<String>>,
+    },
+    /// A project-scoped service account, resolved at exchange time.
+    ServiceAccount {
+        /// The matched service account's id.
+        service_account_id: Uuid,
+        /// The SA's synthetic user id (used as `created_by` on deployments).
+        synthetic_user_id: Uuid,
+        /// The bound project's id — the token may act only within this project.
+        project_id: Uuid,
+        /// The bound project's name (informational / audit).
+        project_name: String,
+        /// Environment restriction snapshot. `None` = any environment.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        allowed_environment_ids: Option<Vec<Uuid>>,
+        /// Capabilities granted to this token.
+        scopes: Vec<Scope>,
+    },
+    /// A trusted controller identity.
+    Controller {
+        /// The matched controller's stable identity id.
+        identity_id: String,
+    },
+}
+
+impl std::fmt::Debug for PrincipalClaims {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Redact `email` (PII), mirroring `RiseClaims`.
+            PrincipalClaims::User { groups, .. } => f
+                .debug_struct("User")
+                .field("email", &"<redacted>")
+                .field("groups", groups)
+                .finish(),
+            PrincipalClaims::ServiceAccount {
+                service_account_id,
+                synthetic_user_id,
+                project_id,
+                project_name,
+                allowed_environment_ids,
+                scopes,
+            } => f
+                .debug_struct("ServiceAccount")
+                .field("service_account_id", service_account_id)
+                .field("synthetic_user_id", synthetic_user_id)
+                .field("project_id", project_id)
+                .field("project_name", project_name)
+                .field("allowed_environment_ids", allowed_environment_ids)
+                .field("scopes", scopes)
+                .finish(),
+            PrincipalClaims::Controller { identity_id } => f
+                .debug_struct("Controller")
+                .field("identity_id", identity_id)
+                .finish(),
+        }
+    }
+}
+
+/// Claims for a Rise-issued **access token** (HS256).
+///
+/// Minted by the token-exchange endpoint after resolving an external OIDC token
+/// to a Rise principal. It is consumed **only** by Rise's own middleware (which
+/// holds the HS256 secret), so it is never RS256 / JWKS-verifiable by third
+/// parties. Kept structurally separate from [`RiseClaims`] so an SA-shaped token
+/// can never be honored on the user/ingress paths, and vice-versa.
+///
+/// The carried `principal` fully encodes the resolved identity, letting handlers
+/// make snap authorization decisions with no DB round-trips.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct AccessClaims {
+    /// Issuer (Rise public URL) — satisfies the middleware's `is_rise_issued_jwt` branch.
+    pub iss: String,
+    /// Audience (Rise public URL) — verified by the middleware like a session token.
+    pub aud: String,
+    /// Stable principal id: `rise:sa:<sa_id>`, `rise:ctrl:<id>`, or a user uuid.
+    pub sub: String,
+    /// Issued at timestamp.
+    pub iat: u64,
+    /// Expiration timestamp.
+    pub exp: u64,
+    /// Audit id; room for a future revocation deny-list.
+    pub jti: String,
+    /// The resolved principal.
+    pub principal: PrincipalClaims,
 }
 
 /// Subject info for workload identity JWT claims.

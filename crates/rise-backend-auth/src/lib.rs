@@ -16,35 +16,30 @@ mod matchers;
 mod signer;
 mod verify;
 
-pub use claims::{ExternalClaims, RiseClaims, WorkloadClaims, WorkloadSubjectInfo};
+pub use claims::{
+    AccessClaims, ExternalClaims, PrincipalClaims, RiseClaims, Scope, WorkloadClaims,
+    WorkloadSubjectInfo,
+};
 pub use error::{AuthError, JwtSignerError};
 pub use matchers::{
     audience_matches, build_controller_indexes, match_controller_identity,
     matches_wildcard_pattern, validate_controller_id, validate_custom_claims, validate_oidc_issuer,
     ControllerIdentity, ControllerIndexes, ControllerMatch,
 };
-pub use signer::{compute_key_id, RiseTokenSigner};
+pub use signer::{compute_key_id, RiseTokenSigner, RISE_ACCESS_TYP};
 pub use verify::{verify_external_jwt, JwksKeySource, RiseToken};
 
-/// Check if a JWT issuer is a Rise-issued JWT.
+/// Check whether a JWT issuer is Rise-issued.
 ///
-/// Rise JWTs have `iss` set to the Rise public URL (e.g.,
-/// "https://rise.example.com"). This helper checks for exact match or a
-/// port-stripping scheme-prefix match.
+/// Rise JWTs set `iss` to the Rise public URL (e.g. "https://rise.example.com"),
+/// minted from the signer's configured issuer. The match is **exact**: the
+/// exchange endpoint relies on this predicate to reject Rise-issued tokens, so a
+/// fuzzy prefix/port match could let a sibling-port issuer be treated as
+/// Rise-issued. A non-Rise issuer can never forge a Rise *signature*, but exact
+/// matching keeps the routing decision unambiguous at both call sites
+/// (middleware + exchange).
 pub fn is_rise_issued_jwt(issuer: &str, public_url: &str) -> bool {
-    // Exact match
-    if issuer == public_url {
-        return true;
-    }
-
-    // Check if issuer starts with the public_url's base (handles port differences)
-    if let Some(public_base) = public_url.strip_suffix(|c: char| c.is_ascii_digit() || c == ':') {
-        if issuer.starts_with(public_base) {
-            return true;
-        }
-    }
-
-    false
+    issuer == public_url
 }
 
 #[cfg(test)]
@@ -60,11 +55,24 @@ mod tests {
     }
 
     #[test]
-    fn test_is_rise_issued_jwt_port_prefix() {
-        // The port-stripping prefix branch: public_url ends in a port digit, and
-        // the issuer matches the digit-stripped base. Mirrors the original
-        // middleware helper's fuzzy `starts_with` behavior verbatim.
+    fn test_is_rise_issued_jwt_exact_match_with_port() {
         assert!(is_rise_issued_jwt(
+            "https://rise.example.com:8443",
+            "https://rise.example.com:8443"
+        ));
+    }
+
+    #[test]
+    fn test_is_rise_issued_jwt_rejects_sibling_port() {
+        // A sibling port that the old fuzzy prefix match would have accepted must
+        // NOT be treated as Rise-issued. The exchange relies on this exactness to
+        // reject Rise-issued source tokens.
+        assert!(!is_rise_issued_jwt(
+            "https://rise.example.com:8440",
+            "https://rise.example.com:8443"
+        ));
+        // The digit-stripped prefix superset is likewise rejected.
+        assert!(!is_rise_issued_jwt(
             "https://rise.example.com:844",
             "https://rise.example.com:8443"
         ));
