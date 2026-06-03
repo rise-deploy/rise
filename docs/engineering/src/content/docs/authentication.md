@@ -16,7 +16,7 @@ algorithm/claim disambiguation rules, see the engineering reference in
 |---|---|---|---|---|---|
 | **[Session](#session-hs256)** | Issued | HS256 | Rise `public_url` | Rise API middleware | `server.jwt_signing_secret`, `server.jwt_expiry_seconds` |
 | **[Ingress](#ingress-rs256)** | Issued | RS256 | Project URL | Nginx/ingress via Rise JWKS | `server.rs256_private_key_pem` |
-| **[Workload identity](#workload-identity-rs256)** | Issued | RS256 | Caller-supplied (e.g. `sts.amazonaws.com`) | External system via Rise JWKS | `server.rs256_private_key_pem`, `deployment.identity_token_ttl_seconds` |
+| **[Workload identity](#workload-identity-rs256)** | Issued | RS256 | Caller-supplied (e.g. `sts.amazonaws.com`) | External system via Rise JWKS | `server.rs256_private_key_pem`, `deployment_controller.identity_token_ttl_seconds` |
 | **[User login (OIDC)](#user-login-oidc)** | Accepted | per IdP | — | Rise (JWKS of `auth.issuer`) | `auth.issuer`, `auth.client_id`, `auth.client_secret` |
 | **[Service account](#service-accounts-cicd)** | Accepted | RS256 (JWKS) | project-scoped | Rise (JWKS of the SA issuer) | per-project (CLI/API managed) |
 | **[Controller](#controllers)** | Accepted | RS256 (JWKS) | per identity | Rise (JWKS of controller issuer) | `auth.controllers[]` |
@@ -30,8 +30,9 @@ algorithm/claim disambiguation rules, see the engineering reference in
 Rise acts as an OIDC issuer for the RS256 tokens below. External systems verify
 them against Rise's public key, published at:
 
-- **JWKS:** `GET {public_url}/auth/jwks`
-- **OIDC discovery:** `GET {public_url}/.well-known/openid-configuration`
+- **JWKS:** `GET {public_url}/api/v1/auth/jwks`
+- **OIDC discovery:** `GET {public_url}/.well-known/openid-configuration` (served at
+  the root, per the OIDC spec)
 
 ### Session (HS256)
 
@@ -47,7 +48,7 @@ internal concern — they are never verified outside Rise.
 Issued for **private project** access enforcement at the ingress layer (see
 [Private Project Authentication](/operator-docs/kubernetes/private-auth/)). It is
 asymmetric (RS256) so the ingress can verify it via Rise's JWKS without holding a
-shared secret, and its audience is the project URL. Minted by `GET /auth/ingress`.
+shared secret, and its audience is the project URL. Minted by `GET /api/v1/auth/ingress`.
 
 ### Workload identity (RS256)
 
@@ -62,9 +63,9 @@ Two paths produce these tokens:
 
 - The controller **auto-mints** them and projects them into pods under
   `/var/run/secrets/rise/tokens/`. Lifetime is
-  `deployment.identity_token_ttl_seconds` (default 3600s); the controller
+  `deployment_controller.identity_token_ttl_seconds` (default 3600s); the controller
   re-mints once a token passes half its lifetime.
-- Apps may also call `POST /identity/token` directly, exchanging their
+- Apps may also call `POST /api/v1/identity/token` directly, exchanging their
   deployment bootstrap credential (`Authorization: Bearer <credential>`) for a
   token with a requested audience.
 
@@ -110,9 +111,10 @@ Trusted external controllers authenticate with OIDC JWTs declared under
 supported). Use a dedicated issuer or audience per controller to keep identities
 unambiguous.
 
-> Controller **endpoints** are not yet served; this configuration takes effect
-> when the generic resource API is introduced in a future release. It is safe to
-> configure ahead of time.
+> Controllers authenticate against the generic resource API
+> (`/api/v1/resources`). Today, built-in resources do not yet grant controllers
+> write access (their `allowed_status_controller_ids` is empty), so configuring
+> controllers is currently forward-looking — it is safe to set up ahead of time.
 
 ## Forthcoming: Access tokens & token exchange
 
@@ -131,5 +133,5 @@ Access row and an "exchange" section. Design details live in
 - [ ] Every accepted issuer (`auth.issuer`, service accounts, controllers) is one
       you control or explicitly trust; constrain `aud` (and `sub` where possible).
 - [ ] Workload `aud` values are the specific external systems you intend (avoid
-      broad audiences); `deployment.identity_token_ttl_seconds` is as short as
+      broad audiences); `deployment_controller.identity_token_ttl_seconds` is as short as
       your federation tolerates.

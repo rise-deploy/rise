@@ -118,8 +118,10 @@ pub async fn verify_external_jwt(
     // Disable built-in audience validation - validated separately via expected_claims
     validation.validate_aud = false;
 
-    // Validate and decode the token. `exp` is enforced by `Validation`'s
-    // defaults (`validate_exp` is true), so no manual expiry recheck is needed.
+    // Validate and decode the token. `exp` is enforced by `Validation`
+    // (`validate_exp` is true by default) with jsonwebtoken's default 60s
+    // clock-skew leeway — intentionally replacing the previous strict (zero-leeway)
+    // manual `now > exp` recheck.
     let token_data = decode::<serde_json::Value>(token, key, &validation)?;
 
     Ok(ExternalClaims::new(issuer.to_string(), token_data.claims))
@@ -190,6 +192,34 @@ mod tests {
             }
             other => panic!("expected Session, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_verify_rise_jwt_rejects_workload_token() {
+        // A workload identity token is RS256 and signed with the same key and
+        // issuer as an ingress token; the ONLY thing preventing it from verifying
+        // as `RiseToken::Ingress` is that `WorkloadClaims` carries no `email`
+        // while `RiseClaims` requires one. Lock that separation so it cannot
+        // silently break (e.g. if `email` is ever made `Option`/`#[serde(default)]`).
+        let signer = create_test_signer();
+        let token = signer
+            .sign_workload_jwt(
+                &crate::WorkloadSubjectInfo {
+                    sub: "rise:proj:myapp:env:prod",
+                    project: "myapp",
+                    environment: "prod",
+                    deployment_group: "default",
+                    deployment_id: "20260101-000000",
+                },
+                "sts.amazonaws.com",
+                900,
+            )
+            .unwrap();
+
+        assert!(
+            signer.verify_rise_jwt(&token).is_err(),
+            "workload token must not verify as a Rise session/ingress token"
+        );
     }
 
     #[test]
