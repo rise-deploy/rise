@@ -373,14 +373,11 @@ impl RiseTokenSigner {
         Ok(token)
     }
 
-    /// Verify and decode a Rise user JWT (HS256 only) with audience validation
+    /// Verify and decode a Rise user JWT (HS256 only) with audience validation.
     ///
-    /// This is the legacy adapter preserving today's behavior: only accepts
-    /// HS256 tokens (user JWTs) and validates that the audience matches the Rise
-    /// public URL, rejecting RS256 ingress tokens and wrong-audience tokens.
-    ///
-    /// Delegates to [`Self::verify_rise_jwt`] (which disambiguates by algorithm)
-    /// and then enforces the `Session` + `aud == expected_aud` posture.
+    /// Adapter over [`Self::verify_rise_jwt`] for the API authentication path:
+    /// accepts only an HS256 `Session` token whose `aud` matches the Rise public
+    /// URL, rejecting RS256 ingress tokens and wrong-audience tokens.
     ///
     /// # Arguments
     /// * `token` - The JWT token string
@@ -396,20 +393,19 @@ impl RiseTokenSigner {
             // labeled distinctly as an audience mismatch (still rejected).
             RiseToken::Session(_) => Err(JwtSignerError::AudienceMismatch),
             // An RS256 ingress token — genuinely the wrong token kind on the API
-            // path, so reject it as an algorithm error, exactly as before.
+            // path, so reject it as an algorithm error.
             RiseToken::Ingress(_) => Err(JwtSignerError::SigningFailed(
                 jsonwebtoken::errors::ErrorKind::InvalidAlgorithm.into(),
             )),
         }
     }
 
-    /// Verify and decode a Rise JWT without audience validation
+    /// Verify and decode a Rise JWT without audience validation.
     ///
-    /// Legacy adapter used by the `ingress_auth` handler where both HS256 (user
-    /// session) and RS256 (app-scoped) tokens must be accepted. Project access is
-    /// validated separately via database checks.
-    ///
-    /// Delegates to [`Self::verify_rise_jwt`] and accepts either variant.
+    /// Adapter over [`Self::verify_rise_jwt`] for the `ingress_auth` handler, which
+    /// accepts both HS256 (user session) and RS256 (app-scoped ingress) tokens and
+    /// does not check `aud`. Project access is validated separately via database
+    /// checks.
     pub fn verify_jwt_skip_aud(&self, token: &str) -> Result<RiseClaims, JwtSignerError> {
         match self.verify_rise_jwt(token)? {
             RiseToken::Session(claims) | RiseToken::Ingress(claims) => Ok(claims),
