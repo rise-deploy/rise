@@ -102,6 +102,10 @@ pointed at `localhost` / the `/etc/hosts` aliases). It is the Docker-backend
 analog of `mise br` (which runs the host backend against the Kubernetes dev
 config). Migrations auto-run on startup, so no `db:migrate` step is needed.
 
+> For the broader getting-started / two-backend onboarding (Kubernetes and
+> Docker side by side), see the [Local Development](/operator-docs/development/)
+> guide. This section covers the Docker-specific wiring only.
+
 **Prerequisites (one-time):** run `mise setup hosts` once — it adds
 `rise-dex → 127.0.0.1` to `/etc/hosts`, which host-Rise needs to reach the OIDC
 issuer `http://rise-dex:5556/dex`. That is the **only** setup required: the

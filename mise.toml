@@ -35,7 +35,7 @@ if ! docker info > /dev/null 2>&1; then
   issues="${issues}\n  - Docker is not running"
 fi
 if ! kubectl cluster-info > /dev/null 2>&1; then
-  issues="${issues}\n  - No Kubernetes cluster reachable  →  mise setup minikube"
+  issues="${issues}\n  - No Kubernetes cluster reachable (only needed for the Kubernetes backend 'mise br'; not for the Docker backend 'mise br-docker')  →  mise setup minikube"
 fi
 if [ ! -f .env ] || ! grep -q '^# BEGIN RISE K8S DEV$' .env 2>/dev/null; then
   issues="${issues}\n  - .env missing rise-managed block (RISE_K8S_HOST_IP, RISE_AUTH_BACKEND_URL, ...)  →  mise setup"
@@ -206,11 +206,11 @@ run = """
 if [ -f .env ]; then
   . ./.env
 else
-  printf "Error: .env not found. Run 'mise setup' first — it writes the\n  RISE_K8S_HOST_IP / RISE_AUTH_BACKEND_URL block the backend needs.\n" >&2
+  printf "Error: .env not found.\n  This is the Kubernetes dev path and needs 'mise setup' (provisions the cluster + .env block:\n  RISE_K8S_HOST_IP / RISE_AUTH_BACKEND_URL). For the lighter Docker backend instead, run 'mise br-docker'.\n" >&2
   exit 1
 fi
 if [ -z "${RISE_AUTH_BACKEND_URL:-}" ] || [ -z "${RISE_K8S_HOST_IP:-}" ]; then
-  printf "Error: .env is missing the rise-managed block (RISE_K8S_HOST_IP, RISE_AUTH_BACKEND_URL).\n  Run 'mise setup' to (re)write it.\n" >&2
+  printf "Error: .env is missing the rise-managed block (RISE_K8S_HOST_IP, RISE_AUTH_BACKEND_URL).\n  This is the Kubernetes dev path and needs 'mise setup' (provisions the cluster + .env).\n  For the lighter Docker backend instead, run 'mise br-docker'.\n" >&2
   exit 1
 fi
 cargo run --features cli,backend -- backend server
