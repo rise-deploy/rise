@@ -1309,6 +1309,25 @@ pub enum DeploymentControllerSettings {
         /// deployments. Default: 3600 (1 hour).
         #[serde(default = "default_identity_token_ttl_seconds")]
         identity_token_ttl_seconds: u64,
+
+        /// **Dev-only.** Publish each app container's HTTP port to a random
+        /// `127.0.0.1` host port so a host-run backend (`mise br docker` /
+        /// Docker Desktop, where container bridge IPs aren't routable from the
+        /// host) can health-probe the app directly. Leave off in production —
+        /// the containerized backend reaches app containers over the
+        /// `rise_default` network.
+        // Accepts a native YAML boolean or a string ("true"/"false") via
+        // deserialize_bool_flexible, so it can be driven by an env-interpolated
+        // config value (e.g. publish_app_ports:
+        // "${RISE_PUBLISH_APP_PORTS:-false}"), which the loader resolves to a
+        // string before deserialization. Kept as `//` (not `///`) so the
+        // generated JSON schema description is unchanged.
+        #[serde(
+            default,
+            deserialize_with = "crate::server::ssrf::deserialize_bool_flexible"
+        )]
+        #[schemars(with = "bool")]
+        publish_app_ports: bool,
     },
 }
 

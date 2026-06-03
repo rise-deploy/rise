@@ -249,6 +249,7 @@ docker)
   RISE_CLIENT_REGISTRY_URL=localhost:5000 \\
   RISE_AUTH_BACKEND_URL=http://$GW:3000 \\
   RISE_APP_BACKEND_HOST_ALIAS=rise.localhost \\
+  RISE_PUBLISH_APP_PORTS=true \\
   RISE_STATIC_DIR=$PWD/static \\
   RISE_FRONTEND_DEV_PROXY_URL=http://localhost:5173 \\
   RISE_SSRF_ALLOW_PRIVATE=true \\

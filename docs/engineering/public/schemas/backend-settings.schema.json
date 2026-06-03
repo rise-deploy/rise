@@ -656,6 +656,11 @@
               "description": "Ingress URL template for the production (default) deployment group.\nSame semantics as the Kubernetes variant. Must contain\n`{project_name}`. Drives both the computed app URLs and the Traefik\n`Host(...)` router rules.",
               "type": "string"
             },
+            "publish_app_ports": {
+              "default": false,
+              "description": "**Dev-only.** Publish each app container's HTTP port to a random\n`127.0.0.1` host port so a host-run backend (`mise br docker` /\nDocker Desktop, where container bridge IPs aren't routable from the\nhost) can health-probe the app directly. Leave off in production —\nthe containerized backend reaches app containers over the\n`rise_default` network.",
+              "type": "boolean"
+            },
             "reconcile_interval_secs": {
               "default": 5,
               "description": "Interval in seconds between reconcile ticks. Defaults to 5.",

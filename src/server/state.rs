@@ -354,6 +354,7 @@ async fn init_docker_backend(
         access_classes,
         auth_backend_url,
         app_backend_host_aliases,
+        publish_app_ports,
         ..
     } = settings
     else {
@@ -506,6 +507,7 @@ async fn init_docker_backend(
             access_classes: access_requirements,
             app_backend_host_aliases,
             app_backend_ip,
+            publish_app_ports: *publish_app_ports,
         },
     );
     reconciler.spawn();

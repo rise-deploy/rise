@@ -95,6 +95,13 @@ pub struct BuilderConfig<'a> {
     /// startup). Paired with `app_backend_host_aliases` to build `extra_hosts`.
     /// `None` disables injection.
     pub app_backend_ip: Option<&'a str>,
+    /// **DEV-ONLY.** When `true`, each routable container with a `port` also
+    /// publishes that port to a random `127.0.0.1` host port (empty `host_port`
+    /// → Docker assigns a free one, bound to loopback). Lets a host-run backend
+    /// (Docker Desktop, where the container bridge IP isn't routable from the
+    /// host) health-probe the app directly. Off in production — worker
+    /// containers (no port) and the disabled case get no port bindings.
+    pub publish_app_ports: bool,
 }
 
 /// Result of building one container: the deterministic name and the bollard
@@ -230,6 +237,37 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
         _ => None,
     };
 
+    // ── DEV-ONLY: publish the app port to a random loopback host port ──
+    // When `publish_app_ports` is on, publish every HTTP container's `{port}/tcp`
+    // to a random `127.0.0.1` host port (empty `host_port` → Docker picks a free
+    // one). This lets a host-run backend on Docker Desktop — where the container
+    // bridge IP isn't routable from the host — health-probe the app directly on
+    // loopback. NOTE: this is deliberately NOT gated on `desired.routable`: a
+    // not-yet-active deployment is unroutable (no Traefik router) but must still
+    // be probed to become Healthy, so it needs the published port too — gating on
+    // routable would deadlock (port→health→active→routable→port). Worker
+    // containers (no port) and the disabled case get neither an exposed port nor a
+    // binding.
+    let publish_port = desired.port.filter(|_| cfg.publish_app_ports);
+    let (exposed_ports, port_bindings) = match publish_port {
+        Some(port) => {
+            let key = format!("{port}/tcp");
+            let mut exposed: HashMap<String, HashMap<(), ()>> = HashMap::new();
+            exposed.insert(key.clone(), HashMap::new());
+            let mut bindings: bollard::models::PortMap = HashMap::new();
+            bindings.insert(
+                key,
+                Some(vec![bollard::models::PortBinding {
+                    host_ip: Some("127.0.0.1".to_string()),
+                    // Empty → Docker assigns a random free host port.
+                    host_port: Some(String::new()),
+                }]),
+            );
+            (Some(exposed), Some(bindings))
+        }
+        None => (None, None),
+    };
+
     let host_config = HostConfig {
         nano_cpus,
         memory,
@@ -239,6 +277,7 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
         }),
         network_mode: Some(cfg.traefik_network.to_string()),
         extra_hosts,
+        port_bindings,
         ..Default::default()
     };
 
@@ -246,6 +285,7 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
         image: Some(desired.image.clone()),
         env: if env.is_empty() { None } else { Some(env) },
         labels: Some(all_labels),
+        exposed_ports,
         host_config: Some(host_config),
         networking_config: Some(bollard::container::NetworkingConfig {
             endpoints_config: endpoints,
@@ -402,6 +442,7 @@ mod tests {
             access_classes: empty_access_classes(),
             app_backend_host_aliases: &[],
             app_backend_ip: None,
+            publish_app_ports: false,
         }
     }
 
@@ -600,6 +641,101 @@ mod tests {
             .unwrap()
             .extra_hosts
             .is_none());
+    }
+
+    #[test]
+    fn publish_app_ports_binds_routable_port_to_loopback() {
+        // DEV-ONLY: with publish_app_ports on, a routable container gets an
+        // exposed port + a 127.0.0.1 binding with an empty (random) host port.
+        let cfg = BuilderConfig {
+            publish_app_ports: true,
+            ..test_cfg()
+        };
+        let built = build_container(&single_container(), &cfg);
+
+        let exposed = built
+            .config
+            .exposed_ports
+            .as_ref()
+            .expect("exposed_ports must be set when publishing");
+        assert!(exposed.contains_key("8080/tcp"));
+
+        let bindings = built
+            .config
+            .host_config
+            .as_ref()
+            .unwrap()
+            .port_bindings
+            .as_ref()
+            .expect("port_bindings must be set when publishing");
+        let binding = bindings
+            .get("8080/tcp")
+            .and_then(|b| b.as_ref())
+            .and_then(|v| v.first())
+            .expect("a binding for 8080/tcp");
+        assert_eq!(binding.host_ip.as_deref(), Some("127.0.0.1"));
+        // Empty host_port → Docker assigns a random free port.
+        assert_eq!(binding.host_port.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn publish_app_ports_off_adds_no_bindings() {
+        // Default (production): no exposed ports, no port bindings.
+        let built = build_container(&single_container(), &test_cfg());
+        assert!(built.config.exposed_ports.is_none());
+        assert!(built
+            .config
+            .host_config
+            .as_ref()
+            .unwrap()
+            .port_bindings
+            .is_none());
+    }
+
+    #[test]
+    fn publish_app_ports_skips_worker_without_port() {
+        // A worker (no port) never gets a binding, even with publishing on.
+        let cfg = BuilderConfig {
+            publish_app_ports: true,
+            ..test_cfg()
+        };
+        let mut desired = single_container();
+        desired.container = "worker".to_string();
+        desired.port = None;
+        desired.routes = vec![];
+        let built = build_container(&desired, &cfg);
+        assert!(built.config.exposed_ports.is_none());
+        assert!(built
+            .config
+            .host_config
+            .as_ref()
+            .unwrap()
+            .port_bindings
+            .is_none());
+    }
+
+    #[test]
+    fn publish_app_ports_publishes_non_routable_container_for_probing() {
+        // A not-yet-active (non-routable) container STILL gets a published port:
+        // it has no Traefik router yet, but the reconciler must health-probe it to
+        // promote it to Healthy/active. Gating publish on `routable` would deadlock
+        // (port→health→active→routable→port). Worker containers (no port) are still
+        // skipped — see publish_app_ports_skips_worker_without_port.
+        let cfg = BuilderConfig {
+            publish_app_ports: true,
+            ..test_cfg()
+        };
+        let mut desired = single_container();
+        desired.routable = false;
+        let built = build_container(&desired, &cfg);
+        assert!(built.config.exposed_ports.is_some());
+        assert!(built
+            .config
+            .host_config
+            .as_ref()
+            .unwrap()
+            .port_bindings
+            .is_some());
     }
 
     #[test]
