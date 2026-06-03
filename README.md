@@ -83,9 +83,10 @@ mise backend:run   # alias: mise br
 ```
 
 `mise setup` invokes `./scripts/dev-setup.sh`; you can run individual steps
-directly (`./scripts/dev-setup.sh hosts`, `docker`, `minikube`, `k3s`, or
-`preflight`). Apps are served at `*.rise.local` (the `/etc/hosts` + host-IP
-wiring that `mise setup` provisions).
+with `mise setup <hosts|docker|minikube|k3s|preflight>` (mise passes the
+subcommand through, or run `./scripts/dev-setup.sh <...>` directly). Apps are
+served at `*.rise.local` (the `/etc/hosts` + host-IP wiring that `mise setup`
+provisions).
 
 #### Option B — Docker backend
 
@@ -98,7 +99,7 @@ mise setup hosts
 
 # Runs the compose support services + Rise on the host with the Docker
 # backend (reuses config/docker.yaml; no Rise image build).
-mise backend:run-docker   # alias: mise br-docker
+mise backend:run docker   # alias: mise br docker
 
 # Optionally, in another terminal:
 mise frontend:dev

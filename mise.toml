@@ -24,24 +24,34 @@ description = "Tear down what 'mise setup' brought up (cluster, .env block, daem
 run = "./scripts/dev-setup.sh down"
 
 [tasks.dev]
+description = "Bring up the full dev environment (services + frontend + backend). Backend: 'k8s' (default) or 'docker'."
+usage = 'arg "backend" default="k8s"'
 run = """
+backend="${usage_backend:-k8s}"
 issues=""
-for h in rise-registry rise-jfrog rise.local rise-dex; do
-  if ! awk -v h="$h" '{for(i=1;i<=NF;i++) if($i==h){found=1;exit}} END{exit !found}' /etc/hosts 2>/dev/null; then
-    issues="${issues}\n  - /etc/hosts missing '$h'  →  mise setup hosts"
-  fi
-done
+# rise-dex (the OIDC issuer host) is needed by both backends.
+if ! awk '{for(i=1;i<=NF;i++) if($i=="rise-dex"){f=1;exit}} END{exit !f}' /etc/hosts 2>/dev/null; then
+  issues="${issues}\n  - /etc/hosts missing 'rise-dex'  →  mise setup hosts"
+fi
 if ! docker info > /dev/null 2>&1; then
   issues="${issues}\n  - Docker is not running"
 fi
-if ! kubectl cluster-info > /dev/null 2>&1; then
-  issues="${issues}\n  - No Kubernetes cluster reachable (only needed for the Kubernetes backend 'mise br'; not for the Docker backend 'mise br-docker')  →  mise setup minikube"
-fi
-if [ ! -f .env ] || ! grep -q '^# BEGIN RISE K8S DEV$' .env 2>/dev/null; then
-  issues="${issues}\n  - .env missing rise-managed block (RISE_K8S_HOST_IP, RISE_AUTH_BACKEND_URL, ...)  →  mise setup"
+if [ "$backend" = "k8s" ]; then
+  # Kubernetes-only prerequisites (the Docker backend needs none of these).
+  for h in rise-registry rise-jfrog rise.local; do
+    if ! awk -v h="$h" '{for(i=1;i<=NF;i++) if($i==h){found=1;exit}} END{exit !found}' /etc/hosts 2>/dev/null; then
+      issues="${issues}\n  - /etc/hosts missing '$h'  →  mise setup hosts"
+    fi
+  done
+  if ! kubectl cluster-info > /dev/null 2>&1; then
+    issues="${issues}\n  - No Kubernetes cluster reachable  →  mise setup minikube"
+  fi
+  if [ ! -f .env ] || ! grep -q '^# BEGIN RISE K8S DEV$' .env 2>/dev/null; then
+    issues="${issues}\n  - .env missing rise-managed block (RISE_K8S_HOST_IP, RISE_AUTH_BACKEND_URL, ...)  →  mise setup"
+  fi
 fi
 if [ -n "$issues" ]; then
-  printf "Preflight issues:\n%b\n\n" "$issues"
+  printf "Preflight issues (backend: %s):\n%b\n\n" "$backend" "$issues"
   printf "Continue anyway? [y/N] "
   read -r answer
   case "$answer" in
@@ -50,13 +60,13 @@ if [ -n "$issues" ]; then
   esac
 fi
 
-docker compose up -d
-mise run db:migrate
+# The frontend dev server; the backend (mise run backend:run <backend>) brings up
+# the support services itself for the chosen backend.
 set -m
 mise run frontend:dev &
 FE_PID=$!
 trap 'kill -TERM -$FE_PID 2>/dev/null; wait $FE_PID 2>/dev/null' EXIT INT TERM
-mise run backend:run
+mise run backend:run "$backend"
 """
 
 [tasks."sqlx:prepare"]
@@ -200,78 +210,75 @@ description = "Start all backend dependencies with docker compose."
 run = "docker compose up -d"
 
 [tasks."backend:run"]
-description = "Run the backend server."
-depends = ["backend:deps", "db:migrate"]
-run = """
-if [ -f .env ]; then
-  . ./.env
-else
-  printf "Error: .env not found.\n  This is the Kubernetes dev path and needs 'mise setup' (provisions the cluster + .env block:\n  RISE_K8S_HOST_IP / RISE_AUTH_BACKEND_URL). For the lighter Docker backend instead, run 'mise br-docker'.\n" >&2
-  exit 1
-fi
-if [ -z "${RISE_AUTH_BACKEND_URL:-}" ] || [ -z "${RISE_K8S_HOST_IP:-}" ]; then
-  printf "Error: .env is missing the rise-managed block (RISE_K8S_HOST_IP, RISE_AUTH_BACKEND_URL).\n  This is the Kubernetes dev path and needs 'mise setup' (provisions the cluster + .env).\n  For the lighter Docker backend instead, run 'mise br-docker'.\n" >&2
-  exit 1
-fi
-cargo run --features cli,backend -- backend server
-"""
-alias = "br"
-env.https_proxy = ""
-env.HTTPS_PROXY = ""
-
-[tasks."backend:run-docker"]
-description = "Run Rise on the host with the Docker deployment backend against the compose support services (no image build)."
+description = "Run the backend server on the host. Backend: 'k8s' (default) or 'docker' (no image build)."
+usage = 'arg "backend" default="k8s"'
 run = """
 {% raw %}
-set -e
-
-# Preflight: host-side Rise must resolve the Dex issuer host (rise-dex →
-# 127.0.0.1) to reach OIDC at http://rise-dex:5556/dex. That is the ONLY setup a
-# Docker dev needs — the registry uses localhost:5000 (insecure-by-default in
-# Docker, no daemon.json change) and app/control-plane hosts use *.rise.localhost
-# (loopback per RFC 6761), so no other /etc/hosts entries are required. The full
-# `mise setup` (minikube/K8s) is NOT needed. Warn (don't fail) if rise-dex is
-# missing.
-if ! awk '{for(i=1;i<=NF;i++) if($i=="rise-dex"){f=1;exit}} END{exit !f}' /etc/hosts 2>/dev/null; then
-  printf "Hint: /etc/hosts is missing 'rise-dex' (→ 127.0.0.1). Run 'mise setup hosts' (no cluster needed).\n" >&2
-fi
-
-# Bring up ONLY the support services (NOT the Rise container — there is none in
-# docker-compose.yml). vault/jfrog are profile-gated and excluded automatically.
-docker compose up -d postgres dex registry traefik
-
-# Wait briefly for Postgres to accept connections (migrations auto-run at startup).
-for _ in $(seq 1 30); do
-  if docker compose exec -T postgres pg_isready -U rise >/dev/null 2>&1; then
-    break
+backend="${usage_backend:-k8s}"
+case "$backend" in
+docker)
+  set -e
+  # Docker dev path: run Rise on the host with the Docker deployment backend
+  # against the compose support services (no Rise image build). The only setup
+  # it needs is rise-dex in /etc/hosts (the OIDC issuer host -> 127.0.0.1); the
+  # registry uses localhost:5000 (insecure-by-default) and apps use
+  # *.rise.localhost (loopback per RFC 6761). The full `mise setup` (minikube) is
+  # NOT needed. Warn (don't fail) if rise-dex is missing.
+  if ! awk '{for(i=1;i<=NF;i++) if($i=="rise-dex"){f=1;exit}} END{exit !f}' /etc/hosts 2>/dev/null; then
+    printf "Hint: /etc/hosts is missing 'rise-dex' (-> 127.0.0.1). Run 'mise setup hosts' (no cluster needed).\n" >&2
   fi
-  sleep 1
-done
-
-# The rise_default bridge gateway IP is the host's address on that network, so
-# containers (Traefik forwardAuth, app containers) reach host-Rise through it.
-GW="$(docker network inspect rise_default -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)"
-if [ -z "$GW" ]; then
-  printf "Error: could not determine the rise_default bridge gateway IP. Is the network up?\n" >&2
+  # Bring up only the support services (no Rise container in docker-compose.yml).
+  docker compose up -d postgres dex registry traefik
+  for _ in $(seq 1 30); do
+    docker compose exec -T postgres pg_isready -U rise >/dev/null 2>&1 && break
+    sleep 1
+  done
+  # The rise_default bridge gateway is the host's address on that network, so
+  # containers (Traefik forwardAuth, app containers) reach host-Rise through it.
+  GW="$(docker network inspect rise_default -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)"
+  if [ -z "$GW" ]; then
+    printf "Error: could not determine the rise_default bridge gateway IP. Is the network up?\n" >&2
+    exit 1
+  fi
+  echo "Rise runs on the HOST; containers reach it at http://$GW:3000 (rise_default gateway)."
+  RISE_CONFIG_RUN_MODE=docker \\
+  DATABASE_URL=postgres://rise:rise123@localhost:5432/rise \\
+  PUBLIC_URL=http://rise.localhost:3000 \\
+  DEX_ISSUER=http://rise-dex:5556/dex \\
+  RISE_REGISTRY_URL=localhost:5000 \\
+  RISE_CLIENT_REGISTRY_URL=localhost:5000 \\
+  RISE_AUTH_BACKEND_URL=http://$GW:3000 \\
+  RISE_APP_BACKEND_HOST_ALIAS=rise.localhost \\
+  RISE_STATIC_DIR=$PWD/static \\
+  RISE_SSRF_ALLOW_PRIVATE=true \\
+  RISE_SSRF_ALLOW_HTTP=true \\
+  cargo run --features cli,backend -- backend server
+  ;;
+k8s)
+  # Kubernetes dev path: run Rise on the host against the K8s dev config; needs
+  # `mise setup` (cluster + the .env block).
+  if [ -f .env ]; then
+    . ./.env
+  else
+    printf "Error: .env not found.\n  The Kubernetes dev path needs 'mise setup' (provisions the cluster + the .env\n  block: RISE_K8S_HOST_IP / RISE_AUTH_BACKEND_URL). For the lighter Docker\n  backend instead, run 'mise br docker'.\n" >&2
+    exit 1
+  fi
+  if [ -z "${RISE_AUTH_BACKEND_URL:-}" ] || [ -z "${RISE_K8S_HOST_IP:-}" ]; then
+    printf "Error: .env is missing the rise-managed block (RISE_K8S_HOST_IP,\n  RISE_AUTH_BACKEND_URL). Run 'mise setup'. For the Docker backend instead, run\n  'mise br docker'.\n" >&2
+    exit 1
+  fi
+  docker compose up -d
+  mise run db:migrate
+  cargo run --features cli,backend -- backend server
+  ;;
+*)
+  printf "Unknown backend '%s'. Use 'k8s' (default) or 'docker'.\n" "$backend" >&2
   exit 1
-fi
-echo "Rise runs on the HOST; containers reach it at http://$GW:3000 (rise_default gateway)."
-
-RISE_CONFIG_RUN_MODE=docker \
-DATABASE_URL=postgres://rise:rise123@localhost:5432/rise \
-PUBLIC_URL=http://rise.localhost:3000 \
-DEX_ISSUER=http://rise-dex:5556/dex \
-RISE_REGISTRY_URL=localhost:5000 \
-RISE_CLIENT_REGISTRY_URL=localhost:5000 \
-RISE_AUTH_BACKEND_URL=http://$GW:3000 \
-RISE_APP_BACKEND_HOST_ALIAS=rise.localhost \
-RISE_STATIC_DIR=$PWD/static \
-RISE_SSRF_ALLOW_PRIVATE=true \
-RISE_SSRF_ALLOW_HTTP=true \
-cargo run --features cli,backend -- backend server
+  ;;
+esac
 {% endraw %}
 """
-alias = "br-docker"
+alias = "br"
 env.https_proxy = ""
 env.HTTPS_PROXY = ""
 

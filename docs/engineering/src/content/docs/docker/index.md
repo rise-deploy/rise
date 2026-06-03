@@ -93,14 +93,15 @@ for app hosts.
 ### Local development (run Rise on the host, no image)
 
 For the inner-loop while hacking on the backend you don't need to build the Rise
-image at all. `mise br-docker` brings up only the support services from the dev
+image at all. `mise br docker` brings up only the support services from the dev
 `docker-compose.yml` (Postgres, Dex, registry, Traefik — **not** a Rise
 container) and runs Rise on the host via `cargo run --features cli,backend --
 backend server`, reusing the env-driven `config/docker.yaml` (run_mode `docker`)
 with host-facing overrides (`DATABASE_URL`/`DEX_ISSUER`/`RISE_REGISTRY_URL`
-pointed at `localhost` / the `/etc/hosts` aliases). It is the Docker-backend
-analog of `mise br` (which runs the host backend against the Kubernetes dev
-config). Migrations auto-run on startup, so no `db:migrate` step is needed.
+pointed at `localhost` / the `/etc/hosts` aliases). It is the Docker backend of
+the unified `mise br [k8s|docker]` task (`k8s`, the default, runs the host backend
+against the Kubernetes dev config). Migrations auto-run on startup, so no
+`db:migrate` step is needed.
 
 > For the broader getting-started / two-backend onboarding (Kubernetes and
 > Docker side by side), see the [Local Development](/operator-docs/development/)
