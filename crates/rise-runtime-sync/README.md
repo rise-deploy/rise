@@ -51,6 +51,14 @@ with_leader_election(pool, "rise-my-controller", Uuid::new_v4(), ttl, shutdown.c
     .await?;
 ```
 
+Once acquired, the lease is kept alive by a background heartbeat task that renews
+`expires_at` every ~`ttl`/3. If a renewal lapses — the holder crashes, stalls
+past the TTL, or a peer takes over — the holder steps down (`is_leader()` flips
+back to `false`) and stops working; a peer reclaims the lease once `expires_at`
+passes, or immediately if the holder released it on shutdown. `is_leader()` is a
+local atomic (no DB round-trip); call `assert_leader()` / `ensure_leader_for()`
+to re-verify against the DB right before an irreversible write.
+
 ### `GlobalSchedule` via `leader_controller!` — leader + cross-replica cadence
 
 `GlobalSchedule` fences interval work so a leadership handover can't double-run
