@@ -78,7 +78,7 @@ the credential). It follows RFC 8693:
 The exchange verifies the inner OIDC token exactly as the accept paths below do
 (issuer guard → JWKS signature + `exp` → per-identity claim matching), then mints
 the access token. With `rise_project` it resolves a **project service account**;
-without it, a **controller** identity. Lifetime is clamped to
+without it, a **controller** identity. Lifetime is
 `server.auth_token_max_ttl_seconds` (default 600s) — deliberately short, because
 an exchanged token cannot be revoked mid-life (deleting the SA or tightening its
 environment restrictions only takes effect once it expires).

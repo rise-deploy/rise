@@ -300,9 +300,8 @@ pub struct ServerSettings {
     #[serde(default = "default_workload_token_max_ttl_seconds")]
     pub workload_token_max_ttl_seconds: u64,
 
-    /// Maximum TTL in seconds for Rise access tokens minted by the auth
-    /// token-exchange endpoint (`POST /api/v1/auth/token`). Requests that specify
-    /// a higher TTL are silently capped to this value. Kept short because an
+    /// Lifetime in seconds of Rise access tokens minted by the auth
+    /// token-exchange endpoint (`POST /api/v1/auth/token`). Kept short because an
     /// exchanged token cannot be revoked mid-life. Default: 600 (10 minutes).
     #[serde(default = "default_auth_token_max_ttl_seconds")]
     pub auth_token_max_ttl_seconds: u64,
