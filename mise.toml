@@ -222,6 +222,7 @@ env.HTTPS_PROXY = ""
 [tasks."backend:run-docker"]
 description = "Run Rise on the host with the Docker deployment backend against the compose support services (no image build)."
 run = """
+{% raw %}
 set -e
 
 # Preflight: warn (don't fail) if the dev /etc/hosts aliases are missing — the
@@ -265,6 +266,7 @@ RISE_STATIC_DIR=$PWD/static \
 RISE_SSRF_ALLOW_PRIVATE=true \
 RISE_SSRF_ALLOW_HTTP=true \
 cargo run --features cli,backend -- backend server
+{% endraw %}
 """
 alias = "br-docker"
 env.https_proxy = ""
