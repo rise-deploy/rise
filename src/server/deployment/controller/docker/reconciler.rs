@@ -582,6 +582,39 @@ impl DockerReconciler {
         // onto the not-yet-healthy container.
         let routable = deployment.is_active;
 
+        // Cross-container service discovery: expose each routable sibling's
+        // address as `RISE_CONTAINER_HOST__<NAME>=<host>:<port>`, mirroring the
+        // K8s convention (`ResourceBuilder::auto_container_host_env_vars`) so a
+        // multi-container app's code is portable across backends. The host is
+        // the sibling's deterministic Docker container name — Docker's embedded
+        // DNS resolves it on the shared user-defined network, so no network
+        // alias or `extra_hosts` entry is needed. Only meaningful with ≥2
+        // containers, so a single-container app doesn't get a pointless
+        // self-entry. Each container also sees its own entry (harmless), matching
+        // K8s; order follows `container_specs` for deterministic env hashes.
+        let injected_hosts: Vec<(String, String)> = if container_specs.len() >= 2 {
+            container_specs
+                .iter()
+                .filter_map(|spec| {
+                    let port = spec.port?;
+                    let key = format!(
+                        "RISE_CONTAINER_HOST__{}",
+                        spec.name.to_uppercase().replace('-', "_")
+                    );
+                    let host = container_builder::container_name(
+                        &self.config.container_prefix,
+                        &project.name,
+                        &deployment.deployment_group,
+                        &deployment.deployment_id,
+                        &spec.name,
+                    );
+                    Some((key, format!("{host}:{port}")))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // Build a desired container per spec. Clamp replicas to 1 for now.
         // TODO(replicas): run N containers sharing one Traefik service to
         // load-balance. Until then a single container serves each spec.
@@ -598,7 +631,13 @@ impl DockerReconciler {
                     "Docker backend does not support replicas>1; running a single container"
                 );
             }
-            let mut env = merge_container_env(&base_env, &system_env, spec, env_name.as_deref());
+            let mut env = merge_container_env(
+                &base_env,
+                &system_env,
+                &injected_hosts,
+                spec,
+                env_name.as_deref(),
+            );
             // Pin PORT to this container's declared port.
             if let Some(port) = spec.port {
                 upsert_env(&mut env, "PORT", &port.to_string());
@@ -1539,12 +1578,22 @@ fn action_key(a: &ReconcileAction) -> (u8, String) {
 fn merge_container_env(
     base_env: &[(String, String)],
     system_env: &[(String, String)],
+    injected_hosts: &[(String, String)],
     spec: &crate::server::deployment::models::ContainerSpec,
     env_name: Option<&str>,
 ) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = base_env.to_vec();
     for (k, v) in system_env {
         upsert_env(&mut env, k, v);
+    }
+    // Cross-container service-discovery hosts (`RISE_CONTAINER_HOST__<NAME>`).
+    // Only added when not already present, so user globals win; per-container
+    // `env_overrides` below run last and can shadow them too — matching the K8s
+    // precedence in `webhook.rs`.
+    for (k, v) in injected_hosts {
+        if !env.iter().any(|(ek, _)| ek == k) {
+            env.push((k.clone(), v.clone()));
+        }
     }
     for over in &spec.env_overrides {
         // Per-container secret overrides are rejected at request time.
@@ -1972,12 +2021,64 @@ mod tests {
             }],
             health_check: None,
         };
-        let merged = merge_container_env(&base, &system, &spec, None);
+        let merged = merge_container_env(&base, &system, &[], &spec, None);
         let foo = merged.iter().find(|(k, _)| k == "FOO").unwrap();
         assert_eq!(foo.1, "override");
         assert!(merged
             .iter()
             .any(|(k, v)| k == "RISE_APP_URL" && v == "url"));
+    }
+
+    #[test]
+    fn merge_env_injects_container_hosts_unless_user_set() {
+        use crate::server::deployment::models::{ContainerSpec, EnvOverride};
+        // A user global and a per-container override both targeting the same
+        // discovery key must win over the auto-injected sibling host.
+        let base = vec![(
+            "RISE_CONTAINER_HOST__API".to_string(),
+            "user-global:1".to_string(),
+        )];
+        let injected = vec![
+            (
+                "RISE_CONTAINER_HOST__API".to_string(),
+                "rise_myapp_default_ts_api:8080".to_string(),
+            ),
+            (
+                "RISE_CONTAINER_HOST__REDIS".to_string(),
+                "rise_myapp_default_ts_redis:6379".to_string(),
+            ),
+        ];
+        let spec = ContainerSpec {
+            name: "web".to_string(),
+            image: None,
+            port: Some(8080),
+            replicas: None,
+            cpu: None,
+            memory: None,
+            env_overrides: vec![EnvOverride {
+                key: "RISE_CONTAINER_HOST__REDIS".to_string(),
+                value: "override-redis:6379".to_string(),
+                is_secret: false,
+                is_protected: None,
+                source: None,
+                for_environment: None,
+            }],
+            health_check: None,
+        };
+        let merged = merge_container_env(&base, &[], &injected, &spec, None);
+        // User global wins; injected value is not appended a second time.
+        let api: Vec<_> = merged
+            .iter()
+            .filter(|(k, _)| k == "RISE_CONTAINER_HOST__API")
+            .collect();
+        assert_eq!(api.len(), 1);
+        assert_eq!(api[0].1, "user-global:1");
+        // Per-container override shadows the injected sibling host.
+        let redis = merged
+            .iter()
+            .find(|(k, _)| k == "RISE_CONTAINER_HOST__REDIS")
+            .unwrap();
+        assert_eq!(redis.1, "override-redis:6379");
     }
 
     #[test]
@@ -2000,9 +2101,9 @@ mod tests {
             }],
             health_check: None,
         };
-        let merged = merge_container_env(&[], &[], &spec, Some("staging"));
+        let merged = merge_container_env(&[], &[], &[], &spec, Some("staging"));
         assert!(!merged.iter().any(|(k, _)| k == "ONLY_PROD"));
-        let merged_prod = merge_container_env(&[], &[], &spec, Some("production"));
+        let merged_prod = merge_container_env(&[], &[], &[], &spec, Some("production"));
         assert!(merged_prod.iter().any(|(k, _)| k == "ONLY_PROD"));
     }
 
