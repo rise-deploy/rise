@@ -52,11 +52,12 @@ Legend: ✅ supported · ⚠️ partial / with caveats · ❌ not supported (see
 | Cross-container service discovery | `RISE_CONTAINER_HOST__*` | ✅ | ✅ | Service DNS (K8s) vs. container-name DNS on `rise_default` (Docker). |
 | Auto-injected env vars (`RISE_APP_URL`, `RISE_CONTAINER`, `PORT`, …) | implicit | ✅ | ✅ | Same variable contract on both. |
 | CPU / memory limits | `cpu`, `memory` | ✅ | ✅ | Pod resources (K8s) vs. `nano_cpus`/`memory` (Docker). |
-| HTTP health checks | `health_check` | ✅ | ✅ | Readiness/liveness probes (K8s) vs. controller HTTP probe (Docker). |
+| HTTP health checks | `health_check` | ✅ | ✅ | Readiness/liveness probes (K8s) vs. controller HTTP probe (Docker). The Docker probe honors `path` and `disabled`; the fine-grained timing/threshold knobs (`period_seconds`, `failure_threshold`, …) and separate `liveness_enabled`/`readiness_enabled` toggles are K8s-only (Docker probes once per reconcile tick). |
 | Deployment observability (Pods tab) | `controller_metadata.pod_status` | ✅ | ✅ | Same `pod_status` JSON shape rendered by the frontend. |
 | Rollback | `rise deploy rollback` | ✅ | ✅ | Re-resolves the prior deployment's image on both. |
 | Private image pull | registry config | ✅ | ✅ | imagePullSecret (K8s) vs. host-daemon `docker login` (Docker). |
 | Workload identity tokens | token-exchange API | ✅ | ✅ | Backend-agnostic (issued by the control plane). |
+| Secret env-var isolation | `rise env set --secret` | ✅ | ⚠️ | K8s stores secret env in a per-project Secret; Docker flattens them into plain container env (visible to `docker inspect`). Use the Kubernetes backend where at-rest env isolation matters. |
 | Replicas > 1 (horizontal scale) | `replicas` | ✅ | ❌ | **Docker limitation:** one container per spec today; `replicas>1` runs a single container (warned). |
 | Zero-downtime active switch | implicit (blue/green) | ✅ | ⚠️ | Service selector flip (K8s) is atomic; Docker recreates the container, so there is a brief routing gap. |
 | Per-group network isolation | implicit | ✅ | ❌ | **Docker limitation:** NetworkPolicy (K8s) has no single-host equivalent; all app containers share `rise_default`. |

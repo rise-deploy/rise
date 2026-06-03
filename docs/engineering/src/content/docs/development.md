@@ -290,7 +290,7 @@ How it works:
 
 **BuildKit can't push to registry** — verify `RISE_MANAGED_BUILDKIT_NETWORK_NAME=rise_default` is set in your environment (should be in `.envrc`).
 
-**OAuth redirects fail** — ensure `rise.local` is in `/etc/hosts` (`mise check:hosts` will tell you).
+**OAuth redirects fail** — ensure `rise.local` is in `/etc/hosts` (re-run `mise setup hosts` to add it).
 
 **Minikube pods `ImagePullBackOff`** — verify registry access from inside Minikube:
 ```bash

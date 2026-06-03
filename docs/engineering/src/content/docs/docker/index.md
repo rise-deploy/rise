@@ -42,9 +42,12 @@ families of labels on each (see
 All containers — Rise's own services and the app containers the reconciler
 creates — join the `rise_default` Docker network. Traefik is pinned to that same
 network (`--providers.docker.network=rise_default`, mirrored by
-`deployment_controller.traefik_network`) so it can reach app containers by their
-network alias. The Compose project name is fixed to `rise` so the network is
-always named `rise_default` regardless of the launch directory.
+`deployment_controller.traefik_network`) so it can reach app containers at their
+address on that network. Traefik discovers each app container through the Docker
+provider and the per-router `traefik.docker.network` label (the app containers
+carry no extra network alias of their own). The Compose project name is fixed to
+`rise` so the network is always named `rise_default` regardless of the launch
+directory.
 
 ## Two run modes
 
@@ -289,6 +292,13 @@ traefik.http.middlewares.<router>-auth.forwardauth.authResponseHeaders
     = X-Auth-Request-Email,X-Auth-Request-User
 traefik.http.routers.<router>.middlewares = <router>-auth@docker
 ```
+
+> The `http://rise:3000` host shown here is the value for the **standalone
+> Compose stack**, where the backend is a service named `rise`. It is whatever
+> `deployment_controller.auth_backend_url` resolves to — on the host-dev path
+> (`mise br docker`) that is the bridge gateway URL `http://$GW:3000` (see
+> [Local development](#local-development-run-rise-on-the-host-no-image)), not
+> `rise:3000`.
 
 Traefik issues a subrequest to `/api/v1/auth/ingress` (the
 `deployment_controller.auth_backend_url`, internally `http://rise:3000`) before

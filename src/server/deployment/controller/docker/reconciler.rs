@@ -951,7 +951,15 @@ impl DockerReconciler {
             );
             let inspected = self.inspect_for_reconcile(&name, spec.port).await;
             let ready = match spec.port {
-                Some(port) => self.probe_container(inspected.as_ref(), port).await,
+                // HTTP container: honor the per-container `health_check` spec.
+                // `disabled` (→ `effective_health_path` returns None) removes the
+                // probe, so a *running* container is ready — mirroring K8s, where
+                // `health_check = false` removes the probes. Otherwise probe the
+                // container's `health_check.path` (or the controller default).
+                Some(port) => match effective_health_path(spec, &self.config.health_path) {
+                    Some(path) => self.probe_container(inspected.as_ref(), port, &path).await,
+                    None => inspected.as_ref().map(|i| i.running).unwrap_or(false),
+                },
                 // Worker: no HTTP endpoint, so the daemon's run state is the
                 // only liveness signal we have.
                 None => inspected.as_ref().map(|i| i.running).unwrap_or(false),
@@ -1036,14 +1044,19 @@ impl DockerReconciler {
     /// Reuses the reconciler's shared `reqwest::Client` and its `status < 500`
     /// semantics (5s timeout). A missing inspection / address (container not yet
     /// attached or started) is treated as not-ready rather than an error.
-    async fn probe_container(&self, inspected: Option<&InspectedContainer>, port: u16) -> bool {
+    async fn probe_container(
+        &self,
+        inspected: Option<&InspectedContainer>,
+        port: u16,
+        health_path: &str,
+    ) -> bool {
         let Some(inspected) = inspected else {
             return false;
         };
         let url = if self.config.publish_app_ports {
             match inspected.published_host_port.as_deref() {
                 Some(host_port) if !host_port.is_empty() => {
-                    format!("http://127.0.0.1:{}{}", host_port, self.config.health_path)
+                    format!("http://127.0.0.1:{}{}", host_port, health_path)
                 }
                 _ => {
                     debug!("Container has no published loopback port yet; treating as not-ready");
@@ -1053,7 +1066,7 @@ impl DockerReconciler {
         } else {
             match inspected.ip.as_deref() {
                 Some(ip) if !ip.is_empty() => {
-                    format!("http://{}:{}{}", ip, port, self.config.health_path)
+                    format!("http://{}:{}{}", ip, port, health_path)
                 }
                 _ => {
                     debug!(
@@ -1575,6 +1588,35 @@ fn action_key(a: &ReconcileAction) -> (u8, String) {
 /// Merge env for one container in final precedence:
 /// base (plain + secret) → system env → per-container overrides. Later writes
 /// win on key conflict.
+/// Effective HTTP health-probe path for a container, honoring its public
+/// `health_check` spec (`rise.toml [containers.X.health_check]`):
+///
+/// - `disabled = true` → `None`: the probe is turned off (the caller treats a
+///   *running* container as ready), matching the Kubernetes behavior where
+///   `health_check = false` removes the readiness/liveness probes.
+/// - `path` set → that path, normalized to a leading `/`.
+/// - otherwise → the controller's default `health_path`.
+///
+/// Note: the reconcile loop probes once per tick, so the spec's fine-grained
+/// timing/threshold knobs (`period_seconds`, `failure_threshold`, …) and the
+/// separate `liveness_enabled`/`readiness_enabled` toggles are not applied on
+/// Docker — only `path` and `disabled` are. See the deployment-backends feature
+/// matrix.
+fn effective_health_path(
+    spec: &crate::server::deployment::models::ContainerSpec,
+    default_path: &str,
+) -> Option<String> {
+    let hc = spec.health_check.as_ref();
+    if hc.map(|h| h.disabled).unwrap_or(false) {
+        return None;
+    }
+    match hc.and_then(|h| h.path.as_deref()).filter(|p| !p.is_empty()) {
+        Some(p) if p.starts_with('/') => Some(p.to_string()),
+        Some(p) => Some(format!("/{p}")),
+        None => Some(default_path.to_string()),
+    }
+}
+
 fn merge_container_env(
     base_env: &[(String, String)],
     system_env: &[(String, String)],
@@ -2027,6 +2069,72 @@ mod tests {
         assert!(merged
             .iter()
             .any(|(k, v)| k == "RISE_APP_URL" && v == "url"));
+    }
+
+    #[test]
+    fn effective_health_path_honors_spec() {
+        use crate::server::deployment::models::{ContainerSpec, HealthCheckSpec};
+        let base = ContainerSpec {
+            name: "app".to_string(),
+            image: None,
+            port: Some(8080),
+            replicas: None,
+            cpu: None,
+            memory: None,
+            env_overrides: vec![],
+            health_check: None,
+        };
+        // No spec → controller default.
+        assert_eq!(
+            effective_health_path(&base, "/").as_deref(),
+            Some("/"),
+            "default path"
+        );
+        // disabled → None (probe turned off).
+        let disabled = ContainerSpec {
+            health_check: Some(HealthCheckSpec {
+                disabled: true,
+                ..Default::default()
+            }),
+            ..base.clone()
+        };
+        assert_eq!(effective_health_path(&disabled, "/"), None, "disabled");
+        // explicit path used verbatim.
+        let with_path = ContainerSpec {
+            health_check: Some(HealthCheckSpec {
+                path: Some("/healthz".to_string()),
+                ..Default::default()
+            }),
+            ..base.clone()
+        };
+        assert_eq!(
+            effective_health_path(&with_path, "/").as_deref(),
+            Some("/healthz")
+        );
+        // path missing a leading slash is normalized.
+        let no_slash = ContainerSpec {
+            health_check: Some(HealthCheckSpec {
+                path: Some("healthz".to_string()),
+                ..Default::default()
+            }),
+            ..base.clone()
+        };
+        assert_eq!(
+            effective_health_path(&no_slash, "/").as_deref(),
+            Some("/healthz")
+        );
+        // empty path falls back to the default.
+        let empty = ContainerSpec {
+            health_check: Some(HealthCheckSpec {
+                path: Some(String::new()),
+                ..Default::default()
+            }),
+            ..base.clone()
+        };
+        assert_eq!(
+            effective_health_path(&empty, "/livez").as_deref(),
+            Some("/livez")
+        );
     }
 
     #[test]
