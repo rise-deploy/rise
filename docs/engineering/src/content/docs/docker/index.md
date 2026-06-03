@@ -102,6 +102,15 @@ pointed at `localhost` / the `/etc/hosts` aliases). It is the Docker-backend
 analog of `mise br` (which runs the host backend against the Kubernetes dev
 config). Migrations auto-run on startup, so no `db:migrate` step is needed.
 
+**Prerequisites (one-time):** run `mise setup hosts` once — it adds
+`rise-dex → 127.0.0.1` to `/etc/hosts`, which host-Rise needs to reach the OIDC
+issuer `http://rise-dex:5556/dex`. That is the **only** setup required: the
+registry uses `localhost:5000` (which Docker treats as insecure by default, so
+no `daemon.json` change), and app / control-plane hosts use `*.rise.localhost`
+(loopback per RFC 6761, resolved automatically by browsers). You do **not** need
+the full `mise setup` (that provisions minikube/Kubernetes, which the Docker
+backend doesn't use).
+
 The twist is **container→host reachability**: Traefik's forwardAuth and the app
 containers run in containers but must reach Rise on the host. On Linux the
 `rise_default` bridge **gateway IP** is the host's address on that network, so

@@ -225,13 +225,16 @@ run = """
 {% raw %}
 set -e
 
-# Preflight: warn (don't fail) if the dev /etc/hosts aliases are missing — the
-# host-side Rise resolves the Dex/registry hosts via /etc/hosts (→ 127.0.0.1).
-for h in rise-dex rise-registry; do
-  if ! awk -v h="$h" '{for(i=1;i<=NF;i++) if($i==h){found=1;exit}} END{exit !found}' /etc/hosts 2>/dev/null; then
-    printf "Hint: /etc/hosts is missing '%s' (→ 127.0.0.1). Run 'mise setup hosts'.\n" "$h" >&2
-  fi
-done
+# Preflight: host-side Rise must resolve the Dex issuer host (rise-dex →
+# 127.0.0.1) to reach OIDC at http://rise-dex:5556/dex. That is the ONLY setup a
+# Docker dev needs — the registry uses localhost:5000 (insecure-by-default in
+# Docker, no daemon.json change) and app/control-plane hosts use *.rise.localhost
+# (loopback per RFC 6761), so no other /etc/hosts entries are required. The full
+# `mise setup` (minikube/K8s) is NOT needed. Warn (don't fail) if rise-dex is
+# missing.
+if ! awk '{for(i=1;i<=NF;i++) if($i=="rise-dex"){f=1;exit}} END{exit !f}' /etc/hosts 2>/dev/null; then
+  printf "Hint: /etc/hosts is missing 'rise-dex' (→ 127.0.0.1). Run 'mise setup hosts' (no cluster needed).\n" >&2
+fi
 
 # Bring up ONLY the support services (NOT the Rise container — there is none in
 # docker-compose.yml). vault/jfrog are profile-gated and excluded automatically.
