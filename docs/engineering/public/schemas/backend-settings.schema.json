@@ -175,7 +175,7 @@
       "type": "object"
     },
     "ControllerIdentity": {
-      "description": "A trusted external controller identity configured under `auth.controllers`.\n\nEach entry binds a stable controller ID (the key used under\n`status.controllers`) to an OIDC issuer plus required claim constraints.\n`claims.aud` is mandatory. Wildcards follow `JwtValidator::validate_custom_claims`\nglob rules (`*` matches any sequence of characters).",
+      "description": "A trusted external controller identity configured under `auth.controllers`.\n\nEach entry binds a stable controller ID (the key used under\n`status.controllers`) to an OIDC issuer plus required claim constraints.\n`claims.aud` is mandatory. Wildcards follow [`validate_custom_claims`]\nglob rules (`*` matches any sequence of characters).",
       "properties": {
         "claims": {
           "additionalProperties": {

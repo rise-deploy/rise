@@ -12,26 +12,7 @@ use crate::db::{service_accounts, users, User};
 use crate::server::auth::context::VerifiedExternalToken;
 use crate::server::auth::cookie_helpers;
 use crate::server::state::AppState;
-
-/// Check if a JWT issuer is a Rise-issued JWT
-///
-/// Rise JWTs have `iss` set to the Rise public URL (e.g., "https://rise.example.com").
-/// This helper checks for exact match or scheme prefix match.
-fn is_rise_issued_jwt(issuer: &str, public_url: &str) -> bool {
-    // Exact match
-    if issuer == public_url {
-        return true;
-    }
-
-    // Check if issuer starts with the public_url's base (handles port differences)
-    if let Some(public_base) = public_url.strip_suffix(|c: char| c.is_ascii_digit() || c == ':') {
-        if issuer.starts_with(public_base) {
-            return true;
-        }
-    }
-
-    false
-}
+use rise_backend_auth::is_rise_issued_jwt;
 
 /// Extract Bearer token from Authorization header
 pub(crate) fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
@@ -58,7 +39,7 @@ struct MinimalClaims {
 /// Authentication middleware that validates JWT and injects User or VerifiedExternalToken
 /// into request extensions.
 ///
-/// For Rise-issued JWTs: validates with JwtSigner and injects `User`.
+/// For Rise-issued JWTs: validates with `RiseTokenSigner` and injects `User`.
 /// For external JWTs: validates signature + expiry via JWKS (phase 1) and injects
 /// `VerifiedExternalToken`. Claim validation against project-scoped service accounts
 /// happens in phase 2 (inside handlers via `AuthContext::resolve_for_project`).
@@ -212,9 +193,7 @@ pub async fn auth_middleware(
         }
 
         // Validate signature + expiry via JWKS (no custom claim validation)
-        let claims = state
-            .jwt_validator
-            .validate_token(&token, &issuer)
+        let claims = rise_backend_auth::verify_external_jwt(&token, &issuer, &*state.jwt_validator)
             .await
             .map_err(|e| {
                 tracing::warn!(
@@ -223,7 +202,9 @@ pub async fn auth_middleware(
                     e
                 );
                 (StatusCode::UNAUTHORIZED, format!("Invalid token: {}", e))
-            })?;
+            })?
+            .claims()
+            .clone();
 
         tracing::debug!(
             "Auth middleware: external JWT JWKS-validated for issuer '{}'",
