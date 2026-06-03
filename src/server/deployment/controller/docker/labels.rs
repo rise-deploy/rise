@@ -28,6 +28,12 @@ pub const SUFFIX_IMAGE: &str = "image";
 /// container is not routable). Lets the diff detect routing transitions —
 /// active↔inactive — that Docker can't apply to a running container in place.
 pub const SUFFIX_ROUTE_HASH: &str = "route-hash";
+/// Monotonic generation counter for a container slot's identity tuple
+/// (project, group, deployment-id, container). Starts at 1; bumped on every
+/// recreate so the new container's NAME (`..._g{n}`) is visibly newer than the
+/// one it replaced. NOT part of any matching key or hash — purely cosmetic plus
+/// the source for computing the next generation.
+pub const SUFFIX_GENERATION: &str = "generation";
 
 /// Build a namespaced bookkeeping label key, e.g. `rise.dev/project`.
 pub fn ns_key(label_namespace: &str, suffix: &str) -> String {
@@ -61,6 +67,9 @@ pub struct BookkeepingLabels<'a> {
     /// non-routable container). Stamped as `{ns}/route-hash` so the reconciler
     /// can detect when routability/routing changed and recreate the container.
     pub route_hash: &'a str,
+    /// Monotonic generation of this container; rendered as `{ns}/generation`.
+    /// Drives the `..._g{n}` name suffix. NOT fed into any hash or matching key.
+    pub generation: u32,
 }
 
 impl BookkeepingLabels<'_> {
@@ -93,6 +102,10 @@ impl BookkeepingLabels<'_> {
         labels.insert(ns_key(ns, SUFFIX_ENV_HASH), self.env_hash.to_string());
         labels.insert(ns_key(ns, SUFFIX_IMAGE), self.image.to_string());
         labels.insert(ns_key(ns, SUFFIX_ROUTE_HASH), self.route_hash.to_string());
+        // Cosmetic bookkeeping only — never read by `hash_traefik_labels` /
+        // `hash_recreate_signature`, so the generation never affects the
+        // recreate signature (no per-generation recreate loop).
+        labels.insert(ns_key(ns, SUFFIX_GENERATION), self.generation.to_string());
         labels
     }
 }

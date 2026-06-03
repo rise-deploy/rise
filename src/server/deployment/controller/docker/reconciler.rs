@@ -586,9 +586,14 @@ impl DockerReconciler {
         // address as `RISE_CONTAINER_HOST__<NAME>=<host>:<port>`, mirroring the
         // K8s convention (`ResourceBuilder::auto_container_host_env_vars`) so a
         // multi-container app's code is portable across backends. The host is
-        // the sibling's deterministic Docker container name — Docker's embedded
-        // DNS resolves it on the shared user-defined network, so no network
-        // alias or `extra_hosts` entry is needed. Only meaningful with ≥2
+        // the sibling's generation-FREE `stable_identity_name` — NOT its live
+        // `--name` (which carries a per-recreate `_g{n}` suffix). Each container
+        // attaches that stable name as a Docker NETWORK ALIAS (see
+        // `build_container`), so Docker's embedded DNS resolves it on the shared
+        // user-defined network and the address keeps pointing at the sibling
+        // across recreates. Using the stable name (not the generation-ful one)
+        // also keeps the env hash from drifting every recreate, which would
+        // otherwise trigger an infinite recreate loop. Only meaningful with ≥2
         // containers, so a single-container app doesn't get a pointless
         // self-entry. Each container also sees its own entry (harmless), matching
         // K8s; order follows `container_specs` for deterministic env hashes.
@@ -601,7 +606,7 @@ impl DockerReconciler {
                         "RISE_CONTAINER_HOST__{}",
                         spec.name.to_uppercase().replace('-', "_")
                     );
-                    let host = container_builder::container_name(
+                    let host = container_builder::stable_identity_name(
                         &self.config.container_prefix,
                         &project.name,
                         &deployment.deployment_group,
@@ -681,6 +686,11 @@ impl DockerReconciler {
                 // the same render path `build_container` stamps on the live
                 // container, so the diff's comparison is exact.
                 route_hash: String::new(),
+                // Seed generation. `compute_desired_for_deployment` can't know
+                // the real value (it depends on the live container's current
+                // generation), so the diff resolves it before apply: a brand-new
+                // slot stays `1`, a recreate bumps to the live `g{n}` + 1.
+                generation: 1,
             };
             // Precompute the route-hash from the same render the builder uses so
             // the diff can detect routing transitions (active↔inactive) that
@@ -744,9 +754,24 @@ impl DockerReconciler {
                 Some(ActualContainer {
                     id: s.id.unwrap_or_default(),
                     name,
+                    project: labels
+                        .get(&labels::ns_key(ns, labels::SUFFIX_PROJECT))
+                        .cloned(),
+                    deployment_group: labels
+                        .get(&labels::ns_key(ns, labels::SUFFIX_DEPLOYMENT_GROUP))
+                        .cloned(),
+                    container: labels
+                        .get(&labels::ns_key(ns, labels::SUFFIX_CONTAINER))
+                        .cloned(),
                     deployment_id_label: labels
                         .get(&labels::ns_key(ns, labels::SUFFIX_DEPLOYMENT_ID))
                         .cloned(),
+                    // Parse the generation label; default 0 (legacy/missing) so
+                    // the first recreate of such a container yields generation 1.
+                    generation: labels
+                        .get(&labels::ns_key(ns, labels::SUFFIX_GENERATION))
+                        .and_then(|g| g.parse::<u32>().ok())
+                        .unwrap_or(0),
                     image_label: labels.get(&labels::ns_key(ns, SUFFIX_IMAGE)).cloned(),
                     env_hash_label: labels.get(&labels::ns_key(ns, SUFFIX_ENV_HASH)).cloned(),
                     route_hash_label: labels
@@ -768,25 +793,35 @@ impl DockerReconciler {
         actions: &[ReconcileAction],
     ) -> Result<()> {
         let builder_cfg = self.builder_cfg();
-        let by_name: HashMap<String, &DesiredContainer> = desired
+        // Index desired containers by their stable IDENTITY tuple so an action
+        // (which carries the identity, not the generation-ful name) can find the
+        // desired container regardless of the `_g{n}` name suffix.
+        let by_identity: HashMap<String, &DesiredContainer> = desired
             .iter()
             .map(|d| {
-                let name = container_builder::container_name(
-                    &self.config.container_prefix,
+                let key = identity_key(
                     &d.project,
                     &d.deployment_group,
                     &d.deployment_id,
                     &d.container,
                 );
-                (name, d)
+                (key, d)
             })
             .collect();
 
         for action in actions {
             match action {
-                ReconcileAction::Create { name } => {
-                    if let Some(d) = by_name.get(name.as_str()) {
-                        if let Err(e) = self.create_container(d, &builder_cfg).await {
+                ReconcileAction::Create {
+                    identity,
+                    name,
+                    generation,
+                } => {
+                    if let Some(d) = by_identity.get(identity.as_str()) {
+                        // Stamp the resolved generation on a clone so the created
+                        // container's name + `generation` label match the action.
+                        let mut d = (*d).clone();
+                        d.generation = *generation;
+                        if let Err(e) = self.create_container(&d, &builder_cfg).await {
                             error!(
                                 project = %project.name,
                                 container = %name,
@@ -795,19 +830,29 @@ impl DockerReconciler {
                         }
                     }
                 }
-                ReconcileAction::Recreate { name, existing_id } => {
-                    // The replacement reuses the old container's deterministic
-                    // name, so we can't create-then-swap without a temp name.
-                    // To keep the outage window minimal we pre-pull the image
-                    // (the slowest, most failure-prone step) *before* removing
-                    // the running container — a pull failure then leaves the old
-                    // container in place rather than tearing it down first.
+                ReconcileAction::Recreate {
+                    identity,
+                    name,
+                    existing_id,
+                    generation,
+                } => {
+                    // The replacement gets a fresh `_g{n}` name (generation + 1),
+                    // distinct from the old container's, so in principle a
+                    // create-then-swap is now possible. We still pre-pull the
+                    // image (the slowest, most failure-prone step) *before*
+                    // removing the running container — a pull failure then leaves
+                    // the old container in place rather than tearing it down
+                    // first.
                     //
-                    // TODO(create-then-swap): create the replacement under a
-                    // temporary name, confirm it started, then atomically remove
-                    // the old container and rename the new one. Requires the
-                    // diff/health paths to tolerate the transient temp name.
-                    if let Some(d) = by_name.get(name.as_str()) {
+                    // TODO(create-then-swap): now that the generation makes the
+                    // replacement's name distinct, create the new container,
+                    // confirm it started, then remove the old one — eliminating
+                    // the outage window entirely.
+                    if let Some(d) = by_identity.get(identity.as_str()) {
+                        // Stamp the resolved (bumped) generation on a clone so the
+                        // replacement's name + `generation` label match the action.
+                        let mut d = (*d).clone();
+                        d.generation = *generation;
                         if let Err(e) = self.pull_image(&d.image).await {
                             error!(
                                 project = %project.name,
@@ -817,7 +862,7 @@ impl DockerReconciler {
                             continue;
                         }
                         self.remove_container(existing_id).await;
-                        if let Err(e) = self.create_container(d, &builder_cfg).await {
+                        if let Err(e) = self.create_container(&d, &builder_cfg).await {
                             error!(
                                 project = %project.name,
                                 container = %name,
@@ -929,10 +974,24 @@ impl DockerReconciler {
         }
 
         let (container_specs, _routes) = resolve_runtime_containers(deployment)?;
+        // The live container's `--name` now carries a per-recreate `_g{n}`
+        // suffix we can't reconstruct from the spec alone. Enumerate the actual
+        // containers once and index them by their stable identity tuple so each
+        // spec can be resolved to its REAL (generation-ful) name + id, which we
+        // then inspect by. A spec with no matching actual is simply not-ready.
+        let actual = self.list_actual_containers(project).await?;
+        let actual_by_identity: HashMap<String, &ActualContainer> = actual
+            .iter()
+            .filter_map(|a| a.identity().map(|id| (id, a)))
+            .collect();
         // Inspect each container ONCE and reuse the result for both the health
         // probe (Issue 1) and the pod_status metadata builder (Issue 2). The
-        // map is keyed by the deterministic container name.
+        // map is keyed by the actual container's real (generation-ful) name.
         let mut inspected_by_name: HashMap<String, Option<InspectedContainer>> = HashMap::new();
+        // spec name → the resolved name we keyed `inspected_by_name` under, so
+        // `build_controller_metadata` reuses the same inspection (and shows the
+        // real generation-ful pod name where the container exists).
+        let mut resolved_name_by_spec: HashMap<String, String> = HashMap::new();
         // Every container must be ready for the deployment to be healthy:
         //   - HTTP containers (with a port) must answer the probe — a real HTTP
         //     GET to the app (loopback published port when `publish_app_ports`
@@ -948,56 +1007,84 @@ impl DockerReconciler {
         let running_of =
             |i: &Option<InspectedContainer>| i.as_ref().map(|i| i.running).unwrap_or(false);
         for spec in &container_specs {
-            let name = container_builder::container_name(
-                &self.config.container_prefix,
+            let identity = identity_key(
                 &project.name,
                 &deployment.deployment_group,
                 &deployment.deployment_id,
                 &spec.name,
             );
-            let inspected = self.inspect_for_reconcile(&name, spec.port).await;
-            let ready = match spec.port {
-                // HTTP container: honor the per-container `health_check` spec.
-                // `disabled` (→ `effective_health_path` returns None) removes the
-                // probe, so a *running* container is ready — mirroring K8s, where
-                // `health_check = false` removes the probes. Otherwise probe the
-                // container's `health_check.path` (or the controller default).
-                Some(port) => match effective_health_path(spec, &self.config.health_path) {
-                    Some(path) => match self.probe_container(inspected.as_ref(), port, &path).await
-                    {
-                        Ok(()) => true,
-                        Err(reason) => {
-                            // Per-tick at debug to avoid noise while an app is
-                            // still warming up; the reason is also folded into the
-                            // user-visible Unhealthy status below.
-                            debug!(
-                                deployment_id = %deployment.deployment_id,
-                                container = %spec.name,
-                                "Health probe failed: {reason}"
-                            );
-                            not_ready_reasons.push(format!("'{}' {reason}", spec.name));
-                            false
+            // Resolve this spec to its live container. When present, inspect by
+            // the actual generation-ful name; when absent (not yet created /
+            // mid-recreate), use the generation-free stable name as a stable map
+            // key and skip the inspect (yields None → not-ready below).
+            let actual = actual_by_identity.get(&identity).copied();
+            let name = match actual {
+                Some(a) => a.name.clone(),
+                None => container_builder::stable_identity_name(
+                    &self.config.container_prefix,
+                    &project.name,
+                    &deployment.deployment_group,
+                    &deployment.deployment_id,
+                    &spec.name,
+                ),
+            };
+            let inspected = match actual {
+                Some(a) => self.inspect_for_reconcile(&a.name, spec.port).await,
+                None => None,
+            };
+            let ready = if actual.is_none() {
+                // No live container matches this spec's identity (not yet
+                // created, or briefly absent mid-recreate) — definitively
+                // not-ready, with a clear reason in the existing diagnostic
+                // style. Skip probing (there's nothing to probe).
+                not_ready_reasons.push(format!("'{}' container not found", spec.name));
+                false
+            } else {
+                match spec.port {
+                    // HTTP container: honor the per-container `health_check` spec.
+                    // `disabled` (→ `effective_health_path` returns None) removes the
+                    // probe, so a *running* container is ready — mirroring K8s, where
+                    // `health_check = false` removes the probes. Otherwise probe the
+                    // container's `health_check.path` (or the controller default).
+                    Some(port) => match effective_health_path(spec, &self.config.health_path) {
+                        Some(path) => {
+                            match self.probe_container(inspected.as_ref(), port, &path).await {
+                                Ok(()) => true,
+                                Err(reason) => {
+                                    // Per-tick at debug to avoid noise while an app is
+                                    // still warming up; the reason is also folded into the
+                                    // user-visible Unhealthy status below.
+                                    debug!(
+                                        deployment_id = %deployment.deployment_id,
+                                        container = %spec.name,
+                                        "Health probe failed: {reason}"
+                                    );
+                                    not_ready_reasons.push(format!("'{}' {reason}", spec.name));
+                                    false
+                                }
+                            }
+                        }
+                        None => {
+                            let running = running_of(&inspected);
+                            if !running {
+                                not_ready_reasons
+                                    .push(format!("'{}' not running (probe disabled)", spec.name));
+                            }
+                            running
                         }
                     },
+                    // Worker: no HTTP endpoint, so the daemon's run state is the
+                    // only liveness signal we have.
                     None => {
                         let running = running_of(&inspected);
                         if !running {
-                            not_ready_reasons
-                                .push(format!("'{}' not running (probe disabled)", spec.name));
+                            not_ready_reasons.push(format!("worker '{}' not running", spec.name));
                         }
                         running
                     }
-                },
-                // Worker: no HTTP endpoint, so the daemon's run state is the
-                // only liveness signal we have.
-                None => {
-                    let running = running_of(&inspected);
-                    if !running {
-                        not_ready_reasons.push(format!("worker '{}' not running", spec.name));
-                    }
-                    running
                 }
             };
+            resolved_name_by_spec.insert(spec.name.clone(), name.clone());
             inspected_by_name.insert(name, inspected);
             if !ready {
                 all_ready = false;
@@ -1024,6 +1111,7 @@ impl DockerReconciler {
             project,
             deployment,
             &container_specs,
+            &resolved_name_by_spec,
             &inspected_by_name,
             is_ready,
         );
@@ -1224,21 +1312,32 @@ impl DockerReconciler {
         project: &Project,
         deployment: &Deployment,
         container_specs: &[crate::server::deployment::models::ContainerSpec],
+        resolved_name_by_spec: &HashMap<String, String>,
         inspected_by_name: &HashMap<String, Option<InspectedContainer>>,
         is_ready: bool,
     ) -> serde_json::Value {
         // Map each spec to its (name, inspection) so the pure builder can
-        // produce the pod_status without touching `self`.
+        // produce the pod_status without touching `self`. The name is the live
+        // container's REAL (generation-ful) name where one exists — resolved by
+        // `reconcile_health` from the actual containers — else the generation-
+        // free stable name for a not-yet-created container. The reconstructed
+        // generation-ful name can't be derived from the spec alone, so we reuse
+        // the resolution computed during the probe loop.
         let named: Vec<(String, Option<InspectedContainer>)> = container_specs
             .iter()
             .map(|s| {
-                let name = container_builder::container_name(
-                    &self.config.container_prefix,
-                    &project.name,
-                    &deployment.deployment_group,
-                    &deployment.deployment_id,
-                    &s.name,
-                );
+                let name = resolved_name_by_spec
+                    .get(&s.name)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        container_builder::stable_identity_name(
+                            &self.config.container_prefix,
+                            &project.name,
+                            &deployment.deployment_group,
+                            &deployment.deployment_id,
+                            &s.name,
+                        )
+                    });
                 let inspected = inspected_by_name.get(&name).cloned().flatten();
                 (name, inspected)
             })
@@ -1456,11 +1555,26 @@ fn build_pod_status(
 pub struct ActualContainer {
     pub id: String,
     pub name: String,
+    /// The `project` bookkeeping label. Part of the stable identity tuple used
+    /// to match this container to a desired one across generations (the live
+    /// `--name` carries a per-recreate `_g{n}` suffix and can't be matched
+    /// directly). `None` for legacy containers missing the label.
+    pub project: Option<String>,
+    /// The `deployment-group` bookkeeping label (identity tuple member).
+    pub deployment_group: Option<String>,
+    /// The `container` bookkeeping label (identity tuple member).
+    pub container: Option<String>,
     /// The `deployment-id` bookkeeping label stamped on the live container.
     /// Used by the diff to protect a container from GC when its owning
-    /// deployment's desired computation failed this tick. `None` for legacy
-    /// containers created before this label was read (treated as unprotected).
+    /// deployment's desired computation failed this tick, and as a member of the
+    /// stable identity tuple. `None` for legacy containers created before this
+    /// label was read (treated as unprotected).
     pub deployment_id_label: Option<String>,
+    /// Monotonic generation parsed from the `generation` label. The NEXT
+    /// generation on a recreate is `generation + 1`. Defaults to `0` when the
+    /// label is missing/legacy/unparseable, so the first recreate of a legacy
+    /// container yields generation `1`.
+    pub generation: u32,
     pub image_label: Option<String>,
     pub env_hash_label: Option<String>,
     /// The `route-hash` recreate-signature label stamped on the live container
@@ -1481,6 +1595,22 @@ pub struct ActualContainer {
 }
 
 impl ActualContainer {
+    /// Stable identity of this container from its bookkeeping LABELS — the tuple
+    /// (project, deployment_group, deployment_id, container). Used to match an
+    /// actual container to a desired one WITHOUT relying on the live `--name`,
+    /// which now carries a per-recreate `_g{n}` generation suffix. Returns
+    /// `None` when any identity label is missing (a legacy/foreign container
+    /// that can't be matched — it's only ever a removable orphan, if not
+    /// protected).
+    fn identity(&self) -> Option<String> {
+        Some(identity_key(
+            self.project.as_deref()?,
+            self.deployment_group.as_deref()?,
+            self.deployment_id_label.as_deref()?,
+            self.container.as_deref()?,
+        ))
+    }
+
     /// Whether the daemon reports this container in a terminal-ish state that
     /// won't self-recover, so the reconciler must recreate it.
     ///
@@ -1501,21 +1631,38 @@ impl ActualContainer {
 }
 
 /// What to do with one container slot.
+///
+/// Create/Recreate carry the stable `identity` (so `apply_actions` can find the
+/// desired container by its identity tuple), the resolved generation-ful `name`
+/// (for logging/clarity), and the `generation` to stamp on the new container.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReconcileAction {
-    /// No matching actual container — create + start it.
-    Create { name: String },
-    /// Actual exists but drifted (image or env-hash) — replace it.
-    Recreate { name: String, existing_id: String },
+    /// No matching actual container — create + start it at `generation`.
+    Create {
+        identity: String,
+        name: String,
+        generation: u32,
+    },
+    /// Actual exists but drifted (image / env-hash / route-hash / not running)
+    /// — replace it, bumping to `generation` (live generation + 1).
+    Recreate {
+        identity: String,
+        name: String,
+        existing_id: String,
+        generation: u32,
+    },
     /// Actual exists with no desired match — garbage-collect it.
     Remove { id: String, name: String },
 }
 
 /// Classify each desired/actual container into create / recreate / remove.
 ///
-/// Pure: no daemon access. `container_prefix` is the configured prefix used to
-/// derive each desired container's deterministic name so it matches the names
-/// stamped by `apply_actions` / `build_container`.
+/// Pure: no daemon access. Matching is by the STABLE IDENTITY tuple (project,
+/// deployment_group, deployment_id, container) read from bookkeeping labels —
+/// NOT by container name, which now carries a per-recreate `_g{n}` generation
+/// suffix. `container_prefix` is the configured prefix used only to render the
+/// resolved generation-ful `name` carried on each Create/Recreate action (for
+/// logging); `apply_actions` looks the desired container up by `identity`.
 ///
 /// `protected_deployment_ids` is the set of deployment-ids whose desired
 /// computation FAILED this tick. An actual container whose `deployment-id`
@@ -1531,30 +1678,52 @@ pub fn diff_desired_vs_actual(
     container_prefix: &str,
     protected_deployment_ids: &HashSet<String>,
 ) -> Vec<ReconcileAction> {
-    // Desired containers keyed by their deterministic name.
-    let mut desired_by_name: HashMap<String, &DesiredContainer> = HashMap::new();
+    // Desired containers keyed by their STABLE IDENTITY tuple (project, group,
+    // deployment-id, container) — NOT by their live `--name`, which now carries
+    // a per-recreate `_g{n}` generation suffix that differs between an actual
+    // container and the next-generation name we'd compute for it.
+    let mut desired_by_identity: HashMap<String, &DesiredContainer> = HashMap::new();
     for d in desired {
-        let name = container_builder::container_name(
-            container_prefix,
+        let key = identity_key(
             &d.project,
             &d.deployment_group,
             &d.deployment_id,
             &d.container,
         );
-        desired_by_name.insert(name, d);
+        desired_by_identity.insert(key, d);
     }
 
-    let actual_by_name: HashMap<&str, &ActualContainer> =
-        actual.iter().map(|a| (a.name.as_str(), a)).collect();
+    // Actual containers keyed by the identity tuple read from their bookkeeping
+    // labels. Containers missing identity labels (`identity() == None`) are not
+    // indexed here — they can never match a desired slot and are only ever
+    // removable orphans (handled in the GC pass below).
+    let actual_by_identity: HashMap<String, &ActualContainer> = actual
+        .iter()
+        .filter_map(|a| a.identity().map(|id| (id, a)))
+        .collect();
 
     let mut actions = Vec::new();
-    let mut matched_actual: HashSet<String> = HashSet::new();
+    let mut matched_actual_ids: HashSet<String> = HashSet::new();
 
-    for (name, d) in &desired_by_name {
-        match actual_by_name.get(name.as_str()) {
-            None => actions.push(ReconcileAction::Create { name: name.clone() }),
+    for (identity, d) in &desired_by_identity {
+        match actual_by_identity.get(identity) {
+            None => {
+                // Brand-new slot: create at generation 1.
+                actions.push(ReconcileAction::Create {
+                    identity: identity.clone(),
+                    name: container_builder::container_name(
+                        container_prefix,
+                        &d.project,
+                        &d.deployment_group,
+                        &d.deployment_id,
+                        &d.container,
+                        1,
+                    ),
+                    generation: 1,
+                });
+            }
             Some(a) => {
-                matched_actual.insert(name.clone());
+                matched_actual_ids.insert(a.id.clone());
                 let image_drift = a.image_label.as_deref() != Some(d.image.as_str());
                 let env_drift = a.env_hash_label.as_deref() != Some(d.env_hash.as_str());
                 // Recreate-signature drift: the live container's stamped
@@ -1568,6 +1737,11 @@ pub fn diff_desired_vs_actual(
                 // the only way. Idempotent: once the stamped hash equals the
                 // desired one nothing recreates. A legacy container missing the
                 // label (`None`) is recreated once to gain it, then converges.
+                //
+                // NOTE: the generation is deliberately NOT part of any of these
+                // drift checks (it isn't fed into image/env/route hashes either),
+                // so a stable container produces ZERO actions regardless of its
+                // `_g{n}` suffix — the key no-infinite-recreate invariant.
                 let route_drift = a.route_hash_label.as_deref() != Some(d.route_hash.as_str());
                 // A container that matches on image + env but is in a
                 // terminal-ish state (created-but-never-started, exited, or
@@ -1576,9 +1750,21 @@ pub fn diff_desired_vs_actual(
                 // are left to Docker's restart policy so its backoff can settle.
                 let not_running = a.needs_recreate();
                 if image_drift || env_drift || route_drift || not_running {
+                    // Bump to the next generation so the replacement's name is
+                    // visibly newer than the one it replaces.
+                    let generation = a.generation + 1;
                     actions.push(ReconcileAction::Recreate {
-                        name: name.clone(),
+                        identity: identity.clone(),
+                        name: container_builder::container_name(
+                            container_prefix,
+                            &d.project,
+                            &d.deployment_group,
+                            &d.deployment_id,
+                            &d.container,
+                            generation,
+                        ),
                         existing_id: a.id.clone(),
+                        generation,
                     });
                 }
             }
@@ -1586,7 +1772,7 @@ pub fn diff_desired_vs_actual(
     }
 
     for a in actual {
-        if matched_actual.contains(&a.name) {
+        if matched_actual_ids.contains(&a.id) {
             continue;
         }
         // Protect containers belonging to a deployment whose desired
@@ -1626,10 +1812,18 @@ pub fn controller_class_matches(configured: &str, org_class: Option<&str>) -> bo
 
 fn action_key(a: &ReconcileAction) -> (u8, String) {
     match a {
-        ReconcileAction::Create { name } => (0, name.clone()),
+        ReconcileAction::Create { name, .. } => (0, name.clone()),
         ReconcileAction::Recreate { name, .. } => (1, name.clone()),
         ReconcileAction::Remove { name, .. } => (2, name.clone()),
     }
+}
+
+/// Stable identity key for a container slot, joining the identity tuple
+/// (project, deployment_group, deployment_id, container) with a NUL separator
+/// (which can't appear in any of these names). Built from desired fields and
+/// from actual bookkeeping labels so the two match across name generations.
+fn identity_key(project: &str, group: &str, deployment_id: &str, container: &str) -> String {
+    format!("{project}\u{0}{group}\u{0}{deployment_id}\u{0}{container}")
 }
 
 // ── Env merge helpers ─────────────────────────────────────────────────
@@ -1777,7 +1971,20 @@ mod tests {
             // the real value via `route_hash_for`. Tests that exercise routing
             // drift override this and the matching actual label.
             route_hash: "rh-active".to_string(),
+            // Seed generation (the diff resolves the real value before apply).
+            generation: 1,
         }
+    }
+
+    /// Stable identity key for the `desired()` helper's slot, used to build the
+    /// `identity` field of expected Create/Recreate actions.
+    fn identity_of(d: &DesiredContainer) -> String {
+        identity_key(
+            &d.project,
+            &d.deployment_group,
+            &d.deployment_id,
+            &d.container,
+        )
     }
 
     /// Empty protected-deployment-ids set for the common case where no
@@ -1786,22 +1993,36 @@ mod tests {
         HashSet::new()
     }
 
-    fn name_of(d: &DesiredContainer) -> String {
+    /// The resolved generation-ful name for the `desired()` slot at a given
+    /// generation (the name a Create/Recreate action carries).
+    fn name_of_gen(d: &DesiredContainer, generation: u32) -> String {
         container_builder::container_name(
             "rise",
             &d.project,
             &d.deployment_group,
             &d.deployment_id,
             &d.container,
+            generation,
         )
     }
 
-    /// A live container belonging to the `desired()` helper's deployment.
-    fn actual_for(d: &DesiredContainer, image: &str, env_hash: &str) -> ActualContainer {
+    /// A live container belonging to the `desired()` helper's deployment, at a
+    /// given generation. Its name carries the `_g{generation}` suffix and it
+    /// carries the full identity-label set so the diff can match it.
+    fn actual_for_gen(
+        d: &DesiredContainer,
+        image: &str,
+        env_hash: &str,
+        generation: u32,
+    ) -> ActualContainer {
         ActualContainer {
             id: "cid".to_string(),
-            name: name_of(d),
+            name: name_of_gen(d, generation),
+            project: Some(d.project.clone()),
+            deployment_group: Some(d.deployment_group.clone()),
+            container: Some(d.container.clone()),
             deployment_id_label: Some(d.deployment_id.clone()),
+            generation,
             image_label: Some(image.to_string()),
             env_hash_label: Some(env_hash.to_string()),
             route_hash_label: Some("rh-active".to_string()),
@@ -1809,12 +2030,24 @@ mod tests {
         }
     }
 
+    /// A live container at generation 1 (the common case for most diff tests).
+    fn actual_for(d: &DesiredContainer, image: &str, env_hash: &str) -> ActualContainer {
+        actual_for_gen(d, image, env_hash, 1)
+    }
+
     #[test]
     fn diff_creates_missing() {
         let d = desired("app", "img:1", "h1");
         let actions =
             diff_desired_vs_actual(std::slice::from_ref(&d), &[], "rise", &no_protected());
-        assert_eq!(actions, vec![ReconcileAction::Create { name: name_of(&d) }]);
+        assert_eq!(
+            actions,
+            vec![ReconcileAction::Create {
+                identity: identity_of(&d),
+                name: name_of_gen(&d, 1),
+                generation: 1,
+            }]
+        );
     }
 
     #[test]
@@ -1834,8 +2067,10 @@ mod tests {
         assert_eq!(
             actions,
             vec![ReconcileAction::Recreate {
-                name: name_of(&d),
-                existing_id: "cid".to_string()
+                identity: identity_of(&d),
+                name: name_of_gen(&d, 2),
+                existing_id: "cid".to_string(),
+                generation: 2,
             }]
         );
     }
@@ -1849,8 +2084,10 @@ mod tests {
         assert_eq!(
             actions,
             vec![ReconcileAction::Recreate {
-                name: name_of(&d),
-                existing_id: "cid".to_string()
+                identity: identity_of(&d),
+                name: name_of_gen(&d, 2),
+                existing_id: "cid".to_string(),
+                generation: 2,
             }]
         );
     }
@@ -1870,8 +2107,10 @@ mod tests {
             assert_eq!(
                 actions,
                 vec![ReconcileAction::Recreate {
-                    name: name_of(&d),
-                    existing_id: "cid".to_string()
+                    identity: identity_of(&d),
+                    name: name_of_gen(&d, 2),
+                    existing_id: "cid".to_string(),
+                    generation: 2,
                 }],
                 "state {state:?} should force recreate"
             );
@@ -1905,8 +2144,12 @@ mod tests {
     fn diff_removes_orphan() {
         let actual = vec![ActualContainer {
             id: "old".to_string(),
-            name: "rise_myapp_default_oldid_app".to_string(),
+            name: "rise_myapp_default_oldid_app_g1".to_string(),
+            project: Some("myapp".to_string()),
+            deployment_group: Some("default".to_string()),
+            container: Some("app".to_string()),
             deployment_id_label: Some("oldid".to_string()),
+            generation: 1,
             image_label: Some("img:1".to_string()),
             env_hash_label: Some("h1".to_string()),
             route_hash_label: Some("rh-active".to_string()),
@@ -1917,7 +2160,7 @@ mod tests {
             actions,
             vec![ReconcileAction::Remove {
                 id: "old".to_string(),
-                name: "rise_myapp_default_oldid_app".to_string()
+                name: "rise_myapp_default_oldid_app_g1".to_string()
             }]
         );
     }
@@ -1928,8 +2171,12 @@ mod tests {
         let new = desired("app", "img:2", "h2");
         let actual = vec![ActualContainer {
             id: "old".to_string(),
-            name: "rise_myapp_default_oldid_app".to_string(),
+            name: "rise_myapp_default_oldid_app_g1".to_string(),
+            project: Some("myapp".to_string()),
+            deployment_group: Some("default".to_string()),
+            container: Some("app".to_string()),
             deployment_id_label: Some("oldid".to_string()),
+            generation: 1,
             image_label: Some("img:1".to_string()),
             env_hash_label: Some("h1".to_string()),
             route_hash_label: Some("rh-active".to_string()),
@@ -1941,11 +2188,13 @@ mod tests {
             actions,
             vec![
                 ReconcileAction::Create {
-                    name: name_of(&new)
+                    identity: identity_of(&new),
+                    name: name_of_gen(&new, 1),
+                    generation: 1,
                 },
                 ReconcileAction::Remove {
                     id: "old".to_string(),
-                    name: "rise_myapp_default_oldid_app".to_string()
+                    name: "rise_myapp_default_oldid_app_g1".to_string()
                 },
             ]
         );
@@ -1959,8 +2208,12 @@ mod tests {
         // remove it — matching the K8s model (children untouched on failed sync).
         let actual = vec![ActualContainer {
             id: "live".to_string(),
-            name: "rise_myapp_default_protectedid_app".to_string(),
+            name: "rise_myapp_default_protectedid_app_g1".to_string(),
+            project: Some("myapp".to_string()),
+            deployment_group: Some("default".to_string()),
+            container: Some("app".to_string()),
             deployment_id_label: Some("protectedid".to_string()),
+            generation: 1,
             image_label: Some("img:1".to_string()),
             env_hash_label: Some("h1".to_string()),
             route_hash_label: Some("rh-active".to_string()),
@@ -1983,8 +2236,12 @@ mod tests {
         let actual = vec![
             ActualContainer {
                 id: "protected".to_string(),
-                name: "rise_myapp_default_protectedid_app".to_string(),
+                name: "rise_myapp_default_protectedid_app_g1".to_string(),
+                project: Some("myapp".to_string()),
+                deployment_group: Some("default".to_string()),
+                container: Some("app".to_string()),
                 deployment_id_label: Some("protectedid".to_string()),
+                generation: 1,
                 image_label: Some("img:1".to_string()),
                 env_hash_label: Some("h1".to_string()),
                 route_hash_label: Some("rh-active".to_string()),
@@ -1992,8 +2249,12 @@ mod tests {
             },
             ActualContainer {
                 id: "orphan".to_string(),
-                name: "rise_myapp_default_orphanid_app".to_string(),
+                name: "rise_myapp_default_orphanid_app_g1".to_string(),
+                project: Some("myapp".to_string()),
+                deployment_group: Some("default".to_string()),
+                container: Some("app".to_string()),
                 deployment_id_label: Some("orphanid".to_string()),
+                generation: 1,
                 image_label: Some("img:1".to_string()),
                 env_hash_label: Some("h1".to_string()),
                 route_hash_label: Some("rh-active".to_string()),
@@ -2007,7 +2268,7 @@ mod tests {
             actions,
             vec![ReconcileAction::Remove {
                 id: "orphan".to_string(),
-                name: "rise_myapp_default_orphanid_app".to_string()
+                name: "rise_myapp_default_orphanid_app_g1".to_string()
             }],
             "only the unprotected orphan should be removed"
         );
@@ -2031,8 +2292,10 @@ mod tests {
         assert_eq!(
             actions,
             vec![ReconcileAction::Recreate {
-                name: name_of(&d),
-                existing_id: "cid".to_string()
+                identity: identity_of(&d),
+                name: name_of_gen(&d, 2),
+                existing_id: "cid".to_string(),
+                generation: 2,
             }]
         );
     }
@@ -2047,21 +2310,18 @@ mod tests {
         d.routable = false;
         d.route_hash = String::new();
         let actual = vec![ActualContainer {
-            id: "cid".to_string(),
-            name: name_of(&d),
-            deployment_id_label: Some(d.deployment_id.clone()),
-            image_label: Some("img:1".to_string()),
-            env_hash_label: Some("h1".to_string()),
             route_hash_label: Some("rh-active".to_string()),
-            state: Some("running".to_string()),
+            ..actual_for(&d, "img:1", "h1")
         }];
         let actions =
             diff_desired_vs_actual(std::slice::from_ref(&d), &actual, "rise", &no_protected());
         assert_eq!(
             actions,
             vec![ReconcileAction::Recreate {
-                name: name_of(&d),
-                existing_id: "cid".to_string()
+                identity: identity_of(&d),
+                name: name_of_gen(&d, 2),
+                existing_id: "cid".to_string(),
+                generation: 2,
             }]
         );
     }
@@ -2071,18 +2331,66 @@ mod tests {
         // Idempotence: once image + env + route-hash all match and the container
         // is running, the diff emits NO action — no recreate oscillation.
         let d = desired("app", "img:1", "h1"); // route_hash = "rh-active"
-        let actual = vec![ActualContainer {
-            id: "cid".to_string(),
-            name: name_of(&d),
-            deployment_id_label: Some(d.deployment_id.clone()),
-            image_label: Some("img:1".to_string()),
-            env_hash_label: Some("h1".to_string()),
-            route_hash_label: Some("rh-active".to_string()),
-            state: Some("running".to_string()),
-        }];
+        let actual = vec![actual_for(&d, "img:1", "h1")];
         let actions =
             diff_desired_vs_actual(std::slice::from_ref(&d), &actual, "rise", &no_protected());
         assert!(actions.is_empty(), "matching container must not recreate");
+    }
+
+    #[test]
+    fn diff_no_action_when_matched_with_different_generation_suffix() {
+        // The KEY anti-infinite-recreate test: a stable container (no image/env/
+        // route drift, running) that was recreated several times — so its live
+        // name carries `_g5` and its generation label is 5 — must still match the
+        // desired slot by IDENTITY and produce ZERO actions. The generation never
+        // feeds any matching key or hash, so the `_g{n}` suffix is irrelevant.
+        let d = desired("app", "img:1", "h1"); // route_hash = "rh-active"
+        let actual = vec![actual_for_gen(&d, "img:1", "h1", 5)];
+        assert!(
+            actual[0].name.ends_with("_g5"),
+            "fixture must carry a non-1 generation suffix"
+        );
+        let actions =
+            diff_desired_vs_actual(std::slice::from_ref(&d), &actual, "rise", &no_protected());
+        assert!(
+            actions.is_empty(),
+            "a stable container must not recreate regardless of its _g{{n}} suffix"
+        );
+    }
+
+    #[test]
+    fn diff_recreate_bumps_generation_from_actual() {
+        // A drifted match at generation 5 recreates at generation 6 (actual + 1),
+        // and the carried name reflects the bumped generation.
+        let d = desired("app", "img:2", "h1"); // image drift
+        let actual = vec![actual_for_gen(&d, "img:1", "h1", 5)];
+        let actions =
+            diff_desired_vs_actual(std::slice::from_ref(&d), &actual, "rise", &no_protected());
+        assert_eq!(
+            actions,
+            vec![ReconcileAction::Recreate {
+                identity: identity_of(&d),
+                name: name_of_gen(&d, 6),
+                existing_id: "cid".to_string(),
+                generation: 6,
+            }]
+        );
+    }
+
+    #[test]
+    fn diff_create_uses_generation_one() {
+        // A missing slot always creates at generation 1.
+        let d = desired("app", "img:1", "h1");
+        let actions =
+            diff_desired_vs_actual(std::slice::from_ref(&d), &[], "rise", &no_protected());
+        assert_eq!(
+            actions,
+            vec![ReconcileAction::Create {
+                identity: identity_of(&d),
+                name: name_of_gen(&d, 1),
+                generation: 1,
+            }]
+        );
     }
 
     #[test]

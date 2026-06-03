@@ -70,6 +70,13 @@ pub struct DesiredContainer {
     /// mutate a running container's labels or port bindings in place, so such a
     /// transition must be reconciled by recreation.
     pub route_hash: String,
+    /// Resolved monotonic generation for this container's `--name` suffix
+    /// (`..._g{n}`). NOT an identity field and NOT fed into routing or any hash.
+    /// `compute_desired_for_deployment` can't know it (it depends on the live
+    /// container's current generation), so it seeds `1` as a placeholder and the
+    /// diff resolves the real value before apply: a brand-new slot → `1`, a
+    /// recreate → live `g{n}` + 1.
+    pub generation: u32,
 }
 
 /// Static controller configuration the builder needs.
@@ -116,11 +123,36 @@ pub struct BuiltContainer {
 /// Maximum length of a Docker container name segment we emit before hashing.
 const MAX_NAME_LEN: usize = 63;
 
-/// Compute the deterministic container name:
-/// `<prefix>_<project>_<group>_<deploymentid>_<container>`, sanitized to
-/// `[a-zA-Z0-9_.-]`, hash-suffixed when longer than [`MAX_NAME_LEN`] so it
-/// stays unique and the diff can still match it.
+/// Compute the live container's `--name`:
+/// `<prefix>_<project>_<group>_<deploymentid>_<container>_g<generation>`,
+/// sanitized to `[a-zA-Z0-9_.-]`, hash-suffixed when longer than
+/// [`MAX_NAME_LEN`]. The `_g{n}` suffix is folded into the raw string BEFORE the
+/// length cap, so the >63-char hash-truncation branch still caps the whole
+/// string (suffix included). The generation makes a recreated container's name
+/// visibly newer than the one it replaced; matching is by bookkeeping LABELS
+/// (the stable identity tuple), never by this name — see
+/// [`stable_identity_name`] for the generation-free identity used by DNS / env.
 pub fn container_name(
+    prefix: &str,
+    project: &str,
+    deployment_group: &str,
+    deployment_id: &str,
+    container: &str,
+    generation: u32,
+) -> String {
+    let raw =
+        format!("{prefix}_{project}_{deployment_group}_{deployment_id}_{container}_g{generation}");
+    sanitize_and_cap(&raw)
+}
+
+/// Generation-FREE stable identity name:
+/// `<prefix>_<project>_<group>_<deploymentid>_<container>`, sanitized + capped
+/// the same way as [`container_name`] but with no `_g{n}` suffix. Used where a
+/// name must stay constant across generations — the network alias and the
+/// injected `RISE_CONTAINER_HOST__<NAME>` service-discovery hostname — so
+/// Docker's embedded DNS keeps resolving siblings and the env hash doesn't drift
+/// every recreate.
+pub fn stable_identity_name(
     prefix: &str,
     project: &str,
     deployment_group: &str,
@@ -128,7 +160,15 @@ pub fn container_name(
     container: &str,
 ) -> String {
     let raw = format!("{prefix}_{project}_{deployment_group}_{deployment_id}_{container}");
-    let sanitized = sanitize_name(&raw);
+    sanitize_and_cap(&raw)
+}
+
+/// Sanitize a raw name to `[a-zA-Z0-9_.-]` and hash-truncate it when it exceeds
+/// [`MAX_NAME_LEN`]. Shared by [`container_name`] and [`stable_identity_name`]
+/// so the 63-char cap logic lives in one place. Deterministic: same input →
+/// same output.
+fn sanitize_and_cap(raw: &str) -> String {
+    let sanitized = sanitize_name(raw);
     if sanitized.len() <= MAX_NAME_LEN {
         return sanitized;
     }
@@ -162,6 +202,7 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
         &desired.deployment_group,
         &desired.deployment_id,
         &desired.container,
+        desired.generation,
     );
 
     // ── Labels: Traefik (routable only) ────────────────────────────────
@@ -189,6 +230,7 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
         env_hash: &desired.env_hash,
         image: &desired.image,
         route_hash: &route_hash,
+        generation: desired.generation,
     }
     .render();
     all_labels.extend(traefik_labels);
@@ -217,8 +259,28 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
     // misleading `unhealthy` status in `docker ps` with no bearing on routing.
 
     // ── Network attachment ─────────────────────────────────────────────
+    // Attach a NETWORK ALIAS equal to the generation-FREE stable identity name
+    // so siblings keep resolving this container across recreates: the live
+    // container's `--name` carries the `_g{n}` generation suffix (which changes
+    // every recreate), but the injected `RISE_CONTAINER_HOST__<NAME>` discovery
+    // env points at the stable name. Docker's embedded DNS resolves the alias on
+    // the shared user-defined network, so the env hash never drifts per
+    // generation and siblings never point at a stale `_g{n}` name.
+    let stable_alias = stable_identity_name(
+        cfg.container_prefix,
+        &desired.project,
+        &desired.deployment_group,
+        &desired.deployment_id,
+        &desired.container,
+    );
     let mut endpoints = HashMap::new();
-    endpoints.insert(cfg.traefik_network.to_string(), EndpointSettings::default());
+    endpoints.insert(
+        cfg.traefik_network.to_string(),
+        EndpointSettings {
+            aliases: Some(vec![stable_alias]),
+            ..Default::default()
+        },
+    );
 
     // ── Local app→backend host aliases (extra_hosts) ───────────────────
     // LOCAL-DEV ONLY: map the configured alias host(s) (e.g. `rise.localhost`)
@@ -485,24 +547,81 @@ mod tests {
             // Traefik labels, so the value stored here is irrelevant to these
             // builder tests. `route_hash_for` is exercised separately below.
             route_hash: String::new(),
+            generation: 1,
         }
     }
 
     #[test]
     fn deterministic_name() {
-        let n1 = container_name("rise", "myapp", "default", "20260101-120000", "app");
-        let n2 = container_name("rise", "myapp", "default", "20260101-120000", "app");
+        let n1 = container_name("rise", "myapp", "default", "20260101-120000", "app", 1);
+        let n2 = container_name("rise", "myapp", "default", "20260101-120000", "app", 1);
         assert_eq!(n1, n2);
-        assert_eq!(n1, "rise_myapp_default_20260101-120000_app");
+        assert_eq!(n1, "rise_myapp_default_20260101-120000_app_g1");
     }
 
     #[test]
     fn long_name_is_hashed_but_stable() {
         let long_project = "a".repeat(100);
-        let n1 = container_name("rise", &long_project, "default", "20260101-120000", "app");
-        let n2 = container_name("rise", &long_project, "default", "20260101-120000", "app");
+        let n1 = container_name(
+            "rise",
+            &long_project,
+            "default",
+            "20260101-120000",
+            "app",
+            1,
+        );
+        let n2 = container_name(
+            "rise",
+            &long_project,
+            "default",
+            "20260101-120000",
+            "app",
+            1,
+        );
         assert_eq!(n1, n2);
         assert!(n1.len() <= MAX_NAME_LEN);
+    }
+
+    #[test]
+    fn stable_identity_name_has_no_generation_suffix() {
+        let n = stable_identity_name("rise", "myapp", "default", "20260101-120000", "app");
+        assert_eq!(n, "rise_myapp_default_20260101-120000_app");
+        assert!(
+            !n.contains("_g"),
+            "stable identity name must not carry a _g suffix"
+        );
+    }
+
+    #[test]
+    fn network_alias_is_stable_identity_name_without_generation() {
+        // The Docker network alias must be the generation-FREE stable identity
+        // name so siblings resolve this container across recreates and the
+        // injected discovery env doesn't drift each generation.
+        let mut desired = single_container();
+        desired.generation = 7;
+        let built = build_container(&desired, &test_cfg());
+        // The container NAME carries the generation suffix...
+        assert_eq!(built.name, "rise_myapp_default_20260101-120000_app_g7");
+        let aliases = built
+            .config
+            .networking_config
+            .as_ref()
+            .unwrap()
+            .endpoints_config
+            .get("rise_default")
+            .unwrap()
+            .aliases
+            .as_ref()
+            .expect("network endpoint must carry an alias");
+        // ...but the alias is the stable, generation-free name.
+        assert_eq!(
+            aliases,
+            &vec!["rise_myapp_default_20260101-120000_app".to_string()]
+        );
+        assert!(
+            !aliases[0].contains("_g"),
+            "network alias must not carry a _g generation suffix"
+        );
     }
 
     #[test]
@@ -510,7 +629,7 @@ mod tests {
         let desired = single_container();
         let built = build_container(&desired, &test_cfg());
 
-        assert_eq!(built.name, "rise_myapp_default_20260101-120000_app");
+        assert_eq!(built.name, "rise_myapp_default_20260101-120000_app_g1");
 
         let labels = built.config.labels.as_ref().unwrap();
         assert_eq!(
