@@ -1764,7 +1764,7 @@
         },
         "frontend_dev_proxy_url": {
           "default": null,
-          "description": "Development-only frontend proxy target (for Vite), e.g. \"http://localhost:5173\"\nWhen set, non-API frontend routes are proxied to this URL instead of serving embedded assets.",
+          "description": "Development-only frontend proxy target (for Vite), e.g. \"http://localhost:5173\"\nWhen set, non-API frontend routes are proxied to this URL instead of serving embedded assets.\nAn empty/whitespace value (e.g. an unset `${VAR:-}` env default) is treated as `None`\nso a production config can env-drive this without accidentally proxying to \"\".",
           "type": [
             "string",
             "null"

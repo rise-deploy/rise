@@ -240,7 +240,9 @@ pub struct ServerSettings {
     pub public_url: String,
     /// Development-only frontend proxy target (for Vite), e.g. "http://localhost:5173"
     /// When set, non-API frontend routes are proxied to this URL instead of serving embedded assets.
-    #[serde(default)]
+    /// An empty/whitespace value (e.g. an unset `${VAR:-}` env default) is treated as `None`
+    /// so a production config can env-drive this without accidentally proxying to "".
+    #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
     pub frontend_dev_proxy_url: Option<String>,
 
     /// Whether to set Secure flag on cookies (true for HTTPS, false for HTTP development)
@@ -374,6 +376,20 @@ impl Default for OAuthRateLimitSettings {
 
 fn default_cookie_secure() -> bool {
     true
+}
+
+/// Deserialize an `Option<String>` where a blank/whitespace-only value is `None`.
+///
+/// Lets a config env-drive an optional field via `${VAR:-}`: when the env var is
+/// unset the loader yields the empty string `""`, which would otherwise become
+/// `Some("")`. Trimming it to `None` keeps the "unset" semantics (e.g. so a
+/// production config never proxies the frontend to "").
+fn deserialize_optional_nonempty_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+    Ok(opt.filter(|s| !s.trim().is_empty()))
 }
 
 /// Deserialize a list of strings, dropping blank/whitespace-only entries.

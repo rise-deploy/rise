@@ -250,6 +250,7 @@ docker)
   RISE_AUTH_BACKEND_URL=http://$GW:3000 \\
   RISE_APP_BACKEND_HOST_ALIAS=rise.localhost \\
   RISE_STATIC_DIR=$PWD/static \\
+  RISE_FRONTEND_DEV_PROXY_URL=http://localhost:5173 \\
   RISE_SSRF_ALLOW_PRIVATE=true \\
   RISE_SSRF_ALLOW_HTTP=true \\
   cargo run --features cli,backend -- backend server

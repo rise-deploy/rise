@@ -34,6 +34,11 @@ server:
   jwt_claims: ["sub", "email", "name"]
   static_dir: "${RISE_STATIC_DIR:-/var/lib/rise/static}"
   docs_dir: "${RISE_DOCS_DIR:-/var/rise/docs}"
+  # Dev-only: when running the host backend via `mise dev docker`/`mise br docker`,
+  # this is set to the Vite dev server so the SPA is proxied (the local checkout
+  # has no built frontend). Unset in production -> empty -> None -> serve the
+  # built SPA baked into the image's static_dir.
+  frontend_dev_proxy_url: "${RISE_FRONTEND_DEV_PROXY_URL:-}"
   # SSRF guard for server-side URL fetches (OIDC discovery, OAuth extension
   # issuer/token endpoints, etc.). Default CLOSED for production: private/loopback
   # IPs and plain HTTP are rejected. `trusted_hosts` ONLY exempts the listed hosts
