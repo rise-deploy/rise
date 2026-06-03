@@ -500,8 +500,9 @@ mod tests {
     /// Layer the resource-store and runtime-sync schemas on top of the root
     /// migrations that `#[sqlx::test]` already ran, mirroring the pattern in
     /// `src/server/resources/handlers.rs` tests. The runtime-sync schema is
-    /// required because `ResourceGcController::new` spawns a `LeaderElection`
-    /// that writes to `runtime_sync.leader_leases`.
+    /// required because the GC controller runs under a `LeaderElection` and
+    /// `GlobalSchedule`, which write to `runtime_sync.leader_leases` /
+    /// `runtime_sync.leader_schedules`.
     async fn store_for(pool: PgPool) -> Arc<dyn ResourceStore> {
         rise_resource_store::run_migrations(&pool)
             .await
