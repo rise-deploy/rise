@@ -1273,6 +1273,20 @@ pub enum DeploymentControllerSettings {
         #[serde(default, deserialize_with = "deserialize_blank_filtered_list")]
         app_backend_host_aliases: Vec<String>,
 
+        /// **LOCAL-DEV ONLY.** Explicit IP/value to alias the
+        /// `app_backend_host_aliases` hosts to (injected as `extra_hosts` on
+        /// managed app containers), used VERBATIM instead of resolving the
+        /// `auth_backend_url` host via DNS.
+        ///
+        /// Set to Docker's special `host-gateway` so apps reach a host-run
+        /// backend (`mise br docker`) on both Docker Desktop and Linux — Docker
+        /// replaces `host-gateway` with the host gateway per container at create
+        /// time. Empty/absent (the default) → fall back to DNS resolution of the
+        /// `auth_backend_url` host. **Leave unset in production** (the
+        /// containerized backend is resolved by Docker DNS).
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        app_backend_ip: Option<String>,
+
         /// Label namespace prefix for Rise bookkeeping labels
         /// (e.g. `rise.dev/managed-by`). Defaults to `rise.dev`.
         #[serde(default = "default_label_namespace")]
@@ -2605,6 +2619,10 @@ auth:
         // The local overlay sets this so app containers get rise.localhost ->
         // backend via extra_hosts.
         env.insert("RISE_APP_BACKEND_HOST_ALIAS", "rise.localhost");
+        // `mise br docker` sets this so the alias is stamped verbatim as
+        // rise.localhost:host-gateway (host-run backend, portable across
+        // Docker Desktop and Linux) instead of being DNS-resolved.
+        env.insert("RISE_APP_BACKEND_IP", "host-gateway");
         // The local overlay opens the SSRF guard to reach the internal
         // http://rise-dex:5556 issuer. Set as string "true" (env-interpolated) to
         // exercise the string->bool flexible deserialization.
@@ -2642,6 +2660,7 @@ auth:
             production_ingress_url_template,
             ingress_port,
             app_backend_host_aliases,
+            app_backend_ip,
             ..
         }) = &settings.deployment_controller
         else {
@@ -2653,6 +2672,12 @@ auth:
             app_backend_host_aliases,
             &vec!["rise.localhost".to_string()],
             "local: app_backend_host_aliases must contain the issuer host"
+        );
+        // LOCAL: explicit host-gateway override (used verbatim, skips DNS).
+        assert_eq!(
+            app_backend_ip.as_deref(),
+            Some("host-gateway"),
+            "local: app_backend_ip must be the host-gateway override"
         );
         assert_eq!(ingress_schema, "http");
         assert_eq!(traefik_entrypoint, "web");
@@ -2715,6 +2740,7 @@ auth:
             traefik_entrypoint,
             production_ingress_url_template,
             app_backend_host_aliases,
+            app_backend_ip,
             ..
         }) = &settings.deployment_controller
         else {
@@ -2726,6 +2752,13 @@ auth:
         assert!(
             app_backend_host_aliases.is_empty(),
             "prod: app_backend_host_aliases must be empty, got {app_backend_host_aliases:?}"
+        );
+        // PROD: RISE_APP_BACKEND_IP unset -> blank `${...:-}` -> None, so the
+        // controller falls back to DNS resolution (containerized backend), and
+        // never injects a host-gateway override.
+        assert!(
+            app_backend_ip.is_none(),
+            "prod: app_backend_ip must be None, got {app_backend_ip:?}"
         );
         assert_eq!(ingress_schema, "https");
         assert_eq!(traefik_entrypoint, "websecure");

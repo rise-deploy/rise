@@ -95,6 +95,12 @@ services:
       - "8090:8080"    # Traefik dashboard: http://localhost:8090
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+    # Make `host.docker.internal` resolve to the host gateway so Traefik's
+    # forwardAuth can reach a host-run backend (`mise br docker`, which sets
+    # RISE_AUTH_BACKEND_URL=http://host.docker.internal:3000) on Linux too.
+    # No-op on Docker Desktop, which resolves host.docker.internal automatically.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     # Join the compose default network ("rise_default") explicitly so Traefik is
     # on the same network as the app containers it routes to. The Docker provider
     # is pinned to this network via --providers.docker.network=rise_default, so

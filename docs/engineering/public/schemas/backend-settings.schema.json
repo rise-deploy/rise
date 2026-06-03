@@ -569,6 +569,14 @@
               },
               "type": "array"
             },
+            "app_backend_ip": {
+              "default": null,
+              "description": "**LOCAL-DEV ONLY.** Explicit IP/value to alias the\n`app_backend_host_aliases` hosts to (injected as `extra_hosts` on\nmanaged app containers), used VERBATIM instead of resolving the\n`auth_backend_url` host via DNS.\n\nSet to Docker's special `host-gateway` so apps reach a host-run\nbackend (`mise br docker`) on both Docker Desktop and Linux — Docker\nreplaces `host-gateway` with the host gateway per container at create\ntime. Empty/absent (the default) → fall back to DNS resolution of the\n`auth_backend_url` host. **Leave unset in production** (the\ncontainerized backend is resolved by Docker DNS).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "auth_backend_url": {
               "default": "",
               "description": "Internal URL Traefik uses to reach the Rise backend for the\nforwardAuth subrequest (e.g. `http://rise:3000` on the compose\nnetwork). Used to build the `forwardauth.address` middleware label\npointing at `/api/v1/auth/ingress`. Required when any configured\naccess class has a non-`None` access requirement\n(`Authenticated`/`Member`); the backend refuses to start otherwise,\nto avoid serving those projects publicly with no auth enforced.",

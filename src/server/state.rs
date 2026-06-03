@@ -354,6 +354,7 @@ async fn init_docker_backend(
         access_classes,
         auth_backend_url,
         app_backend_host_aliases,
+        app_backend_ip: app_backend_ip_override,
         publish_app_ports,
         ..
     } = settings
@@ -461,6 +462,21 @@ async fn init_docker_backend(
     let app_backend_host_aliases = app_backend_host_aliases.clone();
     let app_backend_ip = if app_backend_host_aliases.is_empty() {
         None
+    } else if let Some(ip) = app_backend_ip_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        // Explicit override (e.g. `host-gateway` for `mise br docker`): used
+        // verbatim, skipping DNS resolution. The override can name a value that
+        // is not DNS-resolvable from the host (e.g. `host-gateway`,
+        // `host.docker.internal`), which Docker resolves per container.
+        tracing::info!(
+            backend_ip = %ip,
+            aliases = ?app_backend_host_aliases,
+            "Using explicit app_backend_ip override for app container host aliases (local dev)"
+        );
+        Some(ip.to_string())
     } else {
         match resolve_backend_ip(auth_backend_url).await {
             Some(ip) => {

@@ -233,22 +233,25 @@ docker)
     docker compose exec -T postgres pg_isready -U rise >/dev/null 2>&1 && break
     sleep 1
   done
-  # The rise_default bridge gateway is the host's address on that network, so
-  # containers (Traefik forwardAuth, app containers) reach host-Rise through it.
-  GW="$(docker network inspect rise_default -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)"
-  if [ -z "$GW" ]; then
-    printf "Error: could not determine the rise_default bridge gateway IP. Is the network up?\n" >&2
-    exit 1
-  fi
-  echo "Rise runs on the HOST; containers reach it at http://$GW:3000 (rise_default gateway)."
+  # Rise runs on the HOST while Traefik + app containers run in Docker. They
+  # reach host-Rise via Docker's magic host gateway, which is portable across
+  # Docker Desktop (macOS/Windows) and Linux:
+  #   - Traefik forwardAuth -> http://host.docker.internal:3000 (Docker Desktop
+  #     resolves it automatically; on Linux the dev compose Traefik service
+  #     carries extra_hosts host.docker.internal:host-gateway).
+  #   - app containers -> RISE_APP_BACKEND_IP=host-gateway makes the controller
+  #     stamp extra_hosts rise.localhost:host-gateway (Docker resolves the host
+  #     gateway per container on both platforms).
+  echo "Rise runs on the HOST; containers reach it at http://host.docker.internal:3000."
   RISE_CONFIG_RUN_MODE=docker \\
   DATABASE_URL=postgres://rise:rise123@localhost:5432/rise \\
   PUBLIC_URL=http://rise.localhost:3000 \\
   DEX_ISSUER=http://rise-dex:5556/dex \\
   RISE_REGISTRY_URL=localhost:5000 \\
   RISE_CLIENT_REGISTRY_URL=localhost:5000 \\
-  RISE_AUTH_BACKEND_URL=http://$GW:3000 \\
+  RISE_AUTH_BACKEND_URL=http://host.docker.internal:3000 \\
   RISE_APP_BACKEND_HOST_ALIAS=rise.localhost \\
+  RISE_APP_BACKEND_IP=host-gateway \\
   RISE_PUBLISH_APP_PORTS=true \\
   RISE_STATIC_DIR=$PWD/static \\
   RISE_FRONTEND_DEV_PROXY_URL=http://localhost:5173 \\

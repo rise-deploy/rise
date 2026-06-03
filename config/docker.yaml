@@ -134,6 +134,12 @@ deployment_controller:
   # The local overlay sets RISE_APP_BACKEND_HOST_ALIAS=rise.localhost to enable it.
   app_backend_host_aliases:
     - "${RISE_APP_BACKEND_HOST_ALIAS:-}"
+  # LOCAL-DEV ONLY: explicit value the app_backend_host_aliases resolve to, used
+  # verbatim (skips DNS resolution of auth_backend_url). `mise br docker` sets
+  # RISE_APP_BACKEND_IP=host-gateway so apps reach the host-run backend on both
+  # Docker Desktop and Linux. Unset (prod/standalone) => blank => None => falls
+  # back to DNS resolution of auth_backend_url (e.g. http://rise:3000).
+  app_backend_ip: "${RISE_APP_BACKEND_IP:-}"
   # DEV-ONLY: publish each app container's HTTP port to a random 127.0.0.1 host
   # port so a host-run backend (mise br docker / Docker Desktop, where container
   # bridge IPs aren't routable from the host) can health-probe the app directly.

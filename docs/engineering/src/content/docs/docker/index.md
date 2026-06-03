@@ -120,24 +120,28 @@ the full `mise setup` (that provisions minikube/Kubernetes, which the Docker
 backend doesn't use).
 
 The twist is **container→host reachability**: Traefik's forwardAuth and the app
-containers run in containers but must reach Rise on the host. On Linux the
-`rise_default` bridge **gateway IP** is the host's address on that network, so
-the task computes it and sets `RISE_AUTH_BACKEND_URL=http://$GW:3000`:
+containers run in containers but must reach Rise on the host. `mise br docker`
+solves this with Docker's magic host gateway, which is **portable across Docker
+Desktop (macOS/Windows) and Linux** — no per-platform overrides:
 
-```bash
-GW=$(docker network inspect rise_default -f '{{(index .IPAM.Config 0).Gateway}}')
-```
+- **Traefik → backend (forwardAuth):** the task sets
+  `RISE_AUTH_BACKEND_URL=http://host.docker.internal:3000`. Docker Desktop
+  resolves `host.docker.internal` to the host automatically; on Linux the dev
+  `docker-compose.yml` Traefik service carries
+  `extra_hosts: ["host.docker.internal:host-gateway"]` so it resolves there too
+  (a no-op on Docker Desktop).
+- **App → backend:** the task sets `RISE_APP_BACKEND_IP=host-gateway` (with
+  `RISE_APP_BACKEND_HOST_ALIAS=rise.localhost`), so Rise's
+  `app_backend_host_aliases` machinery injects `rise.localhost:host-gateway`
+  into every managed app container's `extra_hosts`. Docker replaces the special
+  `host-gateway` value with the host gateway per container on **both** Docker
+  Desktop and Linux, so apps reach host-Rise (validate the `rise_jwt` cookie,
+  OIDC discovery) without any DNS lookup.
 
-Rise's `app_backend_host_aliases` machinery then resolves that `auth_backend_url`
-host (here the gateway IP) and injects `rise.localhost:<GW>` into every managed
-app container's `extra_hosts`, so apps can reach host-Rise (validate the
-`rise_jwt` cookie, OIDC discovery) and Traefik's forwardAuth address becomes
-`http://$GW:3000/...`.
-
-> This is **Linux-oriented**: the bridge gateway resolves to the host. On Docker
-> Desktop (macOS/Windows) the gateway differs and the host is instead reachable
-> at `host.docker.internal`; override `RISE_AUTH_BACKEND_URL` (and, if needed,
-> `RISE_APP_BACKEND_HOST_ALIAS`) accordingly.
+The new `deployment_controller.app_backend_ip` setting (env
+`RISE_APP_BACKEND_IP`) is the explicit override that supplies `host-gateway`
+verbatim, bypassing the DNS resolution used for a containerized backend. It is
+**local-dev only** — leave it unset in production.
 
 ## Production deployment
 
@@ -299,7 +303,7 @@ traefik.http.routers.<router>.middlewares = <router>-auth@docker
 > The `http://rise:3000` host shown here is the value for the **standalone
 > Compose stack**, where the backend is a service named `rise`. It is whatever
 > `deployment_controller.auth_backend_url` resolves to — on the host-dev path
-> (`mise br docker`) that is the bridge gateway URL `http://$GW:3000` (see
+> (`mise br docker`) that is `http://host.docker.internal:3000` (see
 > [Local development](#local-development-run-rise-on-the-host-no-image)), not
 > `rise:3000`.
 
@@ -355,18 +359,28 @@ the Rise backend at that host. In a **local** stack the public host resolves to
 the app container's *own* loopback, not the backend — so those calls would fail.
 
 To fix this locally the Docker controller stamps `HostConfig.extra_hosts` on
-every managed app container, mapping the configured alias host to the backend's
-IP on the shared `rise_default` network. The backend IP is resolved at reconcile
-startup from the `auth_backend_url` host (e.g. `rise`) via Docker DNS. The local
-overlay enables it by setting `RISE_APP_BACKEND_HOST_ALIAS=rise.localhost`, which
-populates `deployment_controller.app_backend_host_aliases`.
+every managed app container, mapping the configured alias host
+(`RISE_APP_BACKEND_HOST_ALIAS=rise.localhost`, which populates
+`deployment_controller.app_backend_host_aliases`) to the backend. There are two
+cases, depending on where the backend runs:
 
-**Production needs nothing here** — and the alias list is empty by default.
-Public DNS resolves `rise.${RISE_DOMAIN}` to Traefik, which terminates TLS and
-forwards to the backend; injecting an `extra_hosts` override in production would
-wrongly bypass Traefik and break TLS. (The captured backend IP is fixed at
-container-create time; if the backend restarts with a new IP, existing app
-containers keep the old entry until recreated — acceptable for local dev.)
+1. **Containerized backend (standalone Compose):** the alias is mapped to the
+   backend's IP on the shared `rise_default` network, resolved at reconcile
+   startup from the `auth_backend_url` host (e.g. `rise`) via Docker DNS
+   (`resolve_backend_ip` in `src/server/state.rs`). The captured IP is fixed at
+   container-create time; if the backend restarts with a new IP, existing app
+   containers keep the old entry until recreated — acceptable for local dev.
+2. **Host-run backend (`mise br docker`):** the task sets
+   `RISE_APP_BACKEND_IP=host-gateway` (the `deployment_controller.app_backend_ip`
+   setting), so the controller stamps `rise.localhost:host-gateway` verbatim,
+   skipping DNS. Docker resolves the special `host-gateway` value to the host
+   gateway **per container** at create time, on both Docker Desktop and Linux —
+   so there is no captured IP and no staleness.
+
+**Production needs nothing here** — and the alias list is empty by default
+(`app_backend_ip` is unset too). Public DNS resolves `rise.${RISE_DOMAIN}` to
+Traefik, which terminates TLS and forwards to the backend; injecting an
+`extra_hosts` override in production would wrongly bypass Traefik and break TLS.
 
 ## Authentication / Dex
 
