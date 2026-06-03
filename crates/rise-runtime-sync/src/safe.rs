@@ -148,11 +148,10 @@ macro_rules! leader_controller {
                 // of the others' intervals. Every deadline is anchored at startup
                 // (`now`), not `now + interval`, so each schedule is evaluated on
                 // the first loop iteration and runs promptly after start/handover
-                // instead of waiting a full interval — matching the prior
-                // immediate-first-tick of `tokio::time::interval`. The
-                // GlobalSchedule gate still fences sub-interval re-runs, so the
-                // first pass cannot burst. (`let _ = $interval` just consumes the
-                // metavariable to drive the per-schedule repetition.)
+                // instead of waiting a full interval. The GlobalSchedule gate
+                // still fences sub-interval re-runs, so the first pass cannot
+                // burst. (`let _ = $interval` just consumes the metavariable to
+                // drive the per-schedule repetition.)
                 let __start = ::tokio::time::Instant::now();
                 let mut __deadlines = [$({ let _ = $interval; __start }),+];
                 loop {

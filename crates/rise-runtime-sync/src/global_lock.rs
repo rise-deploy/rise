@@ -22,9 +22,9 @@
 //!   than recycled) but guarantees the lock cannot leak — and needs no `await`.
 //!
 //! `Drop` can't `await`, so it can't run `pg_advisory_unlock` itself; closing
-//! the connection is the async-free equivalent. (The previous design returned
-//! the lock-holding connection to the pool on a forgotten `release()`, which
-//! could leak the lock until the pool happened to evict that connection.)
+//! the connection is the async-free equivalent. Returning the lock-holding
+//! connection to the pool on a forgotten `release()` would instead leak the
+//! lock until the pool happened to evict that connection — hence the close.
 //!
 //! For a critical section that fits in a single transaction, prefer
 //! `pg_advisory_xact_lock` directly — Postgres releases transaction-scoped

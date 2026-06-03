@@ -193,8 +193,8 @@ impl ResourceGcController {
                     );
                     // 2, 4, 8, 16, 32, 60, 60 ... — capped at 60s after the
                     // 6th consecutive failure. Recovery still happens within
-                    // ~1 minute of the dependency returning, but a sustained
-                    // outage no longer produces 360 identical log lines/hour.
+                    // ~1 minute of the dependency returning, while the cap keeps
+                    // a sustained outage to ~1 log line/minute.
                     let exp = consecutive_failures.min(6);
                     let backoff_secs = std::cmp::min(60u64, 2u64.saturating_pow(exp));
                     tokio::time::sleep(Duration::from_secs(backoff_secs)).await;

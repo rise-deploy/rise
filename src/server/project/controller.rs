@@ -45,10 +45,10 @@ impl ProjectController {
                 // `process_deleting_projects`.
                 "rise-project-deletion" every Duration::from_secs(5)
                     => controller.process_deleting_projects(&election).await,
-                // Hourly housekeeping. A real `GlobalSchedule` (vs the previous
-                // per-replica tick counter, which reset on every leadership
-                // handover and could perpetually defer the sweep) keeps the
-                // cadence globally coordinated across replicas.
+                // Hourly housekeeping. Using a `GlobalSchedule` keeps the
+                // cadence globally coordinated across replicas and survives
+                // leadership handovers (the cadence is anchored on the shared
+                // `last_run_at`, not on any single replica's local state).
                 "rise-project-cleanup" every Duration::from_secs(3600)
                     => controller.cleanup_expired_transient_state().await,
             },
