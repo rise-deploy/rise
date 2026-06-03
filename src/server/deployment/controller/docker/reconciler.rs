@@ -941,6 +941,12 @@ impl DockerReconciler {
         //   - workers (no port) must exist and be `running` on the daemon.
         // An empty spec set is never ready.
         let mut all_ready = !container_specs.is_empty();
+        // Per-container "why not ready" detail, surfaced into the Unhealthy status
+        // reason (and logged) so an operator sees *what* was probed and *how* it
+        // failed — not just a generic "health probe failing".
+        let mut not_ready_reasons: Vec<String> = Vec::new();
+        let running_of =
+            |i: &Option<InspectedContainer>| i.as_ref().map(|i| i.running).unwrap_or(false);
         for spec in &container_specs {
             let name = container_builder::container_name(
                 &self.config.container_prefix,
@@ -957,12 +963,40 @@ impl DockerReconciler {
                 // `health_check = false` removes the probes. Otherwise probe the
                 // container's `health_check.path` (or the controller default).
                 Some(port) => match effective_health_path(spec, &self.config.health_path) {
-                    Some(path) => self.probe_container(inspected.as_ref(), port, &path).await,
-                    None => inspected.as_ref().map(|i| i.running).unwrap_or(false),
+                    Some(path) => match self.probe_container(inspected.as_ref(), port, &path).await
+                    {
+                        Ok(()) => true,
+                        Err(reason) => {
+                            // Per-tick at debug to avoid noise while an app is
+                            // still warming up; the reason is also folded into the
+                            // user-visible Unhealthy status below.
+                            debug!(
+                                deployment_id = %deployment.deployment_id,
+                                container = %spec.name,
+                                "Health probe failed: {reason}"
+                            );
+                            not_ready_reasons.push(format!("'{}' {reason}", spec.name));
+                            false
+                        }
+                    },
+                    None => {
+                        let running = running_of(&inspected);
+                        if !running {
+                            not_ready_reasons
+                                .push(format!("'{}' not running (probe disabled)", spec.name));
+                        }
+                        running
+                    }
                 },
                 // Worker: no HTTP endpoint, so the daemon's run state is the
                 // only liveness signal we have.
-                None => inspected.as_ref().map(|i| i.running).unwrap_or(false),
+                None => {
+                    let running = running_of(&inspected);
+                    if !running {
+                        not_ready_reasons.push(format!("worker '{}' not running", spec.name));
+                    }
+                    running
+                }
             };
             inspected_by_name.insert(name, inspected);
             if !ready {
@@ -973,6 +1007,15 @@ impl DockerReconciler {
             }
         }
         let is_ready = all_ready;
+        // Human-readable rollup of the not-ready reasons for the status message.
+        let unhealthy_reason = if not_ready_reasons.is_empty() {
+            "Container health probe failing".to_string()
+        } else {
+            format!(
+                "Container health probe failing: {}",
+                not_ready_reasons.join("; ")
+            )
+        };
 
         // Snapshot controller_metadata in a K8s-pod-status-shaped blob so the
         // existing status APIs/UI render unchanged. Built from the inspections
@@ -1006,14 +1049,10 @@ impl DockerReconciler {
             DeploymentStatus::Healthy if !is_ready => {
                 warn!(
                     deployment_id = %deployment.deployment_id,
-                    "Healthy deployment is now unhealthy"
+                    "Healthy deployment is now unhealthy: {unhealthy_reason}"
                 );
-                db_deployments::mark_unhealthy(
-                    &self.db_pool,
-                    deployment.id,
-                    "Container health probe failing".to_string(),
-                )
-                .await?;
+                db_deployments::mark_unhealthy(&self.db_pool, deployment.id, unhealthy_reason)
+                    .await?;
                 db_projects::update_calculated_status(&self.db_pool, project.id).await?;
             }
             DeploymentStatus::Unhealthy if is_ready => {
@@ -1042,44 +1081,53 @@ impl DockerReconciler {
     /// for the containerized/production backend on the shared network.
     ///
     /// Reuses the reconciler's shared `reqwest::Client` and its `status < 500`
-    /// semantics (5s timeout). A missing inspection / address (container not yet
-    /// attached or started) is treated as not-ready rather than an error.
+    /// semantics (5s timeout). Returns `Ok(())` when the app answers `< 500`, or
+    /// `Err(reason)` describing exactly what was probed and how it failed (no
+    /// target yet, bad status, or a connection/timeout error) so the reason can
+    /// be surfaced into the deployment's Unhealthy status and logs.
     async fn probe_container(
         &self,
         inspected: Option<&InspectedContainer>,
         port: u16,
         health_path: &str,
-    ) -> bool {
+    ) -> Result<(), String> {
         let Some(inspected) = inspected else {
-            return false;
+            return Err("container not yet created/inspectable".to_string());
         };
         let url = if self.config.publish_app_ports {
             match inspected.published_host_port.as_deref() {
                 Some(host_port) if !host_port.is_empty() => {
-                    format!("http://127.0.0.1:{}{}", host_port, health_path)
+                    format!("http://127.0.0.1:{host_port}{health_path}")
                 }
                 _ => {
-                    debug!("Container has no published loopback port yet; treating as not-ready");
-                    return false;
+                    return Err(format!(
+                        "app port {port} is not published to a loopback host port yet \
+                         (publish_app_ports is on) — the container predates the setting and \
+                         will be recreated automatically to gain the binding"
+                    ));
                 }
             }
         } else {
             match inspected.ip.as_deref() {
-                Some(ip) if !ip.is_empty() => {
-                    format!("http://{}:{}{}", ip, port, health_path)
-                }
+                Some(ip) if !ip.is_empty() => format!("http://{ip}:{port}{health_path}"),
                 _ => {
-                    debug!(
-                        network = %self.config.traefik_network,
-                        "Container has no IP on the Traefik network yet; treating as not-ready"
-                    );
-                    return false;
+                    return Err(format!(
+                        "container has no IP on network '{}' yet",
+                        self.config.traefik_network
+                    ));
                 }
             }
         };
         match self.http_client.get(&url).send().await {
-            Ok(resp) => resp.status().as_u16() < 500,
-            Err(_) => false,
+            Ok(resp) => {
+                let code = resp.status().as_u16();
+                if code < 500 {
+                    Ok(())
+                } else {
+                    Err(format!("GET {url} returned HTTP {code}"))
+                }
+            }
+            Err(e) => Err(format!("GET {url} failed: {}", probe_error_detail(&e))),
         }
     }
 
@@ -1415,13 +1463,13 @@ pub struct ActualContainer {
     pub deployment_id_label: Option<String>,
     pub image_label: Option<String>,
     pub env_hash_label: Option<String>,
-    /// The `route-hash` bookkeeping label stamped on the live container (sha256
-    /// of its rendered Traefik label set; empty string when non-routable).
+    /// The `route-hash` recreate-signature label stamped on the live container
+    /// (sha256 of its rendered Traefik label set plus its published-port intent).
     /// `None` for legacy containers created before this label existed. Compared
-    /// against the desired container's `route_hash` so a routing transition —
-    /// e.g. a deployment becoming or ceasing to be active — forces a recreate
-    /// that adds or removes the Traefik labels (Docker can't mutate them in
-    /// place on a running container).
+    /// against the desired container's `route_hash` so a routing transition (a
+    /// deployment becoming or ceasing to be active) OR a published-port change
+    /// forces a recreate — Docker can't mutate a running container's labels or
+    /// port bindings in place.
     pub route_hash_label: Option<String>,
     /// Daemon-reported lifecycle state (e.g. "running", "exited", "created",
     /// "dead", "restarting", "paused"). `None` when the daemon didn't report
@@ -1509,16 +1557,17 @@ pub fn diff_desired_vs_actual(
                 matched_actual.insert(name.clone());
                 let image_drift = a.image_label.as_deref() != Some(d.image.as_str());
                 let env_drift = a.env_hash_label.as_deref() != Some(d.env_hash.as_str());
-                // Routing drift: the live container's stamped `route-hash`
-                // differs from the desired one. This is what makes routability a
-                // first-class part of the diff — when a deployment becomes active
-                // (gains Traefik labels) or stops being active (loses them) the
-                // hash changes, forcing a recreate WITH/WITHOUT the labels.
-                // Docker can't mutate a running container's labels in place, so
-                // recreation is the only way to apply the change. Idempotent:
-                // once the stamped hash equals the desired one nothing recreates.
-                // A legacy container missing the label (`None`) is recreated once
-                // to gain it, then converges.
+                // Recreate-signature drift: the live container's stamped
+                // `route-hash` differs from the desired one. This makes
+                // create-time-only properties a first-class part of the diff —
+                // when a deployment becomes active (gains Traefik labels) or
+                // stops being active (loses them), OR when its app port starts/
+                // stops being published to a loopback host port, the hash changes
+                // and forces a recreate to apply it. Docker can't mutate a running
+                // container's labels or port bindings in place, so recreation is
+                // the only way. Idempotent: once the stamped hash equals the
+                // desired one nothing recreates. A legacy container missing the
+                // label (`None`) is recreated once to gain it, then converges.
                 let route_drift = a.route_hash_label.as_deref() != Some(d.route_hash.as_str());
                 // A container that matches on image + env but is in a
                 // terminal-ish state (created-but-never-started, exited, or
@@ -1588,6 +1637,22 @@ fn action_key(a: &ReconcileAction) -> (u8, String) {
 /// Merge env for one container in final precedence:
 /// base (plain + secret) → system env → per-container overrides. Later writes
 /// win on key conflict.
+/// Concise, human-readable detail for a probe `reqwest::Error`: prefer the
+/// underlying transport source (e.g. "connection refused", "timed out") over
+/// reqwest's verbose wrapper text, so the surfaced reason is actionable.
+fn probe_error_detail(e: &reqwest::Error) -> String {
+    use std::error::Error;
+    if let Some(src) = e.source() {
+        src.to_string()
+    } else if e.is_timeout() {
+        "timed out".to_string()
+    } else if e.is_connect() {
+        "connection error".to_string()
+    } else {
+        e.to_string()
+    }
+}
+
 /// Effective HTTP health-probe path for a container, honoring its public
 /// `health_check` spec (`rise.toml [containers.X.health_check]`):
 ///

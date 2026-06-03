@@ -60,13 +60,15 @@ pub struct DesiredContainer {
     /// `false` so its `Host(...)` rule is dropped and only the active deployment
     /// is routed.
     pub routable: bool,
-    /// sha256 of the fully-rendered Traefik label set for this container (empty
-    /// for a non-routable container). Precomputed by the reconciler via
+    /// Recreate-signature hash: sha256 of the fully-rendered Traefik label set
+    /// for this container PLUS whether its app port is published to a loopback
+    /// host port (`publish_app_ports`). Precomputed by the reconciler via
     /// [`route_hash_for`] so the (pure) diff can compare it against the
     /// `route-hash` bookkeeping label stamped on the actual container, and force
-    /// a recreate when routing changes — including a deployment becoming or
-    /// ceasing to be active. Docker can't mutate a running container's labels in
-    /// place, so a routing transition must be reconciled by recreation.
+    /// a recreate when either changes — a deployment becoming/ceasing to be
+    /// active, or the published-port binding being added/removed. Docker can't
+    /// mutate a running container's labels or port bindings in place, so such a
+    /// transition must be reconciled by recreation.
     pub route_hash: String,
 }
 
@@ -163,12 +165,16 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
     );
 
     // ── Labels: Traefik (routable only) ────────────────────────────────
-    // Render the Traefik label set first so its hash can be stamped as a
-    // bookkeeping label (`route-hash`). That hash lets the diff detect routing
-    // transitions — including a deployment becoming/ceasing to be active — that
-    // Docker can't apply to a running container's labels in place.
+    // Render the Traefik label set first so its recreate-signature hash can be
+    // stamped as a bookkeeping label (`route-hash`). That hash lets the diff
+    // detect create-time-only changes Docker can't apply to a running container
+    // in place — routing transitions (a deployment becoming/ceasing to be
+    // active) AND whether the app port is published to a loopback host port.
     let traefik_labels = render_traefik_labels_for(desired, cfg);
-    let route_hash = labels::hash_traefik_labels(&traefik_labels);
+    let route_hash = labels::hash_recreate_signature(
+        &traefik_labels,
+        desired.port.is_some() && cfg.publish_app_ports,
+    );
 
     // ── Labels: bookkeeping ─────────────────────────────────────────────
     let mut all_labels = BookkeepingLabels {
@@ -408,13 +414,16 @@ fn render_traefik_labels_for(
     out
 }
 
-/// Compute the `route-hash` for a desired container without building the full
-/// create spec. Used by the reconciler's diff so a routing transition (a
-/// deployment becoming or ceasing to be active) forces a recreate that
-/// adds/removes the Traefik labels. Must stay consistent with the hash stamped
-/// by [`build_container`].
+/// Compute the `route-hash` recreate signature for a desired container without
+/// building the full create spec. Used by the reconciler's diff so a routing
+/// transition (a deployment becoming or ceasing to be active) OR a change in
+/// whether the app port is published to a loopback host port forces a recreate.
+/// Must stay consistent with the hash stamped by [`build_container`].
 pub fn route_hash_for(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> String {
-    labels::hash_traefik_labels(&render_traefik_labels_for(desired, cfg))
+    labels::hash_recreate_signature(
+        &render_traefik_labels_for(desired, cfg),
+        desired.port.is_some() && cfg.publish_app_ports,
+    )
 }
 
 #[cfg(test)]
@@ -816,6 +825,38 @@ mod tests {
         desired.routable = false;
         let inactive = route_hash_for(&desired, &cfg);
         assert_ne!(active, inactive);
+    }
+
+    #[test]
+    fn route_hash_for_changes_with_publish_app_ports() {
+        // Toggling publish_app_ports for a port-bearing container changes the
+        // recreate-signature, so a container created before the flag was enabled
+        // (no published port) is recreated to gain the loopback binding — no
+        // manual redeploy needed.
+        let desired = single_container();
+        assert!(desired.port.is_some(), "fixture must have a port");
+        let mut cfg = test_cfg();
+        cfg.publish_app_ports = false;
+        let without = route_hash_for(&desired, &cfg);
+        cfg.publish_app_ports = true;
+        let with = route_hash_for(&desired, &cfg);
+        assert_ne!(without, with);
+    }
+
+    #[test]
+    fn route_hash_for_ignores_publish_for_worker() {
+        // A worker (no port) is never published, so the publish flag must not
+        // change its recreate-signature (no spurious churn of port-less
+        // containers when the flag is toggled).
+        let mut desired = single_container();
+        desired.port = None;
+        desired.routes = vec![];
+        let mut cfg = test_cfg();
+        cfg.publish_app_ports = false;
+        let off = route_hash_for(&desired, &cfg);
+        cfg.publish_app_ports = true;
+        let on = route_hash_for(&desired, &cfg);
+        assert_eq!(off, on);
     }
 
     #[test]

@@ -121,6 +121,30 @@ pub fn hash_traefik_labels(labels: &HashMap<String, String>) -> String {
         .collect()
 }
 
+/// Recreate-signature hash stamped as the `route-hash` bookkeeping label.
+///
+/// Extends [`hash_traefik_labels`] with create-time-only `HostConfig` properties
+/// the diff must detect but Docker can't change on a running container in place —
+/// currently whether the app port is published to a loopback host port
+/// (`publish_app_ports`). Folding it into the same hash the diff already compares
+/// means toggling port publishing (or a container created before the setting was
+/// enabled) registers as drift and forces a recreate, exactly like a Traefik
+/// label change — with no extra field to compare.
+pub fn hash_recreate_signature(labels: &HashMap<String, String>, publish_port: bool) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    // Compose over the label hash + a domain-separated publish bit, so the
+    // result still changes if either the labels or the publish intent change.
+    hasher.update(hash_traefik_labels(labels).as_bytes());
+    hasher.update(b"|publish_port:");
+    hasher.update([publish_port as u8]);
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// forwardAuth middleware spec for a routable container. Mirrors the
 /// Kubernetes nginx `auth-url`/`auth-response-headers` annotations: Traefik
 /// issues a subrequest to `address` before proxying, and copies the named
@@ -524,5 +548,21 @@ mod tests {
             hash_traefik_labels(&HashMap::new())
         );
         assert_ne!(hash_traefik_labels(&empty), hash_traefik_labels(&a));
+    }
+
+    #[test]
+    fn hash_recreate_signature_folds_in_publish_bit() {
+        let mut labels = HashMap::new();
+        labels.insert("traefik.enable".to_string(), "true".to_string());
+
+        let off = hash_recreate_signature(&labels, false);
+        let on = hash_recreate_signature(&labels, true);
+        // The publish bit changes the signature (drives the recreate at toggle).
+        assert_ne!(off, on);
+        // Deterministic for the same inputs.
+        assert_eq!(off, hash_recreate_signature(&labels, false));
+        // Distinct from the bare label hash, so containers stamped with the old
+        // label-only hash recreate once to converge onto the new signature.
+        assert_ne!(off, hash_traefik_labels(&labels));
     }
 }
