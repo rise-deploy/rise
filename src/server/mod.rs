@@ -146,10 +146,21 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
     let mut controller_handles = vec![];
 
     // Cooperative shutdown signal for all background controllers and extension
-    // loops. Created in `AppState::new` (extensions start there) and shared here;
-    // cancelled once the server has received SIGINT/SIGTERM, so each loop exits
-    // and releases its leader lease promptly instead of waiting out the TTL.
+    // loops. Created in `AppState::new` (extensions start there) and shared here.
     let shutdown = state.shutdown.clone();
+
+    // Cancel the shared token the moment a SIGINT/SIGTERM arrives, so the HTTP
+    // drain and the controllers'/extensions' lease release proceed concurrently
+    // — rather than the controllers holding their leases for the whole HTTP
+    // drain and only stopping once `axum::serve` returns.
+    {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            info!("Shutdown signal received; stopping background tasks");
+            shutdown.cancel();
+        });
+    }
 
     // Start project controller (always enabled)
     info!("Starting project controller");
@@ -322,26 +333,27 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         info!("Metacontroller webhook listener on http://{}", webhook_addr);
         let webhook_listener = tokio::net::TcpListener::bind(&webhook_addr).await?;
 
+        let webhook_shutdown = shutdown.clone();
         Some(tokio::spawn(async move {
             axum::serve(
                 webhook_listener,
                 webhook_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
-            .with_graceful_shutdown(shutdown_signal())
+            .with_graceful_shutdown(async move { webhook_shutdown.cancelled().await })
             .await
         }))
     } else {
         None
     };
 
-    // Graceful shutdown support
+    // Graceful shutdown driven off the shared token (cancelled by the signal
+    // watcher above), so the HTTP drain and lease release run concurrently.
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown({
+            let shutdown = shutdown.clone();
+            async move { shutdown.cancelled().await }
+        })
         .await?;
-
-    // The server stopped because we received a shutdown signal — tell the
-    // background controllers to stop and release their leader leases.
-    shutdown.cancel();
 
     #[cfg(feature = "backend")]
     if let Some(handle) = webhook_handle {

@@ -822,9 +822,9 @@ impl AppState {
         // every leader-elected loop and releases its lease.
         let shutdown = tokio_util::sync::CancellationToken::new();
         // Collect the extension tasks' handles so `run_server` can await their
-        // graceful lease release on shutdown.
-        let extension_handles: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
+        // graceful lease release on shutdown. A plain Vec during startup (no lock
+        // is held across `start()`); wrapped in Arc<Mutex<…>> in the returned state.
+        let mut extension_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
         // Register extensions from configuration
         if let Some(ref extensions_config) = settings.extensions {
@@ -903,10 +903,7 @@ impl AppState {
                         extension_registry.register_type(aws_rds_arc.clone());
 
                         // Start the extension's reconciliation loop
-                        extension_handles
-                            .lock()
-                            .unwrap()
-                            .push(aws_rds_arc.start(shutdown.clone()));
+                        extension_handles.push(aws_rds_arc.start(shutdown.clone()));
 
                         tracing::info!("AWS RDS extension provider initialized and started");
                     }
@@ -964,10 +961,7 @@ impl AppState {
                         let aws_s3_arc: Arc<dyn crate::server::extensions::Extension> =
                             Arc::new(aws_s3_provisioner);
                         extension_registry.register_type(aws_s3_arc.clone());
-                        extension_handles
-                            .lock()
-                            .unwrap()
-                            .push(aws_s3_arc.start(shutdown.clone()));
+                        extension_handles.push(aws_s3_arc.start(shutdown.clone()));
 
                         tracing::info!("AWS S3 bucket extension provider initialized and started");
                     }
@@ -1000,10 +994,7 @@ impl AppState {
         let oauth_provider_arc: Arc<dyn crate::server::extensions::Extension> =
             Arc::new(oauth_provider);
         extension_registry.register_type(oauth_provider_arc.clone());
-        extension_handles
-            .lock()
-            .unwrap()
-            .push(oauth_provider_arc.start(shutdown.clone()));
+        extension_handles.push(oauth_provider_arc.start(shutdown.clone()));
         tracing::info!("OAuth extension provider initialized and started");
 
         // Register Snowflake OAuth provisioner (if configured)
@@ -1057,7 +1048,7 @@ impl AppState {
                     let snowflake_oauth_arc: Arc<dyn crate::server::extensions::Extension> =
                         Arc::new(snowflake_oauth_provisioner);
                     extension_registry.register_type(snowflake_oauth_arc.clone());
-                    extension_handles.lock().unwrap().push(snowflake_oauth_arc.start(shutdown.clone()));
+                    extension_handles.push(snowflake_oauth_arc.start(shutdown.clone()));
                     tracing::info!("Snowflake OAuth provisioner initialized and started");
                 }
             }
@@ -1144,7 +1135,7 @@ impl AppState {
         Ok(Self {
             db_pool,
             shutdown,
-            extension_handles,
+            extension_handles: Arc::new(std::sync::Mutex::new(extension_handles)),
             jwt_validator,
             jwt_signer,
             oauth_client,
