@@ -15,9 +15,6 @@ pub enum AuthError {
     /// The `kid` in the JWT header was not present in the issuer's JWKS.
     #[error("Key {kid} not found in JWKS for issuer {issuer}")]
     KeyNotFound { kid: String, issuer: String },
-    /// The token's `exp` claim is in the past.
-    #[error("Token has expired")]
-    Expired,
     /// JWKS could not be fetched / resolved for the issuer.
     #[error("Failed to obtain JWKS for issuer {issuer}: {detail}")]
     Jwks { issuer: String, detail: String },
@@ -27,9 +24,6 @@ pub enum AuthError {
     /// A configuration value (e.g. controller id) was invalid.
     #[error("{0}")]
     InvalidConfig(String),
-    /// System time could not be read.
-    #[error("System time error: {0}")]
-    SystemTime(#[from] std::time::SystemTimeError),
 }
 
 /// Errors from JWT signing and key setup. Moved verbatim from `jwt_signer.rs`.
@@ -39,6 +33,8 @@ pub enum JwtSignerError {
     InvalidBase64(#[from] base64::DecodeError),
     #[error("JWT signing failed: {0}")]
     SigningFailed(#[from] jsonwebtoken::errors::Error),
+    #[error("JWT audience does not match expected audience")]
+    AudienceMismatch,
     #[error("System time error: {0}")]
     SystemTimeError(#[from] std::time::SystemTimeError),
     #[error("Missing required claim: {0}")]
@@ -59,7 +55,16 @@ impl From<AuthError> for JwtSignerError {
     fn from(err: AuthError) -> Self {
         match err {
             AuthError::Jwt(e) => JwtSignerError::SigningFailed(e),
-            AuthError::SystemTime(e) => JwtSignerError::SystemTimeError(e),
+            // SAFETY: this catch-all is only correct because the verify adapters
+            // (`verify_user_jwt` / `verify_jwt_skip_aud`) only ever propagate the
+            // error of `verify_rise_jwt`, whose return set is `{AuthError::Jwt}`.
+            // The remaining variants (MissingKid / KeyNotFound / Jwks /
+            // ClaimMismatch / InvalidConfig) belong to the external-JWT and
+            // controller-matching paths, which do NOT convert into
+            // `JwtSignerError`, so they are unreachable here today. If a future
+            // change lets any of them reach an adapter, add an explicit arm
+            // mapping it to a precise `JwtSignerError` variant rather than
+            // silently collapsing it into `InvalidAlgorithm`.
             _ => JwtSignerError::SigningFailed(
                 jsonwebtoken::errors::ErrorKind::InvalidAlgorithm.into(),
             ),

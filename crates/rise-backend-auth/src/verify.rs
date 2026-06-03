@@ -89,8 +89,8 @@ pub trait JwksKeySource: Send + Sync {
 /// 1. Decode the header to get the key ID (`kid`).
 /// 2. Fetch JWKS for the issuer via the [`JwksKeySource`].
 /// 3. Verify the signature (RS256) against the matching key, with `iss` set and
-///    audience validation disabled.
-/// 4. Double-check token expiry.
+///    audience validation disabled. Expiry (`exp`) is enforced by
+///    [`Validation`]'s defaults (`validate_exp`).
 ///
 /// Custom claim matching is performed separately (see
 /// [`validate_custom_claims`](crate::validate_custom_claims)).
@@ -118,18 +118,9 @@ pub async fn verify_external_jwt(
     // Disable built-in audience validation - validated separately via expected_claims
     validation.validate_aud = false;
 
-    // Validate and decode the token
+    // Validate and decode the token. `exp` is enforced by `Validation`'s
+    // defaults (`validate_exp` is true), so no manual expiry recheck is needed.
     let token_data = decode::<serde_json::Value>(token, key, &validation)?;
-
-    // Validate exp claim manually (should be handled by jsonwebtoken, but double-check)
-    if let Some(exp) = token_data.claims.get("exp").and_then(|v| v.as_u64()) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs();
-        if now > exp {
-            return Err(AuthError::Expired);
-        }
-    }
 
     Ok(ExternalClaims::new(issuer.to_string(), token_data.claims))
 }
@@ -276,7 +267,10 @@ mod tests {
             .unwrap();
 
         let result = signer.verify_user_jwt(&token, "https://rise.test");
-        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(crate::error::JwtSignerError::AudienceMismatch)
+        ));
     }
 
     #[test]

@@ -7,10 +7,9 @@
 //! controller tokens with user/SA flows.
 //!
 //! The configuration type ([`ControllerIdentity`]) and the pure matchers
-//! ([`match_controller_identity`], [`build_controller_indexes`],
-//! [`validate_controller_id`], [`audience_matches`]) live in the pure
-//! `rise-backend-auth` crate; they are imported here (and `ControllerIdentity`
-//! is re-exported so `settings.rs` and other references keep compiling).
+//! ([`match_controller_identity`], [`build_controller_indexes`]) live in the
+//! pure `rise-backend-auth` crate and are re-exported here so call sites can
+//! refer to them via this module path.
 //!
 //! The extractor is consumed by the generic resource API
 //! (`src/server/resources/handlers.rs`).

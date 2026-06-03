@@ -90,6 +90,7 @@ cargo fmt --all -- --check
 mise sqlx:check
 mise resource:schema:check
 helm lint helm/rise
+cargo test --package rise-backend-auth --all-targets
 """
 env.SQLX_OFFLINE = true
 

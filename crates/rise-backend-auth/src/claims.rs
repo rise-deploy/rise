@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 /// The `aud` claim determines the scope:
 /// - For UI login: aud = Rise public URL (e.g., "https://rise.example.com")
 /// - For project ingress: aud = project URL (e.g., "https://myapp.apps.rise.dev")
-#[derive(Debug, Serialize, Deserialize, Clone)]
+///
+/// `Debug` is implemented manually to redact the `email` field (PII) so it never
+/// leaks via `{:?}` (e.g. in logs or panic messages).
+#[derive(Serialize, Deserialize, Clone)]
 pub struct RiseClaims {
     /// User ID from IdP
     pub sub: String,
@@ -28,6 +31,21 @@ pub struct RiseClaims {
     pub iss: String,
     /// Audience (Rise UI URL or project URL)
     pub aud: String,
+}
+
+impl std::fmt::Debug for RiseClaims {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RiseClaims")
+            .field("sub", &self.sub)
+            .field("email", &"<redacted>")
+            .field("name", &self.name)
+            .field("groups", &self.groups)
+            .field("iat", &self.iat)
+            .field("exp", &self.exp)
+            .field("iss", &self.iss)
+            .field("aud", &self.aud)
+            .finish()
+    }
 }
 
 /// Subject info for workload identity JWT claims.

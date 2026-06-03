@@ -216,6 +216,10 @@ fn is_valid_name_segment(name: &str) -> bool {
 /// rules of the original `CONTROLLER_ID_RE`: lowercase host labels, mandatory
 /// dot, no leading/trailing label hyphen, and the case-sensitivity split
 /// between host (`[a-z0-9]`) and the optional `/name` (`[A-Za-z0-9]`).
+///
+/// NOTE: `crates/rise-resource-api` carries a parallel controller-id validator.
+/// The two implementations must be kept in agreement; de-duplicating them into a
+/// single shared validator is a tracked follow-up so they don't drift silently.
 pub fn validate_controller_id(id: &str) -> Result<(), AuthError> {
     if id.is_empty() {
         return Err(AuthError::InvalidConfig(
@@ -706,6 +710,30 @@ mod tests {
         expected_wrong.insert("aud".to_string(), "my-audience".to_string());
         expected_wrong.insert("environment".to_string(), "staging".to_string());
         assert!(validate_custom_claims(&jwt_claims, &expected_wrong).is_err());
+    }
+
+    #[test]
+    fn test_validate_custom_claims_mixed_exact_and_wildcard() {
+        // Three claims: aud exact, project_path exact, environment wildcard.
+        let jwt_claims = serde_json::json!({
+            "aud": "my-audience",
+            "project_path": "myorg/myrepo",
+            "environment": "app-mr/6",
+        });
+
+        let mut expected = HashMap::new();
+        expected.insert("aud".to_string(), "my-audience".to_string());
+        expected.insert("project_path".to_string(), "myorg/myrepo".to_string());
+        expected.insert("environment".to_string(), "app*".to_string());
+        assert!(validate_custom_claims(&jwt_claims, &expected).is_ok());
+
+        // Same constraint set, but the wildcard claim no longer matches.
+        let jwt_claims_fail = serde_json::json!({
+            "aud": "my-audience",
+            "project_path": "myorg/myrepo",
+            "environment": "webapp-staging",
+        });
+        assert!(validate_custom_claims(&jwt_claims_fail, &expected).is_err());
     }
 
     // --- validate_oidc_issuer ---

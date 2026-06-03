@@ -211,7 +211,7 @@ cargo clippy --all-features --all-targets -- -D warnings  # Lint (uses cached bu
 
 | What changed | Command | Why |
 |---|---|---|
-| Any `.rs` file | `cargo test --all-features` | Unit tests (requires `mise run db:migrate` once) |
+| Any `.rs` file | `cargo test --workspace --all-features` | Unit tests (requires `mise run db:migrate` once); `--workspace` ensures crates such as `rise-backend-auth` are included |
 | SQLX queries (`sqlx::query!` etc.) | `mise run sqlx:prepare` | Regenerate offline query cache (commit the result) |
 | Server settings structs (`src/server/settings.rs`) | `mise run config:schema:generate` | Regenerate `docs/engineering/public/schemas/backend-settings.schema.json` (commit the result) |
 | `src/rise_toml.rs` structs | `mise run rise-toml:schema:generate` | Regenerate `docs/user/public/schemas/rise-toml-v1.schema.json` (commit the result) |
@@ -225,7 +225,7 @@ mise run lint                  # cargo check + clippy + fmt check + sqlx check +
 mise run config:schema:check        # Verify backend config schema is up to date
 mise run rise-toml:schema:check    # Verify rise.toml schema is up to date
 mise run crd:check                 # Verify CRD YAML matches Rust definition
-cargo test --all-features      # Unit tests
+cargo test --workspace --all-features  # Unit tests (all crates)
 ```
 
 The `mise run lint` task runs: `cargo all-features check`, `cargo all-features clippy -- -D warnings`, `cargo fmt --check`, `mise sqlx:check`, and `helm lint helm/rise`.

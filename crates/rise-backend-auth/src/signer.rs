@@ -34,7 +34,7 @@ pub struct RiseTokenSigner {
 
     issuer: String,
     pub default_expiry_seconds: u64,
-    claims_to_include: Vec<String>,
+    claims_to_include: std::collections::HashSet<String>,
 }
 
 /// Compute a short key ID from a public key PEM.
@@ -176,7 +176,7 @@ impl RiseTokenSigner {
             rs256_key_id,
             issuer,
             default_expiry_seconds,
-            claims_to_include,
+            claims_to_include: claims_to_include.into_iter().collect(),
         })
     }
 
@@ -222,6 +222,56 @@ impl RiseTokenSigner {
         }))
     }
 
+    /// Build the shared [`RiseClaims`] body for user (HS256) and ingress (RS256)
+    /// tokens. Extracts the required `sub`/`email`, the optional `name` (only
+    /// when configured in `claims_to_include`), computes `iat`/`exp`, and stamps
+    /// the issuer and the supplied audience. The caller chooses the algorithm /
+    /// header when encoding.
+    fn build_rise_claims(
+        &self,
+        idp_claims: &serde_json::Value,
+        groups: Option<Vec<String>>,
+        aud: &str,
+        expiry_override: Option<u64>,
+    ) -> Result<RiseClaims, JwtSignerError> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let exp = expiry_override.unwrap_or_else(|| now + self.default_expiry_seconds);
+
+        // Extract required claims
+        let sub = idp_claims
+            .get("sub")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| JwtSignerError::MissingClaim("sub".to_string()))?
+            .to_string();
+
+        let email = idp_claims
+            .get("email")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| JwtSignerError::MissingClaim("email".to_string()))?
+            .to_string();
+
+        // Extract optional name claim if requested
+        let name = if self.claims_to_include.contains("name") {
+            idp_claims
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        } else {
+            None
+        };
+
+        Ok(RiseClaims {
+            sub,
+            email,
+            name,
+            groups,
+            iat: now,
+            exp,
+            iss: self.issuer.clone(),
+            aud: aud.to_string(),
+        })
+    }
+
     /// Sign a new Rise JWT for user authentication (HS256)
     ///
     /// This JWT is used for authenticating users to Rise (both UI and CLI).
@@ -241,42 +291,8 @@ impl RiseTokenSigner {
         rise_public_url: &str,
         expiry_override: Option<u64>,
     ) -> Result<String, JwtSignerError> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let exp = expiry_override.unwrap_or_else(|| now + self.default_expiry_seconds);
-
-        // Extract required claims
-        let sub = idp_claims
-            .get("sub")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| JwtSignerError::MissingClaim("sub".to_string()))?
-            .to_string();
-
-        let email = idp_claims
-            .get("email")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| JwtSignerError::MissingClaim("email".to_string()))?
-            .to_string();
-
-        // Extract optional name claim if requested
-        let name = if self.claims_to_include.contains(&"name".to_string()) {
-            idp_claims
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        } else {
-            None
-        };
-
-        let claims = RiseClaims {
-            sub,
-            email,
-            name,
-            groups,
-            iat: now,
-            exp,
-            iss: self.issuer.clone(),
-            aud: rise_public_url.to_string(),
-        };
+        let claims =
+            self.build_rise_claims(idp_claims, groups, rise_public_url, expiry_override)?;
 
         let header = Header::new(Algorithm::HS256);
         let token = encode(&header, &claims, &self.hs256_encoding_key)?;
@@ -303,42 +319,7 @@ impl RiseTokenSigner {
         project_url: &str,
         expiry_override: Option<u64>,
     ) -> Result<String, JwtSignerError> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let exp = expiry_override.unwrap_or_else(|| now + self.default_expiry_seconds);
-
-        // Extract required claims
-        let sub = idp_claims
-            .get("sub")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| JwtSignerError::MissingClaim("sub".to_string()))?
-            .to_string();
-
-        let email = idp_claims
-            .get("email")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| JwtSignerError::MissingClaim("email".to_string()))?
-            .to_string();
-
-        // Extract optional name claim if requested
-        let name = if self.claims_to_include.contains(&"name".to_string()) {
-            idp_claims
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        } else {
-            None
-        };
-
-        let claims = RiseClaims {
-            sub,
-            email,
-            name,
-            groups,
-            iat: now,
-            exp,
-            iss: self.issuer.clone(),
-            aud: project_url.to_string(),
-        };
+        let claims = self.build_rise_claims(idp_claims, groups, project_url, expiry_override)?;
 
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(self.rs256_key_id.clone());
@@ -411,9 +392,12 @@ impl RiseTokenSigner {
     ) -> Result<RiseClaims, JwtSignerError> {
         match self.verify_rise_jwt(token)? {
             RiseToken::Session(claims) if claims.aud == expected_aud => Ok(claims),
-            // An HS256 session token with the wrong audience, or an RS256 ingress
-            // token — both rejected on the API path, exactly as before.
-            _ => Err(JwtSignerError::SigningFailed(
+            // A correctly-signed HS256 session token with the wrong audience:
+            // labeled distinctly as an audience mismatch (still rejected).
+            RiseToken::Session(_) => Err(JwtSignerError::AudienceMismatch),
+            // An RS256 ingress token — genuinely the wrong token kind on the API
+            // path, so reject it as an algorithm error, exactly as before.
+            RiseToken::Ingress(_) => Err(JwtSignerError::SigningFailed(
                 jsonwebtoken::errors::ErrorKind::InvalidAlgorithm.into(),
             )),
         }
