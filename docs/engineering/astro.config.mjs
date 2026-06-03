@@ -37,21 +37,27 @@ export default defineConfig({
               ],
             },
             {
-              label: 'Kubernetes',
+              label: 'Deployment Backends',
               items: [
-                { label: 'Overview', slug: 'kubernetes' },
-                { label: 'Configuration', slug: 'kubernetes/configuration' },
-                { label: 'Architecture', slug: 'kubernetes/architecture' },
-                { label: 'Private Project Auth', slug: 'kubernetes/private-auth' },
-                { label: 'Custom Domains & TLS', slug: 'kubernetes/custom-domains' },
-                { label: 'Resources Reference', slug: 'kubernetes/resources' },
-                { label: 'Operations & Security', slug: 'kubernetes/operations' },
-              ],
-            },
-            {
-              label: 'Docker',
-              items: [
-                { label: 'Overview', slug: 'docker' },
+                { label: 'Overview & Feature Matrix', slug: 'deployment-backends' },
+                {
+                  label: 'Kubernetes',
+                  items: [
+                    { label: 'Overview', slug: 'kubernetes' },
+                    { label: 'Configuration', slug: 'kubernetes/configuration' },
+                    { label: 'Architecture', slug: 'kubernetes/architecture' },
+                    { label: 'Private Project Auth', slug: 'kubernetes/private-auth' },
+                    { label: 'Custom Domains & TLS', slug: 'kubernetes/custom-domains' },
+                    { label: 'Resources Reference', slug: 'kubernetes/resources' },
+                    { label: 'Operations & Security', slug: 'kubernetes/operations' },
+                  ],
+                },
+                {
+                  label: 'Docker',
+                  items: [
+                    { label: 'Overview', slug: 'docker' },
+                  ],
+                },
               ],
             },
             {
