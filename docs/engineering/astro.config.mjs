@@ -59,6 +59,7 @@ export default defineConfig({
             { label: 'Production Deployment', slug: 'production' },
             { label: 'Database', slug: 'database' },
             { label: 'PostgreSQL Upgrades', slug: 'upgrading-postgresql' },
+            { label: 'Upgrade Notes & Breaking Changes', slug: 'upgrade-notes' },
           ],
         },
         {
