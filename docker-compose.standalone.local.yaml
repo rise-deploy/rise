@@ -27,8 +27,13 @@ services:
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"
       - "--providers.docker.network=rise_default"
+      # Keep Traefik's API enabled internally (:8080, NOT published) so the
+      # backend's health-rolling serverStatus gate works in local/e2e too; the
+      # command is replaced wholesale on override, so it must be re-added here.
+      - "--api.insecure=true"
       - "--entrypoints.web.address=:80"
-    # Sequences are replaced (not merged) on override, so this drops 443.
+    # Sequences are replaced (not merged) on override, so this drops 443. :8080
+    # stays unpublished — the Traefik API is internal-only (rise_default).
     ports:
       - "80:80"        # app traffic: http://<project>.rise.localhost
 

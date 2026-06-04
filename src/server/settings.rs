@@ -686,10 +686,9 @@ fn default_metacontroller_webhook_port() -> u16 {
 ///   active/routable deployment at a time); the old route is dropped and the new
 ///   one stamped in one step.
 ///
-/// Currently defaults to `Recreate`; the default flips to `HealthRolling` in a
-/// later change once the rolling reconcile path lands. Driven by the
-/// `cutover_strategy` controller setting (kebab-case string in YAML, so
-/// `${VAR:-recreate}` interpolation deserializes straight into the enum).
+/// Defaults to `HealthRolling`. Driven by the `cutover_strategy` controller
+/// setting (kebab-case string in YAML, so `${VAR:-health-rolling}` interpolation
+/// deserializes straight into the enum).
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum CutoverStrategy {
@@ -702,7 +701,7 @@ pub enum CutoverStrategy {
 
 #[cfg(feature = "backend")]
 fn default_cutover_strategy() -> CutoverStrategy {
-    CutoverStrategy::Recreate
+    CutoverStrategy::HealthRolling
 }
 
 // ── Docker deployment controller defaults ──────────────────────────────
@@ -2769,19 +2768,21 @@ auth:
         else {
             panic!("expected docker deployment_controller");
         };
-        // cutover_strategy: env-driven `${RISE_CUTOVER_STRATEGY:-recreate}`
-        // defaults to `recreate` (the rolling default flips in a later change).
+        // cutover_strategy: env-driven `${RISE_CUTOVER_STRATEGY:-health-rolling}`
+        // defaults to `health-rolling`.
         assert_eq!(
             *cutover_strategy,
-            CutoverStrategy::Recreate,
-            "local: cutover_strategy must default to recreate"
+            CutoverStrategy::HealthRolling,
+            "local: cutover_strategy must default to health-rolling"
         );
-        // traefik_api_url: env-driven `${RISE_TRAEFIK_API_URL:-}` resolves to an
-        // empty string, which `deserialize_optional_nonempty_string` collapses to
-        // None (fall back to Rise's own probe).
+        // traefik_api_url: env-driven `${RISE_TRAEFIK_API_URL:-http://rise-traefik:8080}`
+        // defaults to the in-network standalone Traefik API (the serverStatus
+        // rolling gate works out of the box). Host-run dev overrides it to the
+        // published dashboard port.
         assert_eq!(
-            *traefik_api_url, None,
-            "local: traefik_api_url must default to None"
+            traefik_api_url.as_deref(),
+            Some("http://rise-traefik:8080"),
+            "local: traefik_api_url must default to the in-network Traefik API"
         );
         // Replicas: env-driven max (RISE_MAX_REPLICAS) defaults to 10 so the
         // Docker backend allows horizontal scale-out out of the box (the
@@ -2872,16 +2873,21 @@ auth:
         else {
             panic!("expected docker deployment_controller");
         };
-        // PROD: cutover_strategy still defaults to recreate (env unset).
+        // PROD: cutover_strategy defaults to health-rolling (env unset).
         assert_eq!(
             *cutover_strategy,
-            CutoverStrategy::Recreate,
-            "prod: cutover_strategy must default to recreate"
+            CutoverStrategy::HealthRolling,
+            "prod: cutover_strategy must default to health-rolling"
         );
-        // PROD: traefik_api_url unset -> None.
+        // PROD: traefik_api_url unset -> defaults to the in-network standalone
+        // Traefik API (rise-traefik:8080), reached over rise_default. The
+        // standalone Traefik enables its API internally (--api.insecure=true)
+        // without publishing :8080, so the serverStatus gate works with no extra
+        // env on the backend.
         assert_eq!(
-            *traefik_api_url, None,
-            "prod: traefik_api_url must default to None"
+            traefik_api_url.as_deref(),
+            Some("http://rise-traefik:8080"),
+            "prod: traefik_api_url must default to the in-network Traefik API"
         );
         // PROD: RISE_APP_BACKEND_HOST_ALIAS unset -> the single blank entry is
         // filtered out -> empty list -> NO extra_hosts injection (public DNS +

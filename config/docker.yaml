@@ -159,16 +159,17 @@ deployment_controller:
   #                     health check drains the old ones as the new come up.
   #   recreate        => Rise-gated single cutover: one active/routable
   #                     deployment at a time (old route dropped, new stamped).
-  # Default is `recreate` for now; the default flips to `health-rolling` in a
-  # later change once the rolling reconcile path lands.
-  cutover_strategy: "${RISE_CUTOVER_STRATEGY:-recreate}"
-  # Base URL of Traefik's API, e.g. http://rise-traefik:8080 in-network or
-  # http://localhost:8090 for a host-run dev backend. In health-rolling mode the
-  # reconciler reads Traefik's per-server health status (loadBalancer.serverStatus)
-  # to retire the old deployment only once the new servers are actually in
-  # Traefik's rotation. Optional basic-auth may be embedded in the URL (userinfo).
-  # Leave empty to fall back to Rise's own probe.
-  traefik_api_url: "${RISE_TRAEFIK_API_URL:-}"
+  # Default is `health-rolling`.
+  cutover_strategy: "${RISE_CUTOVER_STRATEGY:-health-rolling}"
+  # Traefik API base for the serverStatus rolling gate; standalone reaches
+  # Traefik in-network at rise-traefik:8080; host-run dev overrides to the
+  # published dashboard port; empty disables -> mirror-probe fallback.
+  #
+  # In health-rolling mode the reconciler reads Traefik's per-server health
+  # status (loadBalancer.serverStatus) to retire the old deployment only once the
+  # new servers are actually in Traefik's rotation. Optional basic-auth may be
+  # embedded in the URL (userinfo).
+  traefik_api_url: "${RISE_TRAEFIK_API_URL:-http://rise-traefik:8080}"
   access_classes:
     public:
       display_name: Public

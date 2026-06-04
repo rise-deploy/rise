@@ -250,6 +250,7 @@ docker)
   RISE_REGISTRY_URL=localhost:5000 \\
   RISE_CLIENT_REGISTRY_URL=localhost:5000 \\
   RISE_AUTH_BACKEND_URL=http://host.docker.internal:3000 \\
+  RISE_TRAEFIK_API_URL=http://localhost:8090 \\
   RISE_APP_BACKEND_HOST_ALIAS=rise.localhost \\
   RISE_APP_BACKEND_IP=host-gateway \\
   RISE_PUBLISH_APP_PORTS=true \\
