@@ -248,6 +248,9 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         // route is public.
         .merge(platform::routes::routes())
         .merge(auth::routes::public_routes())
+        // RFC 8693 token exchange — the source token is the credential, so the
+        // endpoint is public.
+        .merge(auth::exchange::routes::routes())
         .merge(workload_tokens::routes::routes());
 
     // Auth-only routes (require authentication but NOT platform access)

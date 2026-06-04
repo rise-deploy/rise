@@ -36,33 +36,44 @@ verifier; callers enforce audience per context).
 
 | Alg | header `typ` | Verifier output | Notes |
 |---|---|---|---|
-| HS256 | any (incl. default `"JWT"`) | `RiseToken::Session(RiseClaims)` | UI / CLI user login, `aud = public_url` (checked by the API middleware, not here) |
+| HS256 | `"rise-access+jwt"` | `RiseToken::Access(AccessClaims)` | exchanged SA / controller principal (RFC 8693), `aud = public_url` (checked by the API middleware, not here) |
+| HS256 | any other (incl. default `"JWT"`, missing, unknown) | `RiseToken::Session(RiseClaims)` | UI / CLI user login, `aud = public_url` (checked by the API middleware, not here) |
 | RS256 | any (incl. default `"JWT"`) | `RiseToken::Ingress(RiseClaims)` | deployed-app ingress auth, `aud = project_url` (not checked here) |
 | anything else | — | **rejected** (`InvalidAlgorithm`) | only HS256 / RS256 are accepted |
 
-**Today (Phase 0): dispatch is on `alg` only.** `verify_rise_jwt` does **not** read
-`header.typ`, and there is no `RiseToken::Access` variant. Session vs. Ingress is
-decided purely by algorithm.
+**Dispatch:** RS256 → `Ingress`. HS256 branches on the header `typ` **first** — the
+access `typ` (`rise-access+jwt`) → `Access`; anything else → `Session`. The access
+`typ` is matched *exclusively*; legacy session tokens carry the default `"JWT"`, so a
+session is never required to set a specific `typ`. The
+`rise_token_disambiguation_matrix` unit test pins this table against the real
+`verify_rise_jwt`.
 
-Two notes on the **current** RS256 / HS256 boundaries:
+Two notes on the RS256 / HS256 boundaries:
 
+- **Session vs. Access (HS256).** Both are HS256, and `RiseClaims` has no
+  `#[serde(deny_unknown_fields)]`, so they are not serde-distinguishable — the
+  `header.typ` discriminator is what keeps them apart. `AccessClaims` *does* use
+  `deny_unknown_fields`. The ingress adapter (`verify_jwt_skip_aud`) additionally
+  rejects any token carrying a `principal` claim, so an access-shaped payload can
+  never be honored on the ingress path.
 - **Workload vs. Ingress (RS256).** Rise also mints **Workload** tokens (RS256,
   same key, default `typ:"JWT"`), but they are **sign-only** — `verify_rise_jwt`
   never returns a `Workload` variant. The *only* thing currently keeping a Workload
   token from deserializing as `Ingress` on the RS256 branch is that `RiseClaims.email`
   is **required** and `WorkloadClaims` never sets it. This is **fragile** (it breaks
-  if `email` ever becomes optional, or a workload subject carries `email`); the
-  Phase-1 `typ` discriminator should make this separation explicit.
-- **Session vs. Access (HS256).** Once `RiseToken::Access` is added it will also be
-  HS256, and `RiseClaims` has no `#[serde(deny_unknown_fields)]`, so the two are not
-  serde-distinguishable. The Phase-1 `header.typ` discriminator is what keeps them
-  apart (see "Roadmap").
+  if `email` ever becomes optional, or a workload subject carries `email`); making the
+  RS256 Ingress-vs-Workload split explicit via a distinct `typ` is still deferred (see
+  "Roadmap").
 
 ### Sign-only Rise token (not a verifier output)
 
 | Token | Alg | header `typ` | Verify | Purpose |
 |---|---|---|---|---|
 | Workload (`WorkloadClaims`) | RS256 | `"JWT"` | n/a — sign-only; verified **externally** via the published JWKS (AWS STS / GCP WIF / Vault), never by Rise | outbound federation |
+
+The signer (`RiseTokenSigner`) mints all four kinds — `sign_user_jwt` (Session),
+`sign_access_jwt` (Access), `sign_ingress_jwt` (Ingress), `sign_workload_jwt`
+(Workload) — but the verifier classifies only the three inbound kinds above.
 
 ### External tokens — `verify_external_jwt` (Path A)
 
@@ -77,35 +88,27 @@ enforces `iss` + `exp`. Audience and any custom-claim constraints are validated
 **separately** by the pure matchers ([`validate_custom_claims`],
 [`match_controller_identity`]) over the resulting `ExternalClaims`.
 
-## Roadmap (Phase 1+ additions)
+## Roadmap (still deferred)
 
-The following are **not yet implemented** but are part of the token model the plan
-describes. They will extend the matrix above:
-
-- **`RiseToken::Access(AccessClaims)`** — HS256, `aud = public_url`, the exchanged
-  service-account / controller principal (RFC 8693 token exchange).
-- **`header.typ` discriminator (hard prerequisite for `Access`).** Because Session
-  and Access are both HS256, `verify_rise_jwt` MUST branch on `header.typ` **before**
-  `RiseToken::Access` is added — in the **same** change. The rules:
-  - HS256 + Access `typ` (e.g. `rise-access+jwt`) ⇒ `Access`.
-  - HS256 + missing/unknown `typ` ⇒ `Session` (do **not** require a specific `typ`
-    on legacy Session tokens — `Header::new` emits the default `"JWT"`, so a
-    Session-specific requirement would break existing sessions).
-  - The same mechanism should also make Ingress vs. Workload separation explicit
-    rather than relying on the missing-`email` serde accident.
-- **`rise_token_disambiguation_matrix` test** — a parametrized unit test asserting
-  this whole matrix against the real `verify_rise_jwt`, landing **with** the `typ`
-  discriminator (its discriminating rows do not exist before then).
+- **Explicit RS256 Ingress-vs-Workload `typ` split.** Today the separation relies on
+  the missing-`email` serde accident (see above). Giving `sign_workload_jwt` a distinct
+  `typ` and adding an inbound workload-verify path is out of scope.
+- **`PrincipalClaims::User` minting.** The `User` variant exists but the exchange does
+  not mint it; unifying the user OIDC login flow onto `AccessClaims::User` (cookies,
+  ingress) is deferred.
+- **Per-SA configurable scopes** (a DB column + migration) and a `jti` deny-list for
+  hard revocation.
 
 ## Public surface (selected)
 
 - Verify: [`verify_external_jwt`], [`RiseTokenSigner::verify_rise_jwt`].
-- Sign: [`RiseTokenSigner`] (`sign_user_jwt`, `sign_ingress_jwt`,
-  `sign_workload_jwt`, `generate_jwks`), [`compute_key_id`].
+- Sign: [`RiseTokenSigner`] (`sign_user_jwt`, `sign_access_jwt`, `sign_ingress_jwt`,
+  `sign_workload_jwt`, `generate_jwks`), [`compute_key_id`], `RISE_ACCESS_TYP`.
 - Adapters (legacy, thin wrappers over `verify_rise_jwt`): `verify_user_jwt`
-  (HS256 + `aud`), `verify_jwt_skip_aud` (HS256 **or** RS256, `aud` skipped).
-- Claims: [`RiseClaims`], [`WorkloadClaims`], [`WorkloadSubjectInfo`],
-  [`ExternalClaims`].
+  (HS256 + `aud`), `verify_jwt_skip_aud` (HS256 **or** RS256, `aud` skipped; rejects
+  access tokens / `principal`-carrying tokens).
+- Claims: [`RiseClaims`], [`AccessClaims`], [`PrincipalClaims`], [`Scope`],
+  [`WorkloadClaims`], [`WorkloadSubjectInfo`], [`ExternalClaims`].
 - Matchers / config: [`ControllerIdentity`], [`ControllerIndexes`],
   [`ControllerMatch`], `match_controller_identity`, `build_controller_indexes`,
   `validate_custom_claims`, `audience_matches`, `matches_wildcard_pattern`,
