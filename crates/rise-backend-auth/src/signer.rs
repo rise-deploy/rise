@@ -1,80 +1,29 @@
+//! Rise-issued token signing and verification.
+//!
+//! [`RiseTokenSigner`] holds an HS256 symmetric key and an RS256 keypair (the
+//! RS256 public key is exposed via JWKS for third parties to verify). It is the
+//! single home for minting and verifying Rise-issued JWTs.
+
 use base64::engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD as BASE64URL};
 use base64::Engine;
-use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{encode, Algorithm, DecodingKey, EncodingKey, Header};
 use rsa::traits::PublicKeyParts;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Claims for Rise-issued JWTs (both UI and ingress authentication)
-///
-/// The `aud` claim determines the scope:
-/// - For UI login: aud = Rise public URL (e.g., "https://rise.example.com")
-/// - For project ingress: aud = project URL (e.g., "https://myapp.apps.rise.dev")
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct RiseClaims {
-    /// User ID from IdP
-    pub sub: String,
-    /// User email
-    pub email: String,
-    /// User name (optional)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// Rise team names the user is a member of (ALL teams, not just IdP-managed)
-    /// Used for authorization and audit logging
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub groups: Option<Vec<String>>,
-    /// Issued at timestamp
-    pub iat: u64,
-    /// Expiration timestamp
-    pub exp: u64,
-    /// Issuer (Rise backend URL)
-    pub iss: String,
-    /// Audience (Rise UI URL or project URL)
-    pub aud: String,
-}
+use crate::claims::{
+    AccessClaims, PrincipalClaims, RiseClaims, WorkloadClaims, WorkloadSubjectInfo,
+};
+use crate::error::JwtSignerError;
+use crate::verify::RiseToken;
 
-/// Subject info for workload identity JWT claims.
-pub struct WorkloadSubjectInfo<'a> {
-    pub sub: &'a str,
-    pub project: &'a str,
-    pub environment: &'a str,
-    pub deployment_group: &'a str,
-    pub deployment_id: &'a str,
-}
-
-/// Claims for Rise-issued workload identity JWTs (RS256).
+/// JWT header `typ` for Rise access tokens.
 ///
-/// Issued to deployed apps so they can federate identity to external systems
-/// (AWS STS, GCP WIF, Vault, ...). The subject describes the *Rise* identity —
-/// `rise:proj:<project>:env:<environment>` — independent of the runtime.
-/// These are distinct from [`RiseClaims`], which is user-shaped and requires
-/// an `email` claim; workload tokens must never be accepted by Rise's own auth.
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct WorkloadClaims {
-    /// Issuer (Rise backend URL)
-    pub iss: String,
-    /// Subject: `rise:proj:<project>:env:<environment>`
-    pub sub: String,
-    /// Audience supplied by the caller
-    pub aud: String,
-    /// Issued at timestamp
-    pub iat: u64,
-    /// Not before timestamp
-    pub nbf: u64,
-    /// Expiration timestamp
-    pub exp: u64,
-    /// Unique token ID
-    pub jti: String,
-    /// Rise project name (informational)
-    pub project: String,
-    /// Rise environment name (informational; `<null>` if the deployment has none)
-    pub environment: String,
-    /// Deployment group (informational)
-    pub deployment_group: String,
-    /// Rise deployment ID (informational)
-    pub deployment_id: String,
-}
+/// This is the **primary discriminator** between a session token and an access
+/// token (both HS256): `verify_rise_jwt` routes a token carrying this `typ` to
+/// [`RiseToken::Access`], and the legacy `verify_user_jwt` / `verify_jwt_skip_aud`
+/// adapters reject it. Session tokens carry the default `"JWT"` `typ`.
+pub const RISE_ACCESS_TYP: &str = "rise-access+jwt";
 
 /// JWT signer supporting both HS256 (symmetric) and RS256 (asymmetric) algorithms
 ///
@@ -82,7 +31,7 @@ pub struct WorkloadClaims {
 /// - RS256 is used for project ingress authentication (aud = project URL)
 ///
 /// The RS256 keys can be exposed via JWKS for deployed apps to validate tokens.
-pub struct JwtSigner {
+pub struct RiseTokenSigner {
     // HS256 symmetric key for user authentication
     hs256_encoding_key: EncodingKey,
     hs256_decoding_key: DecodingKey,
@@ -94,31 +43,15 @@ pub struct JwtSigner {
     rs256_key_id: String,
 
     issuer: String,
-    pub(crate) default_expiry_seconds: u64,
-    claims_to_include: Vec<String>,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum JwtSignerError {
-    #[error("Invalid base64 secret: {0}")]
-    InvalidBase64(#[from] base64::DecodeError),
-    #[error("JWT signing failed: {0}")]
-    SigningFailed(#[from] jsonwebtoken::errors::Error),
-    #[error("System time error: {0}")]
-    SystemTimeError(#[from] std::time::SystemTimeError),
-    #[error("Missing required claim: {0}")]
-    MissingClaim(String),
-    #[error("RSA key generation failed: {0}")]
-    RsaKeyError(String),
-    #[error("PEM encoding failed: {0}")]
-    PemError(String),
+    pub default_expiry_seconds: u64,
+    claims_to_include: std::collections::HashSet<String>,
 }
 
 /// Compute a short key ID from a public key PEM.
 ///
 /// Takes the SHA-256 hash of the PEM bytes and encodes only the first 8 bytes
 /// as hex, producing a 16-character key ID.
-fn compute_key_id(public_key_pem: &[u8]) -> String {
+pub fn compute_key_id(public_key_pem: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     use std::fmt::Write;
     let hash = Sha256::digest(public_key_pem);
@@ -129,7 +62,7 @@ fn compute_key_id(public_key_pem: &[u8]) -> String {
     key_id
 }
 
-impl JwtSigner {
+impl RiseTokenSigner {
     /// Create a new JWT signer with both HS256 and RS256 support
     ///
     /// # Arguments
@@ -253,8 +186,23 @@ impl JwtSigner {
             rs256_key_id,
             issuer,
             default_expiry_seconds,
-            claims_to_include,
+            claims_to_include: claims_to_include.into_iter().collect(),
         })
+    }
+
+    /// The issuer URL this signer mints tokens for.
+    pub(crate) fn issuer(&self) -> &str {
+        &self.issuer
+    }
+
+    /// HS256 decoding key, used by the central verifier.
+    pub(crate) fn hs256_decoding_key(&self) -> &DecodingKey {
+        &self.hs256_decoding_key
+    }
+
+    /// RS256 decoding key, used by the central verifier.
+    pub(crate) fn rs256_decoding_key(&self) -> &DecodingKey {
+        &self.rs256_decoding_key
     }
 
     /// Generate JWKS (JSON Web Key Set) for RS256 public key
@@ -284,25 +232,18 @@ impl JwtSigner {
         }))
     }
 
-    /// Sign a new Rise JWT for user authentication (HS256)
-    ///
-    /// This JWT is used for authenticating users to Rise (both UI and CLI).
-    /// Uses HS256 symmetric encryption and sets aud to the Rise public URL.
-    ///
-    /// # Arguments
-    /// * `idp_claims` - Claims from the IdP JWT (must contain at least "sub" and "email")
-    /// * `user_id` - UUID of the user (for fetching team memberships)
-    /// * `db_pool` - Database connection pool (for fetching team memberships)
-    /// * `rise_public_url` - The Rise public URL (used as aud claim)
-    /// * `expiry_override` - Optional expiry timestamp (if None, uses default_expiry_seconds)
-    pub async fn sign_user_jwt(
+    /// Build the shared [`RiseClaims`] body for user (HS256) and ingress (RS256)
+    /// tokens. Extracts the required `sub`/`email`, the optional `name` (only
+    /// when configured in `claims_to_include`), computes `iat`/`exp`, and stamps
+    /// the issuer and the supplied audience. The caller chooses the algorithm /
+    /// header when encoding.
+    fn build_rise_claims(
         &self,
         idp_claims: &serde_json::Value,
-        user_id: uuid::Uuid,
-        db_pool: &sqlx::PgPool,
-        rise_public_url: &str,
+        groups: Option<Vec<String>>,
+        aud: &str,
         expiry_override: Option<u64>,
-    ) -> Result<String, JwtSignerError> {
+    ) -> Result<RiseClaims, JwtSignerError> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let exp = expiry_override.unwrap_or_else(|| now + self.default_expiry_seconds);
 
@@ -320,7 +261,7 @@ impl JwtSigner {
             .to_string();
 
         // Extract optional name claim if requested
-        let name = if self.claims_to_include.contains(&"name".to_string()) {
+        let name = if self.claims_to_include.contains("name") {
             idp_claims
                 .get("name")
                 .and_then(|v| v.as_str())
@@ -329,12 +270,7 @@ impl JwtSigner {
             None
         };
 
-        // Fetch user's team memberships for groups claim
-        let groups = crate::db::teams::get_team_names_for_user(db_pool, user_id)
-            .await
-            .ok();
-
-        let claims = RiseClaims {
+        Ok(RiseClaims {
             sub,
             email,
             name,
@@ -342,8 +278,31 @@ impl JwtSigner {
             iat: now,
             exp,
             iss: self.issuer.clone(),
-            aud: rise_public_url.to_string(),
-        };
+            aud: aud.to_string(),
+        })
+    }
+
+    /// Sign a new Rise JWT for user authentication (HS256)
+    ///
+    /// This JWT is used for authenticating users to Rise (both UI and CLI).
+    /// Uses HS256 symmetric encryption and sets aud to the Rise public URL.
+    ///
+    /// # Arguments
+    /// * `idp_claims` - Claims from the IdP JWT (must contain at least "sub" and "email")
+    /// * `groups` - The user's Rise team names, placed directly into the `groups` claim.
+    ///   Callers resolve these (e.g. via the DB) and pass them in; the signer never
+    ///   touches the database.
+    /// * `rise_public_url` - The Rise public URL (used as aud claim)
+    /// * `expiry_override` - Optional expiry timestamp (if None, uses default_expiry_seconds)
+    pub fn sign_user_jwt(
+        &self,
+        idp_claims: &serde_json::Value,
+        groups: Option<Vec<String>>,
+        rise_public_url: &str,
+        expiry_override: Option<u64>,
+    ) -> Result<String, JwtSignerError> {
+        let claims =
+            self.build_rise_claims(idp_claims, groups, rise_public_url, expiry_override)?;
 
         let header = Header::new(Algorithm::HS256);
         let token = encode(&header, &claims, &self.hs256_encoding_key)?;
@@ -358,59 +317,19 @@ impl JwtSigner {
     ///
     /// # Arguments
     /// * `idp_claims` - Claims from the IdP JWT (must contain at least "sub" and "email")
-    /// * `user_id` - UUID of the user (for fetching team memberships)
-    /// * `db_pool` - Database connection pool (for fetching team memberships)
+    /// * `groups` - The user's Rise team names, placed directly into the `groups` claim.
+    ///   Callers resolve these (e.g. via the DB) and pass them in; the signer never
+    ///   touches the database.
     /// * `project_url` - The project URL (used as aud claim, e.g., "https://myapp.apps.rise.dev")
     /// * `expiry_override` - Optional expiry timestamp (if None, uses default_expiry_seconds)
-    pub async fn sign_ingress_jwt(
+    pub fn sign_ingress_jwt(
         &self,
         idp_claims: &serde_json::Value,
-        user_id: uuid::Uuid,
-        db_pool: &sqlx::PgPool,
+        groups: Option<Vec<String>>,
         project_url: &str,
         expiry_override: Option<u64>,
     ) -> Result<String, JwtSignerError> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let exp = expiry_override.unwrap_or_else(|| now + self.default_expiry_seconds);
-
-        // Extract required claims
-        let sub = idp_claims
-            .get("sub")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| JwtSignerError::MissingClaim("sub".to_string()))?
-            .to_string();
-
-        let email = idp_claims
-            .get("email")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| JwtSignerError::MissingClaim("email".to_string()))?
-            .to_string();
-
-        // Extract optional name claim if requested
-        let name = if self.claims_to_include.contains(&"name".to_string()) {
-            idp_claims
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        } else {
-            None
-        };
-
-        // Fetch user's team memberships for groups claim
-        let groups = crate::db::teams::get_team_names_for_user(db_pool, user_id)
-            .await
-            .ok();
-
-        let claims = RiseClaims {
-            sub,
-            email,
-            name,
-            groups,
-            iat: now,
-            exp,
-            iss: self.issuer.clone(),
-            aud: project_url.to_string(),
-        };
+        let claims = self.build_rise_claims(idp_claims, groups, project_url, expiry_override)?;
 
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(self.rs256_key_id.clone());
@@ -464,11 +383,55 @@ impl JwtSigner {
         Ok(token)
     }
 
-    /// Verify and decode a Rise user JWT (HS256 only) with audience validation
+    /// Sign a Rise access token (HS256) for an exchanged principal.
     ///
-    /// This is used by the API middleware to authenticate user requests.
-    /// Only accepts HS256 tokens (user JWTs) and validates that the audience matches
-    /// the Rise public URL, rejecting RS256 ingress tokens.
+    /// Minted by the token-exchange endpoint. The signer stamps `iss` (this
+    /// signer's issuer), `aud`, `iat`/`exp`, and a random `jti`, and sets the
+    /// header `typ` to [`RISE_ACCESS_TYP`] so `verify_rise_jwt` classifies it as
+    /// [`RiseToken::Access`] (and the session/ingress adapters reject it).
+    ///
+    /// # Arguments
+    /// * `sub` - stable principal id (`rise:sa:<id>`, `rise:ctrl:<id>`, ...)
+    /// * `principal` - the fully-resolved principal to embed
+    /// * `aud` - the `aud` claim (the Rise public URL)
+    /// * `ttl_secs` - token lifetime in seconds (caller clamps to the max TTL)
+    pub fn sign_access_jwt(
+        &self,
+        sub: &str,
+        principal: PrincipalClaims,
+        aud: &str,
+        ttl_secs: u64,
+    ) -> Result<(String, AccessClaims), JwtSignerError> {
+        use rand::Rng;
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+
+        let mut jti_bytes = [0u8; 16];
+        rand::rng().fill_bytes(&mut jti_bytes);
+        let jti = BASE64URL.encode(jti_bytes);
+
+        let claims = AccessClaims {
+            iss: self.issuer.clone(),
+            aud: aud.to_string(),
+            sub: sub.to_string(),
+            iat: now,
+            exp: now + ttl_secs,
+            jti,
+            principal,
+        };
+
+        let mut header = Header::new(Algorithm::HS256);
+        header.typ = Some(RISE_ACCESS_TYP.to_string());
+        let token = encode(&header, &claims, &self.hs256_encoding_key)?;
+
+        Ok((token, claims))
+    }
+
+    /// Verify and decode a Rise user JWT (HS256 only) with audience validation.
+    ///
+    /// Adapter over [`Self::verify_rise_jwt`] for the API authentication path:
+    /// accepts only an HS256 `Session` token whose `aud` matches the Rise public
+    /// URL, rejecting RS256 ingress tokens and wrong-audience tokens.
     ///
     /// # Arguments
     /// * `token` - The JWT token string
@@ -478,74 +441,82 @@ impl JwtSigner {
         token: &str,
         expected_aud: &str,
     ) -> Result<RiseClaims, JwtSignerError> {
-        let header = jsonwebtoken::decode_header(token)?;
-        if header.alg != Algorithm::HS256 {
+        match self.verify_rise_jwt(token)? {
+            RiseToken::Session(claims) if claims.aud == expected_aud => Ok(claims),
+            // A correctly-signed HS256 session token with the wrong audience:
+            // labeled distinctly as an audience mismatch (still rejected).
+            RiseToken::Session(_) => Err(JwtSignerError::AudienceMismatch),
+            // An RS256 ingress token, or an exchanged access token — genuinely the
+            // wrong token kind on the user-login path, so reject as an alg error.
+            RiseToken::Ingress(_) | RiseToken::Access(_) => Err(JwtSignerError::SigningFailed(
+                jsonwebtoken::errors::ErrorKind::InvalidAlgorithm.into(),
+            )),
+        }
+    }
+
+    /// Verify and decode a Rise JWT without audience validation.
+    ///
+    /// Adapter over [`Self::verify_rise_jwt`] for the `ingress_auth` handler, which
+    /// accepts both HS256 (user session) and RS256 (app-scoped ingress) tokens and
+    /// does not check `aud`. Project access is validated separately via database
+    /// checks.
+    pub fn verify_jwt_skip_aud(&self, token: &str) -> Result<RiseClaims, JwtSignerError> {
+        let claims = match self.verify_rise_jwt(token)? {
+            RiseToken::Session(claims) | RiseToken::Ingress(claims) => claims,
+            // An exchanged access token must never be honored on the ingress path.
+            RiseToken::Access(_) => {
+                return Err(JwtSignerError::SigningFailed(
+                    jsonwebtoken::errors::ErrorKind::InvalidAlgorithm.into(),
+                ))
+            }
+        };
+
+        // Defense-in-depth (§4.1 ingress hardening): the `typ` discriminator above
+        // already routes a Rise access token to `RiseToken::Access`, but because
+        // `RiseClaims` intentionally does NOT use `deny_unknown_fields`, a token
+        // *without* the access `typ` that nonetheless carries a `principal` claim
+        // would deserialize cleanly as a session/ingress token (extra field
+        // ignored). Reject any such token outright so an access-shaped payload can
+        // never be accepted on the ingress path. The payload was just
+        // signature-verified, so this peek reads authenticated bytes.
+        if rise_jwt_payload_has_principal(token) {
             return Err(JwtSignerError::SigningFailed(
                 jsonwebtoken::errors::ErrorKind::InvalidAlgorithm.into(),
             ));
         }
 
-        let mut validation = Validation::new(Algorithm::HS256);
-        validation.set_issuer(&[&self.issuer]);
-        validation.set_audience(&[expected_aud]);
-
-        let token_data = decode::<RiseClaims>(token, &self.hs256_decoding_key, &validation)?;
-        Ok(token_data.claims)
-    }
-
-    /// Verify and decode a Rise JWT without audience validation
-    ///
-    /// Only used by the `ingress_auth` handler where both HS256 (user session) and RS256
-    /// (app-scoped) tokens must be accepted. Project access is validated separately via
-    /// database checks. Do not use this for API authentication — use `verify_user_jwt` instead.
-    ///
-    /// # Arguments
-    /// * `token` - The JWT token string
-    ///
-    /// # Returns
-    /// The decoded claims if the JWT signature and issuer are valid
-    pub fn verify_jwt_skip_aud(&self, token: &str) -> Result<RiseClaims, JwtSignerError> {
-        let header = jsonwebtoken::decode_header(token)?;
-
-        match header.alg {
-            Algorithm::HS256 => {
-                let mut validation = Validation::new(Algorithm::HS256);
-                validation.set_issuer(&[&self.issuer]);
-                validation.validate_aud = false;
-
-                let token_data =
-                    decode::<RiseClaims>(token, &self.hs256_decoding_key, &validation)?;
-                Ok(token_data.claims)
-            }
-            Algorithm::RS256 => {
-                let mut validation = Validation::new(Algorithm::RS256);
-                validation.set_issuer(&[&self.issuer]);
-                validation.validate_aud = false;
-
-                let token_data =
-                    decode::<RiseClaims>(token, &self.rs256_decoding_key, &validation)?;
-                Ok(token_data.claims)
-            }
-            _ => Err(JwtSignerError::SigningFailed(
-                jsonwebtoken::errors::Error::from(
-                    jsonwebtoken::errors::ErrorKind::InvalidAlgorithm,
-                ),
-            )),
-        }
+        Ok(claims)
     }
 }
 
-// Note: Full integration tests require a database connection and are in the tests/ directory.
-// These unit tests verify basic JWT signing and verification without database access.
+/// Whether a (already signature-verified) JWT's payload carries a top-level
+/// `principal` claim. Used to fail-close the ingress path against access-shaped
+/// tokens (§4.1). Returns `false` if the payload cannot be parsed (the caller has
+/// already verified the signature, so this only guards the claim shape).
+fn rise_jwt_payload_has_principal(token: &str) -> bool {
+    let Some(payload_b64) = token.split('.').nth(1) else {
+        return false;
+    };
+    let Ok(payload) = BASE64URL.decode(payload_b64) else {
+        return false;
+    };
+    serde_json::from_slice::<serde_json::Value>(&payload)
+        .ok()
+        .and_then(|v| v.as_object().map(|obj| obj.contains_key("principal")))
+        .unwrap_or(false)
+}
 
+// Tests live alongside the verifier in `verify.rs` and exercise both the
+// adapters and the central `verify_rise_jwt` entry point.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use jsonwebtoken::{decode, Validation};
 
-    fn create_test_signer() -> JwtSigner {
+    pub(crate) fn create_test_signer() -> RiseTokenSigner {
         // Exactly 32 bytes encoded as base64
         let secret = BASE64.encode([0u8; 32]);
-        JwtSigner::new(
+        RiseTokenSigner::new(
             &secret,
             "https://rise.test".to_string(),
             3600,
@@ -587,120 +558,6 @@ mod tests {
         );
         assert!(key.get("n").is_some());
         assert!(key.get("e").is_some());
-    }
-
-    #[test]
-    fn test_verify_rs256_jwt() {
-        let signer = create_test_signer();
-
-        // Create an RS256 JWT for testing
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let claims = RiseClaims {
-            sub: "user456".to_string(),
-            email: "user2@example.com".to_string(),
-            name: None,
-            groups: None,
-            iat: now,
-            exp: now + 3600,
-            iss: "https://rise.test".to_string(),
-            aud: "https://myapp.apps.rise.dev".to_string(),
-        };
-
-        let mut header = Header::new(Algorithm::RS256);
-        header.kid = Some(signer.rs256_key_id.to_string());
-        let token = encode(&header, &claims, &signer.rs256_encoding_key).unwrap();
-
-        // Verify with skip_aud method (since we're not validating audience in tests)
-        let verified_claims = signer.verify_jwt_skip_aud(&token).unwrap();
-
-        assert_eq!(verified_claims.sub, "user456");
-        assert_eq!(verified_claims.email, "user2@example.com");
-        assert_eq!(verified_claims.aud, "https://myapp.apps.rise.dev");
-    }
-
-    #[test]
-    fn test_verify_user_jwt_accepts_valid_hs256() {
-        let signer = create_test_signer();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let claims = RiseClaims {
-            sub: "user123".to_string(),
-            email: "user@example.com".to_string(),
-            name: None,
-            groups: None,
-            iat: now,
-            exp: now + 3600,
-            iss: "https://rise.test".to_string(),
-            aud: "https://rise.test".to_string(),
-        };
-
-        let header = Header::new(Algorithm::HS256);
-        let token = encode(&header, &claims, &signer.hs256_encoding_key).unwrap();
-
-        let verified = signer.verify_user_jwt(&token, "https://rise.test").unwrap();
-        assert_eq!(verified.sub, "user123");
-        assert_eq!(verified.email, "user@example.com");
-        assert_eq!(verified.aud, "https://rise.test");
-    }
-
-    #[test]
-    fn test_verify_user_jwt_rejects_rs256() {
-        let signer = create_test_signer();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let claims = RiseClaims {
-            sub: "user456".to_string(),
-            email: "user2@example.com".to_string(),
-            name: None,
-            groups: None,
-            iat: now,
-            exp: now + 3600,
-            iss: "https://rise.test".to_string(),
-            aud: "https://rise.test".to_string(),
-        };
-
-        let mut header = Header::new(Algorithm::RS256);
-        header.kid = Some(signer.rs256_key_id.to_string());
-        let token = encode(&header, &claims, &signer.rs256_encoding_key).unwrap();
-
-        let result = signer.verify_user_jwt(&token, "https://rise.test");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_verify_user_jwt_rejects_wrong_audience() {
-        let signer = create_test_signer();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let claims = RiseClaims {
-            sub: "user789".to_string(),
-            email: "user3@example.com".to_string(),
-            name: None,
-            groups: None,
-            iat: now,
-            exp: now + 3600,
-            iss: "https://rise.test".to_string(),
-            aud: "https://myapp.apps.rise.dev".to_string(),
-        };
-
-        let header = Header::new(Algorithm::HS256);
-        let token = encode(&header, &claims, &signer.hs256_encoding_key).unwrap();
-
-        let result = signer.verify_user_jwt(&token, "https://rise.test");
-        assert!(result.is_err());
     }
 
     #[test]
@@ -746,7 +603,7 @@ mod tests {
     fn test_invalid_secret_length() {
         let short_secret = BASE64.encode(b"short"); // Less than 32 bytes
 
-        let result = JwtSigner::new(
+        let result = RiseTokenSigner::new(
             &short_secret,
             "https://rise.test".to_string(),
             3600,

@@ -4207,6 +4207,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "rise-backend-auth"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "jsonwebtoken 10.4.0",
+ "rand 0.10.1",
+ "rsa",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.18",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "rise-deploy"
 version = "0.23.0-rc4"
 dependencies = [
@@ -4242,8 +4260,10 @@ dependencies = [
  "rand 0.10.1",
  "regex",
  "reqwest 0.13.4",
+ "rise-backend-auth",
  "rise-resource-api",
  "rise-resource-store",
+ "rise-runtime-sync",
  "rsa",
  "rustls",
  "schemars 1.2.1",
@@ -4261,6 +4281,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
+ "tokio-util",
  "toml",
  "tower",
  "tower-http",
@@ -4298,6 +4319,21 @@ dependencies = [
  "sqlx",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rise-runtime-sync"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "sha2 0.11.0",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]

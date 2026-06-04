@@ -31,7 +31,6 @@ use crate::db::{
     deployments as db_deployments, env_vars as db_env_vars, environments as db_environments,
     projects as db_projects,
 };
-use crate::server::auth::jwt_signer::WorkloadSubjectInfo;
 use crate::server::deployment::crd;
 use crate::server::deployment::resource_builder::{
     IdentityMount, ResourceBuilder, ANNOTATION_ENV_SECRET_HASH, ANNOTATION_LAST_REFRESH,
@@ -41,6 +40,7 @@ use crate::server::deployment::resource_builder::{
 use crate::server::deployment::state_machine;
 use crate::server::state::AppState;
 use crate::server::workload_tokens::{sha256_hex, workload_subject, NO_ENVIRONMENT};
+use rise_backend_auth::WorkloadSubjectInfo;
 
 // ── Metacontroller webhook protocol types ──────────────────────────────
 

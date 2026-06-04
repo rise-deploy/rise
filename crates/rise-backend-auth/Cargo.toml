@@ -1,0 +1,22 @@
+[package]
+name = "rise-backend-auth"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rise-deploy/rise"
+description = "Pure-core token signing, verification, and matching for Rise"
+publish = false
+
+[dependencies]
+async-trait = { workspace = true }
+base64 = { workspace = true }
+jsonwebtoken = { workspace = true }
+rand = { workspace = true }
+rsa = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }

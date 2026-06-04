@@ -15,7 +15,8 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::db::leader_leases::LeaderElection;
+use rise_runtime_sync::{with_leader_election, LeaderElection};
+use tokio_util::sync::CancellationToken;
 
 const ENV_VAR_BUCKET_NAME: &str = "S3_BUCKET_NAME";
 const ENV_VAR_ACCESS_KEY_ID: &str = "AWS_ACCESS_KEY_ID";
@@ -1127,7 +1128,7 @@ impl Extension for AwsS3Provisioner {
         Ok(())
     }
 
-    fn start(&self) {
+    fn start(&self, shutdown: CancellationToken) -> tokio::task::JoinHandle<()> {
         let provisioner = Self {
             s3_client: self.s3_client.clone(),
             iam_client: self.iam_client.clone(),
@@ -1145,18 +1146,22 @@ impl Extension for AwsS3Provisioner {
                 provisioner.extension_type()
             );
 
-            let election = LeaderElection::spawn(
-                provisioner.db_pool.clone(),
+            let pool = provisioner.db_pool.clone();
+            let result = with_leader_election(
+                pool,
                 "rise-ext-s3",
                 Uuid::new_v4(),
                 std::time::Duration::from_secs(60),
-            );
-
+                shutdown.clone(),
+                move |election| async move {
             let mut error_state: HashMap<Uuid, (usize, DateTime<Utc>)> = HashMap::new();
 
             loop {
                 if !election.is_leader() {
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                    }
                     continue;
                 }
 
@@ -1253,9 +1258,19 @@ impl Extension for AwsS3Provisioner {
                 }
 
                 let wait_time = if needs_active_polling { 2 } else { 10 };
-                sleep(std::time::Duration::from_secs(wait_time)).await;
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = sleep(std::time::Duration::from_secs(wait_time)) => {}
+                }
             }
-        });
+            Ok(())
+                },
+            )
+            .await;
+            if let Err(e) = result {
+                error!("AWS S3 extension reconciliation loop error: {:?}", e);
+            }
+        })
     }
 
     async fn before_deployment(

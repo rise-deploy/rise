@@ -12,26 +12,7 @@ use crate::db::{service_accounts, users, User};
 use crate::server::auth::context::VerifiedExternalToken;
 use crate::server::auth::cookie_helpers;
 use crate::server::state::AppState;
-
-/// Check if a JWT issuer is a Rise-issued JWT
-///
-/// Rise JWTs have `iss` set to the Rise public URL (e.g., "https://rise.example.com").
-/// This helper checks for exact match or scheme prefix match.
-fn is_rise_issued_jwt(issuer: &str, public_url: &str) -> bool {
-    // Exact match
-    if issuer == public_url {
-        return true;
-    }
-
-    // Check if issuer starts with the public_url's base (handles port differences)
-    if let Some(public_base) = public_url.strip_suffix(|c: char| c.is_ascii_digit() || c == ':') {
-        if issuer.starts_with(public_base) {
-            return true;
-        }
-    }
-
-    false
-}
+use rise_backend_auth::{is_rise_issued_jwt, AccessClaims, PrincipalClaims, RiseToken};
 
 /// Extract Bearer token from Authorization header
 pub(crate) fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
@@ -58,7 +39,7 @@ struct MinimalClaims {
 /// Authentication middleware that validates JWT and injects User or VerifiedExternalToken
 /// into request extensions.
 ///
-/// For Rise-issued JWTs: validates with JwtSigner and injects `User`.
+/// For Rise-issued JWTs: validates with `RiseTokenSigner` and injects `User`.
 /// For external JWTs: validates signature + expiry via JWKS (phase 1) and injects
 /// `VerifiedExternalToken`. Claim validation against project-scoped service accounts
 /// happens in phase 2 (inside handlers via `AuthContext::resolve_for_project`).
@@ -138,47 +119,89 @@ pub async fn auth_middleware(
     );
 
     if is_rise_issued_jwt(&issuer, &state.public_url) {
-        // Rise-issued JWT — only accept HS256 user tokens with correct audience
+        // Rise-issued JWT — classify centrally (HS256 session / HS256 access /
+        // RS256 ingress) and accept only the kinds valid on the API path.
         tracing::debug!("Auth middleware: authenticating with Rise-issued JWT");
 
-        let claims = state
-            .jwt_signer
-            .verify_user_jwt(&token, &state.public_url)
-            .map_err(|e| {
-                tracing::warn!("Auth middleware: Rise JWT validation failed: {:#}", e);
-                (StatusCode::UNAUTHORIZED, format!("Invalid token: {}", e))
-            })?;
-
-        tracing::debug!("Auth middleware: Rise JWT validation successful");
-
-        let email = &claims.email;
-        tracing::debug!("Rise JWT validated for user: {}", email);
-
-        // Extract groups from Rise JWT for platform access checks
-        let groups = claims.groups.clone();
-        req.extensions_mut().insert(groups);
-
-        // CRITICAL: user creation and default-Organization membership must
-        // happen in a single transaction so bootstrap's validation pass
-        // never sees a user row without a membership.
-        let user = users::find_or_create_with_default_organization(
-            &state.db_pool,
-            email,
-            state.default_organization_uid,
-        )
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to find/create user: {:#}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Database error".to_string(),
-            )
+        let rise_token = state.jwt_signer.verify_rise_jwt(&token).map_err(|e| {
+            tracing::warn!("Auth middleware: Rise JWT validation failed: {:#}", e);
+            (StatusCode::UNAUTHORIZED, format!("Invalid token: {}", e))
         })?;
 
-        tracing::debug!("User authenticated: {} ({})", user.email, user.id);
-        req.extensions_mut().insert(user);
+        match rise_token {
+            RiseToken::Session(claims) => {
+                // User session token — `aud` must be the Rise public URL (the
+                // verifier skips `aud`, so enforce it here as the API path does).
+                if claims.aud != state.public_url {
+                    tracing::warn!("Auth middleware: session token audience mismatch");
+                    return Err((StatusCode::UNAUTHORIZED, "Invalid token".to_string()));
+                }
+
+                let email = &claims.email;
+                tracing::debug!("Rise session JWT validated for user");
+
+                // Extract groups from Rise JWT for platform access checks
+                let groups = claims.groups.clone();
+                req.extensions_mut().insert(groups);
+
+                // CRITICAL: user creation and default-Organization membership must
+                // happen in a single transaction so bootstrap's validation pass
+                // never sees a user row without a membership.
+                let user = users::find_or_create_with_default_organization(
+                    &state.db_pool,
+                    email,
+                    state.default_organization_uid,
+                )
+                .await
+                .map_err(|e| {
+                    tracing::error!("Failed to find/create user: {:#}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Database error".to_string(),
+                    )
+                })?;
+
+                tracing::debug!("User authenticated: {} ({})", user.email, user.id);
+                req.extensions_mut().insert(user);
+            }
+            RiseToken::Access(claims) => {
+                // Exchanged access token — `aud` must be the Rise public URL.
+                if claims.aud != state.public_url {
+                    tracing::warn!("Auth middleware: access token audience mismatch");
+                    return Err((StatusCode::UNAUTHORIZED, "Invalid token".to_string()));
+                }
+                tracing::debug!(
+                    "Auth middleware: Rise access token accepted (principal={:?})",
+                    claims.principal
+                );
+                req.extensions_mut().insert(claims);
+            }
+            RiseToken::Ingress(_) => {
+                // RS256 ingress tokens are for deployed-app ingress auth only.
+                tracing::warn!("Auth middleware: ingress token rejected on the API path");
+                return Err((StatusCode::UNAUTHORIZED, "Invalid token".to_string()));
+            }
+        }
+    } else if !state.auth_settings.allow_raw_external_tokens {
+        // Raw external tokens are disabled — callers must pre-exchange at
+        // `POST /api/v1/auth/token` for a Rise access token.
+        tracing::warn!(
+            "Auth middleware: raw external token from issuer '{}' rejected (allow_raw_external_tokens=false)",
+            issuer
+        );
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Raw external tokens are not accepted; exchange your token at /api/v1/auth/token"
+                .to_string(),
+        ));
     } else {
-        // External issuer — phase 1: JWKS validation only
+        // External issuer — legacy path: JWKS validation only, resolved per
+        // project later. Emit a deprecation signal so operators can see who
+        // still needs to migrate to the token-exchange flow.
+        tracing::warn!(
+            issuer = %issuer,
+            "deprecated: accepting raw external token (not pre-exchanged); migrate to POST /api/v1/auth/token"
+        );
         tracing::debug!(
             "Auth middleware: external JWT from issuer '{}', performing JWKS validation",
             issuer
@@ -212,9 +235,7 @@ pub async fn auth_middleware(
         }
 
         // Validate signature + expiry via JWKS (no custom claim validation)
-        let claims = state
-            .jwt_validator
-            .validate_token(&token, &issuer)
+        let claims = rise_backend_auth::verify_external_jwt(&token, &issuer, &*state.jwt_validator)
             .await
             .map_err(|e| {
                 tracing::warn!(
@@ -223,7 +244,9 @@ pub async fn auth_middleware(
                     e
                 );
                 (StatusCode::UNAUTHORIZED, format!("Invalid token: {}", e))
-            })?;
+            })?
+            .claims()
+            .clone();
 
         tracing::debug!(
             "Auth middleware: external JWT JWKS-validated for issuer '{}'",
@@ -301,11 +324,34 @@ pub async fn platform_access_middleware(
 ) -> Result<Response, (StatusCode, String)> {
     use crate::server::auth::platform_access::{ConfigBasedAccessChecker, PlatformAccessChecker};
 
-    // Service accounts (external tokens) bypass platform access checks.
+    // Service accounts (legacy external tokens) bypass platform access checks.
     // Their access is validated per-project in phase 2.
     if req.extensions().get::<VerifiedExternalToken>().is_some() {
         tracing::debug!("Skipping platform access check for external token (service account)");
         return Ok(next.run(req).await);
+    }
+
+    // Exchanged access tokens: service-account and controller principals carry
+    // their own authorization (project binding / controller identity), so they
+    // bypass the email/group allowlist exactly as a legacy external token does.
+    // A (reserved) user access token is gated like any other user.
+    if let Some(claims) = req.extensions().get::<AccessClaims>() {
+        match &claims.principal {
+            PrincipalClaims::ServiceAccount { .. } | PrincipalClaims::Controller { .. } => {
+                tracing::debug!("Skipping platform access check for access token (SA/controller)");
+                return Ok(next.run(req).await);
+            }
+            PrincipalClaims::User { .. } => {
+                // Reserved — not minted in Phase 1. Fall through to user gating
+                // would require a `User` extension, which an access token does
+                // not provide, so reject explicitly rather than 500.
+                tracing::warn!("User access token presented; not supported in this phase");
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    "User access tokens are not supported".to_string(),
+                ));
+            }
+        }
     }
 
     // Extract user from extensions (injected by auth_middleware for Rise JWTs)

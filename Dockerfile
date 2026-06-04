@@ -17,6 +17,8 @@ FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY crates/rise-resource-api/Cargo.toml ./crates/rise-resource-api/Cargo.toml
 COPY crates/rise-resource-store/Cargo.toml ./crates/rise-resource-store/Cargo.toml
+COPY crates/rise-backend-auth/Cargo.toml ./crates/rise-backend-auth/Cargo.toml
+COPY crates/rise-runtime-sync/Cargo.toml ./crates/rise-runtime-sync/Cargo.toml
 
 # Create dummy sources for cargo to be happy
 RUN mkdir -p src && \
@@ -24,7 +26,11 @@ RUN mkdir -p src && \
     mkdir -p crates/rise-resource-api/src && \
     echo "" > crates/rise-resource-api/src/lib.rs && \
     mkdir -p crates/rise-resource-store/src && \
-    echo "" > crates/rise-resource-store/src/lib.rs
+    echo "" > crates/rise-resource-store/src/lib.rs && \
+    mkdir -p crates/rise-backend-auth/src && \
+    echo "" > crates/rise-backend-auth/src/lib.rs && \
+    mkdir -p crates/rise-runtime-sync/src && \
+    echo "" > crates/rise-runtime-sync/src/lib.rs
 
 RUN cargo chef prepare --recipe-path recipe.json
 

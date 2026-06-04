@@ -26,6 +26,7 @@ export default defineConfig({
             { label: 'Overview', slug: 'index' },
             { label: 'Operator Guide', slug: 'operator-guide' },
             { label: 'Configuration', slug: 'configuration' },
+            { label: 'Authentication & Tokens', slug: 'authentication' },
             {
               label: 'Registry Operations',
               items: [
@@ -70,6 +71,7 @@ export default defineConfig({
             { label: 'Production Deployment', slug: 'production' },
             { label: 'Database', slug: 'database' },
             { label: 'PostgreSQL Upgrades', slug: 'upgrading-postgresql' },
+            { label: 'Upgrade Notes & Breaking Changes', slug: 'upgrade-notes' },
           ],
         },
         {

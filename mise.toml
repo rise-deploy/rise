@@ -85,19 +85,45 @@ run = "cargo sqlx prepare -- --package rise-resource-store --all-targets"
 description = "Verify the SQLX query cache for rise-resource-store is up to date."
 run = "cargo sqlx prepare --check -- --package rise-resource-store --all-targets"
 
+[tasks."runtime-sync:db:migrate"]
+description = "Create the runtime_sync schema/tables in the dev DB (needed before runtime-sync:sqlx:prepare)."
+run = """
+docker compose up postgres -d && sleep 2
+psql "$DATABASE_URL" -c 'CREATE SCHEMA IF NOT EXISTS runtime_sync'
+PGOPTIONS='-c search_path=runtime_sync,public' sqlx migrate run --source crates/rise-runtime-sync/migrations
+"""
+
+[tasks."runtime-sync:sqlx:prepare"]
+description = "Prepare the SQLX query cache for rise-runtime-sync (requires running DB with runtime_sync schema applied)."
+# Run from the crate dir so the cache is written crate-local
+# (crates/rise-runtime-sync/.sqlx); a root-level per-package prepare would wipe
+# the rise-deploy cache in the shared workspace-root .sqlx.
+dir = "crates/rise-runtime-sync"
+run = "cargo sqlx prepare -- --all-targets"
+
+[tasks."runtime-sync:sqlx:check"]
+description = "Verify the SQLX query cache for rise-runtime-sync is up to date."
+dir = "crates/rise-runtime-sync"
+run = "cargo sqlx prepare --check -- --all-targets"
+
 [tasks.lint]
 description = "Run all linting checks (clippy, formatting, sqlx, helm)."
 run = """
 cargo all-features check --all-targets
 cargo check --package rise-resource-api --all-targets
 cargo check --package rise-resource-store --all-targets
+cargo check --package rise-backend-auth --all-targets
+cargo check --package rise-runtime-sync --all-targets
 cargo all-features clippy --all-targets -- -D warnings
 cargo clippy --package rise-resource-api --all-targets -- -D warnings
 cargo clippy --package rise-resource-store --all-targets -- -D warnings
+cargo clippy --package rise-backend-auth --all-targets -- -D warnings
+cargo clippy --package rise-runtime-sync --all-targets -- -D warnings
 cargo fmt --all -- --check
 mise sqlx:check
 mise resource:schema:check
 helm lint helm/rise
+cargo test --package rise-backend-auth --all-targets
 """
 env.SQLX_OFFLINE = true
 

@@ -99,6 +99,11 @@
           "description": "Allow all users to list all teams (default: false).\nWhen false, non-admin users only see teams they are members of.",
           "type": "boolean"
         },
+        "allow_raw_external_tokens": {
+          "default": true,
+          "description": "Accept raw external OIDC tokens directly at request time (default: true).\n\nWhen `true`, a CI service account may present its external OIDC token\ndirectly to project-scoped endpoints, and Rise resolves the service\naccount per request (the legacy two-phase path). When `false`, callers\nmust first exchange their token at `POST /api/v1/auth/token` for a Rise\naccess token.\n\nLeaving this `true` keeps the legacy attack surface and forfeits the\nsecurity benefits of the exchange (no service-account DB lookups in the\nrequest hot path, and an authenticated `platform/capabilities`). It is\nslated to default to `false` in a future release; migrate CI to\npre-exchange before then.",
+          "type": "boolean"
+        },
         "allow_team_creation": {
           "default": true,
           "description": "Allow regular users to create teams (default: true).\nWhen false, only admin users can create teams.",
@@ -175,7 +180,7 @@
       "type": "object"
     },
     "ControllerIdentity": {
-      "description": "A trusted external controller identity configured under `auth.controllers`.\n\nEach entry binds a stable controller ID (the key used under\n`status.controllers`) to an OIDC issuer plus required claim constraints.\n`claims.aud` is mandatory. Wildcards follow `JwtValidator::validate_custom_claims`\nglob rules (`*` matches any sequence of characters).",
+      "description": "A trusted external controller identity configured under `auth.controllers`.\n\nEach entry binds a stable controller ID (the key used under\n`status.controllers`) to an OIDC issuer plus required claim constraints.\n`claims.aud` is mandatory. Wildcards follow [`validate_custom_claims`]\nglob rules (`*` matches any sequence of characters).",
       "properties": {
         "claims": {
           "additionalProperties": {
@@ -1781,6 +1786,13 @@
     },
     "ServerSettings": {
       "properties": {
+        "auth_token_max_ttl_seconds": {
+          "default": 600,
+          "description": "Lifetime in seconds of Rise access tokens minted by the auth\ntoken-exchange endpoint (`POST /api/v1/auth/token`). Kept short because an\nexchanged token cannot be revoked mid-life. Default: 600 (10 minutes).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "cookie_domain": {
           "default": null,
           "description": "Cookie domain for migration from deployments that previously used domain-scoped cookies.\nWhen configured, responses that set a new host-only `rise_jwt` cookie also include a\n`Max-Age=0` Set-Cookie with this Domain attribute to expire any stale domain-scoped\ncookies browsers may still be sending. Remove once the migration window has passed.",

@@ -1,4 +1,4 @@
-use crate::db::{env_vars as db_env_vars, leader_leases::LeaderElection};
+use crate::db::env_vars as db_env_vars;
 use crate::server::encryption::EncryptionProvider;
 use crate::server::extensions::providers::oauth::models::{
     OAuthExtensionSpec, OAuthExtensionStatus, TokenResponse,
@@ -6,9 +6,11 @@ use crate::server::extensions::providers::oauth::models::{
 use crate::server::extensions::{Extension, InjectedEnvVar, InjectedEnvVarValue};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use rise_runtime_sync::with_leader_election;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use url::Url;
 use uuid::Uuid;
@@ -521,22 +523,26 @@ impl Extension for OAuthProvider {
         Ok(())
     }
 
-    fn start(&self) {
+    fn start(&self, shutdown: CancellationToken) -> tokio::task::JoinHandle<()> {
         let provider = self.clone();
 
         tokio::spawn(async move {
             info!("Starting OAuth provider reconciliation loop");
 
-            let election = LeaderElection::spawn(
-                provider.db_pool.clone(),
+            let pool = provider.db_pool.clone();
+            let result = with_leader_election(
+                pool,
                 "rise-ext-oauth",
                 Uuid::new_v4(),
                 std::time::Duration::from_secs(60),
-            );
-
+                shutdown.clone(),
+                move |election| async move {
             loop {
                 if !election.is_leader() {
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                    }
                     continue;
                 }
 
@@ -575,9 +581,19 @@ impl Extension for OAuthProvider {
                     }
                 }
 
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                }
             }
-        });
+            Ok(())
+                },
+            )
+            .await;
+            if let Err(e) = result {
+                error!("OAuth extension reconciliation loop error: {:?}", e);
+            }
+        })
     }
 
     async fn before_deployment(

@@ -53,7 +53,7 @@ Let's outline the architecture and components needed for this Rust-based project
 
 ## Architecture Overview
 
-**Note**: The project is structured as a **single consolidated Rust crate** (`rise-deploy`) that produces the `rise` binary with both CLI and server capabilities enabled via feature flags.
+**Note**: The project is a Cargo **workspace**. The primary crate `rise-deploy` produces the `rise` binary with both CLI and server capabilities enabled via feature flags. A few focused, backend-only support crates live under `crates/` and are depended on as optional, `backend`-feature-gated path deps: `rise-resource-api` / `rise-resource-store` (generic resource API), and `rise-backend-auth` (pure-core token signing, verification, and matching — the single home for auth-token logic; see `AUTH_TOKEN_EXCHANGE_PLAN.md`).
 
 ### Crate Structure (`rise-deploy`)
 
@@ -100,7 +100,7 @@ cargo build --all-features     # Full build with CLI + backend
 
 ## Implementation Steps
 
-**Project Structure**: Consolidated into single `rise-deploy` crate (formerly separate `rise-backend` and `rise-cli` crates)
+**Project Structure**: A Cargo workspace whose primary crate `rise-deploy` carries both CLI and backend (feature-gated). Focused, backend-only support crates live under `crates/` — `rise-resource-api` / `rise-resource-store` and the pure-core `rise-backend-auth` (the single home for auth-token signing, verification, and matching).
 
 ### Completed Implementation
 
@@ -167,6 +167,27 @@ For user-facing documentation, see the [`/docs`](./docs) directory. Key topics i
 - The default development branch is `develop`. PRs for feature work should target `develop`, not `main`.
 - Always target the branch your feature branch was created from when opening a PR.
 
+## Rollout Tracking
+
+High-impact, multi-PR, or operator-affecting changes are tracked in the **Rise
+Rollout Tracker** GitHub Project: <https://github.com/orgs/rise-deploy/projects/1>.
+Consult it when planning or reviewing large or breaking work to see in-flight
+workstreams, their phase, and outstanding finalization gates (deferred steps that
+flip a default, drop a compat shim, or tighten a constraint).
+
+Keep it current as work merges:
+
+- When a PR advances a tracked workstream, add it to the Project, link it from the
+  PR body, and move the item's `Status`. When you defer a finalization step, file
+  it as a `rollout-gate` issue and add it to the Project.
+- Set `Workstream`, `Breaking?`, `Operator impact`, and `Target release` on every
+  item. If `Operator impact` is not `None`, the item is **not** `Done` until the
+  operator [Upgrade Notes](docs/engineering/src/content/docs/upgrade-notes.md) page
+  has a matching entry for that release.
+- Plans like `MULTI_TENANCY_PLAN.md` and `AUTH_TOKEN_EXCHANGE_PLAN.md` own the
+  *why* and phase rationale; the Project owns *live status*. Don't duplicate
+  rationale into the board.
+
 ## Guidelines
 
 - Build features in small increments with frequent commits. Use Git history as a reference for what was done and why.
@@ -176,6 +197,7 @@ For user-facing documentation, see the [`/docs`](./docs) directory. Key topics i
 - Axum capture groups are formatted as `{capture}`
 - Keep the documentation updated. Don't be overly verbose when documenting the project. People can read the code, but things that are not obvious or help getting started and context are usually helpful in documentation, as well as well-placed and lean examples.
 - When removing a feature, do a comprehensive check on the codebase to ensure any remaining references to that feature are removed or updated. This includes documentation files/READMEs, config files, code comments, etc.
+- Don't reference previous versions of the code in comments, docs, or commit-independent artifacts (e.g. "the previous design did X", "vs the old tick counter", "this used to be Y"). Comments must describe what the code does *now* and why — a reader has no access to the version you're contrasting against, and such notes rot. Git history is the place for that context. (Referring to runtime/domain concepts like "the previous leader replica" is fine — that's not code history.)
 - The CLI should first and foremost always accept the names of things (e.g. project names, or project names + deployment timestamp). The UUIDs in our tables are only for internal book-keeping.
 - Admin users (`auth.admin_users`) bypass the regular permission checks on the typed APIs (projects, teams, deployments, etc.) — they have full access there without passing ownership/membership checks. This does **not** extend to the generic resource API (`/api/v1/resources`), which is operator-gated (`auth.operator_users`): admins are not operators and do not bypass its checks. Granting admins access to the resource API is intentionally deferred (see `MULTI_TENANCY_PLAN.md`).
 - Any SQLX queries are to be wrapped by helper functions in the `rise_deploy::db` crate. No SQLX queries outside of this crate are allowed.
@@ -211,7 +233,7 @@ cargo clippy --all-features --all-targets -- -D warnings  # Lint (uses cached bu
 
 | What changed | Command | Why |
 |---|---|---|
-| Any `.rs` file | `cargo test --all-features` | Unit tests (requires `mise run db:migrate` once) |
+| Any `.rs` file | `cargo test --workspace --all-features` | Unit tests (requires `mise run db:migrate` once); `--workspace` ensures crates such as `rise-backend-auth` are included |
 | SQLX queries (`sqlx::query!` etc.) | `mise run sqlx:prepare` | Regenerate offline query cache (commit the result) |
 | Server settings structs (`src/server/settings.rs`) | `mise run config:schema:generate` | Regenerate `docs/engineering/public/schemas/backend-settings.schema.json` (commit the result) |
 | `src/rise_toml.rs` structs | `mise run rise-toml:schema:generate` | Regenerate `docs/user/public/schemas/rise-toml-v1.schema.json` (commit the result) |
@@ -225,7 +247,7 @@ mise run lint                  # cargo check + clippy + fmt check + sqlx check +
 mise run config:schema:check        # Verify backend config schema is up to date
 mise run rise-toml:schema:check    # Verify rise.toml schema is up to date
 mise run crd:check                 # Verify CRD YAML matches Rust definition
-cargo test --all-features      # Unit tests
+cargo test --workspace --all-features  # Unit tests (all crates)
 ```
 
 The `mise run lint` task runs: `cargo all-features check`, `cargo all-features clippy -- -D warnings`, `cargo fmt --check`, `mise sqlx:check`, and `helm lint helm/rise`.

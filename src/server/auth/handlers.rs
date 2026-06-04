@@ -573,11 +573,16 @@ pub async fn code_exchange(
         )
     })?;
 
+    // Resolve the user's team memberships for the groups claim; on a DB error,
+    // fall back to no groups rather than failing the login.
+    let groups = crate::db::teams::get_team_names_for_user(&state.db_pool, user.id)
+        .await
+        .ok();
+
     // Issue Rise JWT for user authentication (consumed by the CLI)
     let rise_jwt = state
         .jwt_signer
-        .sign_user_jwt(&claims, user.id, &state.db_pool, &state.public_url, None)
-        .await
+        .sign_user_jwt(&claims, groups, &state.public_url, None)
         .map_err(|e| {
             tracing::error!("Failed to sign Rise JWT: {:#}", e);
             (
@@ -676,22 +681,28 @@ pub async fn device_exchange(
                 }
             };
 
-            // Issue Rise JWT for user authentication (consumed by the CLI)
-            let rise_jwt = match state
-                .jwt_signer
-                .sign_user_jwt(&claims, user.id, &state.db_pool, &state.public_url, None)
+            // Resolve the user's team memberships for the groups claim; on a DB
+            // error, fall back to no groups rather than failing the login.
+            let groups = crate::db::teams::get_team_names_for_user(&state.db_pool, user.id)
                 .await
-            {
-                Ok(jwt) => jwt,
-                Err(e) => {
-                    tracing::error!("Failed to sign Rise JWT: {:#}", e);
-                    return Json(DeviceExchangeResponse {
-                        token: None,
-                        error: Some("server_error".to_string()),
-                        error_description: Some("Failed to create token".to_string()),
-                    });
-                }
-            };
+                .ok();
+
+            // Issue Rise JWT for user authentication (consumed by the CLI)
+            let rise_jwt =
+                match state
+                    .jwt_signer
+                    .sign_user_jwt(&claims, groups, &state.public_url, None)
+                {
+                    Ok(jwt) => jwt,
+                    Err(e) => {
+                        tracing::error!("Failed to sign Rise JWT: {:#}", e);
+                        return Json(DeviceExchangeResponse {
+                            token: None,
+                            error: Some("server_error".to_string()),
+                            error_description: Some("Failed to create token".to_string()),
+                        });
+                    }
+                };
 
             tracing::info!(
                 "CLI device login successful for user {} - issued Rise JWT",
@@ -1201,10 +1212,15 @@ pub async fn oauth_callback(
             .or_else(|| build_project_url(&state, project))
             .unwrap_or_else(|| state.public_url.trim_end_matches('/').to_string());
 
+        // Resolve the user's team memberships for the groups claim; on a DB
+        // error, fall back to no groups rather than failing the login.
+        let groups = crate::db::teams::get_team_names_for_user(&state.db_pool, user.id)
+            .await
+            .ok();
+
         let rise_jwt = state
             .jwt_signer
-            .sign_ingress_jwt(&claims, user.id, &state.db_pool, &project_url, None)
-            .await
+            .sign_ingress_jwt(&claims, groups, &project_url, None)
             .map_err(|e| {
                 tracing::error!("Failed to sign Rise JWT: {:#}", e);
                 (
@@ -1324,11 +1340,16 @@ pub async fn oauth_callback(
     // Sync groups after login
     sync_groups_after_login(&state, &token_info.id_token).await?;
 
+    // Resolve the user's team memberships for the groups claim; on a DB error,
+    // fall back to no groups rather than failing the login.
+    let groups = crate::db::teams::get_team_names_for_user(&state.db_pool, user.id)
+        .await
+        .ok();
+
     // Issue Rise HS256 JWT for user authentication (consumed by the UI)
     let rise_jwt = state
         .jwt_signer
-        .sign_user_jwt(&claims, user.id, &state.db_pool, &state.public_url, None)
-        .await
+        .sign_user_jwt(&claims, groups, &state.public_url, None)
         .map_err(|e| {
             tracing::error!("Failed to sign user JWT: {:#}", e);
             (

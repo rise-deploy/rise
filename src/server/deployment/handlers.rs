@@ -1175,12 +1175,26 @@ pub async fn create_deployment(
             })?;
     }
 
-    // Enforce service account environment restrictions
+    // Enforce service account environment restrictions.
     if is_sa {
-        let sa = service_accounts::find_active_by_user_id(&state.db_pool, user.id)
-            .await
-            .internal_err("Failed to look up service account")?;
-        if let Some(ref allowed_env_ids) = sa.and_then(|sa| sa.allowed_environment_ids) {
+        // The restriction snapshot: an exchanged access token carries it inline
+        // (no DB), preserving the same one-active-SA-per-synthetic-user semantics
+        // as the legacy lookup; a raw external token resolves the active SA row.
+        let allowed_env_ids: Option<Vec<uuid::Uuid>> = match auth.access_claims() {
+            Some(claims) => match &claims.principal {
+                rise_backend_auth::PrincipalClaims::ServiceAccount {
+                    allowed_environment_ids,
+                    ..
+                } => allowed_environment_ids.clone(),
+                _ => None,
+            },
+            None => service_accounts::find_active_by_user_id(&state.db_pool, user.id)
+                .await
+                .internal_err("Failed to look up service account")?
+                .and_then(|sa| sa.allowed_environment_ids),
+        };
+
+        if let Some(ref allowed_env_ids) = allowed_env_ids {
             let target_env_id = resolved_environment.as_ref().map(|e| e.id);
             match target_env_id {
                 Some(env_id) if !allowed_env_ids.contains(&env_id) => {
