@@ -146,7 +146,7 @@ const MAX_NAME_LEN: usize = 63;
 /// distinct; the generation makes a recreated container's name visibly newer
 /// than the one it replaced. Matching is by bookkeeping LABELS (the stable
 /// identity tuple including the replica), never by this name — see
-/// [`stable_identity_name`] for the replica- and generation-free identity used by
+/// [`group_app_name`] for the group-scoped, deployment-id-free identity used by
 /// DNS / env.
 pub fn container_name(
     prefix: &str,
@@ -165,13 +165,14 @@ pub fn container_name(
 
 /// Replica- and generation-FREE stable identity name:
 /// `<prefix>_<project>_<group>_<deploymentid>_<container>`, sanitized + capped
-/// the same way as [`container_name`] but with no `_r{n}` / `_g{n}` suffix. Used
-/// where a name must stay constant across replicas AND generations — the shared
-/// network alias and the injected `RISE_CONTAINER_HOST__<NAME>` service-discovery
-/// hostname. Because EVERY replica of a container attaches this same alias,
-/// Docker's embedded DNS ROUND-ROBINS the alias across all running replicas, and
-/// the discovery host points at that one shared name; the env hash also doesn't
-/// drift per replica or per recreate.
+/// the same way as [`container_name`] but with no `_r{n}` / `_g{n}` suffix.
+///
+/// Still deployment-id-BEARING (unlike [`group_app_name`]). Used only to
+/// synthesize a stable per-replica placeholder pod name for diagnostics when a
+/// replica has no live container yet (the diff appends `_r{n}`). The DNS-facing
+/// names — the network alias and the `RISE_CONTAINER_HOST__<NAME>` discovery host
+/// — are GROUP-scoped now (see [`group_app_name`]) so they stay stable across
+/// deployments, not just across replicas/generations of one deployment.
 pub fn stable_identity_name(
     prefix: &str,
     project: &str,
@@ -183,10 +184,34 @@ pub fn stable_identity_name(
     sanitize_and_cap(&raw)
 }
 
+/// Group-scoped, deployment-id-FREE application name:
+/// `<prefix>_<project>_<group>_<container>`, sanitized + capped exactly like
+/// [`container_name`] but with NO deployment-id, replica, or generation segment.
+///
+/// This is the stable, deployment-id-free name shared by ALL of a group's
+/// deployments and replicas. EVERY container that belongs to a (project, group,
+/// container) — regardless of which deployment created it — attaches this same
+/// name as its Docker NETWORK ALIAS, so Docker's embedded DNS ROUND-ROBINS the
+/// alias across whatever containers currently carry it (matching the Kubernetes
+/// group Service, whose name is likewise deployment-id-free). It is also the
+/// `RISE_CONTAINER_HOST__<NAME>` sibling-discovery host. Because the name is
+/// stable across deployments, an old and a new deployment of the same group can
+/// share one DNS name during a rolling overlap — foundational for
+/// health-driven rolling-overlap routing.
+pub fn group_app_name(
+    prefix: &str,
+    project: &str,
+    deployment_group: &str,
+    container: &str,
+) -> String {
+    let raw = format!("{prefix}_{project}_{deployment_group}_{container}");
+    sanitize_and_cap(&raw)
+}
+
 /// Sanitize a raw name to `[a-zA-Z0-9_.-]` and hash-truncate it when it exceeds
-/// [`MAX_NAME_LEN`]. Shared by [`container_name`] and [`stable_identity_name`]
-/// so the 63-char cap logic lives in one place. Deterministic: same input →
-/// same output.
+/// [`MAX_NAME_LEN`]. Shared by [`container_name`], [`stable_identity_name`] and
+/// [`group_app_name`] so the 63-char cap logic lives in one place.
+/// Deterministic: same input → same output.
 fn sanitize_and_cap(raw: &str) -> String {
     let sanitized = sanitize_name(raw);
     if sanitized.len() <= MAX_NAME_LEN {
@@ -281,25 +306,27 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
     // misleading `unhealthy` status in `docker ps` with no bearing on routing.
 
     // ── Network attachment ─────────────────────────────────────────────
-    // Attach a NETWORK ALIAS equal to the generation-FREE stable identity name
-    // so siblings keep resolving this container across recreates: the live
-    // container's `--name` carries the `_g{n}` generation suffix (which changes
-    // every recreate), but the injected `RISE_CONTAINER_HOST__<NAME>` discovery
-    // env points at the stable name. Docker's embedded DNS resolves the alias on
-    // the shared user-defined network, so the env hash never drifts per
-    // generation and siblings never point at a stale `_g{n}` name.
-    let stable_alias = stable_identity_name(
+    // Attach a NETWORK ALIAS equal to the GROUP-scoped, deployment-id-FREE app
+    // name (see [`group_app_name`]) so siblings keep resolving this container
+    // across recreates AND across deployments of the same group: the live
+    // container's `--name` carries the per-recreate `_g{n}` generation suffix and
+    // the per-deployment id, but the injected `RISE_CONTAINER_HOST__<NAME>`
+    // discovery env points at this stable name. Docker's embedded DNS resolves
+    // the alias on the shared user-defined network and ROUND-ROBINS it across
+    // whatever containers currently carry it, so the env hash never drifts per
+    // generation/replica and old+new deployments of the group share one DNS name
+    // (foundational for rolling overlap), mirroring the K8s group Service.
+    let group_alias = group_app_name(
         cfg.container_prefix,
         &desired.project,
         &desired.deployment_group,
-        &desired.deployment_id,
         &desired.container,
     );
     let mut endpoints = HashMap::new();
     endpoints.insert(
         cfg.traefik_network.to_string(),
         EndpointSettings {
-            aliases: Some(vec![stable_alias]),
+            aliases: Some(vec![group_alias]),
             ..Default::default()
         },
     );
@@ -465,14 +492,16 @@ fn render_traefik_labels_for(
         if route.hosts.is_empty() {
             continue;
         }
-        // Include the deployment id so a superseded (Terminating) container and
-        // its replacement carry distinct Traefik router/service names during a
-        // rollout — otherwise both would expose identical router labels for up
-        // to one reconcile interval and collide. The Host rule stays the same so
-        // traffic keeps resolving to the project.
+        // GROUP-scoped router/service base name — deployment-id-FREE, so ALL
+        // routers/services/middlewares for a (project, group, container) are
+        // named IDENTICALLY across every deployment of the group. This lets an
+        // old and a new deployment share one Traefik service (their replica
+        // containers register as servers of the same load balancer), which sets
+        // up health-driven rolling overlap. Mirrors the K8s group Service/Ingress
+        // naming, which is likewise deployment-id-free.
         let base = labels::sanitize_router_name(&format!(
-            "{}-{}-{}-{}",
-            desired.project, desired.deployment_group, desired.deployment_id, desired.container
+            "{}-{}-{}",
+            desired.project, desired.deployment_group, desired.container
         ));
         // Distinct router per route so multiple path prefixes don't collide.
         let router_name = if routes.len() > 1 {
@@ -630,14 +659,34 @@ mod tests {
     }
 
     #[test]
-    fn network_alias_is_stable_identity_name_without_generation() {
-        // The Docker network alias must be the generation-FREE stable identity
-        // name so siblings resolve this container across recreates and the
-        // injected discovery env doesn't drift each generation.
+    fn group_app_name_is_deployment_id_free() {
+        // The group-scoped name is `{prefix}_{project}_{group}_{container}` with
+        // NO deployment-id, replica, or generation segment — stable across
+        // deployments. It is also the `RISE_CONTAINER_HOST__REDIS` discovery host.
+        let n = group_app_name("rise", "myapp", "default", "redis");
+        assert_eq!(n, "rise_myapp_default_redis");
+        // Use the `worker` container to assert no `_r{n}` / `_g{n}` suffix without
+        // tripping over the literal "_r" inside "redis".
+        let w = group_app_name("rise", "myapp", "default", "worker");
+        assert_eq!(w, "rise_myapp_default_worker");
+        assert!(!w.contains("_r"), "must not carry a _r replica suffix");
+        assert!(!w.contains("_g"), "must not carry a _g generation suffix");
+        // Independent of deployment id by construction (no id param).
+        assert_eq!(
+            group_app_name("rise", "myapp", "default", "redis"),
+            "rise_myapp_default_redis"
+        );
+    }
+
+    #[test]
+    fn network_alias_is_group_scoped_without_deployment_id_or_generation() {
+        // The Docker network alias must be the GROUP-scoped, deployment-id-FREE
+        // app name so siblings resolve this container across recreates AND across
+        // deployments of the group, and the injected discovery env doesn't drift.
         let mut desired = single_container();
         desired.generation = 7;
         let built = build_container(&desired, &test_cfg());
-        // The container NAME carries the replica + generation suffix...
+        // The container NAME carries the deployment id + replica + generation...
         assert_eq!(built.name, "rise_myapp_default_20260101-120000_app_r0_g7");
         let aliases = built
             .config
@@ -650,15 +699,51 @@ mod tests {
             .aliases
             .as_ref()
             .expect("network endpoint must carry an alias");
-        // ...but the alias is the stable, generation-free name.
-        assert_eq!(
-            aliases,
-            &vec!["rise_myapp_default_20260101-120000_app".to_string()]
+        // ...but the alias is the group-scoped `{prefix}_{project}_{group}_{container}`.
+        assert_eq!(aliases, &vec!["rise_myapp_default_app".to_string()]);
+        assert!(
+            !aliases[0].contains("20260101-120000"),
+            "network alias must not carry the deployment id"
         );
         assert!(
             !aliases[0].contains("_g"),
             "network alias must not carry a _g generation suffix"
         );
+        assert!(
+            !aliases[0].contains("_r"),
+            "network alias must not carry a _r replica suffix"
+        );
+    }
+
+    #[test]
+    fn network_alias_stable_across_different_deployment_ids() {
+        // Two DIFFERENT deployment_ids of the same (project, group, container)
+        // must attach the IDENTICAL group-scoped network alias, so Docker DNS can
+        // round-robin across both deployments' containers during a rolling overlap.
+        let cfg = test_cfg();
+        let mut d1 = single_container();
+        d1.deployment_id = "20260101-120000".to_string();
+        let mut d2 = single_container();
+        d2.deployment_id = "20260202-235959".to_string();
+
+        let alias_of = |d: &DesiredContainer| -> Vec<String> {
+            build_container(d, &cfg)
+                .config
+                .networking_config
+                .unwrap()
+                .endpoints_config
+                .get("rise_default")
+                .unwrap()
+                .aliases
+                .clone()
+                .unwrap()
+        };
+        assert_eq!(
+            alias_of(&d1),
+            alias_of(&d2),
+            "different deployments of a group must share one network alias"
+        );
+        assert_eq!(alias_of(&d1), vec!["rise_myapp_default_app".to_string()]);
     }
 
     #[test]
@@ -687,10 +772,7 @@ mod tests {
         let a0 = alias_of(&r0);
         let a1 = alias_of(&r1);
         assert_eq!(a0, a1, "replicas must share one network alias");
-        assert_eq!(
-            a0,
-            vec!["rise_myapp_default_20260101-120000_app".to_string()]
-        );
+        assert_eq!(a0, vec!["rise_myapp_default_app".to_string()]);
         assert!(
             !a0[0].contains("_r"),
             "shared alias must not carry a _r replica suffix"
@@ -725,15 +807,48 @@ mod tests {
             t0, t1,
             "replicas must render identical Traefik labels (shared router+service)"
         );
-        // Spot-check the shared service/router name is replica-free.
-        assert!(t0.contains_key(
-            "traefik.http.services.myapp-default-20260101-120000-app.loadbalancer.server.port"
-        ));
-        assert!(t0.contains_key("traefik.http.routers.myapp-default-20260101-120000-app.rule"));
+        // Spot-check the shared service/router name is group-scoped (replica- and
+        // deployment-id-free).
+        assert!(t0.contains_key("traefik.http.services.myapp-default-app.loadbalancer.server.port"));
+        assert!(t0.contains_key("traefik.http.routers.myapp-default-app.rule"));
         assert!(
             !t0.keys().any(|k| k.contains("-r0") || k.contains("-r1")),
             "Traefik router/service names must not include a replica index"
         );
+        assert!(
+            !t0.keys().any(|k| k.contains("20260101-120000")),
+            "Traefik router/service names must not include the deployment id"
+        );
+    }
+
+    #[test]
+    fn traefik_names_stable_across_different_deployment_ids() {
+        // Two DIFFERENT deployment_ids of the same (project, group, container)
+        // must render the SAME Traefik service/router names, so an old and a new
+        // deployment register as servers of ONE Traefik service (rolling overlap).
+        let cfg = test_cfg();
+        let mut d1 = single_container();
+        d1.deployment_id = "20260101-120000".to_string();
+        let mut d2 = single_container();
+        d2.deployment_id = "20260202-235959".to_string();
+
+        let traefik_of = |d: &DesiredContainer| -> std::collections::BTreeMap<String, String> {
+            build_container(d, &cfg)
+                .config
+                .labels
+                .unwrap()
+                .into_iter()
+                .filter(|(k, _)| k.starts_with("traefik."))
+                .collect()
+        };
+        assert_eq!(
+            traefik_of(&d1),
+            traefik_of(&d2),
+            "different deployments of a group must share one Traefik router+service"
+        );
+        let t = traefik_of(&d1);
+        assert!(t.contains_key("traefik.http.routers.myapp-default-app.rule"));
+        assert!(t.contains_key("traefik.http.services.myapp-default-app.loadbalancer.server.port"));
     }
 
     #[test]
@@ -767,15 +882,13 @@ mod tests {
         );
         assert_eq!(
             labels
-                .get("traefik.http.routers.myapp-default-20260101-120000-app.rule")
+                .get("traefik.http.routers.myapp-default-app.rule")
                 .map(String::as_str),
             Some("Host(`myapp.rise.dev`)")
         );
         assert_eq!(
             labels
-                .get(
-                    "traefik.http.services.myapp-default-20260101-120000-app.loadbalancer.server.port"
-                )
+                .get("traefik.http.services.myapp-default-app.loadbalancer.server.port")
                 .map(String::as_str),
             Some("8080")
         );
@@ -1109,13 +1222,13 @@ mod tests {
         // Two routers, index suffixed. Longest prefix (/api/v1) sorts first → -0.
         assert_eq!(
             labels
-                .get("traefik.http.routers.myapp-default-20260101-120000-api-0.rule")
+                .get("traefik.http.routers.myapp-default-api-0.rule")
                 .map(String::as_str),
             Some("Host(`myapp.rise.dev`) && PathPrefix(`/api/v1`)")
         );
         assert_eq!(
             labels
-                .get("traefik.http.routers.myapp-default-20260101-120000-api-1.rule")
+                .get("traefik.http.routers.myapp-default-api-1.rule")
                 .map(String::as_str),
             Some("Host(`myapp.rise.dev`)")
         );
@@ -1132,13 +1245,13 @@ mod tests {
         let labels = built.config.labels.as_ref().unwrap();
         assert_eq!(
             labels
-                .get("traefik.http.routers.myapp-default-20260101-120000-app.tls")
+                .get("traefik.http.routers.myapp-default-app.tls")
                 .map(String::as_str),
             Some("true")
         );
         assert_eq!(
             labels
-                .get("traefik.http.routers.myapp-default-20260101-120000-app.tls.certresolver")
+                .get("traefik.http.routers.myapp-default-app.tls.certresolver")
                 .map(String::as_str),
             Some("le")
         );
@@ -1164,7 +1277,7 @@ mod tests {
         desired.access_class = "private".to_string();
         let built = build_container(&desired, &cfg);
         let labels = built.config.labels.as_ref().unwrap();
-        let r = "myapp-default-20260101-120000-app";
+        let r = "myapp-default-app";
         assert_eq!(
             labels
                 .get(&format!(
@@ -1241,7 +1354,7 @@ mod tests {
         desired.access_class = "ghost".to_string();
         let built = build_container(&desired, &cfg);
         let labels = built.config.labels.as_ref().unwrap();
-        let r = "myapp-default-20260101-120000-app";
+        let r = "myapp-default-app";
         // forwardAuth middleware IS stamped (route is protected, not open).
         assert_eq!(
             labels

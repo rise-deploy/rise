@@ -606,18 +606,21 @@ impl DockerReconciler {
         // Cross-container service discovery: expose each routable sibling's
         // address as `RISE_CONTAINER_HOST__<NAME>=<host>:<port>`, mirroring the
         // K8s convention (`ResourceBuilder::auto_container_host_env_vars`) so a
-        // multi-container app's code is portable across backends. The host is
-        // the sibling's generation-FREE `stable_identity_name` — NOT its live
-        // `--name` (which carries a per-recreate `_g{n}` suffix). Each container
-        // attaches that stable name as a Docker NETWORK ALIAS (see
-        // `build_container`), so Docker's embedded DNS resolves it on the shared
-        // user-defined network and the address keeps pointing at the sibling
-        // across recreates. Using the stable name (not the generation-ful one)
-        // also keeps the env hash from drifting every recreate, which would
-        // otherwise trigger an infinite recreate loop. Only meaningful with ≥2
-        // containers, so a single-container app doesn't get a pointless
-        // self-entry. Each container also sees its own entry (harmless), matching
-        // K8s; order follows `container_specs` for deterministic env hashes.
+        // multi-container app's code is portable across backends. The host is the
+        // sibling's GROUP-scoped, deployment-id-FREE `group_app_name` (the alias
+        // shared across ALL deployments and replicas of the group) — NOT its live
+        // `--name` (which carries the deployment id plus a per-recreate `_g{n}`
+        // suffix). Every container of that (project, group, container) attaches
+        // this same name as its Docker NETWORK ALIAS (see `build_container`), so
+        // Docker's embedded DNS resolves it on the shared user-defined network and
+        // ROUND-ROBINS across whatever containers currently carry it — the address
+        // keeps pointing at the sibling across recreates AND across deployments of
+        // the group. Using the deployment-id-free name also keeps the env hash
+        // from drifting per recreate/deployment, which would otherwise trigger an
+        // infinite recreate loop. Only meaningful with ≥2 containers, so a
+        // single-container app doesn't get a pointless self-entry. Each container
+        // also sees its own entry (harmless), matching K8s; order follows
+        // `container_specs` for deterministic env hashes.
         let injected_hosts: Vec<(String, String)> = if container_specs.len() >= 2 {
             container_specs
                 .iter()
@@ -627,11 +630,10 @@ impl DockerReconciler {
                         "RISE_CONTAINER_HOST__{}",
                         spec.name.to_uppercase().replace('-', "_")
                     );
-                    let host = container_builder::stable_identity_name(
+                    let host = container_builder::group_app_name(
                         &self.config.container_prefix,
                         &project.name,
                         &deployment.deployment_group,
-                        &deployment.deployment_id,
                         &spec.name,
                     );
                     Some((key, format!("{host}:{port}")))
@@ -2768,14 +2770,16 @@ mod tests {
             "RISE_CONTAINER_HOST__API".to_string(),
             "user-global:1".to_string(),
         )];
+        // Injected hosts use the GROUP-scoped, deployment-id-FREE alias
+        // (`{prefix}_{project}_{group}_{container}`).
         let injected = vec![
             (
                 "RISE_CONTAINER_HOST__API".to_string(),
-                "rise_myapp_default_ts_api:8080".to_string(),
+                "rise_myapp_default_api:8080".to_string(),
             ),
             (
                 "RISE_CONTAINER_HOST__REDIS".to_string(),
-                "rise_myapp_default_ts_redis:6379".to_string(),
+                "rise_myapp_default_redis:6379".to_string(),
             ),
         ];
         let spec = ContainerSpec {
