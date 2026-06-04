@@ -271,7 +271,7 @@
         },
         "max_replicas": {
           "default": 1,
-          "description": "Maximum replicas allowed (default: 1)",
+          "description": "Maximum replicas allowed (default: 1). Accepts a number or a numeric\nstring so it can be env-driven (e.g. `\"${RISE_MAX_REPLICAS:-10}\"`).",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"

@@ -392,6 +392,32 @@ where
     Ok(opt.filter(|s| !s.trim().is_empty()))
 }
 
+/// Accept a `u32` from either a JSON number or a numeric string, so a field can
+/// be env-driven via `${VAR:-N}`. The settings loader interpolates `${VAR}` into
+/// a JSON string, so `max_replicas: "${RISE_MAX_REPLICAS:-10}"` reaches serde as
+/// the string `"10"`; serde won't coerce string→u32, so accept both forms.
+fn deserialize_u32_flexible<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum U32OrString {
+        Num(u32),
+        Str(String),
+    }
+
+    match U32OrString::deserialize(deserializer)? {
+        U32OrString::Num(n) => Ok(n),
+        U32OrString::Str(s) => s
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| D::Error::custom(format!("invalid integer string {s:?}; expected a u32"))),
+    }
+}
+
 /// Deserialize a list of strings, dropping blank/whitespace-only entries.
 ///
 /// The settings loader interpolates `${VAR}` per string element, so an
@@ -794,8 +820,13 @@ pub struct DeploymentConstraints {
     #[serde(default = "default_min_replicas")]
     pub min_replicas: u32,
 
-    /// Maximum replicas allowed (default: 1)
-    #[serde(default = "default_max_replicas")]
+    /// Maximum replicas allowed (default: 1). Accepts a number or a numeric
+    /// string so it can be env-driven (e.g. `"${RISE_MAX_REPLICAS:-10}"`).
+    #[serde(
+        default = "default_max_replicas",
+        deserialize_with = "deserialize_u32_flexible"
+    )]
+    #[schemars(with = "u32")]
     pub max_replicas: u32,
 
     /// Minimum CPU allowed (default: "100m")
@@ -1938,6 +1969,23 @@ impl Settings {
 mod tests {
     use super::*;
 
+    #[test]
+    fn deserialize_u32_flexible_accepts_number_and_numeric_string() {
+        #[derive(Deserialize)]
+        struct Holder {
+            #[serde(deserialize_with = "deserialize_u32_flexible")]
+            n: u32,
+        }
+        // Plain number (e.g. config/default.yaml).
+        let from_num: Holder = serde_yaml::from_str("n: 7").unwrap();
+        assert_eq!(from_num.n, 7);
+        // Numeric string (e.g. an interpolated `${RISE_MAX_REPLICAS:-10}`).
+        let from_str: Holder = serde_yaml::from_str("n: \"10\"").unwrap();
+        assert_eq!(from_str.n, 10);
+        // A non-numeric string is rejected.
+        assert!(serde_yaml::from_str::<Holder>("n: \"abc\"").is_err());
+    }
+
     fn ok_template(id: &str) -> QuickstartTemplateConfig {
         QuickstartTemplateConfig {
             id: id.to_string(),
@@ -2661,11 +2709,19 @@ auth:
             ingress_port,
             app_backend_host_aliases,
             app_backend_ip,
+            deployment_constraints,
             ..
         }) = &settings.deployment_controller
         else {
             panic!("expected docker deployment_controller");
         };
+        // Replicas: env-driven max (RISE_MAX_REPLICAS) defaults to 10 so the
+        // Docker backend allows horizontal scale-out out of the box (the
+        // platform default of 1 would reject replicas>1 at the API).
+        assert_eq!(
+            deployment_constraints.max_replicas, 10,
+            "docker default max_replicas must be 10 (env-driven, unset)"
+        );
         // LOCAL: alias populated so the controller injects rise.localhost ->
         // backend into app containers.
         assert_eq!(

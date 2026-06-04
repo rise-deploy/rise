@@ -119,6 +119,13 @@ deployment_controller:
   ingress_schema: "${RISE_INGRESS_SCHEME:-http}"
   reconcile_interval_secs: 5
   controller_class_name: "default"
+  # Platform replica bounds. The Docker backend supports horizontal scale-out
+  # (N containers per spec behind one Traefik service, rolling recreate), so
+  # allow replicas > 1 out of the box — tune the ceiling via RISE_MAX_REPLICAS.
+  # The controller additionally hard-clamps to 50. The platform default is 1,
+  # which would otherwise reject every replicas > 1 request at the API.
+  deployment_constraints:
+    max_replicas: "${RISE_MAX_REPLICAS:-10}"
   # Internal URL Traefik uses to reach the Rise backend for the forwardAuth
   # subrequest (compose service name + port).
   auth_backend_url: "${RISE_AUTH_BACKEND_URL:-http://rise:3000}"
