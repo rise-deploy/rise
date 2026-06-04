@@ -336,7 +336,7 @@ pub async fn platform_access_middleware(
     // bypass the email/group allowlist exactly as a legacy external token does.
     // A (reserved) user access token is gated like any other user.
     if let Some(claims) = req.extensions().get::<AccessClaims>() {
-        match claims.principal {
+        match &claims.principal {
             PrincipalClaims::ServiceAccount { .. } | PrincipalClaims::Controller { .. } => {
                 tracing::debug!("Skipping platform access check for access token (SA/controller)");
                 return Ok(next.run(req).await);

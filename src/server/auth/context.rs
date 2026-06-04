@@ -187,7 +187,7 @@ impl AuthContext {
         match self {
             AuthContext::ExternalToken(_) => true,
             AuthContext::Access(claims) => {
-                matches!(claims.principal, PrincipalClaims::ServiceAccount { .. })
+                matches!(&claims.principal, PrincipalClaims::ServiceAccount { .. })
             }
             AuthContext::User(_) => false,
         }
