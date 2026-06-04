@@ -145,8 +145,12 @@ pub struct BuilderConfig<'a> {
     /// Traffic-cutover strategy for the group. Only `HealthRolling` emits the
     /// Traefik load-balancer health-check labels (`...loadbalancer.healthcheck.*`)
     /// for routable containers that have an effective health path; `Recreate`
-    /// (the current default) emits none, so today's routing is unchanged. The
-    /// reconcile/rolling behavior itself is wired in a later step.
+    /// (the current default) emits none, so its routing is unchanged. In
+    /// `HealthRolling` mode the reconciler gates the Deploying→Healthy cutover on
+    /// Traefik's `serverStatus` (the old active deployment is retired only once
+    /// the new servers are confirmed UP), mirroring with Rise's own probe when no
+    /// Traefik API is configured — see `reconciler::reconcile_health` and
+    /// `rolling_rotation_decision`.
     pub cutover_strategy: crate::server::settings::CutoverStrategy,
 }
 
@@ -436,6 +440,74 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
     BuiltContainer { name, config }
 }
 
+/// Group-scoped Traefik router/service BASE name for a (project, group,
+/// container), deployment-id-FREE so ALL routers/services/middlewares of a
+/// (project, group, container) are named IDENTICALLY across every deployment of
+/// the group. This lets an old and a new deployment share one Traefik service
+/// (their replica containers register as servers of the same load balancer),
+/// setting up health-driven rolling overlap. Mirrors the K8s group
+/// Service/Ingress naming, which is likewise deployment-id-free.
+///
+/// Shared by [`render_traefik_labels_for`] (which stamps the labels) and the
+/// reconciler's `serverStatus` lookup (which queries `{service}@docker`) so the
+/// two can't drift on how the service is named.
+pub fn group_service_base(project: &str, deployment_group: &str, container: &str) -> String {
+    labels::sanitize_router_name(&format!("{project}-{deployment_group}-{container}"))
+}
+
+/// Per-route Traefik service/router name for route `route_idx` of a container
+/// that emits `route_count` routes. A single-route container uses the bare
+/// [`group_service_base`]; a multi-route container gets per-route services
+/// `{base}-{idx}` (so multiple path prefixes don't collide on one router/service
+/// name). The reconciler queries these SAME names for `serverStatus`, so the
+/// derivation lives in ONE place. Routes are sorted longest-path-prefix-first by
+/// [`render_traefik_labels_for`] before indexing, so callers that need the names
+/// in label order must sort the same way.
+pub fn group_service_name(base: &str, route_idx: usize, route_count: usize) -> String {
+    if route_count > 1 {
+        format!("{base}-{route_idx}")
+    } else {
+        base.to_string()
+    }
+}
+
+/// The full set of Traefik service names a container's routable routes emit, in
+/// the same order [`render_traefik_labels_for`] stamps them (longest path-prefix
+/// first). Empty when the container is not routable / portless / has no host.
+///
+/// The reconciler reads `serverStatus` for the same service(s) via the runtime
+/// [`DesiredContainer`]-free path
+/// ([`super::reconciler::service_names_for_spec`]); this `DesiredContainer`-based
+/// form is the reference used to assert the two derivations agree.
+#[cfg(test)]
+pub fn group_service_names(desired: &DesiredContainer) -> Vec<String> {
+    if desired.port.filter(|_| desired.routable).is_none() {
+        return Vec::new();
+    }
+    let base = group_service_base(
+        &desired.project,
+        &desired.deployment_group,
+        &desired.container,
+    );
+    let mut routes = desired.routes.clone();
+    routes.sort_by(|a, b| {
+        let al = a.path_prefix.as_deref().unwrap_or("/").len();
+        let bl = b.path_prefix.as_deref().unwrap_or("/").len();
+        bl.cmp(&al)
+    });
+    // Enumerate over the FULL sorted list (matching `render_traefik_labels_for`,
+    // where the `{base}-{idx}` index is the position in the full list and the
+    // multi-route test is `routes.len() > 1`), but only emit a name for routes
+    // that actually produce a router — those with at least one host.
+    let route_count = routes.len();
+    routes
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| !r.hosts.is_empty())
+        .map(|(idx, _)| group_service_name(&base, idx, route_count))
+        .collect()
+}
+
 /// Render the full Traefik label map for a desired container.
 ///
 /// Empty when the container is not routable (superseded / not-yet-active
@@ -511,27 +583,22 @@ fn render_traefik_labels_for(
         let bl = b.path_prefix.as_deref().unwrap_or("/").len();
         bl.cmp(&al)
     });
+    // GROUP-scoped router/service base name — deployment-id-FREE, shared with
+    // the reconciler's `serverStatus` lookup via [`group_service_base`] so the
+    // two can't drift. Distinct per-route service names (`{base}-{idx}` when
+    // there is more than one route) keep multiple path prefixes from colliding;
+    // [`group_service_name`] is the single source for that derivation.
+    let route_count = routes.len();
+    let base = group_service_base(
+        &desired.project,
+        &desired.deployment_group,
+        &desired.container,
+    );
     for (idx, route) in routes.iter().enumerate() {
         if route.hosts.is_empty() {
             continue;
         }
-        // GROUP-scoped router/service base name — deployment-id-FREE, so ALL
-        // routers/services/middlewares for a (project, group, container) are
-        // named IDENTICALLY across every deployment of the group. This lets an
-        // old and a new deployment share one Traefik service (their replica
-        // containers register as servers of the same load balancer), which sets
-        // up health-driven rolling overlap. Mirrors the K8s group Service/Ingress
-        // naming, which is likewise deployment-id-free.
-        let base = labels::sanitize_router_name(&format!(
-            "{}-{}-{}",
-            desired.project, desired.deployment_group, desired.container
-        ));
-        // Distinct router per route so multiple path prefixes don't collide.
-        let router_name = if routes.len() > 1 {
-            format!("{base}-{idx}")
-        } else {
-            base
-        };
+        let router_name = group_service_name(&base, idx, route_count);
         let traefik = labels::render_traefik_labels(&TraefikRoute {
             router_name: &router_name,
             hosts: &route.hosts,
@@ -1297,6 +1364,92 @@ mod tests {
                 .map(String::as_str),
             Some("Host(`myapp.rise.dev`)")
         );
+    }
+
+    #[test]
+    fn group_service_names_single_route_matches_emitted_service_label() {
+        // A single-route container's `serverStatus` lookup name must equal the
+        // bare base service the labels stamp (`{project}-{group}-{container}`).
+        let desired = single_container();
+        let built = build_container(&desired, &test_cfg());
+        let labels = built.config.labels.unwrap();
+        // The label set carries exactly one loadbalancer service for the base.
+        assert!(
+            labels.contains_key("traefik.http.services.myapp-default-app.loadbalancer.server.port")
+        );
+
+        let names = group_service_names(&desired);
+        assert_eq!(names, vec!["myapp-default-app".to_string()]);
+        // Every derived name corresponds to a service the labels actually emit.
+        for name in &names {
+            assert!(
+                labels.contains_key(&format!(
+                    "traefik.http.services.{name}.loadbalancer.server.port"
+                )),
+                "derived service {name} must match an emitted service label"
+            );
+        }
+    }
+
+    #[test]
+    fn group_service_names_multi_route_matches_per_route_service_labels() {
+        // A multi-route container emits per-route services `{base}-{idx}`; the
+        // reconciler's lookup names must match those EXACTLY (the bug behind the
+        // 404 → serverStatus None fallback for multi-route containers).
+        let mut desired = single_container();
+        desired.container = "api".to_string();
+        desired.routes = vec![
+            DesiredRoute {
+                hosts: vec!["myapp.rise.dev".to_string()],
+                path_prefix: Some("/".to_string()),
+            },
+            DesiredRoute {
+                hosts: vec!["myapp.rise.dev".to_string()],
+                path_prefix: Some("/api/v1".to_string()),
+            },
+        ];
+        let built = build_container(&desired, &test_cfg());
+        let labels = built.config.labels.unwrap();
+
+        // Labels emit per-route services -0 (longest prefix /api/v1) and -1 (/).
+        assert!(labels
+            .contains_key("traefik.http.services.myapp-default-api-0.loadbalancer.server.port"));
+        assert!(labels
+            .contains_key("traefik.http.services.myapp-default-api-1.loadbalancer.server.port"));
+        // And NO bare-base service (that name 404s in the Traefik API).
+        assert!(!labels
+            .contains_key("traefik.http.services.myapp-default-api.loadbalancer.server.port"));
+
+        let names = group_service_names(&desired);
+        assert_eq!(
+            names,
+            vec![
+                "myapp-default-api-0".to_string(),
+                "myapp-default-api-1".to_string()
+            ],
+            "derived names must match the per-route service labels (longest prefix first)"
+        );
+        for name in &names {
+            assert!(
+                labels.contains_key(&format!(
+                    "traefik.http.services.{name}.loadbalancer.server.port"
+                )),
+                "derived service {name} must match an emitted service label"
+            );
+        }
+    }
+
+    #[test]
+    fn group_service_names_empty_for_non_routable_or_worker() {
+        // Non-routable (superseded) container: no Traefik service, so no lookup.
+        let mut non_routable = single_container();
+        non_routable.routable = false;
+        assert!(group_service_names(&non_routable).is_empty());
+        // Worker (no port): never routed.
+        let mut worker = single_container();
+        worker.port = None;
+        worker.routes = vec![];
+        assert!(group_service_names(&worker).is_empty());
     }
 
     #[test]

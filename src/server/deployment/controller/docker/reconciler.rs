@@ -44,10 +44,15 @@ const DEPLOYING_TIMEOUT_MINUTES: i64 = 5;
 /// Mirrors `webhook::PRE_PUSHED_TIMEOUT_MINUTES`.
 const PRE_PUSHED_TIMEOUT_MINUTES: i64 = 10;
 
-/// Upper bound on the number of replicas the Docker backend will run for a
-/// single container spec. A single-host daemon can run many containers behind
+/// Controller HARD cap on the number of replicas the Docker backend will run for
+/// a single container spec. A single-host daemon can run many containers behind
 /// one Traefik LB service, but we cap it to avoid a runaway spec exhausting the
 /// host; requests above this are clamped (with a warning).
+///
+/// This is distinct from the user-facing, configurable
+/// `deployment_constraints.max_replicas` (the operator-set per-deployment limit
+/// enforced at request time): `MAX_REPLICAS` is the controller's unconditional
+/// backstop and is always `>=` any sane configured limit.
 const MAX_REPLICAS: u32 = 50;
 
 /// Owned controller configuration the reconciler carries.
@@ -88,10 +93,13 @@ pub struct ReconcilerConfig {
     /// the container's network IP. Off in production. See the `Docker` settings
     /// variant's `publish_app_ports`.
     pub publish_app_ports: bool,
-    /// Traffic-cutover strategy for the group. For now it is only forwarded into
-    /// [`BuilderConfig`] so the container builder gates the Traefik health-check
-    /// labels on `HealthRolling`; the reconcile/rolling behavior itself is wired
-    /// in a later step. See the `Docker` settings variant's `cutover_strategy`.
+    /// Traffic-cutover strategy for the group. Forwarded into [`BuilderConfig`]
+    /// so the container builder gates the Traefik health-check labels on
+    /// `HealthRolling`, AND consumed by the reconciler: in `HealthRolling` mode
+    /// the Deploying→Healthy readiness signal is whether each container's server
+    /// is actually in Traefik's rotation (per `serverStatus`), so the old active
+    /// deployment is retired only once the new servers are confirmed UP. See the
+    /// `Docker` settings variant's `cutover_strategy`.
     pub cutover_strategy: crate::server::settings::CutoverStrategy,
     /// Base URL of Traefik's API (e.g. `http://rise-traefik:8080`), optionally
     /// with embedded basic-auth userinfo. In `HealthRolling` mode the reconciler
@@ -371,11 +379,21 @@ impl DockerReconciler {
         // 4. Health → status (probe routable containers, transition).
         let non_terminal =
             db_deployments::list_non_terminal_for_project(&self.db_pool, project.id).await?;
+        // Memoize Traefik `serverStatus` per service for THIS reconcile pass:
+        // during a rollout a group has 2+ non-terminal deployments sharing one
+        // group-scoped service, so without this each `reconcile_health` would
+        // re-fetch the SAME serverStatus (up to 3s each). Populated once per
+        // service and reused across the group's deployments this tick.
+        let mut server_status_cache: HashMap<String, Option<HashMap<String, bool>>> =
+            HashMap::new();
         for deployment in &non_terminal {
             if !should_have_infrastructure(deployment) {
                 continue;
             }
-            if let Err(e) = self.reconcile_health(project, deployment).await {
+            if let Err(e) = self
+                .reconcile_health(project, deployment, &mut server_status_cache)
+                .await
+            {
                 warn!(
                     deployment_id = %deployment.deployment_id,
                     "Health reconcile failed: {:?}", e
@@ -926,7 +944,8 @@ impl DockerReconciler {
                         // container's name + `generation` label match the action.
                         let mut d = (*d).clone();
                         d.generation = *generation;
-                        if let Err(e) = self.create_container(&d, &builder_cfg).await {
+                        // Plain create (no pre-pull) pulls the image itself.
+                        if let Err(e) = self.create_container(&d, &builder_cfg, false).await {
                             error!(
                                 project = %project.name,
                                 container = %name,
@@ -967,7 +986,11 @@ impl DockerReconciler {
                             continue;
                         }
                         self.remove_container(existing_id).await;
-                        if let Err(e) = self.create_container(&d, &builder_cfg).await {
+                        // The image was just pulled above, BEFORE the destructive
+                        // remove, so skip the pull inside `create_container` — a
+                        // transient pull failure must not strand us with the old
+                        // container already gone. The image is pulled exactly once.
+                        if let Err(e) = self.create_container(&d, &builder_cfg, true).await {
                             error!(
                                 project = %project.name,
                                 container = %name,
@@ -988,17 +1011,26 @@ impl DockerReconciler {
         Ok(())
     }
 
+    /// Create and start one container. When `already_pulled` is `true` the image
+    /// pull is skipped — the caller (the Recreate path) pulled it BEFORE the
+    /// destructive remove so a transient pull failure can't strand the slot with
+    /// the old container already gone; the image is pulled exactly once. The
+    /// plain Create path passes `false` so it still pulls here.
     async fn create_container(
         &self,
         desired: &DesiredContainer,
         builder_cfg: &BuilderConfig<'_>,
+        already_pulled: bool,
     ) -> Result<()> {
         use bollard::container::{CreateContainerOptions, StartContainerOptions};
 
         let built = container_builder::build_container(desired, builder_cfg);
 
-        // Pull the image with registry auth (anonymous → None).
-        self.pull_image(&desired.image).await?;
+        // Pull the image with registry auth (anonymous → None), unless the caller
+        // already pulled it before a destructive remove.
+        if !already_pulled {
+            self.pull_image(&desired.image).await?;
+        }
 
         self.docker
             .create_container(
@@ -1069,7 +1101,56 @@ impl DockerReconciler {
 
     // ── Health → status ────────────────────────────────────────────────
 
-    async fn reconcile_health(&self, project: &Project, deployment: &Deployment) -> Result<()> {
+    /// Fetch and aggregate Traefik `serverStatus` across the service name(s) a
+    /// container's labels emit (one bare-base service for a single-route
+    /// container, per-route `{base}-{idx}` services for a multi-route one),
+    /// memoized per service for the reconcile pass via `cache`.
+    ///
+    /// Returns `Some(merged map)` if AT LEAST ONE queried service reported a
+    /// serverStatus (the per-route services share the same `http://{ip}:{port}`
+    /// servers, so merging them is safe and a server reported UP by any route's
+    /// health check counts as UP). `None` when there is no Traefik API, no
+    /// service names, or every queried service returned `None` (unreachable /
+    /// non-200 / no HC labels) — the caller then falls back to Rise's own probe.
+    async fn fetch_server_status_aggregated(
+        &self,
+        service_names: &[String],
+        cache: &mut HashMap<String, Option<HashMap<String, bool>>>,
+    ) -> Option<HashMap<String, bool>> {
+        let client = self.traefik_api.as_ref()?;
+        let mut merged: HashMap<String, bool> = HashMap::new();
+        let mut any = false;
+        for service in service_names {
+            let status = match cache.get(service) {
+                Some(cached) => cached.clone(),
+                None => {
+                    let fetched = client.server_status(service).await;
+                    cache.insert(service.clone(), fetched.clone());
+                    fetched
+                }
+            };
+            if let Some(map) = status {
+                any = true;
+                for (server, up) in map {
+                    // A server is UP if ANY route's health check reports it UP.
+                    let entry = merged.entry(server).or_insert(false);
+                    *entry = *entry || up;
+                }
+            }
+        }
+        if any {
+            Some(merged)
+        } else {
+            None
+        }
+    }
+
+    async fn reconcile_health(
+        &self,
+        project: &Project,
+        deployment: &Deployment,
+        server_status_cache: &mut HashMap<String, Option<HashMap<String, bool>>>,
+    ) -> Result<()> {
         // Only probe states where health is meaningful.
         if !matches!(
             deployment.status,
@@ -1078,7 +1159,7 @@ impl DockerReconciler {
             return Ok(());
         }
 
-        let (container_specs, _routes) = resolve_runtime_containers(deployment)?;
+        let (container_specs, route_specs) = resolve_runtime_containers(deployment)?;
         // The live container's `--name` now carries a per-recreate `_g{n}`
         // suffix we can't reconstruct from the spec alone. Enumerate the actual
         // containers once and index them by their stable identity tuple so each
@@ -1116,25 +1197,41 @@ impl DockerReconciler {
             // In `HealthRolling` mode, the readiness signal that drives the
             // Deploying→Healthy supersede (and Healthy→Unhealthy) is whether the
             // container's server is actually IN Traefik's rotation, not whether
-            // Rise's own probe passes. All replicas of this spec share ONE
-            // group-scoped Traefik load-balancer service, so fetch its
-            // `serverStatus` once per spec. `None` (no Traefik API configured, or
-            // the call failed/HC absent) → `rolling_rotation_decision` returns
+            // Rise's own probe passes. Fetch the `serverStatus` for the SAME
+            // Traefik service(s) the container's labels emit — a single-route
+            // container has one bare-base service, a multi-route container has
+            // per-route services (`{base}-{idx}`) — and aggregate them, so a
+            // multi-route container's lookup doesn't 404 against a bare-base name
+            // that was never registered. `None` (no Traefik API configured, the
+            // call failed, or no HC labels) → `rolling_rotation_decision` returns
             // `FallBackToProbe` and we mirror with Rise's own probe.
+            let service_names = service_names_for_spec(
+                &project.name,
+                &deployment.deployment_group,
+                spec,
+                &route_specs,
+            );
+            let has_health_path = effective_health_path(spec, &self.config.health_path).is_some();
             let server_status = if rolling {
-                match &self.traefik_api {
-                    Some(client) => {
-                        let service = labels::sanitize_router_name(&format!(
-                            "{}-{}-{}",
-                            project.name, deployment.deployment_group, spec.name
-                        ));
-                        client.server_status(&service).await
-                    }
-                    None => None,
-                }
+                self.fetch_server_status_aggregated(&service_names, server_status_cache)
+                    .await
             } else {
                 None
             };
+            // When the Traefik API IS available but no serverStatus came back for
+            // a container that HAS a health path, the per-server health check is
+            // degraded (service not yet registered, or HC labels missing) — warn
+            // so operators see it, rather than silently falling back to the probe.
+            if rolling && self.traefik_api.is_some() && has_health_path && server_status.is_none() {
+                warn!(
+                    deployment_id = %deployment.deployment_id,
+                    container = %spec.name,
+                    services = ?service_names,
+                    "Traefik API reachable but returned no serverStatus for a container with a \
+                     health path; falling back to Rise's own probe (Traefik per-server health \
+                     check may be missing or the service is not yet registered)"
+                );
+            }
             for replica in 0..replica_count {
                 // Label each container with its replica index only when there is
                 // more than one, so single-replica diagnostics read unchanged.
@@ -1188,102 +1285,69 @@ impl DockerReconciler {
                         // up. Otherwise probe `health_check.path` (or default).
                         Some(port) => {
                             let health_path = effective_health_path(spec, &self.config.health_path);
-                            // In `HealthRolling` mode the readiness signal is
-                            // IN-ROTATION (per Traefik), not Rise's raw probe. The
-                            // pure `rolling_rotation_decision` decides; on
-                            // `FallBackToProbe` (no Traefik API / call failed) we
-                            // mirror with Rise's own probe (today's behavior).
-                            if rolling {
-                                let has_health_path = health_path.is_some();
-                                let running = running_of(&inspected);
-                                let api_available =
-                                    self.traefik_api.is_some() && server_status.is_some();
-                                let server_up = server_status.as_ref().and_then(|m| {
-                                    inspected.as_ref().and_then(|i| i.ip.as_deref()).map(|ip| {
-                                        m.get(&format!("http://{ip}:{port}"))
-                                            .copied()
-                                            .unwrap_or(false)
-                                    })
-                                });
-                                // Distinguish "absent from serverStatus" (ip known
-                                // but server URL missing) from "no ip yet": when
-                                // the container has no IP, server_up stays None and
-                                // the decision reports the absent-server reason.
-                                let server_up = match (api_available, server_up) {
-                                    (true, Some(up)) => Some(up),
-                                    (true, None) => None,
-                                    (false, _) => None,
-                                };
-                                match rolling_rotation_decision(
-                                    has_health_path,
-                                    running,
-                                    api_available,
-                                    server_up,
-                                ) {
-                                    RotationDecision::InRotation => true,
-                                    RotationDecision::NotInRotation(reason) => {
-                                        debug!(
-                                            deployment_id = %deployment.deployment_id,
-                                            container = %label,
-                                            "Not in rotation: {reason}"
-                                        );
-                                        not_ready_reasons.push(format!("'{label}' {reason}"));
-                                        false
-                                    }
-                                    RotationDecision::FallBackToProbe => {
-                                        debug!(
-                                            deployment_id = %deployment.deployment_id,
-                                            container = %label,
-                                            "Traefik API unavailable; mirroring with Rise probe"
-                                        );
-                                        let path = health_path
-                                            .as_deref()
-                                            .expect("FallBackToProbe implies a health path");
-                                        match self
-                                            .probe_container(inspected.as_ref(), port, path)
-                                            .await
-                                        {
-                                            Ok(()) => true,
-                                            Err(reason) => {
-                                                not_ready_reasons
-                                                    .push(format!("'{label}' {reason}"));
-                                                false
-                                            }
-                                        }
-                                    }
+                            let has_health_path = health_path.is_some();
+                            let running = running_of(&inspected);
+                            // Whether Traefik's serverStatus authoritatively
+                            // reports this replica's server, and if so UP/DOWN.
+                            // `api_available` requires both a client AND a fetched
+                            // status; `server_up` is None when the URL is absent
+                            // from the map (or no IP yet) so the decision reports
+                            // the distinct absent-server reason.
+                            let api_available =
+                                self.traefik_api.is_some() && server_status.is_some();
+                            let server_up = server_status.as_ref().and_then(|m| {
+                                inspected.as_ref().and_then(|i| i.ip.as_deref()).map(|ip| {
+                                    m.get(&format!("http://{ip}:{port}"))
+                                        .copied()
+                                        .unwrap_or(false)
+                                })
+                            });
+                            let server_up = match (api_available, server_up) {
+                                (true, Some(up)) => Some(up),
+                                (true, None) => None,
+                                (false, _) => None,
+                            };
+                            // Pure selection of the readiness verdict. `NeedsProbe`
+                            // means the decision depends on Rise's own probe — we
+                            // run it and use its detailed failure reason.
+                            match replica_ready(
+                                rolling,
+                                has_health_path,
+                                running,
+                                api_available,
+                                server_up,
+                                None,
+                            ) {
+                                ReadyVerdict::Ready => true,
+                                ReadyVerdict::NotReady(reason) => {
+                                    debug!(
+                                        deployment_id = %deployment.deployment_id,
+                                        container = %label,
+                                        "Replica not ready: {reason}"
+                                    );
+                                    not_ready_reasons.push(format!("'{label}' {reason}"));
+                                    false
                                 }
-                            } else {
-                                match health_path {
-                                    Some(path) => {
-                                        match self
-                                            .probe_container(inspected.as_ref(), port, &path)
-                                            .await
-                                        {
-                                            Ok(()) => true,
-                                            Err(reason) => {
-                                                // Per-tick at debug to avoid noise
-                                                // while an app is still warming up;
-                                                // the reason is also folded into the
-                                                // Unhealthy status.
-                                                debug!(
-                                                    deployment_id = %deployment.deployment_id,
-                                                    container = %label,
-                                                    "Health probe failed: {reason}"
-                                                );
-                                                not_ready_reasons
-                                                    .push(format!("'{label}' {reason}"));
-                                                false
-                                            }
+                                ReadyVerdict::NeedsProbe => {
+                                    let path = health_path
+                                        .as_deref()
+                                        .expect("NeedsProbe implies a health path");
+                                    match self.probe_container(inspected.as_ref(), port, path).await
+                                    {
+                                        Ok(()) => true,
+                                        Err(reason) => {
+                                            // Per-tick at debug to avoid noise while
+                                            // an app is still warming up; the reason
+                                            // is also folded into the Unhealthy
+                                            // status.
+                                            debug!(
+                                                deployment_id = %deployment.deployment_id,
+                                                container = %label,
+                                                "Health probe failed: {reason}"
+                                            );
+                                            not_ready_reasons.push(format!("'{label}' {reason}"));
+                                            false
                                         }
-                                    }
-                                    None => {
-                                        let running = running_of(&inspected);
-                                        if !running {
-                                            not_ready_reasons.push(format!(
-                                                "'{label}' not running (probe disabled)"
-                                            ));
-                                        }
-                                        running
                                     }
                                 }
                             }
@@ -2292,6 +2356,104 @@ pub(crate) fn routable_for(
     match cutover_strategy {
         crate::server::settings::CutoverStrategy::Recreate => is_active,
         crate::server::settings::CutoverStrategy::HealthRolling => true,
+    }
+}
+
+/// Group-scoped Traefik service name(s) a container spec's routes emit, used by
+/// the reconciler's `serverStatus` lookup so it queries the SAME service(s) the
+/// labels stamp. Mirrors [`container_builder::group_service_names`] but derives
+/// from the runtime [`ContainerSpec`] + [`RouteSpec`] set (what `reconcile_health`
+/// has on hand): a single-route container yields the bare base
+/// `{project}-{group}-{container}`; a multi-route container yields per-route
+/// `{base}-{idx}` names (longest path-prefix first, matching the renderer).
+///
+/// A port-less worker has no routes/service → empty. Routability is implicit:
+/// the caller only consults this in `HealthRolling` mode, where every deployment
+/// is routable.
+fn service_names_for_spec(
+    project: &str,
+    deployment_group: &str,
+    spec: &crate::server::deployment::models::ContainerSpec,
+    route_specs: &[crate::server::deployment::models::RouteSpec],
+) -> Vec<String> {
+    if spec.port.is_none() {
+        return Vec::new();
+    }
+    let base = container_builder::group_service_base(project, deployment_group, &spec.name);
+    // Routes for this container, sorted longest-path-prefix-first — the SAME
+    // ordering `render_traefik_labels_for` uses to index per-route services.
+    let mut routes: Vec<&crate::server::deployment::models::RouteSpec> = route_specs
+        .iter()
+        .filter(|r| r.container == spec.name)
+        .collect();
+    routes.sort_by_key(|r| std::cmp::Reverse(r.path.len()));
+    let route_count = routes.len();
+    if route_count == 0 {
+        return Vec::new();
+    }
+    (0..route_count)
+        .map(|idx| container_builder::group_service_name(&base, idx, route_count))
+        .collect()
+}
+
+/// Whether a single replica counts as READY, factored out of the per-replica
+/// loop in `reconcile_health` so the `serverStatus`/fallback selection is
+/// unit-testable without a daemon. Inputs:
+///
+/// - `rolling`: the group's cutover strategy is `HealthRolling`;
+/// - `has_health_path`: the container has an effective health path;
+/// - `running`: the live container is `running` on the daemon;
+/// - `api_available`: a Traefik API client is configured AND its serverStatus
+///   call for this container's service(s) succeeded;
+/// - `server_up`: when `api_available`, whether Traefik reports this container's
+///   server URL UP (`None` = absent from the map / no IP yet);
+/// - `probe_ok`: the result of Rise's own HTTP probe when one was performed
+///   (`Some(true/false)`), or `None` when no probe has been run yet.
+///
+/// Returns [`ReadyVerdict::NeedsProbe`] when the decision depends on Rise's own
+/// probe but `probe_ok` is `None` — the caller then runs `probe_container` and
+/// re-resolves (or passes the result back in). Keeps `reconcile_health`'s
+/// behavior identical: rolling uses `rolling_rotation_decision`; non-rolling
+/// probes when a health path exists, else gates on `running`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ReadyVerdict {
+    Ready,
+    NotReady(String),
+    /// The verdict needs Rise's own HTTP probe; the caller must run it and fold
+    /// the result back in (via `probe_ok`).
+    NeedsProbe,
+}
+
+pub(crate) fn replica_ready(
+    rolling: bool,
+    has_health_path: bool,
+    running: bool,
+    api_available: bool,
+    server_up: Option<bool>,
+    probe_ok: Option<bool>,
+) -> ReadyVerdict {
+    if rolling {
+        match rolling_rotation_decision(has_health_path, running, api_available, server_up) {
+            RotationDecision::InRotation => ReadyVerdict::Ready,
+            RotationDecision::NotInRotation(reason) => ReadyVerdict::NotReady(reason),
+            RotationDecision::FallBackToProbe => match probe_ok {
+                Some(true) => ReadyVerdict::Ready,
+                Some(false) => ReadyVerdict::NotReady("health probe failed".to_string()),
+                None => ReadyVerdict::NeedsProbe,
+            },
+        }
+    } else if has_health_path {
+        // Non-rolling with a probe: readiness IS the probe result.
+        match probe_ok {
+            Some(true) => ReadyVerdict::Ready,
+            Some(false) => ReadyVerdict::NotReady("health probe failed".to_string()),
+            None => ReadyVerdict::NeedsProbe,
+        }
+    } else if running {
+        // No probe: a running container is ready (ready-when-running).
+        ReadyVerdict::Ready
+    } else {
+        ReadyVerdict::NotReady("not running (probe disabled)".to_string())
     }
 }
 
@@ -3624,6 +3786,232 @@ mod tests {
                 assert!(reason.contains("not running"), "got: {reason}");
             }
             other => panic!("expected NotInRotation, got {other:?}"),
+        }
+    }
+
+    // ── service-name derivation (matches the labels) ───────────────────────
+
+    #[test]
+    fn service_names_for_spec_single_route_is_bare_base() {
+        use crate::server::deployment::models::{ContainerSpec, RouteSpec};
+        let spec = ContainerSpec {
+            name: "app".to_string(),
+            image: None,
+            port: Some(8080),
+            replicas: None,
+            cpu: None,
+            memory: None,
+            env_overrides: vec![],
+            health_check: None,
+        };
+        let routes = vec![RouteSpec {
+            path: "/".to_string(),
+            container: "app".to_string(),
+        }];
+        // A single-route container uses the bare base name — exactly what the
+        // labels stamp (`group_service_names` over the matching DesiredContainer).
+        assert_eq!(
+            service_names_for_spec("myapp", "default", &spec, &routes),
+            vec!["myapp-default-app".to_string()]
+        );
+    }
+
+    #[test]
+    fn service_names_for_spec_multi_route_uses_per_route_indices() {
+        use crate::server::deployment::models::{ContainerSpec, RouteSpec};
+        let spec = ContainerSpec {
+            name: "api".to_string(),
+            image: None,
+            port: Some(8080),
+            replicas: None,
+            cpu: None,
+            memory: None,
+            env_overrides: vec![],
+            health_check: None,
+        };
+        // Two routes for `api` (+ one for another container, which is ignored).
+        let routes = vec![
+            RouteSpec {
+                path: "/".to_string(),
+                container: "api".to_string(),
+            },
+            RouteSpec {
+                path: "/api/v1".to_string(),
+                container: "api".to_string(),
+            },
+            RouteSpec {
+                path: "/".to_string(),
+                container: "other".to_string(),
+            },
+        ];
+        // Per-route services, longest path-prefix first (-0 = /api/v1, -1 = /),
+        // matching the renderer's `{base}-{idx}` services for a multi-route
+        // container. The bare base is NOT queried (it 404s in the Traefik API).
+        assert_eq!(
+            service_names_for_spec("myapp", "default", &spec, &routes),
+            vec![
+                "myapp-default-api-0".to_string(),
+                "myapp-default-api-1".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn service_names_for_spec_derivation_matches_container_builder() {
+        // The reconciler-side derivation must agree with the builder-side
+        // `group_service_names` (the labels) for the same routes — single AND
+        // multi-route — so the lookup never drifts from what's stamped.
+        use crate::server::deployment::models::{ContainerSpec, RouteSpec};
+        use container_builder::{group_service_names, DesiredRoute};
+
+        let mk_desired = |container: &str, paths: &[&str]| {
+            let mut d = desired(container, "img:1", "h1");
+            d.routes = paths
+                .iter()
+                .map(|p| DesiredRoute {
+                    hosts: vec!["myapp.rise.dev".to_string()],
+                    path_prefix: Some(p.to_string()),
+                })
+                .collect();
+            d
+        };
+        let mk_spec_routes = |container: &str, paths: &[&str]| {
+            let spec = ContainerSpec {
+                name: container.to_string(),
+                image: None,
+                port: Some(8080),
+                replicas: None,
+                cpu: None,
+                memory: None,
+                env_overrides: vec![],
+                health_check: None,
+            };
+            let routes: Vec<RouteSpec> = paths
+                .iter()
+                .map(|p| RouteSpec {
+                    path: p.to_string(),
+                    container: container.to_string(),
+                })
+                .collect();
+            (spec, routes)
+        };
+
+        for paths in [&["/"][..], &["/", "/api/v1"][..], &["/", "/a", "/bb"][..]] {
+            let (spec, routes) = mk_spec_routes("app", paths);
+            let from_spec = service_names_for_spec("myapp", "default", &spec, &routes);
+            let from_labels = group_service_names(&mk_desired("app", paths));
+            assert_eq!(
+                from_spec, from_labels,
+                "service-name derivation must match the labels for paths {paths:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn service_names_for_spec_worker_has_no_services() {
+        use crate::server::deployment::models::ContainerSpec;
+        let worker = ContainerSpec {
+            name: "worker".to_string(),
+            image: None,
+            port: None,
+            replicas: None,
+            cpu: None,
+            memory: None,
+            env_overrides: vec![],
+            health_check: None,
+        };
+        assert!(service_names_for_spec("myapp", "default", &worker, &[]).is_empty());
+    }
+
+    // ── replica_ready (pure readiness selection) ───────────────────────────
+
+    #[test]
+    fn replica_ready_rolling_server_up_is_ready() {
+        // Rolling + HC + Traefik UP → Ready, no probe needed.
+        assert_eq!(
+            replica_ready(true, true, true, true, Some(true), None),
+            ReadyVerdict::Ready
+        );
+    }
+
+    #[test]
+    fn replica_ready_rolling_server_down_is_not_ready() {
+        match replica_ready(true, true, true, true, Some(false), None) {
+            ReadyVerdict::NotReady(reason) => assert!(reason.contains("DOWN"), "got: {reason}"),
+            other => panic!("expected NotReady, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replica_ready_rolling_absent_server_is_not_ready() {
+        match replica_ready(true, true, true, true, None, None) {
+            ReadyVerdict::NotReady(reason) => {
+                assert!(reason.contains("serverStatus"), "got: {reason}")
+            }
+            other => panic!("expected NotReady, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replica_ready_rolling_fallback_needs_probe_then_folds_result() {
+        // Rolling + HC but Traefik API unavailable → fall back to Rise's probe.
+        // With no probe result yet → NeedsProbe; folding the result in resolves.
+        assert_eq!(
+            replica_ready(true, true, true, false, None, None),
+            ReadyVerdict::NeedsProbe
+        );
+        assert_eq!(
+            replica_ready(true, true, true, false, None, Some(true)),
+            ReadyVerdict::Ready
+        );
+        assert!(matches!(
+            replica_ready(true, true, true, false, None, Some(false)),
+            ReadyVerdict::NotReady(_)
+        ));
+    }
+
+    #[test]
+    fn replica_ready_rolling_no_health_check_is_ready_when_running() {
+        // Rolling, no HC → ready-when-running; Traefik signal ignored.
+        assert_eq!(
+            replica_ready(true, false, true, false, None, None),
+            ReadyVerdict::Ready
+        );
+        assert!(matches!(
+            replica_ready(true, false, false, false, None, None),
+            ReadyVerdict::NotReady(_)
+        ));
+    }
+
+    #[test]
+    fn replica_ready_non_rolling_uses_probe_when_health_path() {
+        // Non-rolling + HC: readiness IS the probe result.
+        assert_eq!(
+            replica_ready(false, true, true, false, None, None),
+            ReadyVerdict::NeedsProbe
+        );
+        assert_eq!(
+            replica_ready(false, true, true, false, None, Some(true)),
+            ReadyVerdict::Ready
+        );
+        assert!(matches!(
+            replica_ready(false, true, true, false, None, Some(false)),
+            ReadyVerdict::NotReady(_)
+        ));
+    }
+
+    #[test]
+    fn replica_ready_non_rolling_no_health_path_gates_on_running() {
+        // Non-rolling, no HC → ready-when-running with the disabled-probe reason.
+        assert_eq!(
+            replica_ready(false, false, true, false, None, None),
+            ReadyVerdict::Ready
+        );
+        match replica_ready(false, false, false, false, None, None) {
+            ReadyVerdict::NotReady(reason) => {
+                assert!(reason.contains("not running"), "got: {reason}")
+            }
+            other => panic!("expected NotReady, got {other:?}"),
         }
     }
 
