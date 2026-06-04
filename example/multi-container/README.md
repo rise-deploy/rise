@@ -82,9 +82,11 @@ curl https://multi-container.rise.dev/api/jobs
 
 ## Notes
 
-- `[containers]` is mutually exclusive with top-level `[build]` / `[deploy]`.
-  Existing single-container projects keep working — their top-level
-  `[build]` is treated as an implicit `app` container.
+- The top-level `[build]` / `[deploy]` tables act as per-field defaults that
+  every container inherits — `[build]` merges field-by-field (the example sets
+  `backend = "docker"` once), and each `[containers.<name>.deploy]` field falls
+  back to the top-level `[deploy]`. Single-container projects (no `[containers]`)
+  keep working — their top-level `[build]` is the implicit `app` container.
 - Redis here has no persistent volume, so pending jobs are lost on Redis
   pod restart. Fine for a demo; a real app would attach a PVC or use
   managed Redis.

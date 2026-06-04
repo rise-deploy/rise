@@ -41,11 +41,26 @@ function getStatusTone(status) {
 // ── CPU / memory parsing helpers for the multi-container resource breakdown ──
 // CPU is stored as the same string K8s accepts (`"500m"`, `"1"`, `"1.5"`).
 // Memory is the same — IEC suffixes (Ki/Mi/Gi/...) plus the SI suffixes K/M/G.
+// A value may also be a `request-limit` range (`"128m-1"`, `"256Mi-1Gi"`),
+// mirroring the backend's `split_request_limit` in
+// `src/server/deployment/quantity.rs`: a bare value means request == limit, a
+// `req-lim` value carries both sides.
 // Aggregation goes through (millicores, bytes), then re-formats for display so
 // "500m × 2 replicas + 1 × 3 replicas" prints as "4" (not "4000m") and "256Mi
 // × 4 + 1Gi" prints as a single readable value.
 
-function parseCpuToMillicores(s) {
+// Split a fixed-or-range value into its `[request, limit]` sides. A bare value
+// yields request == limit; a single `-` separates the two. Like the Rust
+// `split_request_limit`, real CPU/memory quantities never contain a `-`, so
+// splitting on it is safe (an exotic `"1e-3"` would split into unparseable
+// halves and fall through to 0, which is acceptable for a display total).
+function splitRequestLimit(s: string): [string, string] {
+    const parts = s.split('-');
+    if (parts.length === 2) return [parts[0].trim(), parts[1].trim()];
+    return [s, s];
+}
+
+function parseCpuToMillicores(s: string | null | undefined): number {
     if (s == null) return 0;
     const t = String(s).trim();
     if (!t) return 0;
@@ -57,7 +72,7 @@ function parseCpuToMillicores(s) {
     return Number.isFinite(v) ? v * 1000 : 0;
 }
 
-function formatMillicoresAsCpu(milli) {
+function formatMillicoresAsCpu(milli: number): string {
     if (!Number.isFinite(milli) || milli <= 0) return '0';
     if (milli % 1000 === 0) return String(milli / 1000);
     return `${Math.round(milli)}m`;
@@ -78,7 +93,7 @@ const MEM_UNIT_FACTORS = {
     E: 1e18,
 };
 
-function parseMemoryToBytes(s) {
+function parseMemoryToBytes(s: string | null | undefined): number {
     if (s == null) return 0;
     const t = String(s).trim();
     if (!t) return 0;
@@ -90,7 +105,7 @@ function parseMemoryToBytes(s) {
     return v * factor;
 }
 
-function formatBytesAsMemory(bytes) {
+function formatBytesAsMemory(bytes: number): string {
     if (!Number.isFinite(bytes) || bytes <= 0) return '0';
     // Render in the largest IEC unit that divides the total exactly, so the
     // breakdown stays precise (no rounding) regardless of mixed inputs. Memory
@@ -106,16 +121,28 @@ function formatBytesAsMemory(bytes) {
     return `${bytes}`;
 }
 
-/** Sum (replicas × per-container cpu/memory) across the deployment's containers. */
-function aggregateContainerResources(containers) {
+/**
+ * Sum (replicas × per-container cpu/memory) across the deployment's containers.
+ *
+ * Per-container `cpu`/`memory` may be a `request-limit` range. The "Resources"
+ * panel and breakdown header render this as the deployment's resource footprint
+ * (heading is just "CPU" / "Memory"), so we aggregate the *limit* side — the
+ * ceiling the deployment can consume. A fixed value has request == limit, so
+ * this is unchanged for the common case.
+ */
+function aggregateContainerResources(
+    containers: Array<{ replicas?: number | string | null; cpu?: string | null; memory?: string | null }>,
+): { replicas: number; cpu: string; memory: string } {
     let replicas = 0;
     let cpuMilli = 0;
     let memBytes = 0;
     for (const c of containers) {
         const r = Number(c.replicas) || 0;
         replicas += r;
-        cpuMilli += parseCpuToMillicores(c.cpu) * r;
-        memBytes += parseMemoryToBytes(c.memory) * r;
+        const [, cpuLimit] = splitRequestLimit(String(c.cpu ?? ''));
+        const [, memLimit] = splitRequestLimit(String(c.memory ?? ''));
+        cpuMilli += parseCpuToMillicores(cpuLimit) * r;
+        memBytes += parseMemoryToBytes(memLimit) * r;
     }
     return {
         replicas,

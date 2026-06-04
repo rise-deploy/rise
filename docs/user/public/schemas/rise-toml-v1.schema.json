@@ -111,12 +111,17 @@
           ],
           "description": "Build configuration to produce this container's image. Exclusive with `image`."
         },
-        "cpu": {
-          "description": "CPU allocation (e.g. \"500m\", \"1\") — sets both request and limit.",
-          "type": [
-            "string",
-            "null"
-          ]
+        "deploy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeployConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Deployment resource configuration (replicas, cpu, memory, health_check).\nMirrors the top-level `[deploy]` table; unset fields inherit the\ntop-level `[deploy]` defaults."
         },
         "env": {
           "additionalProperties": {
@@ -126,26 +131,8 @@
           "description": "Plain-text environment variables scoped to this container. Merged on top\nof any project-level env vars; container-scoped values win on conflict.",
           "type": "object"
         },
-        "health_check": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/HealthCheckSetting"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Health check configuration. HTTP liveness+readiness probes are disabled\nby default — they must be explicitly configured here. Set a config block\nto enable probes with a custom path/timing, or `health_check = false` to\nexplicitly mark them disabled. Requires `port` to be set."
-        },
         "image": {
           "description": "Pre-built image reference. Exclusive with `build`.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "memory": {
-          "description": "Memory allocation (e.g. \"256Mi\", \"1Gi\") — sets both request and limit.",
           "type": [
             "string",
             "null"
@@ -160,31 +147,33 @@
             "integer",
             "null"
           ]
-        },
-        "replicas": {
-          "description": "Number of replicas.",
-          "format": "uint32",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
         }
       },
       "type": "object"
     },
     "DeployConfig": {
-      "description": "Deployment resource configuration",
+      "description": "Deployment resource configuration.\n\nShared by the top-level `[deploy]`, per-environment `[environments.<name>.deploy]`,\nand per-container `[containers.<name>.deploy]` tables. Top-level values act as\ndefaults that each container inherits per field.",
       "properties": {
         "cpu": {
-          "description": "CPU allocation (e.g., \"500m\", \"1\") — sets both K8s request and limit",
+          "description": "CPU allocation. Either a fixed value that sets both the K8s request and\nlimit (e.g. `\"500m\"`, `\"1\"`), or a `request-limit` range (e.g. `\"128m-1\"`\n→ request `128m`, limit `1`). The request may not exceed the limit, and\nthe limit is validated against the environment/platform allowed range.",
           "type": [
             "string",
             "null"
           ]
         },
+        "health_check": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HealthCheckSetting"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Health check configuration. HTTP liveness+readiness probes are disabled\nby default — they must be explicitly configured here. Set a config block\nto enable probes with a custom path/timing, or `health_check = false` to\nexplicitly mark them disabled. At the container level this requires the\ncontainer to have a `port`."
+        },
         "memory": {
-          "description": "Memory allocation (e.g., \"256Mi\", \"1Gi\") — sets both K8s request and limit",
+          "description": "Memory allocation. Either a fixed value that sets both the K8s request\nand limit (e.g. `\"256Mi\"`, `\"1Gi\"`), or a `request-limit` range (e.g.\n`\"64Mi-256Mi\"`). Same request/limit and range rules as `cpu`.",
           "type": [
             "string",
             "null"
@@ -373,7 +362,7 @@
       "additionalProperties": {
         "$ref": "#/$defs/ContainerConfig"
       },
-      "description": "Multi-container configuration. When non-empty, top-level `[build]` and\n`[deploy]` must not be set. Each container becomes a separate K8s\nDeployment so replica counts scale independently.",
+      "description": "Multi-container configuration. When non-empty, the top-level `[build]`\nand `[deploy]` tables act as defaults that each container inherits per\nfield (see `ContainerConfig`). Each container becomes a separate K8s\nDeployment so replica counts scale independently.",
       "type": "object"
     },
     "deploy": {

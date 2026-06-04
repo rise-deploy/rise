@@ -1120,20 +1120,44 @@ impl ResourceBuilder {
         cpu: &str,
         memory: &str,
     ) -> Option<ResourceRequirements> {
+        use crate::server::deployment::quantity;
         use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
-        // Single-knob: same value for both request and limit
+        // Each value is either fixed (request == limit) or a `request-limit`
+        // range. Values were validated at deploy time; if parsing somehow fails
+        // here, log and fall back to splitting the raw string on `-`, using the
+        // first segment for the request and the last for the limit. A fixed
+        // value yields one segment (request == limit); this keeps each side an
+        // individually valid Quantity rather than feeding `"128m-1"` to both.
+        let split_raw = |raw: &str| -> (String, String) {
+            let mut parts = raw.split('-');
+            let first = parts.next().unwrap_or(raw).trim().to_string();
+            let last = parts.next_back().map(|s| s.trim().to_string());
+            match last {
+                Some(last) => (first, last),
+                None => (first.clone(), first),
+            }
+        };
+        let (cpu_req, cpu_lim) = quantity::parse_cpu_request_limit(cpu).unwrap_or_else(|e| {
+            tracing::warn!("Failed to parse CPU quantity {cpu:?}, using as-is: {e:?}");
+            split_raw(cpu)
+        });
+        let (mem_req, mem_lim) = quantity::parse_memory_request_limit(memory).unwrap_or_else(|e| {
+            tracing::warn!("Failed to parse memory quantity {memory:?}, using as-is: {e:?}");
+            split_raw(memory)
+        });
+
         Some(ResourceRequirements {
             requests: Some({
                 let mut map = BTreeMap::new();
-                map.insert("cpu".to_string(), Quantity(cpu.to_string()));
-                map.insert("memory".to_string(), Quantity(memory.to_string()));
+                map.insert("cpu".to_string(), Quantity(cpu_req));
+                map.insert("memory".to_string(), Quantity(mem_req));
                 map
             }),
             limits: Some({
                 let mut map = BTreeMap::new();
-                map.insert("cpu".to_string(), Quantity(cpu.to_string()));
-                map.insert("memory".to_string(), Quantity(memory.to_string()));
+                map.insert("cpu".to_string(), Quantity(cpu_lim));
+                map.insert("memory".to_string(), Quantity(mem_lim));
                 map
             }),
             ..Default::default()

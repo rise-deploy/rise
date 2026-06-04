@@ -503,6 +503,38 @@ Run with `RUST_LOG=debug` to see configuration loading details:
 RUST_LOG=debug cargo run --bin rise -- backend server
 ```
 
+## Debugging Authentication and Token Claims
+
+When a deploy or login is rejected with a permission or "claims do not match"
+error, raise the backend log level to see the issuer, claims, and validation
+decisions Rise makes for an incoming token. Keep general output at `info` and
+turn up only the auth and workload-token paths so the relevant lines aren't
+buried:
+
+```bash
+RUST_LOG=info,rise::server::auth=debug,rise::server::workload_tokens=debug \
+  rise backend server
+```
+
+This surfaces:
+
+- `rise::server::auth::handlers` — the OIDC ID-token claims during browser login
+  (`ID token claims: {...}`)
+- `rise::server::auth::middleware` — the issuer the backend peeked at and the
+  JWKS-validation outcome for an incoming token
+- `rise::server::auth::context` — per-service-account claim-mismatch reasons
+  (`SA <id> claim mismatch: ...`); these log at `info`, so they show even without
+  the `debug` targets above
+- `rise::server::workload_tokens::handlers` — `Issued workload identity token`
+  (project / environment / audience / ttl) when an app mints a token through the
+  token-exchange endpoint
+
+`RUST_LOG=rise=debug` works as a catch-all but is far noisier.
+
+To inspect claims from the *client* side — the token the `rise` CLI presents
+(`RISE_TOKEN`, a `RISE_TOKEN_COMMAND`, or GitHub Actions OIDC) — see
+**Inspecting Token Claims** in the user troubleshooting guide.
+
 ## Quickstart Templates
 
 Rise's web UI surfaces a curated catalog of stateless container images that
