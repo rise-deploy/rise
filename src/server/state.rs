@@ -356,6 +356,7 @@ async fn init_docker_backend(
         app_backend_host_aliases,
         app_backend_ip: app_backend_ip_override,
         publish_app_ports,
+        cutover_strategy,
         ..
     } = settings
     else {
@@ -524,6 +525,7 @@ async fn init_docker_backend(
             app_backend_host_aliases,
             app_backend_ip,
             publish_app_ports: *publish_app_ports,
+            cutover_strategy: *cutover_strategy,
         },
     );
     reconciler.spawn();

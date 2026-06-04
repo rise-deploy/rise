@@ -88,6 +88,11 @@ pub struct ReconcilerConfig {
     /// the container's network IP. Off in production. See the `Docker` settings
     /// variant's `publish_app_ports`.
     pub publish_app_ports: bool,
+    /// Traffic-cutover strategy for the group. For now it is only forwarded into
+    /// [`BuilderConfig`] so the container builder gates the Traefik health-check
+    /// labels on `HealthRolling`; the reconcile/rolling behavior itself is wired
+    /// in a later step. See the `Docker` settings variant's `cutover_strategy`.
+    pub cutover_strategy: crate::server::settings::CutoverStrategy,
 }
 
 /// Owned snapshot of one `inspect_container` call, captured once per reconcile
@@ -504,6 +509,7 @@ impl DockerReconciler {
             app_backend_host_aliases: &self.config.app_backend_host_aliases,
             app_backend_ip: self.config.app_backend_ip.as_deref(),
             publish_app_ports: self.config.publish_app_ports,
+            cutover_strategy: self.config.cutover_strategy,
         }
     }
 
@@ -735,6 +741,17 @@ impl DockerReconciler {
                 health_path: spec
                     .port
                     .and_then(|_| effective_health_path(spec, &self.config.health_path)),
+                // Traefik load-balancer health-check timing, carried from the
+                // `health_check` spec. Only consumed by the builder when
+                // `cutover_strategy == HealthRolling` AND a health path exists.
+                health_check_interval_secs: spec
+                    .health_check
+                    .as_ref()
+                    .and_then(|hc| hc.period_seconds),
+                health_check_timeout_secs: spec
+                    .health_check
+                    .as_ref()
+                    .and_then(|hc| hc.timeout_seconds),
             };
             // Precompute the route-hash from the same render the builder uses so
             // the diff can detect routing transitions (active↔inactive) that
@@ -1111,10 +1128,11 @@ impl DockerReconciler {
                 } else {
                     match spec.port {
                         // HTTP container: honor the per-container `health_check`
-                        // spec. `disabled` (→ `effective_health_path` returns None)
-                        // removes the probe, so a *running* container is ready —
-                        // mirroring K8s, where `health_check = false` removes the
-                        // probes. Otherwise probe `health_check.path` (or default).
+                        // spec. An ABSENT `health_check`, or `disabled = true`
+                        // (→ `effective_health_path` returns None), means no HTTP
+                        // probe, so a *running* container is ready — mirroring
+                        // K8s, where a Pod with no readiness probe is Ready once
+                        // up. Otherwise probe `health_check.path` (or default).
                         Some(port) => match effective_health_path(spec, &self.config.health_path) {
                             Some(path) => {
                                 match self.probe_container(inspected.as_ref(), port, &path).await {
@@ -1224,7 +1242,7 @@ impl DockerReconciler {
     /// desired spec, either:
     ///
     /// - it has a `health_path` (HTTP container with the probe enabled) and the
-    ///   probe to its live container succeeds (`< 500`); or
+    ///   probe to its live container succeeds (`2xx–3xx`); or
     /// - it has no `health_path` (worker, or probe disabled) and its live
     ///   container is `running`.
     ///
@@ -1289,11 +1307,14 @@ impl DockerReconciler {
     /// Traefik network (`http://{ip}:{port}{path}`) — today's behavior, correct
     /// for the containerized/production backend on the shared network.
     ///
-    /// Reuses the reconciler's shared `reqwest::Client` and its `status < 500`
-    /// semantics (5s timeout). Returns `Ok(())` when the app answers `< 500`, or
-    /// `Err(reason)` describing exactly what was probed and how it failed (no
-    /// target yet, bad status, or a connection/timeout error) so the reason can
-    /// be surfaced into the deployment's Unhealthy status and logs.
+    /// Reuses the reconciler's shared `reqwest::Client` and a `2xx–3xx`
+    /// success criterion (5s timeout) — the same range Traefik's load-balancer
+    /// health check treats as healthy, so the in-process probe and the Traefik
+    /// health check agree (a `404`/`5xx` health endpoint is NOT healthy).
+    /// Returns `Ok(())` when the app answers `2xx–3xx`, or `Err(reason)`
+    /// describing exactly what was probed and how it failed (no target yet, bad
+    /// status, or a connection/timeout error) so the reason can be surfaced into
+    /// the deployment's Unhealthy status and logs.
     async fn probe_container(
         &self,
         inspected: Option<&InspectedContainer>,
@@ -1330,10 +1351,10 @@ impl DockerReconciler {
         match self.http_client.get(&url).send().await {
             Ok(resp) => {
                 let code = resp.status().as_u16();
-                if code < 500 {
+                if (200..400).contains(&code) {
                     Ok(())
                 } else {
-                    Err(format!("GET {url} returned HTTP {code}"))
+                    Err(format!("GET {url} returned HTTP {code} (expected 2xx–3xx)"))
                 }
             }
             Err(e) => Err(format!("GET {url} failed: {}", probe_error_detail(&e))),
@@ -2091,11 +2112,16 @@ fn probe_error_detail(e: &reqwest::Error) -> String {
 /// Effective HTTP health-probe path for a container, honoring its public
 /// `health_check` spec (`rise.toml [containers.X.health_check]`):
 ///
-/// - `disabled = true` → `None`: the probe is turned off (the caller treats a
-///   *running* container as ready), matching the Kubernetes behavior where
-///   `health_check = false` removes the readiness/liveness probes.
+/// - `health_check` **absent** (`None`) → `None`: HTTP probing is OPT-IN, so a
+///   container with no `health_check` declared is treated as ready as soon as
+///   it is *running* — matching Kubernetes, where a Pod with no readiness probe
+///   is Ready once the container is up.
+/// - `disabled = true` → `None`: the probe is explicitly turned off (the caller
+///   treats a *running* container as ready), matching the Kubernetes behavior
+///   where `health_check = false` removes the readiness/liveness probes.
 /// - `path` set → that path, normalized to a leading `/`.
-/// - otherwise → the controller's default `health_path`.
+/// - set but no `path` (or an empty `path`) → the controller's default
+///   `health_path`.
 ///
 /// Note: the reconcile loop probes once per tick, so the spec's fine-grained
 /// timing/threshold knobs (`period_seconds`, `failure_threshold`, …) and the
@@ -2106,11 +2132,13 @@ fn effective_health_path(
     spec: &crate::server::deployment::models::ContainerSpec,
     default_path: &str,
 ) -> Option<String> {
-    let hc = spec.health_check.as_ref();
-    if hc.map(|h| h.disabled).unwrap_or(false) {
+    // Probing is opt-in: no `health_check` declared → no probe (ready when
+    // running).
+    let hc = spec.health_check.as_ref()?;
+    if hc.disabled {
         return None;
     }
-    match hc.and_then(|h| h.path.as_deref()).filter(|p| !p.is_empty()) {
+    match hc.path.as_deref().filter(|p| !p.is_empty()) {
         Some(p) if p.starts_with('/') => Some(p.to_string()),
         Some(p) => Some(format!("/{p}")),
         None => Some(default_path.to_string()),
@@ -2216,6 +2244,8 @@ mod tests {
             generation: 1,
             replica: 0,
             health_path: Some("/".to_string()),
+            health_check_interval_secs: None,
+            health_check_timeout_secs: None,
         }
     }
 
@@ -2708,11 +2738,22 @@ mod tests {
             env_overrides: vec![],
             health_check: None,
         };
-        // No spec → controller default.
+        // No spec → None: probing is opt-in, so an absent `health_check` means
+        // no HTTP probe (the container is ready when running).
         assert_eq!(
-            effective_health_path(&base, "/").as_deref(),
-            Some("/"),
-            "default path"
+            effective_health_path(&base, "/"),
+            None,
+            "absent health_check → no probe"
+        );
+        // `health_check` set but no path → controller default.
+        let default_path = ContainerSpec {
+            health_check: Some(HealthCheckSpec::default()),
+            ..base.clone()
+        };
+        assert_eq!(
+            effective_health_path(&default_path, "/livez").as_deref(),
+            Some("/livez"),
+            "set-but-no-path → controller default"
         );
         // disabled → None (probe turned off).
         let disabled = ContainerSpec {

@@ -91,7 +91,24 @@ pub struct DesiredContainer {
     /// every OTHER replica being healthy. NOT an identity field and NOT fed into
     /// any hash (so it never causes drift on its own).
     pub health_path: Option<String>,
+    /// Traefik load-balancer health-check interval, in seconds (the spec's
+    /// `period_seconds` when set). Only consulted when `health_path` is `Some`
+    /// AND the cutover strategy is `HealthRolling`, to render
+    /// `...loadbalancer.healthcheck.interval`. `None` → a sensible default.
+    pub health_check_interval_secs: Option<i32>,
+    /// Traefik load-balancer health-check timeout, in seconds (the spec's
+    /// `timeout_seconds` when set). Same gating as `health_check_interval_secs`;
+    /// renders `...loadbalancer.healthcheck.timeout`. `None` → a sensible
+    /// default.
+    pub health_check_timeout_secs: Option<i32>,
 }
+
+/// Default Traefik health-check interval (Go duration `10s`) when the
+/// `health_check` spec sets no `period_seconds`.
+const DEFAULT_HEALTHCHECK_INTERVAL_SECS: i32 = 10;
+/// Default Traefik health-check timeout (Go duration `3s`) when the
+/// `health_check` spec sets no `timeout_seconds`.
+const DEFAULT_HEALTHCHECK_TIMEOUT_SECS: i32 = 3;
 
 /// Static controller configuration the builder needs.
 pub struct BuilderConfig<'a> {
@@ -125,6 +142,12 @@ pub struct BuilderConfig<'a> {
     /// host) health-probe the app directly. Off in production — worker
     /// containers (no port) and the disabled case get no port bindings.
     pub publish_app_ports: bool,
+    /// Traffic-cutover strategy for the group. Only `HealthRolling` emits the
+    /// Traefik load-balancer health-check labels (`...loadbalancer.healthcheck.*`)
+    /// for routable containers that have an effective health path; `Recreate`
+    /// (the current default) emits none, so today's routing is unchanged. The
+    /// reconcile/rolling behavior itself is wired in a later step.
+    pub cutover_strategy: crate::server::settings::CutoverStrategy,
 }
 
 /// Result of building one container: the deterministic name and the bollard
@@ -523,6 +546,43 @@ fn render_traefik_labels_for(
             }),
         });
         out.extend(traefik);
+
+        // Traefik load-balancer health-check labels — emitted ONLY in
+        // `HealthRolling` mode AND when this container has an effective health
+        // path (a `health_check` is configured). In `Recreate` mode, or for a
+        // ready-when-running container (no `health_check`), none are emitted, so
+        // today's routing is unchanged. The service name matches the router/
+        // service base (`router_name`), so the check attaches to this route's
+        // service. These labels are part of the rendered set, so toggling them
+        // changes the route-hash and forces a recreate automatically.
+        if cfg.cutover_strategy == crate::server::settings::CutoverStrategy::HealthRolling {
+            if let Some(health_path) = desired.health_path.as_deref() {
+                let interval = desired
+                    .health_check_interval_secs
+                    .unwrap_or(DEFAULT_HEALTHCHECK_INTERVAL_SECS);
+                let timeout = desired
+                    .health_check_timeout_secs
+                    .unwrap_or(DEFAULT_HEALTHCHECK_TIMEOUT_SECS);
+                out.insert(
+                    format!("traefik.http.services.{router_name}.loadbalancer.healthcheck.path"),
+                    health_path.to_string(),
+                );
+                out.insert(
+                    format!(
+                        "traefik.http.services.{router_name}.loadbalancer.healthcheck.interval"
+                    ),
+                    format!("{interval}s"),
+                );
+                out.insert(
+                    format!("traefik.http.services.{router_name}.loadbalancer.healthcheck.timeout"),
+                    format!("{timeout}s"),
+                );
+                out.insert(
+                    format!("traefik.http.services.{router_name}.loadbalancer.healthcheck.scheme"),
+                    "http".to_string(),
+                );
+            }
+        }
     }
     out
 }
@@ -565,6 +625,9 @@ mod tests {
             app_backend_host_aliases: &[],
             app_backend_ip: None,
             publish_app_ports: false,
+            // Default to the no-op cutover for builder tests; the health-check
+            // label tests below override this to `HealthRolling`.
+            cutover_strategy: crate::server::settings::CutoverStrategy::Recreate,
         }
     }
 
@@ -601,6 +664,8 @@ mod tests {
             generation: 1,
             replica: 0,
             health_path: Some("/".to_string()),
+            health_check_interval_secs: None,
+            health_check_timeout_secs: None,
         }
     }
 
@@ -1388,6 +1453,118 @@ mod tests {
             route_hash_for(&public_c, &cfg),
             route_hash_for(&private_c, &cfg),
             "access-class change must change the route hash to trigger recreate"
+        );
+    }
+
+    #[test]
+    fn recreate_mode_emits_no_healthcheck_labels() {
+        // With the default `recreate` cutover, no Traefik health-check labels are
+        // emitted even when a health path is present — today's routing is
+        // unchanged.
+        let cfg = BuilderConfig {
+            cutover_strategy: crate::server::settings::CutoverStrategy::Recreate,
+            ..test_cfg()
+        };
+        let mut desired = single_container();
+        desired.health_path = Some("/healthz".to_string());
+        let built = build_container(&desired, &cfg);
+        let labels = built.config.labels.as_ref().unwrap();
+        assert!(
+            !labels.keys().any(|k| k.contains("healthcheck")),
+            "recreate mode must not emit any healthcheck labels"
+        );
+    }
+
+    #[test]
+    fn health_rolling_with_health_check_emits_healthcheck_labels() {
+        // health-rolling + a health_check with path `/healthz` and period 5s →
+        // healthcheck.path=/healthz, interval=5s (timeout falls back to default).
+        let cfg = BuilderConfig {
+            cutover_strategy: crate::server::settings::CutoverStrategy::HealthRolling,
+            ..test_cfg()
+        };
+        let mut desired = single_container();
+        desired.health_path = Some("/healthz".to_string());
+        desired.health_check_interval_secs = Some(5);
+        desired.health_check_timeout_secs = None;
+        let built = build_container(&desired, &cfg);
+        let labels = built.config.labels.as_ref().unwrap();
+        let svc = "myapp-default-app";
+        assert_eq!(
+            labels
+                .get(&format!(
+                    "traefik.http.services.{svc}.loadbalancer.healthcheck.path"
+                ))
+                .map(String::as_str),
+            Some("/healthz")
+        );
+        assert_eq!(
+            labels
+                .get(&format!(
+                    "traefik.http.services.{svc}.loadbalancer.healthcheck.interval"
+                ))
+                .map(String::as_str),
+            Some("5s")
+        );
+        assert_eq!(
+            labels
+                .get(&format!(
+                    "traefik.http.services.{svc}.loadbalancer.healthcheck.timeout"
+                ))
+                .map(String::as_str),
+            Some("3s"),
+            "timeout falls back to the default Go duration when unset"
+        );
+        assert_eq!(
+            labels
+                .get(&format!(
+                    "traefik.http.services.{svc}.loadbalancer.healthcheck.scheme"
+                ))
+                .map(String::as_str),
+            Some("http")
+        );
+    }
+
+    #[test]
+    fn health_rolling_without_health_check_emits_no_healthcheck_labels() {
+        // health-rolling but NO health_check (ready-when-running) → no healthcheck
+        // labels: probing is opt-in, so a container with no effective health path
+        // gets no Traefik health check.
+        let cfg = BuilderConfig {
+            cutover_strategy: crate::server::settings::CutoverStrategy::HealthRolling,
+            ..test_cfg()
+        };
+        let mut desired = single_container();
+        desired.health_path = None;
+        desired.health_check_interval_secs = None;
+        desired.health_check_timeout_secs = None;
+        let built = build_container(&desired, &cfg);
+        let labels = built.config.labels.as_ref().unwrap();
+        assert!(
+            !labels.keys().any(|k| k.contains("healthcheck")),
+            "ready-when-running container must not emit healthcheck labels"
+        );
+    }
+
+    #[test]
+    fn healthcheck_labels_change_route_hash() {
+        // The health-check labels are part of the rendered Traefik label set, so
+        // toggling cutover strategy (which toggles their presence) changes the
+        // route-hash and forces a recreate automatically.
+        let mut desired = single_container();
+        desired.health_path = Some("/healthz".to_string());
+        let recreate = BuilderConfig {
+            cutover_strategy: crate::server::settings::CutoverStrategy::Recreate,
+            ..test_cfg()
+        };
+        let rolling = BuilderConfig {
+            cutover_strategy: crate::server::settings::CutoverStrategy::HealthRolling,
+            ..test_cfg()
+        };
+        assert_ne!(
+            route_hash_for(&desired, &recreate),
+            route_hash_for(&desired, &rolling),
+            "emitting healthcheck labels must change the route hash"
         );
     }
 }

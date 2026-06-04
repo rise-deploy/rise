@@ -215,6 +215,21 @@
         }
       ]
     },
+    "CutoverStrategy": {
+      "description": "How the Docker backend cuts traffic over from an old deployment to a new one\nwhen a deployment becomes the active/routable one for its group.\n\n- `HealthRolling` (\"health-rolling\" in YAML): old and new replicas register\n  as servers of one shared Traefik load-balancer service and Traefik's\n  per-server health check drains the old ones as the new ones come up — a\n  health-driven rolling overlap with no Rise-side gate.\n- `Recreate` (\"recreate\" in YAML): Rise gates the cutover itself (single\n  active/routable deployment at a time); the old route is dropped and the new\n  one stamped in one step.\n\nCurrently defaults to `Recreate`; the default flips to `HealthRolling` in a\nlater change once the rolling reconcile path lands. Driven by the\n`cutover_strategy` controller setting (kebab-case string in YAML, so\n`${VAR:-recreate}` interpolation deserializes straight into the enum).",
+      "oneOf": [
+        {
+          "const": "health-rolling",
+          "description": "Health-driven rolling overlap via a shared Traefik service + per-server\nhealth check.",
+          "type": "string"
+        },
+        {
+          "const": "recreate",
+          "description": "Rise-gated single cutover (one active/routable deployment at a time).",
+          "type": "string"
+        }
+      ]
+    },
     "DatabaseSettings": {
       "properties": {
         "url": {
@@ -596,6 +611,10 @@
               "default": "default",
               "description": "Stable identifier for this deployment controller. The reconciler only\nreconciles projects matching this class. Defaults to `default`.",
               "type": "string"
+            },
+            "cutover_strategy": {
+              "$ref": "#/$defs/CutoverStrategy",
+              "description": "How the controller cuts traffic over when a deployment becomes the\nactive/routable one for its group. `health-rolling` keeps old and new\nreplicas behind one shared Traefik service and lets Traefik's\nper-server health check drain the old ones (rolling overlap);\n`recreate` (the current default) gates the cutover in Rise (single\nactive deployment at a time). The default flips to `health-rolling` in\na later change. Driven by the kebab-case string in YAML, so a\n`${VAR:-recreate}` interpolation deserializes directly into the enum."
             },
             "deployment_constraints": {
               "$ref": "#/$defs/DeploymentConstraints",

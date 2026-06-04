@@ -675,6 +675,36 @@ fn default_metacontroller_webhook_port() -> u16 {
     3001
 }
 
+/// How the Docker backend cuts traffic over from an old deployment to a new one
+/// when a deployment becomes the active/routable one for its group.
+///
+/// - `HealthRolling` ("health-rolling" in YAML): old and new replicas register
+///   as servers of one shared Traefik load-balancer service and Traefik's
+///   per-server health check drains the old ones as the new ones come up — a
+///   health-driven rolling overlap with no Rise-side gate.
+/// - `Recreate` ("recreate" in YAML): Rise gates the cutover itself (single
+///   active/routable deployment at a time); the old route is dropped and the new
+///   one stamped in one step.
+///
+/// Currently defaults to `Recreate`; the default flips to `HealthRolling` in a
+/// later change once the rolling reconcile path lands. Driven by the
+/// `cutover_strategy` controller setting (kebab-case string in YAML, so
+/// `${VAR:-recreate}` interpolation deserializes straight into the enum).
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum CutoverStrategy {
+    /// Health-driven rolling overlap via a shared Traefik service + per-server
+    /// health check.
+    HealthRolling,
+    /// Rise-gated single cutover (one active/routable deployment at a time).
+    Recreate,
+}
+
+#[cfg(feature = "backend")]
+fn default_cutover_strategy() -> CutoverStrategy {
+    CutoverStrategy::Recreate
+}
+
 // ── Docker deployment controller defaults ──────────────────────────────
 
 #[cfg(feature = "backend")]
@@ -1373,6 +1403,17 @@ pub enum DeploymentControllerSettings {
         )]
         #[schemars(with = "bool")]
         publish_app_ports: bool,
+
+        /// How the controller cuts traffic over when a deployment becomes the
+        /// active/routable one for its group. `health-rolling` keeps old and new
+        /// replicas behind one shared Traefik service and lets Traefik's
+        /// per-server health check drain the old ones (rolling overlap);
+        /// `recreate` (the current default) gates the cutover in Rise (single
+        /// active deployment at a time). The default flips to `health-rolling` in
+        /// a later change. Driven by the kebab-case string in YAML, so a
+        /// `${VAR:-recreate}` interpolation deserializes directly into the enum.
+        #[serde(default = "default_cutover_strategy")]
+        cutover_strategy: CutoverStrategy,
     },
 }
 
@@ -2710,11 +2751,19 @@ auth:
             app_backend_host_aliases,
             app_backend_ip,
             deployment_constraints,
+            cutover_strategy,
             ..
         }) = &settings.deployment_controller
         else {
             panic!("expected docker deployment_controller");
         };
+        // cutover_strategy: env-driven `${RISE_CUTOVER_STRATEGY:-recreate}`
+        // defaults to `recreate` (the rolling default flips in a later change).
+        assert_eq!(
+            *cutover_strategy,
+            CutoverStrategy::Recreate,
+            "local: cutover_strategy must default to recreate"
+        );
         // Replicas: env-driven max (RISE_MAX_REPLICAS) defaults to 10 so the
         // Docker backend allows horizontal scale-out out of the box (the
         // platform default of 1 would reject replicas>1 at the API).
@@ -2797,11 +2846,18 @@ auth:
             production_ingress_url_template,
             app_backend_host_aliases,
             app_backend_ip,
+            cutover_strategy,
             ..
         }) = &settings.deployment_controller
         else {
             panic!("expected docker deployment_controller");
         };
+        // PROD: cutover_strategy still defaults to recreate (env unset).
+        assert_eq!(
+            *cutover_strategy,
+            CutoverStrategy::Recreate,
+            "prod: cutover_strategy must default to recreate"
+        );
         // PROD: RISE_APP_BACKEND_HOST_ALIAS unset -> the single blank entry is
         // filtered out -> empty list -> NO extra_hosts injection (public DNS +
         // Traefik handle the issuer host with correct TLS).
