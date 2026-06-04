@@ -85,6 +85,13 @@ from the old containers to the new is governed by
 > `health_check` switches readiness to a **2xx–3xx** check — enforced by
 > **Traefik's** per-server health check in `health-rolling` mode, and by
 > **Rise's own probe** in `recreate` mode.
+>
+> The zero-gap rollover guarantee only holds **when a `health_check` is set.**
+> Without one (in `health-rolling` mode) Traefik has no per-server check to
+> drain against, so a new server joins the load balancer the moment it is
+> *running* — Traefik may route to it before the app inside has finished
+> starting (the same exposure a Kubernetes pod with no readiness probe has).
+> Set a `health_check` for apps that need traffic withheld until they are ready.
 
 `traefik_api_url` defaults differ per environment: the standalone stack defaults
 to the in-network `http://rise-traefik:8080` (the standalone Traefik enables its
