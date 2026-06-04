@@ -167,6 +167,27 @@ For user-facing documentation, see the [`/docs`](./docs) directory. Key topics i
 - The default development branch is `develop`. PRs for feature work should target `develop`, not `main`.
 - Always target the branch your feature branch was created from when opening a PR.
 
+## Rollout Tracking
+
+High-impact, multi-PR, or operator-affecting changes are tracked in the **Rise
+Rollout Tracker** GitHub Project: <https://github.com/orgs/rise-deploy/projects/1>.
+Consult it when planning or reviewing large or breaking work to see in-flight
+workstreams, their phase, and outstanding finalization gates (deferred steps that
+flip a default, drop a compat shim, or tighten a constraint).
+
+Keep it current as work merges:
+
+- When a PR advances a tracked workstream, add it to the Project, link it from the
+  PR body, and move the item's `Status`. When you defer a finalization step, file
+  it as a `rollout-gate` issue and add it to the Project.
+- Set `Workstream`, `Breaking?`, `Operator impact`, and `Target release` on every
+  item. If `Operator impact` is not `None`, the item is **not** `Done` until the
+  operator [Upgrade Notes](docs/engineering/src/content/docs/upgrade-notes.md) page
+  has a matching entry for that release.
+- Plans like `MULTI_TENANCY_PLAN.md` and `AUTH_TOKEN_EXCHANGE_PLAN.md` own the
+  *why* and phase rationale; the Project owns *live status*. Don't duplicate
+  rationale into the board.
+
 ## Guidelines
 
 - Build features in small increments with frequent commits. Use Git history as a reference for what was done and why.
