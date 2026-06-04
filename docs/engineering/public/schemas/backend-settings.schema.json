@@ -703,6 +703,14 @@
                 "null"
               ]
             },
+            "traefik_api_url": {
+              "default": null,
+              "description": "Base URL of Traefik's API (e.g. `http://rise-traefik:8080` in-network\nor `http://localhost:8090` for a host-run dev backend). Used in\n`health-rolling` mode to read per-server health status\n(`loadBalancer.serverStatus`) from Traefik so the old deployment is\nretired only once the new servers are actually in Traefik's rotation.\nOptional basic-auth may be embedded in the URL (userinfo). Leave empty\nto fall back to Rise's own in-process health probe as the in-rotation\nproxy.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "traefik_certresolver": {
               "default": null,
               "description": "Optional Traefik certresolver name. When set, routers get\n`tls=true` + `tls.certresolver=<name>` labels for automatic TLS.",

@@ -14,6 +14,7 @@ pub mod client;
 pub mod container_builder;
 pub mod labels;
 pub mod reconciler;
+pub mod traefik_api;
 
 use super::{DeploymentBackend, DeploymentUrls};
 use crate::db::models::{Deployment, Project};

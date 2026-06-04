@@ -1414,6 +1414,17 @@ pub enum DeploymentControllerSettings {
         /// `${VAR:-recreate}` interpolation deserializes directly into the enum.
         #[serde(default = "default_cutover_strategy")]
         cutover_strategy: CutoverStrategy,
+
+        /// Base URL of Traefik's API (e.g. `http://rise-traefik:8080` in-network
+        /// or `http://localhost:8090` for a host-run dev backend). Used in
+        /// `health-rolling` mode to read per-server health status
+        /// (`loadBalancer.serverStatus`) from Traefik so the old deployment is
+        /// retired only once the new servers are actually in Traefik's rotation.
+        /// Optional basic-auth may be embedded in the URL (userinfo). Leave empty
+        /// to fall back to Rise's own in-process health probe as the in-rotation
+        /// proxy.
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        traefik_api_url: Option<String>,
     },
 }
 
@@ -2752,6 +2763,7 @@ auth:
             app_backend_ip,
             deployment_constraints,
             cutover_strategy,
+            traefik_api_url,
             ..
         }) = &settings.deployment_controller
         else {
@@ -2763,6 +2775,13 @@ auth:
             *cutover_strategy,
             CutoverStrategy::Recreate,
             "local: cutover_strategy must default to recreate"
+        );
+        // traefik_api_url: env-driven `${RISE_TRAEFIK_API_URL:-}` resolves to an
+        // empty string, which `deserialize_optional_nonempty_string` collapses to
+        // None (fall back to Rise's own probe).
+        assert_eq!(
+            *traefik_api_url, None,
+            "local: traefik_api_url must default to None"
         );
         // Replicas: env-driven max (RISE_MAX_REPLICAS) defaults to 10 so the
         // Docker backend allows horizontal scale-out out of the box (the
@@ -2847,6 +2866,7 @@ auth:
             app_backend_host_aliases,
             app_backend_ip,
             cutover_strategy,
+            traefik_api_url,
             ..
         }) = &settings.deployment_controller
         else {
@@ -2857,6 +2877,11 @@ auth:
             *cutover_strategy,
             CutoverStrategy::Recreate,
             "prod: cutover_strategy must default to recreate"
+        );
+        // PROD: traefik_api_url unset -> None.
+        assert_eq!(
+            *traefik_api_url, None,
+            "prod: traefik_api_url must default to None"
         );
         // PROD: RISE_APP_BACKEND_HOST_ALIAS unset -> the single blank entry is
         // filtered out -> empty list -> NO extra_hosts injection (public DNS +
