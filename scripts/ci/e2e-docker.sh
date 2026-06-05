@@ -54,6 +54,10 @@ RISE_JWT_SIGNING_SECRET_B64="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 RUN_ID="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
 PUB_PROJECT="pub-e2e-${RUN_ID}"
 PRIV_PROJECT="priv-e2e-${RUN_ID}"
+# Cutover scenarios. Kept short so the group-scoped Traefik service name
+# ({project}-default-app, sanitized) stays well under any length limit.
+CUT_PROJECT="cut-e2e-${RUN_ID}"
+CUT_RECREATE_PROJECT="cutr-e2e-${RUN_ID}"
 WHOAMI_IMAGE="${WHOAMI_IMAGE:-traefik/whoami}"
 
 RISE_CLI_BIN=""
@@ -140,6 +144,50 @@ curl_through_traefik() {
     sleep 2
   done
   printf '%s' "${code}"
+}
+
+# Sanitize a string into a Traefik router/service name exactly as the Docker
+# controller does (src/.../docker/labels.rs::sanitize_router_name): lowercase,
+# every char outside [a-z0-9-] collapsed to a single '-', trimmed of leading/
+# trailing '-'. The group-scoped service base is sanitize("{project}-{group}-
+# {container}"); for a single-container deploy group=default, container=app.
+sanitize_router_name() {
+  printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9-]+/-/g; s/-+/-/g; s/^-+//; s/-+$//'
+}
+
+# Query the internal Traefik API (http://rise-traefik:8080), which is NOT
+# published to the host (only :80 is). We reach it from inside the rise_default
+# compose network by exec'ing the already-running `dex` container, which ships
+# `wget` (it uses wget in its own healthcheck) — so no extra image is pulled.
+# Prints the response body to stdout; non-zero exit on transport failure.
+#
+#   traefik_api <path>   e.g. traefik_api "/api/http/services/foo@docker"
+traefik_api() {
+  local path="$1"
+  docker compose "${COMPOSE_ARGS[@]}" exec -T dex \
+    wget -q -O - "http://rise-traefik:8080${path}" 2>/dev/null
+}
+
+# Poll an app host through Traefik for a fixed number of rounds and FAIL the
+# moment any response is a 5xx (or a transport error). Returns 0 only if every
+# observed response was < 500. Used to assert the rolling cutover has no 5xx gap:
+# the old servers must keep serving until the new ones are confirmed UP.
+#
+#   assert_no_5xx_gap <host> <rounds> <sleep_secs>
+assert_no_5xx_gap() {
+  local host="$1" rounds="$2" gap="$3" code i
+  for ((i = 1; i <= rounds; i++)); do
+    code="$(curl -sS -o /dev/null -w '%{http_code}' \
+      -H "Host: ${host}" "${TRAEFIK_URL}/" 2>/dev/null || echo 000)"
+    if [[ "${code}" == "000" || "${code}" -ge 500 ]]; then
+      log "ERROR: cutover gap — request through Traefik returned ${code} (expected 2xx/3xx)"
+      return 1
+    fi
+    sleep "${gap}"
+  done
+  return 0
 }
 
 cleanup() {
@@ -366,5 +414,224 @@ if ! grep -qi "Hostname:" "${priv_body}"; then
   exit 1
 fi
 log "Authenticated private request allowed (200, whoami output)"
+
+############################################
+# (c) HEALTH-ROLLING CUTOVER: durable regression defense against the
+#     serverStatus-shape bug class. A health-rolling cutover gates retirement of
+#     the old active deployment on Traefik's per-server health (serverStatus). If
+#     the gate signal is shaped wrong (or absent), the gate silently no-ops. This
+#     scenario exercises the REAL external contract end to end:
+#       1. deploy with a health_check + 2 replicas (cutover defaults to
+#          health-rolling) and confirm it serves 200 via Traefik;
+#       2. assert the Traefik API actually EXPOSES a non-empty TOP-LEVEL
+#          serverStatus map (the gate signal) for the group-scoped service;
+#       3. redeploy a changed revision and assert NO 5xx gap across the cutover.
+############################################
+log "Scenario (c): health-rolling cutover ${CUT_PROJECT}"
+
+# A health_check requires a `[containers.<name>]` block in rise.toml (the
+# single-image `--image` path has none), so deploy from a generated project
+# dir. The `app` container pins the same already-pulled whoami image (which
+# answers 200 on `/`, so `/` is a valid health path — no new image dependency),
+# port 80, 2 replicas, and an explicit health_check. With a health_check present
+# and the default health-rolling strategy, the controller stamps the per-server
+# Traefik healthcheck labels, so Traefik publishes serverStatus.
+CUT_DIR="${E2E_TMPDIR}/cut"
+mkdir -p "${CUT_DIR}"
+cat >"${CUT_DIR}/rise.toml" <<EOF
+[project]
+name = "${CUT_PROJECT}"
+
+[containers.app]
+image = "${WHOAMI_IMAGE}"
+port = 80
+replicas = 2
+
+[containers.app.deploy.health_check]
+path = "/"
+EOF
+
+rise_cli project create "${CUT_PROJECT}" --access-class public --no-rise-toml
+# Deploy reads rise.toml from the path arg; REV=1 so the next deploy's changed
+# env forces a fresh revision (new env-hash) in the same group → a cutover.
+rise_cli deploy "${CUT_DIR}" --project "${CUT_PROJECT}" --env REV=1
+wait_for_healthy "${CUT_PROJECT}"
+
+log "Asserting cutover project serves 200 through Traefik"
+cut_body="${E2E_TMPDIR}/cut_body.txt"
+code="$(curl_through_traefik "${CUT_PROJECT}.rise.localhost" "${cut_body}")"
+if [[ "${code}" != "200" ]]; then
+  log "ERROR: expected 200 for cutover project, got ${code}"
+  cat "${cut_body}" || true
+  exit 1
+fi
+if ! grep -qi "Hostname:" "${cut_body}"; then
+  log "ERROR: cutover response did not look like whoami output"
+  cat "${cut_body}" || true
+  exit 1
+fi
+log "Cutover project reachable (200, whoami output)"
+
+# Derive the group-scoped Traefik service name the controller uses for the
+# serverStatus lookup: sanitize("{project}-{group}-{container}") with the
+# defaults group=default, container=app. Cross-check it against a running app
+# container's actual `traefik.http.services.*.loadbalancer.server.port` label so
+# the test fails loudly if the controller's naming ever diverges from this
+# derivation.
+CUT_SVC="$(sanitize_router_name "${CUT_PROJECT}-default-app")"
+log "Derived group-scoped Traefik service: ${CUT_SVC}@docker"
+
+cut_label_svc=""
+for _ in $(seq 1 30); do
+  cut_container="$(docker ps --filter "name=rise_${CUT_PROJECT}" --format '{{.Names}}' | head -1)"
+  if [[ -n "${cut_container:-}" ]]; then
+    # Extract the service name from the loadbalancer.server.port label key
+    # (traefik.http.services.<svc>.loadbalancer.server.port). This is exactly
+    # the service the serverStatus query targets.
+    cut_label_svc="$(docker inspect "${cut_container}" --format '{{json .Config.Labels}}' \
+      | tr ',' '\n' \
+      | sed -nE 's/.*"traefik\.http\.services\.([^.]+)\.loadbalancer\.server\.port".*/\1/p' \
+      | head -1)"
+    if [[ -n "${cut_label_svc}" ]]; then
+      break
+    fi
+  fi
+  sleep 2
+done
+if [[ -z "${cut_label_svc}" ]]; then
+  log "ERROR: could not read the Traefik service name off the cutover app container labels"
+  exit 1
+fi
+if [[ "${cut_label_svc}" != "${CUT_SVC}" ]]; then
+  log "ERROR: derived service '${CUT_SVC}' != container-label service '${cut_label_svc}'"
+  exit 1
+fi
+log "Container label service matches the derived name (${cut_label_svc})"
+
+log "Asserting Traefik API exposes a non-empty TOP-LEVEL serverStatus for ${CUT_SVC}@docker"
+# THE core regression assertion: the serverStatus gate signal must exist and be
+# correctly shaped. Traefik v3.x puts serverStatus at the TOP LEVEL of the
+# service object (a sibling of loadBalancer), keyed by server URL
+# (http://{ip}:{port}) with UP/DOWN values. We assert:
+#   - the service object exists (.name present),
+#   - the TOP-LEVEL .serverStatus is a non-empty object,
+#   - every key looks like http://host:port,
+#   - every value is UP or DOWN (and at least one reaches UP).
+# The serverStatus map populates only once Traefik has run a health check, so
+# poll until it appears (or fail after the budget).
+cut_svc_json="${E2E_TMPDIR}/cut_svc.json"
+cut_status_ok=0
+for _ in $(seq 1 30); do
+  if ! traefik_api "/api/http/services/${CUT_SVC}@docker" >"${cut_svc_json}" 2>/dev/null; then
+    sleep 2
+    continue
+  fi
+  # Require a parseable service object whose TOP-LEVEL serverStatus is a
+  # non-empty map of http://host:port -> UP/DOWN with at least one UP.
+  if jq -e '
+        (.name != null)
+        and ((.serverStatus // {}) | type == "object")
+        and ((.serverStatus // {}) | length > 0)
+        and ((.serverStatus // {}) | to_entries
+              | all(.key | test("^http://[^/]+:[0-9]+$")))
+        and ((.serverStatus // {}) | to_entries
+              | all(.value | test("^(UP|DOWN)$"; "i")))
+        and ((.serverStatus // {}) | to_entries
+              | any(.value | test("^UP$"; "i")))
+      ' "${cut_svc_json}" >/dev/null 2>&1; then
+    cut_status_ok=1
+    break
+  fi
+  sleep 2
+done
+if [[ "${cut_status_ok}" != "1" ]]; then
+  log "ERROR: Traefik API did not expose a valid non-empty top-level serverStatus for ${CUT_SVC}@docker"
+  log "Last Traefik service payload:"
+  cat "${cut_svc_json}" || true
+  exit 1
+fi
+log "Traefik API exposes a non-empty top-level serverStatus (gate signal present):"
+jq -c '.serverStatus' "${cut_svc_json}" | sed 's/^/[e2e-docker]   /'
+
+log "Forcing a cutover (changed revision) and asserting no 5xx gap across the rollout"
+# Redeploy a changed revision (new env → new env-hash → new deployment in the
+# same group → a health-rolling cutover). Poll the app URL through Traefik for
+# the duration of the rollout and assert every response is 2xx/3xx: the rolling
+# overlap promise is that the old servers keep serving until the new servers are
+# confirmed UP, so there must be NO 5xx gap.
+#
+# The deploy returns once the deployment is created; the cutover then proceeds
+# asynchronously over several reconcile ticks. Poll across that window. (We
+# assert "no 5xx", not strict request counting: in CI the exact tick timing is
+# not deterministic, so a hard "served by new revision within N seconds" check
+# would be flaky. The no-5xx invariant is the durable, non-flaky contract.)
+rise_cli deploy "${CUT_DIR}" --project "${CUT_PROJECT}" --env REV=2
+if ! assert_no_5xx_gap "${CUT_PROJECT}.rise.localhost" 40 1; then
+  log "ERROR: observed a 5xx gap during the health-rolling cutover"
+  rise_cli deployment list --project "${CUT_PROJECT}" --limit 5 || true
+  exit 1
+fi
+# After the polling window the new revision must be Healthy and still serving.
+wait_for_healthy "${CUT_PROJECT}"
+code="$(curl_through_traefik "${CUT_PROJECT}.rise.localhost" "${cut_body}")"
+if [[ "${code}" != "200" ]]; then
+  log "ERROR: expected 200 after cutover, got ${code}"
+  exit 1
+fi
+log "Health-rolling cutover completed with no 5xx gap (final 200)"
+
+############################################
+# (d) RECREATE STRATEGY: the recreate cutover path must ALSO converge to 200.
+#     Recreate mode now uses the same 2xx-3xx readiness contract, so a deploy
+#     under RISE_CUTOVER_STRATEGY=recreate must still come up Healthy and serve
+#     200. Kept lightweight: we flip the backend's cutover strategy in place
+#     (env override + recreate the rise service) rather than standing up a second
+#     full stack, then deploy a fresh project and assert it converges to 200.
+############################################
+log "Scenario (d): recreate-strategy convergence ${CUT_RECREATE_PROJECT}"
+log "Switching the rise backend to RISE_CUTOVER_STRATEGY=recreate"
+# config/docker.yaml reads cutover_strategy from ${RISE_CUTOVER_STRATEGY:-health-rolling}.
+# Set it for the backend and recreate just the rise service so it re-reads config;
+# the Postgres state (org bootstrap, existing projects) is preserved.
+RISE_CUTOVER_STRATEGY=recreate \
+  docker compose "${COMPOSE_ARGS[@]}" up -d --no-deps --force-recreate rise
+
+log "Waiting for Rise /health after the recreate-strategy switch"
+for _ in $(seq 1 60); do
+  code="$(curl -fsS -o /dev/null -w '%{http_code}' "${RISE_URL}/health" 2>/dev/null || echo 000)"
+  if [[ "${code}" == "200" ]]; then
+    break
+  fi
+  sleep 2
+done
+if [[ "${code:-000}" != "200" ]]; then
+  log "ERROR: Rise /health never returned 200 after recreate-strategy switch (last=${code:-000})"
+  exit 1
+fi
+
+# Re-mint the token (a fresh process; the secret is unchanged so the old token
+# would still validate, but re-minting keeps the iat/exp fresh).
+RISE_TOKEN="$(create_rise_ci_token)"
+export RISE_TOKEN
+
+# A single-replica recreate deploy of the same whoami image must converge to 200.
+rise_cli project create "${CUT_RECREATE_PROJECT}" --access-class public --no-rise-toml
+rise_cli deploy --project "${CUT_RECREATE_PROJECT}" --image "${WHOAMI_IMAGE}" --http-port 80 --replicas 1
+wait_for_healthy "${CUT_RECREATE_PROJECT}"
+
+log "Asserting recreate-strategy project serves 200 through Traefik"
+cutr_body="${E2E_TMPDIR}/cutr_body.txt"
+code="$(curl_through_traefik "${CUT_RECREATE_PROJECT}.rise.localhost" "${cutr_body}")"
+if [[ "${code}" != "200" ]]; then
+  log "ERROR: expected 200 for recreate-strategy project, got ${code}"
+  cat "${cutr_body}" || true
+  exit 1
+fi
+if ! grep -qi "Hostname:" "${cutr_body}"; then
+  log "ERROR: recreate-strategy response did not look like whoami output"
+  cat "${cutr_body}" || true
+  exit 1
+fi
+log "Recreate strategy converges to 200 (whoami output)"
 
 log "Docker backend E2E smoke tests completed successfully"
