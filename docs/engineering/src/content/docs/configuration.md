@@ -409,6 +409,24 @@ containers on a single Docker host, routed by Traefik. Select it with
 - `ingress_port?` — external port apps are served on (e.g. `80` locally).
 - `controller_class_name` — controller ownership class (default `default`).
 - `reconcile_interval_secs` — in-process reconcile loop interval in seconds (default `5`).
+- `cutover_strategy` — how traffic cuts over when a deployment becomes active:
+  `health-rolling` (default) or `recreate`.
+- `traefik_api_url?` — base URL of Traefik's API, read in `health-rolling` mode to
+  drain old replicas via the top-level `serverStatus` map.
+- `deployment_constraints.max_replicas` — upper bound on requested replicas (default `10`).
+- `access_classes` — ingress access classes (keyed by identifier) defining
+  authentication levels, mirroring the Kubernetes variant.
+- `auth_backend_url` — internal URL Traefik uses to reach the Rise backend for the
+  forwardAuth subrequest; required when any access class is `Authenticated`/`Member`.
+- `auth_signin_url` — browser-facing base URL for the login redirect (falls back to
+  the server `public_url` when empty).
+- `publish_app_ports` — **dev-only.** Publish each app container's HTTP port to a
+  random `127.0.0.1` host port so a host-run backend can health-probe it directly.
+- `app_backend_host_aliases` / `app_backend_ip` — **dev-only** host-alias knobs that
+  inject `extra_hosts` so app containers can reach the Rise backend at the issuer host.
+
+See the [Docker operator guide](/operator-docs/docker/) for the full controller
+configuration, including TLS/ACME and the rolling-cutover gate.
 
 Kubernetes-only fields (namespace prefix, ingress annotations, network policies, host
 aliases, node selectors, etc.) do not apply to the Docker variant.

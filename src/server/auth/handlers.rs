@@ -2271,8 +2271,9 @@ mod tests {
             validate_redirect_url("https://secret.example.com/dashboard", public_url, &[]),
             "/"
         );
-        // A DIFFERENT project's host under the same parent domain is now REJECTED
-        // (the old parent-domain wildcard would have allowed it).
+        // A DIFFERENT project's host under the same parent domain is rejected:
+        // redirects are gated by exact membership in the allow-set, not by a
+        // shared parent domain.
         assert_eq!(
             validate_redirect_url("https://other.example.com/", public_url, &allowed),
             "/"

@@ -166,7 +166,7 @@ deployment_controller:
   # published dashboard port; empty disables -> mirror-probe fallback.
   #
   # In health-rolling mode the reconciler reads Traefik's per-server health
-  # status (loadBalancer.serverStatus) to retire the old deployment only once the
+  # status (the top-level serverStatus map) to retire the old deployment only once the
   # new servers are actually in Traefik's rotation. Optional basic-auth may be
   # embedded in the URL (userinfo).
   traefik_api_url: "${RISE_TRAEFIK_API_URL:-http://rise-traefik:8080}"
