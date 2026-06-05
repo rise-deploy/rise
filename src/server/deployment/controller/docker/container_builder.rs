@@ -142,10 +142,11 @@ pub struct BuilderConfig<'a> {
     /// host) health-probe the app directly. Off in production — worker
     /// containers (no port) and the disabled case get no port bindings.
     pub publish_app_ports: bool,
-    /// Traffic-cutover strategy for the group. Only `HealthRolling` emits the
-    /// Traefik load-balancer health-check labels (`...loadbalancer.healthcheck.*`)
-    /// for routable containers that have an effective health path; `Recreate`
-    /// (the current default) emits none, so its routing is unchanged. In
+    /// Traffic-cutover strategy for the group. Only `HealthRolling` (the
+    /// default) emits the Traefik load-balancer health-check labels
+    /// (`...loadbalancer.healthcheck.*`) for routable containers that have an
+    /// effective health path; `Recreate` emits none, so its routing is
+    /// unchanged. In
     /// `HealthRolling` mode the reconciler gates the Deploying→Healthy cutover on
     /// Traefik's `serverStatus` (the old active deployment is retired only once
     /// the new servers are confirmed UP), mirroring with Rise's own probe when no

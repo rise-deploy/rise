@@ -41,6 +41,22 @@ pub(crate) fn merge_container_env(
     env
 }
 
+/// Apply the controller's mandatory, non-overridable env pins to a merged env
+/// vector: the container's declared `PORT` (when set) and `RISE_CONTAINER`
+/// (always — the container's own name, a system identity var). Both overwrite
+/// any user-supplied value and fold into the `env_hash`. Mirrors the Kubernetes
+/// builder's `RISE_CONTAINER` injection in `resource_builder::build_container`.
+pub(crate) fn pin_system_env(
+    env: &mut Vec<(String, String)>,
+    container_name: &str,
+    port: Option<u16>,
+) {
+    if let Some(port) = port {
+        upsert_env(env, "PORT", &port.to_string());
+    }
+    upsert_env(env, "RISE_CONTAINER", container_name);
+}
+
 pub(crate) fn upsert_env(env: &mut Vec<(String, String)>, key: &str, value: &str) {
     if let Some(existing) = env.iter_mut().find(|(k, _)| k == key) {
         existing.1 = value.to_string();
@@ -187,6 +203,35 @@ mod tests {
         assert!(!merged.iter().any(|(k, _)| k == "ONLY_PROD"));
         let merged_prod = merge_container_env(&[], &[], &[], &spec, Some("production"));
         assert!(merged_prod.iter().any(|(k, _)| k == "ONLY_PROD"));
+    }
+
+    #[test]
+    fn pin_system_env_injects_rise_container_and_overwrites_user_value() {
+        // RISE_CONTAINER is always injected as the container's own name, even
+        // when the user tries to set it — mirrors the Kubernetes builder.
+        let mut env = vec![
+            ("RISE_CONTAINER".to_string(), "user-bogus".to_string()),
+            ("FOO".to_string(), "bar".to_string()),
+        ];
+        pin_system_env(&mut env, "web", Some(8080));
+        let rc = env
+            .iter()
+            .find(|(k, _)| k == "RISE_CONTAINER")
+            .expect("RISE_CONTAINER must be present");
+        assert_eq!(rc.1, "web", "user-supplied RISE_CONTAINER is overwritten");
+        // Exactly one RISE_CONTAINER entry (upsert, not append).
+        assert_eq!(env.iter().filter(|(k, _)| k == "RISE_CONTAINER").count(), 1);
+        // PORT pinned too.
+        assert!(env.iter().any(|(k, v)| k == "PORT" && v == "8080"));
+    }
+
+    #[test]
+    fn pin_system_env_injects_rise_container_without_port() {
+        let mut env = Vec::new();
+        pin_system_env(&mut env, "api", None);
+        assert!(env.iter().any(|(k, v)| k == "RISE_CONTAINER" && v == "api"));
+        // No PORT when the container declares none.
+        assert!(!env.iter().any(|(k, _)| k == "PORT"));
     }
 
     #[test]

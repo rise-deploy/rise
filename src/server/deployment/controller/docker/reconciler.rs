@@ -15,12 +15,15 @@ use anyhow::Result;
 use bollard::Docker;
 use chrono::Utc;
 use futures::StreamExt;
+use rise_runtime_sync::{with_leader_election, LeaderElection, LEASE_DURATION};
 use sqlx::PgPool;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 use super::container_builder::{self, BuilderConfig, DesiredContainer, DesiredRoute};
 use super::diff::{diff_desired_vs_actual, identity_key, ActualContainer, ReconcileAction};
-use super::env::{hash_env, merge_container_env, upsert_env};
+use super::env::{hash_env, merge_container_env, pin_system_env};
 use super::health::{effective_health_path, probe_error_detail};
 use super::labels::{self, SUFFIX_ENV_HASH, SUFFIX_IMAGE, SUFFIX_MANAGED_BY};
 use super::pod_status::build_controller_metadata;
@@ -109,10 +112,11 @@ pub struct ReconcilerConfig {
     pub cutover_strategy: crate::server::settings::CutoverStrategy,
     /// Base URL of Traefik's API (e.g. `http://rise-traefik:8080`), optionally
     /// with embedded basic-auth userinfo. In `HealthRolling` mode the reconciler
-    /// reads `loadBalancer.serverStatus` from Traefik to learn whether a
-    /// container's server is actually in Traefik's rotation (UP) before retiring
-    /// the prior active deployment. `None` (unset) → fall back to Rise's own
-    /// in-process health probe as the in-rotation proxy. See the `Docker`
+    /// reads the top-level `serverStatus` map from Traefik (falling back to a
+    /// `loadBalancer.serverStatus` nesting for version tolerance) to learn
+    /// whether a container's server is actually in Traefik's rotation (UP) before
+    /// retiring the prior active deployment. `None` (unset) → fall back to Rise's
+    /// own in-process health probe as the in-rotation proxy. See the `Docker`
     /// settings variant's `traefik_api_url`.
     pub traefik_api_url: Option<String>,
 }
@@ -210,23 +214,74 @@ impl DockerReconciler {
         }
     }
 
-    /// Spawn the reconcile loop on the current Tokio runtime. The loop never
-    /// panics: per-tick and per-project errors are logged and isolated.
-    pub fn spawn(self) {
+    /// Lease name for the Docker reconciler's leader election. Each tick runs
+    /// destructive Docker operations (container create/remove, route changes),
+    /// so — like every other in-process destructive loop (resource GC, project,
+    /// ECR) — only the elected leader may act. In the single-instance standalone
+    /// default this replica is always the leader, so behavior is unchanged.
+    const LEASE_NAME: &'static str = "docker-deployment-reconciler";
+
+    /// Run the reconcile loop under a leader election until `shutdown` is
+    /// cancelled, releasing the lease on exit so a peer replica can take over
+    /// promptly instead of waiting out the lease TTL.
+    ///
+    /// The per-tick destructive work ([`tick`], which drives `reconcile_project`
+    /// / `apply_actions`) is gated on leadership: a non-leader replica skips the
+    /// tick entirely (logged at debug) and never touches the Docker daemon. The
+    /// loop never panics: per-tick and per-project errors are logged and
+    /// isolated.
+    pub async fn run(self, shutdown: CancellationToken) -> Result<()> {
+        let pool = self.db_pool.clone();
+        with_leader_election(
+            pool,
+            Self::LEASE_NAME,
+            Uuid::new_v4(),
+            LEASE_DURATION,
+            shutdown.clone(),
+            move |election| async move {
+                self.reconcile_loop(election, shutdown).await;
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// Drive the periodic reconcile loop, gating the destructive tick behind
+    /// `election.is_leader()`. Returns once `shutdown` is cancelled so the
+    /// caller (`with_leader_election`) releases the lease.
+    async fn reconcile_loop(&self, election: LeaderElection, shutdown: CancellationToken) {
         let interval = std::time::Duration::from_secs(self.config.reconcile_interval_secs.max(1));
-        tokio::spawn(async move {
-            info!(
-                interval_secs = interval.as_secs(),
-                controller_class = %self.config.controller_class,
-                "Docker reconciler started"
-            );
-            loop {
-                if let Err(e) = self.tick().await {
-                    error!("Docker reconcile tick failed: {:?}", e);
-                }
-                tokio::time::sleep(interval).await;
+        info!(
+            interval_secs = interval.as_secs(),
+            controller_class = %self.config.controller_class,
+            "Docker reconciler started"
+        );
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = tokio::time::sleep(interval) => {}
             }
-        });
+            // Only the leader runs the destructive reconcile. A non-leader
+            // replica skips the tick so it never races the leader on the shared
+            // Docker daemon. In the single-instance default this is always true.
+            if !election.is_leader() {
+                debug!("Not the Docker reconciler leader; skipping tick");
+                continue;
+            }
+            if let Err(e) = self.tick().await {
+                error!("Docker reconcile tick failed: {:?}", e);
+            }
+        }
+    }
+
+    /// Spawn [`run`](Self::run) on the current Tokio runtime, returning the
+    /// task handle so the caller can await graceful lease release on shutdown.
+    pub fn spawn(self, shutdown: CancellationToken) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            if let Err(e) = self.run(shutdown).await {
+                error!("Docker reconciler exited with error: {:?}", e);
+            }
+        })
     }
 
     /// Run a single reconcile pass over the projects this controller owns.
@@ -734,10 +789,11 @@ impl DockerReconciler {
                 spec,
                 env_name.as_deref(),
             );
-            // Pin PORT to this container's declared port.
-            if let Some(port) = spec.port {
-                upsert_env(&mut env, "PORT", &port.to_string());
-            }
+            // Pin the controller's mandatory env: this container's declared
+            // PORT, and RISE_CONTAINER (the container's own name) — both
+            // overwrite any user value and fold into `env_hash`. RISE_CONTAINER
+            // mirrors the Kubernetes builder (`resource_builder::build_container`).
+            pin_system_env(&mut env, &spec.name, spec.port);
             // Hash the *entire* final merged env (plain + system + secret), over
             // a deterministically-sorted copy, so drift in any variable forces
             // recreation. PORT is already pinned above so it participates too.
@@ -1301,17 +1357,24 @@ impl DockerReconciler {
                             // the distinct absent-server reason.
                             let api_available =
                                 self.traefik_api.is_some() && server_status.is_some();
-                            let server_up = server_status.as_ref().and_then(|m| {
-                                inspected.as_ref().and_then(|i| i.ip.as_deref()).map(|ip| {
-                                    m.get(&format!("http://{ip}:{port}"))
-                                        .copied()
-                                        .unwrap_or(false)
+                            // `server_status` is only ever `Some` when a Traefik
+                            // client exists (see `fetch_server_status_aggregated`,
+                            // which returns `None` without one), so `server_up`
+                            // can be `Some` only when `api_available` is true.
+                            // When the API isn't available the verdict must defer
+                            // to Rise's own probe (`None`); when it is, pass the
+                            // per-server UP/DOWN (or `None` for an absent server)
+                            // straight through.
+                            let server_up = if api_available {
+                                server_status.as_ref().and_then(|m| {
+                                    inspected.as_ref().and_then(|i| i.ip.as_deref()).map(|ip| {
+                                        m.get(&format!("http://{ip}:{port}"))
+                                            .copied()
+                                            .unwrap_or(false)
+                                    })
                                 })
-                            });
-                            let server_up = match (api_available, server_up) {
-                                (true, Some(up)) => Some(up),
-                                (true, None) => None,
-                                (false, _) => None,
+                            } else {
+                                None
                             };
                             // Pure selection of the readiness verdict. `NeedsProbe`
                             // means the decision depends on Rise's own probe — we

@@ -1433,20 +1433,20 @@ pub enum DeploymentControllerSettings {
         publish_app_ports: bool,
 
         /// How the controller cuts traffic over when a deployment becomes the
-        /// active/routable one for its group. `health-rolling` keeps old and new
-        /// replicas behind one shared Traefik service and lets Traefik's
-        /// per-server health check drain the old ones (rolling overlap);
-        /// `recreate` (the current default) gates the cutover in Rise (single
-        /// active deployment at a time). The default flips to `health-rolling` in
-        /// a later change. Driven by the kebab-case string in YAML, so a
-        /// `${VAR:-recreate}` interpolation deserializes directly into the enum.
+        /// active/routable one for its group. `health-rolling` (the default)
+        /// keeps old and new replicas behind one shared Traefik service and lets
+        /// Traefik's per-server health check drain the old ones (rolling
+        /// overlap); `recreate` gates the cutover in Rise (single active
+        /// deployment at a time). Driven by the kebab-case string in YAML, so a
+        /// `${VAR:-health-rolling}` interpolation deserializes directly into the
+        /// enum.
         #[serde(default = "default_cutover_strategy")]
         cutover_strategy: CutoverStrategy,
 
         /// Base URL of Traefik's API (e.g. `http://rise-traefik:8080` in-network
         /// or `http://localhost:8090` for a host-run dev backend). Used in
-        /// `health-rolling` mode to read per-server health status
-        /// (`loadBalancer.serverStatus`) from Traefik so the old deployment is
+        /// `health-rolling` mode to read per-server health status (the
+        /// top-level `serverStatus` map) from Traefik so the old deployment is
         /// retired only once the new servers are actually in Traefik's rotation.
         /// Optional basic-auth may be embedded in the URL (userinfo). Leave empty
         /// to fall back to Rise's own in-process health probe as the in-rotation

@@ -619,7 +619,7 @@
             },
             "cutover_strategy": {
               "$ref": "#/$defs/CutoverStrategy",
-              "description": "How the controller cuts traffic over when a deployment becomes the\nactive/routable one for its group. `health-rolling` keeps old and new\nreplicas behind one shared Traefik service and lets Traefik's\nper-server health check drain the old ones (rolling overlap);\n`recreate` (the current default) gates the cutover in Rise (single\nactive deployment at a time). The default flips to `health-rolling` in\na later change. Driven by the kebab-case string in YAML, so a\n`${VAR:-recreate}` interpolation deserializes directly into the enum."
+              "description": "How the controller cuts traffic over when a deployment becomes the\nactive/routable one for its group. `health-rolling` (the default)\nkeeps old and new replicas behind one shared Traefik service and lets\nTraefik's per-server health check drain the old ones (rolling\noverlap); `recreate` gates the cutover in Rise (single active\ndeployment at a time). Driven by the kebab-case string in YAML, so a\n`${VAR:-health-rolling}` interpolation deserializes directly into the\nenum."
             },
             "deployment_constraints": {
               "$ref": "#/$defs/DeploymentConstraints",
@@ -710,7 +710,7 @@
             },
             "traefik_api_url": {
               "default": null,
-              "description": "Base URL of Traefik's API (e.g. `http://rise-traefik:8080` in-network\nor `http://localhost:8090` for a host-run dev backend). Used in\n`health-rolling` mode to read per-server health status\n(`loadBalancer.serverStatus`) from Traefik so the old deployment is\nretired only once the new servers are actually in Traefik's rotation.\nOptional basic-auth may be embedded in the URL (userinfo). Leave empty\nto fall back to Rise's own in-process health probe as the in-rotation\nproxy.",
+              "description": "Base URL of Traefik's API (e.g. `http://rise-traefik:8080` in-network\nor `http://localhost:8090` for a host-run dev backend). Used in\n`health-rolling` mode to read per-server health status (the\ntop-level `serverStatus` map) from Traefik so the old deployment is\nretired only once the new servers are actually in Traefik's rotation.\nOptional basic-auth may be embedded in the URL (userinfo). Leave empty\nto fall back to Rise's own in-process health probe as the in-rotation\nproxy.",
               "type": [
                 "string",
                 "null"

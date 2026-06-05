@@ -336,7 +336,12 @@ async fn init_docker_backend(
     resource_store: Arc<dyn rise_resource_store::ResourceStore>,
     db_pool: PgPool,
     public_url: &str,
-) -> Result<(Arc<dyn DeploymentBackend>, bollard::Docker)> {
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<(
+    Arc<dyn DeploymentBackend>,
+    bollard::Docker,
+    tokio::task::JoinHandle<()>,
+)> {
     use crate::server::deployment::controller::docker::reconciler::{
         DockerReconciler, ReconcilerConfig,
     };
@@ -538,10 +543,19 @@ async fn init_docker_backend(
             traefik_api_url: traefik_api_url.clone(),
         },
     );
-    reconciler.spawn();
-    tracing::info!("Docker reconcile loop spawned");
+    // The reconcile loop runs under a leader election (mirrors the resource GC
+    // worker): only the elected leader performs the destructive per-tick Docker
+    // reconcile. In the single-instance standalone default this replica is
+    // always the leader, so behavior is unchanged. The returned handle lets the
+    // caller await graceful lease release on shutdown.
+    let reconciler_handle = reconciler.spawn(shutdown);
+    tracing::info!("Docker reconcile loop spawned (leader-gated)");
 
-    Ok((Arc::new(backend) as Arc<dyn DeploymentBackend>, docker))
+    Ok((
+        Arc::new(backend) as Arc<dyn DeploymentBackend>,
+        docker,
+        reconciler_handle,
+    ))
 }
 
 impl AppState {
@@ -1109,12 +1123,19 @@ impl AppState {
             }
         };
 
+        // Cooperative shutdown signal shared by extension reconciliation loops
+        // and the background controllers (see `run_server`). Cancelling it stops
+        // every leader-elected loop and releases its lease. Created here (before
+        // the deployment backend init) so the Docker reconciler's leader
+        // election can be wired to it.
+        let shutdown = tokio_util::sync::CancellationToken::new();
+
         // Initialize the deployment backend by matching on the configured
         // controller variant. Kubernetes uses the slim Metacontroller-backed
         // backend; Docker connects bollard, builds its own ResourceBuilder, and
-        // spawns the in-process reconcile loop.
+        // spawns the in-process reconcile loop (under a leader election).
         #[cfg(feature = "backend")]
-        let (deployment_backend, docker_client) = {
+        let (deployment_backend, docker_client, docker_reconciler_handle) = {
             use crate::server::settings::DeploymentControllerSettings;
             match &settings.deployment_controller {
                 Some(DeploymentControllerSettings::Kubernetes { .. }) => {
@@ -1127,19 +1148,21 @@ impl AppState {
                     (
                         init_kubernetes_backend(rb, kc, db_pool.clone()).await?,
                         None,
+                        None,
                     )
                 }
                 Some(docker_settings @ DeploymentControllerSettings::Docker { .. }) => {
-                    let (backend, docker) = init_docker_backend(
+                    let (backend, docker, reconciler_handle) = init_docker_backend(
                         docker_settings,
                         registry_provider.clone(),
                         encryption_provider.clone(),
                         resource_store.clone(),
                         db_pool.clone(),
                         &public_url,
+                        shutdown.clone(),
                     )
                     .await?;
-                    (backend, Some(docker))
+                    (backend, Some(docker), Some(reconciler_handle))
                 }
                 None => {
                     return Err(anyhow::anyhow!(
@@ -1174,14 +1197,16 @@ impl AppState {
         #[allow(unused_mut)]
         let mut extension_registry = crate::server::extensions::registry::ExtensionRegistry::new();
 
-        // Cooperative shutdown signal shared by extension reconciliation loops
-        // and the background controllers (see `run_server`). Cancelling it stops
-        // every leader-elected loop and releases its lease.
-        let shutdown = tokio_util::sync::CancellationToken::new();
         // Collect the extension tasks' handles so `run_server` can await their
         // graceful lease release on shutdown. A plain Vec during startup (no lock
         // is held across `start()`); wrapped in Arc<Mutex<…>> in the returned state.
+        // The Docker reconciler's leader-elected loop (if any) is tracked here too
+        // so its lease is released gracefully on shutdown.
         let mut extension_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        #[cfg(feature = "backend")]
+        if let Some(handle) = docker_reconciler_handle {
+            extension_handles.push(handle);
+        }
 
         // Register extensions from configuration
         if let Some(ref extensions_config) = settings.extensions {

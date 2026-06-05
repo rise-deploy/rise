@@ -75,7 +75,7 @@ impl TraefikApiClient {
         let resp = match req.send().await {
             Ok(resp) => resp,
             Err(e) => {
-                tracing::debug!(service = %service, "Traefik API request failed: {e}");
+                tracing::debug!(service = %service, "Traefik API request failed: {e:?}");
                 return None;
             }
         };
@@ -90,7 +90,7 @@ impl TraefikApiClient {
         let body = match resp.text().await {
             Ok(body) => body,
             Err(e) => {
-                tracing::debug!(service = %service, "Traefik API body read failed: {e}");
+                tracing::debug!(service = %service, "Traefik API body read failed: {e:?}");
                 return None;
             }
         };
