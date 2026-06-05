@@ -12,9 +12,17 @@
 
 pub mod client;
 pub mod container_builder;
+pub mod diff;
+pub mod env;
+pub mod health;
 pub mod labels;
+pub mod pod_status;
 pub mod reconciler;
+pub mod rolling;
 pub mod traefik_api;
+
+#[cfg(test)]
+mod test_helpers;
 
 use super::{DeploymentBackend, DeploymentUrls};
 use crate::db::models::{Deployment, Project};
