@@ -7,8 +7,9 @@
 //! (`{service}@docker`, where `{service}` is the group-scoped
 //! `sanitize_router_name({project}-{group}-{container})`). When a `health_check`
 //! is configured, Traefik runs a per-server health check and exposes the result
-//! under `loadBalancer.serverStatus` as a map of server URL
-//! (`http://{ip}:{port}`) → `"UP"`/`"DOWN"`. Reading this lets the reconciler
+//! as a top-level `serverStatus` map of server URL
+//! (`http://{ip}:{port}`) → `"UP"`/`"DOWN"` (sibling of `loadBalancer` in the
+//! v3.x service payload). Reading this lets the reconciler
 //! retire the prior active deployment only once the NEW servers are confirmed
 //! serving (UP), so there is no cutover gap.
 //!
@@ -57,7 +58,7 @@ impl TraefikApiClient {
         })
     }
 
-    /// GET `loadBalancer.serverStatus` for a Traefik service, returning a map of
+    /// GET a Traefik service's `serverStatus`, returning a map of
     /// server URL (`http://{ip}:{port}`) → `true` (UP) / `false` (DOWN).
     ///
     /// `service` is the bare service base name (e.g. `myapp-default-app`); the
@@ -125,12 +126,20 @@ fn split_userinfo(raw: &str) -> Option<(String, Option<(String, String)>)> {
     Some((base, basic_auth))
 }
 
-/// Shape of a Traefik `/api/http/services/{name}` response we care about: only
-/// the `loadBalancer.serverStatus` map. All other fields are ignored. When the
-/// service has no health check configured, `serverStatus` is absent (Traefik
-/// omits it), which deserializes to `None`.
+/// Shape of a Traefik `/api/http/services/{name}` response we care about: the
+/// `serverStatus` map. All other fields are ignored.
+///
+/// In **Traefik v3.x** (verified against v3.7.1, the version the reference stack
+/// pins) `serverStatus` is a **top-level** field of the service object, a sibling
+/// of `loadBalancer` — NOT nested inside it. We read the top-level field and,
+/// for tolerance across versions, fall back to a `loadBalancer.serverStatus`
+/// nesting if a version ever emits it there. When the service has no health
+/// check configured, `serverStatus` is absent (Traefik omits it) and both read
+/// as `None`.
 #[derive(Debug, Deserialize)]
 struct ServicePayload {
+    #[serde(rename = "serverStatus")]
+    server_status: Option<HashMap<String, String>>,
     #[serde(rename = "loadBalancer")]
     load_balancer: Option<LoadBalancerPayload>,
 }
@@ -143,13 +152,17 @@ struct LoadBalancerPayload {
 
 /// Parse a Traefik service JSON payload into a `server URL → UP?` map.
 ///
-/// Returns `None` when the body doesn't parse, or when `serverStatus` is absent
-/// (no health check configured) — both cases mean "no rotation signal available,
-/// fall back". A present-but-empty `serverStatus` yields `Some(empty map)`.
-/// Status strings are matched case-insensitively against `"UP"`.
+/// Prefers the top-level `serverStatus` (Traefik v3.x); falls back to a
+/// `loadBalancer.serverStatus` nesting for version tolerance. Returns `None` when
+/// the body doesn't parse, or when `serverStatus` is absent in both places (no
+/// health check configured) — meaning "no rotation signal available, fall back".
+/// A present-but-empty `serverStatus` yields `Some(empty map)`. Status strings
+/// are matched case-insensitively against `"UP"`.
 fn parse_server_status(body: &str) -> Option<HashMap<String, bool>> {
     let payload: ServicePayload = serde_json::from_str(body).ok()?;
-    let status = payload.load_balancer?.server_status?;
+    let status = payload
+        .server_status
+        .or_else(|| payload.load_balancer.and_then(|lb| lb.server_status))?;
     Some(
         status
             .into_iter()
@@ -164,9 +177,11 @@ mod tests {
 
     #[test]
     fn parses_up_and_down_server_status() {
-        // A representative Traefik `/api/http/services/{name}@docker` payload:
-        // a load-balancer service with a configured health check, so Traefik
-        // reports a per-server status map.
+        // The REAL Traefik v3.7.1 `/api/http/services/{name}@docker` shape:
+        // `serverStatus` is a TOP-LEVEL field of the service object — a sibling
+        // of `loadBalancer`, NOT nested inside it. (Getting this wrong silently
+        // disabled the whole serverStatus gate; keep this fixture matching real
+        // Traefik output.)
         let body = r#"{
             "loadBalancer": {
                 "servers": [
@@ -174,20 +189,36 @@ mod tests {
                     { "url": "http://10.0.0.3:8080" }
                 ],
                 "healthCheck": { "path": "/healthz", "interval": "10s" },
-                "serverStatus": {
-                    "http://10.0.0.2:8080": "UP",
-                    "http://10.0.0.3:8080": "DOWN"
-                }
+                "passHostHeader": true
             },
             "status": "enabled",
             "usedBy": ["myapp-default-app@docker"],
             "name": "myapp-default-app@docker",
-            "provider": "docker"
+            "provider": "docker",
+            "type": "loadbalancer",
+            "serverStatus": {
+                "http://10.0.0.2:8080": "UP",
+                "http://10.0.0.3:8080": "DOWN"
+            }
         }"#;
-        let map = parse_server_status(body).expect("serverStatus present");
+        let map = parse_server_status(body).expect("top-level serverStatus present");
         assert_eq!(map.get("http://10.0.0.2:8080"), Some(&true));
         assert_eq!(map.get("http://10.0.0.3:8080"), Some(&false));
         assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn parses_nested_loadbalancer_server_status_fallback() {
+        // Version tolerance: if a Traefik version ever nests serverStatus under
+        // loadBalancer, we still read it.
+        let body = r#"{
+            "loadBalancer": {
+                "serverStatus": { "http://10.0.0.2:8080": "UP" }
+            },
+            "name": "x@docker"
+        }"#;
+        let map = parse_server_status(body).expect("nested serverStatus present");
+        assert_eq!(map.get("http://10.0.0.2:8080"), Some(&true));
     }
 
     #[test]
@@ -221,16 +252,16 @@ mod tests {
 
     #[test]
     fn empty_server_status_yields_empty_map() {
-        let body = r#"{ "loadBalancer": { "serverStatus": {} } }"#;
+        let body = r#"{ "serverStatus": {} }"#;
         let map = parse_server_status(body).expect("present but empty");
         assert!(map.is_empty());
     }
 
     #[test]
     fn status_match_is_case_insensitive() {
-        let body = r#"{ "loadBalancer": { "serverStatus": {
+        let body = r#"{ "serverStatus": {
             "http://a:1": "up", "http://b:2": "Down"
-        } } }"#;
+        } }"#;
         let map = parse_server_status(body).unwrap();
         assert_eq!(map.get("http://a:1"), Some(&true));
         assert_eq!(map.get("http://b:2"), Some(&false));
