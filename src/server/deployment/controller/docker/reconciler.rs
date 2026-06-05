@@ -15,7 +15,9 @@ use anyhow::Result;
 use bollard::Docker;
 use chrono::Utc;
 use futures::StreamExt;
-use rise_runtime_sync::{with_leader_election, LeaderElection, LEASE_DURATION};
+use rise_runtime_sync::{
+    with_leader_election, LeaderElection, LeaderStatus, LeaseError, LEASE_DURATION,
+};
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -63,6 +65,16 @@ const PRE_PUSHED_TIMEOUT_MINUTES: i64 = 10;
 /// enforced at request time): `MAX_REPLICAS` is the controller's unconditional
 /// backstop and is always `>=` any sane configured limit.
 const MAX_REPLICAS: u32 = 50;
+
+/// Minimum lease validity required before a project's destructive Docker
+/// operations (container create/remove/recreate). Re-verified per project via
+/// `election.ensure_leader_for` so a partitioned former leader can't race a new
+/// leader against the shared Docker daemon for up to the lease TTL. Mirrors the
+/// resource-GC worker's `PER_ROW_MIN_VALIDITY`: comfortably above one project's
+/// apply cost, well below the `LEASE_DURATION / 2` ceiling, so the cached-horizon
+/// fast path (zero DB cost) succeeds essentially always while heartbeats are
+/// healthy.
+const PER_PROJECT_MIN_VALIDITY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Owned controller configuration the reconciler carries.
 #[derive(Clone)]
@@ -227,9 +239,17 @@ impl DockerReconciler {
     ///
     /// The per-tick destructive work ([`tick`], which drives `reconcile_project`
     /// / `apply_actions`) is gated on leadership: a non-leader replica skips the
-    /// tick entirely (logged at debug) and never touches the Docker daemon. The
-    /// loop never panics: per-tick and per-project errors are logged and
-    /// isolated.
+    /// tick entirely (logged at debug) and never touches the Docker daemon, and
+    /// leadership is RE-VERIFIED against the DB before each project's destructive
+    /// actions (see `reconcile_project`) so a partitioned former leader can't
+    /// race the new leader on the shared daemon for up to the lease TTL.
+    ///
+    /// Unlike the resource-GC worker, this loop is NOT panic-supervised: there is
+    /// no inner respawn-after-backoff. It relies on `tick()` being panic-free —
+    /// per-tick and per-project errors are returned as `Result` / isolated and
+    /// logged, never `panic!`/`unwrap` on fallible work — so the loop body cannot
+    /// unwind. (We intentionally cite GC only for the leader-election pattern, not
+    /// for panic supervision, to avoid overstating the parity.)
     pub async fn run(self, shutdown: CancellationToken) -> Result<()> {
         let pool = self.db_pool.clone();
         with_leader_election(
@@ -249,6 +269,12 @@ impl DockerReconciler {
     /// Drive the periodic reconcile loop, gating the destructive tick behind
     /// `election.is_leader()`. Returns once `shutdown` is cancelled so the
     /// caller (`with_leader_election`) releases the lease.
+    ///
+    /// Single-instance behavior is unchanged in steady state (the lone replica is
+    /// always leader). The one observable difference after a restart: the loop
+    /// sleeps `reconcile_interval_secs` before the first tick (the standard
+    /// cadence), so the first reconcile is deferred by up to one interval rather
+    /// than running immediately on startup.
     async fn reconcile_loop(&self, election: LeaderElection, shutdown: CancellationToken) {
         let interval = std::time::Duration::from_secs(self.config.reconcile_interval_secs.max(1));
         info!(
@@ -264,11 +290,13 @@ impl DockerReconciler {
             // Only the leader runs the destructive reconcile. A non-leader
             // replica skips the tick so it never races the leader on the shared
             // Docker daemon. In the single-instance default this is always true.
+            // (The cheap cached `is_leader()` is a fast pre-filter; leadership is
+            // re-verified against the DB per project before any destructive op.)
             if !election.is_leader() {
                 debug!("Not the Docker reconciler leader; skipping tick");
                 continue;
             }
-            if let Err(e) = self.tick().await {
+            if let Err(e) = self.tick(&election).await {
                 error!("Docker reconcile tick failed: {:?}", e);
             }
         }
@@ -291,7 +319,7 @@ impl DockerReconciler {
     /// not match `config.controller_class` belong to a different controller and
     /// are skipped entirely — neither reconciled nor GC'd. This mirrors the K8s
     /// webhook's `enforce_controller_class`.
-    async fn tick(&self) -> Result<()> {
+    async fn tick(&self, election: &LeaderElection) -> Result<()> {
         let projects = db_projects::list(&self.db_pool, None).await?;
         // Memoize org_uid → controller-class for the duration of this tick so N
         // projects sharing one Organization don't each trigger a store read.
@@ -308,11 +336,62 @@ impl DockerReconciler {
                     continue;
                 }
             }
-            if let Err(e) = self.reconcile_project(&project).await {
+            // Re-verify leadership against the DB immediately before this
+            // project's destructive reconcile. A partitioned former leader can
+            // otherwise keep mutating the shared Docker daemon (create/remove)
+            // alongside the new leader for up to the lease TTL. `ensure_leader_for`
+            // short-circuits to a local-clock check when the cached lease horizon
+            // already covers `PER_PROJECT_MIN_VALIDITY` (zero DB cost in steady
+            // state); otherwise it falls back to a DB-verified, DB-blip-tolerant
+            // `verify_leader` round-trip. On confirmed loss we ABORT the remainder
+            // of the tick rather than skipping just this project — the lease is
+            // global, so once it's gone no further project may act this tick.
+            if !self.confirm_leadership(election).await {
+                return Ok(());
+            }
+            if let Err(e) = self.reconcile_project(&project, election).await {
                 error!(project = %project.name, "Failed to reconcile project: {:?}", e);
             }
         }
         Ok(())
+    }
+
+    /// Re-verify leadership before a project's destructive work, mirroring the
+    /// resource-GC worker's per-row `ensure_leader_for` check. Returns `true` to
+    /// proceed, `false` to ABORT the rest of the tick (confirmed loss of the
+    /// global lease). A transient DB blip during verification falls back to the
+    /// cached `is_leader()` flag and continues (same DB-blip-tolerant semantics as
+    /// the sibling controllers), so a brief DB hiccup doesn't stall reconciliation.
+    async fn confirm_leadership(&self, election: &LeaderElection) -> bool {
+        match election.ensure_leader_for(PER_PROJECT_MIN_VALIDITY).await {
+            Ok(LeaderStatus::Leader) => true,
+            Ok(LeaderStatus::NotLeader) => {
+                warn!("Lost Docker reconciler leader lease mid-tick; aborting remaining projects");
+                false
+            }
+            Err(LeaseError::Db(e)) => {
+                if election.is_leader() {
+                    warn!(
+                        error = ?e,
+                        "Leader verification DB blip; falling back to cached flag and continuing"
+                    );
+                    true
+                } else {
+                    warn!(
+                        error = ?e,
+                        "Leader verification failed and cached flag is false; aborting tick"
+                    );
+                    false
+                }
+            }
+            Err(e @ LeaseError::InvalidMinValidity { .. }) => {
+                // Programmer error: PER_PROJECT_MIN_VALIDITY must fit inside
+                // LEASE_DURATION / 2. Surface loudly and abort the tick — we can't
+                // safely confirm leadership.
+                error!(error = ?e, "ensure_leader_for misconfigured; aborting tick");
+                false
+            }
+        }
     }
 
     /// Whether this controller owns `project`, i.e. the project's Organization's
@@ -369,13 +448,20 @@ impl DockerReconciler {
         Ok(class)
     }
 
-    async fn reconcile_project(&self, project: &Project) -> Result<()> {
+    async fn reconcile_project(&self, project: &Project, election: &LeaderElection) -> Result<()> {
         let non_terminal =
             db_deployments::list_non_terminal_for_project(&self.db_pool, project.id).await?;
 
         // 1. Status transitions (port of webhook::perform_status_transitions).
+        // Isolate per-deployment so one transient DB-write error can't abort the
+        // whole project tick — matching the desired-compute and health loops.
         for deployment in &non_terminal {
-            self.perform_status_transition(project, deployment).await?;
+            if let Err(e) = self.perform_status_transition(project, deployment).await {
+                warn!(
+                    deployment_id = %deployment.deployment_id,
+                    "Status transition failed: {:?}", e
+                );
+            }
         }
         // Re-read after transitions so the desired set reflects status changes
         // (e.g. Pushed → Deploying).
@@ -435,6 +521,14 @@ impl DockerReconciler {
         } else {
             actions
         };
+        // Re-verify leadership immediately before the Docker-daemon-destructive
+        // apply: the desired computation + health probing above can take a while,
+        // so the lease may have lapsed since the per-project check in `tick`. If
+        // it can't be confirmed, skip the apply for this project (the health pass
+        // below is read-only).
+        if !self.confirm_leadership(election).await {
+            return Ok(());
+        }
         self.apply_actions(project, &desired, &actions).await?;
 
         // 4. Health → status (probe routable containers, transition).
@@ -1047,7 +1141,20 @@ impl DockerReconciler {
                             );
                             continue;
                         }
-                        self.remove_container(existing_id).await;
+                        // If the old container can't be removed, do NOT create the
+                        // replacement: two same-identity containers would share the
+                        // network alias + Traefik router and both serve (incl. the
+                        // stale image). Skip the create — symmetric with the
+                        // pull-failure guard above — and retry next tick.
+                        if self.remove_container(existing_id).await.is_err() {
+                            error!(
+                                project = %project.name,
+                                container = %name,
+                                "Failed to remove existing container for recreate; \
+                                 skipping create to avoid two same-identity containers"
+                            );
+                            continue;
+                        }
                         // The image was just pulled above, BEFORE the destructive
                         // remove, so skip the pull inside `create_container` — a
                         // transient pull failure must not strand us with the old
@@ -1061,12 +1168,16 @@ impl DockerReconciler {
                         }
                     } else {
                         // No desired match (shouldn't happen for Recreate) — GC.
-                        self.remove_container(existing_id).await;
+                        // Best-effort: failure is already logged in remove_container.
+                        let _ = self.remove_container(existing_id).await;
                     }
                 }
                 ReconcileAction::Remove { id, name } => {
                     debug!(project = %project.name, container = %name, "GC removing container");
-                    self.remove_container(id).await;
+                    // Best-effort GC: failure is logged in remove_container and
+                    // retried next tick (the container stays in the desired-absent
+                    // set), so we don't propagate the error.
+                    let _ = self.remove_container(id).await;
                 }
             }
         }
@@ -1144,7 +1255,12 @@ impl DockerReconciler {
         Ok(())
     }
 
-    async fn remove_container(&self, id: &str) {
+    /// Force-remove a container by id. Returns `Err` on failure (logged here too)
+    /// so the Recreate path can refuse to create the replacement when the old
+    /// container is still present — otherwise two same-identity containers would
+    /// share the alias + router, both serving (incl. the stale image). GC callers
+    /// that don't care about the outcome can ignore the result.
+    async fn remove_container(&self, id: &str) -> Result<()> {
         use bollard::container::RemoveContainerOptions;
         if let Err(e) = self
             .docker
@@ -1158,7 +1274,9 @@ impl DockerReconciler {
             .await
         {
             warn!(container_id = %id, "Failed to remove container: {:?}", e);
+            return Err(anyhow::anyhow!("Failed to remove container {id}: {e:?}"));
         }
+        Ok(())
     }
 
     // ── Health → status ────────────────────────────────────────────────
@@ -1362,16 +1480,19 @@ impl DockerReconciler {
                             // which returns `None` without one), so `server_up`
                             // can be `Some` only when `api_available` is true.
                             // When the API isn't available the verdict must defer
-                            // to Rise's own probe (`None`); when it is, pass the
-                            // per-server UP/DOWN (or `None` for an absent server)
-                            // straight through.
+                            // to Rise's own probe (`None`). When it IS available,
+                            // pass the per-server UP/DOWN straight through, and
+                            // leave `server_up` as `None` when the URL is absent
+                            // from the map (or there's no IP yet) — that ABSENT
+                            // case is distinct from a reported-DOWN server and the
+                            // verdict reports a different reason for each. Do NOT
+                            // collapse absent → `Some(false)`: that would mislabel
+                            // an unknown server as "DOWN".
                             let server_up = if api_available {
                                 server_status.as_ref().and_then(|m| {
-                                    inspected.as_ref().and_then(|i| i.ip.as_deref()).map(|ip| {
-                                        m.get(&format!("http://{ip}:{port}"))
-                                            .copied()
-                                            .unwrap_or(false)
-                                    })
+                                    inspected.as_ref().and_then(|i| i.ip.as_deref()).and_then(
+                                        |ip| m.get(&format!("http://{ip}:{port}")).copied(),
+                                    )
                                 })
                             } else {
                                 None

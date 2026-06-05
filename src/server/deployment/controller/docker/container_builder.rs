@@ -11,7 +11,9 @@ use bollard::container::Config;
 use bollard::secret::{EndpointSettings, HostConfig, RestartPolicy, RestartPolicyNameEnum};
 
 use super::labels::{self, BookkeepingLabels, ForwardAuth, TraefikRoute};
-use crate::server::deployment::quantity::{parse_cpu_millicores, parse_memory_bytes};
+use crate::server::deployment::quantity::{
+    parse_cpu_millicores, parse_cpu_request_limit, parse_memory_bytes, parse_memory_request_limit,
+};
 use crate::server::settings::AccessRequirement;
 
 /// One ingress route attached to a routable container.
@@ -146,8 +148,8 @@ pub struct BuilderConfig<'a> {
     /// default) emits the Traefik load-balancer health-check labels
     /// (`...loadbalancer.healthcheck.*`) for routable containers that have an
     /// effective health path; `Recreate` emits none, so its routing is
-    /// unchanged. In
-    /// `HealthRolling` mode the reconciler gates the Deploying→Healthy cutover on
+    /// unchanged. In `HealthRolling` mode the reconciler gates the
+    /// Deploying→Healthy cutover on
     /// Traefik's `serverStatus` (the old active deployment is retired only once
     /// the new servers are confirmed UP), mirroring with Rise's own probe when no
     /// Traefik API is configured — see `reconciler::reconcile_health` and
@@ -318,13 +320,38 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
         .collect();
 
     // ── Resources ──────────────────────────────────────────────────────
-    // cpu millicores → nano_cpus (1 core = 1e9 nano_cpus = 1000 millicores).
-    let nano_cpus = parse_cpu_millicores(&desired.cpu)
-        .ok()
-        .map(|millicores| (millicores as i64) * 1_000_000);
-    let memory = parse_memory_bytes(&desired.memory)
-        .ok()
-        .map(|bytes| bytes as i64);
+    // A cpu/memory value is either fixed (`"500m"`) or a documented
+    // `request-limit` range (`"500m-1"`). Docker has a single hard cap per
+    // resource (`nano_cpus`/`memory`), so we apply the LIMIT half — mirroring the
+    // K8s builder, which puts the limit half into the pod's `limits` (the hard
+    // cap) while the request half feeds `requests` (scheduling only). Using the
+    // single-value parsers here would reject any range and silently drop the cap,
+    // leaving the container UNBOUNDED while K8s caps it — a strict-parity break.
+    // On a genuine parse failure we `warn!` (with the offending value) instead of
+    // silently dropping the limit.
+    let nano_cpus = match parse_cpu_request_limit(&desired.cpu) {
+        // cpu millicores → nano_cpus (1 core = 1e9 nano_cpus = 1000 millicores).
+        Ok((_req, lim)) => parse_cpu_millicores(&lim)
+            .ok()
+            .map(|millicores| (millicores as i64) * 1_000_000),
+        Err(e) => {
+            tracing::warn!(
+                cpu = %desired.cpu,
+                "Failed to parse CPU quantity; leaving nano_cpus unset (no hard cap): {e:?}"
+            );
+            None
+        }
+    };
+    let memory = match parse_memory_request_limit(&desired.memory) {
+        Ok((_req, lim)) => parse_memory_bytes(&lim).ok().map(|bytes| bytes as i64),
+        Err(e) => {
+            tracing::warn!(
+                memory = %desired.memory,
+                "Failed to parse memory quantity; leaving memory unset (no hard cap): {e:?}"
+            );
+            None
+        }
+    };
 
     // ── Health check ────────────────────────────────────────────────────
     // We deliberately inject *no* Docker HEALTHCHECK. The reconciler's HTTP
@@ -441,6 +468,13 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
     BuiltContainer { name, config }
 }
 
+/// Maximum length of the human-readable (sanitized) portion of a Traefik
+/// router/service base name, before the `-{hex8}` injective suffix is appended.
+/// Comfortably inside Traefik/Docker name limits even with the suffix and any
+/// per-route `-{idx}` / `-auth` decorations [`group_service_name`] /
+/// [`render_traefik_labels_for`] add on top.
+const MAX_SERVICE_BASE_LEN: usize = 48;
+
 /// Group-scoped Traefik router/service BASE name for a (project, group,
 /// container), deployment-id-FREE so ALL routers/services/middlewares of a
 /// (project, group, container) are named IDENTICALLY across every deployment of
@@ -449,11 +483,50 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
 /// setting up health-driven rolling overlap. Mirrors the K8s group
 /// Service/Ingress naming, which is likewise deployment-id-free.
 ///
+/// **Injective.** [`sanitize_router_name`] is lossy — it lowercases and
+/// collapses every run of non-`[a-z0-9]` to a single `-`, so distinct tuples
+/// that differ only in separators or case (e.g. `("a.b", …)` vs `("a-b", …)`,
+/// or `Foo` vs `foo`) would otherwise collapse to the SAME router/service name.
+/// Two projects pooled behind one Traefik load balancer is a multi-tenant
+/// boundary break (one project's labels could suppress the other's forwardAuth).
+/// To guarantee distinct tuples get distinct names, we append a short stable
+/// hash of the STRUCTURED `(project, group, container)` tuple — the first 8 hex
+/// chars of a SHA-256 over a NUL-separated (collision-free, since NUL can't
+/// appear in any field) encoding of the three fields. The human-readable base
+/// is length-capped first so the total stays well within name limits.
+///
 /// Shared by [`render_traefik_labels_for`] (which stamps the labels) and the
 /// reconciler's `serverStatus` lookup (which queries `{service}@docker`) so the
 /// two can't drift on how the service is named.
 pub fn group_service_base(project: &str, deployment_group: &str, container: &str) -> String {
-    labels::sanitize_router_name(&format!("{project}-{deployment_group}-{container}"))
+    use sha2::{Digest, Sha256};
+    let mut sanitized =
+        labels::sanitize_router_name(&format!("{project}-{deployment_group}-{container}"));
+    sanitized.truncate(MAX_SERVICE_BASE_LEN);
+    // Trim any trailing `-` left by truncation so the base reads cleanly before
+    // the suffix join (and never yields a `--` run).
+    let base = sanitized.trim_end_matches('-');
+
+    // Hash the STRUCTURED tuple (not the lossy sanitized string) with NUL field
+    // separators, so two tuples collide here only if they are byte-identical.
+    // 64 bits of suffix (16 hex chars): this name is a multi-tenant boundary and
+    // an attacker controls their own project/group/container names, so a shorter
+    // suffix would be grindable into a deliberate collision with a victim's
+    // service; 64 bits makes that infeasible.
+    let mut hasher = Sha256::new();
+    hasher.update(project.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(deployment_group.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(container.as_bytes());
+    let digest = hasher.finalize();
+    let suffix: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+
+    if base.is_empty() {
+        suffix
+    } else {
+        format!("{base}-{suffix}")
+    }
 }
 
 /// Per-route Traefik service/router name for route `route_idx` of a container
@@ -738,6 +811,76 @@ mod tests {
     }
 
     #[test]
+    fn group_service_base_is_injective_across_separator_and_case_collisions() {
+        // `sanitize_router_name` is lossy: `a.b` and `a-b` both sanitize to
+        // `a-b`, and `Foo`/`foo` both lowercase to `foo`. The injective hash
+        // suffix (over the STRUCTURED tuple) must keep the two distinct so two
+        // projects are never pooled behind one Traefik load balancer.
+        assert_ne!(
+            group_service_base("a.b", "default", "app"),
+            group_service_base("a-b", "default", "app"),
+            "tuples differing only in separators must not collide"
+        );
+        assert_ne!(
+            group_service_base("Foo", "default", "app"),
+            group_service_base("foo", "default", "app"),
+            "tuples differing only in case must not collide"
+        );
+        // The collision also can't be shifted across field boundaries: the NUL
+        // separator means `("ab", "c", …)` and `("a", "bc", …)` are distinct.
+        assert_ne!(
+            group_service_base("ab", "c", "app"),
+            group_service_base("a", "bc", "app"),
+            "field boundaries must be hash-significant (NUL separator)"
+        );
+    }
+
+    #[test]
+    fn group_service_base_is_stable_across_calls() {
+        // The same tuple must always yield the same name so the labels and the
+        // reconciler's serverStatus lookup agree across ticks/processes.
+        assert_eq!(
+            group_service_base("myapp", "default", "app"),
+            group_service_base("myapp", "default", "app"),
+        );
+    }
+
+    #[test]
+    fn group_service_base_normal_tuple_is_readable_and_valid() {
+        // A normal tuple stays human-readable (the sanitized base is preserved)
+        // and the whole name is a valid Traefik router/service name
+        // (`[a-z0-9-]`, no leading/trailing `-`, comfortably under the limit).
+        let base = group_service_base("myapp", "default", "app");
+        assert!(
+            base.starts_with("myapp-default-app-"),
+            "readable base preserved: {base}"
+        );
+        assert!(
+            base.len() <= MAX_SERVICE_BASE_LEN + 1 + 16,
+            "name stays within limits: {base} ({} chars)",
+            base.len()
+        );
+        assert!(
+            base.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+            "only [a-z0-9-] allowed: {base}"
+        );
+        assert!(
+            !base.starts_with('-') && !base.ends_with('-'),
+            "no leading/trailing dash: {base}"
+        );
+        // A pathologically long project still produces a valid, capped name with
+        // the injective suffix intact.
+        let long = group_service_base(&"p".repeat(200), "default", "app");
+        assert!(
+            long.len() <= MAX_SERVICE_BASE_LEN + 1 + 16,
+            "long tuple is length-capped: {long} ({} chars)",
+            long.len()
+        );
+        assert!(!long.ends_with('-') && !long.contains("--"));
+    }
+
+    #[test]
     fn deterministic_name() {
         let n1 = container_name("rise", "myapp", "default", "20260101-120000", "app", 0, 1);
         let n2 = container_name("rise", "myapp", "default", "20260101-120000", "app", 0, 1);
@@ -941,9 +1084,12 @@ mod tests {
             "replicas must render identical Traefik labels (shared router+service)"
         );
         // Spot-check the shared service/router name is group-scoped (replica- and
-        // deployment-id-free).
-        assert!(t0.contains_key("traefik.http.services.myapp-default-app.loadbalancer.server.port"));
-        assert!(t0.contains_key("traefik.http.routers.myapp-default-app.rule"));
+        // deployment-id-free). The base carries the injective `-{hex8}` suffix.
+        let base = group_service_base("myapp", "default", "app");
+        assert!(t0.contains_key(&format!(
+            "traefik.http.services.{base}.loadbalancer.server.port"
+        )));
+        assert!(t0.contains_key(&format!("traefik.http.routers.{base}.rule")));
         assert!(
             !t0.keys().any(|k| k.contains("-r0") || k.contains("-r1")),
             "Traefik router/service names must not include a replica index"
@@ -980,8 +1126,11 @@ mod tests {
             "different deployments of a group must share one Traefik router+service"
         );
         let t = traefik_of(&d1);
-        assert!(t.contains_key("traefik.http.routers.myapp-default-app.rule"));
-        assert!(t.contains_key("traefik.http.services.myapp-default-app.loadbalancer.server.port"));
+        let base = group_service_base("myapp", "default", "app");
+        assert!(t.contains_key(&format!("traefik.http.routers.{base}.rule")));
+        assert!(t.contains_key(&format!(
+            "traefik.http.services.{base}.loadbalancer.server.port"
+        )));
     }
 
     #[test]
@@ -1013,15 +1162,18 @@ mod tests {
             labels.get("traefik.enable").map(String::as_str),
             Some("true")
         );
+        let base = group_service_base("myapp", "default", "app");
         assert_eq!(
             labels
-                .get("traefik.http.routers.myapp-default-app.rule")
+                .get(&format!("traefik.http.routers.{base}.rule"))
                 .map(String::as_str),
             Some("Host(`myapp.rise.dev`)")
         );
         assert_eq!(
             labels
-                .get("traefik.http.services.myapp-default-app.loadbalancer.server.port")
+                .get(&format!(
+                    "traefik.http.services.{base}.loadbalancer.server.port"
+                ))
                 .map(String::as_str),
             Some("8080")
         );
@@ -1040,6 +1192,49 @@ mod tests {
             hc.restart_policy.as_ref().and_then(|r| r.name),
             Some(RestartPolicyNameEnum::UNLESS_STOPPED)
         );
+    }
+
+    #[test]
+    fn resource_range_applies_the_limit_half_as_hard_cap() {
+        // A `request-limit` range must set the Docker hard cap (nano_cpus/memory)
+        // from the LIMIT half — mirroring the K8s builder, which feeds the limit
+        // half into the pod's `limits`. The single-value parsers reject a range,
+        // so without this the container would run UNBOUNDED (a parity break).
+        let mut desired = single_container();
+        desired.cpu = "500m-1".to_string();
+        desired.memory = "256Mi-1Gi".to_string();
+        let built = build_container(&desired, &test_cfg());
+        let hc = built.config.host_config.as_ref().unwrap();
+        // Limit half: cpu `1` core → 1000 millicores → 1e9 nano_cpus.
+        assert_eq!(hc.nano_cpus, Some(1_000_000_000));
+        // Limit half: memory `1Gi` → bytes.
+        assert_eq!(hc.memory, Some(1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn resource_bare_value_still_applies_as_cap() {
+        // A bare (fixed) value still parses and caps both resources (request ==
+        // limit), so the common single-value case is unaffected by range support.
+        let mut desired = single_container();
+        desired.cpu = "250m".to_string();
+        desired.memory = "128Mi".to_string();
+        let built = build_container(&desired, &test_cfg());
+        let hc = built.config.host_config.as_ref().unwrap();
+        assert_eq!(hc.nano_cpus, Some(250_000_000));
+        assert_eq!(hc.memory, Some(128 * 1024 * 1024));
+    }
+
+    #[test]
+    fn resource_unparseable_value_leaves_cap_unset() {
+        // A genuinely unparseable value leaves the cap unset (logged via warn!)
+        // rather than panicking or applying a bogus cap.
+        let mut desired = single_container();
+        desired.cpu = "not-a-cpu".to_string();
+        desired.memory = "garbage".to_string();
+        let built = build_container(&desired, &test_cfg());
+        let hc = built.config.host_config.as_ref().unwrap();
+        assert_eq!(hc.nano_cpus, None);
+        assert_eq!(hc.memory, None);
     }
 
     #[test]
@@ -1353,15 +1548,18 @@ mod tests {
         let built = build_container(&desired, &test_cfg());
         let labels = built.config.labels.as_ref().unwrap();
         // Two routers, index suffixed. Longest prefix (/api/v1) sorts first → -0.
+        let base = group_service_base("myapp", "default", "api");
+        let r0 = group_service_name(&base, 0, 2);
+        let r1 = group_service_name(&base, 1, 2);
         assert_eq!(
             labels
-                .get("traefik.http.routers.myapp-default-api-0.rule")
+                .get(&format!("traefik.http.routers.{r0}.rule"))
                 .map(String::as_str),
             Some("Host(`myapp.rise.dev`) && PathPrefix(`/api/v1`)")
         );
         assert_eq!(
             labels
-                .get("traefik.http.routers.myapp-default-api-1.rule")
+                .get(&format!("traefik.http.routers.{r1}.rule"))
                 .map(String::as_str),
             Some("Host(`myapp.rise.dev`)")
         );
@@ -1374,13 +1572,14 @@ mod tests {
         let desired = single_container();
         let built = build_container(&desired, &test_cfg());
         let labels = built.config.labels.unwrap();
+        let base = group_service_base("myapp", "default", "app");
         // The label set carries exactly one loadbalancer service for the base.
-        assert!(
-            labels.contains_key("traefik.http.services.myapp-default-app.loadbalancer.server.port")
-        );
+        assert!(labels.contains_key(&format!(
+            "traefik.http.services.{base}.loadbalancer.server.port"
+        )));
 
         let names = group_service_names(&desired);
-        assert_eq!(names, vec!["myapp-default-app".to_string()]);
+        assert_eq!(names, vec![base.clone()]);
         // Every derived name corresponds to a service the labels actually emit.
         for name in &names {
             assert!(
@@ -1413,21 +1612,24 @@ mod tests {
         let labels = built.config.labels.unwrap();
 
         // Labels emit per-route services -0 (longest prefix /api/v1) and -1 (/).
-        assert!(labels
-            .contains_key("traefik.http.services.myapp-default-api-0.loadbalancer.server.port"));
-        assert!(labels
-            .contains_key("traefik.http.services.myapp-default-api-1.loadbalancer.server.port"));
+        let base = group_service_base("myapp", "default", "api");
+        let svc0 = group_service_name(&base, 0, 2);
+        let svc1 = group_service_name(&base, 1, 2);
+        assert!(labels.contains_key(&format!(
+            "traefik.http.services.{svc0}.loadbalancer.server.port"
+        )));
+        assert!(labels.contains_key(&format!(
+            "traefik.http.services.{svc1}.loadbalancer.server.port"
+        )));
         // And NO bare-base service (that name 404s in the Traefik API).
-        assert!(!labels
-            .contains_key("traefik.http.services.myapp-default-api.loadbalancer.server.port"));
+        assert!(!labels.contains_key(&format!(
+            "traefik.http.services.{base}.loadbalancer.server.port"
+        )));
 
         let names = group_service_names(&desired);
         assert_eq!(
             names,
-            vec![
-                "myapp-default-api-0".to_string(),
-                "myapp-default-api-1".to_string()
-            ],
+            vec![svc0.clone(), svc1.clone()],
             "derived names must match the per-route service labels (longest prefix first)"
         );
         for name in &names {
@@ -1462,15 +1664,16 @@ mod tests {
         let desired = single_container();
         let built = build_container(&desired, &cfg);
         let labels = built.config.labels.as_ref().unwrap();
+        let base = group_service_base("myapp", "default", "app");
         assert_eq!(
             labels
-                .get("traefik.http.routers.myapp-default-app.tls")
+                .get(&format!("traefik.http.routers.{base}.tls"))
                 .map(String::as_str),
             Some("true")
         );
         assert_eq!(
             labels
-                .get("traefik.http.routers.myapp-default-app.tls.certresolver")
+                .get(&format!("traefik.http.routers.{base}.tls.certresolver"))
                 .map(String::as_str),
             Some("le")
         );
@@ -1496,7 +1699,7 @@ mod tests {
         desired.access_class = "private".to_string();
         let built = build_container(&desired, &cfg);
         let labels = built.config.labels.as_ref().unwrap();
-        let r = "myapp-default-app";
+        let r = group_service_base("myapp", "default", "app");
         assert_eq!(
             labels
                 .get(&format!(
@@ -1573,7 +1776,7 @@ mod tests {
         desired.access_class = "ghost".to_string();
         let built = build_container(&desired, &cfg);
         let labels = built.config.labels.as_ref().unwrap();
-        let r = "myapp-default-app";
+        let r = group_service_base("myapp", "default", "app");
         // forwardAuth middleware IS stamped (route is protected, not open).
         assert_eq!(
             labels
@@ -1643,7 +1846,7 @@ mod tests {
         desired.health_check_timeout_secs = None;
         let built = build_container(&desired, &cfg);
         let labels = built.config.labels.as_ref().unwrap();
-        let svc = "myapp-default-app";
+        let svc = group_service_base("myapp", "default", "app");
         assert_eq!(
             labels
                 .get(&format!(

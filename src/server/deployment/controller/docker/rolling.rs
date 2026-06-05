@@ -566,9 +566,12 @@ mod tests {
         }];
         // A single-route container uses the bare base name — exactly what the
         // labels stamp (`group_service_names` over the matching DesiredContainer).
+        // The base carries the injective hash suffix `group_service_base`
+        // appends, so derive it the same way rather than hardcoding the hash.
+        let base = container_builder::group_service_base("myapp", "default", "app");
         assert_eq!(
             service_names_for_spec("myapp", "default", &spec, &routes),
-            vec!["myapp-default-app".to_string()]
+            vec![base]
         );
     }
 
@@ -603,11 +606,14 @@ mod tests {
         // Per-route services, longest path-prefix first (-0 = /api/v1, -1 = /),
         // matching the renderer's `{base}-{idx}` services for a multi-route
         // container. The bare base is NOT queried (it 404s in the Traefik API).
+        // The base carries the injective hash suffix, so derive the per-route
+        // names via `group_service_name` rather than hardcoding the hash.
+        let base = container_builder::group_service_base("myapp", "default", "api");
         assert_eq!(
             service_names_for_spec("myapp", "default", &spec, &routes),
             vec![
-                "myapp-default-api-0".to_string(),
-                "myapp-default-api-1".to_string()
+                container_builder::group_service_name(&base, 0, 2),
+                container_builder::group_service_name(&base, 1, 2),
             ]
         );
     }
