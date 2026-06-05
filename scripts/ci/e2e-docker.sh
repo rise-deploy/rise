@@ -472,14 +472,17 @@ if ! grep -qi "Hostname:" "${cut_body}"; then
 fi
 log "Cutover project reachable (200, whoami output)"
 
-# Derive the group-scoped Traefik service name the controller uses for the
-# serverStatus lookup: sanitize("{project}-{group}-{container}") with the
-# defaults group=default, container=app. Cross-check it against a running app
-# container's actual `traefik.http.services.*.loadbalancer.server.port` label so
-# the test fails loudly if the controller's naming ever diverges from this
-# derivation.
-CUT_SVC="$(sanitize_router_name "${CUT_PROJECT}-default-app")"
-log "Derived group-scoped Traefik service: ${CUT_SVC}@docker"
+# The controller's group-scoped Traefik service name is
+# `{cap(sanitize("{project}-{group}-{container}"),48)}-{hex16}`, where the
+# 16-hex suffix is a stable hash of the structured tuple that keeps the name
+# injective across tenants (see `group_service_base`). The hash makes the name
+# impractical to re-derive in shell, so we read the AUTHORITATIVE service name
+# straight off a running app container's
+# `traefik.http.services.<svc>.loadbalancer.server.port` label and use that for
+# the serverStatus query. We still guard against naming drift by asserting it
+# matches the readable, sanitized base (defaults group=default, container=app)
+# followed by a 16-hex suffix.
+CUT_SVC_BASE="$(sanitize_router_name "${CUT_PROJECT}-default-app")"
 
 cut_label_svc=""
 for _ in $(seq 1 30); do
@@ -502,11 +505,14 @@ if [[ -z "${cut_label_svc}" ]]; then
   log "ERROR: could not read the Traefik service name off the cutover app container labels"
   exit 1
 fi
-if [[ "${cut_label_svc}" != "${CUT_SVC}" ]]; then
-  log "ERROR: derived service '${CUT_SVC}' != container-label service '${cut_label_svc}'"
+# Drift guard: the readable base (CUT_PROJECT is short, so it isn't truncated)
+# plus the injective 16-hex suffix the controller appends.
+if [[ ! "${cut_label_svc}" =~ ^${CUT_SVC_BASE}-[0-9a-f]{16}$ ]]; then
+  log "ERROR: container-label service '${cut_label_svc}' does not match expected '${CUT_SVC_BASE}-<hex16>'"
   exit 1
 fi
-log "Container label service matches the derived name (${cut_label_svc})"
+CUT_SVC="${cut_label_svc}"
+log "Group-scoped Traefik service (from container label): ${CUT_SVC}@docker"
 
 log "Asserting Traefik API exposes a non-empty TOP-LEVEL serverStatus for ${CUT_SVC}@docker"
 # THE core regression assertion: the serverStatus gate signal must exist and be
