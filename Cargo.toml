@@ -97,6 +97,8 @@ backend = [
     "dep:kube",
     "dep:k8s-openapi",
     "dep:rustls",
+    # Docker runtime (Traefik routing)
+    "dep:bollard",
     # AWS services (former "aws" feature)
     "dep:aws-config",
     "dep:aws-sdk-ecr",
@@ -189,6 +191,9 @@ aws-sdk-sts = { version = "1.80", default-features = false, features = ["default
 kube = { version = "3", features = ["client", "derive"], optional = true }
 k8s-openapi = { version = "0.27", features = ["v1_31", "schemars"], optional = true }
 rustls = { version = "0.23", features = ["ring"], optional = true }
+
+# Docker runtime feature dependency (Traefik routing)
+bollard = { version = "0.18", optional = true }
 
 # Snowflake feature dependencies
 snowflake-connector-rs = { version = "0.9", optional = true }

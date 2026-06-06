@@ -252,21 +252,36 @@ cargo test --workspace --all-features  # Unit tests (all crates)
 
 The `mise run lint` task runs: `cargo all-features check`, `cargo all-features clippy -- -D warnings`, `cargo fmt --check`, `mise sqlx:check`, and `helm lint helm/rise`.
 
-## Future Enhancements
+## Deployment Backend Parity (STRICT)
 
-### Ingress Authentication (Kubernetes Controller)
+Rise supports multiple deployment backends (currently **Kubernetes** and
+**Docker**). They are equal first-class citizens, and we aim for **semantic
+feature parity and correctness across all of them**.
 
-The project `visibility` field (Public/Private) is currently stored but not enforced at the ingress level. This field is intended for ingress-level authentication:
+**The rule:** any feature configurable through a public Rise API surface
+(`rise.toml`, project/deployment settings, environment variables, the HTTP API)
+must, *where technically possible*, be supported by **every** backend, and must
+behave the **same way** on each. A gap that is a fundamental limitation of a
+backend (e.g. a single-host Docker daemon has no horizontal scale-out or
+per-workload network policy) is acceptable and must be documented; a gap that is
+merely unimplemented is a **parity bug** to track and close.
 
-- **Public projects**: The ingress will serve the application without requiring authentication
-- **Private projects**: The ingress will require user authentication AND verify project access authorization before serving the application
+**How to apply it:**
 
-**Current State**: The visibility field is stored in the database and returned via the API, but does NOT affect:
-- API authorization (all projects require ownership/team membership to access via API)
-- Ingress routing (authentication not yet configured in ingress annotations)
+- **Do not implicitly plan the cross-backend work.** When a feature is requested
+  or implemented for one backend, do **not** silently extend it to the others.
+  Implement what was asked.
+- **Do raise the flag — explicitly.** During **planning** and **review**, call
+  out the parity implication: "this is configurable via <public API> and is now
+  supported on <backend A> but not <backend B> — is that an intentional
+  limitation or a parity gap to track?" Surface it; let the human decide.
+- **Keep the feature matrix current.** The source of truth is the
+  [Deployment Backends](docs/engineering/src/content/docs/deployment-backends.md)
+  overview page (`/operator-docs/deployment-backends/`). Any change that adds or
+  alters a backend feature must update the matrix in the **same** change — add a
+  row for a new feature, flip a cell when support changes, and note the reason
+  for any `⚠️`/`❌`.
 
-**Implementation Plan**:
-- The Kubernetes controller will configure ingress resources based on the visibility field
-- Public projects will have standard ingress rules
-- Private projects will have OAuth2 proxy or similar authentication middleware configured in the ingress
-- The authentication layer will validate both user identity AND project access permissions before proxying requests to the application
+## Ingress Authentication
+
+Ingress-level authentication is driven by each project's **access class** (`access_requirement`: `None` / `Authenticated` / `Member`), not the legacy `visibility` field. The Kubernetes controller is fully wired: for non-`None` access requirements it stamps nginx auth annotations (`nginx.ingress.kubernetes.io/auth-url` → `/api/v1/auth/ingress`, `auth-signin`, `auth-response-headers`) — see `ResourceBuilder::build_ingress_annotations` in `src/server/deployment/resource_builder.rs`. The subrequest is served by the `ingress_auth` handler in `src/server/auth/handlers.rs`, which validates the Rise JWT session cookie, then enforces `Authenticated` (any logged-in user) or `Member` (project owner/team member) and returns `X-Auth-Request-Email`/`X-Auth-Request-User` on success.

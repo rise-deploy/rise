@@ -151,13 +151,20 @@ async fn run_inner(
 }
 
 /// Resolve the `controller_class_name` for the configured deployment
-/// controller. The Kubernetes controller carries an explicit field; other
-/// backends are treated as having no controller class (the Organization's
+/// controller. Both the Kubernetes and Docker controllers carry an explicit
+/// `controller_class_name` field, so for either backend we stamp the
+/// Organization's `spec.deploymentControllerClass` with that class (so the
+/// reconciler's ownership check matches). Other or absent controllers are
+/// treated as having no controller class (the Organization's
 /// `spec.deploymentControllerClass` is left unset, which means "no
 /// controller manages this org's deployments").
 fn controller_class_name_for_bootstrap(settings: &Settings) -> Option<&str> {
     match &settings.deployment_controller {
         Some(DeploymentControllerSettings::Kubernetes {
+            controller_class_name,
+            ..
+        }) => Some(controller_class_name.as_str()),
+        Some(DeploymentControllerSettings::Docker {
             controller_class_name,
             ..
         }) => Some(controller_class_name.as_str()),
@@ -518,6 +525,28 @@ mod tests {
     fn build_organization_spec_without_controller_class() {
         let spec = build_organization_spec("Default", None);
         assert!(spec.deployment_controller_class.is_none());
+    }
+
+    #[test]
+    fn controller_class_name_for_bootstrap_returns_docker_class() {
+        // The Docker backend must stamp the Organization's controller class
+        // (symmetric with Kubernetes), otherwise the Docker reconciler's
+        // ownership check never matches and deployments stall at "Pushed".
+        let mut settings = test_settings();
+        settings.deployment_controller = Some(
+            serde_json::from_value(serde_json::json!({
+                "type": "docker",
+                "production_ingress_url_template": "http://{project_name}.localhost",
+                "traefik_network": "rise",
+                "controller_class_name": "my-docker",
+            }))
+            .expect("docker deployment_controller settings"),
+        );
+
+        assert_eq!(
+            controller_class_name_for_bootstrap(&settings),
+            Some("my-docker")
+        );
     }
 
     #[test]

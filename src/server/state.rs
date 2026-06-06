@@ -104,6 +104,11 @@ pub struct AppState {
     pub oauth_rate_limiter: Arc<crate::server::rate_limit::OAuthRateLimiter>,
     pub access_classes:
         Arc<std::collections::HashMap<String, crate::server::settings::AccessClass>>,
+    /// Browser-facing base URL used to build the login redirect when the
+    /// `ingress_auth` handler runs in Traefik mode (`signin_redirect=1`).
+    /// Sourced from the Docker controller's `auth_signin_url` (falling back to
+    /// `public_url`); for other backends it is just `public_url`.
+    pub signin_base_url: String,
     /// Production ingress URL template (for custom domain validation)
     pub production_ingress_url_template: Option<String>,
     /// Staging ingress URL template (for custom domain validation)
@@ -249,6 +254,308 @@ async fn init_kubernetes_backend(
     tracing::info!("Kubernetes deployment backend initialized and connection tested");
 
     Ok(Arc::new(backend) as Arc<dyn DeploymentBackend>)
+}
+
+/// Extract the bare host from an `auth_backend_url` like `http://rise:3000`
+/// (→ `rise`). Strips an optional `scheme://`, then a trailing `:port` and any
+/// path. Returns `None` for an empty/host-less value. Kept dependency-free (no
+/// `url` crate, which is `cli`-feature-gated) since the value is a simple
+/// internal service URL.
+#[cfg(feature = "backend")]
+fn backend_host_from_url(auth_backend_url: &str) -> Option<String> {
+    let trimmed = auth_backend_url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Drop scheme.
+    let after_scheme = match trimmed.split_once("://") {
+        Some((_scheme, rest)) => rest,
+        None => trimmed,
+    };
+    // Authority ends at the first '/'.
+    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+    // Strip userinfo if present.
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    // Strip the port. Naive on bracketed IPv6 literals, which we don't expect
+    // for an internal service URL.
+    let host = host_port.split(':').next().unwrap_or(host_port);
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
+/// LOCAL-DEV helper: resolve the Rise backend's IP on the shared Docker network
+/// by extracting the host from `auth_backend_url` (e.g. `http://rise:3000` →
+/// `rise`) and looking it up via the system resolver from inside this container.
+///
+/// Inside the rise-backend container, Docker DNS resolves the backend's service
+/// name (`rise`) to its address on `traefik_network` — exactly the IP app
+/// containers must alias the public issuer host to. Returns `None` on any parse
+/// or resolution failure so the caller can skip injection gracefully.
+#[cfg(feature = "backend")]
+async fn resolve_backend_ip(auth_backend_url: &str) -> Option<String> {
+    let host = backend_host_from_url(auth_backend_url)?;
+
+    // Resolve via the system resolver. Append a dummy port so `lookup_host`
+    // accepts the input; we only care about the IP. Prefer the first IPv4
+    // address (Docker's default bridge networks are IPv4).
+    let lookup = tokio::net::lookup_host((host.as_str(), 0)).await;
+    match lookup {
+        Ok(addrs) => {
+            let mut first: Option<String> = None;
+            for addr in addrs {
+                let ip = addr.ip();
+                if ip.is_ipv4() {
+                    return Some(ip.to_string());
+                }
+                first.get_or_insert_with(|| ip.to_string());
+            }
+            first
+        }
+        Err(e) => {
+            tracing::debug!(host = %host, "DNS lookup for backend IP failed: {:?}", e);
+            None
+        }
+    }
+}
+
+/// Initialize the Docker deployment backend.
+///
+/// Builds a `ResourceBuilder` from the Docker variant's URL templates (the
+/// Kubernetes-only fields are left empty/None), connects bollard, constructs the
+/// `DockerBackend`, tests connectivity, and spawns the in-process
+/// `DockerReconciler`. Returns the backend plus the bollard client so the log
+/// backend can reuse it.
+#[cfg(feature = "backend")]
+async fn init_docker_backend(
+    settings: &crate::server::settings::DeploymentControllerSettings,
+    registry_provider: Arc<dyn RegistryProvider>,
+    encryption_provider: Option<Arc<dyn EncryptionProvider>>,
+    resource_store: Arc<dyn rise_resource_store::ResourceStore>,
+    db_pool: PgPool,
+    public_url: &str,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<(
+    Arc<dyn DeploymentBackend>,
+    bollard::Docker,
+    tokio::task::JoinHandle<()>,
+)> {
+    use crate::server::deployment::controller::docker::reconciler::{
+        DockerReconciler, ReconcilerConfig,
+    };
+    use crate::server::deployment::controller::{docker::client, DockerBackend};
+    use crate::server::deployment::resource_builder::ResourceBuilder;
+    use crate::server::settings::DeploymentControllerSettings;
+
+    let DeploymentControllerSettings::Docker {
+        docker_host,
+        production_ingress_url_template,
+        staging_ingress_url_template,
+        environment_ingress_url_template,
+        ingress_port,
+        ingress_schema,
+        traefik_network,
+        traefik_entrypoint,
+        traefik_certresolver,
+        label_namespace,
+        container_prefix,
+        controller_class_name,
+        reconcile_interval_secs,
+        health_probes,
+        access_classes,
+        auth_backend_url,
+        app_backend_host_aliases,
+        app_backend_ip: app_backend_ip_override,
+        publish_app_ports,
+        cutover_strategy,
+        traefik_api_url,
+        ..
+    } = settings
+    else {
+        return Err(anyhow::anyhow!(
+            "init_docker_backend called with a non-Docker controller variant"
+        ));
+    };
+
+    // ResourceBuilder for the Docker runtime. The Kubernetes-only fields are
+    // empty/None — `compute_*_urls` and `primary_ingress_hosts` only read the
+    // URL templates, schema, port and registry provider.
+    let resource_builder = Arc::new(ResourceBuilder {
+        production_ingress_url_template: production_ingress_url_template.clone(),
+        staging_ingress_url_template: staging_ingress_url_template.clone(),
+        environment_ingress_url_template: environment_ingress_url_template.clone(),
+        ingress_port: *ingress_port,
+        ingress_schema: ingress_schema.clone(),
+        registry_provider: registry_provider.clone(),
+        auth_backend_url: String::new(),
+        auth_signin_url: String::new(),
+        backend_address: None,
+        namespace_labels: HashMap::new(),
+        namespace_annotations: HashMap::new(),
+        ingress_annotations: HashMap::new(),
+        ingress_tls_secret_name: None,
+        custom_domain_tls_mode: crate::server::settings::CustomDomainTlsMode::PerDomain,
+        custom_domain_ingress_annotations: HashMap::new(),
+        node_selector: HashMap::new(),
+        image_pull_secret_name: None,
+        access_classes: HashMap::new(),
+        host_aliases: HashMap::new(),
+        extra_service_token_audiences: HashMap::new(),
+        use_default_service_account_for_production: true,
+        network_policy: crate::server::settings::NetworkPolicyConfig {
+            ingress: Vec::new(),
+            egress: None,
+        },
+        pod_security_enabled: true,
+        health_probes: health_probes.clone(),
+    });
+
+    // Connect bollard.
+    let docker = client::connect(docker_host.as_deref())?;
+
+    let backend = DockerBackend::new(docker.clone(), resource_builder.clone(), db_pool.clone());
+    backend.test_connection().await?;
+    tracing::info!("Docker deployment backend initialized and connection tested");
+
+    // Spawn the in-process reconciler.
+    let health_path = health_probes
+        .as_ref()
+        .map(|hp| hp.path.clone())
+        .unwrap_or_else(|| "/".to_string());
+    // The Docker backend keeps secret env vars as plain KEY=VALUE entries on the
+    // container (visible via `docker inspect`) — an accepted, documented caveat.
+    // Surface it once at startup so operators are aware.
+    tracing::warn!(
+        "Docker deployment backend: secret environment variables are stored as plain \
+         container env and are visible via `docker inspect`. This is an accepted caveat \
+         of the Docker runtime; use the Kubernetes backend for secret isolation."
+    );
+
+    // Flatten the configured access classes to name → access requirement for
+    // the container builder, which only needs the requirement to decide whether
+    // to stamp Traefik forwardAuth middleware. `None`-valued entries (used to
+    // delete inherited classes) are skipped.
+    let access_requirements: HashMap<String, crate::server::settings::AccessRequirement> =
+        access_classes
+            .iter()
+            .filter_map(|(name, ac)| {
+                ac.as_ref()
+                    .map(|ac| (name.clone(), ac.access_requirement.clone()))
+            })
+            .collect();
+
+    // Fail CLOSED: refuse to start if any non-`None` access class is configured
+    // but forwardAuth cannot be wired because the internal backend URL is
+    // missing. Otherwise such projects would be served publicly with no auth.
+    let offending = crate::server::settings::docker_access_classes_missing_auth_backend_url(
+        access_classes,
+        auth_backend_url,
+    );
+    if !offending.is_empty() {
+        anyhow::bail!(
+            "Docker deployment backend: access class(es) [{}] require authentication \
+             (Authenticated/Member) but `deployment_controller.auth_backend_url` is empty. \
+             Traefik forwardAuth cannot be enforced, so those projects would be served \
+             publicly. Set `deployment_controller.auth_backend_url` (e.g. http://rise:3000) \
+             to enable ingress authentication, or change the access requirement to None.",
+            offending.join(", ")
+        );
+    }
+
+    // LOCAL-DEV ONLY: resolve the backend's IP on the shared Traefik network so
+    // the reconciler can stamp `extra_hosts` (alias → backend IP) on managed app
+    // containers. We resolve the host from `auth_backend_url` (e.g. `rise` in
+    // `http://rise:3000`) via DNS from inside this container — that yields the
+    // backend's address on `traefik_network`. Empty alias list (the default /
+    // production) → skip resolution entirely so no override is injected.
+    //
+    // Resolution failure is non-fatal: we log and leave the IP unset, which
+    // disables injection (apps fall back to whatever the alias host resolves to)
+    // rather than crashing the backend at startup.
+    let app_backend_host_aliases = app_backend_host_aliases.clone();
+    let app_backend_ip = if app_backend_host_aliases.is_empty() {
+        None
+    } else if let Some(ip) = app_backend_ip_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        // Explicit override (e.g. `host-gateway` for `mise br docker`): used
+        // verbatim, skipping DNS resolution. The override can name a value that
+        // is not DNS-resolvable from the host (e.g. `host-gateway`,
+        // `host.docker.internal`), which Docker resolves per container.
+        tracing::info!(
+            backend_ip = %ip,
+            aliases = ?app_backend_host_aliases,
+            "Using explicit app_backend_ip override for app container host aliases (local dev)"
+        );
+        Some(ip.to_string())
+    } else {
+        match resolve_backend_ip(auth_backend_url).await {
+            Some(ip) => {
+                tracing::info!(
+                    backend_ip = %ip,
+                    aliases = ?app_backend_host_aliases,
+                    "Resolved Rise backend IP for app container host aliases (local dev)"
+                );
+                Some(ip)
+            }
+            None => {
+                tracing::warn!(
+                    auth_backend_url = %auth_backend_url,
+                    aliases = ?app_backend_host_aliases,
+                    "Could not resolve Rise backend IP for app container host aliases; \
+                     skipping extra_hosts injection (apps may fail to reach the issuer in local dev)"
+                );
+                None
+            }
+        }
+    };
+
+    let reconciler = DockerReconciler::new(
+        docker.clone(),
+        db_pool,
+        resource_builder,
+        registry_provider,
+        encryption_provider,
+        resource_store,
+        ReconcilerConfig {
+            controller_class: controller_class_name.clone(),
+            label_namespace: label_namespace.clone(),
+            container_prefix: container_prefix.clone(),
+            traefik_network: traefik_network.clone(),
+            traefik_entrypoint: traefik_entrypoint.clone(),
+            traefik_certresolver:
+                crate::server::deployment::controller::docker::labels::normalize_certresolver(
+                    traefik_certresolver.clone(),
+                ),
+            reconcile_interval_secs: *reconcile_interval_secs,
+            health_path,
+            public_url: public_url.to_string(),
+            auth_backend_url: auth_backend_url.clone(),
+            access_classes: access_requirements,
+            app_backend_host_aliases,
+            app_backend_ip,
+            publish_app_ports: *publish_app_ports,
+            cutover_strategy: *cutover_strategy,
+            traefik_api_url: traefik_api_url.clone(),
+        },
+    );
+    // The reconcile loop runs under a leader election (mirrors the resource GC
+    // worker): only the elected leader performs the destructive per-tick Docker
+    // reconcile. In the single-instance standalone default this replica is
+    // always the leader, so behavior is unchanged. The returned handle lets the
+    // caller await graceful lease release on shutdown.
+    let reconciler_handle = reconciler.spawn(shutdown);
+    tracing::info!("Docker reconcile loop spawned (leader-gated)");
+
+    Ok((
+        Arc::new(backend) as Arc<dyn DeploymentBackend>,
+        docker,
+        reconciler_handle,
+    ))
 }
 
 impl AppState {
@@ -790,27 +1097,99 @@ impl AppState {
                     *identity_token_ttl_seconds,
                     Some(controller_class_name.clone()),
                 )
+            } else if let Some(DeploymentControllerSettings::Docker {
+                deployment_defaults,
+                deployment_constraints,
+                identity_token_ttl_seconds,
+                controller_class_name,
+                ..
+            }) = &settings.deployment_controller
+            {
+                // Docker mode: no K8s ResourceBuilder / kube client / webhook,
+                // but surface the deployment defaults/constraints/class so
+                // request validation and identity-token minting behave the same.
+                (
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(deployment_defaults.clone()),
+                    Some(deployment_constraints.clone()),
+                    *identity_token_ttl_seconds,
+                    Some(controller_class_name.clone()),
+                )
             } else {
                 (None, None, None, None, None, None, 3600, None)
             }
         };
 
-        // Initialize deployment backend (slim wrapper around ResourceBuilder + kube client)
+        // Cooperative shutdown signal shared by extension reconciliation loops
+        // and the background controllers (see `run_server`). Cancelling it stops
+        // every leader-elected loop and releases its lease. Created here (before
+        // the deployment backend init) so the Docker reconciler's leader
+        // election can be wired to it.
+        let shutdown = tokio_util::sync::CancellationToken::new();
+
+        // Initialize the deployment backend by matching on the configured
+        // controller variant. Kubernetes uses the slim Metacontroller-backed
+        // backend; Docker connects bollard, builds its own ResourceBuilder, and
+        // spawns the in-process reconcile loop (under a leader election).
         #[cfg(feature = "backend")]
-        let deployment_backend = {
-            let rb = resource_builder.clone().ok_or_else(|| {
-                anyhow::anyhow!("Deployment controller not configured. Please add deployment_controller configuration with type: kubernetes")
-            })?;
-            let kc = webhook_kube_client
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("Kubernetes client not initialized"))?;
-            init_kubernetes_backend(rb, kc, db_pool.clone()).await?
+        let (deployment_backend, docker_client, docker_reconciler_handle) = {
+            use crate::server::settings::DeploymentControllerSettings;
+            match &settings.deployment_controller {
+                Some(DeploymentControllerSettings::Kubernetes { .. }) => {
+                    let rb = resource_builder.clone().ok_or_else(|| {
+                        anyhow::anyhow!("Deployment controller not configured. Please add deployment_controller configuration with type: kubernetes")
+                    })?;
+                    let kc = webhook_kube_client
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("Kubernetes client not initialized"))?;
+                    (
+                        init_kubernetes_backend(rb, kc, db_pool.clone()).await?,
+                        None,
+                        None,
+                    )
+                }
+                Some(docker_settings @ DeploymentControllerSettings::Docker { .. }) => {
+                    let (backend, docker, reconciler_handle) = init_docker_backend(
+                        docker_settings,
+                        registry_provider.clone(),
+                        encryption_provider.clone(),
+                        resource_store.clone(),
+                        db_pool.clone(),
+                        &public_url,
+                        shutdown.clone(),
+                    )
+                    .await?;
+                    (backend, Some(docker), Some(reconciler_handle))
+                }
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "Deployment controller not configured. Please add a deployment_controller \
+                         configuration block (type: kubernetes or type: docker)."
+                    ));
+                }
+            }
         };
 
+        // Surface the Docker controller's configured `label_namespace` so the
+        // Docker log backend resolves containers by the same namespaced labels
+        // the reconciler stamps (rather than a hardcoded literal).
+        #[cfg(feature = "backend")]
+        let docker_label_namespace = match &settings.deployment_controller {
+            Some(crate::server::settings::DeploymentControllerSettings::Docker {
+                label_namespace,
+                ..
+            }) => Some(label_namespace.clone()),
+            _ => None,
+        };
         #[cfg(feature = "backend")]
         let runtime_log_backend = crate::server::deployment::logs::init_runtime_log_backend(
             &settings.deployment_logs,
             webhook_kube_client.clone(),
+            docker_client.clone(),
+            docker_label_namespace.as_deref(),
         )
         .await?;
 
@@ -818,14 +1197,16 @@ impl AppState {
         #[allow(unused_mut)]
         let mut extension_registry = crate::server::extensions::registry::ExtensionRegistry::new();
 
-        // Cooperative shutdown signal shared by extension reconciliation loops
-        // and the background controllers (see `run_server`). Cancelling it stops
-        // every leader-elected loop and releases its lease.
-        let shutdown = tokio_util::sync::CancellationToken::new();
         // Collect the extension tasks' handles so `run_server` can await their
         // graceful lease release on shutdown. A plain Vec during startup (no lock
         // is held across `start()`); wrapped in Arc<Mutex<…>> in the returned state.
+        // The Docker reconciler's leader-elected loop (if any) is tracked here too
+        // so its lease is released gracefully on shutdown.
         let mut extension_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        #[cfg(feature = "backend")]
+        if let Some(handle) = docker_reconciler_handle {
+            extension_handles.push(handle);
+        }
 
         // Register extensions from configuration
         if let Some(ref extensions_config) = settings.extensions {
@@ -1100,6 +1481,7 @@ impl AppState {
             environment_ingress_url_template,
             ingress_schema,
             ingress_port,
+            signin_base_url,
         ) = if let Some(crate::server::settings::DeploymentControllerSettings::Kubernetes {
             access_classes,
             production_ingress_url_template,
@@ -1121,6 +1503,41 @@ impl AppState {
                 environment_ingress_url_template.clone(),
                 ingress_schema.clone(),
                 *ingress_port,
+                // K8s uses nginx auth-signin (built in ResourceBuilder), so the
+                // handler's Traefik signin-redirect mode is never engaged; default
+                // to public_url for completeness.
+                public_url.clone(),
+            )
+        } else if let Some(crate::server::settings::DeploymentControllerSettings::Docker {
+            access_classes,
+            production_ingress_url_template,
+            staging_ingress_url_template,
+            environment_ingress_url_template,
+            ingress_schema,
+            ingress_port,
+            auth_signin_url,
+            ..
+        }) = &settings.deployment_controller
+        {
+            let filtered: std::collections::HashMap<_, _> = access_classes
+                .iter()
+                .filter_map(|(k, v)| v.as_ref().map(|ac| (k.clone(), ac.clone())))
+                .collect();
+            // Browser-facing signin base URL for the Traefik forwardAuth redirect.
+            // Falls back to public_url when auth_signin_url is empty.
+            let signin_base = if auth_signin_url.trim().is_empty() {
+                public_url.clone()
+            } else {
+                auth_signin_url.clone()
+            };
+            (
+                Arc::new(filtered),
+                Some(production_ingress_url_template.clone()),
+                staging_ingress_url_template.clone(),
+                environment_ingress_url_template.clone(),
+                ingress_schema.clone(),
+                *ingress_port,
+                signin_base,
             )
         } else {
             (
@@ -1130,6 +1547,7 @@ impl AppState {
                 None,
                 "https".to_string(),
                 None,
+                public_url.clone(),
             )
         };
 
@@ -1167,6 +1585,7 @@ impl AppState {
             encrypt_rate_limiter,
             oauth_rate_limiter,
             access_classes,
+            signin_base_url,
             production_ingress_url_template,
             staging_ingress_url_template,
             environment_ingress_url_template,
@@ -1190,5 +1609,47 @@ impl AppState {
                 settings.quickstart.as_ref(),
             )),
         })
+    }
+}
+
+#[cfg(all(test, feature = "backend"))]
+mod backend_host_tests {
+    use super::backend_host_from_url;
+
+    #[test]
+    fn parses_scheme_host_port() {
+        assert_eq!(
+            backend_host_from_url("http://rise:3000").as_deref(),
+            Some("rise")
+        );
+    }
+
+    #[test]
+    fn parses_https_and_path() {
+        assert_eq!(
+            backend_host_from_url("https://rise.example.com:8443/api").as_deref(),
+            Some("rise.example.com")
+        );
+    }
+
+    #[test]
+    fn parses_bare_host_port() {
+        assert_eq!(backend_host_from_url("rise:3000").as_deref(), Some("rise"));
+        assert_eq!(backend_host_from_url("rise").as_deref(), Some("rise"));
+    }
+
+    #[test]
+    fn strips_userinfo() {
+        assert_eq!(
+            backend_host_from_url("http://user:pass@rise:3000").as_deref(),
+            Some("rise")
+        );
+    }
+
+    #[test]
+    fn empty_or_hostless_is_none() {
+        assert_eq!(backend_host_from_url(""), None);
+        assert_eq!(backend_host_from_url("   "), None);
+        assert_eq!(backend_host_from_url("http://"), None);
     }
 }

@@ -30,7 +30,7 @@ encryption:
   key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" # Generate with: openssl rand -base64 32
 
 auth:
-  issuer: "http://localhost:5556/dex"
+  issuer: "http://rise-dex:5556/dex"
   client_id: "rise-backend"
   client_secret: "rise-backend-secret"
   admin_users:
@@ -61,6 +61,10 @@ deployment_logs:
   type: "loki"
   url: "${RISE_LOKI_URL:-http://localhost:3100}"
   retention_hint: "168h"
+# When using the Docker controller, switch logs to the Docker backend
+# (the kubernetes/loki log backends need their respective clients):
+# deployment_logs:
+#   type: "docker"
 
 # JFrog Artifactory registry (via Vault):
 # registry:
@@ -88,6 +92,31 @@ deployment_logs:
 #     type: "direct"
 #     jfrog_url: "http://localhost:3082"
 #     admin_token: "${JFROG_ADMIN_TOKEN}"
+
+# Docker deployment controller (single-host, Traefik-routed) — alternative to the
+# Kubernetes controller below. Bring up Traefik with `docker compose up -d traefik`,
+# then comment out the kubernetes block and uncomment this one.
+# deployment_controller:
+#   type: "docker"
+#   traefik_network: "rise_default"
+#   traefik_entrypoint: "web"
+#   production_ingress_url_template: "{project_name}.rise.localhost"
+#   staging_ingress_url_template: "{deployment_group}--{project_name}.rise.localhost"
+#   environment_ingress_url_template: "{environment}--{project_name}.rise.localhost"
+#   ingress_schema: "http"
+#   ingress_port: 80
+#   reconcile_interval_secs: 5
+#   controller_class_name: "default"
+#   # access_classes is optional; it defaults to a single permissive "public"
+#   # class. The Docker runtime enforces non-None access classes via Traefik
+#   # forwardAuth: the controller stamps forwardAuth middleware on each
+#   # non-`None` app router pointing at /api/v1/auth/ingress, which requires
+#   # deployment_controller.auth_backend_url to be set. Startup fails closed if a
+#   # non-`None` access class is configured without auth_backend_url.
+#   # The controller stamps Traefik labels on each app container, e.g. for project
+#   # `my-app` (group `default`, container `app`, app port 8080):
+#   #   traefik.http.routers.my-app-default-app.rule=Host(`my-app.rise.localhost`)
+#   #   traefik.http.services.my-app-default-app.loadbalancer.server.port=8080
 
 deployment_controller:
   type: "kubernetes"

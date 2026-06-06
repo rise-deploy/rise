@@ -38,8 +38,24 @@ In-flight PRs with operator impact (not yet merged):
   [`AUTH_TOKEN_EXCHANGE_PLAN.md`](https://github.com/rise-deploy/rise/blob/develop/AUTH_TOKEN_EXCHANGE_PLAN.md).
 - **Config change — Docker deployment backend** ([#358](https://github.com/rise-deploy/rise/pull/358)).
   Selectable via `deployment_controller.type = "docker"`. Single-host; Kubernetes
-  remains the default. The deployment-backend feature matrix and Docker pages ship
-  with this PR.
+  remains the default, so existing installs are unaffected unless they opt in.
+  Operator-relevant settings on the Docker controller (env-driven; the shipped
+  standalone compose sets working defaults):
+  - `cutover_strategy` (default `health-rolling`) — a new deployment rolls over via
+    Traefik health checks, with old and new overlapping in one load-balanced
+    service (a rolling update, vs. Kubernetes' atomic blue/green); `recreate` keeps
+    a single-cutover model. Probing is **opt-in**: no `health_check` means
+    ready-when-running; a set `health_check` is a **2xx–3xx** check.
+  - `traefik_api_url` (default in-network `http://rise-traefik:8080`) — the rolling
+    gate reads Traefik's `serverStatus`. The standalone Traefik enables its API
+    internally (`--api.insecure=true`, port **not** published). If you run your own
+    Traefik, expose its API to the backend over the internal network (optionally
+    with basic-auth embedded in the URL), or leave it unset to fall back to Rise's
+    own probe.
+  - Replicas: the Docker config raises `deployment_constraints.max_replicas` to 10
+    (`RISE_MAX_REPLICAS`); the controller additionally hard-caps at 50.
+  The deployment-backend feature matrix, the Docker operator pages, and the
+  cutover/health-check docs ship with this PR.
 - **Action required — reserved `RISE_` env-var prefix** ([#355](https://github.com/rise-deploy/rise/pull/355)).
   User-supplied environment variable keys beginning with `RISE_` are rejected at
   the API and at deploy time (project env vars and per-container

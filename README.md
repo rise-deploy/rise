@@ -56,31 +56,70 @@ Note that this does not include server code unless you use `--features cli,serve
 direnv allow
 # or else use `. .envrc`
 
-# Install development tools
+# Install development tools (both paths need this)
 mise install
-
-# One-stop dev environment setup (cross-platform: Linux + macOS).
-# Configures /etc/hosts (sudo), Docker insecure registries, and brings up
-# a local cluster (minikube by default; k3s on Linux). Run interactively
-# so the sudo prompt works.
-mise setup
-
-# Terminal (1): Start the frontend
-mise frontend:dev
-
-# Terminal (2): Start the backend (will also start required containers with docker compose)
-mise backend:run
 ```
 
-`mise setup` invokes `./scripts/dev-setup.sh`. You can also run individual steps directly: `./scripts/dev-setup.sh hosts`, `docker`, `minikube`, `k3s`, or `preflight` (hosts + docker only).
+Rise supports two deployment backends, and you can run either one locally as a
+first-class dev environment. Choose the backend that fits what you're working
+on — both are fully supported.
+
+#### Option A — Kubernetes backend
+
+The original backend. Pick it to work on the Kubernetes controller / Helm /
+metacontroller, or if you already run a cluster.
+
+```bash
+# One-stop dev setup (cross-platform: Linux + macOS). Configures /etc/hosts
+# (sudo), Docker insecure registries, and brings up a local cluster (minikube
+# by default; k3s on Linux). Run interactively so the sudo prompt works.
+mise setup
+
+# Terminal (1): frontend
+mise frontend:dev
+
+# Terminal (2): host backend against the Kubernetes dev config (starts deps)
+mise backend:run   # alias: mise br
+```
+
+`mise setup` invokes `./scripts/dev-setup.sh`; you can run individual steps
+with `mise setup <hosts|docker|minikube|k3s|preflight>` (mise passes the
+subcommand through, or run `./scripts/dev-setup.sh <...>` directly). Apps are
+served at `*.rise.local` (the `/etc/hosts` + host-IP wiring that `mise setup`
+provisions).
+
+#### Option B — Docker backend
+
+A lighter single-host setup with no cluster; great for backend/frontend feature
+work and for the Docker deployment backend itself.
+
+```bash
+# Adds only the /etc/hosts aliases (incl. rise-dex); no cluster, no minikube.
+mise setup hosts
+
+# Runs the compose support services + Rise on the host with the Docker
+# backend (reuses config/docker.yaml; no Rise image build).
+mise backend:run docker   # alias: mise br docker
+
+# Optionally, in another terminal:
+mise frontend:dev
+```
+
+Apps are served at `*.rise.localhost` (loopback per RFC 6761 — no `/etc/hosts`
+edits needed). For the full reference see the operator guide's
+[Local development](https://niklasrosenstein.github.io/rise/operator-docs/docker/#local-development-run-rise-on-the-host-no-image)
+section.
+
+### Services and credentials
 
 Services will be available at:
 - **Rise server**: http://localhost:3000
 - **PostgreSQL**: localhost:5432
-- **Minikube HTTP/HTTPS Ingress**: http://localhost:8080, https://localhost:8443
 - **Vite.js Frontend Server**: http://localhost:5731
+- **Minikube HTTP/HTTPS Ingress** (Kubernetes path only): http://localhost:8080, https://localhost:8443
 
-You may also need to add entries for deployed projects to `/etc/hosts`:
+On the Kubernetes path you may also need to add entries for deployed projects to
+`/etc/hosts` (the Docker path uses `*.rise.localhost`, which needs no edits):
 
 ```
 127.0.0.1 {project}.rise.local # One for each Rise-deployed project you want to access
@@ -96,13 +135,31 @@ You may also need to add entries for deployed projects to `/etc/hosts`:
 # Build the CLI
 cargo build
 # `rise` binary should be available from direnv, otherwise use `cargo run`
+```
 
-rise login # Add --url http://rise.local:3000 if you've logged into another backend before
+On the **Kubernetes backend**:
+
+```bash
+rise login --url http://rise.local:3000
 
 cd examples/hello-world
 rise project create hello-world
 rise deploy
+# Reachable at http://hello-world.rise.local
 ```
+
+On the **Docker backend**:
+
+```bash
+rise login --url http://rise.localhost:3000
+
+cd examples/hello-world
+rise project create hello-world
+rise deploy
+# Reachable at http://hello-world.rise.localhost
+```
+
+(Add `--url ...` to `rise login` to switch between backends you've used before.)
 
 ## Releasing
 

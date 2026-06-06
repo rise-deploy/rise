@@ -32,7 +32,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 OS=$(uname -s)
 
-REQUIRED_HOSTS=(rise-registry rise-jfrog rise.local)
+REQUIRED_HOSTS=(rise-registry rise-jfrog rise.local rise-dex)
 REQUIRED_REGISTRIES='["rise-registry:5000","localhost:5000","127.0.0.1:5000","rise-jfrog:8082","localhost:3082"]'
 
 # Marker lines bracketing the section of /etc/hosts this script owns. Anything
@@ -106,6 +106,7 @@ setup_hosts() {
     echo "127.0.0.1 rise-registry"
     echo "127.0.0.1 rise-jfrog"
     echo "127.0.0.1 rise.local"
+    echo "127.0.0.1 rise-dex"
     # Guard the expansion because bash 3.2 (the system bash on macOS) errors
     # on "${arr[@]}" under set -u when arr is empty.
     if (( ${#ingress_hosts[@]} > 0 )); then
@@ -171,7 +172,7 @@ strip_managed_block_and_legacy() {
       }
       if ($0 == begin) { in_block = 1; next }
       for (i = 1; i <= NF; i++) {
-        if ($i == "rise-registry" || $i == "rise-jfrog" || $i == "rise.local") next
+        if ($i == "rise-registry" || $i == "rise-jfrog" || $i == "rise.local" || $i == "rise-dex") next
       }
       print
     }

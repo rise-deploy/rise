@@ -1,0 +1,27 @@
+# Traefik file-provider dynamic config for the DEV stack (mise dev docker / mise br docker).
+#
+# Routes /.rise/* on EVERY host (including app hosts like
+# hello-world.rise.localhost) to the Rise backend that runs on the HOST, so the
+# login / ingress-auth endpoints (e.g. /.rise/auth/signin) are served by the
+# backend and set the session cookie on the app's own host. priority=1000 beats
+# the app routers' default (rule-length) priority so /.rise wins on an app host.
+#
+# The standalone compose does this with a label on the `rise-backend` CONTAINER
+# (traefik.http.routers.rise-dotrise...). The dev stack has no backend container
+# — Rise runs on the host — so a Docker-provider label can't express it; this
+# file-provider router targets the host backend by URL instead. `host.docker.internal`
+# resolves to the host (Docker Desktop natively; Linux via the traefik service's
+# `extra_hosts: host.docker.internal:host-gateway`).
+http:
+  routers:
+    rise-dotrise:
+      rule: "PathPrefix(`/.rise`)"
+      entryPoints:
+        - web
+      priority: 1000
+      service: rise-dotrise
+  services:
+    rise-dotrise:
+      loadBalancer:
+        servers:
+          - url: "http://host.docker.internal:3000"

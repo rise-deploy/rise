@@ -1,0 +1,32 @@
+# =============================================================================
+# DEMO IdP overlay — exposes the bundled Dex publicly at dex.${RISE_DOMAIN}.
+#
+#   docker compose -f docker-compose.standalone.yaml \
+#                  -f docker-compose.standalone.demo-idp.yaml up -d
+#
+# OPT-IN ONLY. The bundled Dex serves dev/dex/config.yaml, which ships STATIC
+# DEMO PASSWORDS (admin@example.com / "password", etc.) that grant a Rise admin
+# session. The production base file (docker-compose.standalone.yaml) therefore
+# does NOT publish Dex to the internet by default — the backend reaches it
+# internally over rise_default (rise-dex:5556), but no public router exists.
+#
+# Layering this overlay publishes Dex at https://dex.${RISE_DOMAIN} (TLS via the
+# `le` ACME resolver) so a browser can complete the OAuth login when DEX_ISSUER
+# points there. Use it ONLY for a throwaway demo/evaluation stack. For anything
+# real, replace Dex with a proper IdP (set auth.issuer / auth.client_id /
+# auth.client_secret to the external provider) and do NOT layer this file — see
+# the operator docs ("Production caveat").
+# =============================================================================
+
+services:
+  dex:
+    # Expose Dex publicly at dex.${RISE_DOMAIN} (TLS) so browsers can reach the
+    # OIDC issuer when DEX_ISSUER points there.
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.rise-dex.rule=Host(`dex.${RISE_DOMAIN}`)"
+      - "traefik.http.routers.rise-dex.entrypoints=websecure"
+      - "traefik.http.routers.rise-dex.tls=true"
+      - "traefik.http.routers.rise-dex.tls.certresolver=le"
+      - "traefik.http.services.rise-dex.loadbalancer.server.port=5556"
+      - "traefik.docker.network=rise_default"

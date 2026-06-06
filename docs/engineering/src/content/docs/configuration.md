@@ -392,6 +392,67 @@ expiration_interval_secs = 60
 secret_refresh_interval_secs = 3600
 ```
 
+### Deployment Controller (Docker)
+
+As an alternative to the Kubernetes controller, the Docker controller deploys apps as
+containers on a single Docker host, routed by Traefik. Select it with
+`deployment_controller.type: "docker"`. Supported fields:
+
+- `type: "docker"` — required discriminator.
+- `traefik_network` — Docker network Traefik watches (e.g. `rise_default`).
+- `traefik_entrypoint` — Traefik entrypoint name (default `web`).
+- `traefik_certresolver?` — optional Traefik certresolver for TLS (omit for plain HTTP).
+- `production_ingress_url_template` — host template for production deployments.
+- `staging_ingress_url_template?` / `environment_ingress_url_template?` — host
+  templates for staging / per-environment deployments.
+- `ingress_schema` — `http` or `https` (default `https`).
+- `ingress_port?` — external port apps are served on (e.g. `80` locally).
+- `controller_class_name` — controller ownership class (default `default`).
+- `reconcile_interval_secs` — in-process reconcile loop interval in seconds (default `5`).
+- `cutover_strategy` — how traffic cuts over when a deployment becomes active:
+  `health-rolling` (default) or `recreate`.
+- `traefik_api_url?` — base URL of Traefik's API, read in `health-rolling` mode to
+  drain old replicas via the top-level `serverStatus` map.
+- `deployment_constraints.max_replicas` — upper bound on requested replicas (default `10`).
+  The Docker controller additionally clamps every request to a hard backstop of `50`
+  regardless of this value, so raising it above `50` silently clamps (with only a
+  server-side log).
+- `access_classes` — ingress access classes (keyed by identifier) defining
+  authentication levels, mirroring the Kubernetes variant.
+- `auth_backend_url` — internal URL Traefik uses to reach the Rise backend for the
+  forwardAuth subrequest; required when any access class is `Authenticated`/`Member`.
+- `auth_signin_url` — browser-facing base URL for the login redirect (falls back to
+  the server `public_url` when empty).
+- `publish_app_ports` — **dev-only.** Publish each app container's HTTP port to a
+  random `127.0.0.1` host port so a host-run backend can health-probe it directly.
+- `app_backend_host_aliases` / `app_backend_ip` — **dev-only** host-alias knobs that
+  inject `extra_hosts` so app containers can reach the Rise backend at the issuer host.
+
+See the [Docker operator guide](/operator-docs/docker/) for the full controller
+configuration, including TLS/ACME and the rolling-cutover gate.
+
+Kubernetes-only fields (namespace prefix, ingress annotations, network policies, host
+aliases, node selectors, etc.) do not apply to the Docker variant.
+
+Example:
+
+```yaml
+deployment_controller:
+  type: "docker"
+  traefik_network: "rise_default"
+  traefik_entrypoint: "web"
+  production_ingress_url_template: "{project_name}.rise.localhost"
+  staging_ingress_url_template: "{deployment_group}--{project_name}.rise.localhost"
+  environment_ingress_url_template: "{environment}--{project_name}.rise.localhost"
+  ingress_schema: "http"
+  ingress_port: 80
+  reconcile_interval_secs: 5
+  controller_class_name: "default"
+```
+
+The configuration schema is regenerated via `mise run config:schema:generate`, and CI
+verifies it is up to date on every PR.
+
 ## Validation
 
 The backend validates configuration on startup:

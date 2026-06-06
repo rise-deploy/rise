@@ -12,12 +12,19 @@ use std::time::Duration;
 pub struct SsrfConfig {
     /// Allow private/loopback IPs in SSRF-validated URLs.
     /// WARNING: Only enable for local development. Never enable in production.
-    #[serde(default)]
+    // Accepts a native YAML boolean or a string ("true"/"false") via
+    // deserialize_bool_flexible so it can be driven by an env-interpolated config
+    // value (e.g. allow_private_networks: "${RISE_SSRF_ALLOW_PRIVATE:-false}"),
+    // which the loader resolves to a string before deserialization. Kept as `//`
+    // (not `///`) so the generated JSON schema description is unchanged.
+    #[serde(default, deserialize_with = "deserialize_bool_flexible")]
+    #[schemars(with = "bool")]
     pub allow_private_networks: bool,
 
     /// Allow HTTP (non-TLS) URLs in SSRF-validated requests.
     /// WARNING: Only enable for local development. Never enable in production.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bool_flexible")]
+    #[schemars(with = "bool")]
     pub allow_http: bool,
 
     /// Hostnames that are allowed to resolve to private/internal IP addresses.
@@ -39,6 +46,38 @@ impl SsrfConfig {
     /// Whether HTTP is allowed (either via `allow_http` or `allow_private_networks`).
     fn http_allowed(&self) -> bool {
         self.allow_http || self.allow_private_networks
+    }
+}
+
+/// Deserialize a boolean that may arrive as a native bool or as a string.
+///
+/// The settings loader interpolates `${VAR}` inside string config values and
+/// produces a JSON string, so an env-driven flag like
+/// `allow_private_networks: "${RISE_SSRF_ALLOW_PRIVATE:-false}"` reaches serde as
+/// the string `"false"`. serde does not coerce string→bool, so accept both forms
+/// (case-insensitive `true`/`false`, plus `1`/`0`/`yes`/`no`/`on`/`off`).
+pub(crate) fn deserialize_bool_flexible<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BoolOrString {
+        Bool(bool),
+        Str(String),
+    }
+
+    match BoolOrString::deserialize(deserializer)? {
+        BoolOrString::Bool(b) => Ok(b),
+        BoolOrString::Str(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Ok(true),
+            "false" | "0" | "no" | "off" => Ok(false),
+            other => Err(D::Error::custom(format!(
+                "invalid boolean string {other:?}; expected true/false"
+            ))),
+        },
     }
 }
 

@@ -20,7 +20,7 @@ browser ──ingress──► api ──┐
 The deployment controller injects one env var per routable sibling container:
 
 ```
-RISE_CONTAINER_HOST__<NAME>=<service>:<port>
+RISE_CONTAINER_HOST__<NAME>=<host>:<port>
 ```
 
 Both `api` and `worker` read `RISE_CONTAINER_HOST__REDIS` to find Redis —

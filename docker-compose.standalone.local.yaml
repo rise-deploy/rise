@@ -1,0 +1,103 @@
+# =============================================================================
+# Local / e2e overlay for the standalone Rise stack. Layer it ON TOP of
+# docker-compose.standalone.yaml:
+#
+#   docker compose -f docker-compose.standalone.yaml \
+#                  -f docker-compose.standalone.local.yaml up -d
+#
+# Effect: plain HTTP on *.rise.localhost, no TLS, no Let's Encrypt. This is what
+# the e2e (scripts/ci/e2e-docker.sh) and a quick local try use. No RISE_DOMAIN /
+# ACME_EMAIL needed.
+#
+#   * Traefik: single `web` (:80) entrypoint — NO websecure, NO ACME, NO HTTP->
+#     HTTPS redirect. The label-based routers in the base file that target the
+#     `websecure` entrypoint simply have no matching entrypoint here and are
+#     inert; the /.rise router is re-stamped onto `web` below.
+#   * rise: switches to RISE_CONFIG_RUN_MODE=docker, whose shipped config
+#     (config/docker.yaml at /etc/rise/docker.yaml) already defaults to the local
+#     HTTP stack (http / rise.localhost / rise-dex / localhost:5000) — so NO extra
+#     env is needed here — and re-stamps the /.rise router onto the `web`
+#     entrypoint (no TLS).
+# =============================================================================
+
+services:
+  traefik:
+    command:
+      - "--log.level=INFO"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=rise_default"
+      # Keep Traefik's API enabled internally (:8080, NOT published) so the
+      # backend's health-rolling serverStatus gate works in local/e2e too; the
+      # command is replaced wholesale on override, so it must be re-added here.
+      - "--api.insecure=true"
+      - "--entrypoints.web.address=:80"
+    # Sequences are replaced (not merged) on override, so this drops 443. :8080
+    # stays unpublished — the Traefik API is internal-only (rise_default).
+    ports:
+      - "80:80"        # app traffic: http://<project>.rise.localhost
+
+  # Dex stays internal in local mode (the base file has no public dex router —
+  # that is opt-in via the demo-idp overlay). Re-publish :5556 on loopback so
+  # local browser login works (issuer http://rise-dex:5556/dex -> 127.0.0.1 via
+  # the mise-managed /etc/hosts entry).
+  dex:
+    ports:
+      - "127.0.0.1:5556:5556"
+
+  registry:
+    # Drop the public Traefik exposure + basicauth; re-publish :5000 on loopback
+    # for local `rise deploy` push (client_registry_url=localhost:5000).
+    labels: !reset []
+    ports:
+      - "127.0.0.1:5000:5000"
+
+  rise:
+    image: ${RISE_IMAGE_REPOSITORY:-ghcr.io/rise-deploy/rise}:${RISE_IMAGE_TAG:-0.23.0}
+    # Re-publish the backend on loopback so the CLI/e2e reach the control plane
+    # directly at http://rise.localhost:3000 (prod goes through Traefik instead).
+    ports:
+      - "127.0.0.1:3000:3000"
+    # Labels normalize to maps and MERGE across files (a sequence/!reset does
+    # NOT cleanly re-add), so instead of touching the base `rise-dotrise`
+    # router we ADD a sibling `rise-dotrise-web` router on the plain `web`
+    # entrypoint with no TLS. The base `rise-dotrise` router targets the
+    # `websecure` entrypoint + `le` resolver, neither of which exists in the
+    # local overlay, so it is inert here.
+    labels:
+      - "traefik.http.routers.rise-dotrise-web.rule=PathPrefix(`/.rise`)"
+      - "traefik.http.routers.rise-dotrise-web.entrypoints=web"
+      - "traefik.http.routers.rise-dotrise-web.priority=1000"
+      - "traefik.http.routers.rise-dotrise-web.service=rise-dotrise-web"
+      - "traefik.http.services.rise-dotrise-web.loadbalancer.server.port=3000"
+    # Compose merges `environment` by variable name, so we must OVERRIDE every
+    # prod-flipping RISE_* var the base file set back to its local default
+    # (config/docker.yaml's built-in defaults are already local, but the base
+    # env would otherwise leak the prod values). Setting RISE_CONFIG_RUN_MODE
+    # alone is not enough.
+    environment:
+      - DATABASE_URL=postgres://${POSTGRES_USER:-rise}:${POSTGRES_PASSWORD:-rise123}@rise-postgres:5432/${POSTGRES_DB:-rise}
+      - RISE_CONFIG_DIR=/etc/rise
+      - RISE_CONFIG_RUN_MODE=docker
+      # Reset the base file's prod overrides to the local HTTP defaults.
+      - PUBLIC_URL=http://rise.localhost:3000
+      - RISE_INGRESS_DOMAIN=rise.localhost
+      - RISE_INGRESS_SCHEME=http
+      - RISE_CERTRESOLVER=
+      - RISE_TRAEFIK_ENTRYPOINT=web
+      - RISE_CLIENT_REGISTRY_URL=localhost:5000
+      - RISE_COOKIE_SECURE=false
+      - DEX_ISSUER=http://rise-dex:5556/dex
+      # LOCAL ONLY: open the SSRF guard so the backend can reach the internal
+      # plain-HTTP http://rise-dex:5556 issuer (and other private-network
+      # services). Prod keeps the guard closed (default false) and relies on
+      # public DNS/TLS for the issuer, plus trusted_hosts for any internal hosts.
+      - RISE_SSRF_ALLOW_PRIVATE=true
+      - RISE_SSRF_ALLOW_HTTP=true
+      # LOCAL ONLY: alias the public issuer host to the Rise backend's IP inside
+      # app containers (via extra_hosts) so apps can reach the issuer/control
+      # plane (validate rise_jwt, OIDC discovery). Prod leaves this unset — public
+      # DNS + Traefik resolve rise.${RISE_DOMAIN} with correct TLS.
+      - RISE_APP_BACKEND_HOST_ALIAS=rise.localhost
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock

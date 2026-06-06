@@ -75,6 +75,45 @@ services:
     depends_on:
       - registry
 
+  # Traefik reverse proxy for the Docker deployment controller (type: docker).
+  # Routes *.rise.localhost to app containers via the Docker provider, reading the
+  # Traefik labels the Rise controller stamps on each app container. Only used when
+  # deployment_controller.type = "docker" (see config/development.yaml).
+  traefik:
+    image: traefik:v3.7.1
+    container_name: rise-traefik
+    restart: unless-stopped
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=rise_default"
+      # File provider: routes /.rise/* on app hosts to the host-run Rise backend
+      # (see dev/traefik/dynamic/rise-dotrise.yml). The backend isn't a container
+      # here, so a Docker-provider label can't target it.
+      - "--providers.file.directory=/etc/traefik/dynamic"
+      - "--providers.file.watch=true"
+      - "--entrypoints.web.address=:80"
+      - "--api.dashboard=true"
+      - "--api.insecure=true"
+    ports:
+      - "80:80"        # app traffic: http://<project>.rise.localhost
+      - "8090:8080"    # Traefik dashboard: http://localhost:8090
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./dev/traefik/dynamic:/etc/traefik/dynamic:ro
+    # Make `host.docker.internal` resolve to the host gateway so Traefik's
+    # forwardAuth can reach a host-run backend (`mise br docker`, which sets
+    # RISE_AUTH_BACKEND_URL=http://host.docker.internal:3000) on Linux too.
+    # No-op on Docker Desktop, which resolves host.docker.internal automatically.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Join the compose default network ("rise_default") explicitly so Traefik is
+    # on the same network as the app containers it routes to. The Docker provider
+    # is pinned to this network via --providers.docker.network=rise_default, so
+    # Traefik must be a member to reach the backends.
+    networks:
+      - default
+
   # HashiCorp Vault with JFrog Artifactory secrets plugin.
   # Automatically configures itself and JFrog on startup.
   # Access: VAULT_ADDR=http://localhost:8200 VAULT_TOKEN=root

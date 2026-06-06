@@ -1,0 +1,185 @@
+# yaml-language-server: $schema=../docs/engineering/public/schemas/backend-settings.schema.json
+# =============================================================================
+# Single config for the standalone Docker deployment backend (run_mode: docker),
+# shipped in the image at /etc/rise/docker.yaml. The Rise backend loads it when
+# RISE_CONFIG_RUN_MODE=docker (overlaid on default.yaml).
+#
+# Production vs local differ ONLY by env vars set in the compose files
+# (docker-compose.standalone.yaml vs docker-compose.standalone.local.yaml). The
+# defaults baked in below are LOCAL-friendly, so a bare RISE_CONFIG_RUN_MODE=docker
+# with only DATABASE_URL set yields a working plain-HTTP local stack on
+# *.rise.localhost; the production compose file overrides the RISE_* env to flip
+# to TLS / Let's Encrypt on the real domain.
+#
+# The config loader interpolates ${VAR} / ${VAR:-default} but leaves Rise's own
+# {project_name} / {deployment_group} / {environment} ingress placeholders intact.
+#
+# INSECURE DEMO VALUES — REGENERATE BEFORE ANY REAL USE. The jwt_signing_secret,
+# encryption.key and auth.client_secret defaults below are well-known repo
+# placeholders and provide NO security. In production OVERRIDE them via the
+# RISE_JWT_SIGNING_SECRET / RISE_ENCRYPTION_KEY / OIDC_CLIENT_SECRET / ADMIN_EMAIL
+# env vars (see docker-compose.standalone.yaml).
+# =============================================================================
+server:
+  host: "0.0.0.0"
+  port: 3000
+  # Base public URL of the control plane. App hosts ({project}.${RISE_INGRESS_DOMAIN})
+  # are siblings of this host, not subdomains of it, so the post-login deep-link
+  # redirect is validated against BOTH this host and the ingress domain suffix
+  # (see validate_redirect_url in src/server/auth/handlers.rs). Prod sets
+  # PUBLIC_URL=https://rise.${RISE_DOMAIN}.
+  public_url: "${PUBLIC_URL:-http://rise.localhost:3000}"
+  cookie_secure: "${RISE_COOKIE_SECURE:-false}"
+  jwt_signing_secret: "${RISE_JWT_SIGNING_SECRET:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}"
+  jwt_claims: ["sub", "email", "name"]
+  static_dir: "${RISE_STATIC_DIR:-/var/lib/rise/static}"
+  docs_dir: "${RISE_DOCS_DIR:-/var/rise/docs}"
+  # Dev-only: when running the host backend via `mise dev docker`/`mise br docker`,
+  # this is set to the Vite dev server so the SPA is proxied (the local checkout
+  # has no built frontend). Unset in production -> empty -> None -> serve the
+  # built SPA baked into the image's static_dir.
+  frontend_dev_proxy_url: "${RISE_FRONTEND_DEV_PROXY_URL:-}"
+  # SSRF guard for server-side URL fetches (OIDC discovery, OAuth extension
+  # issuer/token endpoints, etc.). Default CLOSED for production: private/loopback
+  # IPs and plain HTTP are rejected. `trusted_hosts` ONLY exempts the listed hosts
+  # from the private-IP block — it does NOT relax the HTTPS requirement, which is
+  # enforced globally. Reaching a plain-HTTP internal issuer therefore also needs
+  # allow_http=true; that is why the local overlay sets RISE_SSRF_ALLOW_HTTP=true
+  # (alongside RISE_SSRF_ALLOW_PRIVATE=true) to reach the internal
+  # http://rise-dex:5556 issuer. For production, prefer an HTTPS internal/issuer
+  # endpoint so the guard can stay fully closed. Add your own internal hosts as needed.
+  ssrf:
+    allow_private_networks: "${RISE_SSRF_ALLOW_PRIVATE:-false}"
+    allow_http: "${RISE_SSRF_ALLOW_HTTP:-false}"
+    trusted_hosts:
+      - "rise-dex"
+      - "rise-registry"
+      - "rise"
+database:
+  url: "${DATABASE_URL}"
+encryption:
+  type: "aes-gcm-256"
+  key: "${RISE_ENCRYPTION_KEY:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}"
+auth:
+  # Single OIDC issuer. Local default is the internal Dex (http://rise-dex:5556/dex);
+  # prod sets DEX_ISSUER=https://dex.${RISE_DOMAIN} (computed in compose because the
+  # loader does a single, non-recursive ${VAR} pass).
+  issuer: "${DEX_ISSUER:-http://rise-dex:5556/dex}"
+  client_id: "${OIDC_CLIENT_ID:-rise-backend}"
+  client_secret: "${OIDC_CLIENT_SECRET:-rise-backend-secret}"
+  admin_users: ["${ADMIN_EMAIL:-admin@example.com}"]
+  # Operators have full access to the generic resource API (/api/v1/resources)
+  # and always bypass platform_access. Defaults to none — set RISE_OPERATOR_EMAIL
+  # to grant a single operator (mount a config override for several). The blank
+  # entry is filtered out when the var is unset, so this collapses to an empty list.
+  operator_users:
+    - "${RISE_OPERATOR_EMAIL:-}"
+  allow_team_creation: true
+  allow_list_all_teams: true
+  # Who may use the CLI/API/dashboard (the "platform"), as opposed to merely
+  # logging in to a forwardAuth-protected app. Defaults to `allow_all` so any
+  # authenticated IdP user can use the platform — operators opt into a locked-
+  # down stack with RISE_PLATFORM_ACCESS_POLICY=restrictive and then grant
+  # specific users via RISE_PLATFORM_ALLOWED_EMAILS (comma/space-separated is
+  # NOT supported; pass a single email, or override this block in a mounted
+  # config for multiple). admin_users / operator_users always bypass this.
+  platform_access:
+    policy: "${RISE_PLATFORM_ACCESS_POLICY:-allow_all}"
+    allowed_user_emails:
+      - "${RISE_PLATFORM_ALLOWED_EMAIL:-}"
+registry:
+  type: "oci-client-auth"
+  # Internal URL the HOST Docker daemon uses to PULL app images (the backend
+  # mounts the host socket, so the host resolver — not Docker's embedded DNS —
+  # resolves this host). For the default `rise-registry:5000` to work the host
+  # daemon must be able to resolve `rise-registry` AND list `rise-registry:5000`
+  # in its insecure-registries (plain HTTP). See the registry "Pull" section in
+  # docs/.../docker/index.md; override with RISE_REGISTRY_URL (e.g. a published
+  # 127.0.0.1:5000 or the public TLS registry.${RISE_DOMAIN}).
+  registry_url: "${RISE_REGISTRY_URL:-rise-registry:5000}"
+  namespace: "rise-apps"
+  # Public URL the CLI PUSHES to. Local default is the loopback-published
+  # registry (localhost:5000); prod sets registry.${RISE_DOMAIN} (behind Traefik
+  # basicauth). The CLI does its own `docker login`; oci-client-auth mints none.
+  client_registry_url: "${RISE_CLIENT_REGISTRY_URL:-localhost:5000}"
+deployment_controller:
+  type: "docker"
+  traefik_network: "rise_default"
+  # Traefik entrypoint app routers bind to. Local: `web` (:80). Prod: `websecure`.
+  traefik_entrypoint: "${RISE_TRAEFIK_ENTRYPOINT:-web}"
+  # Optional certresolver. Empty (local) => no TLS labels; prod sets `le`. An
+  # empty/whitespace value is normalized to None by the controller (see
+  # normalize_certresolver in src/server/deployment/controller/docker/labels.rs).
+  traefik_certresolver: "${RISE_CERTRESOLVER:-}"
+  production_ingress_url_template: "{project_name}.${RISE_INGRESS_DOMAIN:-rise.localhost}"
+  staging_ingress_url_template: "{deployment_group}--{project_name}.${RISE_INGRESS_DOMAIN:-rise.localhost}"
+  environment_ingress_url_template: "{environment}--{project_name}.${RISE_INGRESS_DOMAIN:-rise.localhost}"
+  # URL scheme for generated ingress URLs. Local: http; prod: https. Ports are
+  # implicit (80/443) so no ingress_port is set.
+  ingress_schema: "${RISE_INGRESS_SCHEME:-http}"
+  reconcile_interval_secs: 5
+  controller_class_name: "default"
+  # Platform replica bounds. The Docker backend supports horizontal scale-out
+  # (N containers per spec behind one Traefik service, rolling recreate), so
+  # allow replicas > 1 out of the box — tune the ceiling via RISE_MAX_REPLICAS.
+  # The controller additionally hard-clamps to 50. The platform default is 1,
+  # which would otherwise reject every replicas > 1 request at the API.
+  deployment_constraints:
+    max_replicas: "${RISE_MAX_REPLICAS:-10}"
+  # Internal URL Traefik uses to reach the Rise backend for the forwardAuth
+  # subrequest (compose service name + port).
+  auth_backend_url: "${RISE_AUTH_BACKEND_URL:-http://rise:3000}"
+  # Browser-facing base URL for the login redirect; kept consistent with
+  # public_url's host.
+  auth_signin_url: "${PUBLIC_URL:-http://rise.localhost:3000}"
+  # LOCAL-DEV ONLY: hostname(s) to alias to the Rise backend's IP on rise_default,
+  # injected as `extra_hosts` on managed app containers so apps can reach the
+  # public issuer host (e.g. rise.localhost) to validate the rise_jwt cookie / do
+  # OIDC discovery. Blank entries are dropped at load time, so the default (env
+  # unset) is an EMPTY list and NO override is injected — which is exactly what
+  # production wants (public DNS + Traefik resolve the issuer with correct TLS).
+  # The local overlay sets RISE_APP_BACKEND_HOST_ALIAS=rise.localhost to enable it.
+  app_backend_host_aliases:
+    - "${RISE_APP_BACKEND_HOST_ALIAS:-}"
+  # LOCAL-DEV ONLY: explicit value the app_backend_host_aliases resolve to, used
+  # verbatim (skips DNS resolution of auth_backend_url). `mise br docker` sets
+  # RISE_APP_BACKEND_IP=host-gateway so apps reach the host-run backend on both
+  # Docker Desktop and Linux. Unset (prod/standalone) => blank => None => falls
+  # back to DNS resolution of auth_backend_url (e.g. http://rise:3000).
+  app_backend_ip: "${RISE_APP_BACKEND_IP:-}"
+  # DEV-ONLY: publish each app container's HTTP port to a random 127.0.0.1 host
+  # port so a host-run backend (mise br docker / Docker Desktop, where container
+  # bridge IPs aren't routable from the host) can health-probe the app directly.
+  # Default off; the containerized/production backend reaches apps over the
+  # rise_default network. `mise br docker` sets RISE_PUBLISH_APP_PORTS=true.
+  publish_app_ports: "${RISE_PUBLISH_APP_PORTS:-false}"
+  # How traffic cuts over when a new deployment becomes active for its group.
+  #   health-rolling => Traefik-HC rolling overlap: old and new replicas share
+  #                     one Traefik load-balancer service and Traefik's per-server
+  #                     health check drains the old ones as the new come up.
+  #   recreate        => Rise-gated single cutover: one active/routable
+  #                     deployment at a time (old route dropped, new stamped).
+  # Default is `health-rolling`.
+  cutover_strategy: "${RISE_CUTOVER_STRATEGY:-health-rolling}"
+  # Traefik API base for the serverStatus rolling gate; standalone reaches
+  # Traefik in-network at rise-traefik:8080; host-run dev overrides to the
+  # published dashboard port; empty disables -> mirror-probe fallback.
+  #
+  # In health-rolling mode the reconciler reads Traefik's per-server health
+  # status (the top-level serverStatus map) to retire the old deployment only once the
+  # new servers are actually in Traefik's rotation. Optional basic-auth may be
+  # embedded in the URL (userinfo).
+  traefik_api_url: "${RISE_TRAEFIK_API_URL:-http://rise-traefik:8080}"
+  access_classes:
+    public:
+      display_name: Public
+      description: Public — no auth.
+      ingress_class: traefik
+      access_requirement: None
+    private:
+      display_name: Private
+      description: Requires project membership.
+      ingress_class: traefik
+      access_requirement: Member
+deployment_logs:
+  type: "docker"
