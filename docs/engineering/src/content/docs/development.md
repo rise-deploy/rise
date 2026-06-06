@@ -71,7 +71,7 @@ The registry uses `localhost:5000` (insecure-by-default in Docker — no
 per RFC 6761, so no `/etc/hosts` edits for app hosts). The only setup `mise br docker`
 needs is the `rise-dex` host alias from `mise setup hosts`. See
 [Docker backend (local)](#docker-backend-local) below and the operator guide's
-[Local development](/operator-docs/docker/#local-development-run-rise-on-the-host-no-image)
+[Local development](/operator-docs/docker/quick-start/#local-development-run-rise-on-the-host-no-image)
 section for the full reference.
 
 ## Day-to-Day
@@ -264,7 +264,7 @@ the unified `mise br [k8s|docker]` task (`k8s` is the default, against the
 Kubernetes dev config). You no longer hand-edit `config/development.yaml` to switch
 controllers — the task selects the Docker controller via run_mode. See the
 operator guide's
-[Local development](/operator-docs/docker/#local-development-run-rise-on-the-host-no-image)
+[Local development](/operator-docs/docker/quick-start/#local-development-run-rise-on-the-host-no-image)
 section for the full reference (gateway-IP / `extra_hosts` wiring, Docker Desktop
 notes, etc.).
 

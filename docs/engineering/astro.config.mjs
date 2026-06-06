@@ -57,6 +57,12 @@ export default defineConfig({
                   label: 'Docker',
                   items: [
                     { label: 'Overview', slug: 'docker' },
+                    { label: 'Architecture', slug: 'docker/architecture' },
+                    { label: 'Quick Start', slug: 'docker/quick-start' },
+                    { label: 'Production Deployment', slug: 'docker/production' },
+                    { label: 'Authentication & Ingress Auth', slug: 'docker/authentication' },
+                    { label: 'Container Registry', slug: 'docker/registry' },
+                    { label: 'Troubleshooting', slug: 'docker/troubleshooting' },
                   ],
                 },
               ],
