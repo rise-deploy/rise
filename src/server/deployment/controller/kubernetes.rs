@@ -10,7 +10,7 @@ use crate::db::models::{Deployment, Project};
 use crate::server::deployment::resource_builder::ResourceBuilder;
 use anyhow::Result;
 use async_trait::async_trait;
-use sqlx::PgPool;
+use rise_backend_core::DeploymentStore;
 use std::sync::Arc;
 
 /// Slim Kubernetes backend wrapping ResourceBuilder and kube client.
@@ -21,19 +21,19 @@ use std::sync::Arc;
 pub struct KubernetesBackend {
     kube_client: kube::Client,
     resource_builder: Arc<ResourceBuilder>,
-    db_pool: PgPool,
+    store: Arc<dyn DeploymentStore>,
 }
 
 impl KubernetesBackend {
     pub fn new(
         kube_client: kube::Client,
         resource_builder: Arc<ResourceBuilder>,
-        db_pool: PgPool,
+        store: Arc<dyn DeploymentStore>,
     ) -> Self {
         Self {
             kube_client,
             resource_builder,
-            db_pool,
+            store,
         }
     }
 
@@ -59,7 +59,7 @@ impl DeploymentBackend for KubernetesBackend {
     ) -> Result<DeploymentUrls> {
         // Load environment info if the deployment has one
         let environment = if let Some(env_id) = deployment.environment_id {
-            crate::db::environments::find_by_id(&self.db_pool, env_id).await?
+            self.store.find_environment(env_id).await?
         } else {
             None
         };
@@ -67,13 +67,10 @@ impl DeploymentBackend for KubernetesBackend {
         // All envs are needed so `compute_deployment_urls` can suppress a DG URL
         // whose host would collide with another env's URL (see
         // `host_conflicts_with_other_env`).
-        let all_environments =
-            crate::db::environments::list_for_project(&self.db_pool, project.id).await?;
+        let all_environments = self.store.list_environments_for_project(project.id).await?;
 
         // Load custom domains for the project
-        let custom_domains =
-            crate::db::custom_domains::list_project_custom_domains(&self.db_pool, project.id)
-                .await?;
+        let custom_domains = self.store.list_project_custom_domains(project.id).await?;
 
         Ok(self.resource_builder.compute_deployment_urls(
             project,
@@ -89,9 +86,7 @@ impl DeploymentBackend for KubernetesBackend {
         project: &Project,
         deployment_group: &str,
     ) -> Result<DeploymentUrls> {
-        let custom_domains =
-            crate::db::custom_domains::list_project_custom_domains(&self.db_pool, project.id)
-                .await?;
+        let custom_domains = self.store.list_project_custom_domains(project.id).await?;
 
         Ok(self
             .resource_builder

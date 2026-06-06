@@ -14,8 +14,10 @@ pub mod models;
 pub mod providers;
 pub mod quantity;
 pub mod state_machine;
+pub mod store;
 
 pub use backend::{DeploymentBackend, DeploymentUrls};
 pub use providers::{
     EncryptionProvider, ImageTagType, RegistryAuthMethod, RegistryCredentials, RegistryProvider,
 };
+pub use store::DeploymentStore;

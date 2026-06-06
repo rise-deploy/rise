@@ -247,7 +247,8 @@ async fn init_kubernetes_backend(
 ) -> Result<Arc<dyn DeploymentBackend>> {
     use crate::server::deployment::controller::KubernetesBackend;
 
-    let backend = KubernetesBackend::new(kube_client, resource_builder, db_pool);
+    let store = Arc::new(crate::db::deployment_store::PgDeploymentStore::new(db_pool));
+    let backend = KubernetesBackend::new(kube_client, resource_builder, store);
 
     // Test Kubernetes API connection
     backend.test_connection().await?;
@@ -418,7 +419,10 @@ async fn init_docker_backend(
     // Connect bollard.
     let docker = client::connect(docker_host.as_deref())?;
 
-    let backend = DockerBackend::new(docker.clone(), resource_builder.clone(), db_pool.clone());
+    let store = Arc::new(crate::db::deployment_store::PgDeploymentStore::new(
+        db_pool.clone(),
+    ));
+    let backend = DockerBackend::new(docker.clone(), resource_builder.clone(), store);
     backend.test_connection().await?;
     tracing::info!("Docker deployment backend initialized and connection tested");
 
