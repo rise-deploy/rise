@@ -108,9 +108,14 @@ pub struct DesiredContainer {
 /// Default Traefik health-check interval (Go duration `10s`) when the
 /// `health_check` spec sets no `period_seconds`.
 const DEFAULT_HEALTHCHECK_INTERVAL_SECS: i32 = 10;
-/// Default Traefik health-check timeout (Go duration `3s`) when the
-/// `health_check` spec sets no `timeout_seconds`.
-const DEFAULT_HEALTHCHECK_TIMEOUT_SECS: i32 = 3;
+/// Default Traefik health-check timeout (Go duration `5s`) when the
+/// `health_check` spec sets no `timeout_seconds`. Matches the Kubernetes
+/// default (`HealthProbeConfig::timeout_seconds` = 5 in
+/// `resource_builder::create_http_probe_with_override`) so the same public
+/// input — a `health_check` with no explicit `timeout_seconds` — yields the
+/// same effective timeout on both backends (no Docker-stricter divergence
+/// that could mark a slow-but-healthy endpoint DOWN on Docker but UP on K8s).
+const DEFAULT_HEALTHCHECK_TIMEOUT_SECS: i32 = 5;
 
 /// Static controller configuration the builder needs.
 pub struct BuilderConfig<'a> {
@@ -469,7 +474,7 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
 }
 
 /// Maximum length of the human-readable (sanitized) portion of a Traefik
-/// router/service base name, before the `-{hex8}` injective suffix is appended.
+/// router/service base name, before the `-{hex16}` injective suffix is appended.
 /// Comfortably inside Traefik/Docker name limits even with the suffix and any
 /// per-route `-{idx}` / `-auth` decorations [`group_service_name`] /
 /// [`render_traefik_labels_for`] add on top.
@@ -490,8 +495,8 @@ const MAX_SERVICE_BASE_LEN: usize = 48;
 /// Two projects pooled behind one Traefik load balancer is a multi-tenant
 /// boundary break (one project's labels could suppress the other's forwardAuth).
 /// To guarantee distinct tuples get distinct names, we append a short stable
-/// hash of the STRUCTURED `(project, group, container)` tuple — the first 8 hex
-/// chars of a SHA-256 over a NUL-separated (collision-free, since NUL can't
+/// hash of the STRUCTURED `(project, group, container)` tuple — the first 8 bytes
+/// (16 hex chars) of a SHA-256 over a NUL-separated (collision-free, since NUL can't
 /// appear in any field) encoding of the three fields. The human-readable base
 /// is length-capped first so the total stays well within name limits.
 ///
@@ -630,13 +635,17 @@ fn render_traefik_labels_for(
         AccessRequirement::None => None,
         AccessRequirement::Authenticated | AccessRequirement::Member => {
             if cfg.auth_backend_url.is_empty() {
-                // Invariant: startup (`init_docker_backend`) fails CLOSED when a
-                // non-`None` access class is configured without an
-                // `auth_backend_url` (see
+                // No internal backend URL → we CANNOT wire forwardAuth. Startup
+                // (`init_docker_backend`) fails closed only for access classes
+                // that are CONFIGURED without an `auth_backend_url` (see
                 // `settings::docker_access_classes_missing_auth_backend_url`),
-                // so this branch is unreachable in a running backend. We still
-                // refuse to stamp a half-broken (auth-less) middleware here
-                // rather than silently emit an open route.
+                // but a project can still reach here carrying a stale/removed/
+                // renamed access-class string: the unknown-class branch above
+                // fails closed to `Member`, so an auth requirement now coincides
+                // with an empty `auth_backend_url`. We must NOT stamp a router
+                // with no forwardAuth (that would be an OPEN public route for a
+                // Member/Authenticated-only app); the route loop below withholds
+                // the router entirely when this is `None`.
                 None
             } else {
                 Some(format!(
@@ -647,6 +656,23 @@ fn render_traefik_labels_for(
             }
         }
     };
+
+    // FAIL CLOSED: auth is required (Authenticated/Member) but no forwardAuth
+    // address could be built (empty `auth_backend_url`). Stamping a router with
+    // no middleware would expose the app as an OPEN public route — exactly what
+    // the access class forbids. K8s exposes nothing in this case, so for parity
+    // we withhold ALL routers for this container: the app is simply not routed.
+    let auth_required = !matches!(requirement, AccessRequirement::None);
+    if auth_required && forward_auth_address.is_none() {
+        tracing::warn!(
+            project = %desired.project,
+            access_class = %desired.access_class,
+            "Withholding Traefik router(s): forwardAuth could not be wired \
+             (auth_backend_url is empty) for an access requirement that mandates \
+             authentication — refusing to expose an unauthenticated public route"
+        );
+        return out;
+    }
 
     // One router per (host-set × route). Single-container apps have a single
     // `/` route, so this yields exactly one router. Longest path-prefix first
@@ -687,6 +713,24 @@ fn render_traefik_labels_for(
             }),
         });
         out.extend(traefik);
+
+        // Explicit longest-prefix-first router priority (parity with nginx's
+        // implicit longest-match). Traefik would otherwise fall back to implicit
+        // rule-LENGTH priority, which conflates host-rule length with path
+        // specificity; deriving the priority from the route's path-prefix length
+        // makes a more-specific prefix (`/api/v1`) deterministically outrank a
+        // shorter/host-only one (`/`). The `+1` keeps even a host-only (empty/`/`)
+        // route at a positive, non-zero priority.
+        let path_len = route
+            .path_prefix
+            .as_deref()
+            .filter(|p| !p.is_empty() && *p != "/")
+            .map(str::len)
+            .unwrap_or(0);
+        out.insert(
+            format!("traefik.http.routers.{router_name}.priority"),
+            (path_len + 1).to_string(),
+        );
 
         // Traefik load-balancer health-check labels — emitted ONLY in
         // `HealthRolling` mode AND when this container has an effective health
@@ -746,11 +790,20 @@ mod tests {
 
     use std::sync::OnceLock;
 
-    /// Shared empty access-class map (no forwardAuth) for tests that don't
-    /// exercise authentication.
-    fn empty_access_classes() -> &'static HashMap<String, AccessRequirement> {
+    /// Shared default access-class map for tests that don't exercise
+    /// authentication: the fixture's `public` class maps to `AccessRequirement::None`
+    /// so the common-case container is a properly-CONFIGURED public app (routed,
+    /// no forwardAuth). An empty map would instead make `public` an UNKNOWN class
+    /// that correctly fails closed — and, with the empty `auth_backend_url` here,
+    /// withholds the router entirely — which is not what these baseline tests mean
+    /// to exercise.
+    fn default_access_classes() -> &'static HashMap<String, AccessRequirement> {
         static MAP: OnceLock<HashMap<String, AccessRequirement>> = OnceLock::new();
-        MAP.get_or_init(HashMap::new)
+        MAP.get_or_init(|| {
+            let mut m = HashMap::new();
+            m.insert("public".to_string(), AccessRequirement::None);
+            m
+        })
     }
 
     fn test_cfg() -> BuilderConfig<'static> {
@@ -762,7 +815,7 @@ mod tests {
             traefik_entrypoint: "web",
             traefik_certresolver: None,
             auth_backend_url: "",
-            access_classes: empty_access_classes(),
+            access_classes: default_access_classes(),
             app_backend_host_aliases: &[],
             app_backend_ip: None,
             publish_app_ports: false,
@@ -1084,7 +1137,7 @@ mod tests {
             "replicas must render identical Traefik labels (shared router+service)"
         );
         // Spot-check the shared service/router name is group-scoped (replica- and
-        // deployment-id-free). The base carries the injective `-{hex8}` suffix.
+        // deployment-id-free). The base carries the injective `-{hex16}` suffix.
         let base = group_service_base("myapp", "default", "app");
         assert!(t0.contains_key(&format!(
             "traefik.http.services.{base}.loadbalancer.server.port"
@@ -1566,6 +1619,65 @@ mod tests {
     }
 
     #[test]
+    fn longer_prefix_route_gets_higher_priority_label() {
+        // Each path route gets an explicit `priority` label derived from its
+        // path-prefix length, so a more-specific prefix (`/api/v1`) outranks a
+        // shorter/host-only one (`/`) deterministically rather than relying on
+        // Traefik's implicit rule-length heuristic (nginx longest-match parity).
+        let mut desired = single_container();
+        desired.container = "api".to_string();
+        desired.routes = vec![
+            DesiredRoute {
+                hosts: vec!["myapp.rise.dev".to_string()],
+                path_prefix: Some("/".to_string()),
+            },
+            DesiredRoute {
+                hosts: vec!["myapp.rise.dev".to_string()],
+                path_prefix: Some("/api/v1".to_string()),
+            },
+        ];
+        let built = build_container(&desired, &test_cfg());
+        let labels = built.config.labels.as_ref().unwrap();
+        let base = group_service_base("myapp", "default", "api");
+        // r0 = longest prefix (/api/v1, sorts first); r1 = host-only (/).
+        let r0 = group_service_name(&base, 0, 2);
+        let r1 = group_service_name(&base, 1, 2);
+        let p0: usize = labels
+            .get(&format!("traefik.http.routers.{r0}.priority"))
+            .expect("longer-prefix route must carry a priority label")
+            .parse()
+            .unwrap();
+        let p1: usize = labels
+            .get(&format!("traefik.http.routers.{r1}.priority"))
+            .expect("host-only route must carry a priority label")
+            .parse()
+            .unwrap();
+        assert!(
+            p0 > p1,
+            "longer prefix /api/v1 (priority {p0}) must outrank host-only / (priority {p1})"
+        );
+        // Host-only route still has a positive, non-zero priority.
+        assert!(p1 >= 1, "host-only route priority must be positive");
+    }
+
+    #[test]
+    fn single_route_carries_a_priority_label() {
+        // Even a single host-only route gets an explicit priority label (a
+        // positive value), so routing is never left to Traefik's implicit
+        // heuristic.
+        let built = build_container(&single_container(), &test_cfg());
+        let labels = built.config.labels.as_ref().unwrap();
+        let base = group_service_base("myapp", "default", "app");
+        assert_eq!(
+            labels
+                .get(&format!("traefik.http.routers.{base}.priority"))
+                .map(String::as_str),
+            Some("1"),
+            "host-only single route gets priority 1 (path_len 0 + 1)"
+        );
+    }
+
+    #[test]
     fn group_service_names_single_route_matches_emitted_service_label() {
         // A single-route container's `serverStatus` lookup name must equal the
         // bare base service the labels stamp (`{project}-{group}-{container}`).
@@ -1762,6 +1874,83 @@ mod tests {
     }
 
     #[test]
+    fn auth_required_without_backend_url_emits_no_router_fails_closed() {
+        // FAIL CLOSED: a Member-requirement project whose forwardAuth can't be
+        // wired (empty auth_backend_url — reachable with a stale/removed access
+        // class) must NOT be stamped as an open public router. Zero Traefik
+        // routers/services are emitted; the app is simply not routed (parity with
+        // K8s, which exposes nothing here).
+        let mut map = HashMap::new();
+        map.insert("private".to_string(), AccessRequirement::Member);
+        let cfg = BuilderConfig {
+            auth_backend_url: "",
+            access_classes: &map,
+            ..test_cfg()
+        };
+        let mut desired = single_container();
+        desired.access_class = "private".to_string();
+        let built = build_container(&desired, &cfg);
+        let labels = built.config.labels.as_ref().unwrap();
+        assert!(
+            !labels.keys().any(|k| k.starts_with("traefik.")),
+            "no Traefik labels at all when auth is required but forwardAuth can't be wired"
+        );
+        assert!(!labels.contains_key("traefik.enable"));
+        assert!(!labels
+            .keys()
+            .any(|k| k.starts_with("traefik.http.routers.")));
+
+        // CONTRAST: a None-requirement project with the same empty backend URL
+        // DOES get a (public, unauthenticated) router — that's its access class.
+        let mut public_map = HashMap::new();
+        public_map.insert("public".to_string(), AccessRequirement::None);
+        let public_cfg = BuilderConfig {
+            auth_backend_url: "",
+            access_classes: &public_map,
+            ..test_cfg()
+        };
+        let mut public_c = single_container();
+        public_c.access_class = "public".to_string();
+        let public_built = build_container(&public_c, &public_cfg);
+        let public_labels = public_built.config.labels.as_ref().unwrap();
+        assert_eq!(
+            public_labels.get("traefik.enable").map(String::as_str),
+            Some("true"),
+            "None-requirement route is public and IS routed even with empty auth_backend_url"
+        );
+        assert!(
+            !public_labels.keys().any(|k| k.contains("forwardauth")),
+            "None-requirement route carries no forwardAuth"
+        );
+
+        // CONTRAST: a Member-requirement project WITH a working auth_backend_url
+        // DOES get a router, behind forwardAuth.
+        let set_cfg = BuilderConfig {
+            auth_backend_url: "http://rise:3000",
+            access_classes: &map,
+            ..test_cfg()
+        };
+        let mut member_c = single_container();
+        member_c.access_class = "private".to_string();
+        let member_built = build_container(&member_c, &set_cfg);
+        let member_labels = member_built.config.labels.as_ref().unwrap();
+        let r = group_service_base("myapp", "default", "app");
+        assert_eq!(
+            member_labels.get("traefik.enable").map(String::as_str),
+            Some("true"),
+            "Member route IS routed when forwardAuth can be wired"
+        );
+        assert_eq!(
+            member_labels
+                .get(&format!(
+                    "traefik.http.middlewares.{r}-auth.forwardauth.address"
+                ))
+                .map(String::as_str),
+            Some("http://rise:3000/api/v1/auth/ingress?project=myapp&signin_redirect=1")
+        );
+    }
+
+    #[test]
     fn unknown_access_class_fails_closed_not_public() {
         // A project whose access_class is absent from the map must NOT be served
         // as an open public route. We fail closed: the route is stamped behind
@@ -1869,8 +2058,8 @@ mod tests {
                     "traefik.http.services.{svc}.loadbalancer.healthcheck.timeout"
                 ))
                 .map(String::as_str),
-            Some("3s"),
-            "timeout falls back to the default Go duration when unset"
+            Some("5s"),
+            "timeout falls back to the default Go duration (matching K8s) when unset"
         );
         assert_eq!(
             labels
