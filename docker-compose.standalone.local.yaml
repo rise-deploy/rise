@@ -53,7 +53,7 @@ services:
       - "127.0.0.1:5000:5000"
 
   rise:
-    image: ${RISE_IMAGE_REPOSITORY:-ghcr.io/rise-deploy/rise}:${RISE_IMAGE_TAG:-0.22.0}
+    image: ${RISE_IMAGE_REPOSITORY:-ghcr.io/rise-deploy/rise}:${RISE_IMAGE_TAG:-0.23.0}
     # Re-publish the backend on loopback so the CLI/e2e reach the control plane
     # directly at http://rise.localhost:3000 (prod goes through Traefik instead).
     ports:

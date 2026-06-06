@@ -224,7 +224,7 @@ services:
     # RISE_IMAGE_TAG is MANUALLY PINNED to a known-good released version; bump on
     # upgrade — there is no automatic 'latest released' resolution. Override with
     # RISE_IMAGE_TAG (CI/e2e does this) or RISE_IMAGE_REPOSITORY for a fork/mirror.
-    image: ${RISE_IMAGE_REPOSITORY:-ghcr.io/rise-deploy/rise}:${RISE_IMAGE_TAG:-0.22.0}
+    image: ${RISE_IMAGE_REPOSITORY:-ghcr.io/rise-deploy/rise}:${RISE_IMAGE_TAG:-0.23.0}
     container_name: rise-backend
     restart: unless-stopped
     command: ["backend", "server"]

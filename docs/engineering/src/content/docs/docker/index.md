@@ -9,9 +9,9 @@ single host and routes traffic to them with [Traefik](https://traefik.io/)
 Docker daemon and a Compose stack.
 
 A complete, runnable reference stack ships in the repository as
-[`docker-compose.standalone.yaml`](https://github.com/NiklasRosenstein/rise/blob/main/docker-compose.standalone.yaml)
+[`docker-compose.standalone.yaml`](https://github.com/rise-deploy/rise/blob/develop/docker-compose.standalone.yaml)
 with a local/dev overlay
-[`docker-compose.standalone.local.yaml`](https://github.com/NiklasRosenstein/rise/blob/main/docker-compose.standalone.local.yaml).
+[`docker-compose.standalone.local.yaml`](https://github.com/rise-deploy/rise/blob/develop/docker-compose.standalone.local.yaml).
 This guide explains how the stack is wired and how to run it locally or in
 production.
 
@@ -273,7 +273,7 @@ export ACME_CA_SERVER=https://acme-staging-v02.api.letsencrypt.org/directory
 | `ACME_CA_SERVER` | LE production | Set to LE staging while testing. |
 | `REGISTRY_BASIC_AUTH` | empty | htpasswd users for the public registry (see [Container registry](#container-registry-pushpull-close-the-loop)). |
 | `DEX_ISSUER` | `https://dex.${RISE_DOMAIN}` | OIDC issuer (see [Authentication / Dex](#authentication--dex)). |
-| `RISE_IMAGE_TAG` | `0.22.0` | **Manual** image pin — bump on upgrade. There is no automatic "latest released" resolution. |
+| `RISE_IMAGE_TAG` | `0.23.0` | **Manual** image pin — bump on upgrade. There is no automatic "latest released" resolution. |
 | `RISE_IMAGE_REPOSITORY` | `ghcr.io/rise-deploy/rise` | Override for a fork/mirror. |
 | `POSTGRES_PASSWORD` | `rise123` | Change it. |
 | `RISE_JWT_SIGNING_SECRET` | insecure repo placeholder | **Set it.** Overrides the demo secret baked into `config/docker.yaml`. `openssl rand -base64 32`. |

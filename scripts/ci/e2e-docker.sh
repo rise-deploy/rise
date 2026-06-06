@@ -586,6 +586,55 @@ if [[ "${code}" != "200" ]]; then
 fi
 log "Health-rolling cutover completed with no 5xx gap (final 200)"
 
+# Assert the NEW revision actually TOOK OVER, not just that "something is Healthy".
+# wait_for_healthy only greps for "Healthy" anywhere, and during the rolling
+# overlap the OLD (REV=1) deployment is Healthy too — so a no-op cutover where the
+# new servers never join would still pass the no-5xx + Healthy checks above. The
+# durable end state after convergence is: every running app container for the
+# cutover project carries the REV=2 env we deployed, and NO running container
+# still carries REV=1 (the old replicas have been retired). We read it straight
+# off the running containers' `.Config.Env` (the same `docker inspect` idiom used
+# for the label assertions above). Poll until convergence so we assert the settled
+# state, not a race-y mid-cutover snapshot.
+log "Asserting the new revision (REV=2) became the active/serving one"
+cut_rev_ok=0
+for _ in $(seq 1 30); do
+  # All running app containers for the cutover project (replicas=2 → expect ≥1).
+  mapfile -t cut_app_containers < <(
+    docker ps --filter "name=rise_${CUT_PROJECT}" --format '{{.Names}}'
+  )
+  if [[ "${#cut_app_containers[@]}" -eq 0 ]]; then
+    sleep 2
+    continue
+  fi
+  saw_rev2=0
+  saw_rev1=0
+  for c in "${cut_app_containers[@]}"; do
+    env_json="$(docker inspect "${c}" --format '{{json .Config.Env}}' 2>/dev/null || echo '[]')"
+    if printf '%s' "${env_json}" | jq -e 'any(.[]; . == "REV=2")' >/dev/null 2>&1; then
+      saw_rev2=1
+    fi
+    if printf '%s' "${env_json}" | jq -e 'any(.[]; . == "REV=1")' >/dev/null 2>&1; then
+      saw_rev1=1
+    fi
+  done
+  if [[ "${saw_rev2}" -eq 1 && "${saw_rev1}" -eq 0 ]]; then
+    cut_rev_ok=1
+    break
+  fi
+  sleep 2
+done
+if [[ "${cut_rev_ok}" != "1" ]]; then
+  log "ERROR: REV=2 did not become the sole active revision after cutover convergence"
+  log "(expected every running rise_${CUT_PROJECT} app container to carry REV=2 and none to carry REV=1)"
+  for c in "${cut_app_containers[@]}"; do
+    log "  ${c} env: $(docker inspect "${c}" --format '{{json .Config.Env}}' 2>/dev/null || echo '?')"
+  done
+  rise_cli deployment list --project "${CUT_PROJECT}" --limit 5 || true
+  exit 1
+fi
+log "New revision took over: all running ${CUT_PROJECT} app containers carry REV=2, none carry REV=1"
+
 ############################################
 # (d) RECREATE STRATEGY: the recreate cutover path must ALSO converge to 200.
 #     Recreate mode now uses the same 2xx-3xx readiness contract, so a deploy

@@ -414,6 +414,9 @@ containers on a single Docker host, routed by Traefik. Select it with
 - `traefik_api_url?` — base URL of Traefik's API, read in `health-rolling` mode to
   drain old replicas via the top-level `serverStatus` map.
 - `deployment_constraints.max_replicas` — upper bound on requested replicas (default `10`).
+  The Docker controller additionally clamps every request to a hard backstop of `50`
+  regardless of this value, so raising it above `50` silently clamps (with only a
+  server-side log).
 - `access_classes` — ingress access classes (keyed by identifier) defining
   authentication levels, mirroring the Kubernetes variant.
 - `auth_backend_url` — internal URL Traefik uses to reach the Rise backend for the
