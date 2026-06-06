@@ -143,6 +143,14 @@ pub(crate) fn routable_for(
 /// `{project}-{group}-{container}`; a multi-route container yields per-route
 /// `{base}-{idx}` names (longest path-prefix first, matching the renderer).
 ///
+/// `primary_hosts` is the deployment's resolved ingress hosts. The label renderer
+/// emits a router (and thus a Traefik service) only for routes that have at least
+/// one host (`render_traefik_labels_for` gates each route on `!hosts.is_empty()`,
+/// and the runtime routes all share `primary_hosts`). When `primary_hosts` is
+/// empty NO router is stamped, so this returns empty too — otherwise the
+/// reconciler would query `serverStatus` for services Traefik never registered
+/// and log a misleading WARN every tick.
+///
 /// A port-less worker has no routes/service → empty. Routability is implicit:
 /// the caller only consults this in `HealthRolling` mode, where every deployment
 /// is routable.
@@ -151,8 +159,12 @@ pub(crate) fn service_names_for_spec(
     deployment_group: &str,
     spec: &crate::server::deployment::models::ContainerSpec,
     route_specs: &[crate::server::deployment::models::RouteSpec],
+    primary_hosts: &[String],
 ) -> Vec<String> {
-    if spec.port.is_none() {
+    // No routable host → no router stamped → no service to query (mirrors the
+    // label renderer's per-route `!hosts.is_empty()` gate; the runtime routes all
+    // share the deployment's `primary_hosts`).
+    if spec.port.is_none() || primary_hosts.is_empty() {
         return Vec::new();
     }
     let base = container_builder::group_service_base(project, deployment_group, &spec.name);
@@ -569,8 +581,9 @@ mod tests {
         // The base carries the injective hash suffix `group_service_base`
         // appends, so derive it the same way rather than hardcoding the hash.
         let base = container_builder::group_service_base("myapp", "default", "app");
+        let hosts = ["myapp.rise.dev".to_string()];
         assert_eq!(
-            service_names_for_spec("myapp", "default", &spec, &routes),
+            service_names_for_spec("myapp", "default", &spec, &routes, &hosts),
             vec![base]
         );
     }
@@ -609,8 +622,9 @@ mod tests {
         // The base carries the injective hash suffix, so derive the per-route
         // names via `group_service_name` rather than hardcoding the hash.
         let base = container_builder::group_service_base("myapp", "default", "api");
+        let hosts = ["myapp.rise.dev".to_string()];
         assert_eq!(
-            service_names_for_spec("myapp", "default", &spec, &routes),
+            service_names_for_spec("myapp", "default", &spec, &routes, &hosts),
             vec![
                 container_builder::group_service_name(&base, 0, 2),
                 container_builder::group_service_name(&base, 1, 2),
@@ -658,9 +672,12 @@ mod tests {
             (spec, routes)
         };
 
+        // The desired routes the labels are derived from all carry this host, so
+        // the runtime derivation must be given the same host set to agree.
+        let hosts = ["myapp.rise.dev".to_string()];
         for paths in [&["/"][..], &["/", "/api/v1"][..], &["/", "/a", "/bb"][..]] {
             let (spec, routes) = mk_spec_routes("app", paths);
-            let from_spec = service_names_for_spec("myapp", "default", &spec, &routes);
+            let from_spec = service_names_for_spec("myapp", "default", &spec, &routes, &hosts);
             let from_labels = group_service_names(&mk_desired("app", paths));
             assert_eq!(
                 from_spec, from_labels,
@@ -682,7 +699,38 @@ mod tests {
             env_overrides: vec![],
             health_check: None,
         };
-        assert!(service_names_for_spec("myapp", "default", &worker, &[]).is_empty());
+        let hosts = ["myapp.rise.dev".to_string()];
+        assert!(service_names_for_spec("myapp", "default", &worker, &[], &hosts).is_empty());
+    }
+
+    #[test]
+    fn service_names_for_spec_hostless_yields_empty() {
+        // A routable HTTP container whose deployment resolved NO ingress host
+        // emits no Traefik router (the label renderer gates each route on a
+        // non-empty host set), so the reconciler must query NO service — otherwise
+        // it would hit `serverStatus` for a service Traefik never registered and
+        // log a misleading WARN every tick. Mirrors `render_traefik_labels_for`.
+        use crate::server::deployment::models::{ContainerSpec, RouteSpec};
+        let spec = ContainerSpec {
+            name: "app".to_string(),
+            image: None,
+            port: Some(8080),
+            replicas: None,
+            cpu: None,
+            memory: None,
+            env_overrides: vec![],
+            health_check: None,
+        };
+        let routes = vec![RouteSpec {
+            path: "/".to_string(),
+            container: "app".to_string(),
+        }];
+        // Same spec/routes that yield a service WITH a host — but with no host the
+        // result is empty.
+        assert!(
+            service_names_for_spec("myapp", "default", &spec, &routes, &[]).is_empty(),
+            "no routable host → no service names"
+        );
     }
 
     #[test]

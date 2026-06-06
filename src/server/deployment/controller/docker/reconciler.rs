@@ -24,7 +24,9 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::container_builder::{self, BuilderConfig, DesiredContainer, DesiredRoute};
-use super::diff::{diff_desired_vs_actual, identity_key, ActualContainer, ReconcileAction};
+use super::diff::{
+    diff_desired_vs_actual, identity_key, ActualContainer, InspectedContainer, ReconcileAction,
+};
 use super::env::{hash_env, merge_container_env, pin_system_env};
 use super::health::{effective_health_path, probe_error_detail};
 use super::labels::{self, SUFFIX_ENV_HASH, SUFFIX_IMAGE, SUFFIX_MANAGED_BY};
@@ -38,6 +40,7 @@ use crate::server::deployment::resource_builder::ResourceBuilder;
 use crate::server::deployment::state_machine;
 use crate::server::deployment::webhook::{
     resolve_deployment_env_vars, resolve_runtime_containers, should_have_infrastructure,
+    DEPLOYING_TIMEOUT_MINUTES, PRE_PUSHED_TIMEOUT_MINUTES,
 };
 use crate::server::encryption::EncryptionProvider;
 use crate::server::registry::RegistryProvider;
@@ -47,13 +50,6 @@ use crate::db::deployments as db_deployments;
 use crate::db::env_vars as db_env_vars;
 use crate::db::environments as db_environments;
 use crate::db::projects as db_projects;
-
-/// Duration a deployment can be in Deploying state before timing out.
-/// Mirrors `webhook::DEPLOYING_TIMEOUT_MINUTES`.
-const DEPLOYING_TIMEOUT_MINUTES: i64 = 5;
-/// Duration a deployment can be in pre-Pushed states before timing out.
-/// Mirrors `webhook::PRE_PUSHED_TIMEOUT_MINUTES`.
-const PRE_PUSHED_TIMEOUT_MINUTES: i64 = 10;
 
 /// Controller HARD cap on the number of replicas the Docker backend will run for
 /// a single container spec. A single-host daemon can run many containers behind
@@ -131,37 +127,6 @@ pub struct ReconcilerConfig {
     /// own in-process health probe as the in-rotation proxy. See the `Docker`
     /// settings variant's `traefik_api_url`.
     pub traefik_api_url: Option<String>,
-}
-
-/// Owned snapshot of one `inspect_container` call, captured once per reconcile
-/// tick and reused by both the health probe and the `pod_status` builder. All
-/// fields are owned so the value can be stored in a map and unit-tested without
-/// a live daemon.
-#[derive(Debug, Clone)]
-pub struct InspectedContainer {
-    /// `state.status` as the lowercase Docker API string ("running", "exited",
-    /// "created", "restarting", "dead", …). `None` if absent.
-    pub status: Option<String>,
-    /// `state.running`.
-    pub running: bool,
-    /// `state.started_at` (RFC3339 string from the daemon).
-    pub started_at: Option<String>,
-    /// `state.finished_at`.
-    pub finished_at: Option<String>,
-    /// `state.exit_code`.
-    pub exit_code: Option<i64>,
-    /// TOP-LEVEL `restart_count` from the inspect response (not inside state).
-    pub restart_count: Option<i64>,
-    /// `state.health.status` ("none"/"starting"/"healthy"/"unhealthy").
-    pub health: Option<String>,
-    /// `state.error` (non-empty only).
-    pub error: Option<String>,
-    /// IPv4 address on the configured Traefik network (the non-published probe
-    /// target). `None` if not attached/assigned yet.
-    pub ip: Option<String>,
-    /// The random `127.0.0.1` host port Docker published for the app port (only
-    /// when `publish_app_ports` created a binding). The published probe target.
-    pub published_host_port: Option<String>,
 }
 
 /// Background reconciler. Holds everything needed to converge Docker state with
@@ -342,10 +307,12 @@ impl DockerReconciler {
             // alongside the new leader for up to the lease TTL. `ensure_leader_for`
             // short-circuits to a local-clock check when the cached lease horizon
             // already covers `PER_PROJECT_MIN_VALIDITY` (zero DB cost in steady
-            // state); otherwise it falls back to a DB-verified, DB-blip-tolerant
-            // `verify_leader` round-trip. On confirmed loss we ABORT the remainder
-            // of the tick rather than skipping just this project — the lease is
-            // global, so once it's gone no further project may act this tick.
+            // state); otherwise it falls back to a `verify_leader` DB round-trip.
+            // A DB-verification FAILURE fails safe (skips the tick) — see
+            // `confirm_leadership` — because the shared daemon stays reachable
+            // during a DB partition. On confirmed loss (or a DB error) we ABORT
+            // the remainder of the tick rather than skipping just this project —
+            // the lease is global, so once it's gone no further project may act.
             if !self.confirm_leadership(election).await {
                 return Ok(());
             }
@@ -358,10 +325,17 @@ impl DockerReconciler {
 
     /// Re-verify leadership before a project's destructive work, mirroring the
     /// resource-GC worker's per-row `ensure_leader_for` check. Returns `true` to
-    /// proceed, `false` to ABORT the rest of the tick (confirmed loss of the
-    /// global lease). A transient DB blip during verification falls back to the
-    /// cached `is_leader()` flag and continues (same DB-blip-tolerant semantics as
-    /// the sibling controllers), so a brief DB hiccup doesn't stall reconciliation.
+    /// proceed, `false` to SKIP the destructive work (abort the rest of the tick).
+    ///
+    /// Unlike the sibling controllers, a DB-verification failure here FAILS SAFE
+    /// by returning `false` (skip the tick) rather than falling back to the cached
+    /// `is_leader()` flag. The Docker daemon is reachable during a DB-only
+    /// partition, so a partitioned former leader trusting its stale cached flag
+    /// would mutate the SAME daemon a DB-reachable peer is legitimately driving —
+    /// a split-brain. (The GC sibling's destructive op is itself a Postgres write,
+    /// unreachable during the partition, so its cached fallback is harmless; that
+    /// safety does not transfer to a reachable daemon.) Daemon ops are reversible
+    /// and retried next tick, so skipping on a DB blip is the correct, safe choice.
     async fn confirm_leadership(&self, election: &LeaderElection) -> bool {
         match election.ensure_leader_for(PER_PROJECT_MIN_VALIDITY).await {
             Ok(LeaderStatus::Leader) => true,
@@ -370,19 +344,18 @@ impl DockerReconciler {
                 false
             }
             Err(LeaseError::Db(e)) => {
-                if election.is_leader() {
-                    warn!(
-                        error = ?e,
-                        "Leader verification DB blip; falling back to cached flag and continuing"
-                    );
-                    true
-                } else {
-                    warn!(
-                        error = ?e,
-                        "Leader verification failed and cached flag is false; aborting tick"
-                    );
-                    false
-                }
+                // FAIL SAFE: do NOT trust the cached `is_leader()` flag. A
+                // partitioned former leader keeps it set during a DB-only
+                // partition while a DB-reachable peer takes the lease; trusting
+                // it would race both against the shared, still-reachable daemon.
+                // Skip the tick — daemon ops are reversible and retried next tick.
+                warn!(
+                    error = ?e,
+                    "Leader verification DB error; failing safe and skipping the tick \
+                     (the shared Docker daemon stays reachable during a DB partition, so \
+                     trusting a stale cached leader flag could split-brain the daemon)"
+                );
+                false
             }
             Err(e @ LeaseError::InvalidMinValidity { .. }) => {
                 // Programmer error: PER_PROJECT_MIN_VALIDITY must fit inside
@@ -529,7 +502,8 @@ impl DockerReconciler {
         if !self.confirm_leadership(election).await {
             return Ok(());
         }
-        self.apply_actions(project, &desired, &actions).await?;
+        self.apply_actions(project, &desired, &actions, election)
+            .await?;
 
         // 4. Health → status (probe routable containers, transition).
         let non_terminal =
@@ -1069,6 +1043,7 @@ impl DockerReconciler {
         project: &Project,
         desired: &[DesiredContainer],
         actions: &[ReconcileAction],
+        election: &LeaderElection,
     ) -> Result<()> {
         let builder_cfg = self.builder_cfg();
         // Index desired containers by their stable IDENTITY tuple so an action
@@ -1089,6 +1064,16 @@ impl DockerReconciler {
             .collect();
 
         for action in actions {
+            // Re-verify leadership before EACH destructive action. A single
+            // Create/Recreate can cold-`pull_image` for tens of seconds —
+            // exceeding `PER_PROJECT_MIN_VALIDITY` — so the lease confirmed before
+            // the loop may have lapsed by the time a later action runs. This fails
+            // safe (skips on a DB error, per #1) and is zero-cost on the fast path
+            // (cached horizon). On loss we STOP applying further actions for this
+            // project — the lease is global, so no further daemon op may run.
+            if !self.confirm_leadership(election).await {
+                return Ok(());
+            }
             match action {
                 ReconcileAction::Create {
                     identity,
@@ -1260,9 +1245,15 @@ impl DockerReconciler {
     /// container is still present — otherwise two same-identity containers would
     /// share the alias + router, both serving (incl. the stale image). GC callers
     /// that don't care about the outcome can ignore the result.
+    ///
+    /// A `404` (container already gone — an out-of-band removal race) is treated
+    /// as SUCCESS: delete is idempotent, the desired end-state (container absent)
+    /// already holds, so the Recreate path proceeds and GC stays quiet. Any other
+    /// failure still returns `Err`, so the Recreate guard keeps fencing a genuinely
+    /// stuck remove.
     async fn remove_container(&self, id: &str) -> Result<()> {
         use bollard::container::RemoveContainerOptions;
-        if let Err(e) = self
+        match self
             .docker
             .remove_container(
                 id,
@@ -1273,10 +1264,17 @@ impl DockerReconciler {
             )
             .await
         {
-            warn!(container_id = %id, "Failed to remove container: {:?}", e);
-            return Err(anyhow::anyhow!("Failed to remove container {id}: {e:?}"));
+            Ok(()) => Ok(()),
+            Err(e) if is_not_found(&e) => {
+                // Already gone (out-of-band removal race): idempotent success.
+                debug!(container_id = %id, "Container already removed (404); treating as success");
+                Ok(())
+            }
+            Err(e) => {
+                warn!(container_id = %id, "Failed to remove container: {:?}", e);
+                Err(anyhow::anyhow!("Failed to remove container {id}: {e:?}"))
+            }
         }
-        Ok(())
     }
 
     // ── Health → status ────────────────────────────────────────────────
@@ -1323,6 +1321,40 @@ impl DockerReconciler {
         } else {
             None
         }
+    }
+
+    /// Resolve the deployment's primary ingress hosts — the same set
+    /// `compute_desired_for_deployment` feeds into each route's `hosts`. Used by
+    /// the `HealthRolling` readiness pass to decide whether the container emits a
+    /// Traefik router at all (no host → no router → no `serverStatus` to query).
+    async fn primary_hosts_for_deployment(
+        &self,
+        project: &Project,
+        deployment: &Deployment,
+    ) -> Result<Vec<String>> {
+        let environment = if let Some(env_id) = deployment.environment_id {
+            db_environments::find_by_id(&self.db_pool, env_id).await?
+        } else {
+            None
+        };
+        let all_environments = db_environments::list_for_project(&self.db_pool, project.id).await?;
+        let custom_domains =
+            db_custom_domains::list_project_custom_domains(&self.db_pool, project.id).await?;
+        Ok(self
+            .resource_builder
+            .primary_ingress_hosts(
+                project,
+                &deployment.deployment_group,
+                environment.as_ref().filter(|env| {
+                    env.primary_deployment_group.as_deref() == Some(&deployment.deployment_group)
+                }),
+                &custom_domains,
+                true,
+                &all_environments,
+            )
+            .into_iter()
+            .map(|h| h.host)
+            .collect())
     }
 
     async fn reconcile_health(
@@ -1372,6 +1404,15 @@ impl DockerReconciler {
             |i: &Option<InspectedContainer>| i.as_ref().map(|i| i.running).unwrap_or(false);
         let rolling =
             self.config.cutover_strategy == crate::server::settings::CutoverStrategy::HealthRolling;
+        // Only the `HealthRolling` readiness pass consults `service_names_for_spec`
+        // (and only it needs the host gate), so resolve the hosts once per tick
+        // for this deployment, lazily — non-rolling groups pay nothing.
+        let primary_hosts = if rolling {
+            self.primary_hosts_for_deployment(project, deployment)
+                .await?
+        } else {
+            Vec::new()
+        };
         for spec in &container_specs {
             let replica_count = clamp_replicas(spec.replicas);
             // In `HealthRolling` mode, the readiness signal that drives the
@@ -1390,6 +1431,7 @@ impl DockerReconciler {
                 &deployment.deployment_group,
                 spec,
                 &route_specs,
+                &primary_hosts,
             );
             let has_health_path = effective_health_path(spec, &self.config.health_path).is_some();
             let server_status = if rolling {
@@ -1901,7 +1943,7 @@ impl DockerReconciler {
 ///   every project.
 /// - Otherwise the Organization must set exactly the same class; an unset or
 ///   differing Org class means the project belongs to another controller.
-pub fn controller_class_matches(configured: &str, org_class: Option<&str>) -> bool {
+fn controller_class_matches(configured: &str, org_class: Option<&str>) -> bool {
     if configured.is_empty() {
         return true;
     }
@@ -1913,6 +1955,20 @@ pub fn controller_class_matches(configured: &str, org_class: Option<&str>) -> bo
 /// computation and health aggregation so both always agree on the replica count.
 fn clamp_replicas(requested: Option<u32>) -> u32 {
     requested.unwrap_or(1).clamp(1, MAX_REPLICAS)
+}
+
+/// Whether a bollard error is the daemon's "no such container" (HTTP 404). Used
+/// to treat an already-gone container as an idempotent removal success (the
+/// desired end-state — container absent — already holds). Kept as a pure helper
+/// so the classification is unit-testable without a live daemon.
+fn is_not_found(e: &bollard::errors::Error) -> bool {
+    matches!(
+        e,
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            ..
+        }
+    )
 }
 
 #[cfg(test)]
@@ -1935,6 +1991,32 @@ mod tests {
         ));
         // Org with no class set is owned by no specific controller.
         assert!(!controller_class_matches("docker.rise.dev/default", None));
+    }
+
+    #[test]
+    fn is_not_found_matches_404_only() {
+        // A 404 from the daemon (container already gone) is classified as
+        // not-found → `remove_container` treats it as idempotent success.
+        assert!(is_not_found(
+            &bollard::errors::Error::DockerResponseServerError {
+                status_code: 404,
+                message: "no such container".to_string(),
+            }
+        ));
+        // Any other server error (e.g. 409 conflict / 500) is NOT not-found, so
+        // the Recreate guard still fences a genuinely-stuck remove.
+        assert!(!is_not_found(
+            &bollard::errors::Error::DockerResponseServerError {
+                status_code: 409,
+                message: "removal already in progress".to_string(),
+            }
+        ));
+        assert!(!is_not_found(
+            &bollard::errors::Error::DockerResponseServerError {
+                status_code: 500,
+                message: "boom".to_string(),
+            }
+        ));
     }
 
     #[test]

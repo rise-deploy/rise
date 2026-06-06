@@ -101,9 +101,9 @@ pub struct FinalizeResponse {
 // ── Deployment timeout ─────────────────────────────────────────────────
 
 /// Duration a deployment can be in Deploying state before timing out
-const DEPLOYING_TIMEOUT_MINUTES: i64 = 5;
+pub(crate) const DEPLOYING_TIMEOUT_MINUTES: i64 = 5;
 /// Duration a deployment can be in pre-Pushed states before timing out
-const PRE_PUSHED_TIMEOUT_MINUTES: i64 = 10;
+pub(crate) const PRE_PUSHED_TIMEOUT_MINUTES: i64 = 10;
 /// Duration after which image pull secret is refreshed (6 hours)
 const SECRET_REFRESH_HOURS: i64 = 6;
 /// Maximum number of terminating/terminated pods to carry forward in controller_metadata

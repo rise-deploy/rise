@@ -105,6 +105,37 @@ impl ActualContainer {
     }
 }
 
+/// Owned snapshot of one `inspect_container` call, captured once per reconcile
+/// tick and reused by both the health probe and the `pod_status` builder. All
+/// fields are owned so the value can be stored in a map and unit-tested without
+/// a live daemon.
+#[derive(Debug, Clone)]
+pub struct InspectedContainer {
+    /// `state.status` as the lowercase Docker API string ("running", "exited",
+    /// "created", "restarting", "dead", …). `None` if absent.
+    pub status: Option<String>,
+    /// `state.running`.
+    pub running: bool,
+    /// `state.started_at` (RFC3339 string from the daemon).
+    pub started_at: Option<String>,
+    /// `state.finished_at`.
+    pub finished_at: Option<String>,
+    /// `state.exit_code`.
+    pub exit_code: Option<i64>,
+    /// TOP-LEVEL `restart_count` from the inspect response (not inside state).
+    pub restart_count: Option<i64>,
+    /// `state.health.status` ("none"/"starting"/"healthy"/"unhealthy").
+    pub health: Option<String>,
+    /// `state.error` (non-empty only).
+    pub error: Option<String>,
+    /// IPv4 address on the configured Traefik network (the non-published probe
+    /// target). `None` if not attached/assigned yet.
+    pub ip: Option<String>,
+    /// The random `127.0.0.1` host port Docker published for the app port (only
+    /// when `publish_app_ports` created a binding). The published probe target.
+    pub published_host_port: Option<String>,
+}
+
 /// What to do with one container slot.
 ///
 /// Create/Recreate carry the stable `identity` (so `apply_actions` can find the

@@ -39,7 +39,6 @@ use std::sync::Arc;
 /// Reconciliation/health checks/termination run in
 /// [`reconciler::DockerReconciler`], spawned at startup (see `state.rs`).
 pub struct DockerBackend {
-    #[allow(dead_code)]
     docker: Docker,
     resource_builder: Arc<ResourceBuilder>,
     db_pool: PgPool,

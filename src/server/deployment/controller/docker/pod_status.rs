@@ -4,7 +4,7 @@
 
 use chrono::Utc;
 
-use super::reconciler::InspectedContainer;
+use super::diff::InspectedContainer;
 use crate::db::models::DeploymentStatus;
 
 /// Assemble the `controller_metadata` JSON for the deployment: a
