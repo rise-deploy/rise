@@ -1,0 +1,22 @@
+[package]
+name = "rise-backend-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rise-deploy/rise"
+description = "Shared deployment-backend contracts for Rise (models, traits, URL/quantity helpers)"
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Only for `#[derive(sqlx::FromRow)]` / `#[derive(sqlx::Type)]` on the moved
+# models. This crate never opens a connection or runs a query — the
+# `DeploymentStore` implementation lives in `rise-deploy`.
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
