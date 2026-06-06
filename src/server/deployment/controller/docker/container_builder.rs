@@ -587,6 +587,29 @@ pub fn group_service_names(desired: &DesiredContainer) -> Vec<String> {
         .collect()
 }
 
+/// Whether the Traefik router must be WITHHELD for a container with this access
+/// class — i.e. the class resolves to an auth requirement (Authenticated/Member,
+/// INCLUDING the fail-closed unknown-class→Member case) but no forwardAuth can be
+/// wired because `auth_backend_url` is empty. Stamping a router then would expose
+/// the app as an open public route, so the router is withheld (the app is not
+/// routed). The authoritative definition of the withhold condition: both the
+/// label renderer (which omits the router) AND the reconciler (which must then
+/// treat the container as NOT routable, so a misconfigured deploy surfaces as
+/// not-Healthy instead of silently Healthy-but-unrouted) consult this.
+pub(crate) fn router_withheld(
+    access_class: &str,
+    access_classes: &HashMap<String, AccessRequirement>,
+    auth_backend_url: &str,
+) -> bool {
+    // Unknown/removed class fails closed to the most restrictive requirement.
+    let requirement = access_classes
+        .get(access_class)
+        .cloned()
+        .unwrap_or(AccessRequirement::Member);
+    let auth_required = !matches!(requirement, AccessRequirement::None);
+    auth_required && auth_backend_url.is_empty()
+}
+
 /// Render the full Traefik label map for a desired container.
 ///
 /// Empty when the container is not routable (superseded / not-yet-active
@@ -662,8 +685,11 @@ fn render_traefik_labels_for(
     // no middleware would expose the app as an OPEN public route — exactly what
     // the access class forbids. K8s exposes nothing in this case, so for parity
     // we withhold ALL routers for this container: the app is simply not routed.
-    let auth_required = !matches!(requirement, AccessRequirement::None);
-    if auth_required && forward_auth_address.is_none() {
+    if router_withheld(
+        &desired.access_class,
+        cfg.access_classes,
+        cfg.auth_backend_url,
+    ) {
         tracing::warn!(
             project = %desired.project,
             access_class = %desired.access_class,
@@ -1871,6 +1897,28 @@ mod tests {
         let built = build_container(&desired, &cfg);
         let labels = built.config.labels.as_ref().unwrap();
         assert!(!labels.keys().any(|k| k.contains("forwardauth")));
+    }
+
+    #[test]
+    fn router_withheld_predicate_matches_render_and_reconciler_contract() {
+        use crate::server::settings::AccessRequirement;
+        let mut classes: HashMap<String, AccessRequirement> = HashMap::new();
+        classes.insert("public".into(), AccessRequirement::None);
+        classes.insert("members".into(), AccessRequirement::Member);
+        // None requirement → never withheld, even with an empty backend URL.
+        assert!(!router_withheld("public", &classes, ""));
+        // Auth-required + empty URL → withheld (can't wire forwardAuth).
+        assert!(router_withheld("members", &classes, ""));
+        // Auth-required + configured URL → routed behind forwardAuth, not withheld.
+        assert!(!router_withheld("members", &classes, "http://rise:3000"));
+        // Unknown/removed class fails closed to Member → withheld when URL empty,
+        // routed (behind forwardAuth) when a URL is configured.
+        assert!(router_withheld("stale-removed", &classes, ""));
+        assert!(!router_withheld(
+            "stale-removed",
+            &classes,
+            "http://rise:3000"
+        ));
     }
 
     #[test]

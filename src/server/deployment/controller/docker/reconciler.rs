@@ -783,7 +783,19 @@ impl DockerReconciler {
         //   cutover gap. Making the new deployment routable from the start (rather
         //   than active-gating) also avoids the g1→g2 route-hash churn a recreate
         //   would otherwise cause when `is_active` later flips.
-        let routable = routable_for(self.config.cutover_strategy, deployment.is_active);
+        // A container whose Traefik router would be WITHHELD (auth required but
+        // no `auth_backend_url` to wire forwardAuth — a misconfiguration that
+        // fails closed in the builder) must also be treated as NOT routable here,
+        // so the cutover/readiness path doesn't mark a never-routed container as
+        // in-rotation (ready-when-running) and silently report the deploy Healthy.
+        // Keeping routability consistent with router emission makes such a deploy
+        // surface as not-Healthy instead. Same predicate the builder uses.
+        let routable = routable_for(self.config.cutover_strategy, deployment.is_active)
+            && !container_builder::router_withheld(
+                &project.access_class,
+                &self.config.access_classes,
+                &self.config.auth_backend_url,
+            );
 
         // Cross-container service discovery: expose each routable sibling's
         // address as `RISE_CONTAINER_HOST__<NAME>=<host>:<port>`, mirroring the
