@@ -8,13 +8,15 @@
 //! The diff itself ([`diff_desired_vs_actual`]) is a pure function so it can be
 //! unit-tested without a daemon.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bollard::Docker;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::StreamExt;
+use rand::Rng;
+use rise_backend_auth::{RiseTokenSigner, WorkloadSubjectInfo};
 use rise_runtime_sync::{
     with_leader_election, LeaderElection, LeaderStatus, LeaseError, LEASE_DURATION,
 };
@@ -44,6 +46,7 @@ use crate::server::deployment::webhook::{
 };
 use crate::server::encryption::EncryptionProvider;
 use crate::server::registry::RegistryProvider;
+use crate::server::workload_tokens::{sha256_hex, workload_subject, NO_ENVIRONMENT};
 
 use crate::db::custom_domains as db_custom_domains;
 use crate::db::deployments as db_deployments;
@@ -147,10 +150,34 @@ pub struct DockerReconciler {
     /// when `config.traefik_api_url` is unset (or unparseable) → the reconciler
     /// falls back to Rise's own probe as the in-rotation proxy.
     traefik_api: Option<super::traefik_api::TraefikApiClient>,
+    /// Signs the per-audience workload JWTs delivered as `[identity]` token files
+    /// (and the credential-backed token-exchange endpoint uses the same signer).
+    jwt_signer: Arc<RiseTokenSigner>,
+    /// TTL for auto-minted `[identity]` workload tokens. Tokens are refreshed
+    /// in-place once more than half this TTL has elapsed (parity with the K8s
+    /// webhook's re-mint-at-50% behavior).
+    identity_token_ttl_seconds: u64,
+    /// Per-deployment timestamp of the last in-place token refresh, keyed by
+    /// `deployment_id`. Ephemeral (lost on restart, which only triggers one extra
+    /// refresh) and only ever touched on the single leader's sequential tick.
+    identity_refresh: Mutex<HashMap<String, DateTime<Utc>>>,
     config: ReconcilerConfig,
 }
 
+/// Workload-identity material prepared once per deployment per tick and delivered
+/// into each of the deployment's containers right after create (before start).
+#[derive(Clone)]
+struct PreparedIdentity {
+    /// The deployment's stable bootstrap credential (recovered from an existing
+    /// container, or freshly generated for a brand-new deployment).
+    credential: String,
+    /// Freshly minted per-audience workload tokens (filename → JWT). Empty when
+    /// the deployment declares no `[identity].audiences`.
+    tokens: BTreeMap<String, String>,
+}
+
 impl DockerReconciler {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         docker: Docker,
         db_pool: PgPool,
@@ -158,6 +185,8 @@ impl DockerReconciler {
         registry_provider: Arc<dyn RegistryProvider>,
         encryption_provider: Option<Arc<dyn EncryptionProvider>>,
         resource_store: Arc<dyn rise_resource_store::ResourceStore>,
+        jwt_signer: Arc<RiseTokenSigner>,
+        identity_token_ttl_seconds: u64,
         config: ReconcilerConfig,
     ) -> Self {
         // Built once and reused; on the (unlikely) builder failure fall back to
@@ -187,6 +216,9 @@ impl DockerReconciler {
             resource_store,
             http_client,
             traefik_api,
+            jwt_signer,
+            identity_token_ttl_seconds,
+            identity_refresh: Mutex::new(HashMap::new()),
             config,
         }
     }
@@ -494,6 +526,19 @@ impl DockerReconciler {
         } else {
             actions
         };
+        // Prepare workload-identity material for every deployment that has a
+        // Create/Recreate action this tick: resolve its stable bootstrap
+        // credential (recovered from an existing container or freshly generated),
+        // persist the credential hash so the token-exchange endpoint can
+        // authenticate the app, and mint its per-audience tokens. The result is
+        // delivered into each new container right after create (before start).
+        // Computed BEFORE apply so the credential can be read back from the
+        // soon-to-be-replaced container while it still exists.
+        let identity_deploy_ids = deployment_ids_with_create_or_recreate(&actions);
+        let prepared_identity = self
+            .prepare_identities(project, &non_terminal, &actual, &identity_deploy_ids)
+            .await;
+
         // Re-verify leadership immediately before the Docker-daemon-destructive
         // apply: the desired computation + health probing above can take a while,
         // so the lease may have lapsed since the per-project check in `tick`. If
@@ -502,8 +547,18 @@ impl DockerReconciler {
         if !self.confirm_leadership(election).await {
             return Ok(());
         }
-        self.apply_actions(project, &desired, &actions, election)
+        self.apply_actions(project, &desired, &actions, &prepared_identity, election)
             .await?;
+
+        // Refresh auto-minted `[identity]` token files in place for long-running
+        // containers whose tokens are past half their TTL — parity with the K8s
+        // webhook's re-mint behavior, which keeps mounted token files fresh
+        // without recreating the workload. Daemon-destructive (it re-uploads
+        // files), so it is leader-gated like apply.
+        if self.confirm_leadership(election).await {
+            self.refresh_identity_tokens(project, &non_terminal, &actual)
+                .await;
+        }
 
         // 4. Health → status (probe routable containers, transition).
         let non_terminal =
@@ -1055,6 +1110,7 @@ impl DockerReconciler {
         project: &Project,
         desired: &[DesiredContainer],
         actions: &[ReconcileAction],
+        prepared_identity: &HashMap<String, PreparedIdentity>,
         election: &LeaderElection,
     ) -> Result<()> {
         let builder_cfg = self.builder_cfg();
@@ -1097,8 +1153,12 @@ impl DockerReconciler {
                         // container's name + `generation` label match the action.
                         let mut d = (*d).clone();
                         d.generation = *generation;
+                        let identity = prepared_identity.get(&d.deployment_id);
                         // Plain create (no pre-pull) pulls the image itself.
-                        if let Err(e) = self.create_container(&d, &builder_cfg, false).await {
+                        if let Err(e) = self
+                            .create_container(&d, &builder_cfg, false, identity)
+                            .await
+                        {
                             error!(
                                 project = %project.name,
                                 container = %name,
@@ -1156,7 +1216,11 @@ impl DockerReconciler {
                         // remove, so skip the pull inside `create_container` — a
                         // transient pull failure must not strand us with the old
                         // container already gone. The image is pulled exactly once.
-                        if let Err(e) = self.create_container(&d, &builder_cfg, true).await {
+                        let identity = prepared_identity.get(&d.deployment_id);
+                        if let Err(e) = self
+                            .create_container(&d, &builder_cfg, true, identity)
+                            .await
+                        {
                             error!(
                                 project = %project.name,
                                 container = %name,
@@ -1191,6 +1255,7 @@ impl DockerReconciler {
         desired: &DesiredContainer,
         builder_cfg: &BuilderConfig<'_>,
         already_pulled: bool,
+        identity: Option<&PreparedIdentity>,
     ) -> Result<()> {
         use bollard::container::{CreateContainerOptions, StartContainerOptions};
 
@@ -1211,11 +1276,285 @@ impl DockerReconciler {
                 built.config,
             )
             .await?;
+
+        // Deliver the workload-identity files (bootstrap credential + per-audience
+        // tokens) into the created-but-not-yet-started container, so they are
+        // present at `/var/run/secrets/rise/identity/` when the app's process
+        // first runs. On failure, remove the half-provisioned container and bail
+        // so the slot is recreated next tick rather than running without identity.
+        if let Some(identity) = identity {
+            if let Err(e) = self.deliver_identity(&built.name, identity).await {
+                error!(
+                    container = %built.name,
+                    "Failed to deliver workload-identity files; removing container to retry: {:?}",
+                    e
+                );
+                let _ = self.remove_container(&built.name).await;
+                return Err(e);
+            }
+        }
+
         self.docker
             .start_container(&built.name, None::<StartContainerOptions<String>>)
             .await?;
+        // Record the delivery time so the periodic refresh does not immediately
+        // re-mint freshly delivered tokens.
+        if identity.is_some() {
+            self.identity_refresh
+                .lock()
+                .expect("identity_refresh mutex poisoned")
+                .insert(desired.deployment_id.clone(), Utc::now());
+        }
         info!(container = %built.name, image = %desired.image, "Created and started container");
         Ok(())
+    }
+
+    /// Upload a deployment's bootstrap credential + per-audience token files into
+    /// a container via the Docker archive API.
+    async fn deliver_identity(&self, container: &str, identity: &PreparedIdentity) -> Result<()> {
+        let tar =
+            super::identity::build_identity_tar(Some(&identity.credential), &identity.tokens)?;
+        super::identity::upload_identity(&self.docker, container, tar).await
+    }
+
+    // ── Workload identity ───────────────────────────────────────────────
+
+    /// Prepare the workload-identity material for each deployment that has a
+    /// Create/Recreate action this tick. A preparation failure is isolated and
+    /// logged: the container is still created (it just won't carry identity files
+    /// until a later (re)create), so one transient error can't stall a rollout.
+    async fn prepare_identities(
+        &self,
+        project: &Project,
+        deployments: &[Deployment],
+        actual: &[ActualContainer],
+        deploy_ids: &HashSet<String>,
+    ) -> HashMap<String, PreparedIdentity> {
+        let mut out = HashMap::new();
+        if deploy_ids.is_empty() {
+            return out;
+        }
+        for deployment in deployments {
+            if !deploy_ids.contains(&deployment.deployment_id)
+                || !should_have_infrastructure(deployment)
+            {
+                continue;
+            }
+            match self.prepare_identity(project, deployment, actual).await {
+                Ok(prepared) => {
+                    out.insert(deployment.deployment_id.clone(), prepared);
+                }
+                Err(e) => warn!(
+                    deployment_id = %deployment.deployment_id,
+                    "Failed to prepare workload identity; container(s) will be created \
+                     without identity files this tick: {:?}",
+                    e
+                ),
+            }
+        }
+        out
+    }
+
+    /// Resolve a deployment's stable bootstrap credential, persist its hash, and
+    /// mint its per-audience tokens.
+    async fn prepare_identity(
+        &self,
+        project: &Project,
+        deployment: &Deployment,
+        actual: &[ActualContainer],
+    ) -> Result<PreparedIdentity> {
+        let env_name = self.resolve_environment_name(deployment).await?;
+        let credential = self.resolve_credential(deployment, actual).await;
+
+        // Persist the credential hash so the token-exchange endpoint can look the
+        // deployment up by the credential the app presents. Idempotent: only
+        // written when it differs from what is already on record.
+        let hash = sha256_hex(credential.as_bytes());
+        if deployment.identity_credential_hash.as_deref() != Some(hash.as_str()) {
+            db_deployments::set_identity_credential_hash(&self.db_pool, deployment.id, &hash)
+                .await
+                .context("Failed to persist identity credential hash")?;
+        }
+
+        let tokens = self.mint_audience_tokens(project, deployment, env_name.as_deref())?;
+        Ok(PreparedIdentity { credential, tokens })
+    }
+
+    /// Recover the deployment's stable bootstrap credential from any of its
+    /// existing containers (the Docker analogue of K8s reading it back from the
+    /// observed Secret), falling back to a freshly generated one for a brand-new
+    /// deployment. Reusing the observed value keeps the credential — and thus the
+    /// persisted hash and every replica's credential file — stable across
+    /// recreates, restarts, and scale-up.
+    async fn resolve_credential(
+        &self,
+        deployment: &Deployment,
+        actual: &[ActualContainer],
+    ) -> String {
+        for container in actual
+            .iter()
+            .filter(|c| c.deployment_id_label.as_deref() == Some(deployment.deployment_id.as_str()))
+        {
+            if let Some(credential) =
+                super::identity::read_back_credential(&self.docker, &container.name).await
+            {
+                return credential;
+            }
+        }
+        generate_bootstrap_credential()
+    }
+
+    /// Mint one Rise-signed workload JWT per `[identity].audiences` entry
+    /// (filename → JWT). Empty when the deployment declares no audiences. Mirrors
+    /// the K8s webhook's claims (subject, project, environment, group, id).
+    fn mint_audience_tokens(
+        &self,
+        project: &Project,
+        deployment: &Deployment,
+        env_name: Option<&str>,
+    ) -> Result<BTreeMap<String, String>> {
+        let audiences: BTreeMap<String, String> =
+            serde_json::from_value(deployment.identity_audiences.clone()).unwrap_or_default();
+        if audiences.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+
+        let sub = workload_subject(&project.name, env_name);
+        let info = WorkloadSubjectInfo {
+            sub: &sub,
+            project: &project.name,
+            environment: env_name.unwrap_or(NO_ENVIRONMENT),
+            deployment_group: &deployment.deployment_group,
+            deployment_id: &deployment.deployment_id,
+        };
+
+        let mut out = BTreeMap::new();
+        for (filename, audience) in &audiences {
+            if !super::identity::is_safe_token_filename(filename) {
+                warn!(
+                    deployment_id = %deployment.deployment_id,
+                    filename = %filename,
+                    "Skipping [identity] audience with an unsafe token filename"
+                );
+                continue;
+            }
+            let jwt = self
+                .jwt_signer
+                .sign_workload_jwt(&info, audience, self.identity_token_ttl_seconds)
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to sign workload token for audience {audience}: {e:?}")
+                })?;
+            out.insert(filename.clone(), jwt);
+        }
+        Ok(out)
+    }
+
+    /// Re-mint and re-upload the `[identity]` token files for long-running
+    /// containers whose tokens are past half their TTL — parity with the K8s
+    /// webhook's re-mint behavior, keeping mounted token files fresh without
+    /// recreating the workload. The bootstrap credential is left untouched (it is
+    /// stable and already present), so only the token files are rewritten.
+    async fn refresh_identity_tokens(
+        &self,
+        project: &Project,
+        deployments: &[Deployment],
+        actual: &[ActualContainer],
+    ) {
+        let refresh_after =
+            chrono::Duration::seconds((self.identity_token_ttl_seconds / 2).max(1) as i64);
+        for deployment in deployments {
+            if !should_have_infrastructure(deployment) {
+                continue;
+            }
+            // Cheap pre-check: skip deployments with no audiences (no token files).
+            let has_audiences = deployment
+                .identity_audiences
+                .as_object()
+                .map(|m| !m.is_empty())
+                .unwrap_or(false);
+            if !has_audiences {
+                continue;
+            }
+            // Per-deployment staleness gate (in-memory; a missing entry — e.g.
+            // after a restart — counts as stale and triggers one refresh).
+            let stale = {
+                let map = self
+                    .identity_refresh
+                    .lock()
+                    .expect("identity_refresh mutex poisoned");
+                map.get(&deployment.deployment_id)
+                    .map(|ts| Utc::now().signed_duration_since(*ts) >= refresh_after)
+                    .unwrap_or(true)
+            };
+            if !stale {
+                continue;
+            }
+            // Only the deployment's currently-running containers can receive an
+            // archive upload; just-created containers already carry fresh tokens.
+            let running: Vec<&ActualContainer> = actual
+                .iter()
+                .filter(|c| {
+                    c.deployment_id_label.as_deref() == Some(deployment.deployment_id.as_str())
+                        && c.state.as_deref() == Some("running")
+                })
+                .collect();
+            if running.is_empty() {
+                continue;
+            }
+
+            let env_name = match self.resolve_environment_name(deployment).await {
+                Ok(name) => name,
+                Err(e) => {
+                    warn!(deployment_id = %deployment.deployment_id, "Identity refresh: failed to resolve environment: {:?}", e);
+                    continue;
+                }
+            };
+            let tokens = match self.mint_audience_tokens(project, deployment, env_name.as_deref()) {
+                Ok(tokens) if !tokens.is_empty() => tokens,
+                Ok(_) => continue,
+                Err(e) => {
+                    warn!(deployment_id = %deployment.deployment_id, "Identity refresh: failed to mint tokens: {:?}", e);
+                    continue;
+                }
+            };
+            let tar = match super::identity::build_identity_tar(None, &tokens) {
+                Ok(tar) => tar,
+                Err(e) => {
+                    warn!(deployment_id = %deployment.deployment_id, "Identity refresh: failed to build tar: {:?}", e);
+                    continue;
+                }
+            };
+
+            let mut delivered_any = false;
+            for container in running {
+                match super::identity::upload_identity(&self.docker, &container.name, tar.clone())
+                    .await
+                {
+                    Ok(()) => delivered_any = true,
+                    Err(e) => warn!(
+                        container = %container.name,
+                        "Identity refresh: failed to upload tokens: {:?}", e
+                    ),
+                }
+            }
+            if delivered_any {
+                self.identity_refresh
+                    .lock()
+                    .expect("identity_refresh mutex poisoned")
+                    .insert(deployment.deployment_id.clone(), Utc::now());
+            }
+        }
+    }
+
+    /// Resolve a deployment's environment name (`None` for the no-environment
+    /// case), shared by identity preparation and refresh.
+    async fn resolve_environment_name(&self, deployment: &Deployment) -> Result<Option<String>> {
+        match deployment.environment_id {
+            Some(env_id) => Ok(db_environments::find_by_id(&self.db_pool, env_id)
+                .await?
+                .map(|e| e.name)),
+            None => Ok(None),
+        }
     }
 
     async fn pull_image(&self, image: &str) -> Result<()> {
@@ -1969,6 +2308,33 @@ fn clamp_replicas(requested: Option<u32>) -> u32 {
     requested.unwrap_or(1).clamp(1, MAX_REPLICAS)
 }
 
+/// Generate a fresh 32-byte bootstrap credential, base64url-encoded (no padding).
+/// Matches the K8s webhook's credential format so both backends present the same
+/// kind of bearer secret to the token-exchange endpoint.
+fn generate_bootstrap_credential() -> String {
+    use base64::Engine;
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// The set of `deployment_id`s that have a Create or Recreate action this tick —
+/// the deployments whose containers need workload-identity material prepared and
+/// delivered. The `deployment_id` is the third NUL-separated field of the action's
+/// identity key (see [`identity_key`]).
+fn deployment_ids_with_create_or_recreate(actions: &[ReconcileAction]) -> HashSet<String> {
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            ReconcileAction::Create { identity, .. }
+            | ReconcileAction::Recreate { identity, .. } => {
+                identity.split('\u{0}').nth(2).map(|s| s.to_string())
+            }
+            ReconcileAction::Remove { .. } => None,
+        })
+        .collect()
+}
+
 /// Whether a bollard error is the daemon's "no such container" (HTTP 404). Used
 /// to treat an already-gone container as an idempotent removal success (the
 /// desired end-state — container absent — already holds). Kept as a pure helper
@@ -2043,5 +2409,45 @@ mod tests {
             MAX_REPLICAS,
             "above max → clamped to MAX_REPLICAS"
         );
+    }
+
+    #[test]
+    fn bootstrap_credential_is_random_and_url_safe() {
+        let a = generate_bootstrap_credential();
+        let b = generate_bootstrap_credential();
+        assert_ne!(a, b, "each credential must be freshly random");
+        // 32 bytes base64url-no-pad → 43 chars, alphabet [A-Za-z0-9_-], no '='.
+        assert_eq!(a.len(), 43);
+        assert!(a
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    }
+
+    #[test]
+    fn identity_targets_are_the_create_and_recreate_deployment_ids() {
+        // The deployment_id is the 3rd NUL-separated field of an action's identity
+        // key (project\0group\0deployment_id\0container\0replica).
+        let actions = vec![
+            ReconcileAction::Create {
+                identity: identity_key("proj", "default", "20260101-000000", "app", 0),
+                name: "c1".to_string(),
+                generation: 1,
+            },
+            ReconcileAction::Recreate {
+                identity: identity_key("proj", "default", "20260202-000000", "app", 0),
+                name: "c2".to_string(),
+                existing_id: "deadbeef".to_string(),
+                generation: 2,
+            },
+            // Removals never need identity material.
+            ReconcileAction::Remove {
+                id: "x".to_string(),
+                name: "c3".to_string(),
+            },
+        ];
+        let ids = deployment_ids_with_create_or_recreate(&actions);
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains("20260101-000000"));
+        assert!(ids.contains("20260202-000000"));
     }
 }

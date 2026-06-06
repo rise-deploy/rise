@@ -49,8 +49,15 @@ const EXTRA_SERVICE_TOKENS_MOUNT_PATH: &str = "/var/run/secrets/rise/tokens";
 // Workload identity: a per-deployment Secret carrying the bootstrap credential
 // and any auto-minted workload tokens, mounted as files into the app's pod.
 const IDENTITY_VOLUME_NAME: &str = "rise-identity";
-const IDENTITY_MOUNT_PATH: &str = "/var/run/secrets/rise/identity";
-const IDENTITY_TOKENS_SUBDIR: &str = "tokens";
+/// In-container mount path for the workload-identity material. This is part of
+/// the backend-agnostic contract a workload reads, so the Docker backend (which
+/// delivers the same files via the Docker archive API rather than a Secret
+/// volume) reuses this constant to land the files at the same path.
+pub const IDENTITY_MOUNT_PATH: &str = "/var/run/secrets/rise/identity";
+/// Subdirectory under [`IDENTITY_MOUNT_PATH`] holding the auto-minted per-audience
+/// token files. Shared with the Docker backend so both backends deliver tokens to
+/// the same in-container path.
+pub const IDENTITY_TOKENS_SUBDIR: &str = "tokens";
 /// Secret data key for the bootstrap credential.
 pub const IDENTITY_CREDENTIAL_KEY: &str = "credential";
 /// Prefix for Secret data keys holding auto-minted workload tokens.

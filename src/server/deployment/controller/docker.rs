@@ -15,6 +15,7 @@ pub mod container_builder;
 pub mod diff;
 pub mod env;
 pub mod health;
+pub mod identity;
 pub mod labels;
 pub mod pod_status;
 pub mod reconciler;

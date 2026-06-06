@@ -329,11 +329,13 @@ async fn resolve_backend_ip(auth_backend_url: &str) -> Option<String> {
 /// `DockerReconciler`. Returns the backend plus the bollard client so the log
 /// backend can reuse it.
 #[cfg(feature = "backend")]
+#[allow(clippy::too_many_arguments)]
 async fn init_docker_backend(
     settings: &crate::server::settings::DeploymentControllerSettings,
     registry_provider: Arc<dyn RegistryProvider>,
     encryption_provider: Option<Arc<dyn EncryptionProvider>>,
     resource_store: Arc<dyn rise_resource_store::ResourceStore>,
+    jwt_signer: Arc<RiseTokenSigner>,
     db_pool: PgPool,
     public_url: &str,
     shutdown: tokio_util::sync::CancellationToken,
@@ -371,6 +373,7 @@ async fn init_docker_backend(
         publish_app_ports,
         cutover_strategy,
         traefik_api_url,
+        identity_token_ttl_seconds,
         ..
     } = settings
     else {
@@ -521,6 +524,8 @@ async fn init_docker_backend(
         registry_provider,
         encryption_provider,
         resource_store,
+        jwt_signer,
+        *identity_token_ttl_seconds,
         ReconcilerConfig {
             controller_class: controller_class_name.clone(),
             label_namespace: label_namespace.clone(),
@@ -1157,6 +1162,7 @@ impl AppState {
                         registry_provider.clone(),
                         encryption_provider.clone(),
                         resource_store.clone(),
+                        jwt_signer.clone(),
                         db_pool.clone(),
                         &public_url,
                         shutdown.clone(),
