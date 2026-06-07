@@ -2074,9 +2074,6 @@ async fn prepare_identity_secret(
     environment_name: Option<&str>,
     observed: &ObservedChildren,
 ) -> anyhow::Result<PreparedIdentitySecret> {
-    use base64::Engine;
-    use rand::Rng;
-
     let secret_name = ResourceBuilder::deployment_identity_secret_name(project, deployment);
     let secret_key = format!("{}/{}", namespace, secret_name);
 
@@ -2117,9 +2114,7 @@ async fn prepare_identity_secret(
             // a DB hash that does not match the Secret that actually got applied.
             // The hash is written on the next sync via the reuse path above, once
             // some replica's Secret has been applied and is observed by all.
-            let mut bytes = [0u8; 32];
-            rand::rng().fill_bytes(&mut bytes);
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+            crate::server::workload_tokens::generate_bootstrap_credential()
         }
     };
 
@@ -2179,13 +2174,12 @@ async fn prepare_identity_secret(
                 deployment_group: &deployment.deployment_group,
                 deployment_id: &deployment.deployment_id,
             };
-            let mut minted = BTreeMap::new();
-            for (filename, audience) in &audiences {
-                let jwt = state
-                    .jwt_signer
-                    .sign_workload_jwt(&subject_info, audience, ttl_secs)?;
-                minted.insert(filename.clone(), jwt);
-            }
+            let minted = crate::server::workload_tokens::sign_audience_tokens(
+                &state.jwt_signer,
+                &subject_info,
+                &audiences,
+                ttl_secs,
+            )?;
             (minted, Utc::now())
         }
     };
