@@ -25,6 +25,7 @@ use anyhow::{Context, Result};
 use bollard::container::{DownloadFromContainerOptions, UploadToContainerOptions};
 use bollard::Docker;
 use futures::StreamExt;
+use tracing::warn;
 
 use crate::server::deployment::resource_builder::{
     IDENTITY_CREDENTIAL_KEY, IDENTITY_MOUNT_PATH, IDENTITY_TOKENS_SUBDIR,
@@ -164,9 +165,19 @@ pub async fn read_back_credential(docker: &Docker, container: &str) -> Option<St
     while let Some(chunk) = stream.next().await {
         match chunk {
             Ok(bytes) => buf.extend_from_slice(&bytes),
-            // A missing file yields a 404 error here; treat any read error as
-            // "no recoverable credential" so the caller generates a fresh one.
-            Err(_) => return None,
+            // A missing file is a 404 (container predates this feature) — return
+            // None silently so the caller generates a fresh credential. Any other
+            // error (transient daemon/archive failure) would also force a fresh
+            // credential and rotate it, so surface it rather than swallow it.
+            Err(e) => {
+                if !super::reconciler::is_not_found(&e) {
+                    warn!(
+                        container,
+                        "Failed to read back identity credential, treating as absent: {:?}", e
+                    );
+                }
+                return None;
+            }
         }
     }
     parse_credential_from_tar(&buf)

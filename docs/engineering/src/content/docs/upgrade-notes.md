@@ -37,10 +37,11 @@ In-flight PRs with operator impact (not yet merged):
   entry — to `/var/run/secrets/rise/identity/` inside each app container (via the
   Docker archive API), and refreshes the token files before they expire. No new
   configuration; this closes a parity gap, so a Docker app that sets
-  `[identity].audiences` now receives its tokens instead of nothing. Note:
-  identity files are delivered when a container is **created**, so app containers
-  that were already running before the upgrade only receive them after their next
-  (re)deploy.
+  `[identity].audiences` now receives its tokens instead of nothing. Identity
+  files are delivered when a container is created, and the controller also
+  self-heals already-running containers that lack them on the next reconcile, so
+  apps running before the upgrade pick up their identity material without a
+  redeploy (mirroring the Kubernetes controller re-establishing it on each sync).
 - **Config change — auth token exchange (phase 1)** ([#367](https://github.com/rise-deploy/rise/pull/367)).
   Adds the RFC 8693 exchange endpoint and a Rise `Access` token kind. Purely
   additive; existing token flows are unchanged, legacy in-handler verification

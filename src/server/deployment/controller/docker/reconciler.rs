@@ -1519,8 +1519,6 @@ impl DockerReconciler {
         deployments: &[Deployment],
         actual: &[ActualContainer],
     ) {
-        let refresh_after =
-            chrono::Duration::seconds((self.identity_token_ttl_seconds / 2).max(1) as i64);
         for deployment in deployments {
             if !should_have_infrastructure(deployment) {
                 continue;
@@ -1543,9 +1541,11 @@ impl DockerReconciler {
                     .identity_refresh
                     .lock()
                     .expect("identity_refresh mutex poisoned");
-                map.get(&uuid)
-                    .map(|ts| Utc::now().signed_duration_since(*ts) >= refresh_after)
-                    .unwrap_or(true)
+                identity_refresh_due(
+                    map.get(&uuid).copied(),
+                    self.identity_token_ttl_seconds,
+                    Utc::now(),
+                )
             };
             if !stale {
                 continue;
@@ -1710,12 +1710,12 @@ impl DockerReconciler {
     /// never evicted. Evicting a still-live entry would be harmless anyway (it
     /// would just trigger one extra refresh).
     fn prune_identity_refresh(&self) {
-        let ttl = chrono::Duration::seconds(self.identity_token_ttl_seconds.max(1) as i64);
+        let ttl = self.identity_token_ttl_seconds;
         let now = Utc::now();
         self.identity_refresh
             .lock()
             .expect("identity_refresh mutex poisoned")
-            .retain(|_, ts| now.signed_duration_since(*ts) < ttl);
+            .retain(|_, ts| !identity_refresh_entry_expired(*ts, ttl, now));
     }
 
     /// Resolve a deployment's environment name (`None` for the no-environment
@@ -2534,7 +2534,7 @@ fn deployment_uuids_needing_identity(
 /// to treat an already-gone container as an idempotent removal success (the
 /// desired end-state — container absent — already holds). Kept as a pure helper
 /// so the classification is unit-testable without a live daemon.
-fn is_not_found(e: &bollard::errors::Error) -> bool {
+pub(super) fn is_not_found(e: &bollard::errors::Error) -> bool {
     matches!(
         e,
         bollard::errors::Error::DockerResponseServerError {
@@ -2542,6 +2542,35 @@ fn is_not_found(e: &bollard::errors::Error) -> bool {
             ..
         }
     )
+}
+
+/// Whether a deployment's identity tokens are due for an in-place refresh: the
+/// controller re-mints once a token is past half its TTL. A `None` last-refresh
+/// (e.g. a map entry missing after a controller restart) counts as due. The
+/// half-TTL is floored at 1s so a degenerate `ttl <= 1` doesn't re-mint on every
+/// tick. Pure so the staleness gate is unit-testable.
+fn identity_refresh_due(
+    last_refresh: Option<DateTime<Utc>>,
+    ttl_seconds: u64,
+    now: DateTime<Utc>,
+) -> bool {
+    let half = chrono::Duration::seconds((ttl_seconds / 2).max(1) as i64);
+    match last_refresh {
+        Some(ts) => now.signed_duration_since(ts) >= half,
+        None => true,
+    }
+}
+
+/// Whether an `identity_refresh` map entry is old enough to evict: older than the
+/// full TTL means its deployment is gone or stopped refreshing (an active one
+/// refreshes at half-TTL, so its entry stays younger than the TTL). Evicting a
+/// still-live entry is harmless — it only triggers one extra refresh.
+fn identity_refresh_entry_expired(
+    last_refresh: DateTime<Utc>,
+    ttl_seconds: u64,
+    now: DateTime<Utc>,
+) -> bool {
+    now.signed_duration_since(last_refresh) >= chrono::Duration::seconds(ttl_seconds.max(1) as i64)
 }
 
 #[cfg(test)]
@@ -2589,6 +2618,50 @@ mod tests {
                 status_code: 500,
                 message: "boom".to_string(),
             }
+        ));
+    }
+
+    #[test]
+    fn identity_refresh_due_at_half_ttl() {
+        let now = Utc::now();
+        // A missing entry (e.g. after a controller restart) is always due.
+        assert!(identity_refresh_due(None, 3600, now));
+        // Just refreshed → not due.
+        assert!(!identity_refresh_due(Some(now), 3600, now));
+        // Younger than half-TTL → not due; at/after half-TTL → due.
+        assert!(!identity_refresh_due(
+            Some(now - chrono::Duration::seconds(1799)),
+            3600,
+            now
+        ));
+        assert!(identity_refresh_due(
+            Some(now - chrono::Duration::seconds(1800)),
+            3600,
+            now
+        ));
+        // Degenerate ttl<=1 floors the half-TTL at 1s (no per-tick re-mint storm).
+        assert!(!identity_refresh_due(Some(now), 1, now));
+        assert!(identity_refresh_due(
+            Some(now - chrono::Duration::seconds(1)),
+            1,
+            now
+        ));
+    }
+
+    #[test]
+    fn identity_refresh_entry_expired_at_full_ttl() {
+        let now = Utc::now();
+        // Younger than the full TTL → retained (not expired).
+        assert!(!identity_refresh_entry_expired(
+            now - chrono::Duration::seconds(3599),
+            3600,
+            now
+        ));
+        // At/after the full TTL → expired (evicted).
+        assert!(identity_refresh_entry_expired(
+            now - chrono::Duration::seconds(3600),
+            3600,
+            now
         ));
     }
 
