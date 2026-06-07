@@ -562,12 +562,16 @@ impl DockerReconciler {
         self.apply_actions(project, &desired, &actions, &prepared_identity, election)
             .await?;
 
-        // Refresh auto-minted `[identity]` token files in place for long-running
+        // Re-establish identity for any running deployment whose credential never
+        // got persisted (a prior tick's create failed mid-way), then refresh
+        // auto-minted `[identity]` token files in place for long-running
         // containers whose tokens are past half their TTL — parity with the K8s
-        // webhook's re-mint behavior, which keeps mounted token files fresh
-        // without recreating the workload. Daemon-destructive (it re-uploads
-        // files), so it is leader-gated like apply.
+        // webhook, which re-establishes/re-mints on every sync. Both are
+        // daemon-destructive (they re-upload files), so they are leader-gated like
+        // apply.
         if self.confirm_leadership(election).await {
+            self.remediate_missing_identity(project, &non_terminal, &actual)
+                .await;
             self.refresh_identity_tokens(project, &non_terminal, &actual)
                 .await;
         }
@@ -1091,6 +1095,9 @@ impl DockerReconciler {
                     deployment_id_label: labels
                         .get(&labels::ns_key(ns, labels::SUFFIX_DEPLOYMENT_ID))
                         .cloned(),
+                    deployment_uuid_label: labels
+                        .get(&labels::ns_key(ns, labels::SUFFIX_DEPLOYMENT_UUID))
+                        .cloned(),
                     // Parse the generation label; default 0 (legacy/missing) so
                     // the first recreate of such a container yields generation 1.
                     generation: labels
@@ -1331,11 +1338,14 @@ impl DockerReconciler {
                 }
             }
             // Record the delivery time so the periodic refresh does not
-            // immediately re-mint freshly delivered tokens.
-            self.identity_refresh
-                .lock()
-                .expect("identity_refresh mutex poisoned")
-                .insert(desired.deployment_uuid.clone(), Utc::now());
+            // immediately re-mint freshly delivered tokens. Only meaningful when
+            // the deployment actually has token files to refresh.
+            if !identity.tokens.is_empty() {
+                self.identity_refresh
+                    .lock()
+                    .expect("identity_refresh mutex poisoned")
+                    .insert(desired.deployment_uuid.clone(), Utc::now());
+            }
         }
         info!(container = %built.name, image = %desired.image, "Created and started container");
         Ok(())
@@ -1598,6 +1608,95 @@ impl DockerReconciler {
                     .lock()
                     .expect("identity_refresh mutex poisoned")
                     .insert(uuid, Utc::now());
+            }
+        }
+    }
+
+    /// Self-heal deployments whose bootstrap credential was never established —
+    /// i.e. a running deployment with a NULL `identity_credential_hash`, which
+    /// means a prior tick's create failed to deliver the files or to persist the
+    /// hash (e.g. a transient DB error). Identity is otherwise only set up on
+    /// Create/Recreate, so without this a healthy container left with no credential
+    /// would never recover until an unrelated recreate. This mirrors the K8s
+    /// webhook, which re-establishes identity on every sync.
+    ///
+    /// Bounded to deployments that actually need it (NULL hash + at least one live
+    /// container), so the happy path (hash already persisted on create) pays only
+    /// the cheap `is_some()` check.
+    async fn remediate_missing_identity(
+        &self,
+        project: &Project,
+        deployments: &[Deployment],
+        actual: &[ActualContainer],
+    ) {
+        for deployment in deployments {
+            if !should_have_infrastructure(deployment)
+                || deployment.identity_credential_hash.is_some()
+            {
+                continue;
+            }
+            let live: Vec<&ActualContainer> = actual
+                .iter()
+                .filter(|c| {
+                    container_belongs_to(c, deployment)
+                        && matches!(c.state.as_deref(), Some("running") | Some("restarting"))
+                })
+                .collect();
+            if live.is_empty() {
+                continue;
+            }
+
+            let prepared = match self.prepare_identity(project, deployment, actual).await {
+                Ok(prepared) => prepared,
+                Err(e) => {
+                    warn!(deployment_id = %deployment.deployment_id, "Identity remediation: prepare failed: {:?}", e);
+                    continue;
+                }
+            };
+            // A read-back credential means the files are already present and
+            // `prepare_identity` just persisted the hash — nothing left to do.
+            if prepared.read_back {
+                continue;
+            }
+            // Fresh credential: deliver it (and any tokens) to every live
+            // container, then persist the hash only if ALL deliveries succeeded —
+            // so the hash is never recorded for a credential not on every replica.
+            let tar = match super::identity::build_identity_tar(
+                Some(&prepared.credential),
+                &prepared.tokens,
+            ) {
+                Ok(tar) => tar,
+                Err(e) => {
+                    warn!(deployment_id = %deployment.deployment_id, "Identity remediation: failed to build tar: {:?}", e);
+                    continue;
+                }
+            };
+            let mut all_delivered = true;
+            for container in &live {
+                if let Err(e) =
+                    super::identity::upload_identity(&self.docker, &container.name, tar.clone())
+                        .await
+                {
+                    warn!(container = %container.name, "Identity remediation: failed to deliver: {:?}", e);
+                    all_delivered = false;
+                }
+            }
+            if all_delivered {
+                let hash = sha256_hex(prepared.credential.as_bytes());
+                if let Err(e) = db_deployments::set_identity_credential_hash(
+                    &self.db_pool,
+                    deployment.id,
+                    &hash,
+                )
+                .await
+                {
+                    warn!(deployment_id = %deployment.deployment_id, "Identity remediation: failed to persist hash: {:?}", e);
+                } else if !prepared.tokens.is_empty() {
+                    self.identity_refresh
+                        .lock()
+                        .expect("identity_refresh mutex poisoned")
+                        .insert(deployment.id.to_string(), Utc::now());
+                }
             }
         }
     }
@@ -2380,12 +2479,15 @@ fn clamp_replicas(requested: Option<u32>) -> u32 {
 }
 
 /// Whether an actual container belongs to `deployment`, matched by the
-/// (group, deployment_id) pair (project is already filtered by the caller's
-/// listing). Using the group too — not `deployment_id` alone — disambiguates the
-/// rare same-second `deployment_id` collision across a project's groups.
+/// globally-unique `deployment-uuid` label so it can never conflate two
+/// same-second `deployment_id`s (even within one group). Containers managed by
+/// this controller always carry the label; one missing it (legacy) simply won't
+/// match and is left alone by the identity paths.
 fn container_belongs_to(c: &ActualContainer, deployment: &Deployment) -> bool {
-    c.deployment_group.as_deref() == Some(deployment.deployment_group.as_str())
-        && c.deployment_id_label.as_deref() == Some(deployment.deployment_id.as_str())
+    match c.deployment_uuid_label.as_deref() {
+        Some(uuid) => uuid == deployment.id.to_string(),
+        None => false,
+    }
 }
 
 /// The set of deployment UUIDs that have at least one container being created or

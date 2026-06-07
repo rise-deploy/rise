@@ -91,6 +91,7 @@ pub(crate) fn actual_for_gen(
         deployment_group: Some(d.deployment_group.clone()),
         container: Some(d.container.clone()),
         deployment_id_label: Some(d.deployment_id.clone()),
+        deployment_uuid_label: Some(d.deployment_uuid.clone()),
         generation,
         replica: d.replica,
         image_label: Some(image.to_string()),
