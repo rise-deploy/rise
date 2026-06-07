@@ -283,6 +283,26 @@ jobs:
           helm template rise helm/rise | kubeconform -strict -summary -skip CompositeController
           helm template rise helm/rise -f helm/rise/values-ci.yaml | kubeconform -strict -summary -skip CompositeController
 
+  # Unit tests for the e2e workload-identity verifier fixture. Its RS256/JWKS
+  # verification is security-critical (it must fail closed on forged/invalid
+  # tokens), so its negative-path tests run on every CI — the Docker build of the
+  # fixture in the e2e jobs does not execute them.
+  fixture-go-test:
+    name: e2e identity fixture (go test)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: tests/e2e-identity-fixture/go.mod
+
+      - name: Run fixture unit tests
+        working-directory: tests/e2e-identity-fixture
+        run: go test ./...
+
   package-image:
     name: Build and publish image
     runs-on: ubuntu-latest

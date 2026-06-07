@@ -18,8 +18,14 @@ RISE_PUBLIC_URL="http://rise.local"
 # discovery / JWKS / token exchange. The minted CI token's iss/aud use the same
 # value, so backend validation (set_issuer(public_url) + aud == public_url) still
 # passes. oci-client-auth mode keeps the http://rise.local default unchanged.
+# In-cluster FQDN of the Rise server Service. The chart's fullname is
+# "{release}-{Chart.name}" and Chart.yaml's name is "chart" (see the
+# rise-ci-chart-dex issuer in values-ci.yaml), so the server Service is
+# "${RELEASE_NAME}-chart" on port 3000 — NOT "${RELEASE_NAME}-server"
+# (that suffix is only the HPA/label component, never a Service).
+RISE_SERVER_FQDN="${RELEASE_NAME}-chart.${NAMESPACE}.svc.cluster.local:3000"
 if [[ "${RISE_E2E_REGISTRY_MODE}" == "jfrog-vault" ]]; then
-  RISE_PUBLIC_URL="http://${RELEASE_NAME}-server.${NAMESPACE}.svc.cluster.local:3000"
+  RISE_PUBLIC_URL="http://${RISE_SERVER_FQDN}"
 fi
 RISE_CI_JWT_SIGNING_SECRET_B64="dGVzdC1qd3Qtc2VjcmV0LWtleS1mb3ItY2ktdGVzdGluZy1vbmx5LW5vdC1zZWN1cmU="
 
@@ -214,7 +220,7 @@ helm_args=(
   --set "image.repository=${IMAGE_REPOSITORY}"
   --set "image.tag=${IMAGE_TAG}"
   --set "image.pullPolicy=Always"
-  --set-string "config.deployment_controller.auth_backend_url=http://${RELEASE_NAME}-server.${NAMESPACE}.svc.cluster.local:3000"
+  --set-string "config.deployment_controller.auth_backend_url=http://${RISE_SERVER_FQDN}"
   --set-string "config.deployment_controller.auth_signin_url=http://rise.local"
 )
 
@@ -444,21 +450,35 @@ if [[ "${RISE_E2E_REGISTRY_MODE}" == "jfrog-vault" ]]; then
   kubectl wait --namespace "${ID_APP_NAMESPACE}" --for=condition=Available deployment --all --timeout=5m
 
   echo "[e2e-minikube] Port-forwarding the identity app service"
-  id_app_svc="$(kubectl get svc -n "${ID_APP_NAMESPACE}" -o jsonpath='{.items[0].metadata.name}')"
-  id_app_port="$(kubectl get svc -n "${ID_APP_NAMESPACE}" -o jsonpath='{.items[0].spec.ports[0].port}')"
-  kubectl -n "${ID_APP_NAMESPACE}" port-forward "svc/${id_app_svc}" "18080:${id_app_port}" \
+  # Select the Service exposing the app's HTTP port (8080) rather than blindly
+  # taking items[0], so an incidental extra Service can't be picked.
+  id_app_svc="$(kubectl get svc -n "${ID_APP_NAMESPACE}" \
+    -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.ports[0].port}{"\n"}{end}' \
+    | awk '$2==8080{print $1; exit}')"
+  if [[ -z "${id_app_svc}" ]]; then
+    echo "[e2e-minikube] ERROR: no Service exposing port 8080 in ${ID_APP_NAMESPACE}"
+    kubectl get svc -n "${ID_APP_NAMESPACE}" || true
+    exit 1
+  fi
+  kubectl -n "${ID_APP_NAMESPACE}" port-forward "svc/${id_app_svc}" "18080:8080" \
     >/tmp/rise-e2e-id-port-forward.log 2>&1 &
   ID_PF_PID=$!
   sleep 5
 
-  assert_workload_identity "http://127.0.0.1:18080" "" "${ID_PROJECT}" \
-    "e2e" "rise-e2e-audience" "rise-e2e-exchange"
+  if ! assert_workload_identity "http://127.0.0.1:18080" "" "${ID_PROJECT}" \
+    "e2e" "rise-e2e-audience" "rise-e2e-exchange"; then
+    echo "[e2e-minikube] ERROR: workload identity assertion failed for ${ID_PROJECT}"
+    exit 1
+  fi
 
   # On Kubernetes the controller re-mints the rise-identity Secret at half-TTL
   # (identity_token_ttl_seconds=60 in values-ci.yaml), but the kubelet propagates
   # the updated Secret to the mounted volume with extra latency, so allow a
   # generous window for the in-place refresh to surface in the pod.
-  assert_identity_token_refreshes "http://127.0.0.1:18080" "" "e2e" 180
+  if ! assert_identity_token_refreshes "http://127.0.0.1:18080" "" "e2e" 180; then
+    echo "[e2e-minikube] ERROR: workload identity token did not refresh for ${ID_PROJECT}"
+    exit 1
+  fi
 
   kill "${ID_PF_PID}" >/dev/null 2>&1 || true
   ID_PF_PID=""
