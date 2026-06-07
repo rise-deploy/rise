@@ -156,9 +156,11 @@ pub struct DockerReconciler {
     /// in-place once more than half this TTL has elapsed (parity with the K8s
     /// webhook's re-mint-at-50% behavior).
     identity_token_ttl_seconds: u64,
-    /// Per-deployment timestamp of the last in-place token refresh, keyed by
-    /// `deployment_id`. Ephemeral (lost on restart, which only triggers one extra
-    /// refresh) and only ever touched on the single leader's sequential tick.
+    /// Per-deployment timestamp of the last in-place token refresh, keyed by the
+    /// globally-unique deployment UUID (`deployment.id.to_string()`, NOT the
+    /// second-granular `deployment_id`, which can collide). Ephemeral (lost on
+    /// restart, which only triggers one extra refresh) and only ever touched on
+    /// the single leader's sequential tick.
     identity_refresh: Mutex<HashMap<String, DateTime<Utc>>>,
     config: ReconcilerConfig,
 }
