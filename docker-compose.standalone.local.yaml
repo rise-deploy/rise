@@ -99,5 +99,10 @@ services:
       # plane (validate rise_jwt, OIDC discovery). Prod leaves this unset — public
       # DNS + Traefik resolve rise.${RISE_DOMAIN} with correct TLS.
       - RISE_APP_BACKEND_HOST_ALIAS=rise.localhost
+      # Short identity-token TTL for the workload-identity e2e refresh assertion
+      # (the controller re-mints at half-TTL). Overridable; defaults low here so
+      # local/e2e runs observe a re-mint quickly without affecting production
+      # (which uses the base compose and config/docker.yaml's 3600s default).
+      - RISE_IDENTITY_TOKEN_TTL_SECONDS=${RISE_IDENTITY_TOKEN_TTL_SECONDS:-60}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock

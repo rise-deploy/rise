@@ -424,6 +424,32 @@ where
     }
 }
 
+/// Like [`deserialize_u32_flexible`], but for `u64` fields. Accepts a native
+/// number or a numeric string so the value can be env-driven (the settings
+/// loader interpolates `${VAR}` into a string before deserialization, e.g.
+/// `identity_token_ttl_seconds: "${RISE_IDENTITY_TOKEN_TTL_SECONDS:-3600}"`).
+fn deserialize_u64_flexible<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum U64OrString {
+        Num(u64),
+        Str(String),
+    }
+
+    match U64OrString::deserialize(deserializer)? {
+        U64OrString::Num(n) => Ok(n),
+        U64OrString::Str(s) => s
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| D::Error::custom(format!("invalid integer string {s:?}; expected a u64"))),
+    }
+}
+
 /// Deserialize a list of strings, dropping blank/whitespace-only entries.
 ///
 /// The settings loader interpolates `${VAR}` per string element, so an
@@ -1222,8 +1248,14 @@ pub enum DeploymentControllerSettings {
 
         /// Lifetime in seconds of workload identity tokens auto-minted by the controller
         /// and mounted into deployment pods. The controller re-mints tokens when they
-        /// are older than half this value. Default: 3600 (1 hour).
-        #[serde(default = "default_identity_token_ttl_seconds")]
+        /// are older than half this value. Default: 3600 (1 hour). Accepts a number or
+        /// a numeric string so it can be env-driven (e.g.
+        /// `"${RISE_IDENTITY_TOKEN_TTL_SECONDS:-3600}"`).
+        #[serde(
+            default = "default_identity_token_ttl_seconds",
+            deserialize_with = "deserialize_u64_flexible"
+        )]
+        #[schemars(with = "u64")]
         identity_token_ttl_seconds: u64,
 
         /// Port for the internal metacontroller webhook listener.
@@ -1409,8 +1441,14 @@ pub enum DeploymentControllerSettings {
         health_probes: Option<HealthProbeConfig>,
 
         /// Lifetime in seconds of workload identity tokens minted for
-        /// deployments. Default: 3600 (1 hour).
-        #[serde(default = "default_identity_token_ttl_seconds")]
+        /// deployments. Default: 3600 (1 hour). Accepts a number or a numeric
+        /// string so it can be env-driven (e.g.
+        /// `"${RISE_IDENTITY_TOKEN_TTL_SECONDS:-3600}"`).
+        #[serde(
+            default = "default_identity_token_ttl_seconds",
+            deserialize_with = "deserialize_u64_flexible"
+        )]
+        #[schemars(with = "u64")]
         identity_token_ttl_seconds: u64,
 
         /// **Dev-only.** Publish each app container's HTTP port to a random
@@ -2062,6 +2100,23 @@ mod tests {
         // Numeric string (e.g. an interpolated `${RISE_MAX_REPLICAS:-10}`).
         let from_str: Holder = serde_yaml::from_str("n: \"10\"").unwrap();
         assert_eq!(from_str.n, 10);
+        // A non-numeric string is rejected.
+        assert!(serde_yaml::from_str::<Holder>("n: \"abc\"").is_err());
+    }
+
+    #[test]
+    fn deserialize_u64_flexible_accepts_number_and_numeric_string() {
+        #[derive(Deserialize)]
+        struct Holder {
+            #[serde(deserialize_with = "deserialize_u64_flexible")]
+            n: u64,
+        }
+        // Plain number (native YAML int).
+        let from_num: Holder = serde_yaml::from_str("n: 3600").unwrap();
+        assert_eq!(from_num.n, 3600);
+        // Numeric string (an interpolated `${RISE_IDENTITY_TOKEN_TTL_SECONDS:-3600}`).
+        let from_str: Holder = serde_yaml::from_str("n: \"60\"").unwrap();
+        assert_eq!(from_str.n, 60);
         // A non-numeric string is rejected.
         assert!(serde_yaml::from_str::<Holder>("n: \"abc\"").is_err());
     }

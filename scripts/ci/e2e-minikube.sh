@@ -11,6 +11,16 @@ MINIKUBE_MEMORY="${MINIKUBE_MEMORY:-6144}"
 MINIKUBE_CPUS="${MINIKUBE_CPUS:-4}"
 RISE_E2E_ARTIFACT_DIR="${RISE_E2E_ARTIFACT_DIR:-.rise-e2e-artifacts}"
 RISE_PUBLIC_URL="http://rise.local"
+# public_url is the issuer baked into Rise-signed tokens AND the RISE_ISSUER
+# injected into deployed apps. In jfrog-vault mode (the only mode that runs the
+# workload-identity scenario) point it at the in-cluster server FQDN (port 3000)
+# so a deployed app pod can resolve and reach the issuer via CoreDNS for OIDC
+# discovery / JWKS / token exchange. The minted CI token's iss/aud use the same
+# value, so backend validation (set_issuer(public_url) + aud == public_url) still
+# passes. oci-client-auth mode keeps the http://rise.local default unchanged.
+if [[ "${RISE_E2E_REGISTRY_MODE}" == "jfrog-vault" ]]; then
+  RISE_PUBLIC_URL="http://${RELEASE_NAME}-server.${NAMESPACE}.svc.cluster.local:3000"
+fi
 RISE_CI_JWT_SIGNING_SECRET_B64="dGVzdC1qd3Qtc2VjcmV0LWtleS1mb3ItY2ktdGVzdGluZy1vbmx5LW5vdC1zZWN1cmU="
 
 case "${RISE_E2E_REGISTRY_MODE}" in
@@ -139,19 +149,25 @@ cleanup() {
   if [[ -n "${PF_PID:-}" ]] && kill -0 "${PF_PID}" >/dev/null 2>&1; then
     kill "${PF_PID}" >/dev/null 2>&1 || true
   fi
+  if [[ -n "${ID_PF_PID:-}" ]] && kill -0 "${ID_PF_PID}" >/dev/null 2>&1; then
+    kill "${ID_PF_PID}" >/dev/null 2>&1 || true
+  fi
   if [[ $exit_code -ne 0 ]]; then
     kubectl get pods -A || true
     kubectl get events -A --sort-by=.metadata.creationTimestamp | tail -n 200 || true
     kubectl logs -n "${NAMESPACE}" -l "app.kubernetes.io/instance=${RELEASE_NAME}" --all-containers --tail=200 || true
     kubectl logs -n "${NAMESPACE}" -l "app.kubernetes.io/instance=${RELEASE_NAME}" --all-containers --previous --tail=200 || true
-    if [[ -n "${APP_NAMESPACE:-}" ]]; then
-      kubectl get all -n "${APP_NAMESPACE}" || true
-      kubectl describe deployments -n "${APP_NAMESPACE}" || true
-      while IFS= read -r pod; do
-        kubectl logs -n "${APP_NAMESPACE}" "${pod}" --all-containers --tail=200 || true
-      done < <(kubectl get pods -n "${APP_NAMESPACE}" -o name 2>/dev/null || true)
-    fi
+    for ns in "${APP_NAMESPACE:-}" "${ID_APP_NAMESPACE:-}"; do
+      if [[ -n "${ns}" ]]; then
+        kubectl get all -n "${ns}" || true
+        kubectl describe deployments -n "${ns}" || true
+        while IFS= read -r pod; do
+          kubectl logs -n "${ns}" "${pod}" --all-containers --tail=200 || true
+        done < <(kubectl get pods -n "${ns}" -o name 2>/dev/null || true)
+      fi
+    done
     cat /tmp/rise-e2e-port-forward.log || true
+    cat /tmp/rise-e2e-id-port-forward.log 2>/dev/null || true
   fi
   if [[ "${RISE_E2E_REGISTRY_MODE}" == "jfrog-vault" ]]; then
     collect_jfrog_vault_artifacts
@@ -204,6 +220,9 @@ helm_args=(
 
 if [[ "${RISE_E2E_REGISTRY_MODE}" == "jfrog-vault" ]]; then
   helm_args+=(
+    # In-cluster issuer URL so deployed app pods can reach RISE_ISSUER (see the
+    # RISE_PUBLIC_URL note above); needed by the workload-identity scenario.
+    --set-string "config.server.public_url=${RISE_PUBLIC_URL}"
     --set-string "config.registry.type=jfrog"
     --set-string "config.registry.registry_host=rise-jfrog:8082"
     --set-string "config.registry.client_registry_url=localhost:3082"
@@ -385,6 +404,65 @@ echo "rise deployment logs returned ${lines} line(s)"
 if (( lines == 0 )); then
   echo "Expected 'rise deployment logs' to print at least one line after pod removal"
   exit 1
+fi
+
+# Workload-identity scenario. Runs only in jfrog-vault mode, which is the only
+# minikube mode with a registry the cluster can pull from — required to build and
+# deploy the custom verifier fixture. The fixture (tests/e2e-identity-fixture)
+# verifies the RS256/JWKS signatures INSIDE the container and reports JSON, so the
+# assertions (scripts/ci/lib/identity.sh) are identical to the Docker e2e.
+if [[ "${RISE_E2E_REGISTRY_MODE}" == "jfrog-vault" ]]; then
+  # shellcheck source=scripts/ci/lib/identity.sh
+  source "$(dirname "${BASH_SOURCE[0]}")/lib/identity.sh"
+  IDENTITY_LOG_PREFIX="e2e-minikube"
+
+  ID_PROJECT="e2e-identity-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+  ID_APP_NAMESPACE="rise-${ID_PROJECT}"
+  echo "[e2e-minikube] Workload identity scenario: ${ID_PROJECT}"
+
+  rise_cli project create "${ID_PROJECT}" --access-class public --no-rise-toml
+  RISE_CLI_WITH_DOCKER=true rise_cli deploy \
+    --project "${ID_PROJECT}" \
+    --backend docker:build \
+    --container-cli docker \
+    --http-port 8080 \
+    --replicas 1 \
+    tests/e2e-identity-fixture
+
+  echo "[e2e-minikube] Waiting for identity app namespace ${ID_APP_NAMESPACE}"
+  for _ in {1..60}; do
+    if kubectl get namespace "${ID_APP_NAMESPACE}" >/dev/null 2>&1; then break; fi
+    sleep 2
+  done
+  kubectl get namespace "${ID_APP_NAMESPACE}" >/dev/null
+
+  echo "[e2e-minikube] Waiting for identity app deployment to become available"
+  for _ in {1..60}; do
+    if [[ -n "$(kubectl get deployments -n "${ID_APP_NAMESPACE}" -o name 2>/dev/null)" ]]; then break; fi
+    sleep 5
+  done
+  kubectl wait --namespace "${ID_APP_NAMESPACE}" --for=condition=Available deployment --all --timeout=5m
+
+  echo "[e2e-minikube] Port-forwarding the identity app service"
+  id_app_svc="$(kubectl get svc -n "${ID_APP_NAMESPACE}" -o jsonpath='{.items[0].metadata.name}')"
+  id_app_port="$(kubectl get svc -n "${ID_APP_NAMESPACE}" -o jsonpath='{.items[0].spec.ports[0].port}')"
+  kubectl -n "${ID_APP_NAMESPACE}" port-forward "svc/${id_app_svc}" "18080:${id_app_port}" \
+    >/tmp/rise-e2e-id-port-forward.log 2>&1 &
+  ID_PF_PID=$!
+  sleep 5
+
+  assert_workload_identity "http://127.0.0.1:18080" "" "${ID_PROJECT}" \
+    "e2e" "rise-e2e-audience" "rise-e2e-exchange"
+
+  # On Kubernetes the controller re-mints the rise-identity Secret at half-TTL
+  # (identity_token_ttl_seconds=60 in values-ci.yaml), but the kubelet propagates
+  # the updated Secret to the mounted volume with extra latency, so allow a
+  # generous window for the in-place refresh to surface in the pod.
+  assert_identity_token_refreshes "http://127.0.0.1:18080" "" "e2e" 180
+
+  kill "${ID_PF_PID}" >/dev/null 2>&1 || true
+  ID_PF_PID=""
+  echo "[e2e-minikube] Workload identity verified end to end (issuance, pre-minted file, in-place refresh)"
 fi
 
 echo "Smoke test: helm upgrade is idempotent"

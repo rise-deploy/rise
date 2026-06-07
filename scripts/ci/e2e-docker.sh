@@ -40,6 +40,16 @@ RISE_IMAGE_REPOSITORY="${RISE_IMAGE_REPOSITORY:-ghcr.io/rise-deploy/rise}"
 RISE_IMAGE_TAG="${RISE_IMAGE_TAG:-pr-358-b98adea}"
 export RISE_IMAGE_REPOSITORY RISE_IMAGE_TAG
 
+# The workload-identity scenario builds a fixture image and pushes it to the
+# in-compose registry; the Docker controller then pulls it via the HOST daemon
+# (the backend mounts the host socket). The compose default registry_url
+# (rise-registry:5000) is only resolvable INSIDE rise_default, so point the
+# backend's pull URL at the loopback-published registry (127.0.0.1:5000), which
+# the host daemon can reach and treats as insecure. Push (client_registry_url=
+# localhost:5000) and pull (127.0.0.1:5000) hit the same registry. Public-image
+# scenarios are unaffected (they pull from their own registries, not this one).
+export RISE_REGISTRY_URL="${RISE_REGISTRY_URL:-127.0.0.1:5000}"
+
 RISE_URL="${RISE_URL:-http://localhost:3000}"
 TRAEFIK_URL="${TRAEFIK_URL:-http://localhost:80}"
 # Must match server.public_url and server.jwt_signing_secret in
@@ -58,6 +68,7 @@ PRIV_PROJECT="priv-e2e-${RUN_ID}"
 # ({project}-default-app, sanitized) stays well under any length limit.
 CUT_PROJECT="cut-e2e-${RUN_ID}"
 CUT_RECREATE_PROJECT="cutr-e2e-${RUN_ID}"
+ID_PROJECT="id-e2e-${RUN_ID}"
 WHOAMI_IMAGE="${WHOAMI_IMAGE:-traefik/whoami}"
 
 RISE_CLI_BIN=""
@@ -688,5 +699,47 @@ if ! grep -qi "Hostname:" "${cutr_body}"; then
   exit 1
 fi
 log "Recreate strategy converges to 200 (whoami output)"
+
+############################################
+# (e) WORKLOAD IDENTITY: a deployed app with `[identity.audiences]` receives a
+#     bootstrap credential + a pre-minted token file, can exchange the credential
+#     for a fresh token, and the controller re-mints the token file in place. The
+#     fixture (tests/e2e-identity-fixture) verifies the RS256/JWKS signatures
+#     INSIDE the container and reports JSON, so the assertions (shared with the
+#     K8s e2e via scripts/ci/lib/identity.sh) are backend-agnostic. The fixture
+#     is built from source and pushed to the in-compose registry, exercising the
+#     Docker build→push→pull path end to end.
+############################################
+log "Scenario (e): workload identity ${ID_PROJECT}"
+# shellcheck source=scripts/ci/lib/identity.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/identity.sh"
+IDENTITY_LOG_PREFIX="e2e-docker"
+
+ID_APP_HOST="${ID_PROJECT}.rise.localhost"
+rise_cli project create "${ID_PROJECT}" --access-class public --no-rise-toml
+rise_cli deploy tests/e2e-identity-fixture \
+  --project "${ID_PROJECT}" \
+  --backend docker:build \
+  --http-port 8080 \
+  --replicas 1
+wait_for_healthy "${ID_PROJECT}"
+
+# Full contract: credential present, pre-minted file token (aud=rise-e2e-audience)
+# is signature-valid, on-demand exchange yields a signature-valid token with the
+# requested audience and the project-bound subject.
+if ! assert_workload_identity "${TRAEFIK_URL}" "${ID_APP_HOST}" "${ID_PROJECT}" \
+  "e2e" "rise-e2e-audience" "rise-e2e-exchange"; then
+  log "ERROR: workload identity assertion failed for ${ID_PROJECT}"
+  exit 1
+fi
+
+# In-place refresh: with RISE_IDENTITY_TOKEN_TTL_SECONDS=60 the controller
+# re-mints the token file at ~30s; the reconciler runs every 5s and re-uploads it
+# to the live container.
+if ! assert_identity_token_refreshes "${TRAEFIK_URL}" "${ID_APP_HOST}" "e2e" 120; then
+  log "ERROR: workload identity token did not refresh for ${ID_PROJECT}"
+  exit 1
+fi
+log "Workload identity verified end to end (issuance, pre-minted file, in-place refresh)"
 
 log "Docker backend E2E smoke tests completed successfully"
