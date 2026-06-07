@@ -414,7 +414,7 @@
             },
             "identity_token_ttl_seconds": {
               "default": 3600,
-              "description": "Lifetime in seconds of workload identity tokens auto-minted by the controller\nand mounted into deployment pods. The controller re-mints tokens when they\nare older than half this value. Default: 3600 (1 hour). Accepts a number or\na numeric string so it can be env-driven (e.g.\n`\"${RISE_IDENTITY_TOKEN_TTL_SECONDS:-3600}\"`).",
+              "description": "Lifetime in seconds of workload identity tokens auto-minted by the controller\nand mounted into deployment pods. The controller re-mints tokens when they\nare older than half this value. Default: 3600 (1 hour).",
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
@@ -658,7 +658,7 @@
             },
             "identity_token_ttl_seconds": {
               "default": 3600,
-              "description": "Lifetime in seconds of workload identity tokens minted for\ndeployments. Default: 3600 (1 hour). Accepts a number or a numeric\nstring so it can be env-driven (e.g.\n`\"${RISE_IDENTITY_TOKEN_TTL_SECONDS:-3600}\"`).",
+              "description": "Lifetime in seconds of workload identity tokens minted for\ndeployments. Default: 3600 (1 hour).",
               "format": "uint64",
               "minimum": 0,
               "type": "integer"

@@ -424,32 +424,6 @@ where
     }
 }
 
-/// Like [`deserialize_u32_flexible`], but for `u64` fields. Accepts a native
-/// number or a numeric string so the value can be env-driven (the settings
-/// loader interpolates `${VAR}` into a string before deserialization, e.g.
-/// `identity_token_ttl_seconds: "${RISE_IDENTITY_TOKEN_TTL_SECONDS:-3600}"`).
-fn deserialize_u64_flexible<'de, D>(deserializer: D) -> Result<u64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error;
-
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum U64OrString {
-        Num(u64),
-        Str(String),
-    }
-
-    match U64OrString::deserialize(deserializer)? {
-        U64OrString::Num(n) => Ok(n),
-        U64OrString::Str(s) => s
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| D::Error::custom(format!("invalid integer string {s:?}; expected a u64"))),
-    }
-}
-
 /// Deserialize a list of strings, dropping blank/whitespace-only entries.
 ///
 /// The settings loader interpolates `${VAR}` per string element, so an
@@ -1248,14 +1222,8 @@ pub enum DeploymentControllerSettings {
 
         /// Lifetime in seconds of workload identity tokens auto-minted by the controller
         /// and mounted into deployment pods. The controller re-mints tokens when they
-        /// are older than half this value. Default: 3600 (1 hour). Accepts a number or
-        /// a numeric string so it can be env-driven (e.g.
-        /// `"${RISE_IDENTITY_TOKEN_TTL_SECONDS:-3600}"`).
-        #[serde(
-            default = "default_identity_token_ttl_seconds",
-            deserialize_with = "deserialize_u64_flexible"
-        )]
-        #[schemars(with = "u64")]
+        /// are older than half this value. Default: 3600 (1 hour).
+        #[serde(default = "default_identity_token_ttl_seconds")]
         identity_token_ttl_seconds: u64,
 
         /// Port for the internal metacontroller webhook listener.
@@ -1441,14 +1409,8 @@ pub enum DeploymentControllerSettings {
         health_probes: Option<HealthProbeConfig>,
 
         /// Lifetime in seconds of workload identity tokens minted for
-        /// deployments. Default: 3600 (1 hour). Accepts a number or a numeric
-        /// string so it can be env-driven (e.g.
-        /// `"${RISE_IDENTITY_TOKEN_TTL_SECONDS:-3600}"`).
-        #[serde(
-            default = "default_identity_token_ttl_seconds",
-            deserialize_with = "deserialize_u64_flexible"
-        )]
-        #[schemars(with = "u64")]
+        /// deployments. Default: 3600 (1 hour).
+        #[serde(default = "default_identity_token_ttl_seconds")]
         identity_token_ttl_seconds: u64,
 
         /// **Dev-only.** Publish each app container's HTTP port to a random
@@ -2100,23 +2062,6 @@ mod tests {
         // Numeric string (e.g. an interpolated `${RISE_MAX_REPLICAS:-10}`).
         let from_str: Holder = serde_yaml::from_str("n: \"10\"").unwrap();
         assert_eq!(from_str.n, 10);
-        // A non-numeric string is rejected.
-        assert!(serde_yaml::from_str::<Holder>("n: \"abc\"").is_err());
-    }
-
-    #[test]
-    fn deserialize_u64_flexible_accepts_number_and_numeric_string() {
-        #[derive(Deserialize)]
-        struct Holder {
-            #[serde(deserialize_with = "deserialize_u64_flexible")]
-            n: u64,
-        }
-        // Plain number (native YAML int).
-        let from_num: Holder = serde_yaml::from_str("n: 3600").unwrap();
-        assert_eq!(from_num.n, 3600);
-        // Numeric string (an interpolated `${RISE_IDENTITY_TOKEN_TTL_SECONDS:-3600}`).
-        let from_str: Holder = serde_yaml::from_str("n: \"60\"").unwrap();
-        assert_eq!(from_str.n, 60);
         // A non-numeric string is rejected.
         assert!(serde_yaml::from_str::<Holder>("n: \"abc\"").is_err());
     }
@@ -2999,6 +2944,55 @@ auth:
         assert_eq!(
             production_ingress_url_template,
             "{project_name}.example.com"
+        );
+    }
+
+    #[test]
+    fn docker_e2e_local_overlay_overrides_only_identity_ttl() {
+        // The e2e mounts config/docker-e2e.local.yaml as /etc/rise/local.yaml so
+        // the backend loads it as the optional `local` layer over docker.yaml.
+        // Assert the real override file deep-merges: it lowers
+        // identity_token_ttl_seconds while leaving sibling deployment_controller
+        // fields (and the docker variant tag) intact. Guards against a
+        // config-merge regression that would wipe the rest of the section.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let docker_yaml = fs::read_to_string(format!("{manifest_dir}/config/docker.yaml")).unwrap();
+        let local_yaml =
+            fs::read_to_string(format!("{manifest_dir}/config/docker-e2e.local.yaml")).unwrap();
+
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("default.yaml"), "{}\n").unwrap();
+        fs::write(temp_dir.path().join("docker.yaml"), docker_yaml).unwrap();
+        fs::write(temp_dir.path().join("local.yaml"), local_yaml).unwrap();
+
+        let env: std::collections::HashMap<String, String> =
+            [("DATABASE_URL", "postgres://u@rise-postgres/rise")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+        let settings =
+            Settings::new_with_env(temp_dir.path().to_str().unwrap(), "docker", &|name| {
+                env.get(name).cloned()
+            })
+            .expect("docker.yaml + e2e local overlay must load");
+
+        let Some(DeploymentControllerSettings::Docker {
+            identity_token_ttl_seconds,
+            production_ingress_url_template,
+            ..
+        }) = &settings.deployment_controller
+        else {
+            panic!("expected docker deployment_controller after local overlay merge");
+        };
+        // Overridden by the local overlay.
+        assert_eq!(*identity_token_ttl_seconds, 60);
+        // Sibling key preserved from docker.yaml (deep merge, not replace).
+        assert_eq!(
+            production_ingress_url_template,
+            "{project_name}.rise.localhost"
         );
     }
 

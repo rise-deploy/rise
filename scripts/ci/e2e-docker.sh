@@ -733,9 +733,9 @@ if ! assert_workload_identity "${TRAEFIK_URL}" "${ID_APP_HOST}" "${ID_PROJECT}" 
   exit 1
 fi
 
-# In-place refresh: with RISE_IDENTITY_TOKEN_TTL_SECONDS=60 the controller
-# re-mints the token file at ~30s; the reconciler runs every 5s and re-uploads it
-# to the live container.
+# In-place refresh: the e2e config overlay (config/docker-e2e.local.yaml) sets
+# identity_token_ttl_seconds=60, so the controller re-mints the token file at
+# ~30s; the reconciler runs every 5s and re-uploads it to the live container.
 if ! assert_identity_token_refreshes "${TRAEFIK_URL}" "${ID_APP_HOST}" "e2e" 120; then
   log "ERROR: workload identity token did not refresh for ${ID_PROJECT}"
   exit 1

@@ -119,10 +119,6 @@ deployment_controller:
   ingress_schema: "${RISE_INGRESS_SCHEME:-http}"
   reconcile_interval_secs: 5
   controller_class_name: "default"
-  # TTL for the auto-minted `[identity.audiences]` token files; the controller
-  # re-mints them in place at half this value. Defaults to 3600s; the e2e overlay
-  # lowers it so the workload-identity refresh test observes a re-mint quickly.
-  identity_token_ttl_seconds: "${RISE_IDENTITY_TOKEN_TTL_SECONDS:-3600}"
   # Platform replica bounds. The Docker backend supports horizontal scale-out
   # (N containers per spec behind one Traefik service, rolling recreate), so
   # allow replicas > 1 out of the box — tune the ceiling via RISE_MAX_REPLICAS.
