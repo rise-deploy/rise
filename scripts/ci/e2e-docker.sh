@@ -40,15 +40,12 @@ RISE_IMAGE_REPOSITORY="${RISE_IMAGE_REPOSITORY:-ghcr.io/rise-deploy/rise}"
 RISE_IMAGE_TAG="${RISE_IMAGE_TAG:-pr-358-b98adea}"
 export RISE_IMAGE_REPOSITORY RISE_IMAGE_TAG
 
-# The workload-identity scenario builds a fixture image and pushes it to the
-# in-compose registry; the Docker controller then pulls it via the HOST daemon
-# (the backend mounts the host socket). The compose default registry_url
-# (rise-registry:5000) is only resolvable INSIDE rise_default, so point the
-# backend's pull URL at the loopback-published registry (127.0.0.1:5000), which
-# the host daemon can reach and treats as insecure. Push (client_registry_url=
-# localhost:5000) and pull (127.0.0.1:5000) hit the same registry. Public-image
-# scenarios are unaffected (they pull from their own registries, not this one).
-export RISE_REGISTRY_URL="${RISE_REGISTRY_URL:-127.0.0.1:5000}"
+# Identity-scenario overlay (scripts/.../docker-compose.standalone.identity.yaml):
+# layered onto the rise backend ONLY when it is recreated just before scenario
+# (e), so scenarios (a)-(d) run on the exact default config. It repoints
+# registry_url at the loopback-published registry (so the HOST daemon can pull
+# the built fixture image) and mounts a short-TTL identity config overlay.
+COMPOSE_IDENTITY_OVERLAY="${COMPOSE_IDENTITY_OVERLAY:-docker-compose.standalone.identity.yaml}"
 
 RISE_URL="${RISE_URL:-http://localhost:3000}"
 TRAEFIK_URL="${TRAEFIK_URL:-http://localhost:80}"
@@ -714,6 +711,30 @@ log "Scenario (e): workload identity ${ID_PROJECT}"
 # shellcheck source=scripts/ci/lib/identity.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/identity.sh"
 IDENTITY_LOG_PREFIX="e2e-docker"
+
+# Recreate the rise backend with the identity overlay so the build/pull and the
+# short token TTL apply ONLY from here on (scenarios a-d ran on the default
+# config). Postgres state and the running app containers are preserved; the
+# reconciler re-adopts them after the restart.
+log "Recreating the rise backend with the identity overlay (scoped registry_url + short token TTL)"
+docker compose "${COMPOSE_ARGS[@]}" -f "${COMPOSE_IDENTITY_OVERLAY}" \
+  up -d --no-deps --force-recreate rise
+
+log "Waiting for Rise /health after the identity-overlay switch"
+for _ in $(seq 1 60); do
+  code="$(curl -fsS -o /dev/null -w '%{http_code}' "${RISE_URL}/health" 2>/dev/null || echo 000)"
+  if [[ "${code}" == "200" ]]; then
+    break
+  fi
+  sleep 2
+done
+if [[ "${code:-000}" != "200" ]]; then
+  log "ERROR: Rise /health never returned 200 after the identity-overlay switch (last=${code:-000})"
+  exit 1
+fi
+# Re-mint the bearer token (fresh process; secret unchanged, kept fresh).
+RISE_TOKEN="$(create_rise_ci_token)"
+export RISE_TOKEN
 
 ID_APP_HOST="${ID_PROJECT}.rise.localhost"
 rise_cli project create "${ID_PROJECT}" --access-class public --no-rise-toml

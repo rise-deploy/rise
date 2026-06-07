@@ -87,8 +87,8 @@ assert_workload_identity() {
       and ((.exchanged_token.claims.sub // "") | startswith($subp))
       and ((.file_token.claims.sub // "") | startswith($subp))
       and ((.exchanged_token.claims.iss // "") | length > 0)
-      and ((.exchanged_token.claims.iss // "") | sub("/$"; "")
-            == (.issuer // "" | sub("/$"; "")))
+      and (((.exchanged_token.claims.iss // "") | sub("/$"; ""))
+            == ((.issuer // "") | sub("/$"; "")))
     ' "${out}" >/dev/null 2>&1; then
     _id_log "ERROR: workload identity assertion failed. /identity response:"
     jq . "${out}" 2>/dev/null | sed "s/^/[${IDENTITY_LOG_PREFIX}]   /" || cat "${out}"

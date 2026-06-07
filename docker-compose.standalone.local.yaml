@@ -101,9 +101,3 @@ services:
       - RISE_APP_BACKEND_HOST_ALIAS=rise.localhost
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      # Local/e2e-only config overlay (loaded as the optional `local` layer on
-      # top of /etc/rise/docker.yaml). Lowers the workload-identity token TTL so
-      # the e2e refresh assertion observes the controller's half-TTL re-mint
-      # quickly. Kept out of the shipped config/docker.yaml — the Docker
-      # workload-identity feature is unreleased, so operators get no such knob.
-      - ./config/docker-e2e.local.yaml:/etc/rise/local.yaml:ro
