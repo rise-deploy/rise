@@ -2948,6 +2948,55 @@ auth:
     }
 
     #[test]
+    fn docker_e2e_local_overlay_overrides_only_identity_ttl() {
+        // The e2e mounts config/docker-e2e.local.yaml as /etc/rise/local.yaml so
+        // the backend loads it as the optional `local` layer over docker.yaml.
+        // Assert the real override file deep-merges: it lowers
+        // identity_token_ttl_seconds while leaving sibling deployment_controller
+        // fields (and the docker variant tag) intact. Guards against a
+        // config-merge regression that would wipe the rest of the section.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let docker_yaml = fs::read_to_string(format!("{manifest_dir}/config/docker.yaml")).unwrap();
+        let local_yaml =
+            fs::read_to_string(format!("{manifest_dir}/config/docker-e2e.local.yaml")).unwrap();
+
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("default.yaml"), "{}\n").unwrap();
+        fs::write(temp_dir.path().join("docker.yaml"), docker_yaml).unwrap();
+        fs::write(temp_dir.path().join("local.yaml"), local_yaml).unwrap();
+
+        let env: std::collections::HashMap<String, String> =
+            [("DATABASE_URL", "postgres://u@rise-postgres/rise")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+        let settings =
+            Settings::new_with_env(temp_dir.path().to_str().unwrap(), "docker", &|name| {
+                env.get(name).cloned()
+            })
+            .expect("docker.yaml + e2e local overlay must load");
+
+        let Some(DeploymentControllerSettings::Docker {
+            identity_token_ttl_seconds,
+            production_ingress_url_template,
+            ..
+        }) = &settings.deployment_controller
+        else {
+            panic!("expected docker deployment_controller after local overlay merge");
+        };
+        // Overridden by the local overlay.
+        assert_eq!(*identity_token_ttl_seconds, 60);
+        // Sibling key preserved from docker.yaml (deep merge, not replace).
+        assert_eq!(
+            production_ingress_url_template,
+            "{project_name}.rise.localhost"
+        );
+    }
+
+    #[test]
     fn docker_controller_ignores_null_access_classes() {
         // A `null` entry (used to remove an inherited class) must not trip the
         // check even when auth_backend_url is empty.

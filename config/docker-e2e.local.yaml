@@ -1,0 +1,13 @@
+# Local/e2e-only configuration overlay for the standalone Docker stack.
+#
+# Mounted by docker-compose.standalone.local.yaml to /etc/rise/local.yaml, where
+# the backend loads it as the optional `local` layer (after config/docker.yaml).
+# Nested tables deep-merge, so this overrides only the named keys.
+#
+# Purpose: shorten the workload-identity token TTL so the e2e refresh assertion
+# (scripts/ci/lib/identity.sh) observes the controller's in-place re-mint (which
+# happens at half the TTL) within the test window. This is intentionally NOT in
+# the shipped config/docker.yaml: the Docker workload-identity feature is
+# unreleased and operators should not need to tune it yet.
+deployment_controller:
+  identity_token_ttl_seconds: 60

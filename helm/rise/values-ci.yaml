@@ -41,6 +41,10 @@ config:
 
   deployment_controller:
     type: kubernetes
+    # Short identity-token TTL so the e2e workload-identity refresh assertion
+    # (scripts/ci/lib/identity.sh) observes an in-place re-mint (at half-TTL)
+    # inside the test window. CI-only; production keeps the 3600s default.
+    identity_token_ttl_seconds: 60
     production_ingress_url_template: "{project_name}.apps.rise.local"
     staging_ingress_url_template: "{project_name}-{deployment_group}.preview.rise.local"
     environment_ingress_url_template: "{project_name}-{environment}.preview.rise.local"

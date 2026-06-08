@@ -40,6 +40,13 @@ RISE_IMAGE_REPOSITORY="${RISE_IMAGE_REPOSITORY:-ghcr.io/rise-deploy/rise}"
 RISE_IMAGE_TAG="${RISE_IMAGE_TAG:-pr-358-b98adea}"
 export RISE_IMAGE_REPOSITORY RISE_IMAGE_TAG
 
+# Identity-scenario overlay (scripts/.../docker-compose.standalone.identity.yaml):
+# layered onto the rise backend ONLY when it is recreated just before scenario
+# (e), so scenarios (a)-(d) run on the exact default config. It repoints
+# registry_url at the loopback-published registry (so the HOST daemon can pull
+# the built fixture image) and mounts a short-TTL identity config overlay.
+COMPOSE_IDENTITY_OVERLAY="${COMPOSE_IDENTITY_OVERLAY:-docker-compose.standalone.identity.yaml}"
+
 RISE_URL="${RISE_URL:-http://localhost:3000}"
 TRAEFIK_URL="${TRAEFIK_URL:-http://localhost:80}"
 # Must match server.public_url and server.jwt_signing_secret in
@@ -58,6 +65,7 @@ PRIV_PROJECT="priv-e2e-${RUN_ID}"
 # ({project}-default-app, sanitized) stays well under any length limit.
 CUT_PROJECT="cut-e2e-${RUN_ID}"
 CUT_RECREATE_PROJECT="cutr-e2e-${RUN_ID}"
+ID_PROJECT="id-e2e-${RUN_ID}"
 WHOAMI_IMAGE="${WHOAMI_IMAGE:-traefik/whoami}"
 
 RISE_CLI_BIN=""
@@ -688,5 +696,71 @@ if ! grep -qi "Hostname:" "${cutr_body}"; then
   exit 1
 fi
 log "Recreate strategy converges to 200 (whoami output)"
+
+############################################
+# (e) WORKLOAD IDENTITY: a deployed app with `[identity.audiences]` receives a
+#     bootstrap credential + a pre-minted token file, can exchange the credential
+#     for a fresh token, and the controller re-mints the token file in place. The
+#     fixture (tests/e2e-identity-fixture) verifies the RS256/JWKS signatures
+#     INSIDE the container and reports JSON, so the assertions (shared with the
+#     K8s e2e via scripts/ci/lib/identity.sh) are backend-agnostic. The fixture
+#     is built from source and pushed to the in-compose registry, exercising the
+#     Docker build→push→pull path end to end.
+############################################
+log "Scenario (e): workload identity ${ID_PROJECT}"
+# shellcheck source=scripts/ci/lib/identity.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/identity.sh"
+IDENTITY_LOG_PREFIX="e2e-docker"
+
+# Recreate the rise backend with the identity overlay so the build/pull and the
+# short token TTL apply ONLY from here on (scenarios a-d ran on the default
+# config). Postgres state and the running app containers are preserved; the
+# reconciler re-adopts them after the restart.
+log "Recreating the rise backend with the identity overlay (scoped registry_url + short token TTL)"
+docker compose "${COMPOSE_ARGS[@]}" -f "${COMPOSE_IDENTITY_OVERLAY}" \
+  up -d --no-deps --force-recreate rise
+
+log "Waiting for Rise /health after the identity-overlay switch"
+for _ in $(seq 1 60); do
+  code="$(curl -fsS -o /dev/null -w '%{http_code}' "${RISE_URL}/health" 2>/dev/null || echo 000)"
+  if [[ "${code}" == "200" ]]; then
+    break
+  fi
+  sleep 2
+done
+if [[ "${code:-000}" != "200" ]]; then
+  log "ERROR: Rise /health never returned 200 after the identity-overlay switch (last=${code:-000})"
+  exit 1
+fi
+# Re-mint the bearer token (fresh process; secret unchanged, kept fresh).
+RISE_TOKEN="$(create_rise_ci_token)"
+export RISE_TOKEN
+
+ID_APP_HOST="${ID_PROJECT}.rise.localhost"
+rise_cli project create "${ID_PROJECT}" --access-class public --no-rise-toml
+rise_cli deploy tests/e2e-identity-fixture \
+  --project "${ID_PROJECT}" \
+  --backend docker:build \
+  --http-port 8080 \
+  --replicas 1
+wait_for_healthy "${ID_PROJECT}"
+
+# Full contract: credential present, pre-minted file token (aud=rise-e2e-audience)
+# is signature-valid, on-demand exchange yields a signature-valid token with the
+# requested audience and the project-bound subject.
+if ! assert_workload_identity "${TRAEFIK_URL}" "${ID_APP_HOST}" "${ID_PROJECT}" \
+  "e2e" "rise-e2e-audience" "rise-e2e-exchange"; then
+  log "ERROR: workload identity assertion failed for ${ID_PROJECT}"
+  exit 1
+fi
+
+# In-place refresh: the e2e config overlay (config/docker-e2e.local.yaml) sets
+# identity_token_ttl_seconds=60, so the controller re-mints the token file at
+# ~30s; the reconciler runs every 5s and re-uploads it to the live container.
+if ! assert_identity_token_refreshes "${TRAEFIK_URL}" "${ID_APP_HOST}" "e2e" 120; then
+  log "ERROR: workload identity token did not refresh for ${ID_PROJECT}"
+  exit 1
+fi
+log "Workload identity verified end to end (issuance, pre-minted file, in-place refresh)"
 
 log "Docker backend E2E smoke tests completed successfully"

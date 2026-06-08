@@ -1,0 +1,12 @@
+# Deployment config for the e2e workload-identity verifier fixture.
+#
+# The project name is supplied by the e2e harness via `--project`, so it is
+# intentionally omitted here. The only thing this file contributes that no CLI
+# flag can is the `[identity.audiences]` map, which drives the controller to
+# write a pre-minted token file per audience into the container.
+#
+# The map key is the in-pod filename (/var/run/secrets/rise/identity/tokens/e2e)
+# and the value is the audience stamped into that token's `aud` claim. The e2e
+# assertions key on exactly these values.
+[identity.audiences]
+e2e = "rise-e2e-audience"

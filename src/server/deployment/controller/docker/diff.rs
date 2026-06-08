@@ -27,6 +27,11 @@ pub struct ActualContainer {
     /// stable identity tuple. `None` for legacy containers created before this
     /// label was read (treated as unprotected).
     pub deployment_id_label: Option<String>,
+    /// The `deployment-uuid` bookkeeping label — the globally-unique deployment
+    /// identifier. Used to match a container to its deployment row without the
+    /// same-second-collision risk of the timestamp-based `deployment_id`. `None`
+    /// for legacy containers created before this label was read.
+    pub deployment_uuid_label: Option<String>,
     /// Monotonic generation parsed from the `generation` label. The NEXT
     /// generation on a recreate is `generation + 1`. Defaults to `0` when the
     /// label is missing/legacy/unparseable, so the first recreate of a legacy
@@ -454,6 +459,7 @@ mod tests {
             deployment_group: Some("default".to_string()),
             container: Some("app".to_string()),
             deployment_id_label: Some("oldid".to_string()),
+            deployment_uuid_label: None,
             generation: 1,
             replica: 0,
             image_label: Some("img:1".to_string()),
@@ -482,6 +488,7 @@ mod tests {
             deployment_group: Some("default".to_string()),
             container: Some("app".to_string()),
             deployment_id_label: Some("oldid".to_string()),
+            deployment_uuid_label: None,
             generation: 1,
             replica: 0,
             image_label: Some("img:1".to_string()),
@@ -520,6 +527,7 @@ mod tests {
             deployment_group: Some("default".to_string()),
             container: Some("app".to_string()),
             deployment_id_label: Some("protectedid".to_string()),
+            deployment_uuid_label: None,
             generation: 1,
             replica: 0,
             image_label: Some("img:1".to_string()),
@@ -549,6 +557,7 @@ mod tests {
                 deployment_group: Some("default".to_string()),
                 container: Some("app".to_string()),
                 deployment_id_label: Some("protectedid".to_string()),
+                deployment_uuid_label: None,
                 generation: 1,
                 replica: 0,
                 image_label: Some("img:1".to_string()),
@@ -563,6 +572,7 @@ mod tests {
                 deployment_group: Some("default".to_string()),
                 container: Some("app".to_string()),
                 deployment_id_label: Some("orphanid".to_string()),
+                deployment_uuid_label: None,
                 generation: 1,
                 replica: 0,
                 image_label: Some("img:1".to_string()),

@@ -41,6 +41,44 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
         })
 }
 
+/// Generate a fresh 32-byte bootstrap credential, base64url-encoded (no padding).
+///
+/// The single source of the credential format, shared by both deployment
+/// backends (the K8s webhook and the Docker reconciler) so the bearer secret a
+/// workload presents to the token-exchange endpoint is structurally identical
+/// regardless of backend.
+#[cfg(feature = "backend")]
+pub fn generate_bootstrap_credential() -> String {
+    use base64::Engine;
+    use rand::Rng;
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Mint one Rise-signed workload JWT per audience, returning a `filename → JWT`
+/// map keyed by the same `[identity].audiences` keys.
+///
+/// The single home for the per-audience minting loop, shared by both deployment
+/// backends so the claim set (subject, project, environment, group, id, audience)
+/// can never drift between them.
+#[cfg(feature = "backend")]
+pub fn sign_audience_tokens(
+    signer: &rise_backend_auth::RiseTokenSigner,
+    info: &rise_backend_auth::WorkloadSubjectInfo<'_>,
+    audiences: &std::collections::BTreeMap<String, String>,
+    ttl_secs: u64,
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let mut out = std::collections::BTreeMap::new();
+    for (filename, audience) in audiences {
+        let jwt = signer
+            .sign_workload_jwt(info, audience, ttl_secs)
+            .map_err(|e| anyhow::anyhow!("Failed to sign workload token for {audience}: {e:?}"))?;
+        out.insert(filename.clone(), jwt);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{sha256_hex, workload_subject};
@@ -74,5 +112,19 @@ mod tests {
     fn sha256_hex_is_deterministic_and_distinct() {
         assert_eq!(sha256_hex(b"credential"), sha256_hex(b"credential"));
         assert_ne!(sha256_hex(b"credential-a"), sha256_hex(b"credential-b"));
+    }
+
+    #[cfg(feature = "backend")]
+    #[test]
+    fn bootstrap_credential_is_random_and_url_safe() {
+        use super::generate_bootstrap_credential;
+        let a = generate_bootstrap_credential();
+        let b = generate_bootstrap_credential();
+        assert_ne!(a, b, "each credential must be freshly random");
+        // 32 bytes base64url-no-pad → 43 chars, alphabet [A-Za-z0-9_-], no '='.
+        assert_eq!(a.len(), 43);
+        assert!(a
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
     }
 }
