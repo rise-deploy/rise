@@ -140,13 +140,16 @@ ENV PATH="/root/.local/bin:/root/.local/share/mise/shims:${PATH}"
 # Install build tools via mise.
 #
 # Pin every tool version explicitly — `@latest` here is what broke the image
-# build once `docker-cli` rolled forward to a release whose `docker buildx`
-# plugin discovery changed. pack/railpack/buildkit mirror the versions pinned in
-# `mise.toml`; docker-cli is held at the 28.x line where the buildx plugin loads.
+# build: a Docker CLI plugin-loading regression in the 29.1.x line makes
+# `docker buildx version` (and `docker trust`) report "unknown command: docker
+# buildx" even though the plugin binary is present in the searched
+# `~/.docker/cli-plugins` directory. pack/railpack/buildkit mirror the versions
+# pinned in `mise.toml`; docker-cli is held at the last 29.0.x release, the
+# newest line before the regression.
 ARG PACK_VERSION=0.40.6
-ARG DOCKER_CLI_VERSION=28.3.3
+ARG DOCKER_CLI_VERSION=29.0.4
 ARG RAILPACK_VERSION=0.15.1
-ARG BUILDX_VERSION=0.27.0
+ARG BUILDX_VERSION=0.34.1
 ARG BUILDKIT_VERSION=0.28.0
 
 RUN /root/.local/bin/mise use -g pack@${PACK_VERSION} && \
