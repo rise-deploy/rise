@@ -242,10 +242,11 @@ pub fn diff_desired_vs_actual(
                 // Recreate-signature drift: the live container's stamped
                 // `route-hash` differs from the desired one. This makes
                 // create-time-only properties a first-class part of the diff —
-                // when a deployment becomes active (gains Traefik labels) or
-                // stops being active (loses them), OR when its app port starts/
-                // stops being published to a loopback host port, the hash changes
-                // and forces a recreate to apply it. Docker can't mutate a running
+                // when a container's rendered Traefik labels change (its router is
+                // withheld/wired by an access-class change, its health-check labels
+                // appear/disappear, or its route set changes), OR when its app port
+                // starts/stops being published to a loopback host port, the hash
+                // changes and forces a recreate to apply it. Docker can't mutate a running
                 // container's labels or port bindings in place, so recreation is
                 // the only way. Idempotent: once the stamped hash equals the
                 // desired one nothing recreates. A legacy container missing the

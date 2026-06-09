@@ -153,22 +153,14 @@ deployment_controller:
   # Default off; the containerized/production backend reaches apps over the
   # rise_default network. `mise br docker` sets RISE_PUBLISH_APP_PORTS=true.
   publish_app_ports: "${RISE_PUBLISH_APP_PORTS:-false}"
-  # How traffic cuts over when a new deployment becomes active for its group.
-  #   health-rolling => Traefik-HC rolling overlap: old and new replicas share
-  #                     one Traefik load-balancer service and Traefik's per-server
-  #                     health check drains the old ones as the new come up.
-  #   recreate        => Rise-gated single cutover: one active/routable
-  #                     deployment at a time (old route dropped, new stamped).
-  # Default is `health-rolling`.
-  cutover_strategy: "${RISE_CUTOVER_STRATEGY:-health-rolling}"
   # Traefik API base for the serverStatus rolling gate; standalone reaches
   # Traefik in-network at rise-traefik:8080; host-run dev overrides to the
   # published dashboard port; empty disables -> mirror-probe fallback.
   #
-  # In health-rolling mode the reconciler reads Traefik's per-server health
-  # status (the top-level serverStatus map) to retire the old deployment only once the
-  # new servers are actually in Traefik's rotation. Optional basic-auth may be
-  # embedded in the URL (userinfo).
+  # The reconciler reads Traefik's per-server health status (the top-level
+  # serverStatus map) to retire the old deployment only once the new servers are
+  # actually in Traefik's rotation. Optional basic-auth may be embedded in the URL
+  # (userinfo).
   traefik_api_url: "${RISE_TRAEFIK_API_URL:-http://rise-traefik:8080}"
   access_classes:
     public:

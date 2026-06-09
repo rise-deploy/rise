@@ -220,21 +220,6 @@
         }
       ]
     },
-    "CutoverStrategy": {
-      "description": "How the Docker backend cuts traffic over from an old deployment to a new one\nwhen a deployment becomes the active/routable one for its group.\n\n- `HealthRolling` (\"health-rolling\" in YAML): old and new replicas register\n  as servers of one shared Traefik load-balancer service and Traefik's\n  per-server health check drains the old ones as the new ones come up — a\n  health-driven rolling overlap with no Rise-side gate.\n- `Recreate` (\"recreate\" in YAML): Rise gates the cutover itself (single\n  active/routable deployment at a time); the old route is dropped and the new\n  one stamped in one step.\n\nDefaults to `HealthRolling`. Driven by the `cutover_strategy` controller\nsetting (kebab-case string in YAML, so `${VAR:-health-rolling}` interpolation\ndeserializes straight into the enum).",
-      "oneOf": [
-        {
-          "const": "health-rolling",
-          "description": "Health-driven rolling overlap via a shared Traefik service + per-server\nhealth check.",
-          "type": "string"
-        },
-        {
-          "const": "recreate",
-          "description": "Rise-gated single cutover (one active/routable deployment at a time).",
-          "type": "string"
-        }
-      ]
-    },
     "DatabaseSettings": {
       "properties": {
         "url": {
@@ -617,10 +602,6 @@
               "description": "Stable identifier for this deployment controller. The reconciler only\nreconciles projects matching this class. Defaults to `default`.",
               "type": "string"
             },
-            "cutover_strategy": {
-              "$ref": "#/$defs/CutoverStrategy",
-              "description": "How the controller cuts traffic over when a deployment becomes the\nactive/routable one for its group. `health-rolling` (the default)\nkeeps old and new replicas behind one shared Traefik service and lets\nTraefik's per-server health check drain the old ones (rolling\noverlap); `recreate` gates the cutover in Rise (single active\ndeployment at a time). Driven by the kebab-case string in YAML, so a\n`${VAR:-health-rolling}` interpolation deserializes directly into the\nenum."
-            },
             "deployment_constraints": {
               "$ref": "#/$defs/DeploymentConstraints",
               "description": "Platform-level constraints for deployment resources."
@@ -710,7 +691,7 @@
             },
             "traefik_api_url": {
               "default": null,
-              "description": "Base URL of Traefik's API (e.g. `http://rise-traefik:8080` in-network\nor `http://localhost:8090` for a host-run dev backend). Used in\n`health-rolling` mode to read per-server health status (the\ntop-level `serverStatus` map) from Traefik so the old deployment is\nretired only once the new servers are actually in Traefik's rotation.\nOptional basic-auth may be embedded in the URL (userinfo). Leave empty\nto fall back to Rise's own in-process health probe as the in-rotation\nproxy.",
+              "description": "Base URL of Traefik's API (e.g. `http://rise-traefik:8080` in-network\nor `http://localhost:8090` for a host-run dev backend). Read to learn\nper-server health status (the top-level `serverStatus` map) from\nTraefik so the old deployment is retired only once the new servers are\nactually in Traefik's rotation. Optional basic-auth may be embedded in\nthe URL (userinfo). Leave empty to fall back to Rise's own in-process\nhealth probe as the in-rotation proxy.",
               "type": [
                 "string",
                 "null"

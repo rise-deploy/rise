@@ -32,9 +32,7 @@ use super::env::{hash_env, merge_container_env, pin_system_env};
 use super::health::{effective_health_path, probe_error_detail};
 use super::labels::{self, SUFFIX_ENV_HASH, SUFFIX_IMAGE, SUFFIX_MANAGED_BY};
 use super::pod_status::build_controller_metadata;
-use super::rolling::{
-    filter_rolling_actions, replica_ready, routable_for, service_names_for_spec, ReadyVerdict,
-};
+use super::rolling::{filter_rolling_actions, replica_ready, service_names_for_spec, ReadyVerdict};
 use crate::db::models::{Deployment, DeploymentStatus, Project, TerminationReason};
 use crate::server::deployment::models::rise_system_env_vars;
 use crate::server::deployment::resource_builder::ResourceBuilder;
@@ -112,17 +110,9 @@ pub struct ReconcilerConfig {
     /// the container's network IP. Off in production. See the `Docker` settings
     /// variant's `publish_app_ports`.
     pub publish_app_ports: bool,
-    /// Traffic-cutover strategy for the group. Forwarded into [`BuilderConfig`]
-    /// so the container builder gates the Traefik health-check labels on
-    /// `HealthRolling`, AND consumed by the reconciler: in `HealthRolling` mode
-    /// the Deploying→Healthy readiness signal is whether each container's server
-    /// is actually in Traefik's rotation (per `serverStatus`), so the old active
-    /// deployment is retired only once the new servers are confirmed UP. See the
-    /// `Docker` settings variant's `cutover_strategy`.
-    pub cutover_strategy: crate::server::settings::CutoverStrategy,
     /// Base URL of Traefik's API (e.g. `http://rise-traefik:8080`), optionally
-    /// with embedded basic-auth userinfo. In `HealthRolling` mode the reconciler
-    /// reads the top-level `serverStatus` map from Traefik (falling back to a
+    /// with embedded basic-auth userinfo. The reconciler reads the top-level
+    /// `serverStatus` map from Traefik (falling back to a
     /// `loadBalancer.serverStatus` nesting for version tolerance) to learn
     /// whether a container's server is actually in Traefik's rotation (UP) before
     /// retiring the prior active deployment. `None` (unset) → fall back to Rise's
@@ -145,9 +135,9 @@ pub struct DockerReconciler {
     resource_store: Arc<dyn rise_resource_store::ResourceStore>,
     /// HTTP client reused across health probes (built once, not per-probe).
     http_client: reqwest::Client,
-    /// Traefik API client for the `HealthRolling` in-rotation signal. `None`
-    /// when `config.traefik_api_url` is unset (or unparseable) → the reconciler
-    /// falls back to Rise's own probe as the in-rotation proxy.
+    /// Traefik API client for the in-rotation signal. `None` when
+    /// `config.traefik_api_url` is unset (or unparseable) → the reconciler falls
+    /// back to Rise's own probe as the in-rotation proxy.
     traefik_api: Option<super::traefik_api::TraefikApiClient>,
     /// Signs the per-audience workload JWTs delivered as `[identity]` token files
     /// (and the credential-backed token-exchange endpoint uses the same signer).
@@ -748,7 +738,6 @@ impl DockerReconciler {
             app_backend_host_aliases: &self.config.app_backend_host_aliases,
             app_backend_ip: self.config.app_backend_ip.as_deref(),
             publish_app_ports: self.config.publish_app_ports,
-            cutover_strategy: self.config.cutover_strategy,
         }
     }
 
@@ -837,38 +826,27 @@ impl DockerReconciler {
             source_deployment_id.as_deref(),
         );
 
-        // Routability depends on the cutover strategy:
+        // Every infra-bearing deployment is routable: both the old active and the
+        // new Deploying deployment join the ONE group-scoped Traefik service and
+        // carry its health-check labels immediately; Traefik's per-server health
+        // check drains the old servers as the new ones come UP, so there is no
+        // cutover gap. Routing the new deployment from the start (rather than
+        // gating on `is_active`) also avoids the g1→g2 route-hash churn that a
+        // later `is_active` flip would otherwise cause.
         //
-        // - `Recreate`: a container exists (so it can be health-probed) for any
-        //   infra-bearing deployment, but it is only *routable* when it is the
-        //   active deployment for its group — exactly mirroring the K8s path,
-        //   which builds the Ingress solely from `is_active` deployments
-        //   (`active_by_group` in `webhook.rs`). `is_active` is flipped on by
-        //   `mark_as_active`, which runs only after a deployment becomes Healthy.
-        //   Without this gate a still-Deploying/Pushed deployment would advertise
-        //   the same `Host(...)` rule as the live active one and Traefik would
-        //   split production traffic onto the not-yet-healthy container.
-        //
-        // - `HealthRolling`: always routable. Both the old active and the new
-        //   Deploying deployment join the ONE group-scoped Traefik service and
-        //   carry its health-check labels immediately; Traefik's per-server health
-        //   check drains the old servers as the new ones come UP, so there is no
-        //   cutover gap. Making the new deployment routable from the start (rather
-        //   than active-gating) also avoids the g1→g2 route-hash churn a recreate
-        //   would otherwise cause when `is_active` later flips.
-        // A container whose Traefik router would be WITHHELD (auth required but
-        // no `auth_backend_url` to wire forwardAuth — a misconfiguration that
-        // fails closed in the builder) must also be treated as NOT routable here,
-        // so the cutover/readiness path doesn't mark a never-routed container as
-        // in-rotation (ready-when-running) and silently report the deploy Healthy.
-        // Keeping routability consistent with router emission makes such a deploy
-        // surface as not-Healthy instead. Same predicate the builder uses.
-        let routable = routable_for(self.config.cutover_strategy, deployment.is_active)
-            && !container_builder::router_withheld(
-                &project.access_class,
-                &self.config.access_classes,
-                &self.config.auth_backend_url,
-            );
+        // The sole exception: a container whose Traefik router would be WITHHELD
+        // (auth required but no `auth_backend_url` to wire forwardAuth — a
+        // misconfiguration that fails closed in the builder) is treated as NOT
+        // routable here, so the cutover/readiness path doesn't mark a never-routed
+        // container as in-rotation (ready-when-running) and silently report the
+        // deploy Healthy. Keeping routability consistent with router emission
+        // makes such a deploy surface as not-Healthy instead. Same predicate the
+        // builder uses.
+        let routable = !container_builder::router_withheld(
+            &project.access_class,
+            &self.config.access_classes,
+            &self.config.auth_backend_url,
+        );
 
         // Cross-container service discovery: expose each routable sibling's
         // address as `RISE_CONTAINER_HOST__<NAME>=<host>:<port>`, mirroring the
@@ -1004,8 +982,8 @@ impl DockerReconciler {
                     .port
                     .and_then(|_| effective_health_path(spec, &self.config.health_path)),
                 // Traefik load-balancer health-check timing, carried from the
-                // `health_check` spec. Only consumed by the builder when
-                // `cutover_strategy == HealthRolling` AND a health path exists.
+                // `health_check` spec. Only consumed by the builder when a health
+                // path exists.
                 health_check_interval_secs: spec
                     .health_check
                     .as_ref()
@@ -1848,8 +1826,8 @@ impl DockerReconciler {
 
     /// Resolve the deployment's primary ingress hosts — the same set
     /// `compute_desired_for_deployment` feeds into each route's `hosts`. Used by
-    /// the `HealthRolling` readiness pass to decide whether the container emits a
-    /// Traefik router at all (no host → no router → no `serverStatus` to query).
+    /// the readiness pass to decide whether the container emits a Traefik router
+    /// at all (no host → no router → no `serverStatus` to query).
     async fn primary_hosts_for_deployment(
         &self,
         project: &Project,
@@ -1912,10 +1890,11 @@ impl DockerReconciler {
         let mut pods: Vec<(String, Option<InspectedContainer>)> = Vec::new();
         // Every REPLICA of every spec must be ready for the deployment to be
         // healthy:
-        //   - HTTP containers (with a port) must answer the probe — a real HTTP
-        //     GET to the app (loopback published port when `publish_app_ports`
-        //     is on, else the container IP), independent of Traefik routing, so
-        //     a not-yet-active deployment can still become Healthy (then active);
+        //   - HTTP containers (with a port) are ready once their server is in
+        //     Traefik's rotation (per the per-server `serverStatus`); when no
+        //     Traefik signal is available the readiness pass mirrors with Rise's
+        //     own HTTP GET to the app (loopback published port when
+        //     `publish_app_ports` is on, else the container IP);
         //   - workers (no port) must exist and be `running` on the daemon.
         // An empty spec set is never ready.
         let mut all_ready = !container_specs.is_empty();
@@ -1925,30 +1904,24 @@ impl DockerReconciler {
         let mut not_ready_reasons: Vec<String> = Vec::new();
         let running_of =
             |i: &Option<InspectedContainer>| i.as_ref().map(|i| i.running).unwrap_or(false);
-        let rolling =
-            self.config.cutover_strategy == crate::server::settings::CutoverStrategy::HealthRolling;
-        // Only the `HealthRolling` readiness pass consults `service_names_for_spec`
-        // (and only it needs the host gate), so resolve the hosts once per tick
-        // for this deployment, lazily — non-rolling groups pay nothing.
-        let primary_hosts = if rolling {
-            self.primary_hosts_for_deployment(project, deployment)
-                .await?
-        } else {
-            Vec::new()
-        };
+        // The readiness pass consults `service_names_for_spec` (which needs the
+        // host gate), so resolve the hosts once per tick for this deployment.
+        let primary_hosts = self
+            .primary_hosts_for_deployment(project, deployment)
+            .await?;
         for spec in &container_specs {
             let replica_count = clamp_replicas(spec.replicas);
-            // In `HealthRolling` mode, the readiness signal that drives the
-            // Deploying→Healthy supersede (and Healthy→Unhealthy) is whether the
-            // container's server is actually IN Traefik's rotation, not whether
-            // Rise's own probe passes. Fetch the `serverStatus` for the SAME
-            // Traefik service(s) the container's labels emit — a single-route
-            // container has one bare-base service, a multi-route container has
-            // per-route services (`{base}-{idx}`) — and aggregate them, so a
-            // multi-route container's lookup doesn't 404 against a bare-base name
-            // that was never registered. `None` (no Traefik API configured, the
-            // call failed, or no HC labels) → `rolling_rotation_decision` returns
-            // `FallBackToProbe` and we mirror with Rise's own probe.
+            // The readiness signal that drives the Deploying→Healthy supersede
+            // (and Healthy→Unhealthy) is whether the container's server is
+            // actually IN Traefik's rotation, not whether Rise's own probe passes.
+            // Fetch the `serverStatus` for the SAME Traefik service(s) the
+            // container's labels emit — a single-route container has one bare-base
+            // service, a multi-route container has per-route services
+            // (`{base}-{idx}`) — and aggregate them, so a multi-route container's
+            // lookup doesn't 404 against a bare-base name that was never
+            // registered. `None` (no Traefik API configured, the call failed, or
+            // no HC labels) → `rolling_rotation_decision` returns `FallBackToProbe`
+            // and we mirror with Rise's own probe.
             let service_names = service_names_for_spec(
                 &project.name,
                 &deployment.deployment_group,
@@ -1957,17 +1930,14 @@ impl DockerReconciler {
                 &primary_hosts,
             );
             let has_health_path = effective_health_path(spec, &self.config.health_path).is_some();
-            let server_status = if rolling {
-                self.fetch_server_status_aggregated(&service_names, server_status_cache)
-                    .await
-            } else {
-                None
-            };
+            let server_status = self
+                .fetch_server_status_aggregated(&service_names, server_status_cache)
+                .await;
             // When the Traefik API IS available but no serverStatus came back for
             // a container that HAS a health path, the per-server health check is
             // degraded (service not yet registered, or HC labels missing) — warn
             // so operators see it, rather than silently falling back to the probe.
-            if rolling && self.traefik_api.is_some() && has_health_path && server_status.is_none() {
+            if self.traefik_api.is_some() && has_health_path && server_status.is_none() {
                 warn!(
                     deployment_id = %deployment.deployment_id,
                     container = %spec.name,
@@ -2066,7 +2036,6 @@ impl DockerReconciler {
                             // means the decision depends on Rise's own probe — we
                             // run it and use its detailed failure reason.
                             match replica_ready(
-                                rolling,
                                 has_health_path,
                                 running,
                                 api_available,

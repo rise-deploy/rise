@@ -50,13 +50,12 @@ In-flight PRs with operator impact (not yet merged):
 - **Config change — Docker deployment backend** ([#358](https://github.com/rise-deploy/rise/pull/358)).
   Selectable via `deployment_controller.type = "docker"`. Single-host; Kubernetes
   remains the default, so existing installs are unaffected unless they opt in.
+  A new deployment rolls over via Traefik health checks, with old and new
+  overlapping in one load-balanced service (a rolling update, vs. Kubernetes'
+  atomic blue/green). Probing is **opt-in**: no `health_check` means
+  ready-when-running; a set `health_check` is a **2xx–3xx** check.
   Operator-relevant settings on the Docker controller (env-driven; the shipped
   standalone compose sets working defaults):
-  - `cutover_strategy` (default `health-rolling`) — a new deployment rolls over via
-    Traefik health checks, with old and new overlapping in one load-balanced
-    service (a rolling update, vs. Kubernetes' atomic blue/green); `recreate` keeps
-    a single-cutover model. Probing is **opt-in**: no `health_check` means
-    ready-when-running; a set `health_check` is a **2xx–3xx** check.
   - `traefik_api_url` (default in-network `http://rise-traefik:8080`) — the rolling
     gate reads Traefik's `serverStatus`. The standalone Traefik enables its API
     internally (`--api.insecure=true`, port **not** published). If you run your own

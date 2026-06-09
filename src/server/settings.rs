@@ -704,35 +704,6 @@ fn default_metacontroller_webhook_port() -> u16 {
     3001
 }
 
-/// How the Docker backend cuts traffic over from an old deployment to a new one
-/// when a deployment becomes the active/routable one for its group.
-///
-/// - `HealthRolling` ("health-rolling" in YAML): old and new replicas register
-///   as servers of one shared Traefik load-balancer service and Traefik's
-///   per-server health check drains the old ones as the new ones come up — a
-///   health-driven rolling overlap with no Rise-side gate.
-/// - `Recreate` ("recreate" in YAML): Rise gates the cutover itself (single
-///   active/routable deployment at a time); the old route is dropped and the new
-///   one stamped in one step.
-///
-/// Defaults to `HealthRolling`. Driven by the `cutover_strategy` controller
-/// setting (kebab-case string in YAML, so `${VAR:-health-rolling}` interpolation
-/// deserializes straight into the enum).
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize, JsonSchema)]
-#[serde(rename_all = "kebab-case")]
-pub enum CutoverStrategy {
-    /// Health-driven rolling overlap via a shared Traefik service + per-server
-    /// health check.
-    HealthRolling,
-    /// Rise-gated single cutover (one active/routable deployment at a time).
-    Recreate,
-}
-
-#[cfg(feature = "backend")]
-fn default_cutover_strategy() -> CutoverStrategy {
-    CutoverStrategy::HealthRolling
-}
-
 // ── Docker deployment controller defaults ──────────────────────────────
 
 #[cfg(feature = "backend")]
@@ -1432,25 +1403,13 @@ pub enum DeploymentControllerSettings {
         #[schemars(with = "bool")]
         publish_app_ports: bool,
 
-        /// How the controller cuts traffic over when a deployment becomes the
-        /// active/routable one for its group. `health-rolling` (the default)
-        /// keeps old and new replicas behind one shared Traefik service and lets
-        /// Traefik's per-server health check drain the old ones (rolling
-        /// overlap); `recreate` gates the cutover in Rise (single active
-        /// deployment at a time). Driven by the kebab-case string in YAML, so a
-        /// `${VAR:-health-rolling}` interpolation deserializes directly into the
-        /// enum.
-        #[serde(default = "default_cutover_strategy")]
-        cutover_strategy: CutoverStrategy,
-
         /// Base URL of Traefik's API (e.g. `http://rise-traefik:8080` in-network
-        /// or `http://localhost:8090` for a host-run dev backend). Used in
-        /// `health-rolling` mode to read per-server health status (the
-        /// top-level `serverStatus` map) from Traefik so the old deployment is
-        /// retired only once the new servers are actually in Traefik's rotation.
-        /// Optional basic-auth may be embedded in the URL (userinfo). Leave empty
-        /// to fall back to Rise's own in-process health probe as the in-rotation
-        /// proxy.
+        /// or `http://localhost:8090` for a host-run dev backend). Read to learn
+        /// per-server health status (the top-level `serverStatus` map) from
+        /// Traefik so the old deployment is retired only once the new servers are
+        /// actually in Traefik's rotation. Optional basic-auth may be embedded in
+        /// the URL (userinfo). Leave empty to fall back to Rise's own in-process
+        /// health probe as the in-rotation proxy.
         #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
         traefik_api_url: Option<String>,
     },
@@ -2790,20 +2749,12 @@ auth:
             app_backend_host_aliases,
             app_backend_ip,
             deployment_constraints,
-            cutover_strategy,
             traefik_api_url,
             ..
         }) = &settings.deployment_controller
         else {
             panic!("expected docker deployment_controller");
         };
-        // cutover_strategy: env-driven `${RISE_CUTOVER_STRATEGY:-health-rolling}`
-        // defaults to `health-rolling`.
-        assert_eq!(
-            *cutover_strategy,
-            CutoverStrategy::HealthRolling,
-            "local: cutover_strategy must default to health-rolling"
-        );
         // traefik_api_url: env-driven `${RISE_TRAEFIK_API_URL:-http://rise-traefik:8080}`
         // defaults to the in-network standalone Traefik API (the serverStatus
         // rolling gate works out of the box). Host-run dev overrides it to the
@@ -2895,19 +2846,12 @@ auth:
             production_ingress_url_template,
             app_backend_host_aliases,
             app_backend_ip,
-            cutover_strategy,
             traefik_api_url,
             ..
         }) = &settings.deployment_controller
         else {
             panic!("expected docker deployment_controller");
         };
-        // PROD: cutover_strategy defaults to health-rolling (env unset).
-        assert_eq!(
-            *cutover_strategy,
-            CutoverStrategy::HealthRolling,
-            "prod: cutover_strategy must default to health-rolling"
-        );
         // PROD: traefik_api_url unset -> defaults to the in-network standalone
         // Traefik API (rise-traefik:8080), reached over rise_default. The
         // standalone Traefik enables its API internally (--api.insecure=true)

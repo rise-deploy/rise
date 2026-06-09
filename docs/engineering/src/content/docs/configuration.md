@@ -409,10 +409,8 @@ containers on a single Docker host, routed by Traefik. Select it with
 - `ingress_port?` — external port apps are served on (e.g. `80` locally).
 - `controller_class_name` — controller ownership class (default `default`).
 - `reconcile_interval_secs` — in-process reconcile loop interval in seconds (default `5`).
-- `cutover_strategy` — how traffic cuts over when a deployment becomes active:
-  `health-rolling` (default) or `recreate`.
-- `traefik_api_url?` — base URL of Traefik's API, read in `health-rolling` mode to
-  drain old replicas via the top-level `serverStatus` map.
+- `traefik_api_url?` — base URL of Traefik's API, read to drain old replicas via
+  the top-level `serverStatus` map during a rolling cutover.
 - `deployment_constraints.max_replicas` — upper bound on requested replicas (default `10`).
   The Docker controller additionally clamps every request to a hard backstop of `50`
   regardless of this value, so raising it above `50` silently clamps (with only a

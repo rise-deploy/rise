@@ -1,9 +1,9 @@
 //! Minimal async client for Traefik's HTTP API, used by the Docker reconciler's
-//! `HealthRolling` cutover path to learn whether a container's server is actually
-//! in Traefik's load-balancer rotation.
+//! cutover path to learn whether a container's server is actually in Traefik's
+//! load-balancer rotation.
 //!
-//! In `HealthRolling` mode every deployment of a group registers its replica
-//! containers as servers of ONE shared Traefik load-balancer service
+//! Every deployment of a group registers its replica containers as servers of
+//! ONE shared Traefik load-balancer service
 //! (`{service}@docker`, where `{service}` is the group-scoped
 //! `sanitize_router_name({project}-{group}-{container})`). When a `health_check`
 //! is configured, Traefik runs a per-server health check and exposes the result
