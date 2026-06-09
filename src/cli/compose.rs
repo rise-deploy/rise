@@ -101,9 +101,9 @@ fn build_compose(
             environment.insert(k.clone(), v.clone());
         }
         if let Some(port) = container.port {
-            // Intentional local-dev convenience: each service gets PORT set to
-            // its own container port. Production injects a single shared PORT;
-            // locally a per-container PORT lets each image bind correctly.
+            // Matches the reconciler: each port-having container gets PORT set
+            // to its own declared port; workers (no `port`) keep whatever
+            // deployment-wide PORT came in via `shared_env`, if any.
             environment.insert("PORT".to_string(), port.to_string());
         }
         // The controller always injects RISE_CONTAINER (the container's own name).
@@ -308,25 +308,30 @@ fn resolve_project_name(
     Ok((toml_config, project_name))
 }
 
-/// Fetch project preview env vars (best-effort — warns and returns empty on
-/// failure / when logged out, so compose generation still works offline).
+/// Fetch project preview env vars. Missing credentials (not logged in, no CI
+/// token source) degrade gracefully — warn and return an empty map so
+/// `generate` keeps working offline — but a token source that exists and
+/// *fails* is a hard error, matching `rise run`: silently starting a stack
+/// without its project env (OAuth secrets etc.) is a confusing failure mode.
+/// A failing preview fetch itself stays best-effort, also matching `rise run`.
 async fn fetch_shared_env(
     http_client: &Client,
     config: &Config,
     project_name: &str,
     environment: Option<&str>,
-) -> BTreeMap<String, String> {
+) -> Result<BTreeMap<String, String>> {
     let token = match crate::token_source::resolve_token_with_retry(http_client, config).await {
         Ok(token) => token,
+        Err(e) if crate::token_source::is_no_token_source_error(&e) => {
+            warn!("Not logged in — continuing without project environment variables");
+            warn!("Run 'rise login' or configure a CI token source to authenticate");
+            return Ok(BTreeMap::new());
+        }
         Err(e) => {
-            warn!(
-                "No usable token source — generating without project environment variables: {:?}",
-                e
-            );
-            return BTreeMap::new();
+            return Err(e).context("Failed to resolve token for project environment variables");
         }
     };
-    match env::fetch_preview_env_vars(
+    let env_vars = match env::fetch_preview_env_vars(
         http_client,
         &config.get_backend_url(),
         &token,
@@ -350,7 +355,8 @@ async fn fetch_shared_env(
             warn!("Failed to load project environment variables: {:?}", e);
             BTreeMap::new()
         }
-    }
+    };
+    Ok(env_vars)
 }
 
 /// Build every `[containers.X]` with a `build` section locally (push=false).
@@ -399,6 +405,10 @@ fn build_all_local(
 /// Shared by `rise compose` and `rise run` so a podman-configured project both
 /// builds and runs with podman — including the global-config / auto-detect case,
 /// not just an explicit flag/env/toml setting.
+///
+/// Note: only the *top-level* `[build].container_cli` is consulted. A
+/// per-container `[containers.X.build].container_cli` affects that container's
+/// image build, but there is exactly one runtime CLI for the whole stack.
 pub(crate) fn resolve_container_cli(
     config: &Config,
     build_args: &build::BuildArgs,
@@ -438,7 +448,7 @@ pub async fn generate(
 ) -> Result<()> {
     let res = load_multi_container(options.path, options.project)?;
     let shared_env =
-        fetch_shared_env(http_client, config, &res.project_name, options.environment).await;
+        fetch_shared_env(http_client, config, &res.project_name, options.environment).await?;
 
     let compose = build_compose(
         &res.project_name,
@@ -493,7 +503,7 @@ pub async fn up(http_client: &Client, config: &Config, options: UpOptions<'_>) -
     )?;
 
     let shared_env =
-        fetch_shared_env(http_client, config, &res.project_name, options.environment).await;
+        fetch_shared_env(http_client, config, &res.project_name, options.environment).await?;
     let compose = build_compose(
         &res.project_name,
         &res.resolved,
