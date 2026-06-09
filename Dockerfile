@@ -137,21 +137,30 @@ RUN curl https://mise.run | sh
 # Set up mise environment
 ENV PATH="/root/.local/bin:/root/.local/share/mise/shims:${PATH}"
 
-# Install build tools via mise
-RUN /root/.local/bin/mise use -g pack@latest && \
-    /root/.local/bin/mise use -g docker-cli@latest && \
-    /root/.local/bin/mise use -g ubi:railwayapp/railpack@latest && \
+# Install build tools via mise.
+#
+# Pin every tool version explicitly — `@latest` here is what broke the image
+# build once `docker-cli` rolled forward to a release whose `docker buildx`
+# plugin discovery changed. pack/railpack/buildkit mirror the versions pinned in
+# `mise.toml`; docker-cli is held at the 28.x line where the buildx plugin loads.
+ARG PACK_VERSION=0.40.6
+ARG DOCKER_CLI_VERSION=28.3.3
+ARG RAILPACK_VERSION=0.15.1
+ARG BUILDX_VERSION=0.27.0
+ARG BUILDKIT_VERSION=0.28.0
+
+RUN /root/.local/bin/mise use -g pack@${PACK_VERSION} && \
+    /root/.local/bin/mise use -g docker-cli@${DOCKER_CLI_VERSION} && \
+    /root/.local/bin/mise use -g ubi:railwayapp/railpack@${RAILPACK_VERSION} && \
     /root/.local/bin/mise install
 
-# Install Docker buildx plugin manually
+# Install Docker buildx plugin manually (pinned).
 RUN mkdir -p /root/.docker/cli-plugins && \
-    BUILDX_VERSION=$(curl -sL https://api.github.com/repos/docker/buildx/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/') && \
     curl -sSL "https://github.com/docker/buildx/releases/download/v${BUILDX_VERSION}/buildx-v${BUILDX_VERSION}.linux-amd64" -o /root/.docker/cli-plugins/docker-buildx && \
     chmod +x /root/.docker/cli-plugins/docker-buildx
 
-# Install buildctl from buildkit
-RUN BUILDKIT_VERSION=$(curl -sL https://api.github.com/repos/moby/buildkit/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/') && \
-    curl -sSL "https://github.com/moby/buildkit/releases/download/v${BUILDKIT_VERSION}/buildkit-v${BUILDKIT_VERSION}.linux-amd64.tar.gz" | tar -xz -C /usr/local bin/buildctl && \
+# Install buildctl from buildkit (pinned).
+RUN curl -sSL "https://github.com/moby/buildkit/releases/download/v${BUILDKIT_VERSION}/buildkit-v${BUILDKIT_VERSION}.linux-amd64.tar.gz" | tar -xz -C /usr/local bin/buildctl && \
     chmod +x /usr/local/bin/buildctl
 
 # Verify installations
