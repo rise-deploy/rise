@@ -165,6 +165,11 @@ pub(crate) fn service_names_for_spec(
 /// loop in `reconcile_health` so the `serverStatus` selection is unit-testable
 /// without a daemon. Inputs:
 ///
+/// - `router_withheld`: the project's Traefik router is withheld (auth-required
+///   access class but no `auth_backend_url` to wire forwardAuth). Traefik then
+///   never routes to the container, so it can never be Ready — fails closed
+///   regardless of the other inputs, so a misconfigured deploy surfaces as
+///   not-Healthy instead of superseding a working one while serving no traffic.
 /// - `has_health_path`: the container has an effective health path;
 /// - `running`: the live container is `running` on the daemon;
 /// - `api_available`: a Traefik API client is configured AND its serverStatus
@@ -172,8 +177,9 @@ pub(crate) fn service_names_for_spec(
 /// - `server_up`: when `api_available`, whether Traefik reports this container's
 ///   server URL UP (`None` = absent from the map / no IP yet).
 ///
-/// Thin wrapper over [`rolling_rotation_decision`]: in-rotation → `Ready`,
-/// everything else → `NotReady` with the rotation reason.
+/// A withheld router short-circuits to `NotReady`; otherwise this is a thin
+/// wrapper over [`rolling_rotation_decision`]: in-rotation → `Ready`, everything
+/// else → `NotReady` with the rotation reason.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ReadyVerdict {
     Ready,
@@ -181,11 +187,19 @@ pub(crate) enum ReadyVerdict {
 }
 
 pub(crate) fn replica_ready(
+    router_withheld: bool,
     has_health_path: bool,
     running: bool,
     api_available: bool,
     server_up: Option<bool>,
 ) -> ReadyVerdict {
+    if router_withheld {
+        return ReadyVerdict::NotReady(
+            "router withheld (access class requires authentication but no auth_backend_url is \
+             configured)"
+                .to_string(),
+        );
+    }
     match rolling_rotation_decision(has_health_path, running, api_available, server_up) {
         RotationDecision::InRotation => ReadyVerdict::Ready,
         RotationDecision::NotInRotation(reason) => ReadyVerdict::NotReady(reason),
@@ -669,14 +683,14 @@ mod tests {
     fn replica_ready_server_up_is_ready() {
         // HC + Traefik UP → Ready.
         assert_eq!(
-            replica_ready(true, true, true, Some(true)),
+            replica_ready(false, true, true, true, Some(true)),
             ReadyVerdict::Ready
         );
     }
 
     #[test]
     fn replica_ready_server_down_is_not_ready() {
-        match replica_ready(true, true, true, Some(false)) {
+        match replica_ready(false, true, true, true, Some(false)) {
             ReadyVerdict::NotReady(reason) => assert!(reason.contains("DOWN"), "got: {reason}"),
             other => panic!("expected NotReady, got {other:?}"),
         }
@@ -684,7 +698,7 @@ mod tests {
 
     #[test]
     fn replica_ready_absent_server_is_not_ready() {
-        match replica_ready(true, true, true, None) {
+        match replica_ready(false, true, true, true, None) {
             ReadyVerdict::NotReady(reason) => {
                 assert!(reason.contains("serverStatus"), "got: {reason}")
             }
@@ -696,7 +710,7 @@ mod tests {
     fn replica_ready_api_unavailable_is_not_ready() {
         // HC but no Traefik signal (API unset/unreachable or service not yet
         // registered) → NOT ready, with no fallback. `running` is irrelevant.
-        match replica_ready(true, true, false, None) {
+        match replica_ready(false, true, true, false, None) {
             ReadyVerdict::NotReady(reason) => {
                 assert!(reason.contains("serverStatus"), "got: {reason}")
             }
@@ -707,11 +721,35 @@ mod tests {
     #[test]
     fn replica_ready_no_health_check_is_ready_when_running() {
         // No HC → ready-when-running; Traefik signal ignored.
-        assert_eq!(replica_ready(false, true, false, None), ReadyVerdict::Ready);
+        assert_eq!(
+            replica_ready(false, false, true, false, None),
+            ReadyVerdict::Ready
+        );
         assert!(matches!(
-            replica_ready(false, false, false, None),
+            replica_ready(false, false, false, false, None),
             ReadyVerdict::NotReady(_)
         ));
+    }
+
+    #[test]
+    fn replica_ready_router_withheld_is_never_ready() {
+        // A withheld Traefik router (auth-required access class but no
+        // auth_backend_url) means Traefik never routes to the container, so it is
+        // never Ready — regardless of run-state, health check, or serverStatus.
+        // Without this a ready-when-running container would go Healthy and
+        // supersede a working deployment while serving no traffic.
+        for (has_health_path, running, api_available, server_up) in [
+            (false, true, false, None),      // ready-when-running, would be Ready
+            (true, true, true, Some(true)),  // HC + Traefik UP, would be Ready
+            (false, true, true, Some(true)), // running + UP, would be Ready
+        ] {
+            match replica_ready(true, has_health_path, running, api_available, server_up) {
+                ReadyVerdict::NotReady(reason) => {
+                    assert!(reason.contains("router withheld"), "got: {reason}")
+                }
+                other => panic!("expected NotReady (router withheld), got {other:?}"),
+            }
+        }
     }
 
     #[test]

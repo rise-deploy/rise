@@ -1893,11 +1893,11 @@ impl DockerReconciler {
         let mut pods: Vec<(String, Option<InspectedContainer>)> = Vec::new();
         // Every REPLICA of every spec must be ready for the deployment to be
         // healthy:
-        //   - HTTP containers (with a port) are ready once their server is in
-        //     Traefik's rotation (per the per-server `serverStatus`); when no
-        //     Traefik signal is available the readiness pass mirrors with Rise's
-        //     own HTTP GET to the app (loopback published port when
-        //     `publish_app_ports` is on, else the container IP);
+        //   - HTTP containers WITH a `health_check` are ready only once Traefik's
+        //     per-server `serverStatus` reports the server UP — authoritative,
+        //     with no Rise-side probe fallback; WITHOUT one (ready-when-running)
+        //     a `running` container is ready (Traefik has no serverStatus to
+        //     consult);
         //   - workers (no port) must exist and be `running` on the daemon.
         // An empty spec set is never ready.
         let mut all_ready = !container_specs.is_empty();
@@ -1912,6 +1912,19 @@ impl DockerReconciler {
         let primary_hosts = self
             .primary_hosts_for_deployment(project, deployment)
             .await?;
+        // A router-withheld project (auth-required access class but no
+        // `auth_backend_url` to wire forwardAuth — a builder misconfiguration that
+        // fails closed) gets NO Traefik router, so Traefik will never route to its
+        // app containers. Such a port-ed container must therefore never be marked
+        // Ready: otherwise a ready-when-running container would go Healthy and
+        // supersede a working deployment while serving no traffic. Deployment-level
+        // (depends only on the project's access class), so resolve it once. Workers
+        // (no port) need no router and are unaffected.
+        let router_withheld = container_builder::router_withheld(
+            &project.access_class,
+            &self.config.access_classes,
+            &self.config.auth_backend_url,
+        );
         for spec in &container_specs {
             let replica_count = clamp_replicas(spec.replicas);
             // The readiness signal that drives the Deploying→Healthy supersede
@@ -1952,9 +1965,9 @@ impl DockerReconciler {
                     deployment_id = %deployment.deployment_id,
                     container = %spec.name,
                     services = ?service_names,
-                    "Traefik API reachable but returned no serverStatus for a container with a \
-                     health path; treating it as not-ready until Traefik registers its per-server \
-                     health (service not yet registered, or HC labels missing)"
+                    "no Traefik serverStatus for a container with a health path (API unreachable, \
+                     the service is not yet registered, or its health-check labels are missing); \
+                     treating it as not-ready until Traefik reports its server"
                 );
             }
             for replica in 0..replica_count {
@@ -2009,7 +2022,10 @@ impl DockerReconciler {
                         // mirroring K8s, where a Pod with no readiness probe is
                         // Ready once up. Otherwise readiness is whether Traefik's
                         // serverStatus reports the server UP (authoritative, no
-                        // fallback).
+                        // fallback). A withheld router (`router_withheld`) short-
+                        // circuits to not-ready inside `replica_ready`, so a
+                        // misconfigured-auth deploy never supersedes a working one
+                        // while serving no traffic.
                         Some(port) => {
                             let has_health_path =
                                 effective_health_path(spec, &self.config.health_path).is_some();
@@ -2036,8 +2052,13 @@ impl DockerReconciler {
                             } else {
                                 None
                             };
-                            match replica_ready(has_health_path, running, api_available, server_up)
-                            {
+                            match replica_ready(
+                                router_withheld,
+                                has_health_path,
+                                running,
+                                api_available,
+                                server_up,
+                            ) {
                                 ReadyVerdict::Ready => true,
                                 ReadyVerdict::NotReady(reason) => {
                                     debug!(
