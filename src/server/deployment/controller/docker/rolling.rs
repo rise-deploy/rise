@@ -1,5 +1,5 @@
-//! Pure helpers for the rolling-recreate throttle and the `HealthRolling`
-//! in-rotation / readiness decisions. All `&self`-free so they can be
+//! Pure helpers for the rolling-recreate throttle and the in-rotation /
+//! readiness decisions of the Docker cutover. All `&self`-free so they can be
 //! unit-tested without a daemon or Traefik API.
 
 use std::collections::{HashMap, HashSet};
@@ -112,28 +112,6 @@ pub(crate) fn filter_rolling_actions(
     passed
 }
 
-/// Whether a deployment's containers should carry Traefik routing labels, by
-/// cutover strategy:
-///
-/// - `Recreate`: routable only when the deployment is the active one for its
-///   group (Rise-gated single cutover — today's behavior).
-/// - `HealthRolling`: ALWAYS routable. The old active and the new Deploying
-///   deployment both join the one group-scoped Traefik service immediately;
-///   Traefik's per-server health check drains the old servers as the new ones
-///   come UP, so there's no cutover gap (and no g1→g2 route-hash churn from a
-///   later `is_active` flip).
-///
-/// Pure (no `self`) so it can be unit-tested without a daemon.
-pub(crate) fn routable_for(
-    cutover_strategy: crate::server::settings::CutoverStrategy,
-    is_active: bool,
-) -> bool {
-    match cutover_strategy {
-        crate::server::settings::CutoverStrategy::Recreate => is_active,
-        crate::server::settings::CutoverStrategy::HealthRolling => true,
-    }
-}
-
 /// Group-scoped Traefik service name(s) a container spec's routes emit, used by
 /// the reconciler's `serverStatus` lookup so it queries the SAME service(s) the
 /// labels stamp. Mirrors [`container_builder::group_service_names`] but derives
@@ -152,8 +130,7 @@ pub(crate) fn routable_for(
 /// and log a misleading WARN every tick.
 ///
 /// A port-less worker has no routes/service → empty. Routability is implicit:
-/// the caller only consults this in `HealthRolling` mode, where every deployment
-/// is routable.
+/// every infra-bearing deployment is routable.
 pub(crate) fn service_names_for_spec(
     project: &str,
     deployment_group: &str,
@@ -185,67 +162,51 @@ pub(crate) fn service_names_for_spec(
 }
 
 /// Whether a single replica counts as READY, factored out of the per-replica
-/// loop in `reconcile_health` so the `serverStatus`/fallback selection is
-/// unit-testable without a daemon. Inputs:
+/// loop in `reconcile_health` so the `serverStatus` selection is unit-testable
+/// without a daemon. Inputs:
 ///
-/// - `rolling`: the group's cutover strategy is `HealthRolling`;
+/// - `router_withheld`: the project's Traefik router is withheld (auth-required
+///   access class but no `auth_backend_url` to wire forwardAuth). Traefik then
+///   never routes to the container, so it can never be Ready — fails closed
+///   regardless of the other inputs, so a misconfigured deploy surfaces as
+///   not-Healthy instead of superseding a working one while serving no traffic.
 /// - `has_health_path`: the container has an effective health path;
 /// - `running`: the live container is `running` on the daemon;
 /// - `api_available`: a Traefik API client is configured AND its serverStatus
 ///   call for this container's service(s) succeeded;
 /// - `server_up`: when `api_available`, whether Traefik reports this container's
-///   server URL UP (`None` = absent from the map / no IP yet);
-/// - `probe_ok`: the result of Rise's own HTTP probe when one was performed
-///   (`Some(true/false)`), or `None` when no probe has been run yet.
+///   server URL UP (`None` = absent from the map / no IP yet).
 ///
-/// Returns [`ReadyVerdict::NeedsProbe`] when the decision depends on Rise's own
-/// probe but `probe_ok` is `None` — the caller then runs `probe_container` and
-/// re-resolves (or passes the result back in). Keeps `reconcile_health`'s
-/// behavior identical: rolling uses `rolling_rotation_decision`; non-rolling
-/// probes when a health path exists, else gates on `running`.
+/// A withheld router short-circuits to `NotReady`; otherwise this is a thin
+/// wrapper over [`rolling_rotation_decision`]: in-rotation → `Ready`, everything
+/// else → `NotReady` with the rotation reason.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ReadyVerdict {
     Ready,
     NotReady(String),
-    /// The verdict needs Rise's own HTTP probe; the caller must run it and fold
-    /// the result back in (via `probe_ok`).
-    NeedsProbe,
 }
 
 pub(crate) fn replica_ready(
-    rolling: bool,
+    router_withheld: bool,
     has_health_path: bool,
     running: bool,
     api_available: bool,
     server_up: Option<bool>,
-    probe_ok: Option<bool>,
 ) -> ReadyVerdict {
-    if rolling {
-        match rolling_rotation_decision(has_health_path, running, api_available, server_up) {
-            RotationDecision::InRotation => ReadyVerdict::Ready,
-            RotationDecision::NotInRotation(reason) => ReadyVerdict::NotReady(reason),
-            RotationDecision::FallBackToProbe => match probe_ok {
-                Some(true) => ReadyVerdict::Ready,
-                Some(false) => ReadyVerdict::NotReady("health probe failed".to_string()),
-                None => ReadyVerdict::NeedsProbe,
-            },
-        }
-    } else if has_health_path {
-        // Non-rolling with a probe: readiness IS the probe result.
-        match probe_ok {
-            Some(true) => ReadyVerdict::Ready,
-            Some(false) => ReadyVerdict::NotReady("health probe failed".to_string()),
-            None => ReadyVerdict::NeedsProbe,
-        }
-    } else if running {
-        // No probe: a running container is ready (ready-when-running).
-        ReadyVerdict::Ready
-    } else {
-        ReadyVerdict::NotReady("not running (probe disabled)".to_string())
+    if router_withheld {
+        return ReadyVerdict::NotReady(
+            "router withheld (access class requires authentication but no auth_backend_url is \
+             configured)"
+                .to_string(),
+        );
+    }
+    match rolling_rotation_decision(has_health_path, running, api_available, server_up) {
+        RotationDecision::InRotation => ReadyVerdict::Ready,
+        RotationDecision::NotInRotation(reason) => ReadyVerdict::NotReady(reason),
     }
 }
 
-/// Outcome of the `HealthRolling` in-rotation decision for a single container.
+/// Outcome of the in-rotation decision for a single container.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum RotationDecision {
     /// The container's server is in Traefik's rotation (or running, for a
@@ -254,15 +215,9 @@ pub(crate) enum RotationDecision {
     /// The container is NOT in rotation; the string is a human-readable reason
     /// for the deployment's not-ready diagnostic.
     NotInRotation(String),
-    /// No authoritative Traefik signal is available (a `health_check` is
-    /// configured but the Traefik API is unset or errored). The caller must
-    /// MIRROR — fall back to Rise's own `probe_container` as the in-rotation
-    /// proxy (today's behavior).
-    FallBackToProbe,
 }
 
-/// Pure decision for whether a single container is "in rotation" in
-/// `HealthRolling` mode, given:
+/// Pure decision for whether a single container is "in rotation", given:
 ///
 /// - `has_health_path`: the container has an effective health path (a
 ///   `health_check` is configured AND not disabled);
@@ -273,14 +228,17 @@ pub(crate) enum RotationDecision {
 ///   reports this container's server URL (`http://{ip}:{port}`) as UP. `None`
 ///   means the server URL was absent from the map (Traefik doesn't know it yet).
 ///
-/// Rules (see the module / Step B spec):
-/// - has_health_path + api_available → in-rotation IFF Traefik reports the
-///   server UP; a DOWN/absent server is NOT in rotation (so the old deployment
-///   is kept until the new server is confirmed serving).
-/// - !has_health_path → ready-when-running: in-rotation IFF the container is
-///   `running` (Traefik routes to running servers immediately, no HC).
-/// - has_health_path + !api_available → `FallBackToProbe`: the caller mirrors
-///   with Rise's own probe (graceful degradation when no Traefik API).
+/// Rules:
+/// - `!has_health_path` → ready-when-running: in-rotation IFF the container is
+///   `running` (Traefik routes to running servers immediately; with no health
+///   check it publishes no `serverStatus`, so run-state is the only signal).
+/// - `has_health_path` → Traefik's `serverStatus` is AUTHORITATIVE with no
+///   fallback: in-rotation IFF the server is reported UP. A DOWN/absent server,
+///   OR an unavailable Traefik signal (`!api_available` — API unset/unreachable
+///   or the service not yet registered) → NOT in rotation. A health-checked
+///   container is "ready" only once Traefik is actually routing to it, so the
+///   old deployment is never retired while the new server is invisible to
+///   Traefik (no traffic) — which is exactly what an unregistered server is.
 ///
 /// Kept pure (no `self`, no I/O) so it can be unit-tested without a daemon.
 pub(crate) fn rolling_rotation_decision(
@@ -298,10 +256,15 @@ pub(crate) fn rolling_rotation_decision(
             RotationDecision::NotInRotation("not running (no health check)".to_string())
         };
     }
-    // health_check configured.
+    // health_check configured → Traefik's serverStatus is authoritative.
     if !api_available {
-        // No authoritative Traefik signal — mirror with Rise's own probe.
-        return RotationDecision::FallBackToProbe;
+        // No Traefik signal (API unset/unreachable, or the service is not yet
+        // registered). Traefik isn't routing to this server, so it is NOT ready.
+        return RotationDecision::NotInRotation(
+            "Traefik serverStatus unavailable (API unset/unreachable or service not yet \
+             registered)"
+                .to_string(),
+        );
     }
     match server_up {
         Some(true) => RotationDecision::InRotation,
@@ -478,23 +441,6 @@ mod tests {
                 .count(),
             1,
             "exactly one rollout recreate (r0) admitted"
-        );
-    }
-
-    #[test]
-    fn routable_recreate_follows_is_active() {
-        use crate::server::settings::CutoverStrategy;
-        assert!(routable_for(CutoverStrategy::Recreate, true));
-        assert!(!routable_for(CutoverStrategy::Recreate, false));
-    }
-
-    #[test]
-    fn routable_health_rolling_always_true() {
-        use crate::server::settings::CutoverStrategy;
-        assert!(routable_for(CutoverStrategy::HealthRolling, true));
-        assert!(
-            routable_for(CutoverStrategy::HealthRolling, false),
-            "rolling mode is routable even when not active"
         );
     }
 
@@ -734,25 +680,25 @@ mod tests {
     }
 
     #[test]
-    fn replica_ready_rolling_server_up_is_ready() {
-        // Rolling + HC + Traefik UP → Ready, no probe needed.
+    fn replica_ready_server_up_is_ready() {
+        // HC + Traefik UP → Ready.
         assert_eq!(
-            replica_ready(true, true, true, true, Some(true), None),
+            replica_ready(false, true, true, true, Some(true)),
             ReadyVerdict::Ready
         );
     }
 
     #[test]
-    fn replica_ready_rolling_server_down_is_not_ready() {
-        match replica_ready(true, true, true, true, Some(false), None) {
+    fn replica_ready_server_down_is_not_ready() {
+        match replica_ready(false, true, true, true, Some(false)) {
             ReadyVerdict::NotReady(reason) => assert!(reason.contains("DOWN"), "got: {reason}"),
             other => panic!("expected NotReady, got {other:?}"),
         }
     }
 
     #[test]
-    fn replica_ready_rolling_absent_server_is_not_ready() {
-        match replica_ready(true, true, true, true, None, None) {
+    fn replica_ready_absent_server_is_not_ready() {
+        match replica_ready(false, true, true, true, None) {
             ReadyVerdict::NotReady(reason) => {
                 assert!(reason.contains("serverStatus"), "got: {reason}")
             }
@@ -761,80 +707,65 @@ mod tests {
     }
 
     #[test]
-    fn replica_ready_rolling_fallback_needs_probe_then_folds_result() {
-        // Rolling + HC but Traefik API unavailable → fall back to Rise's probe.
-        // With no probe result yet → NeedsProbe; folding the result in resolves.
-        assert_eq!(
-            replica_ready(true, true, true, false, None, None),
-            ReadyVerdict::NeedsProbe
-        );
-        assert_eq!(
-            replica_ready(true, true, true, false, None, Some(true)),
-            ReadyVerdict::Ready
-        );
-        assert!(matches!(
-            replica_ready(true, true, true, false, None, Some(false)),
-            ReadyVerdict::NotReady(_)
-        ));
-    }
-
-    #[test]
-    fn replica_ready_rolling_no_health_check_is_ready_when_running() {
-        // Rolling, no HC → ready-when-running; Traefik signal ignored.
-        assert_eq!(
-            replica_ready(true, false, true, false, None, None),
-            ReadyVerdict::Ready
-        );
-        assert!(matches!(
-            replica_ready(true, false, false, false, None, None),
-            ReadyVerdict::NotReady(_)
-        ));
-    }
-
-    #[test]
-    fn replica_ready_non_rolling_uses_probe_when_health_path() {
-        // Non-rolling + HC: readiness IS the probe result.
-        assert_eq!(
-            replica_ready(false, true, true, false, None, None),
-            ReadyVerdict::NeedsProbe
-        );
-        assert_eq!(
-            replica_ready(false, true, true, false, None, Some(true)),
-            ReadyVerdict::Ready
-        );
-        assert!(matches!(
-            replica_ready(false, true, true, false, None, Some(false)),
-            ReadyVerdict::NotReady(_)
-        ));
-    }
-
-    #[test]
-    fn replica_ready_non_rolling_no_health_path_gates_on_running() {
-        // Non-rolling, no HC → ready-when-running with the disabled-probe reason.
-        assert_eq!(
-            replica_ready(false, false, true, false, None, None),
-            ReadyVerdict::Ready
-        );
-        match replica_ready(false, false, false, false, None, None) {
+    fn replica_ready_api_unavailable_is_not_ready() {
+        // HC but no Traefik signal (API unset/unreachable or service not yet
+        // registered) → NOT ready, with no fallback. `running` is irrelevant.
+        match replica_ready(false, true, true, false, None) {
             ReadyVerdict::NotReady(reason) => {
-                assert!(reason.contains("not running"), "got: {reason}")
+                assert!(reason.contains("serverStatus"), "got: {reason}")
             }
             other => panic!("expected NotReady, got {other:?}"),
         }
     }
 
     #[test]
-    fn rotation_health_check_api_unavailable_falls_back_to_probe() {
-        // HC configured but Traefik API unset/errored → MIRROR with Rise's own
-        // probe (graceful degradation). The `running`/`server_up` inputs are
-        // ignored in this branch.
+    fn replica_ready_no_health_check_is_ready_when_running() {
+        // No HC → ready-when-running; Traefik signal ignored.
         assert_eq!(
-            rolling_rotation_decision(true, true, false, None),
-            RotationDecision::FallBackToProbe
+            replica_ready(false, false, true, false, None),
+            ReadyVerdict::Ready
         );
-        assert_eq!(
+        assert!(matches!(
+            replica_ready(false, false, false, false, None),
+            ReadyVerdict::NotReady(_)
+        ));
+    }
+
+    #[test]
+    fn replica_ready_router_withheld_is_never_ready() {
+        // A withheld Traefik router (auth-required access class but no
+        // auth_backend_url) means Traefik never routes to the container, so it is
+        // never Ready — regardless of run-state, health check, or serverStatus.
+        // Without this a ready-when-running container would go Healthy and
+        // supersede a working deployment while serving no traffic.
+        for (has_health_path, running, api_available, server_up) in [
+            (false, true, false, None),      // ready-when-running, would be Ready
+            (true, true, true, Some(true)),  // HC + Traefik UP, would be Ready
+            (false, true, true, Some(true)), // running + UP, would be Ready
+        ] {
+            match replica_ready(true, has_health_path, running, api_available, server_up) {
+                ReadyVerdict::NotReady(reason) => {
+                    assert!(reason.contains("router withheld"), "got: {reason}")
+                }
+                other => panic!("expected NotReady (router withheld), got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn rotation_health_check_api_unavailable_is_not_in_rotation() {
+        // HC configured but Traefik API unset/errored (or service not yet
+        // registered) → NOT in rotation, no fallback. `running`/`server_up` are
+        // irrelevant: without a Traefik signal the server isn't receiving traffic.
+        match rolling_rotation_decision(true, true, false, None) {
+            RotationDecision::NotInRotation(reason) => {
+                assert!(reason.contains("serverStatus"), "got: {reason}")
+            }
+            other => panic!("expected NotInRotation, got {other:?}"),
+        }
+        assert!(matches!(
             rolling_rotation_decision(true, false, false, Some(true)),
-            RotationDecision::FallBackToProbe
-        );
+            RotationDecision::NotInRotation(_)
+        ));
     }
 }

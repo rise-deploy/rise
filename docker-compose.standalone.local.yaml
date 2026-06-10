@@ -28,7 +28,7 @@ services:
       - "--providers.docker.exposedbydefault=false"
       - "--providers.docker.network=rise_default"
       # Keep Traefik's API enabled internally (:8080, NOT published) so the
-      # backend's health-rolling serverStatus gate works in local/e2e too; the
+      # backend's rolling serverStatus gate works in local/e2e too; the
       # command is replaced wholesale on override, so it must be re-added here.
       - "--api.insecure=true"
       - "--entrypoints.web.address=:80"

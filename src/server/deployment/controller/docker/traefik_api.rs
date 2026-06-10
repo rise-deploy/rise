@@ -1,9 +1,9 @@
 //! Minimal async client for Traefik's HTTP API, used by the Docker reconciler's
-//! `HealthRolling` cutover path to learn whether a container's server is actually
-//! in Traefik's load-balancer rotation.
+//! cutover path to learn whether a container's server is actually in Traefik's
+//! load-balancer rotation.
 //!
-//! In `HealthRolling` mode every deployment of a group registers its replica
-//! containers as servers of ONE shared Traefik load-balancer service
+//! Every deployment of a group registers its replica containers as servers of
+//! ONE shared Traefik load-balancer service
 //! (`{service}@docker`, where `{service}` is the group-scoped
 //! `sanitize_router_name({project}-{group}-{container})`). When a `health_check`
 //! is configured, Traefik runs a per-server health check and exposes the result
@@ -44,7 +44,8 @@ impl TraefikApiClient {
     /// Build a client from the configured `traefik_api_url`. Any basic-auth
     /// userinfo embedded in the URL is extracted and applied to each request;
     /// the stored base URL has it stripped. Returns `None` when the URL can't be
-    /// parsed (so the caller falls back to Rise's own probe).
+    /// parsed (the reconciler then has no in-rotation signal — health-checked
+    /// containers can't become Healthy).
     pub fn new(traefik_api_url: &str) -> Option<Self> {
         let (base_url, basic_auth) = split_userinfo(traefik_api_url)?;
         let http = reqwest::Client::builder()
@@ -65,7 +66,7 @@ impl TraefikApiClient {
     /// `@docker` provider suffix is appended here. Returns `None` on ANY error
     /// (unreachable, non-200, body parse failure, or `serverStatus` absent —
     /// which is the case when no health check is configured), so the caller
-    /// falls back to Rise's own probe.
+    /// treats the container as not-yet-in-rotation.
     pub async fn server_status(&self, service: &str) -> Option<HashMap<String, bool>> {
         let url = format!("{}/api/http/services/{}@docker", self.base_url, service);
         let mut req = self.http.get(&url);

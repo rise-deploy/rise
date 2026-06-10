@@ -372,7 +372,6 @@ async fn init_docker_backend(
         app_backend_host_aliases,
         app_backend_ip: app_backend_ip_override,
         publish_app_ports,
-        cutover_strategy,
         traefik_api_url,
         identity_token_ttl_seconds,
         ..
@@ -548,7 +547,6 @@ async fn init_docker_backend(
             app_backend_host_aliases,
             app_backend_ip,
             publish_app_ports: *publish_app_ports,
-            cutover_strategy: *cutover_strategy,
             traefik_api_url: traefik_api_url.clone(),
         },
     );

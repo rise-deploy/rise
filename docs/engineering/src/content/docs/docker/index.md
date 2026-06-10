@@ -32,7 +32,7 @@ Traefik entrypoints exist.
 
 ## Guide contents
 
-- [Architecture](/operator-docs/docker/architecture/) — how the standalone stack is wired, cutover strategies, and health checks.
+- [Architecture](/operator-docs/docker/architecture/) — how the standalone stack is wired, the rolling cutover, and health checks.
 - [Quick start](/operator-docs/docker/quick-start/) — the fastest way to try the backend locally over plain HTTP, plus the host-run dev inner loop.
 - [Production deployment](/operator-docs/docker/production/) — DNS, TLS/Let's Encrypt, production env vars, hardening, and platform access.
 - [Authentication & ingress auth](/operator-docs/docker/authentication/) — access classes, forwardAuth, `/.rise` routing, and the OIDC/Dex setup.

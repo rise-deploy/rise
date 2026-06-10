@@ -21,6 +21,15 @@ set -euo pipefail
 #       /.rise/auth/signin page, has its /.rise/* path served by the rise
 #       backend (not the app), and allows a request carrying a valid Rise JWT
 #       session cookie (HTTP 200).
+#   (c) health-rolling cutover — a project with a `health_check` and 2 replicas
+#       deploys and serves 200 through Traefik, the Traefik API exposes a
+#       non-empty top-level `serverStatus` map (the per-server gate signal) for
+#       the group-scoped service, and redeploying a changed revision rolls over
+#       with NO 5xx gap (old servers drain only as the new ones come UP).
+#   (d) workload identity — a project with `[identity.audiences]` receives its
+#       bootstrap credential + a pre-minted token file, exchanges the credential
+#       for a fresh token, and the controller re-mints the token file in place
+#       (RS256/JWKS signatures verified inside the container).
 #
 # Auth for the test is an HS256 JWT minted from the config's
 # jwt_signing_secret (email=admin@example.com → admin), mirroring
@@ -42,7 +51,7 @@ export RISE_IMAGE_REPOSITORY RISE_IMAGE_TAG
 
 # Identity-scenario overlay (scripts/.../docker-compose.standalone.identity.yaml):
 # layered onto the rise backend ONLY when it is recreated just before scenario
-# (e), so scenarios (a)-(d) run on the exact default config. It repoints
+# (d), so scenarios (a)-(c) run on the exact default config. It repoints
 # registry_url at the loopback-published registry (so the HOST daemon can pull
 # the built fixture image) and mounts a short-TTL identity config overlay.
 COMPOSE_IDENTITY_OVERLAY="${COMPOSE_IDENTITY_OVERLAY:-docker-compose.standalone.identity.yaml}"
@@ -61,10 +70,9 @@ RISE_JWT_SIGNING_SECRET_B64="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 RUN_ID="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
 PUB_PROJECT="pub-e2e-${RUN_ID}"
 PRIV_PROJECT="priv-e2e-${RUN_ID}"
-# Cutover scenarios. Kept short so the group-scoped Traefik service name
+# Cutover scenario. Kept short so the group-scoped Traefik service name
 # ({project}-default-app, sanitized) stays well under any length limit.
 CUT_PROJECT="cut-e2e-${RUN_ID}"
-CUT_RECREATE_PROJECT="cutr-e2e-${RUN_ID}"
 ID_PROJECT="id-e2e-${RUN_ID}"
 WHOAMI_IMAGE="${WHOAMI_IMAGE:-traefik/whoami}"
 
@@ -429,8 +437,8 @@ log "Authenticated private request allowed (200, whoami output)"
 #     the old active deployment on Traefik's per-server health (serverStatus). If
 #     the gate signal is shaped wrong (or absent), the gate silently no-ops. This
 #     scenario exercises the REAL external contract end to end:
-#       1. deploy with a health_check + 2 replicas (cutover defaults to
-#          health-rolling) and confirm it serves 200 via Traefik;
+#       1. deploy with a health_check + 2 replicas and confirm it serves 200
+#          via Traefik;
 #       2. assert the Traefik API actually EXPOSES a non-empty TOP-LEVEL
 #          serverStatus map (the gate signal) for the group-scoped service;
 #       3. redeploy a changed revision and assert NO 5xx gap across the cutover.
@@ -442,8 +450,8 @@ log "Scenario (c): health-rolling cutover ${CUT_PROJECT}"
 # dir. The `app` container pins the same already-pulled whoami image (which
 # answers 200 on `/`, so `/` is a valid health path — no new image dependency),
 # port 80, 2 replicas, and an explicit health_check. With a health_check present
-# and the default health-rolling strategy, the controller stamps the per-server
-# Traefik healthcheck labels, so Traefik publishes serverStatus.
+# the controller stamps the per-server Traefik healthcheck labels, so Traefik
+# publishes serverStatus.
 CUT_DIR="${E2E_TMPDIR}/cut"
 mkdir -p "${CUT_DIR}"
 cat >"${CUT_DIR}/rise.toml" <<EOF
@@ -644,61 +652,7 @@ fi
 log "New revision took over: all running ${CUT_PROJECT} app containers carry REV=2, none carry REV=1"
 
 ############################################
-# (d) RECREATE STRATEGY: the recreate cutover path must ALSO converge to 200.
-#     Recreate mode now uses the same 2xx-3xx readiness contract, so a deploy
-#     under RISE_CUTOVER_STRATEGY=recreate must still come up Healthy and serve
-#     200. Kept lightweight: we flip the backend's cutover strategy in place
-#     (env override + recreate the rise service) rather than standing up a second
-#     full stack, then deploy a fresh project and assert it converges to 200.
-############################################
-log "Scenario (d): recreate-strategy convergence ${CUT_RECREATE_PROJECT}"
-log "Switching the rise backend to RISE_CUTOVER_STRATEGY=recreate"
-# config/docker.yaml reads cutover_strategy from ${RISE_CUTOVER_STRATEGY:-health-rolling}.
-# Set it for the backend and recreate just the rise service so it re-reads config;
-# the Postgres state (org bootstrap, existing projects) is preserved.
-RISE_CUTOVER_STRATEGY=recreate \
-  docker compose "${COMPOSE_ARGS[@]}" up -d --no-deps --force-recreate rise
-
-log "Waiting for Rise /health after the recreate-strategy switch"
-for _ in $(seq 1 60); do
-  code="$(curl -fsS -o /dev/null -w '%{http_code}' "${RISE_URL}/health" 2>/dev/null || echo 000)"
-  if [[ "${code}" == "200" ]]; then
-    break
-  fi
-  sleep 2
-done
-if [[ "${code:-000}" != "200" ]]; then
-  log "ERROR: Rise /health never returned 200 after recreate-strategy switch (last=${code:-000})"
-  exit 1
-fi
-
-# Re-mint the token (a fresh process; the secret is unchanged so the old token
-# would still validate, but re-minting keeps the iat/exp fresh).
-RISE_TOKEN="$(create_rise_ci_token)"
-export RISE_TOKEN
-
-# A single-replica recreate deploy of the same whoami image must converge to 200.
-rise_cli project create "${CUT_RECREATE_PROJECT}" --access-class public --no-rise-toml
-rise_cli deploy --project "${CUT_RECREATE_PROJECT}" --image "${WHOAMI_IMAGE}" --http-port 80 --replicas 1
-wait_for_healthy "${CUT_RECREATE_PROJECT}"
-
-log "Asserting recreate-strategy project serves 200 through Traefik"
-cutr_body="${E2E_TMPDIR}/cutr_body.txt"
-code="$(curl_through_traefik "${CUT_RECREATE_PROJECT}.rise.localhost" "${cutr_body}")"
-if [[ "${code}" != "200" ]]; then
-  log "ERROR: expected 200 for recreate-strategy project, got ${code}"
-  cat "${cutr_body}" || true
-  exit 1
-fi
-if ! grep -qi "Hostname:" "${cutr_body}"; then
-  log "ERROR: recreate-strategy response did not look like whoami output"
-  cat "${cutr_body}" || true
-  exit 1
-fi
-log "Recreate strategy converges to 200 (whoami output)"
-
-############################################
-# (e) WORKLOAD IDENTITY: a deployed app with `[identity.audiences]` receives a
+# (d) WORKLOAD IDENTITY: a deployed app with `[identity.audiences]` receives a
 #     bootstrap credential + a pre-minted token file, can exchange the credential
 #     for a fresh token, and the controller re-mints the token file in place. The
 #     fixture (tests/e2e-identity-fixture) verifies the RS256/JWKS signatures
@@ -707,13 +661,13 @@ log "Recreate strategy converges to 200 (whoami output)"
 #     is built from source and pushed to the in-compose registry, exercising the
 #     Docker build→push→pull path end to end.
 ############################################
-log "Scenario (e): workload identity ${ID_PROJECT}"
+log "Scenario (d): workload identity ${ID_PROJECT}"
 # shellcheck source=scripts/ci/lib/identity.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/identity.sh"
 IDENTITY_LOG_PREFIX="e2e-docker"
 
 # Recreate the rise backend with the identity overlay so the build/pull and the
-# short token TTL apply ONLY from here on (scenarios a-d ran on the default
+# short token TTL apply ONLY from here on (scenarios a-c ran on the default
 # config). Postgres state and the running app containers are preserved; the
 # reconciler re-adopts them after the restart.
 log "Recreating the rise backend with the identity overlay (scoped registry_url + short token TTL)"

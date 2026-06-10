@@ -50,19 +50,20 @@ In-flight PRs with operator impact (not yet merged):
 - **Config change — Docker deployment backend** ([#358](https://github.com/rise-deploy/rise/pull/358)).
   Selectable via `deployment_controller.type = "docker"`. Single-host; Kubernetes
   remains the default, so existing installs are unaffected unless they opt in.
+  A new deployment rolls over via Traefik health checks, with old and new
+  overlapping in one load-balanced service (a rolling update, vs. Kubernetes'
+  atomic blue/green). Probing is **opt-in**: no `health_check` means
+  ready-when-running; a set `health_check` is a **2xx–3xx** check.
   Operator-relevant settings on the Docker controller (env-driven; the shipped
   standalone compose sets working defaults):
-  - `cutover_strategy` (default `health-rolling`) — a new deployment rolls over via
-    Traefik health checks, with old and new overlapping in one load-balanced
-    service (a rolling update, vs. Kubernetes' atomic blue/green); `recreate` keeps
-    a single-cutover model. Probing is **opt-in**: no `health_check` means
-    ready-when-running; a set `health_check` is a **2xx–3xx** check.
   - `traefik_api_url` (default in-network `http://rise-traefik:8080`) — the rolling
-    gate reads Traefik's `serverStatus`. The standalone Traefik enables its API
+    gate reads Traefik's `serverStatus`, the **authoritative** readiness signal for
+    health-checked containers (no fallback). The standalone Traefik enables its API
     internally (`--api.insecure=true`, port **not** published). If you run your own
-    Traefik, expose its API to the backend over the internal network (optionally
-    with basic-auth embedded in the URL), or leave it unset to fall back to Rise's
-    own probe.
+    Traefik and any project uses a `health_check`, you **must** expose its API to
+    the backend over the internal network (optionally with basic-auth embedded in
+    the URL); without it a health-checked deployment never becomes Healthy. It may
+    be left unset only when no project uses health checks.
   - Replicas: the Docker config raises `deployment_constraints.max_replicas` to 10
     (`RISE_MAX_REPLICAS`); the controller additionally hard-caps at 50.
   The deployment-backend feature matrix, the Docker operator pages, and the
