@@ -21,6 +21,15 @@ set -euo pipefail
 #       /.rise/auth/signin page, has its /.rise/* path served by the rise
 #       backend (not the app), and allows a request carrying a valid Rise JWT
 #       session cookie (HTTP 200).
+#   (c) health-rolling cutover — a project with a `health_check` and 2 replicas
+#       deploys and serves 200 through Traefik, the Traefik API exposes a
+#       non-empty top-level `serverStatus` map (the per-server gate signal) for
+#       the group-scoped service, and redeploying a changed revision rolls over
+#       with NO 5xx gap (old servers drain only as the new ones come UP).
+#   (d) workload identity — a project with `[identity.audiences]` receives its
+#       bootstrap credential + a pre-minted token file, exchanges the credential
+#       for a fresh token, and the controller re-mints the token file in place
+#       (RS256/JWKS signatures verified inside the container).
 #
 # Auth for the test is an HS256 JWT minted from the config's
 # jwt_signing_secret (email=admin@example.com → admin), mirroring
