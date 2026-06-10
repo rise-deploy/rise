@@ -57,11 +57,13 @@ In-flight PRs with operator impact (not yet merged):
   Operator-relevant settings on the Docker controller (env-driven; the shipped
   standalone compose sets working defaults):
   - `traefik_api_url` (default in-network `http://rise-traefik:8080`) — the rolling
-    gate reads Traefik's `serverStatus`. The standalone Traefik enables its API
+    gate reads Traefik's `serverStatus`, the **authoritative** readiness signal for
+    health-checked containers (no fallback). The standalone Traefik enables its API
     internally (`--api.insecure=true`, port **not** published). If you run your own
-    Traefik, expose its API to the backend over the internal network (optionally
-    with basic-auth embedded in the URL), or leave it unset to fall back to Rise's
-    own probe.
+    Traefik and any project uses a `health_check`, you **must** expose its API to
+    the backend over the internal network (optionally with basic-auth embedded in
+    the URL); without it a health-checked deployment never becomes Healthy. It may
+    be left unset only when no project uses health checks.
   - Replicas: the Docker config raises `deployment_constraints.max_replicas` to 10
     (`RISE_MAX_REPLICAS`); the controller additionally hard-caps at 50.
   The deployment-backend feature matrix, the Docker operator pages, and the

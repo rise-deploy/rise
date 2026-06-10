@@ -115,9 +115,10 @@ pub struct ReconcilerConfig {
     /// `serverStatus` map from Traefik (falling back to a
     /// `loadBalancer.serverStatus` nesting for version tolerance) to learn
     /// whether a container's server is actually in Traefik's rotation (UP) before
-    /// retiring the prior active deployment. `None` (unset) → fall back to Rise's
-    /// own in-process health probe as the in-rotation proxy. See the `Docker`
-    /// settings variant's `traefik_api_url`.
+    /// retiring the prior active deployment. Required for health-checked
+    /// containers — `serverStatus` is the authoritative readiness signal with no
+    /// fallback, so when this is `None` (unset) a health-checked deployment never
+    /// becomes Healthy. See the `Docker` settings variant's `traefik_api_url`.
     pub traefik_api_url: Option<String>,
 }
 
@@ -135,9 +136,10 @@ pub struct DockerReconciler {
     resource_store: Arc<dyn rise_resource_store::ResourceStore>,
     /// HTTP client reused across health probes (built once, not per-probe).
     http_client: reqwest::Client,
-    /// Traefik API client for the in-rotation signal. `None` when
-    /// `config.traefik_api_url` is unset (or unparseable) → the reconciler falls
-    /// back to Rise's own probe as the in-rotation proxy.
+    /// Traefik API client for the authoritative in-rotation signal. `None` when
+    /// `config.traefik_api_url` is unset (or unparseable) — health-checked
+    /// containers then have no readiness signal and never become Healthy
+    /// (`serverStatus` is required, with no probe fallback).
     traefik_api: Option<super::traefik_api::TraefikApiClient>,
     /// Signs the per-audience workload JWTs delivered as `[identity]` token files
     /// (and the credential-backed token-exchange endpoint uses the same signer).
@@ -200,8 +202,8 @@ impl DockerReconciler {
                 );
                 reqwest::Client::new()
             });
-        // Built once from the configured Traefik API URL (if any). `None` → the
-        // reconciler falls back to Rise's own probe for the in-rotation signal.
+        // Built once from the configured Traefik API URL (if any). `None` → no
+        // in-rotation signal, so health-checked containers can't become Healthy.
         let traefik_api = config
             .traefik_api_url
             .as_deref()
@@ -1790,7 +1792,8 @@ impl DockerReconciler {
     /// servers, so merging them is safe and a server reported UP by any route's
     /// health check counts as UP). `None` when there is no Traefik API, no
     /// service names, or every queried service returned `None` (unreachable /
-    /// non-200 / no HC labels) — the caller then falls back to Rise's own probe.
+    /// non-200 / no HC labels) — a health-checked container is then treated as
+    /// not-ready (no fallback) until Traefik reports its server.
     async fn fetch_server_status_aggregated(
         &self,
         service_names: &[String],
@@ -1913,15 +1916,15 @@ impl DockerReconciler {
             let replica_count = clamp_replicas(spec.replicas);
             // The readiness signal that drives the Deploying→Healthy supersede
             // (and Healthy→Unhealthy) is whether the container's server is
-            // actually IN Traefik's rotation, not whether Rise's own probe passes.
-            // Fetch the `serverStatus` for the SAME Traefik service(s) the
-            // container's labels emit — a single-route container has one bare-base
-            // service, a multi-route container has per-route services
-            // (`{base}-{idx}`) — and aggregate them, so a multi-route container's
-            // lookup doesn't 404 against a bare-base name that was never
-            // registered. `None` (no Traefik API configured, the call failed, or
-            // no HC labels) → `rolling_rotation_decision` returns `FallBackToProbe`
-            // and we mirror with Rise's own probe.
+            // actually IN Traefik's rotation. For a health-checked container
+            // Traefik's `serverStatus` is AUTHORITATIVE, with no fallback: until
+            // Traefik reports the server UP it is treated as not-ready (Traefik
+            // isn't routing to it, so it receives no traffic). Fetch the
+            // `serverStatus` for the SAME Traefik service(s) the container's labels
+            // emit — a single-route container has one bare-base service, a
+            // multi-route container has per-route services (`{base}-{idx}`) — and
+            // aggregate them, so a multi-route container's lookup doesn't 404
+            // against a bare-base name that was never registered.
             let service_names = service_names_for_spec(
                 &project.name,
                 &deployment.deployment_group,
@@ -1933,18 +1936,25 @@ impl DockerReconciler {
             let server_status = self
                 .fetch_server_status_aggregated(&service_names, server_status_cache)
                 .await;
-            // When the Traefik API IS available but no serverStatus came back for
-            // a container that HAS a health path, the per-server health check is
-            // degraded (service not yet registered, or HC labels missing) — warn
-            // so operators see it, rather than silently falling back to the probe.
-            if self.traefik_api.is_some() && has_health_path && server_status.is_none() {
+            // Surface the two ways a health-checked container has no Traefik
+            // signal. Both leave it not-ready (serverStatus is required), but the
+            // first is a persistent operator misconfiguration worth a louder log.
+            if has_health_path && self.traefik_api.is_none() {
+                warn!(
+                    deployment_id = %deployment.deployment_id,
+                    container = %spec.name,
+                    "health_check configured but no deployment_controller.traefik_api_url is set; \
+                     the Traefik serverStatus gate is required for health-checked containers, so \
+                     this deployment cannot become Healthy — set traefik_api_url"
+                );
+            } else if has_health_path && server_status.is_none() {
                 warn!(
                     deployment_id = %deployment.deployment_id,
                     container = %spec.name,
                     services = ?service_names,
                     "Traefik API reachable but returned no serverStatus for a container with a \
-                     health path; falling back to Rise's own probe (Traefik per-server health \
-                     check may be missing or the service is not yet registered)"
+                     health path; treating it as not-ready until Traefik registers its per-server \
+                     health (service not yet registered, or HC labels missing)"
                 );
             }
             for replica in 0..replica_count {
@@ -1995,34 +2005,28 @@ impl DockerReconciler {
                         // HTTP container: honor the per-container `health_check`
                         // spec. An ABSENT `health_check`, or `disabled = true`
                         // (→ `effective_health_path` returns None), means no HTTP
-                        // probe, so a *running* container is ready — mirroring
-                        // K8s, where a Pod with no readiness probe is Ready once
-                        // up. Otherwise probe `health_check.path` (or default).
+                        // health check, so a *running* container is ready —
+                        // mirroring K8s, where a Pod with no readiness probe is
+                        // Ready once up. Otherwise readiness is whether Traefik's
+                        // serverStatus reports the server UP (authoritative, no
+                        // fallback).
                         Some(port) => {
-                            let health_path = effective_health_path(spec, &self.config.health_path);
-                            let has_health_path = health_path.is_some();
+                            let has_health_path =
+                                effective_health_path(spec, &self.config.health_path).is_some();
                             let running = running_of(&inspected);
                             // Whether Traefik's serverStatus authoritatively
                             // reports this replica's server, and if so UP/DOWN.
                             // `api_available` requires both a client AND a fetched
                             // status; `server_up` is None when the URL is absent
                             // from the map (or no IP yet) so the decision reports
-                            // the distinct absent-server reason.
-                            let api_available =
-                                self.traefik_api.is_some() && server_status.is_some();
-                            // `server_status` is only ever `Some` when a Traefik
-                            // client exists (see `fetch_server_status_aggregated`,
-                            // which returns `None` without one), so `server_up`
-                            // can be `Some` only when `api_available` is true.
-                            // When the API isn't available the verdict must defer
-                            // to Rise's own probe (`None`). When it IS available,
-                            // pass the per-server UP/DOWN straight through, and
-                            // leave `server_up` as `None` when the URL is absent
-                            // from the map (or there's no IP yet) — that ABSENT
-                            // case is distinct from a reported-DOWN server and the
-                            // verdict reports a different reason for each. Do NOT
+                            // the distinct absent-server reason. `server_status` is
+                            // only ever `Some` when a Traefik client exists (see
+                            // `fetch_server_status_aggregated`), so `server_up` is
+                            // `Some` only when `api_available` is true. Do NOT
                             // collapse absent → `Some(false)`: that would mislabel
                             // an unknown server as "DOWN".
+                            let api_available =
+                                self.traefik_api.is_some() && server_status.is_some();
                             let server_up = if api_available {
                                 server_status.as_ref().and_then(|m| {
                                     inspected.as_ref().and_then(|i| i.ip.as_deref()).and_then(
@@ -2032,16 +2036,8 @@ impl DockerReconciler {
                             } else {
                                 None
                             };
-                            // Pure selection of the readiness verdict. `NeedsProbe`
-                            // means the decision depends on Rise's own probe — we
-                            // run it and use its detailed failure reason.
-                            match replica_ready(
-                                has_health_path,
-                                running,
-                                api_available,
-                                server_up,
-                                None,
-                            ) {
+                            match replica_ready(has_health_path, running, api_available, server_up)
+                            {
                                 ReadyVerdict::Ready => true,
                                 ReadyVerdict::NotReady(reason) => {
                                     debug!(
@@ -2051,28 +2047,6 @@ impl DockerReconciler {
                                     );
                                     not_ready_reasons.push(format!("'{label}' {reason}"));
                                     false
-                                }
-                                ReadyVerdict::NeedsProbe => {
-                                    let path = health_path
-                                        .as_deref()
-                                        .expect("NeedsProbe implies a health path");
-                                    match self.probe_container(inspected.as_ref(), port, path).await
-                                    {
-                                        Ok(()) => true,
-                                        Err(reason) => {
-                                            // Per-tick at debug to avoid noise while
-                                            // an app is still warming up; the reason
-                                            // is also folded into the Unhealthy
-                                            // status.
-                                            debug!(
-                                                deployment_id = %deployment.deployment_id,
-                                                container = %label,
-                                                "Health probe failed: {reason}"
-                                            );
-                                            not_ready_reasons.push(format!("'{label}' {reason}"));
-                                            false
-                                        }
-                                    }
                                 }
                             }
                         }

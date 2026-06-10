@@ -47,11 +47,14 @@ e.g. `path`, `interval`, `timeout`) so Traefik routes only to servers that pass
 the check. The new deployment is **retired-old-gated** on Traefik's per-server
 `serverStatus`: the reconciler reads it via the **internal Traefik API** at
 `deployment_controller.traefik_api_url` and only drops the old deployment once
-the new servers are actually `UP` in Traefik's rotation. When `traefik_api_url`
-is unset or unreachable it **falls back to Rise's own mirror probe**. Old and
-new overlap during a deploy — there is no single atomic cutover; this is a
-rolling update, like a Kubernetes rolling update (vs. an atomic blue/green
-switch).
+the new servers are actually `UP` in Traefik's rotation. This `serverStatus`
+signal is **authoritative with no fallback**: a health-checked container is
+"ready" only once Traefik reports it `UP`, so the old deployment is never retired
+while the new server is still invisible to Traefik (and therefore receiving no
+traffic). `deployment_controller.traefik_api_url` is therefore **required** for
+health-checked projects — see the note below. Old and new overlap during a
+deploy — there is no single atomic cutover; this is a rolling update, like a
+Kubernetes rolling update (vs. an atomic blue/green switch).
 
 > **No Traefik credential needed.** The Traefik API is enabled internally
 > (`--api.insecure=true`) and reached only over the `rise_default` network
@@ -59,11 +62,14 @@ switch).
 > put the API behind basic-auth, embed the credentials in `traefik_api_url`'s
 > userinfo (`http://user:pass@host:8080`).
 
-> **Probing is opt-in.** With **no** `health_check` set, a deployment is
-> considered ready **as soon as its container is running**. Setting a
-> `health_check` switches readiness to a **2xx–3xx** check, enforced by
-> **Traefik's** per-server health check (mirrored by **Rise's own probe** when no
-> Traefik API is reachable).
+> **Probing is opt-in — but requires the Traefik API.** With **no** `health_check`
+> set, a deployment is considered ready **as soon as its container is running**
+> (Traefik publishes no `serverStatus` without a health check, so run-state is the
+> only signal). Setting a `health_check` switches readiness to a **2xx–3xx** check
+> enforced by **Traefik's** per-server health check, read back via `serverStatus`.
+> That signal is authoritative with **no Rise-side fallback**, so a `health_check`
+> **requires a reachable `traefik_api_url`**: without one the deployment never
+> becomes Healthy (the controller logs a clear warning).
 >
 > The zero-gap rollover guarantee only holds **when a `health_check` is set.**
 > Without one Traefik has no per-server check to drain against, so a new server

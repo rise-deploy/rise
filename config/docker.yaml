@@ -155,12 +155,15 @@ deployment_controller:
   publish_app_ports: "${RISE_PUBLISH_APP_PORTS:-false}"
   # Traefik API base for the serverStatus rolling gate; standalone reaches
   # Traefik in-network at rise-traefik:8080; host-run dev overrides to the
-  # published dashboard port; empty disables -> mirror-probe fallback.
+  # published dashboard port.
   #
   # The reconciler reads Traefik's per-server health status (the top-level
   # serverStatus map) to retire the old deployment only once the new servers are
   # actually in Traefik's rotation. Optional basic-auth may be embedded in the URL
-  # (userinfo).
+  # (userinfo). REQUIRED for projects that set a health_check: serverStatus is the
+  # authoritative readiness signal (no fallback), so without a reachable API a
+  # health-checked deployment never becomes Healthy. May be empty only when no
+  # project uses health checks (ready-when-running gates on run-state alone).
   traefik_api_url: "${RISE_TRAEFIK_API_URL:-http://rise-traefik:8080}"
   access_classes:
     public:

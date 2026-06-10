@@ -691,7 +691,7 @@
             },
             "traefik_api_url": {
               "default": null,
-              "description": "Base URL of Traefik's API (e.g. `http://rise-traefik:8080` in-network\nor `http://localhost:8090` for a host-run dev backend). Read to learn\nper-server health status (the top-level `serverStatus` map) from\nTraefik so the old deployment is retired only once the new servers are\nactually in Traefik's rotation. Optional basic-auth may be embedded in\nthe URL (userinfo). Leave empty to fall back to Rise's own in-process\nhealth probe as the in-rotation proxy.",
+              "description": "Base URL of Traefik's API (e.g. `http://rise-traefik:8080` in-network\nor `http://localhost:8090` for a host-run dev backend). Read to learn\nper-server health status (the top-level `serverStatus` map) from\nTraefik so the old deployment is retired only once the new servers are\nactually in Traefik's rotation. Optional basic-auth may be embedded in\nthe URL (userinfo). **Required for projects that set a `health_check`**:\nTraefik's `serverStatus` is the authoritative readiness signal (no\nfallback), so without a reachable API a health-checked deployment never\nbecomes Healthy. May be left empty only when no project uses health\nchecks (ready-when-running gates on run-state alone).",
               "type": [
                 "string",
                 "null"

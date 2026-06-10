@@ -1408,8 +1408,11 @@ pub enum DeploymentControllerSettings {
         /// per-server health status (the top-level `serverStatus` map) from
         /// Traefik so the old deployment is retired only once the new servers are
         /// actually in Traefik's rotation. Optional basic-auth may be embedded in
-        /// the URL (userinfo). Leave empty to fall back to Rise's own in-process
-        /// health probe as the in-rotation proxy.
+        /// the URL (userinfo). **Required for projects that set a `health_check`**:
+        /// Traefik's `serverStatus` is the authoritative readiness signal (no
+        /// fallback), so without a reachable API a health-checked deployment never
+        /// becomes Healthy. May be left empty only when no project uses health
+        /// checks (ready-when-running gates on run-state alone).
         #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
         traefik_api_url: Option<String>,
     },

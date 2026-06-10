@@ -162,30 +162,22 @@ pub(crate) fn service_names_for_spec(
 }
 
 /// Whether a single replica counts as READY, factored out of the per-replica
-/// loop in `reconcile_health` so the `serverStatus`/fallback selection is
-/// unit-testable without a daemon. Inputs:
+/// loop in `reconcile_health` so the `serverStatus` selection is unit-testable
+/// without a daemon. Inputs:
 ///
 /// - `has_health_path`: the container has an effective health path;
 /// - `running`: the live container is `running` on the daemon;
 /// - `api_available`: a Traefik API client is configured AND its serverStatus
 ///   call for this container's service(s) succeeded;
 /// - `server_up`: when `api_available`, whether Traefik reports this container's
-///   server URL UP (`None` = absent from the map / no IP yet);
-/// - `probe_ok`: the result of Rise's own HTTP probe when one was performed
-///   (`Some(true/false)`), or `None` when no probe has been run yet.
+///   server URL UP (`None` = absent from the map / no IP yet).
 ///
-/// Returns [`ReadyVerdict::NeedsProbe`] when the decision depends on Rise's own
-/// probe but `probe_ok` is `None` — the caller then runs `probe_container` and
-/// re-resolves (or passes the result back in). Delegates to
-/// [`rolling_rotation_decision`], mirroring with Rise's own probe when Traefik
-/// has no authoritative signal.
+/// Thin wrapper over [`rolling_rotation_decision`]: in-rotation → `Ready`,
+/// everything else → `NotReady` with the rotation reason.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ReadyVerdict {
     Ready,
     NotReady(String),
-    /// The verdict needs Rise's own HTTP probe; the caller must run it and fold
-    /// the result back in (via `probe_ok`).
-    NeedsProbe,
 }
 
 pub(crate) fn replica_ready(
@@ -193,16 +185,10 @@ pub(crate) fn replica_ready(
     running: bool,
     api_available: bool,
     server_up: Option<bool>,
-    probe_ok: Option<bool>,
 ) -> ReadyVerdict {
     match rolling_rotation_decision(has_health_path, running, api_available, server_up) {
         RotationDecision::InRotation => ReadyVerdict::Ready,
         RotationDecision::NotInRotation(reason) => ReadyVerdict::NotReady(reason),
-        RotationDecision::FallBackToProbe => match probe_ok {
-            Some(true) => ReadyVerdict::Ready,
-            Some(false) => ReadyVerdict::NotReady("health probe failed".to_string()),
-            None => ReadyVerdict::NeedsProbe,
-        },
     }
 }
 
@@ -215,11 +201,6 @@ pub(crate) enum RotationDecision {
     /// The container is NOT in rotation; the string is a human-readable reason
     /// for the deployment's not-ready diagnostic.
     NotInRotation(String),
-    /// No authoritative Traefik signal is available (a `health_check` is
-    /// configured but the Traefik API is unset or errored). The caller must
-    /// MIRROR — fall back to Rise's own `probe_container` as the in-rotation
-    /// proxy (today's behavior).
-    FallBackToProbe,
 }
 
 /// Pure decision for whether a single container is "in rotation", given:
@@ -233,14 +214,17 @@ pub(crate) enum RotationDecision {
 ///   reports this container's server URL (`http://{ip}:{port}`) as UP. `None`
 ///   means the server URL was absent from the map (Traefik doesn't know it yet).
 ///
-/// Rules (see the module / Step B spec):
-/// - has_health_path + api_available → in-rotation IFF Traefik reports the
-///   server UP; a DOWN/absent server is NOT in rotation (so the old deployment
-///   is kept until the new server is confirmed serving).
-/// - !has_health_path → ready-when-running: in-rotation IFF the container is
-///   `running` (Traefik routes to running servers immediately, no HC).
-/// - has_health_path + !api_available → `FallBackToProbe`: the caller mirrors
-///   with Rise's own probe (graceful degradation when no Traefik API).
+/// Rules:
+/// - `!has_health_path` → ready-when-running: in-rotation IFF the container is
+///   `running` (Traefik routes to running servers immediately; with no health
+///   check it publishes no `serverStatus`, so run-state is the only signal).
+/// - `has_health_path` → Traefik's `serverStatus` is AUTHORITATIVE with no
+///   fallback: in-rotation IFF the server is reported UP. A DOWN/absent server,
+///   OR an unavailable Traefik signal (`!api_available` — API unset/unreachable
+///   or the service not yet registered) → NOT in rotation. A health-checked
+///   container is "ready" only once Traefik is actually routing to it, so the
+///   old deployment is never retired while the new server is invisible to
+///   Traefik (no traffic) — which is exactly what an unregistered server is.
 ///
 /// Kept pure (no `self`, no I/O) so it can be unit-tested without a daemon.
 pub(crate) fn rolling_rotation_decision(
@@ -258,10 +242,15 @@ pub(crate) fn rolling_rotation_decision(
             RotationDecision::NotInRotation("not running (no health check)".to_string())
         };
     }
-    // health_check configured.
+    // health_check configured → Traefik's serverStatus is authoritative.
     if !api_available {
-        // No authoritative Traefik signal — mirror with Rise's own probe.
-        return RotationDecision::FallBackToProbe;
+        // No Traefik signal (API unset/unreachable, or the service is not yet
+        // registered). Traefik isn't routing to this server, so it is NOT ready.
+        return RotationDecision::NotInRotation(
+            "Traefik serverStatus unavailable (API unset/unreachable or service not yet \
+             registered)"
+                .to_string(),
+        );
     }
     match server_up {
         Some(true) => RotationDecision::InRotation,
@@ -678,16 +667,16 @@ mod tests {
 
     #[test]
     fn replica_ready_server_up_is_ready() {
-        // HC + Traefik UP → Ready, no probe needed.
+        // HC + Traefik UP → Ready.
         assert_eq!(
-            replica_ready(true, true, true, Some(true), None),
+            replica_ready(true, true, true, Some(true)),
             ReadyVerdict::Ready
         );
     }
 
     #[test]
     fn replica_ready_server_down_is_not_ready() {
-        match replica_ready(true, true, true, Some(false), None) {
+        match replica_ready(true, true, true, Some(false)) {
             ReadyVerdict::NotReady(reason) => assert!(reason.contains("DOWN"), "got: {reason}"),
             other => panic!("expected NotReady, got {other:?}"),
         }
@@ -695,7 +684,7 @@ mod tests {
 
     #[test]
     fn replica_ready_absent_server_is_not_ready() {
-        match replica_ready(true, true, true, None, None) {
+        match replica_ready(true, true, true, None) {
             ReadyVerdict::NotReady(reason) => {
                 assert!(reason.contains("serverStatus"), "got: {reason}")
             }
@@ -704,48 +693,41 @@ mod tests {
     }
 
     #[test]
-    fn replica_ready_fallback_needs_probe_then_folds_result() {
-        // HC but Traefik API unavailable → fall back to Rise's probe. With no
-        // probe result yet → NeedsProbe; folding the result in resolves.
-        assert_eq!(
-            replica_ready(true, true, false, None, None),
-            ReadyVerdict::NeedsProbe
-        );
-        assert_eq!(
-            replica_ready(true, true, false, None, Some(true)),
-            ReadyVerdict::Ready
-        );
-        assert!(matches!(
-            replica_ready(true, true, false, None, Some(false)),
-            ReadyVerdict::NotReady(_)
-        ));
+    fn replica_ready_api_unavailable_is_not_ready() {
+        // HC but no Traefik signal (API unset/unreachable or service not yet
+        // registered) → NOT ready, with no fallback. `running` is irrelevant.
+        match replica_ready(true, true, false, None) {
+            ReadyVerdict::NotReady(reason) => {
+                assert!(reason.contains("serverStatus"), "got: {reason}")
+            }
+            other => panic!("expected NotReady, got {other:?}"),
+        }
     }
 
     #[test]
     fn replica_ready_no_health_check_is_ready_when_running() {
         // No HC → ready-when-running; Traefik signal ignored.
-        assert_eq!(
-            replica_ready(false, true, false, None, None),
-            ReadyVerdict::Ready
-        );
+        assert_eq!(replica_ready(false, true, false, None), ReadyVerdict::Ready);
         assert!(matches!(
-            replica_ready(false, false, false, None, None),
+            replica_ready(false, false, false, None),
             ReadyVerdict::NotReady(_)
         ));
     }
 
     #[test]
-    fn rotation_health_check_api_unavailable_falls_back_to_probe() {
-        // HC configured but Traefik API unset/errored → MIRROR with Rise's own
-        // probe (graceful degradation). The `running`/`server_up` inputs are
-        // ignored in this branch.
-        assert_eq!(
-            rolling_rotation_decision(true, true, false, None),
-            RotationDecision::FallBackToProbe
-        );
-        assert_eq!(
+    fn rotation_health_check_api_unavailable_is_not_in_rotation() {
+        // HC configured but Traefik API unset/errored (or service not yet
+        // registered) → NOT in rotation, no fallback. `running`/`server_up` are
+        // irrelevant: without a Traefik signal the server isn't receiving traffic.
+        match rolling_rotation_decision(true, true, false, None) {
+            RotationDecision::NotInRotation(reason) => {
+                assert!(reason.contains("serverStatus"), "got: {reason}")
+            }
+            other => panic!("expected NotInRotation, got {other:?}"),
+        }
+        assert!(matches!(
             rolling_rotation_decision(true, false, false, Some(true)),
-            RotationDecision::FallBackToProbe
-        );
+            RotationDecision::NotInRotation(_)
+        ));
     }
 }
