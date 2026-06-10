@@ -40,12 +40,12 @@ service accounts, and extensions. That requires:
 ```
 A. Substrate maturation                     B. Migration
    ┌─────────────────────────────────┐         ┌──────────────────────────┐
-   │ A1 Typed built-in registry      │────────▶│ B1 Extensions →          │
+   │ A1 Typed built-in registry      │         │ B1 Extensions →          │
    │ A2 End-user / org RBAC          │──┐      │    one RD per type       │
    │ A3 Pagination + selectors       │  │      │ B2 Project + Env         │──┐
-   │ A4 PATCH (merge+RFC6902)        │  │      │ B3 ServiceAccount        │  │
-   │ A5 Server-side Apply            │  ├─────▶│ B4 Deployment            │──┤
-   │ A6 Secret-marked fields         │  │      │ B5{a..f} Drop typed tbls │◀─┘
+   │ A4 PATCH (merge+RFC6902)        │  ├─────▶│ B3 ServiceAccount        │  │
+   │ A5 Server-side Apply            │  │ (A1+ │ B4 Deployment            │──┤
+   │ A6 Secret-marked fields         │  │  A2) │ B5{a..f} Drop typed tbls │◀─┘
    │ A7 Schemas served via HTTP      │  │      └──────────────────────────┘
    │ A8 Watch API + LISTEN/NOTIFY    │  │      C. Multi-controller
    │ A9 rise-resource-client         │  │         ┌─────────────────────┐
@@ -54,8 +54,9 @@ A. Substrate maturation                     B. Migration
    │ A12 Audit on PATCH/RBAC paths   │  │         │    reference impl   │
    │ A13 Reserve (group,kind) for    │  │         │ C2 Controller as a  │
    │     built-ins (shadowing fix)   │  │         │    resource kind +  │
-   │ A14 admin vs operator overlap   │  │         │    per-Org registry │
-   │ A15 Watch backpressure / limits │  └────────▶└─────────────────────┘
+   │ A14 Watch backpressure / limits │  └────────▶│    per-Org registry │
+   │ (design note for A2:            │            └─────────────────────┘
+   │   admin vs operator overlap)    │
    └─────────────────────────────────┘
 ```
 
@@ -106,9 +107,11 @@ green.
 - **Deferred to follow-ups:** `schema_fn` on the registration (lands with A7,
   which needs per-collection schemas at runtime for the `_schema`/`_discovery`
   endpoints — without it, A7 would re-create the hardcoded match A1 just
-  removed); `status_writers` (lands with the built-in controller-ownership
-  work, currently flagged in B2's notes); driving `schemas.rs::generate_schemas`
-  off the registry (re-evaluate when there are >2 built-ins).
+  removed); `status_writers` (lands when the first built-in actually has a
+  controller writing its status — for now `allowed_status_controller_ids`
+  stays empty for built-ins and the field is omitted from the registration
+  struct entirely); driving `schemas.rs::generate_schemas` off the registry
+  (re-evaluate when there are >2 built-ins).
 - Removes blocker: subsequent built-in kinds (Project, Env, Deployment, SA)
   become one-call registrations rather than copies of the match arm.
 
@@ -266,7 +269,9 @@ green.
   `Arc<BuiltInRegistry>` into the RD validation path.
 - Small, self-contained; can land anywhere after A1.
 
-**PR A14 — Resolve `auth.admin_users` vs `auth.operator_users` interaction**
+**Design note for A2 — `auth.admin_users` vs `auth.operator_users` overlap**
+- *Not a separate PR — must be resolved during A2's design phase.* Recorded
+  here so it doesn't fall out of the plan.
 - CLAUDE.md flags this as intentionally deferred: admins are default-Org
   admins, operators have generic-API access, the two roles do not overlap
   by configuration. Once A2 introduces end-user RBAC, the question becomes
@@ -274,10 +279,8 @@ green.
   semantics in both API paths). Pick one of: (a) make admin a strict subset
   of org-admin under A2's model, (b) keep them disjoint and document
   explicitly in the operator docs, (c) merge into a single role.
-- Resolve as part of A2's design phase, not as a separate PR; recording
-  here so it doesn't fall out of the plan.
 
-**PR A15 — Watch backpressure, connection limits, and observability**
+**PR A14 — Watch backpressure, connection limits, and observability**
 - A8 ships the change feed; this PR adds per-connection rate limits,
   max-concurrent-watch caps per principal, NDJSON chunk timeouts, and
   metrics (active-watch gauge, events-fanned-out counter, drop counter for
@@ -285,7 +288,13 @@ green.
   connections.
 - Self-contained follow-up to A8; not on B/C's critical path.
 
-### Migration (B2/B3/B4 depend on A1 + A2; B1 is independent of A1)
+### Migration
+
+B1 is independent of A1 (extensions ride external `ResourceDefinitions`). B2/B3/B4
+each have two stages: the **data-plane move** (typed APIs become facades over
+the resource store; needs A1 only) and the **API-surface flip** (user-facing
+routes go to `/api/v1/resources/…`; needs A2 for end-user RBAC). Per-PR
+dependencies in each section below.
 
 **PR B1 — Extensions: one ResourceDefinition per type**
 - Add four ResourceDefinitions registered at startup (`AwsRdsPostgres`,
@@ -330,12 +339,24 @@ green.
   - **B5b** — drop `service_accounts` (depends on B3 bake)
   - **B5c** — drop `environments` (depends on B2 bake)
   - **B5d** — drop `deployments` (depends on B4 bake)
-  - **B5e** — drop `projects` (depends on B5c+B5d; projects is the parent
-    in the resource hierarchy)
+  - **B5e** — drop `projects`. Blocked on the full FK fan-in to
+    `projects(id)` clearing, not just the parent-chain children. As of this
+    writing those FKs are: `project_extensions` (→ B5a), `service_accounts`
+    (→ B5b), `environments` (→ B5c), `deployments` (→ B5d), `env_vars`,
+    `custom_domains`, and `project_app_users`. The last three are not yet
+    on the migration roadmap and gate B5e independently — see follow-ups
+    below.
   - **B5f** — drop `teams` (depends on the typed Team API moving onto a
     Team built-in, which is on the post-roadmap backlog)
 - Each PR removes the corresponding typed routes (or thins them to
   read-throughs against the resource API for the CLI compatibility window).
+- **Follow-up migrations (not yet sequenced)**: `env_vars` (high-cardinality
+  + secret-bearing → pulls in A3 + A6, currently flagged in Open Question 3);
+  `custom_domains` (parent: Project or Environment, depending on the env-
+  scoped-domain work); `project_app_users` (end-user identity rows under a
+  Project — likely belongs under a Team or Project user-membership kind, not
+  its own root collection). Treat as B5e prerequisites; add concrete PRs
+  once the typed-table dependencies above are resolved.
 
 ### Multi-controller routing
 
