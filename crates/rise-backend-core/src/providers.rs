@@ -83,7 +83,6 @@ pub trait RegistryProvider: Send + Sync {
     /// that specific image. Other providers (ECR, OCI client-auth) ignore it.
     ///
     /// Defaults to wrapping `get_pull_credentials()` as `LoginCredentials`.
-    #[allow(dead_code)]
     async fn get_k8s_pull_credentials(&self, repository: &str) -> Result<RegistryCredentials> {
         let _ = repository;
         let (username, password) = self.get_pull_credentials().await?;

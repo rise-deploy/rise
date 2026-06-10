@@ -10,7 +10,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use rise_backend_core::models::{
     CustomDomain, Deployment, DeploymentEnvVar, DeploymentStatus, Environment, Project,
-    ProjectStatus, TerminationReason,
+    TerminationReason,
 };
 use rise_backend_core::DeploymentStore;
 use sqlx::PgPool;
@@ -36,10 +36,6 @@ impl DeploymentStore for PgDeploymentStore {
 
     async fn find_project(&self, id: Uuid) -> Result<Option<Project>> {
         crate::db::projects::find_by_id(&self.pool, id).await
-    }
-
-    async fn update_project_status(&self, id: Uuid, status: ProjectStatus) -> Result<Project> {
-        crate::db::projects::update_status(&self.pool, id, status).await
     }
 
     async fn update_project_calculated_status(&self, project_id: Uuid) -> Result<Project> {

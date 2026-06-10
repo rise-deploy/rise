@@ -34,7 +34,6 @@ pub fn needs_image_push(status: &DeploymentStatus) -> bool {
 
 /// Check if a deployment can be cancelled
 /// Only deployments in pre-infrastructure states can be cancelled
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn is_cancellable(status: &DeploymentStatus) -> bool {
     matches!(
         status,
@@ -48,7 +47,6 @@ pub fn is_cancellable(status: &DeploymentStatus) -> bool {
 
 /// Check if a deployment can be terminated
 /// Only deployments with running infrastructure can be terminated
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn is_terminable(status: &DeploymentStatus) -> bool {
     matches!(
         status,

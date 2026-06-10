@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::models::{
     CustomDomain, Deployment, DeploymentEnvVar, DeploymentStatus, Environment, Project,
-    ProjectStatus, TerminationReason,
+    TerminationReason,
 };
 
 /// Persistence operations the deployment controllers depend on.
@@ -30,9 +30,6 @@ pub trait DeploymentStore: Send + Sync {
 
     /// Look up a project by its primary key.
     async fn find_project(&self, id: Uuid) -> Result<Option<Project>>;
-
-    /// Set a project's stored status directly.
-    async fn update_project_status(&self, id: Uuid, status: ProjectStatus) -> Result<Project>;
 
     /// Recompute and persist a project's status from its deployments.
     async fn update_project_calculated_status(&self, project_id: Uuid) -> Result<Project>;

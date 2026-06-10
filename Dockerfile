@@ -146,8 +146,8 @@ ENV PATH="/root/.local/bin:/root/.local/share/mise/shims:${PATH}"
 # `~/.docker/cli-plugins` directory. See https://github.com/docker/cli/issues/6733.
 # pack/railpack/buildkit mirror the versions pinned in `mise.toml`; docker-cli is
 # held at the last 29.0.x release (29.0.4), the newest line before the regression
-# — buildx itself is fine, so it tracks the latest. Bump docker-cli back to the
-# 29.1+ line once the upstream issue is resolved.
+# — buildx itself is fine, so it's pinned to the current latest (0.34.1). Bump
+# docker-cli back to the 29.1+ line once the upstream issue is resolved.
 ARG PACK_VERSION=0.40.6
 ARG DOCKER_CLI_VERSION=29.0.4
 ARG RAILPACK_VERSION=0.15.1
