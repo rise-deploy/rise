@@ -113,17 +113,20 @@ cargo all-features check --all-targets
 cargo check --package rise-resource-api --all-targets
 cargo check --package rise-resource-store --all-targets
 cargo check --package rise-backend-auth --all-targets
+cargo check --package rise-backend-core --all-targets
 cargo check --package rise-runtime-sync --all-targets
 cargo all-features clippy --all-targets -- -D warnings
 cargo clippy --package rise-resource-api --all-targets -- -D warnings
 cargo clippy --package rise-resource-store --all-targets -- -D warnings
 cargo clippy --package rise-backend-auth --all-targets -- -D warnings
+cargo clippy --package rise-backend-core --all-targets -- -D warnings
 cargo clippy --package rise-runtime-sync --all-targets -- -D warnings
 cargo fmt --all -- --check
 mise sqlx:check
 mise resource:schema:check
 helm lint helm/rise
 cargo test --package rise-backend-auth --all-targets
+cargo test --package rise-backend-core --all-targets
 """
 env.SQLX_OFFLINE = true
 

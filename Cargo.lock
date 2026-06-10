@@ -4247,6 +4247,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rise-backend-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "uuid",
+]
+
+[[package]]
 name = "rise-deploy"
 version = "0.23.0-rc4"
 dependencies = [
@@ -4283,6 +4296,7 @@ dependencies = [
  "regex",
  "reqwest 0.13.4",
  "rise-backend-auth",
+ "rise-backend-core",
  "rise-resource-api",
  "rise-resource-store",
  "rise-runtime-sync",

@@ -31,7 +31,7 @@ use crate::server::deployment::resource_builder::ResourceBuilder;
 use anyhow::Result;
 use async_trait::async_trait;
 use bollard::Docker;
-use sqlx::PgPool;
+use rise_backend_core::DeploymentStore;
 use std::sync::Arc;
 
 /// Slim Docker backend wrapping a bollard client + `ResourceBuilder`.
@@ -42,15 +42,19 @@ use std::sync::Arc;
 pub struct DockerBackend {
     docker: Docker,
     resource_builder: Arc<ResourceBuilder>,
-    db_pool: PgPool,
+    store: Arc<dyn DeploymentStore>,
 }
 
 impl DockerBackend {
-    pub fn new(docker: Docker, resource_builder: Arc<ResourceBuilder>, db_pool: PgPool) -> Self {
+    pub fn new(
+        docker: Docker,
+        resource_builder: Arc<ResourceBuilder>,
+        store: Arc<dyn DeploymentStore>,
+    ) -> Self {
         Self {
             docker,
             resource_builder,
-            db_pool,
+            store,
         }
     }
 
@@ -72,15 +76,12 @@ impl DeploymentBackend for DockerBackend {
         project: &Project,
     ) -> Result<DeploymentUrls> {
         let environment = if let Some(env_id) = deployment.environment_id {
-            crate::db::environments::find_by_id(&self.db_pool, env_id).await?
+            self.store.find_environment(env_id).await?
         } else {
             None
         };
-        let all_environments =
-            crate::db::environments::list_for_project(&self.db_pool, project.id).await?;
-        let custom_domains =
-            crate::db::custom_domains::list_project_custom_domains(&self.db_pool, project.id)
-                .await?;
+        let all_environments = self.store.list_environments_for_project(project.id).await?;
+        let custom_domains = self.store.list_project_custom_domains(project.id).await?;
 
         Ok(self.resource_builder.compute_deployment_urls(
             project,
@@ -96,9 +97,7 @@ impl DeploymentBackend for DockerBackend {
         project: &Project,
         deployment_group: &str,
     ) -> Result<DeploymentUrls> {
-        let custom_domains =
-            crate::db::custom_domains::list_project_custom_domains(&self.db_pool, project.id)
-                .await?;
+        let custom_domains = self.store.list_project_custom_domains(project.id).await?;
 
         Ok(self
             .resource_builder

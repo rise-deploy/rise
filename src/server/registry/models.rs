@@ -1,35 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-/// How the CLI should apply registry credentials before pushing
-#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum RegistryAuthMethod {
-    /// Use `docker/podman login` (default; works for ECR, OCI registries)
-    #[default]
-    LoginCredentials,
-    /// Write a `registrytoken` entry directly into the container CLI's auth config file.
-    /// Used when a bearer JWT must be injected without going through the login handshake
-    /// (e.g., GitLab scoped JWTs).
-    RegistryToken,
-}
-
-/// Registry credentials response
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct RegistryCredentials {
-    /// Registry path for docker login (e.g., "123456789.dkr.ecr.us-east-1.amazonaws.com/rise/myapp")
-    /// This should be the full repository path that the credentials are scoped to
-    pub registry_url: String,
-    /// Username for authentication
-    pub username: String,
-    /// Password or token for authentication
-    pub password: String,
-    /// How long the credentials are valid (in seconds)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expires_in: Option<u64>,
-    /// How the CLI should apply these credentials
-    #[serde(default)]
-    pub auth_method: RegistryAuthMethod,
-}
+/// The credential types live in `rise-backend-core`; re-exported here so existing
+/// `crate::server::registry::models::{RegistryCredentials, RegistryAuthMethod}`
+/// references keep working.
+pub use rise_backend_core::{RegistryAuthMethod, RegistryCredentials};
 
 /// Registry credentials response wrapper
 #[derive(Debug, Serialize)]

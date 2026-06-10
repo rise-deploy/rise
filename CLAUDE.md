@@ -53,7 +53,7 @@ Let's outline the architecture and components needed for this Rust-based project
 
 ## Architecture Overview
 
-**Note**: The project is a Cargo **workspace**. The primary crate `rise-deploy` produces the `rise` binary with both CLI and server capabilities enabled via feature flags. A few focused, backend-only support crates live under `crates/` and are depended on as optional, `backend`-feature-gated path deps: `rise-resource-api` / `rise-resource-store` (generic resource API), and `rise-backend-auth` (pure-core token signing, verification, and matching — the single home for auth-token logic; see `AUTH_TOKEN_EXCHANGE_PLAN.md`).
+**Note**: The project is a Cargo **workspace**. The primary crate `rise-deploy` produces the `rise` binary with both CLI and server capabilities enabled via feature flags. A few focused, backend-only support crates live under `crates/` and are depended on as optional, `backend`-feature-gated path deps: `rise-resource-api` / `rise-resource-store` (generic resource API), `rise-backend-auth` (pure-core token signing, verification, and matching — the single home for auth-token logic; see `AUTH_TOKEN_EXCHANGE_PLAN.md`), and `rise-backend-core` (the deployment-backend contract seam: shared deployment models, the `DeploymentBackend` trait, registry/encryption provider traits, the pure `quantity`/`state_machine` helpers, and the `DeploymentStore` trait — the database boundary implemented by `rise-deploy`'s `PgDeploymentStore`; this is the foundation for extracting the Docker/Kubernetes controllers into their own crates, see issue #377).
 
 ### Crate Structure (`rise-deploy`)
 
@@ -233,7 +233,7 @@ cargo clippy --all-features --all-targets -- -D warnings  # Lint (uses cached bu
 
 | What changed | Command | Why |
 |---|---|---|
-| Any `.rs` file | `cargo test --workspace --all-features` | Unit tests (requires `mise run db:migrate` once); `--workspace` ensures crates such as `rise-backend-auth` are included |
+| Any `.rs` file | `cargo test --workspace --all-features` | Unit tests (requires `mise run db:migrate` once); `--workspace` ensures crates such as `rise-backend-auth` and `rise-backend-core` are included |
 | SQLX queries (`sqlx::query!` etc.) | `mise run sqlx:prepare` | Regenerate offline query cache (commit the result) |
 | Server settings structs (`src/server/settings.rs`) | `mise run config:schema:generate` | Regenerate `docs/engineering/public/schemas/backend-settings.schema.json` (commit the result) |
 | `src/rise_toml.rs` structs | `mise run rise-toml:schema:generate` | Regenerate `docs/user/public/schemas/rise-toml-v1.schema.json` (commit the result) |
