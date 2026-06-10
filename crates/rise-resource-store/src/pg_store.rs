@@ -52,14 +52,6 @@ impl PgResourceStore {
         }
     }
 
-    /// Reference to the built-in registry this store routes through. Exposed
-    /// so callers that also need to enumerate built-in kinds (schema
-    /// generation, discovery endpoints) can share the same registration set
-    /// rather than rebuilding their own.
-    pub fn builtins(&self) -> &Arc<BuiltInRegistry> {
-        &self.builtins
-    }
-
     fn is_name_conflict(err: &sqlx::Error) -> bool {
         if let sqlx::Error::Database(db) = err {
             let c = db.constraint().unwrap_or("");

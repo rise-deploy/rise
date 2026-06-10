@@ -73,11 +73,12 @@ impl BuiltInRegistration {
     /// Used by [`BuiltInRegistry::by_group_kind`] to index registrations for
     /// `resolve_collection_by_kind` lookups, which carry a `(group, kind)`
     /// tuple from the parent-chain walk rather than a full `api_version`.
+    ///
+    /// `register()` validates `<group>/<version>` shape on insertion, so on a
+    /// successfully registered entry the split here always succeeds; the
+    /// fallback is only reachable from the constructor of an unregistered
+    /// `BuiltInRegistration`.
     pub fn group(&self) -> &'static str {
-        // A built-in `api_version` is always `<group>/<version>` (compile-time
-        // constant), so the split never falls back; the fallback exists only
-        // to avoid a panic on a malformed runtime extension if we ever expose
-        // dynamic registration.
         match self.api_version.split_once('/') {
             Some((g, _)) => g,
             None => self.api_version,
@@ -135,12 +136,23 @@ impl BuiltInRegistry {
         r
     }
 
-    /// Insert a registration. Panics on duplicate `collection` or duplicate
-    /// `(group, kind)`: built-ins are statically declared, and a duplicate
-    /// is a programmer error, not a runtime condition. Surfacing it as a
-    /// panic at startup avoids silently shadowing one built-in with another
-    /// during routing.
+    /// Insert a registration. Panics on:
+    /// - a malformed `api_version` (must be `<group>/<version>`),
+    /// - a duplicate `collection`, or
+    /// - a duplicate `(group, kind)` tuple.
+    ///
+    /// Built-ins are statically declared, so each of these is a programmer
+    /// error caught at startup rather than a runtime condition. Surfacing
+    /// them as panics avoids silently shadowing one built-in with another
+    /// during routing, and keeps the [`Self::group`] fallback unreachable for
+    /// any registered entry.
     pub fn register(&mut self, reg: BuiltInRegistration) {
+        if reg.api_version.split_once('/').is_none() {
+            panic!(
+                "built-in '{}' has malformed api_version '{}'; expected '<group>/<version>'",
+                reg.collection, reg.api_version
+            );
+        }
         let key = reg.collection;
         if self.by_collection.contains_key(key) {
             panic!("duplicate built-in collection '{key}'");
@@ -192,11 +204,11 @@ impl BuiltInRegistry {
     }
 }
 
-impl Default for BuiltInRegistry {
-    fn default() -> Self {
-        Self::defaults()
-    }
-}
+// Intentionally **no** `impl Default for BuiltInRegistry`. Rust convention is
+// that `Default::default()` produces an empty value for collection-like types
+// (`HashMap::default()`, `Vec::default()`); mapping it to the populated
+// canonical set would invite a subtle test bug. Callers must pick between the
+// two explicit constructors [`Self::empty`] and [`Self::defaults`].
 
 #[cfg(test)]
 mod tests {
@@ -249,6 +261,22 @@ mod tests {
         assert_eq!(info.storage_api_version, API_VERSION_V1ALPHA1);
         // Controller ownership for built-ins is deferred (see roadmap PR B2+).
         assert!(info.allowed_status_controller_ids.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "malformed api_version")]
+    fn malformed_api_version_panics() {
+        let mut r = BuiltInRegistry::empty();
+        r.register(BuiltInRegistration {
+            collection: "examples",
+            // Missing the `/<version>` half; `register` must catch this
+            // before it lands in the by_group_kind index with a degenerate
+            // group string.
+            api_version: "example.dev",
+            kind: "Example",
+            parent: None,
+            spec_validator: Arc::new(OrganizationValidator),
+        });
     }
 
     #[test]

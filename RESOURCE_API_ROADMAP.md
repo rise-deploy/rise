@@ -39,36 +39,41 @@ service accounts, and extensions. That requires:
 
 ```
 A. Substrate maturation                     B. Migration
-   ┌─────────────────────────────┐             ┌────────────────────┐
-   │ A1 Typed built-in registry  │────────────▶│ B1 Extensions →    │
-   │ A2 End-user / org RBAC      │──┐          │    one RD per type │
-   │ A3 Pagination + selectors   │  │          │ B2 Project + Env   │──┐
-   │ A4 PATCH (merge+RFC6902)    │  │          │ B3 ServiceAccount  │  │
-   │ A5 Server-side Apply        │  ├─────────▶│ B4 Deployment      │──┤
-   │ A6 Secret-marked fields     │  │          │ B5 Drop typed tbls │◀─┘
-   │ A7 Schemas served via HTTP  │  │          └────────────────────┘
-   │ A8 Watch API + LISTEN/NOTIFY│  │          C. Multi-controller
-   │ A9 rise-resource-client     │  │             ┌─────────────────┐
-   └─────────────────────────────┘  └────────────▶│ C1 Per-org      │
-                                                  │    controller   │
-                                                  │    routing      │
-                                                  │ C2 External K8s │
-                                                  │    controller   │
-                                                  │    reference    │
-                                                  │    impl         │
-                                                  └─────────────────┘
+   ┌─────────────────────────────────┐         ┌──────────────────────────┐
+   │ A1 Typed built-in registry      │────────▶│ B1 Extensions →          │
+   │ A2 End-user / org RBAC          │──┐      │    one RD per type       │
+   │ A3 Pagination + selectors       │  │      │ B2 Project + Env         │──┐
+   │ A4 PATCH (merge+RFC6902)        │  │      │ B3 ServiceAccount        │  │
+   │ A5 Server-side Apply            │  ├─────▶│ B4 Deployment            │──┤
+   │ A6 Secret-marked fields         │  │      │ B5{a..f} Drop typed tbls │◀─┘
+   │ A7 Schemas served via HTTP      │  │      └──────────────────────────┘
+   │ A8 Watch API + LISTEN/NOTIFY    │  │      C. Multi-controller
+   │ A9 rise-resource-client         │  │         ┌─────────────────────┐
+   │ A10 Built-in version evolution  │  │         │ C1 External K8s     │
+   │ A11 RD spec evolution           │  │         │    controller       │
+   │ A12 Audit on PATCH/RBAC paths   │  │         │    reference impl   │
+   │ A13 Reserve (group,kind) for    │  │         │ C2 Controller as a  │
+   │     built-ins (shadowing fix)   │  │         │    resource kind +  │
+   │ A14 admin vs operator overlap   │  │         │    per-Org registry │
+   │ A15 Watch backpressure / limits │  └────────▶└─────────────────────┘
+   └─────────────────────────────────┘
 ```
 
 Hard ordering rules:
 
-- **A1 (typed built-in registry) blocks B-anything.** Adding Project as a
-  built-in means adding *the second* built-in beyond Organization/RD; doing it
-  on top of the current ad-hoc match in `pg_store::builtin_collection_info`
-  will compound technical debt.
-- **A2 (org-scoped RBAC) blocks B2/B3/B4.** Project/Environment/Deployment/SA
-  are end-user-owned; until the generic API can authorize end users by
-  Organization membership + per-resource ownership, those kinds cannot move
-  off their typed APIs without losing access control.
+- **A1 (typed built-in registry) blocks B2/B3/B4 — but not B1.** Built-ins
+  like Project/Environment/Deployment/ServiceAccount route through the
+  registry; adding a new built-in to the pre-A1 hardcoded match in two
+  places was the tax A1 removes. B1, by contrast, ships extensions as
+  *external* `ResourceDefinitions` validated by JSON Schema with rows in the
+  `resource_definitions` projection — that path never touches the built-in
+  registry, so B1 can land before A1 if scheduling demands.
+- **A2 (org-scoped RBAC) gates the *API-surface* migration of B2/B3/B4, not
+  the *data-plane* move.** The migration can run in two stages: first land
+  the data-plane (typed APIs become facades that write through the resource
+  store with system credentials — no RBAC change), then later flip the
+  user-facing routes onto the generic resource API (requires A2). B2 can
+  therefore begin once A1 is in.
 - **A3 (pagination + label selectors) blocks B4 (Deployment).** Deployments
   are high-cardinality (≫ projects). Unpaginated `list` is acceptable for
   Projects but not for Deployments.
@@ -89,19 +94,23 @@ green.
 
 ### Substrate maturation (does not touch existing typed APIs)
 
-**PR A1 — Typed built-in resource registry**
-- Files: `crates/rise-resource-store/src/{registry.rs,pg_store.rs,validation.rs}`,
-  `crates/rise-resource-api/src/lib.rs`.
-- Introduce `BuiltInRegistration { collection, api_version, kind, parent,
-  spec_validator, status_writers, schema_fn }` and a `BuiltInRegistry` built
-  at process start. Replace the hardcoded match in
-  `builtin_collection_info()` with registry lookups. Organization +
-  ResourceDefinition become two `BuiltInRegistration::for::<…>()` constructor
-  calls. Generated JSON schemas list every registered built-in.
+**PR A1 — Typed built-in resource registry** *(shipped)*
+- Files: `crates/rise-resource-store/src/{builtin.rs,lib.rs,pg_store.rs}`.
+- `BuiltInRegistration { collection, api_version, kind, parent,
+  spec_validator }` and a `BuiltInRegistry` indexed by both plural and
+  `(group, kind)`. `PgResourceStore::new(pool)` keeps using
+  `BuiltInRegistry::defaults()`; `with_builtin_registry()` is exposed for
+  tests and future feature-flagged built-ins. Both hardcoded matches in
+  `pg_store.rs` (`builtin_collection_info`, `resolve_collection_by_kind`)
+  now consult the registry.
+- **Deferred to follow-ups:** `schema_fn` on the registration (lands with A7,
+  which needs per-collection schemas at runtime for the `_schema`/`_discovery`
+  endpoints — without it, A7 would re-create the hardcoded match A1 just
+  removed); `status_writers` (lands with the built-in controller-ownership
+  work, currently flagged in B2's notes); driving `schemas.rs::generate_schemas`
+  off the registry (re-evaluate when there are >2 built-ins).
 - Removes blocker: subsequent built-in kinds (Project, Env, Deployment, SA)
   become one-call registrations rather than copies of the match arm.
-- Risk: registry must be the only writer of `CollectionInfo`; ensure
-  `resolve_collection_by_kind` walks it before external `ResourceDefinitions`.
 
 **PR A2 — Org-scoped RBAC on the generic resource API**
 - Add `OrganizationRole` (member, admin) sourced from
@@ -212,7 +221,71 @@ green.
   though it shares the process); same trait powers external controllers in
   C2.
 
-### Migration (depends on A1, A2, plus per-kind subset)
+**PR A10 — Built-in version evolution**
+- A1 collapses `storage`/`served`/`declared` to a single api_version per
+  built-in ("version evolution happens through code"). That's fine for
+  Organization/ResourceDefinition forever; it breaks the moment Project moves
+  from `v1alpha1` to `v1` post-B2.
+- Extend `BuiltInRegistration` with multiple typed `versions[]` (storage,
+  served lists) and a `convert_spec` hook between adjacent versions; reuse
+  the registry's existing `(group, kind)` indexing.
+- Lands before any built-in needs a second version, not on a fixed
+  calendar. Pulled in from "the future" to make the dependency visible.
+
+**PR A11 — ResourceDefinition spec evolution for existing rows**
+- Today, registering a new RD version is structurally supported but the
+  store does not constrain stored rows on an old version when the new
+  schema tightens. The plan's "old stored versions remain available to
+  owning controller until marked neither served nor storage" needs a
+  concrete validation policy: do tightened schemas reject reads of valid-
+  by-old-schema rows? Block updates that don't migrate?
+- Lands alongside (or just before) the first external controller that
+  actually rolls a schema.
+
+**PR A12 — Audit logging on PATCH / RBAC paths and discovery completeness**
+- The existing audit trail covers POST/PUT/DELETE + controller and operator
+  finalizer/status writes (`src/server/resources/handlers.rs` `rise::audit`
+  events). PATCH (A4/A5), end-user RBAC writes (A2), and the discovery
+  endpoints (A7) need the same coverage — particularly attribution for
+  end-user actors once A2 lands, since "operator did X" no longer covers
+  every mutation.
+- Slot ordering: this stays unblocked through A4/A5/A2/A7 and lands as one
+  consolidated cleanup PR after them.
+
+**PR A13 — Reserve `(group, kind)` for built-ins; close the shadowing gap**
+- Pre-existing: `validate_resource_group` is DNS-shape-only and
+  `RESERVED_COLLECTION_NAMES` covers plurals only, so an external
+  `ResourceDefinition` *can* declare `(rise.dev, Organization)` under a
+  non-`organizations` plural and be silently shadowed in by-kind resolution
+  (the registry's `lookup_by_group_kind` already enforces the right
+  behaviour for the `rise.dev` group, but the RD validator does not stop
+  the registration in the first place).
+- Add a `register_resource_definition`-side check: reject any external RD
+  whose `(group, kind)` collides with a registered built-in, regardless of
+  plural. The built-in registry is the natural authority here — pass
+  `Arc<BuiltInRegistry>` into the RD validation path.
+- Small, self-contained; can land anywhere after A1.
+
+**PR A14 — Resolve `auth.admin_users` vs `auth.operator_users` interaction**
+- CLAUDE.md flags this as intentionally deferred: admins are default-Org
+  admins, operators have generic-API access, the two roles do not overlap
+  by configuration. Once A2 introduces end-user RBAC, the question becomes
+  user-visible (an admin who is also an operator should see consistent
+  semantics in both API paths). Pick one of: (a) make admin a strict subset
+  of org-admin under A2's model, (b) keep them disjoint and document
+  explicitly in the operator docs, (c) merge into a single role.
+- Resolve as part of A2's design phase, not as a separate PR; recording
+  here so it doesn't fall out of the plan.
+
+**PR A15 — Watch backpressure, connection limits, and observability**
+- A8 ships the change feed; this PR adds per-connection rate limits,
+  max-concurrent-watch caps per principal, NDJSON chunk timeouts, and
+  metrics (active-watch gauge, events-fanned-out counter, drop counter for
+  slow consumers). Without it, a single misbehaving controller can exhaust
+  connections.
+- Self-contained follow-up to A8; not on B/C's critical path.
+
+### Migration (B2/B3/B4 depend on A1 + A2; B1 is independent of A1)
 
 **PR B1 — Extensions: one ResourceDefinition per type**
 - Add four ResourceDefinitions registered at startup (`AwsRdsPostgres`,
@@ -248,33 +321,50 @@ green.
 - This is the biggest migration: end-to-end test plan must cover
   deploy/rollback/stop/expire flows + CLI compatibility.
 
-**PR B5 — Drop typed tables**
-- After two releases of dual-read, drop `project_extensions`, then
-  `environments`, `service_accounts`, `deployments`, `projects`, `teams`.
-- Remove the corresponding typed routes (or thin them down to
+**PR B5 — Drop typed tables (one PR per table, gated on per-kind bake time)**
+- B1–B4 land at different times, so "after two releases of dual-read" is a
+  per-kind clock, not a global one. Split into six independent PRs, each
+  gated on its own kind's bake time and on the dashboard/CLI having moved
+  off the typed read path:
+  - **B5a** — drop `project_extensions` (depends on B1 bake)
+  - **B5b** — drop `service_accounts` (depends on B3 bake)
+  - **B5c** — drop `environments` (depends on B2 bake)
+  - **B5d** — drop `deployments` (depends on B4 bake)
+  - **B5e** — drop `projects` (depends on B5c+B5d; projects is the parent
+    in the resource hierarchy)
+  - **B5f** — drop `teams` (depends on the typed Team API moving onto a
+    Team built-in, which is on the post-roadmap backlog)
+- Each PR removes the corresponding typed routes (or thins them to
   read-throughs against the resource API for the CLI compatibility window).
 
 ### Multi-controller routing
 
-**PR C1 — Per-Organization controller registry**
-- Each `Organization.spec.deploymentControllerClass` already chooses a
-  controller class. Add a backend-side controller-registry table (or
-  ResourceDefinition `Controller`) that records which controller identities
-  are registered against which class, plus per-Org config blobs (KubeConfig
-  ref, AWS account, default region). RDS/S3/etc. providers can register the
-  same way per class.
-- A controller-class string moves from "the one in-process K8s controller"
-  to "a queryable list of registered controllers."
-- Required so a customer can BYO an external K8s controller and we route
-  *their* Org's Projects to it.
+C1 and C2 were originally sequenced "registry first, then controller."
+On reflection that's backwards: building a controller-registry abstraction
+before any external controller exists risks designing for hypothetical
+needs. Ship the reference controller first against the existing static
+`deploymentControllerClass` mechanism — what it teaches will inform the
+registry's shape (and, given the rest of this plan, the answer to
+"controller-registry table vs `Controller` resource kind" is almost
+certainly "resource kind").
 
-**PR C2 — External K8s controller reference implementation**
+**PR C1 — External K8s controller reference implementation** *(was C2)*
 - A separate `rise-k8s-controller` binary that uses `rise-resource-client`
   (A9), authenticates with a controller JWT, watches Projects + Deployments
   scoped to its controller class, and reconciles into the configured
-  cluster.
+  cluster. Runs against today's static `deploymentControllerClass`.
 - Validates the whole stack end-to-end: a second copy can run against a
   second cluster for a second Organization, proving the multi-tenant story.
+
+**PR C2 — `Controller` as a resource kind + per-Org controller registry** *(was C1)*
+- Promote "controller identity" from a config-file entry to a first-class
+  resource kind. Each `Controller` row carries: class name, trusted JWT
+  issuer/JWKS, per-class config blobs (KubeConfig ref, AWS account, default
+  region). RDS/S3/etc. providers register the same way per class.
+- An Organization's `spec.deploymentControllerClass` now points at a row
+  rather than a config string; provisioning a customer with their own
+  cluster becomes a Controller create + Org update, not a backend redeploy.
+- Lands after C1 so the abstraction is shaped by a real consumer.
 
 ## Things to Decide Before Coding Each PR
 
