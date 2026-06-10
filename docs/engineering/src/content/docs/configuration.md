@@ -2,23 +2,21 @@
 title: "Configuration Guide"
 ---
 
-Rise backend uses YAML configuration files with environment variable substitution support. TOML is also supported for backward compatibility.
+Rise backend uses YAML configuration files with environment variable substitution support.
 
 ## Configuration Files
 
 Configuration files are located in `config/` and loaded in this order:
 
-1. `default.{toml,yaml,yml}` - Shipped defaults (optional). Ships with the Rise image at `/etc/rise/default.yaml` and carries built-in defaults such as the quickstart catalog.
-2. `{RISE_CONFIG_RUN_MODE}.{toml,yaml,yml}` - Environment-specific config (**required**)
-   - `development.toml` or `development.yaml` when `RISE_CONFIG_RUN_MODE=development`
-   - `production.toml` or `production.yaml` when `RISE_CONFIG_RUN_MODE=production`
-3. `local.{toml,yaml,yml}` - Local overrides (not checked into git, optional)
+1. `default.yaml` - Shipped defaults (optional). Ships with the Rise image at `/etc/rise/default.yaml` and carries built-in defaults such as the quickstart catalog.
+2. `{RISE_CONFIG_RUN_MODE}.yaml` - Environment-specific config (**required**)
+   - `development.yaml` when `RISE_CONFIG_RUN_MODE=development`
+   - `production.yaml` when `RISE_CONFIG_RUN_MODE=production`
+3. `local.yaml` - Local overrides (not checked into git, optional)
 
 Later files override earlier ones.
 
 In container deployments, `RISE_CONFIG_DIR` is typically `/etc/rise`.
-
-**File Format**: The backend supports both YAML and TOML formats. When multiple formats exist for the same config file name (for example `development.yaml` and `development.toml`), TOML takes precedence. YAML is the recommended format as it integrates seamlessly with Kubernetes/Helm deployments.
 
 ## Environment Variable Substitution
 
@@ -40,31 +38,27 @@ server:
 
 ### How It Works
 
-1. Configuration files are parsed as TOML or YAML
+1. Configuration files are parsed as YAML
 2. String values are scanned for `${...}` patterns
 3. Patterns are replaced with environment variable values
 4. Resulting configuration is deserialized into Settings struct
 
-This happens **after** TOML/YAML parsing but **before** deserialization, so:
+This happens **after** YAML parsing but **before** deserialization, so:
 - ✅ Works in all string values (including nested tables/maps and arrays)
 - ✅ Preserves structure and types
 - ✅ Clear error messages if required variables are missing
 
 ## Configuration Precedence
 
-Configuration is loaded in this order (later values override earlier ones):
+Values are resolved in this order (later steps override earlier ones):
 
-1. `default.{toml,yaml,yml}` - Shipped defaults (optional, e.g. the quickstart catalog)
-2. `{RISE_CONFIG_RUN_MODE}.{toml,yaml,yml}` - Active environment config (required)
-3. `local.{toml,yaml,yml}` - Local overrides (not in git, optional)
-4. Environment variable substitution - `${VAR}` patterns are replaced
-5. DATABASE_URL special case - Overrides `[database] url` if set
+1. The config files described in [Configuration Files](#configuration-files), in their loading order
+2. Environment variable substitution - `${VAR}` patterns are replaced
+3. DATABASE_URL special case - Overrides `[database] url` if set
 
 ### Merge semantics
 
 The config loader uses the [`config`](https://crates.io/crates/config) crate, which deep-merges *maps* but **replaces** *arrays*. Practically: if `default.yaml` defines `quickstart.templates` with four entries and `local.yaml` defines `quickstart.templates` with one entry, the resulting catalog contains only that one entry — the defaults are not preserved. To extend a shipped list, copy the entries from `default.yaml` into your override and add to the list.
-
-**Note**: When multiple file formats exist for the same config file, TOML takes precedence over YAML.
 
 Example:
 ```yaml

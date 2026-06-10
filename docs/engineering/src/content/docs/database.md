@@ -149,7 +149,7 @@ CREATE INDEX idx_deployments_expires_at ON deployments(expires_at) WHERE expires
 
 ### Connection Pooling
 
-Configure connection pool size in `config/production.toml` based on load and database limits.
+Configure connection pool size in `config/production.yaml` based on load and database limits.
 
 ### Query Optimization
 

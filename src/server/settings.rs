@@ -1652,7 +1652,7 @@ impl Settings {
         }
     }
 
-    /// Try to add a config file with multiple extension attempts (.toml, .yaml, .yml)
+    /// Try to add a `.yaml` config file.
     /// Returns Ok(true) if a file was loaded, Ok(false) if no file found (when not required)
     fn try_add_config_file(
         builder: &mut config::ConfigBuilder<config::builder::DefaultState>,
@@ -1660,31 +1660,24 @@ impl Settings {
         name: &str,
         required: bool,
     ) -> Result<bool, ConfigError> {
-        // Try extensions in order of preference
-        let extensions = ["toml", "yaml", "yml"];
-
-        for ext in extensions {
-            let path = format!("{}/{}.{}", config_dir, name, ext);
-            if std::path::Path::new(&path).exists() {
-                tracing::info!("Loading config file: {}", path);
-                *builder = builder
-                    .clone()
-                    .add_source(config::File::with_name(&format!("{}/{}", config_dir, name)));
-                return Ok(true);
-            }
+        let path = format!("{}/{}.yaml", config_dir, name);
+        if std::path::Path::new(&path).exists() {
+            tracing::info!("Loading config file: {}", path);
+            // Pass the explicit path and format so the loader can't pick up a
+            // sibling file with a different extension.
+            *builder = builder
+                .clone()
+                .add_source(config::File::with_name(&path).format(config::FileFormat::Yaml));
+            return Ok(true);
         }
 
         if required {
             Err(ConfigError::Message(format!(
-                "Required config file not found: {}/{}.{{toml,yaml,yml}}",
-                config_dir, name
+                "Required config file not found: {}",
+                path
             )))
         } else {
-            tracing::debug!(
-                "Optional config file not found: {}/{}.{{toml,yaml,yml}}",
-                config_dir,
-                name
-            );
+            tracing::debug!("Optional config file not found: {}", path);
             Ok(false)
         }
     }
@@ -1735,8 +1728,7 @@ impl Settings {
     ) -> Result<Self, ConfigError> {
         let mut builder = Config::builder();
 
-        // Load config files in order, trying both .toml and .yaml/.yml extensions.
-        // TOML takes precedence if both exist.
+        // Load `.yaml` config files in order. Later files override earlier ones.
 
         // 1. Load shipped defaults (optional). Carries the built-in quickstart
         //    catalog and other defaults that operators can override. Loaded
