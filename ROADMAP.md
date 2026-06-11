@@ -403,10 +403,17 @@ Phases:
   `POST /api/v1/auth/token`, `AccessClaims`, the `AccessPrincipal` extractor,
   signer methods, and the `auth.allow_raw_external_tokens` operator toggle
   (default `true` — old raw-token CI keeps working). Capabilities stays
-  public in this phase. Crate-side scaffolding (claim types, `Access`
-  variant, `header.typ` discriminator, `sign_access_jwt`) shipped in
-  [#367](https://github.com/rise-deploy/rise/pull/367); the handler-side
-  pieces (1A–1D below) remain.
+  public in this phase. [#367](https://github.com/rise-deploy/rise/pull/367)
+  shipped the crate-side scaffolding (claim types, `Access` variant,
+  `header.typ` discriminator, `sign_access_jwt`) *and*, beyond its title's
+  scope, the server-side endpoint: the live `POST /api/v1/auth/token` handler
+  (`src/server/auth/exchange/`), its `auth_token_max_ttl_seconds` /
+  `auth.allow_raw_external_tokens` settings, and the middleware +
+  `platform_access_middleware` Access-token handling — i.e. PR 1A's endpoint
+  and all of PR 1C. What remains is the **consumption path** — no handler
+  requires an Access token yet, so every project-scoped site still runs the
+  legacy `resolve_for_project`: the `AccessPrincipal` extractor + handler
+  swap (1B) and the deprecation metric + docs (1D).
 - **Phase 2 — CLI auto-exchange** (planned). Pure CLI change — an
   `ExchangingTokenSource` decorator in `cli/token_source.rs` that calls the
   exchange endpoint with the inner OIDC token + project name and caches the
@@ -462,7 +469,7 @@ Reviewed deltas (deliberate, not "byte-for-byte refactor"):
 
 ## Phase 1 — Add the exchange endpoint
 
-- [x] **Crate-side scaffolding** ([PR #367](https://github.com/rise-deploy/rise/pull/367)
+- [x] **Crate-side scaffolding + exchange endpoint** ([PR #367](https://github.com/rise-deploy/rise/pull/367)
   — Access token kind, `typ` discriminator, exact issuer match).
   `AccessClaims` / `PrincipalClaims` / `Scope`; `RiseToken::Access` arm of
   `verify_rise_jwt` with the `header.typ` discriminator (access typ →
@@ -474,20 +481,35 @@ Reviewed deltas (deliberate, not "byte-for-byte refactor"):
   tightened to exact-issuer match (drops fuzzy port prefix) so the exchange
   can reliably reject Rise-issued source tokens.
   `rise_token_disambiguation_matrix` round-trip/rejection test added.
-- [ ] **PR 1A — Exchange handler + `AccessPrincipal` extractor.** New module
+  Beyond the original "scaffolding" scope, also shipped server-side: the live
+  `POST /api/v1/auth/token` exchange handler (`src/server/auth/exchange/`,
+  mounted in `src/server/mod.rs`), the shared `auth/sa_match.rs` SA-matching
+  module (used by both the exchange handler and the legacy
+  `resolve_for_project`), the `auth_token_max_ttl_seconds` (default 600s) and
+  `auth.allow_raw_external_tokens` (default `true`) settings,
+  `#[serde(deny_unknown_fields)]` on `RiseClaims`, the main-middleware
+  `RiseToken::Access` arm, and `platform_access_middleware` Access handling —
+  i.e. the bulk of PR 1A and all of PR 1C below.
+- [x] **PR 1A — Exchange handler** (folded into
+  [#367](https://github.com/rise-deploy/rise/pull/367)). New module
   `src/server/auth/exchange/` (`mod.rs`, `handlers.rs`, `models.rs`,
-  `routes.rs`) — `POST /api/v1/auth/token` (RFC 8693 token exchange).
-  Relocate the body of `resolve_for_project` here; reuse the crate's
-  `verify_external_jwt` + pure matchers (already shipped),
-  `RiseTokenSigner::sign_access_jwt` (already shipped), plus
-  `oauth_rate_limiter` and `extract_bearer_token`. New extractor
-  `src/server/auth/access.rs` with `AccessPrincipal` consuming the
-  `RiseToken::Access` arm. New settings `auth_token_max_ttl_seconds` and
-  `auth.allow_raw_external_tokens` (default `true`). `#[serde(deny_unknown_fields)]`
-  hardening on `RiseClaims` lands here, paired with the (already shipped)
-  `header.typ` check.
-- [ ] **PR 1B — Mechanical handler swap to `AccessPrincipal`.** ~10
-  project-scoped sites in `src/server/deployment/handlers.rs` and
+  `routes.rs`) — `POST /api/v1/auth/token` (RFC 8693 token exchange), mounted
+  in `src/server/mod.rs`. The SA-matching body of `resolve_for_project` was
+  extracted to the shared `src/server/auth/sa_match.rs` (consumed by both the
+  exchange handler and the still-live legacy path); the handler reuses the
+  crate's `verify_external_jwt` + `match_controller_identity`,
+  `RiseTokenSigner::sign_access_jwt`, plus `oauth_rate_limiter` /
+  `extract_client_ip`. Settings `auth_token_max_ttl_seconds` (default 600s)
+  and `auth.allow_raw_external_tokens` (default `true`);
+  `#[serde(deny_unknown_fields)]` hardening on `RiseClaims`, paired with the
+  `header.typ` check. **The `AccessPrincipal` extractor
+  (`src/server/auth/access.rs`) was not built here and moves to 1B** — it has
+  no purpose without the handler consumers 1B introduces.
+- [ ] **PR 1B — `AccessPrincipal` extractor + mechanical handler swap.**
+  First build the extractor `src/server/auth/access.rs` with `AccessPrincipal`
+  consuming the `RiseToken::Access` arm (the `AccessClaims` extension the
+  middleware already injects). Then ~10 project-scoped sites in
+  `src/server/deployment/handlers.rs` and
   `src/server/registry/handlers.rs` swap `AuthContext` → `AccessPrincipal`
   and `resolve_for_project(...)` → `require_project(project.id)?`; the env
   block becomes `auth.allowed_environment_ids()`. The
@@ -500,16 +522,20 @@ Reviewed deltas (deliberate, not "byte-for-byte refactor"):
   (operator-user `update_resource`, controller item-update prohibition,
   per-resource `enforce_controller_allowed` on status subresources) — not
   a one-line swap.
-- [ ] **PR 1C — Middleware platform-access compatibility.**
-  `platform_access_middleware` must recognize the `AccessPrincipal`
-  extension (SA/Controller bypass the allowlist, `User` gated as today) or
-  it 500s on every access-token request. Same Phase-1 edit as PR 1A is
-  injecting the extractor.
-- [ ] **PR 1D — Deprecation metric + operator docs.** Emit a deprecation
-  metric and structured log counting raw-token (non-exchanged) requests,
-  keyed by issuer, so operators can see who still needs migrating. Commit
-  to a target version at which `auth.allow_raw_external_tokens` flips to
-  `false`. Update
+- [x] **PR 1C — Middleware platform-access compatibility** (folded into
+  [#367](https://github.com/rise-deploy/rise/pull/367)).
+  `platform_access_middleware` recognizes the `AccessClaims` extension:
+  `ServiceAccount`/`Controller` principals bypass the allowlist exactly as a
+  legacy external token does, and a (reserved, not-yet-minted) `User` access
+  token is rejected explicitly rather than 500ing. See
+  `src/server/auth/middleware.rs`.
+- [ ] **PR 1D — Deprecation metric + operator docs.** The structured
+  deprecation *log* already shipped in
+  [#367](https://github.com/rise-deploy/rise/pull/367)
+  (`middleware.rs`: `"deprecated: accepting raw external token …"`). What
+  remains: emit a real deprecation *metric* (a counter keyed by issuer) so
+  operators can see who still needs migrating; commit to a target version at
+  which `auth.allow_raw_external_tokens` flips to `false`; and update
   [`docs/engineering/src/content/docs/authentication.md`](docs/engineering/src/content/docs/authentication.md):
   add Access to the at-a-glance table, replace the "Forthcoming" section
   with the real exchange endpoint (request/response, relation to the inner
@@ -569,9 +595,10 @@ Listed so they don't fall out of the plan; not currently sequenced.
 
 ## Open questions
 
-- **Access-token TTL.** Plan says ≤10 minutes. Confirm before Phase 1A —
-  this is the revocation-window bound (an exchanged token can't be revoked
-  mid-life). `jti` field leaves room for a future deny-list.
+- **Access-token TTL.** *Resolved:* shipped as `auth_token_max_ttl_seconds`,
+  default 600s (10 minutes) — the revocation-window bound, since an exchanged
+  token can't be revoked mid-life. `jti` field leaves room for a future
+  deny-list.
 - **Capabilities endpoint timing.** Plan keeps it public through Phase 1
   and flips to auth-only in Phase 3. Could flip earlier (any time after
   Phase 2 ships the CLI auto-exchange so internal callers always bring an
