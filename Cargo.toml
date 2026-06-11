@@ -158,7 +158,7 @@ webbrowser = { version = "1.0.2", optional = true }
 serde_ignored = { version = "0.1", optional = true }
 
 # Server core dependencies
-config = { version = "0.15.19", optional = true }
+config = { version = "0.15.19", default-features = false, features = ["yaml"], optional = true }
 openssl = { version = "0.10.75", features = ["vendored"], optional = true }
 sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "postgres", "uuid", "chrono", "migrate"], optional = true }
 tower = { version = "0.5.2", optional = true }
