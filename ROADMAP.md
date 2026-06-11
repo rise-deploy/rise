@@ -399,22 +399,22 @@ Phases:
   verify entry points, signing, and pure matchers into
   `crates/rise-backend-auth`. Behavior-preserving with two reviewed deltas;
   no exchange endpoint yet.
-- **Phase 1 — Add the exchange endpoint** (in progress, additive). Ship
-  `POST /api/v1/auth/token`, `AccessClaims`, the `AccessPrincipal` extractor,
-  signer methods, and the `auth.allow_raw_external_tokens` operator toggle
-  (default `true` — old raw-token CI keeps working). Capabilities stays
+- **Phase 1 — Add the exchange endpoint** (effectively complete, additive).
+  Ship `POST /api/v1/auth/token`, `AccessClaims`, access-token consumption in
+  handlers, signer methods, and the `auth.allow_raw_external_tokens` operator
+  toggle (default `true` — old raw-token CI keeps working). Capabilities stays
   public in this phase. [#367](https://github.com/rise-deploy/rise/pull/367)
   shipped the crate-side scaffolding (claim types, `Access` variant,
   `header.typ` discriminator, `sign_access_jwt`) *and*, beyond its title's
   scope, the server-side endpoint: the live `POST /api/v1/auth/token` handler
   (`src/server/auth/exchange/`), its `auth_token_max_ttl_seconds` /
-  `auth.allow_raw_external_tokens` settings, and the middleware +
-  `platform_access_middleware` Access-token handling — i.e. PR 1A's endpoint
-  and all of PR 1C. What remains is the **consumption path** — no handler
-  requires an Access token yet, so every project-scoped site still runs the
-  legacy `resolve_for_project`: the `AccessPrincipal` extractor + handler
-  swap (1B) and the deprecation metric + docs (1D).
-- **Phase 2 — CLI auto-exchange** (planned). Pure CLI change — an
+  `auth.allow_raw_external_tokens` settings, the middleware +
+  `platform_access_middleware` Access-token handling, **and access-token
+  consumption** — access tokens flow through the existing `AuthContext::Access`
+  path, so all project-scoped handlers already accept them (see PR 1B). That
+  covers 1A, 1B, and 1C. The only Phase-1 remainder is the optional
+  deprecation metric (1D) — deprioritized; the structured log is enough.
+- **Phase 2 — CLI auto-exchange** (in progress). Pure CLI change — an
   `ExchangingTokenSource` decorator in `cli/token_source.rs` that calls the
   exchange endpoint with the inner OIDC token + project name and caches the
   returned Rise access token, reusing the existing `CachedToken`/`is_fresh`
@@ -502,26 +502,26 @@ Reviewed deltas (deliberate, not "byte-for-byte refactor"):
   `extract_client_ip`. Settings `auth_token_max_ttl_seconds` (default 600s)
   and `auth.allow_raw_external_tokens` (default `true`);
   `#[serde(deny_unknown_fields)]` hardening on `RiseClaims`, paired with the
-  `header.typ` check. **The `AccessPrincipal` extractor
-  (`src/server/auth/access.rs`) was not built here and moves to 1B** — it has
-  no purpose without the handler consumers 1B introduces.
-- [ ] **PR 1B — `AccessPrincipal` extractor + mechanical handler swap.**
-  First build the extractor `src/server/auth/access.rs` with `AccessPrincipal`
-  consuming the `RiseToken::Access` arm (the `AccessClaims` extension the
-  middleware already injects). Then ~10 project-scoped sites in
-  `src/server/deployment/handlers.rs` and
-  `src/server/registry/handlers.rs` swap `AuthContext` → `AccessPrincipal`
-  and `resolve_for_project(...)` → `require_project(project.id)?`; the env
-  block becomes `auth.allowed_environment_ids()`. The
-  **`AccessPrincipal` extractor, on no `AccessClaims`, falls back** to the
-  legacy `VerifiedExternalToken` resolution, so old raw-token clients keep
-  working unchanged. `update_deployment_status` (the unscoped
-  `PATCH /deployments/{deployment_id}/status` site) discovers its project
-  from `deployment_id`, so it stays on the legacy path until Phase 3.
-  `src/server/resources/handlers.rs` requires per-kind authz preservation
-  (operator-user `update_resource`, controller item-update prohibition,
-  per-resource `enforce_controller_allowed` on status subresources) — not
-  a one-line swap.
+  `header.typ` check. **No separate `AccessPrincipal` extractor was built** —
+  #367 instead added access-token consumption directly to `AuthContext`
+  (the `Access` variant), so handlers accept access tokens through the
+  existing path (see PR 1B).
+- [x] **PR 1B — Handlers consume access tokens** (satisfied by
+  [#367](https://github.com/rise-deploy/rise/pull/367), implemented
+  differently than originally planned). The goal — every project-scoped
+  handler accepts an exchanged access token — is already met: #367 folded
+  access tokens into the existing `AuthContext` (the `Access(AccessClaims)`
+  variant, picked up by `from_request_parts`, resolved by
+  `resolve_for_project` → `resolve_access_for_project`). All 13 project-scoped
+  sites in `deployment/handlers.rs` + `registry/handlers.rs` already route
+  through `resolve_for_project`, and none call `auth.user()?`, so they consume
+  access tokens unchanged — **no separate `AccessPrincipal` extractor and no
+  handler swap were needed.** The originally-planned snap-decision form
+  (`require_project(project.id)?` with no per-handler DB resolution) buys
+  nothing while the legacy `VerifiedExternalToken` path must coexist, since
+  that path still needs `resolve_for_project`. That simplification — deleting
+  `resolve_for_project` and collapsing the per-handler boilerplate — is folded
+  into **Phase 3 (PR 3A)**, where the legacy path is removed in the same pass.
 - [x] **PR 1C — Middleware platform-access compatibility** (folded into
   [#367](https://github.com/rise-deploy/rise/pull/367)).
   `platform_access_middleware` recognizes the `AccessClaims` extension:
@@ -546,24 +546,42 @@ Reviewed deltas (deliberate, not "byte-for-byte refactor"):
 
 ## Phase 2 — CLI auto-exchange
 
-- [ ] **PR 2A — `ExchangingTokenSource` decorator.** Pure CLI change in
-  `src/cli/token_source.rs`. Wrap the existing provider: on `token()` it
+- [~] **PR 2A — `ExchangingTokenSource` decorator.** Pure CLI change in
+  `src/cli/token_source.rs`. Wraps the resolved provider: on `token()` it
   calls the exchange endpoint with the inner OIDC token + project name and
   caches the returned Rise access token, reusing the existing
   `CachedToken`/`is_fresh` machinery. Nested freshness: re-mint the inner
-  OIDC token only when stale; re-exchange the outer Rise token when stale.
-  The deploy command (which knows the project) constructs it. The server
-  already supports it from Phase 1.
+  OIDC token only when stale; re-exchange the outer Rise token only when
+  stale (a fresh access token is returned without consulting the inner
+  source). `rise deploy` (which knows the project) constructs it around the
+  resolved base provider; the server already supports it from Phase 1.
+  **Pass-through (no exchange) for tokens the endpoint cannot/must not
+  exchange:** a Rise-issued session token (detected by `iss` == backend URL —
+  interactive `rise login`) and an opaque non-JWT bearer both pass through
+  unchanged, so behavior is fully backward-compatible. The legacy raw-token
+  path stays accepted server-side through the cutover release
+  (`auth.allow_raw_external_tokens`, default `true`) so customers can migrate
+  before Phase 3 flips the default. **Shipped for `rise deploy`; remaining:**
+  extend the wrap to the other project-scoped CLI commands
+  (`service_account`, `environment`, `extension`, `encrypt`, deployment
+  list/show via `resolve_token_with_retry`) and add an E2E test that
+  authenticates with a service account and asserts the exchange path
+  succeeds.
 
 ## Phase 3 — Remove the legacy path
 
 - [ ] **PR 3A — Flip the default + delete the external branch.** Flip
   `auth.allow_raw_external_tokens` default to `false`. Delete the middleware
-  external branch, `resolve_for_project`, `VerifiedExternalToken`, and the
-  `AccessPrincipal` extractor's legacy fallback. Move `platform::routes()`
-  from `public_routes` to `auth_only_routes`. Remove `AuthContext` /
-  `AnyAuth` / `VerifiedExternalToken` from
-  `src/server/auth/context.rs`; remove `ControllerAuthContext` /
+  external branch and the legacy raw-token resolution: the
+  `AuthContext::ExternalToken` variant, `VerifiedExternalToken`, and the
+  `ExternalToken` arm of `resolve_for_project` (the SA-matching now reachable
+  only via the exchange endpoint's shared `sa_match.rs`). The
+  `AuthContext::Access` consumption path stays — that is how handlers accept
+  exchanged tokens. This is also where the long-deferred handler
+  simplification lands: with the legacy path gone, the per-handler
+  `resolve_for_project` + 404-masking boilerplate collapses to a snap
+  decision on the resolved access principal. Move `platform::routes()`
+  from `public_routes` to `auth_only_routes`. Remove `ControllerAuthContext` /
   `VerifiedControllerToken` from `src/server/auth/controller.rs`.
   (`match_controller_identity` / `build_controller_indexes` /
   `ControllerIdentity` stay — they relocated to `rise-backend-auth` in
