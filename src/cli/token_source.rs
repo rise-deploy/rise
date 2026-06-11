@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::config::Config;
-use crate::login::token_utils::{log_token_debug, read_token_exp};
+use crate::login::token_utils::{log_token_debug, read_token_exp, read_token_issuer};
 
 /// Re-mint cached JWTs before two thirds of their observed lifetime has elapsed
 /// and once they are within this many seconds of expiry, so a request issued
@@ -455,6 +455,196 @@ impl TokenSource for CommandToken {
     }
 }
 
+/// RFC 8693 grant type / subject-token type for the auth token-exchange
+/// endpoint (`POST /api/v1/auth/token`). These mirror the server-side
+/// constants in `server::auth::exchange::models`, which live behind the
+/// `backend` feature and so can't be shared with the CLI build.
+const GRANT_TYPE_TOKEN_EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
+const SUBJECT_TOKEN_TYPE_JWT: &str = "urn:ietf:params:oauth:token-type:jwt";
+
+/// Decorates a base [`TokenSource`] so that an external (service-account / CI)
+/// OIDC token is exchanged for a short-lived, Rise-signed access token at
+/// `POST /api/v1/auth/token` before use, scoped to a single project.
+///
+/// Two kinds of token pass through unchanged, preserving prior behavior:
+/// - a **Rise-issued session token** (interactive `rise login`) — the exchange
+///   endpoint rejects Rise-issued source tokens by design, and
+/// - an **opaque (non-JWT) bearer** — there is nothing to exchange.
+///
+/// Nested freshness: the inner source owns its own OIDC mint/refresh cache, so
+/// the inner token is only re-minted when stale; the exchanged access token is
+/// cached here and re-exchanged only once it nears its own `exp`. A still-fresh
+/// access token is returned without even consulting the inner source.
+pub struct ExchangingTokenSource {
+    inner: TokenProvider,
+    http: reqwest::Client,
+    /// Rise backend base URL — used both to build the exchange URL and to
+    /// recognize Rise-issued tokens (by `iss`) that must not be exchanged.
+    backend_url: String,
+    project: String,
+    cache: Mutex<Option<CachedToken>>,
+}
+
+impl ExchangingTokenSource {
+    fn new(
+        inner: TokenProvider,
+        http: reqwest::Client,
+        backend_url: String,
+        project: String,
+    ) -> Self {
+        Self {
+            inner,
+            http,
+            backend_url,
+            project,
+            cache: Mutex::new(None),
+        }
+    }
+
+    async fn exchange(&self, subject_token: &str) -> Result<String> {
+        let url = format!(
+            "{}/api/v1/auth/token",
+            self.backend_url.trim_end_matches('/')
+        );
+        let response = self
+            .http
+            .post(&url)
+            .json(&build_exchange_body(subject_token, &self.project))
+            .send()
+            .await
+            .map_err(|e| {
+                TokenSourceError::retryable(format!("Token exchange request failed: {e}"))
+            })?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        parse_exchange_response(status, &body)
+    }
+}
+
+#[async_trait::async_trait]
+impl TokenSource for ExchangingTokenSource {
+    async fn token(&self) -> Result<String> {
+        // A still-fresh exchanged access token is reused directly; it outlives
+        // inner OIDC rotations, so we needn't consult the inner source at all.
+        {
+            let guard = self.cache.lock().await;
+            if let Some(cached) = guard.as_ref() {
+                if cached.is_fresh() {
+                    return Ok(cached.value.clone());
+                }
+            }
+        }
+
+        let subject = self.inner.token().await?;
+        if !should_exchange(&subject, &self.backend_url) {
+            // Rise session or opaque token: use as-is (legacy raw-token path).
+            return Ok(subject);
+        }
+
+        let access = self.exchange(&subject).await?;
+        let cached = CachedToken::new(access);
+        let value = cached.value.clone();
+        *self.cache.lock().await = Some(cached);
+        Ok(value)
+    }
+
+    fn describe(&self) -> &'static str {
+        "Rise token exchange"
+    }
+}
+
+/// Wrap `inner` so an external OIDC token is exchanged for a Rise access token
+/// scoped to `project` before use. See [`ExchangingTokenSource`] for the
+/// pass-through rules. The project is known by the deploy command, which
+/// constructs this around the resolved base provider.
+pub fn with_token_exchange(
+    inner: TokenProvider,
+    http: reqwest::Client,
+    backend_url: String,
+    project: String,
+) -> TokenProvider {
+    Arc::new(ExchangingTokenSource::new(
+        inner,
+        http,
+        backend_url,
+        project,
+    ))
+}
+
+/// Build the RFC 8693 request body for the exchange endpoint.
+fn build_exchange_body(subject_token: &str, project: &str) -> serde_json::Value {
+    serde_json::json!({
+        "grant_type": GRANT_TYPE_TOKEN_EXCHANGE,
+        "subject_token": subject_token,
+        "subject_token_type": SUBJECT_TOKEN_TYPE_JWT,
+        "rise_project": project,
+    })
+}
+
+/// Parse the exchange endpoint's response into the minted access token, mapping
+/// the HTTP status onto retryable vs. non-retryable token errors so
+/// [`token_with_retry`] only retries transient failures (`5xx`, `429`).
+fn parse_exchange_response(status: reqwest::StatusCode, body: &str) -> Result<String> {
+    if status.is_success() {
+        #[derive(serde::Deserialize)]
+        struct ExchangeOk {
+            access_token: String,
+        }
+        let parsed: ExchangeOk =
+            serde_json::from_str(body).context("Failed to parse token-exchange response")?;
+        if parsed.access_token.trim().is_empty() {
+            return Err(TokenSourceError::non_retryable(
+                "Token-exchange endpoint returned an empty access token",
+            )
+            .into());
+        }
+        return Ok(parsed.access_token);
+    }
+
+    let detail = parse_oauth_error(body).unwrap_or_else(|| body.trim().to_string());
+    let message = format!("Token exchange failed ({status}): {detail}");
+    if status.is_server_error()
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+    {
+        Err(TokenSourceError::retryable(message).into())
+    } else {
+        Err(TokenSourceError::non_retryable(message).into())
+    }
+}
+
+/// Extract a readable `error: description` from an OAuth/RFC 8693 error body.
+fn parse_oauth_error(body: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct OAuthErr {
+        error: String,
+        error_description: Option<String>,
+    }
+    let parsed: OAuthErr = serde_json::from_str(body).ok()?;
+    Some(match parsed.error_description {
+        Some(desc) => format!("{}: {}", parsed.error, desc),
+        None => parsed.error,
+    })
+}
+
+/// Whether `token` should be sent to the exchange endpoint. Only an external
+/// OIDC JWT (an `iss` that is not the Rise backend) is exchanged; a Rise-issued
+/// session token and an opaque non-JWT bearer both pass through unchanged.
+fn should_exchange(token: &str, backend_url: &str) -> bool {
+    match read_token_issuer(token) {
+        Some(issuer) => !issuer_matches_backend(&issuer, backend_url),
+        None => false,
+    }
+}
+
+/// Compare a token's issuer to the backend URL. The server matches `iss`
+/// exactly against its public URL; we additionally tolerate a trailing slash
+/// so a config/issuer slash mismatch errs toward pass-through (never toward
+/// exchanging a Rise-issued token, which the endpoint would reject).
+fn issuer_matches_backend(issuer: &str, backend_url: &str) -> bool {
+    issuer.trim_end_matches('/') == backend_url.trim_end_matches('/')
+}
+
 /// Inputs to the token-source selection, separated from env/IO so the
 /// precedence logic is unit-testable without mutating process env.
 pub struct ProviderInputs {
@@ -764,6 +954,109 @@ mod tests {
 
         assert_eq!(token, "token-2");
         assert_eq!(source.attempts.load(Ordering::SeqCst), 2);
+    }
+
+    mod token_exchange {
+        use super::*;
+
+        fn jwt_with_iss(iss: &str) -> String {
+            let header = general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#);
+            let claims = general_purpose::URL_SAFE_NO_PAD
+                .encode(format!(r#"{{"iss":"{iss}","exp":4102444800}}"#).as_bytes());
+            format!("{header}.{claims}.sig")
+        }
+
+        const BACKEND: &str = "https://rise.example.com";
+
+        #[test]
+        fn external_oidc_jwt_is_exchanged() {
+            assert!(should_exchange(
+                &jwt_with_iss("https://gitlab.com"),
+                BACKEND
+            ));
+        }
+
+        #[test]
+        fn rise_issued_session_token_passes_through() {
+            // Same issuer as the backend → Rise session, must not be exchanged.
+            assert!(!should_exchange(&jwt_with_iss(BACKEND), BACKEND));
+            // Trailing-slash mismatch still recognized as Rise-issued.
+            assert!(!should_exchange(
+                &jwt_with_iss("https://rise.example.com/"),
+                BACKEND
+            ));
+        }
+
+        #[test]
+        fn opaque_non_jwt_passes_through() {
+            assert!(!should_exchange("an-opaque-token", BACKEND));
+        }
+
+        #[tokio::test]
+        async fn decorator_passes_through_rise_session_without_network() {
+            // Inner yields a Rise-issued token; exchange must be skipped, so the
+            // (unreachable) backend URL is never contacted.
+            let inner: TokenProvider = Arc::new(StaticToken::new(
+                jwt_with_iss(BACKEND),
+                "stored login token",
+            ));
+            let src = ExchangingTokenSource::new(
+                inner,
+                reqwest::Client::new(),
+                BACKEND.to_string(),
+                "demo".to_string(),
+            );
+            assert_eq!(src.token().await.unwrap(), jwt_with_iss(BACKEND));
+        }
+
+        #[test]
+        fn build_exchange_body_uses_rfc8693_fields() {
+            let body = build_exchange_body("the-subject", "my-project");
+            assert_eq!(body["grant_type"], GRANT_TYPE_TOKEN_EXCHANGE);
+            assert_eq!(body["subject_token"], "the-subject");
+            assert_eq!(body["subject_token_type"], SUBJECT_TOKEN_TYPE_JWT);
+            assert_eq!(body["rise_project"], "my-project");
+        }
+
+        #[test]
+        fn parse_exchange_response_success_returns_access_token() {
+            let token = parse_exchange_response(
+                reqwest::StatusCode::OK,
+                r#"{"access_token":"rise-access","token_type":"Bearer","issued_token_type":"urn:ietf:params:oauth:token-type:jwt","expires_in":600}"#,
+            )
+            .unwrap();
+            assert_eq!(token, "rise-access");
+        }
+
+        #[test]
+        fn parse_exchange_response_400_is_non_retryable_with_detail() {
+            let err = parse_exchange_response(
+                reqwest::StatusCode::BAD_REQUEST,
+                r#"{"error":"invalid_grant","error_description":"no matching service account"}"#,
+            )
+            .unwrap_err();
+            assert!(is_non_retryable_token_error(&err));
+            let msg = err.to_string();
+            assert!(msg.contains("invalid_grant"));
+            assert!(msg.contains("no matching service account"));
+        }
+
+        #[test]
+        fn parse_exchange_response_503_is_retryable() {
+            let err = parse_exchange_response(
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":"temporarily_unavailable"}"#,
+            )
+            .unwrap_err();
+            assert!(!is_non_retryable_token_error(&err));
+        }
+
+        #[test]
+        fn parse_exchange_response_empty_token_is_non_retryable() {
+            let err = parse_exchange_response(reqwest::StatusCode::OK, r#"{"access_token":""}"#)
+                .unwrap_err();
+            assert!(is_non_retryable_token_error(&err));
+        }
     }
 
     mod command_token_ttl {

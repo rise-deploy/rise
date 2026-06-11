@@ -901,6 +901,16 @@ pub async fn create_deployment(
     // can outlast it. The provider lazily re-mints/refreshes a fresh token before
     // each request (see `token_source`). See issue #352.
     let provider = crate::token_source::resolve_token_provider(http_client, config)?;
+    // Exchange an external (service-account / CI) OIDC token for a short-lived
+    // Rise access token, scoped to this project, before use. A Rise session
+    // token (interactive `rise login`) or an opaque bearer passes through
+    // unchanged. See `token_source::ExchangingTokenSource`.
+    let provider = crate::token_source::with_token_exchange(
+        provider,
+        http_client.clone(),
+        backend_url.to_string(),
+        deploy_opts.project_name.to_string(),
+    );
     debug!("Authenticating to backend using {}", provider.describe());
     let token = token_with_retry(&provider).await?;
 

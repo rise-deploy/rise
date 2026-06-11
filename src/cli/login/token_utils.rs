@@ -68,6 +68,20 @@ pub fn read_token_exp(token: &str) -> Option<i64> {
         .map(|data| data.claims.exp as i64)
 }
 
+/// Extract the `iss` (issuer) claim from a JWT without validating its signature
+/// or expiry. Returns `None` if the token isn't a decodable JWT or has no `iss`.
+///
+/// Used to tell a Rise-issued session token (whose `iss` is the backend URL)
+/// apart from an external OIDC token, so only the latter is sent to the
+/// token-exchange endpoint.
+pub fn read_token_issuer(token: &str) -> Option<String> {
+    decode_jwt_claims(token)
+        .ok()?
+        .get("iss")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 /// Extract expiration from JWT token and format it as a human-readable string
 /// Returns formatted string like "December 16, 2025 at 14:30 UTC (in 7 days)"
 pub fn format_token_expiration(token: &str) -> Result<String> {
@@ -166,6 +180,27 @@ mod tests {
         assert!(error
             .to_string()
             .contains("Failed to parse token claims JSON"));
+    }
+
+    #[test]
+    fn read_token_issuer_reads_iss_without_validation() {
+        let token = format!(
+            "{}.{}.signature",
+            encode_segment(r#"{"alg":"HS256","typ":"JWT"}"#),
+            encode_segment(r#"{"iss":"https://rise.example.com","exp":0}"#),
+        );
+        assert_eq!(
+            read_token_issuer(&token).as_deref(),
+            Some("https://rise.example.com")
+        );
+        // No `iss` claim, and an opaque (non-JWT) value, both yield `None`.
+        let no_iss = format!(
+            "{}.{}.sig",
+            encode_segment(r#"{"alg":"HS256"}"#),
+            encode_segment(r#"{"sub":"x"}"#),
+        );
+        assert_eq!(read_token_issuer(&no_iss), None);
+        assert_eq!(read_token_issuer("not-a-jwt"), None);
     }
 
     #[test]
