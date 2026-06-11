@@ -46,7 +46,8 @@ In-flight PRs with operator impact (not yet merged):
   Adds the RFC 8693 exchange endpoint and a Rise `Access` token kind. Purely
   additive; existing token flows are unchanged, legacy in-handler verification
   remains the fallback. See
-  [`AUTH_TOKEN_EXCHANGE_PLAN.md`](https://github.com/rise-deploy/rise/blob/develop/AUTH_TOKEN_EXCHANGE_PLAN.md).
+  [`ROADMAP.md`](https://github.com/rise-deploy/rise/blob/develop/ROADMAP.md)
+  § "Workstream 2 — Authentication & Token Exchange".
 - **Config change — Docker deployment backend** ([#358](https://github.com/rise-deploy/rise/pull/358)).
   Selectable via `deployment_controller.type = "docker"`. Single-host; Kubernetes
   remains the default, so existing installs are unaffected unless they opt in.
@@ -86,7 +87,7 @@ configuration knobs they introduce.
   API (`/api/v1/resources`) is gated to a new, separately configured Operator
   role. `auth.admin_users` do **not** receive Operator access. No action needed
   unless you want operators to manage generic resources. See
-  [`MULTI_TENANCY_PLAN.md`](https://github.com/rise-deploy/rise/blob/develop/MULTI_TENANCY_PLAN.md).
+  [`ROADMAP.md`](https://github.com/rise-deploy/rise/blob/develop/ROADMAP.md).
 - **Config change — default Organization / Kubernetes `controller_class_name`.**
   Backend startup bootstraps a single default Organization and backfills existing
   users, teams, and projects to it under an advisory lock. Existing installs

@@ -35,9 +35,7 @@
 //!   - **Sweep-error backoff**: consecutive sweep failures (e.g. DB outage)
 //!     trigger an exponential backoff capped at 60s, preventing log spam.
 //!
-//! Out of scope for this PR (per `MULTI_TENANCY_PLAN.md`):
-//!   - Application-layer block on deleting an Organization with typed children
-//!     (teams/projects via `organization_resource_uid`) — lands with PR 5.
+//! Not covered here:
 //!   - Real Prometheus/OpenTelemetry metrics — not yet present in the codebase.
 //!     Structured `tracing` fields stand in until that lands.
 

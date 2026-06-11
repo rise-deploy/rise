@@ -2,7 +2,7 @@
 //!
 //! Operator-only CRUD over the resource store, plus controller-authenticated
 //! status/finalizer endpoints and a `pending-deletion` diagnostics listing.
-//! See `MULTI_TENANCY_PLAN.md` § "Generic API".
+//! See `ROADMAP.md` for the roadmap and phase context.
 
 pub mod error_map;
 pub mod gc;

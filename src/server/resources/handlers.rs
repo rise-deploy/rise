@@ -84,7 +84,7 @@ impl ResourceApiCtx {
 /// Admin users do **not** bypass this check. Unlike the typed project/team
 /// APIs — where admins skip permission checks — the generic resource API is
 /// operator-gated only; admin access here is intentionally deferred (see
-/// `MULTI_TENANCY_PLAN.md`). Do not add an `is_admin` shortcut.
+/// `ROADMAP.md`). Do not add an `is_admin` shortcut.
 fn require_operator(ctx: &ResourceApiCtx, auth: &AuthContext) -> Result<User, ServerError> {
     let user = auth.user()?.clone();
     if !ctx.is_operator(&user.email) {

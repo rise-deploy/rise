@@ -1,3 +1,4 @@
+pub mod builtin;
 pub mod error;
 pub mod models;
 pub mod pg_store;
@@ -6,6 +7,7 @@ pub mod validation;
 
 mod discriminator;
 
+pub use builtin::{BuiltInRegistration, BuiltInRegistry};
 pub use error::StoreError;
 pub use models::ResourceRow;
 pub use pg_store::PgResourceStore;

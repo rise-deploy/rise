@@ -6,7 +6,7 @@
 //! implementation (`PgDeploymentStore`) over SQLX. Defining the boundary as a
 //! trait is the seam that lets the controllers move into their own crates
 //! without depending on `rise-deploy`, and matches the out-of-process
-//! controller direction in `MULTI_TENANCY_PLAN.md`.
+//! controller direction in `ROADMAP.md` (Phase C).
 
 use anyhow::Result;
 use async_trait::async_trait;
