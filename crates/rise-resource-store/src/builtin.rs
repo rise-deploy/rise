@@ -13,7 +13,7 @@
 //! migration PRs) meant copying two `match` arms in two methods. The registry
 //! collapses that to a single [`BuiltInRegistration`].
 //!
-//! See [`RESOURCE_API_ROADMAP.md`](../../../RESOURCE_API_ROADMAP.md) §"PR A1".
+//! See [`ROADMAP.md`](../../../ROADMAP.md) § "PR A1".
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -54,7 +54,7 @@ impl BuiltInRegistration {
     /// Built-ins serve exactly one api_version, so `storage`, `served`, and
     /// `declared` collapse to the same single-element list. `allowed_status_controller_ids`
     /// is empty by default; controller ownership for built-ins lands in a
-    /// later PR (see the `RESOURCE_API_ROADMAP.md` Phase B work).
+    /// later PR (see the `ROADMAP.md` Phase B work).
     pub fn collection_info(&self) -> CollectionInfo {
         CollectionInfo {
             api_version: self.api_version.to_string(),

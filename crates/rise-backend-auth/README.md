@@ -18,8 +18,8 @@ function. A caller therefore cannot fabricate a "verified" value or hand-roll a
 second validation path; the compiler enforces that every auth decision flows
 through this crate ("parse, don't validate").
 
-> See [`../../AUTH_TOKEN_EXCHANGE_PLAN.md`](../../AUTH_TOKEN_EXCHANGE_PLAN.md) for
-> the full design, phasing, and rationale.
+> See [`../../ROADMAP.md`](../../ROADMAP.md) § "Workstream 2 — Authentication
+> & Token Exchange" for the phasing and rationale.
 
 ## Token-disambiguation matrix (canonical)
 

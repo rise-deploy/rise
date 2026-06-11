@@ -53,7 +53,7 @@ Let's outline the architecture and components needed for this Rust-based project
 
 ## Architecture Overview
 
-**Note**: The project is a Cargo **workspace**. The primary crate `rise-deploy` produces the `rise` binary with both CLI and server capabilities enabled via feature flags. A few focused, backend-only support crates live under `crates/` and are depended on as optional, `backend`-feature-gated path deps: `rise-resource-api` / `rise-resource-store` (generic resource API), `rise-backend-auth` (pure-core token signing, verification, and matching — the single home for auth-token logic; see `AUTH_TOKEN_EXCHANGE_PLAN.md`), and `rise-backend-core` (the deployment-backend contract seam: shared deployment models, the `DeploymentBackend` trait, registry/encryption provider traits, the pure `quantity`/`state_machine` helpers, and the `DeploymentStore` trait — the database boundary implemented by `rise-deploy`'s `PgDeploymentStore`; this is the foundation for extracting the Docker/Kubernetes controllers into their own crates, see issue #377).
+**Note**: The project is a Cargo **workspace**. The primary crate `rise-deploy` produces the `rise` binary with both CLI and server capabilities enabled via feature flags. A few focused, backend-only support crates live under `crates/` and are depended on as optional, `backend`-feature-gated path deps: `rise-resource-api` / `rise-resource-store` (generic resource API), `rise-backend-auth` (pure-core token signing, verification, and matching — the single home for auth-token logic; see `ROADMAP.md` § "Authentication & Token Exchange"), and `rise-backend-core` (the deployment-backend contract seam: shared deployment models, the `DeploymentBackend` trait, registry/encryption provider traits, the pure `quantity`/`state_machine` helpers, and the `DeploymentStore` trait — the database boundary implemented by `rise-deploy`'s `PgDeploymentStore`; this is the foundation for extracting the Docker/Kubernetes controllers into their own crates, see issue #377).
 
 ### Crate Structure (`rise-deploy`)
 
@@ -184,9 +184,12 @@ Keep it current as work merges:
   item. If `Operator impact` is not `None`, the item is **not** `Done` until the
   operator [Upgrade Notes](docs/engineering/src/content/docs/upgrade-notes.md) page
   has a matching entry for that release.
-- Plans like `MULTI_TENANCY_PLAN.md` and `AUTH_TOKEN_EXCHANGE_PLAN.md` own the
-  *why* and phase rationale; the Project owns *live status*. Don't duplicate
-  rationale into the board.
+- `ROADMAP.md` owns the *why*, phase rationale, and milestone checkboxes
+  for every in-flight architectural workstream (multi-tenancy + generic
+  resource API, authentication & token exchange, future workstreams). The
+  Project owns *live status*. Don't duplicate rationale into the board, and
+  don't create new `<TOPIC>_PLAN.md` / `<TOPIC>_ROADMAP.md` files — add new
+  workstreams as sections in `ROADMAP.md`.
 
 ## Guidelines
 
@@ -199,7 +202,7 @@ Keep it current as work merges:
 - When removing a feature, do a comprehensive check on the codebase to ensure any remaining references to that feature are removed or updated. This includes documentation files/READMEs, config files, code comments, etc.
 - Don't reference previous versions of the code in comments, docs, or commit-independent artifacts (e.g. "the previous design did X", "vs the old tick counter", "this used to be Y"). Comments must describe what the code does *now* and why — a reader has no access to the version you're contrasting against, and such notes rot. Git history is the place for that context. (Referring to runtime/domain concepts like "the previous leader replica" is fine — that's not code history.)
 - The CLI should first and foremost always accept the names of things (e.g. project names, or project names + deployment timestamp). The UUIDs in our tables are only for internal book-keeping.
-- Admin users (`auth.admin_users`) bypass the regular permission checks on the typed APIs (projects, teams, deployments, etc.) — they have full access there without passing ownership/membership checks. This does **not** extend to the generic resource API (`/api/v1/resources`), which is operator-gated (`auth.operator_users`): admins are not operators and do not bypass its checks. Granting admins access to the resource API is intentionally deferred (see `MULTI_TENANCY_PLAN.md`).
+- Admin users (`auth.admin_users`) bypass the regular permission checks on the typed APIs (projects, teams, deployments, etc.) — they have full access there without passing ownership/membership checks. This does **not** extend to the generic resource API (`/api/v1/resources`), which is operator-gated (`auth.operator_users`): admins are not operators and do not bypass its checks. Granting admins access to the resource API is intentionally deferred (see `ROADMAP.md`).
 - Any SQLX queries are to be wrapped by helper functions in the `rise_deploy::db` crate. No SQLX queries outside of this crate are allowed.
 - When we log errors and don't handle them further, we should include a sensible amount of information about the error. Often logging the error with `{:?}` is good enough.
 - When capturing screenshots, the playwright tool will successfully install the driver even if you might think its install step failed. Always use minimum 1280px width and 800px height for the browser.
