@@ -613,7 +613,7 @@ pub async fn follow_deployment_with_ui(
     // token before each request rather than capturing one up front: in CI the
     // token may be a short-lived OIDC token (see #352). The provider re-mints
     // lazily within a 60s skew of expiry.
-    let provider = crate::token_source::resolve_token_provider(http_client, config)?;
+    let provider = crate::token_source::resolve_token_provider(http_client, config, Some(project))?;
 
     let timeout = parse_duration(timeout_str)?;
     let start_time = Instant::now();

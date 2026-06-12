@@ -143,9 +143,15 @@ pub async fn token_with_retry(provider: &TokenProvider) -> Result<String> {
 }
 
 /// Resolve the configured token provider and then a bearer token with the
-/// shared retry policy. Use for one-shot backend requests.
-pub async fn resolve_token_with_retry(http: &reqwest::Client, config: &Config) -> Result<String> {
-    let provider = resolve_token_provider(http, config)?;
+/// shared retry policy. Use for one-shot backend requests. `project` scopes the
+/// token exchange (see [`resolve_token_provider`]); pass `None` for commands
+/// with no project context.
+pub async fn resolve_token_with_retry(
+    http: &reqwest::Client,
+    config: &Config,
+    project: Option<&str>,
+) -> Result<String> {
+    let provider = resolve_token_provider(http, config, project)?;
     token_with_retry(&provider).await
 }
 
@@ -481,7 +487,10 @@ pub struct ExchangingTokenSource {
     /// Rise backend base URL — used both to build the exchange URL and to
     /// recognize Rise-issued tokens (by `iss`) that must not be exchanged.
     backend_url: String,
-    project: String,
+    /// Target project for a service-account exchange. `None` for commands with
+    /// no project context: an external token then passes through unchanged
+    /// (an SA exchange is project-bound, so there is nothing to exchange for).
+    project: Option<String>,
     cache: Mutex<Option<CachedToken>>,
 }
 
@@ -490,7 +499,7 @@ impl ExchangingTokenSource {
         inner: TokenProvider,
         http: reqwest::Client,
         backend_url: String,
-        project: String,
+        project: Option<String>,
     ) -> Self {
         Self {
             inner,
@@ -509,7 +518,7 @@ impl ExchangingTokenSource {
         let response = self
             .http
             .post(&url)
-            .json(&build_exchange_body(subject_token, &self.project))
+            .json(&build_exchange_body(subject_token, self.project.as_deref()))
             .send()
             .await
             .map_err(|e| {
@@ -540,8 +549,9 @@ impl TokenSource for ExchangingTokenSource {
         }
 
         let subject = self.inner.token().await?;
-        if !should_exchange(&subject, &self.backend_url) {
-            // Rise session or opaque token: use as-is (legacy raw-token path).
+        if !should_exchange(&subject, &self.backend_url, self.project.as_deref()) {
+            // Rise session, opaque token, or no project context: use as-is
+            // (legacy raw-token path).
             return Ok(subject);
         }
 
@@ -552,20 +562,23 @@ impl TokenSource for ExchangingTokenSource {
         Ok(value)
     }
 
+    /// Reports the underlying source, not the exchange wrapper: the exchange is
+    /// always in play in this CLI, so what an operator wants in the logs is
+    /// which identity is being presented (GitHub Actions OIDC, stored login, …).
     fn describe(&self) -> &'static str {
-        "Rise token exchange"
+        self.inner.describe()
     }
 }
 
-/// Wrap `inner` so an external OIDC token is exchanged for a Rise access token
-/// scoped to `project` before use. See [`ExchangingTokenSource`] for the
-/// pass-through rules. The project is known by the deploy command, which
-/// constructs this around the resolved base provider.
-pub fn with_token_exchange(
+/// Wrap `inner` so an external OIDC token is exchanged for a Rise access token,
+/// scoped to `project` (when known), before use. See [`ExchangingTokenSource`]
+/// for the pass-through rules. Centralized through [`resolve_token_provider`]
+/// so every command obtains tokens the same way.
+fn with_token_exchange(
     inner: TokenProvider,
     http: reqwest::Client,
     backend_url: String,
-    project: String,
+    project: Option<String>,
 ) -> TokenProvider {
     Arc::new(ExchangingTokenSource::new(
         inner,
@@ -575,8 +588,9 @@ pub fn with_token_exchange(
     ))
 }
 
-/// Build the RFC 8693 request body for the exchange endpoint.
-fn build_exchange_body(subject_token: &str, project: &str) -> serde_json::Value {
+/// Build the RFC 8693 request body for the exchange endpoint. `rise_project` is
+/// serialized as `null` when absent (the server treats it as no project).
+fn build_exchange_body(subject_token: &str, project: Option<&str>) -> serde_json::Value {
     serde_json::json!({
         "grant_type": GRANT_TYPE_TOKEN_EXCHANGE,
         "subject_token": subject_token,
@@ -646,13 +660,19 @@ fn truncate_detail(body: &str) -> String {
 }
 
 /// Whether `token` should be sent to the exchange endpoint. Only an external
-/// OIDC JWT (an `iss` that is not the Rise backend) is exchanged; a Rise-issued
-/// session token and an opaque non-JWT bearer both pass through unchanged.
-fn should_exchange(token: &str, backend_url: &str) -> bool {
-    match read_token_issuer(token) {
-        Some(issuer) => !issuer_matches_backend(&issuer, backend_url),
-        None => false,
-    }
+/// OIDC JWT (an `iss` that is not the Rise backend) with a project context is
+/// exchanged; a Rise-issued session token, an opaque non-JWT bearer, and any
+/// token used by a command with no project all pass through unchanged. The
+/// project gate matches the server: a service-account exchange is project-bound
+/// (`POST /api/v1/auth/token` routes a projectless request to controller
+/// resolution, which a CLI SA token would fail), so without a project the raw
+/// token continues down the legacy path instead.
+fn should_exchange(token: &str, backend_url: &str, project: Option<&str>) -> bool {
+    project.is_some()
+        && match read_token_issuer(token) {
+            Some(issuer) => !issuer_matches_backend(&issuer, backend_url),
+            None => false,
+        }
 }
 
 /// Compare a token's issuer to the backend URL. The server matches `iss`
@@ -728,8 +748,21 @@ pub fn select_token_provider(
     Err(TokenSourceError::NoSource("Not authenticated. Run 'rise login' first.".to_string()).into())
 }
 
-/// Read real env + config and build the token provider.
-pub fn resolve_token_provider(http: &reqwest::Client, config: &Config) -> Result<TokenProvider> {
+/// Read real env + config and build the token provider for a command.
+///
+/// This is the single entry point every command uses to obtain a token source.
+/// It selects the base source by precedence (`RISE_TOKEN`, then
+/// `RISE_TOKEN_COMMAND`, then GitHub Actions OIDC, then the stored login) and
+/// always layers the token exchange on top, scoped to `project` when the
+/// command has one. The exchange decorator passes through any token it
+/// can't/shouldn't exchange (Rise sessions, opaque bearers, and — for
+/// project-less commands — external tokens), so this is safe to use everywhere.
+/// Pass `None` for commands with no project (login, team, project, whoami, …).
+pub fn resolve_token_provider(
+    http: &reqwest::Client,
+    config: &Config,
+    project: Option<&str>,
+) -> Result<TokenProvider> {
     let command_ttl_secs = std::env::var("RISE_TOKEN_COMMAND_TTL")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -751,7 +784,13 @@ pub fn resolve_token_provider(http: &reqwest::Client, config: &Config) -> Result
         stored_token: config.stored_token(),
         backend_url: config.get_backend_url(),
     };
-    select_token_provider(http, inputs)
+    let base = select_token_provider(http, inputs)?;
+    Ok(with_token_exchange(
+        base,
+        http.clone(),
+        config.get_backend_url(),
+        project.map(str::to_string),
+    ))
 }
 
 #[cfg(test)]
@@ -985,29 +1024,44 @@ mod tests {
         }
 
         const BACKEND: &str = "https://rise.example.com";
+        const PROJECT: Option<&str> = Some("demo");
 
         #[test]
-        fn external_oidc_jwt_is_exchanged() {
+        fn external_oidc_jwt_with_project_is_exchanged() {
             assert!(should_exchange(
                 &jwt_with_iss("https://gitlab.com"),
-                BACKEND
+                BACKEND,
+                PROJECT
+            ));
+        }
+
+        #[test]
+        fn external_oidc_jwt_without_project_passes_through() {
+            // No project context → an SA exchange can't resolve, so the raw
+            // token continues down the legacy path.
+            assert!(!should_exchange(
+                &jwt_with_iss("https://gitlab.com"),
+                BACKEND,
+                None
             ));
         }
 
         #[test]
         fn rise_issued_session_token_passes_through() {
-            // Same issuer as the backend → Rise session, must not be exchanged.
-            assert!(!should_exchange(&jwt_with_iss(BACKEND), BACKEND));
+            // Same issuer as the backend → Rise session, must not be exchanged
+            // even with a project context.
+            assert!(!should_exchange(&jwt_with_iss(BACKEND), BACKEND, PROJECT));
             // Trailing-slash mismatch still recognized as Rise-issued.
             assert!(!should_exchange(
                 &jwt_with_iss("https://rise.example.com/"),
-                BACKEND
+                BACKEND,
+                PROJECT
             ));
         }
 
         #[test]
         fn opaque_non_jwt_passes_through() {
-            assert!(!should_exchange("an-opaque-token", BACKEND));
+            assert!(!should_exchange("an-opaque-token", BACKEND, PROJECT));
         }
 
         #[tokio::test]
@@ -1022,18 +1076,23 @@ mod tests {
                 inner,
                 reqwest::Client::new(),
                 BACKEND.to_string(),
-                "demo".to_string(),
+                Some("demo".to_string()),
             );
             assert_eq!(src.token().await.unwrap(), jwt_with_iss(BACKEND));
+            // describe() reflects the underlying source, not the exchange wrapper.
+            assert_eq!(src.describe(), "stored login token");
         }
 
         #[test]
         fn build_exchange_body_uses_rfc8693_fields() {
-            let body = build_exchange_body("the-subject", "my-project");
+            let body = build_exchange_body("the-subject", Some("my-project"));
             assert_eq!(body["grant_type"], GRANT_TYPE_TOKEN_EXCHANGE);
             assert_eq!(body["subject_token"], "the-subject");
             assert_eq!(body["subject_token_type"], SUBJECT_TOKEN_TYPE_JWT);
             assert_eq!(body["rise_project"], "my-project");
+            // No project → rise_project serializes as null.
+            let body = build_exchange_body("the-subject", None);
+            assert!(body["rise_project"].is_null());
         }
 
         #[test]

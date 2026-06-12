@@ -1080,7 +1080,8 @@ async fn main() -> Result<()> {
             }
             ProjectCommands::AppUser(app_user_cmd) => {
                 let token =
-                    cli::token_source::resolve_token_with_retry(&http_client, &config).await?;
+                    cli::token_source::resolve_token_with_retry(&http_client, &config, None)
+                        .await?;
                 match app_user_cmd {
                     AppUserCommands::Add {
                         project,
@@ -1487,8 +1488,12 @@ async fn main() -> Result<()> {
                 level,
             } => {
                 let project_name = resolve_project_name(project.clone(), path)?;
-                let token =
-                    cli::token_source::resolve_token_with_retry(&http_client, &config).await?;
+                let token = cli::token_source::resolve_token_with_retry(
+                    &http_client,
+                    &config,
+                    Some(&project_name),
+                )
+                .await?;
                 deployment::get_logs(
                     &http_client,
                     &backend_url,
@@ -1599,7 +1604,8 @@ async fn main() -> Result<()> {
                 .await?;
         }
         Commands::Env(env_cmd) => {
-            let token = cli::token_source::resolve_token_with_retry(&http_client, &config).await?;
+            let token =
+                cli::token_source::resolve_token_with_retry(&http_client, &config, None).await?;
             match env_cmd {
                 EnvCommands::Set {
                     project,
@@ -1733,7 +1739,8 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Domain(domain_cmd) => {
-            let token = cli::token_source::resolve_token_with_retry(&http_client, &config).await?;
+            let token =
+                cli::token_source::resolve_token_with_retry(&http_client, &config, None).await?;
             match domain_cmd {
                 DomainCommands::Add {
                     project,

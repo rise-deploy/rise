@@ -35,7 +35,9 @@ pub async fn create_service_account(
     issuer_url: &str,
     claims: HashMap<String, String>,
 ) -> Result<()> {
-    let token = crate::token_source::resolve_token_with_retry(http_client, config).await?;
+    let token =
+        crate::token_source::resolve_token_with_retry(http_client, config, Some(project_name))
+            .await?;
 
     let url = format!(
         "{}/api/v1/projects/{}/service-accounts",
@@ -94,7 +96,9 @@ pub async fn list_service_accounts(
     config: &Config,
     project_name: &str,
 ) -> Result<()> {
-    let token = crate::token_source::resolve_token_with_retry(http_client, config).await?;
+    let token =
+        crate::token_source::resolve_token_with_retry(http_client, config, Some(project_name))
+            .await?;
 
     let url = format!(
         "{}/api/v1/projects/{}/service-accounts",
@@ -172,7 +176,9 @@ pub async fn show_service_account(
     project_name: &str,
     service_account_id: &str,
 ) -> Result<()> {
-    let token = crate::token_source::resolve_token_with_retry(http_client, config).await?;
+    let token =
+        crate::token_source::resolve_token_with_retry(http_client, config, Some(project_name))
+            .await?;
 
     let url = format!(
         "{}/api/v1/projects/{}/service-accounts/{}",
@@ -226,7 +232,9 @@ pub async fn delete_service_account(
     project_name: &str,
     service_account_id: &str,
 ) -> Result<()> {
-    let token = crate::token_source::resolve_token_with_retry(http_client, config).await?;
+    let token =
+        crate::token_source::resolve_token_with_retry(http_client, config, Some(project_name))
+            .await?;
 
     let url = format!(
         "{}/api/v1/projects/{}/service-accounts/{}",

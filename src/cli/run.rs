@@ -111,7 +111,12 @@ pub async fn run_locally(
     if options.use_project_env {
         if let Some(project_name) = &project_name {
             match optional_project_env_token(
-                crate::token_source::resolve_token_with_retry(http_client, config).await,
+                crate::token_source::resolve_token_with_retry(
+                    http_client,
+                    config,
+                    Some(project_name.as_str()),
+                )
+                .await,
             )? {
                 Some(token) => {
                     match env::fetch_preview_env_vars(
