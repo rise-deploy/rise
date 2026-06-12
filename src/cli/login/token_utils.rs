@@ -68,21 +68,6 @@ pub fn read_token_exp(token: &str) -> Option<i64> {
         .map(|data| data.claims.exp as i64)
 }
 
-/// Read the JWT's signature algorithm from its header without verifying the
-/// token. Returns `None` for a non-JWT / undecodable token.
-///
-/// Used to tell a Rise-issued token (HS256 — symmetric, only the server can mint
-/// it) apart from an external OIDC token (asymmetric, verifiable via the issuer's
-/// published JWKS), so only the latter is sent to the token-exchange endpoint.
-/// Keying on the algorithm is robust to the CLI's backend URL differing from the
-/// server's `public_url` / token issuer (port-forward, proxy, `127.0.0.1` vs the
-/// public host), which an issuer-URL comparison is not.
-pub fn read_token_alg(token: &str) -> Option<jsonwebtoken::Algorithm> {
-    jsonwebtoken::decode_header(token)
-        .ok()
-        .map(|header| header.alg)
-}
-
 /// Extract expiration from JWT token and format it as a human-readable string
 /// Returns formatted string like "December 16, 2025 at 14:30 UTC (in 7 days)"
 pub fn format_token_expiration(token: &str) -> Result<String> {
@@ -181,24 +166,6 @@ mod tests {
         assert!(error
             .to_string()
             .contains("Failed to parse token claims JSON"));
-    }
-
-    #[test]
-    fn read_token_alg_reads_header_alg_without_validation() {
-        let hs = format!(
-            "{}.{}.signature",
-            encode_segment(r#"{"alg":"HS256","typ":"JWT"}"#),
-            encode_segment(r#"{"iss":"https://rise.example.com","exp":0}"#),
-        );
-        assert_eq!(read_token_alg(&hs), Some(jsonwebtoken::Algorithm::HS256));
-        let rs = format!(
-            "{}.{}.signature",
-            encode_segment(r#"{"alg":"RS256","typ":"JWT"}"#),
-            encode_segment(r#"{"iss":"https://idp.example","exp":0}"#),
-        );
-        assert_eq!(read_token_alg(&rs), Some(jsonwebtoken::Algorithm::RS256));
-        // An opaque (non-JWT) value has no decodable header.
-        assert_eq!(read_token_alg("not-a-jwt"), None);
     }
 
     #[test]

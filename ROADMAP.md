@@ -547,30 +547,29 @@ Reviewed deltas (deliberate, not "byte-for-byte refactor"):
 ## Phase 2 — CLI auto-exchange
 
 - [~] **PR 2A — `ExchangingTokenSource` decorator.** Pure CLI change in
-  `src/cli/token_source.rs`. Wraps the resolved provider: on `token()` it
-  calls the exchange endpoint with the inner OIDC token + project name and
-  caches the returned Rise access token, reusing the existing
-  `CachedToken`/`is_fresh` machinery. Nested freshness: re-mint the inner
-  OIDC token only when stale; re-exchange the outer Rise token only when
-  stale (a fresh access token is returned without consulting the inner
-  source). **Pass-through (no exchange) for tokens the endpoint cannot/must
-  not exchange:** a Rise-issued session token (detected by `iss` == backend
-  URL — interactive `rise login`), an opaque non-JWT bearer, and (since an SA
-  exchange is project-bound) any external token used by a command with no
-  project — all pass through unchanged, so behavior is fully
-  backward-compatible. The legacy raw-token path stays accepted server-side
-  through the cutover release (`auth.allow_raw_external_tokens`, default
-  `true`) so customers can migrate before Phase 3 flips the default.
+  `src/cli/token_source.rs`. **Intent comes from the input *channel*, never
+  from inspecting the token** (an earlier draft sniffed `iss`/`alg` and broke
+  CI — the CLI's backend URL legitimately differs from the server's
+  `public_url`/token issuer, e.g. `127.0.0.1` vs the public host). A source is
+  classified once via `TokenSource::is_external_oidc()`: `RISE_TOKEN_COMMAND`
+  and GitHub Actions OIDC produce **external** tokens that are exchanged;
+  `RISE_TOKEN` and the stored login are **ready Rise bearers** used as-is. Only
+  external sources are wrapped, and only when a project scopes the
+  (project-bound) SA exchange; the decorator then always exchanges, calling the
+  endpoint with the inner OIDC token + project and caching the Rise access
+  token (reusing `CachedToken`/`is_fresh`). Nested freshness: re-mint the inner
+  OIDC token only when stale; re-exchange the outer access token only when
+  stale. The legacy raw-token path stays accepted server-side through the
+  cutover release (`auth.allow_raw_external_tokens`, default `true`).
   **Centralized:** `resolve_token_provider` / `resolve_token_with_retry` take
-  `project: Option<&str>` and always layer the exchange, so every command
-  obtains tokens the same way (no per-command wrap); `describe()` delegates to
-  the inner source so debug logs name the real identity (GitHub Actions OIDC,
-  stored login, …). Project threaded through **all** project-scoped commands
-  (deploy, deployment list/show/stop/logs/follow, environment, extension,
-  service-account, run, env, domain, app-user); only genuinely project-less
-  commands (team, project CRUD, encrypt) pass `None`. **Remaining:** add an E2E
-  test that authenticates with a service account and asserts the exchange path
-  succeeds.
+  `project: Option<&str>` and do the wrap, so every command obtains tokens the
+  same way; `describe()` delegates to the inner source so debug logs name the
+  real identity (GitHub Actions OIDC, stored login, …). Project threaded
+  through **all** project-scoped commands (deploy, deployment
+  list/show/stop/logs/follow, environment, extension, service-account, run,
+  env, domain, app-user); project-less commands (team, project CRUD, encrypt)
+  pass `None`. **Remaining:** add an E2E test that authenticates with a service
+  account and asserts the exchange path succeeds.
 
 ## Phase 3 — Remove the legacy path
 

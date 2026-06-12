@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::config::Config;
-use crate::login::token_utils::{log_token_debug, read_token_alg, read_token_exp};
+use crate::login::token_utils::{log_token_debug, read_token_exp};
 
 /// Re-mint cached JWTs before two thirds of their observed lifetime has elapsed
 /// and once they are within this many seconds of expiry, so a request issued
@@ -39,6 +39,15 @@ pub trait TokenSource: Send + Sync {
 
     /// Short human label for diagnostics/tests.
     fn describe(&self) -> &'static str;
+
+    /// Whether this source produces an **external** OIDC token that must be
+    /// exchanged for a Rise access token before use (vs. a ready-to-use Rise
+    /// bearer sent as-is). Intent is carried by the input *channel*, never by
+    /// inspecting token contents: `RISE_TOKEN` and the stored login are bearers;
+    /// `RISE_TOKEN_COMMAND` and GitHub Actions OIDC are external tokens.
+    fn is_external_oidc(&self) -> bool {
+        false
+    }
 }
 
 /// Cheaply-cloneable handle threaded through the deployment path.
@@ -350,6 +359,10 @@ impl TokenSource for GithubActionsOidc {
     fn describe(&self) -> &'static str {
         "GitHub Actions OIDC"
     }
+
+    fn is_external_oidc(&self) -> bool {
+        true
+    }
 }
 
 /// Default TTL for opaque (non-JWT) tokens produced by `RISE_TOKEN_COMMAND`.
@@ -359,8 +372,10 @@ const COMMAND_TOKEN_TTL_DEFAULT_SECS: u64 = 10 * 60;
 /// Overridable via `RISE_TOKEN_COMMAND_TIMEOUT` (seconds).
 const COMMAND_TOKEN_TIMEOUT_DEFAULT_SECS: u64 = 10;
 
-/// Runs a user-supplied shell command and uses its trimmed stdout as the
-/// bearer token. Generic escape hatch for any CI / identity system.
+/// Runs a user-supplied shell command and uses its trimmed stdout as an
+/// **external OIDC token**, exchanged for a Rise access token before use (see
+/// [`ExchangingTokenSource`]). Generic escape hatch for any CI / identity system
+/// that can print an OIDC token (GitLab `CI_JOB_JWT`, Vault, etc.).
 ///
 /// If the command outputs a JWT, its `exp` claim governs freshness. For opaque
 /// tokens (no decodable `exp`), the command is re-run before `ttl` elapses
@@ -459,6 +474,10 @@ impl TokenSource for CommandToken {
     fn describe(&self) -> &'static str {
         "RISE_TOKEN_COMMAND"
     }
+
+    fn is_external_oidc(&self) -> bool {
+        true
+    }
 }
 
 /// RFC 8693 grant type / subject-token type for the auth token-exchange
@@ -472,14 +491,14 @@ const SUBJECT_TOKEN_TYPE_JWT: &str = "urn:ietf:params:oauth:token-type:jwt";
 /// the source issuer's JWKS, so allow more headroom than a local mint).
 const TOKEN_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Decorates a base [`TokenSource`] so that an external (service-account / CI)
-/// OIDC token is exchanged for a short-lived, Rise-signed access token at
-/// `POST /api/v1/auth/token` before use, scoped to a single project.
+/// Decorates an external-OIDC base [`TokenSource`] so its token is exchanged for
+/// a short-lived, Rise-signed access token at `POST /api/v1/auth/token` before
+/// use, scoped to a single project.
 ///
-/// Two kinds of token pass through unchanged, preserving prior behavior:
-/// - a **Rise-issued session token** (interactive `rise login`) — the exchange
-///   endpoint rejects Rise-issued source tokens by design, and
-/// - an **opaque (non-JWT) bearer** — there is nothing to exchange.
+/// Only sources that produce an external token are wrapped (see
+/// [`TokenSource::is_external_oidc`] and [`resolve_token_provider`]); a ready
+/// Rise bearer (`RISE_TOKEN`, stored login) is never wrapped, so this decorator
+/// always exchanges and never has to second-guess the token's contents.
 ///
 /// Nested freshness: the inner source owns its own OIDC mint/refresh cache, so
 /// the inner token is only re-minted when stale; the exchanged access token is
@@ -488,13 +507,11 @@ const TOKEN_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct ExchangingTokenSource {
     inner: TokenProvider,
     http: reqwest::Client,
-    /// Rise backend base URL — used both to build the exchange URL and to
-    /// recognize Rise-issued tokens (by `iss`) that must not be exchanged.
+    /// Rise backend base URL — used to build the exchange endpoint URL.
     backend_url: String,
-    /// Target project for a service-account exchange. `None` for commands with
-    /// no project context: an external token then passes through unchanged
-    /// (an SA exchange is project-bound, so there is nothing to exchange for).
-    project: Option<String>,
+    /// Target project; the access token is bound to it (SA exchange is
+    /// project-scoped).
+    project: String,
     cache: Mutex<Option<CachedToken>>,
 }
 
@@ -503,7 +520,7 @@ impl ExchangingTokenSource {
         inner: TokenProvider,
         http: reqwest::Client,
         backend_url: String,
-        project: Option<String>,
+        project: String,
     ) -> Self {
         Self {
             inner,
@@ -537,7 +554,7 @@ impl ExchangingTokenSource {
         let response = self
             .http
             .post(&url)
-            .json(&build_exchange_body(subject_token, self.project.as_deref()))
+            .json(&build_exchange_body(subject_token, &self.project))
             .send()
             .await
             .map_err(|e| {
@@ -572,13 +589,9 @@ impl TokenSource for ExchangingTokenSource {
             }
         }
 
+        // The inner source is always an external-OIDC source (only those are
+        // wrapped), so its token is always exchanged — no content inspection.
         let subject = self.inner.token().await?;
-        if !should_exchange(&subject, self.project.as_deref()) {
-            // Rise (HS256) token, opaque token, or no project context: use as-is
-            // (legacy raw-token path).
-            return Ok(subject);
-        }
-
         let access = self.exchange(&subject).await?;
         let cached = CachedToken::new(access);
         let value = cached.value.clone();
@@ -594,15 +607,14 @@ impl TokenSource for ExchangingTokenSource {
     }
 }
 
-/// Wrap `inner` so an external OIDC token is exchanged for a Rise access token,
-/// scoped to `project` (when known), before use. See [`ExchangingTokenSource`]
-/// for the pass-through rules. Centralized through [`resolve_token_provider`]
-/// so every command obtains tokens the same way.
+/// Wrap an external-OIDC `inner` source so its token is exchanged for a Rise
+/// access token scoped to `project` before use. See [`ExchangingTokenSource`].
+/// Applied only to external sources by [`resolve_token_provider`].
 fn with_token_exchange(
     inner: TokenProvider,
     http: reqwest::Client,
     backend_url: String,
-    project: Option<String>,
+    project: String,
 ) -> TokenProvider {
     Arc::new(ExchangingTokenSource::new(
         inner,
@@ -612,9 +624,8 @@ fn with_token_exchange(
     ))
 }
 
-/// Build the RFC 8693 request body for the exchange endpoint. `rise_project` is
-/// serialized as `null` when absent (the server treats it as no project).
-fn build_exchange_body(subject_token: &str, project: Option<&str>) -> serde_json::Value {
+/// Build the RFC 8693 request body for the exchange endpoint.
+fn build_exchange_body(subject_token: &str, project: &str) -> serde_json::Value {
     serde_json::json!({
         "grant_type": GRANT_TYPE_TOKEN_EXCHANGE,
         "subject_token": subject_token,
@@ -681,38 +692,6 @@ fn truncate_detail(body: &str) -> String {
     } else {
         trimmed.to_string()
     }
-}
-
-/// Whether `token` should be sent to the exchange endpoint. Only an external
-/// OIDC JWT — one signed with an asymmetric algorithm — with a project context
-/// is exchanged. Everything else passes through unchanged:
-/// - a **Rise-issued token** is HS256 (symmetric: only the server holds the
-///   signing secret, so the CLI never legitimately needs to exchange one). We
-///   key on the algorithm, *not* the issuer URL, because the CLI's backend URL
-///   legitimately differs from the server's `public_url` / token issuer
-///   (port-forward, reverse proxy, `127.0.0.1` vs the public host) — an
-///   issuer-URL comparison misclassifies such a token as external and exchanges
-///   it, which the server then rejects.
-/// - an **opaque (non-JWT) bearer** has no algorithm to read.
-/// - a command with **no project**: a service-account exchange is project-bound
-///   (`POST /api/v1/auth/token` routes a projectless request to controller
-///   resolution, which a CLI SA token would fail), so the raw token continues
-///   down the legacy path instead.
-fn should_exchange(token: &str, project: Option<&str>) -> bool {
-    project.is_some()
-        && match read_token_alg(token) {
-            // Symmetric (HS*) ⇒ Rise-issued ⇒ pass through. Any asymmetric or
-            // unknown algorithm ⇒ treat as an external OIDC token ⇒ exchange.
-            Some(alg) => !is_symmetric_alg(alg),
-            None => false,
-        }
-}
-
-/// HMAC (symmetric) JWT algorithms — the family Rise uses to sign its own
-/// session and access tokens.
-fn is_symmetric_alg(alg: jsonwebtoken::Algorithm) -> bool {
-    use jsonwebtoken::Algorithm::{HS256, HS384, HS512};
-    matches!(alg, HS256 | HS384 | HS512)
 }
 
 /// Inputs to the token-source selection, separated from env/IO so the
@@ -784,12 +763,14 @@ pub fn select_token_provider(
 ///
 /// This is the single entry point every command uses to obtain a token source.
 /// It selects the base source by precedence (`RISE_TOKEN`, then
-/// `RISE_TOKEN_COMMAND`, then GitHub Actions OIDC, then the stored login) and
-/// always layers the token exchange on top, scoped to `project` when the
-/// command has one. The exchange decorator passes through any token it
-/// can't/shouldn't exchange (Rise sessions, opaque bearers, and — for
-/// project-less commands — external tokens), so this is safe to use everywhere.
-/// Pass `None` for commands with no project (login, team, project, whoami, …).
+/// `RISE_TOKEN_COMMAND`, then GitHub Actions OIDC, then the stored login). A
+/// source that produces an **external** OIDC token (`RISE_TOKEN_COMMAND`, GitHub
+/// Actions OIDC) is wrapped so its token is exchanged for a Rise access token,
+/// scoped to `project`; a ready Rise bearer (`RISE_TOKEN`, stored login) is used
+/// as-is. Intent comes from the input channel, not from inspecting the token.
+/// Pass `None` for commands with no project (login, team, project, whoami, …);
+/// without a project there is nothing to scope an exchange to, so the external
+/// token is used directly (the server's legacy path still federates it).
 pub fn resolve_token_provider(
     http: &reqwest::Client,
     config: &Config,
@@ -817,12 +798,18 @@ pub fn resolve_token_provider(
         backend_url: config.get_backend_url(),
     };
     let base = select_token_provider(http, inputs)?;
-    Ok(with_token_exchange(
-        base,
-        http.clone(),
-        config.get_backend_url(),
-        project.map(str::to_string),
-    ))
+    // Only an external-OIDC source is exchanged, and only when scoped to a
+    // project. A ready Rise bearer (or any source on a project-less command) is
+    // used as-is.
+    match project {
+        Some(project) if base.is_external_oidc() => Ok(with_token_exchange(
+            base,
+            http.clone(),
+            config.get_backend_url(),
+            project.to_string(),
+        )),
+        _ => Ok(base),
+    }
 }
 
 #[cfg(test)]
@@ -1048,72 +1035,56 @@ mod tests {
     mod token_exchange {
         use super::*;
 
-        /// A JWT with the given header `alg` (HS256 = Rise-issued, RS256 =
-        /// external OIDC). `iss` is irrelevant to the exchange decision now —
-        /// it varies here only to prove it has no effect.
-        fn jwt_with_alg(alg: &str, iss: &str) -> String {
-            let header = general_purpose::URL_SAFE_NO_PAD
-                .encode(format!(r#"{{"alg":"{alg}","typ":"JWT"}}"#).as_bytes());
-            let claims = general_purpose::URL_SAFE_NO_PAD
-                .encode(format!(r#"{{"iss":"{iss}","exp":4102444800}}"#).as_bytes());
-            format!("{header}.{claims}.sig")
-        }
-
-        const BACKEND: &str = "https://rise.example.com";
-        const PROJECT: Option<&str> = Some("demo");
-
-        #[test]
-        fn external_oidc_jwt_with_project_is_exchanged() {
-            // Asymmetric (RS256) ⇒ external OIDC ⇒ exchange.
-            assert!(should_exchange(
-                &jwt_with_alg("RS256", "https://gitlab.com"),
-                PROJECT
-            ));
+        fn gha() -> reqwest::Client {
+            reqwest::Client::new()
         }
 
         #[test]
-        fn external_oidc_jwt_without_project_passes_through() {
-            // No project context → an SA exchange can't resolve, so the raw
-            // token continues down the legacy path.
-            assert!(!should_exchange(
-                &jwt_with_alg("RS256", "https://gitlab.com"),
-                None
-            ));
+        fn external_sources_are_marked_for_exchange() {
+            // RISE_TOKEN_COMMAND and GitHub Actions OIDC produce external tokens.
+            let cmd = CommandToken::new(
+                "echo oidc".into(),
+                Duration::from_secs(600),
+                Duration::from_secs(10),
+            );
+            assert!(cmd.is_external_oidc());
+            let gha =
+                GithubActionsOidc::new(gha(), "https://gha".into(), "rt".into(), "aud".into());
+            assert!(gha.is_external_oidc());
         }
 
         #[test]
-        fn rise_hs256_token_passes_through_regardless_of_issuer() {
-            // Regression (e2e-docker): a Rise HS256 token whose `iss` is the
-            // server's public_url but differs from the CLI's backend URL must NOT
-            // be exchanged — the decision keys on the algorithm, not the URL.
-            assert!(!should_exchange(
-                &jwt_with_alg("HS256", "http://rise.localhost:3000"),
-                PROJECT
-            ));
-            assert!(!should_exchange(&jwt_with_alg("HS256", BACKEND), PROJECT));
+        fn bearer_sources_are_not_exchanged() {
+            // RISE_TOKEN and the stored login are ready Rise bearers.
+            assert!(
+                !StaticToken::new("tok".into(), "RISE_TOKEN environment variable")
+                    .is_external_oidc()
+            );
+            assert!(!StaticToken::new("tok".into(), "stored login token").is_external_oidc());
         }
 
         #[test]
-        fn opaque_non_jwt_passes_through() {
-            assert!(!should_exchange("an-opaque-token", PROJECT));
+        fn rise_token_bearer_is_passed_through() {
+            // Regression (e2e-docker): RISE_TOKEN is a ready Rise bearer — the
+            // selected provider must not be flagged for exchange, regardless of
+            // the token's issuer vs. the CLI's backend URL.
+            let mut inputs = base_inputs();
+            inputs.rise_token = Some("a-rise-token".into());
+            let provider = select_token_provider(&client(), inputs).unwrap();
+            assert!(!provider.is_external_oidc());
         }
 
-        #[tokio::test]
-        async fn decorator_passes_through_rise_session_without_network() {
-            // Inner yields a Rise (HS256) token; exchange must be skipped, so the
-            // (unreachable) backend URL is never contacted.
-            let rise_token = jwt_with_alg("HS256", "http://rise.localhost:3000");
+        #[test]
+        fn describe_delegates_to_inner_source() {
             let inner: TokenProvider =
-                Arc::new(StaticToken::new(rise_token.clone(), "stored login token"));
+                Arc::new(StaticToken::new("x".into(), "GitHub Actions OIDC"));
             let src = ExchangingTokenSource::new(
                 inner,
-                reqwest::Client::new(),
-                BACKEND.to_string(),
-                Some("demo".to_string()),
+                gha(),
+                "https://rise.example.com".to_string(),
+                "demo".to_string(),
             );
-            assert_eq!(src.token().await.unwrap(), rise_token);
-            // describe() reflects the underlying source, not the exchange wrapper.
-            assert_eq!(src.describe(), "stored login token");
+            assert_eq!(src.describe(), "GitHub Actions OIDC");
         }
 
         #[test]
@@ -1132,14 +1103,11 @@ mod tests {
 
         #[test]
         fn build_exchange_body_uses_rfc8693_fields() {
-            let body = build_exchange_body("the-subject", Some("my-project"));
+            let body = build_exchange_body("the-subject", "my-project");
             assert_eq!(body["grant_type"], GRANT_TYPE_TOKEN_EXCHANGE);
             assert_eq!(body["subject_token"], "the-subject");
             assert_eq!(body["subject_token_type"], SUBJECT_TOKEN_TYPE_JWT);
             assert_eq!(body["rise_project"], "my-project");
-            // No project → rise_project serializes as null.
-            let body = build_exchange_body("the-subject", None);
-            assert!(body["rise_project"].is_null());
         }
 
         #[test]

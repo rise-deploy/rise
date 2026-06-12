@@ -43,9 +43,10 @@ pub use verify::{verify_external_jwt, JwksKeySource, RiseToken};
 /// Rise-issued.
 ///
 /// The CLI does not compare issuers at all: it decides whether to pre-exchange a
-/// token from its signature algorithm (Rise tokens are HS256; external OIDC
-/// tokens are asymmetric), which is robust to the client's backend URL differing
-/// from `public_url`. So this predicate is purely server-side and can stay exact.
+/// token from the input *channel* (`RISE_TOKEN` / stored login are ready Rise
+/// bearers; `RISE_TOKEN_COMMAND` / GitHub Actions OIDC are external tokens to
+/// exchange), so it never depends on the client's backend URL matching
+/// `public_url`. This predicate is purely server-side and can stay exact.
 pub fn is_rise_issued_jwt(issuer: &str, public_url: &str) -> bool {
     issuer == public_url
 }
