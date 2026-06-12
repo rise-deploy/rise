@@ -42,11 +42,10 @@ pub use verify::{verify_external_jwt, JwksKeySource, RiseToken};
 /// so a fuzzy prefix/port match could let a sibling-port issuer be treated as
 /// Rise-issued.
 ///
-/// The CLI's `issuer_matches_backend` trims a trailing slash — an intentional,
-/// benign asymmetry: it only gates whether the CLI *pre-exchanges* a token, and
-/// trimming there errs toward pass-through (never toward wrongly exchanging a Rise
-/// session under a stray client-config slash). The server never consults the
-/// client's config, so the two need not match byte-for-byte.
+/// The CLI does not compare issuers at all: it decides whether to pre-exchange a
+/// token from its signature algorithm (Rise tokens are HS256; external OIDC
+/// tokens are asymmetric), which is robust to the client's backend URL differing
+/// from `public_url`. So this predicate is purely server-side and can stay exact.
 pub fn is_rise_issued_jwt(issuer: &str, public_url: &str) -> bool {
     issuer == public_url
 }

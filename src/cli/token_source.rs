@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::config::Config;
-use crate::login::token_utils::{log_token_debug, read_token_exp, read_token_issuer};
+use crate::login::token_utils::{log_token_debug, read_token_alg, read_token_exp};
 
 /// Re-mint cached JWTs before two thirds of their observed lifetime has elapsed
 /// and once they are within this many seconds of expiry, so a request issued
@@ -573,8 +573,8 @@ impl TokenSource for ExchangingTokenSource {
         }
 
         let subject = self.inner.token().await?;
-        if !should_exchange(&subject, &self.backend_url, self.project.as_deref()) {
-            // Rise session, opaque token, or no project context: use as-is
+        if !should_exchange(&subject, self.project.as_deref()) {
+            // Rise (HS256) token, opaque token, or no project context: use as-is
             // (legacy raw-token path).
             return Ok(subject);
         }
@@ -684,31 +684,35 @@ fn truncate_detail(body: &str) -> String {
 }
 
 /// Whether `token` should be sent to the exchange endpoint. Only an external
-/// OIDC JWT (an `iss` that is not the Rise backend) with a project context is
-/// exchanged; a Rise-issued session token, an opaque non-JWT bearer, and any
-/// token used by a command with no project all pass through unchanged. The
-/// project gate matches the server: a service-account exchange is project-bound
-/// (`POST /api/v1/auth/token` routes a projectless request to controller
-/// resolution, which a CLI SA token would fail), so without a project the raw
-/// token continues down the legacy path instead.
-fn should_exchange(token: &str, backend_url: &str, project: Option<&str>) -> bool {
+/// OIDC JWT — one signed with an asymmetric algorithm — with a project context
+/// is exchanged. Everything else passes through unchanged:
+/// - a **Rise-issued token** is HS256 (symmetric: only the server holds the
+///   signing secret, so the CLI never legitimately needs to exchange one). We
+///   key on the algorithm, *not* the issuer URL, because the CLI's backend URL
+///   legitimately differs from the server's `public_url` / token issuer
+///   (port-forward, reverse proxy, `127.0.0.1` vs the public host) — an
+///   issuer-URL comparison misclassifies such a token as external and exchanges
+///   it, which the server then rejects.
+/// - an **opaque (non-JWT) bearer** has no algorithm to read.
+/// - a command with **no project**: a service-account exchange is project-bound
+///   (`POST /api/v1/auth/token` routes a projectless request to controller
+///   resolution, which a CLI SA token would fail), so the raw token continues
+///   down the legacy path instead.
+fn should_exchange(token: &str, project: Option<&str>) -> bool {
     project.is_some()
-        && match read_token_issuer(token) {
-            Some(issuer) => !issuer_matches_backend(&issuer, backend_url),
+        && match read_token_alg(token) {
+            // Symmetric (HS*) ⇒ Rise-issued ⇒ pass through. Any asymmetric or
+            // unknown algorithm ⇒ treat as an external OIDC token ⇒ exchange.
+            Some(alg) => !is_symmetric_alg(alg),
             None => false,
         }
 }
 
-/// Compare a token's issuer to the backend URL, tolerating a trailing slash.
-/// Intentionally more lenient than the server's exact `is_rise_issued_jwt`: this
-/// only gates whether the CLI *pre-exchanges* a token, and trimming errs toward
-/// pass-through — a stray trailing slash in the configured backend URL must never
-/// make the CLI treat a Rise session token as external and try to exchange it
-/// (which the server would reject). The server stays exact so its own routing
-/// agrees with its exact `aud` checks; it never sees the client's config, so the
-/// one-directional leniency here is safe.
-fn issuer_matches_backend(issuer: &str, backend_url: &str) -> bool {
-    issuer.trim_end_matches('/') == backend_url.trim_end_matches('/')
+/// HMAC (symmetric) JWT algorithms — the family Rise uses to sign its own
+/// session and access tokens.
+fn is_symmetric_alg(alg: jsonwebtoken::Algorithm) -> bool {
+    use jsonwebtoken::Algorithm::{HS256, HS384, HS512};
+    matches!(alg, HS256 | HS384 | HS512)
 }
 
 /// Inputs to the token-source selection, separated from env/IO so the
@@ -1044,8 +1048,12 @@ mod tests {
     mod token_exchange {
         use super::*;
 
-        fn jwt_with_iss(iss: &str) -> String {
-            let header = general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#);
+        /// A JWT with the given header `alg` (HS256 = Rise-issued, RS256 =
+        /// external OIDC). `iss` is irrelevant to the exchange decision now —
+        /// it varies here only to prove it has no effect.
+        fn jwt_with_alg(alg: &str, iss: &str) -> String {
+            let header = general_purpose::URL_SAFE_NO_PAD
+                .encode(format!(r#"{{"alg":"{alg}","typ":"JWT"}}"#).as_bytes());
             let claims = general_purpose::URL_SAFE_NO_PAD
                 .encode(format!(r#"{{"iss":"{iss}","exp":4102444800}}"#).as_bytes());
             format!("{header}.{claims}.sig")
@@ -1056,9 +1064,9 @@ mod tests {
 
         #[test]
         fn external_oidc_jwt_with_project_is_exchanged() {
+            // Asymmetric (RS256) ⇒ external OIDC ⇒ exchange.
             assert!(should_exchange(
-                &jwt_with_iss("https://gitlab.com"),
-                BACKEND,
+                &jwt_with_alg("RS256", "https://gitlab.com"),
                 PROJECT
             ));
         }
@@ -1068,45 +1076,42 @@ mod tests {
             // No project context → an SA exchange can't resolve, so the raw
             // token continues down the legacy path.
             assert!(!should_exchange(
-                &jwt_with_iss("https://gitlab.com"),
-                BACKEND,
+                &jwt_with_alg("RS256", "https://gitlab.com"),
                 None
             ));
         }
 
         #[test]
-        fn rise_issued_session_token_passes_through() {
-            // Same issuer as the backend → Rise session, must not be exchanged
-            // even with a project context.
-            assert!(!should_exchange(&jwt_with_iss(BACKEND), BACKEND, PROJECT));
-            // Trailing-slash mismatch still recognized as Rise-issued.
+        fn rise_hs256_token_passes_through_regardless_of_issuer() {
+            // Regression (e2e-docker): a Rise HS256 token whose `iss` is the
+            // server's public_url but differs from the CLI's backend URL must NOT
+            // be exchanged — the decision keys on the algorithm, not the URL.
             assert!(!should_exchange(
-                &jwt_with_iss("https://rise.example.com/"),
-                BACKEND,
+                &jwt_with_alg("HS256", "http://rise.localhost:3000"),
                 PROJECT
             ));
+            assert!(!should_exchange(&jwt_with_alg("HS256", BACKEND), PROJECT));
         }
 
         #[test]
         fn opaque_non_jwt_passes_through() {
-            assert!(!should_exchange("an-opaque-token", BACKEND, PROJECT));
+            assert!(!should_exchange("an-opaque-token", PROJECT));
         }
 
         #[tokio::test]
         async fn decorator_passes_through_rise_session_without_network() {
-            // Inner yields a Rise-issued token; exchange must be skipped, so the
+            // Inner yields a Rise (HS256) token; exchange must be skipped, so the
             // (unreachable) backend URL is never contacted.
-            let inner: TokenProvider = Arc::new(StaticToken::new(
-                jwt_with_iss(BACKEND),
-                "stored login token",
-            ));
+            let rise_token = jwt_with_alg("HS256", "http://rise.localhost:3000");
+            let inner: TokenProvider =
+                Arc::new(StaticToken::new(rise_token.clone(), "stored login token"));
             let src = ExchangingTokenSource::new(
                 inner,
                 reqwest::Client::new(),
                 BACKEND.to_string(),
                 Some("demo".to_string()),
             );
-            assert_eq!(src.token().await.unwrap(), jwt_with_iss(BACKEND));
+            assert_eq!(src.token().await.unwrap(), rise_token);
             // describe() reflects the underlying source, not the exchange wrapper.
             assert_eq!(src.describe(), "stored login token");
         }

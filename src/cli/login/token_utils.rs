@@ -68,18 +68,19 @@ pub fn read_token_exp(token: &str) -> Option<i64> {
         .map(|data| data.claims.exp as i64)
 }
 
-/// Extract the `iss` (issuer) claim from a JWT without validating its signature
-/// or expiry. Returns `None` if the token isn't a decodable JWT or has no `iss`.
+/// Read the JWT's signature algorithm from its header without verifying the
+/// token. Returns `None` for a non-JWT / undecodable token.
 ///
-/// Used to tell a Rise-issued session token (whose `iss` is the backend URL)
-/// apart from an external OIDC token, so only the latter is sent to the
-/// token-exchange endpoint.
-pub fn read_token_issuer(token: &str) -> Option<String> {
-    decode_jwt_claims(token)
-        .ok()?
-        .get("iss")
-        .and_then(Value::as_str)
-        .map(str::to_string)
+/// Used to tell a Rise-issued token (HS256 — symmetric, only the server can mint
+/// it) apart from an external OIDC token (asymmetric, verifiable via the issuer's
+/// published JWKS), so only the latter is sent to the token-exchange endpoint.
+/// Keying on the algorithm is robust to the CLI's backend URL differing from the
+/// server's `public_url` / token issuer (port-forward, proxy, `127.0.0.1` vs the
+/// public host), which an issuer-URL comparison is not.
+pub fn read_token_alg(token: &str) -> Option<jsonwebtoken::Algorithm> {
+    jsonwebtoken::decode_header(token)
+        .ok()
+        .map(|header| header.alg)
 }
 
 /// Extract expiration from JWT token and format it as a human-readable string
@@ -183,24 +184,21 @@ mod tests {
     }
 
     #[test]
-    fn read_token_issuer_reads_iss_without_validation() {
-        let token = format!(
+    fn read_token_alg_reads_header_alg_without_validation() {
+        let hs = format!(
             "{}.{}.signature",
             encode_segment(r#"{"alg":"HS256","typ":"JWT"}"#),
             encode_segment(r#"{"iss":"https://rise.example.com","exp":0}"#),
         );
-        assert_eq!(
-            read_token_issuer(&token).as_deref(),
-            Some("https://rise.example.com")
+        assert_eq!(read_token_alg(&hs), Some(jsonwebtoken::Algorithm::HS256));
+        let rs = format!(
+            "{}.{}.signature",
+            encode_segment(r#"{"alg":"RS256","typ":"JWT"}"#),
+            encode_segment(r#"{"iss":"https://idp.example","exp":0}"#),
         );
-        // No `iss` claim, and an opaque (non-JWT) value, both yield `None`.
-        let no_iss = format!(
-            "{}.{}.sig",
-            encode_segment(r#"{"alg":"HS256"}"#),
-            encode_segment(r#"{"sub":"x"}"#),
-        );
-        assert_eq!(read_token_issuer(&no_iss), None);
-        assert_eq!(read_token_issuer("not-a-jwt"), None);
+        assert_eq!(read_token_alg(&rs), Some(jsonwebtoken::Algorithm::RS256));
+        // An opaque (non-JWT) value has no decodable header.
+        assert_eq!(read_token_alg("not-a-jwt"), None);
     }
 
     #[test]
