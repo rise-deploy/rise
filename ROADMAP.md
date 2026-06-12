@@ -565,12 +565,12 @@ Reviewed deltas (deliberate, not "byte-for-byte refactor"):
   `project: Option<&str>` and always layer the exchange, so every command
   obtains tokens the same way (no per-command wrap); `describe()` delegates to
   the inner source so debug logs name the real identity (GitHub Actions OIDC,
-  stored login, …). Project threaded through all project-scoped commands
+  stored login, …). Project threaded through **all** project-scoped commands
   (deploy, deployment list/show/stop/logs/follow, environment, extension,
-  service-account, run). **Remaining:** `rise env` and `rise app-user` resolve
-  their project after the token inside `main()`'s dispatch — they stay on the
-  legacy path pending a dispatch tidy-up; and add an E2E test that
-  authenticates with a service account and asserts the exchange path succeeds.
+  service-account, run, env, domain, app-user); only genuinely project-less
+  commands (team, project CRUD, encrypt) pass `None`. **Remaining:** add an E2E
+  test that authenticates with a service account and asserts the exchange path
+  succeeds.
 
 ## Phase 3 — Remove the legacy path
 
