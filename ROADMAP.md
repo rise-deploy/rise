@@ -553,20 +553,24 @@ Reviewed deltas (deliberate, not "byte-for-byte refactor"):
   `CachedToken`/`is_fresh` machinery. Nested freshness: re-mint the inner
   OIDC token only when stale; re-exchange the outer Rise token only when
   stale (a fresh access token is returned without consulting the inner
-  source). `rise deploy` (which knows the project) constructs it around the
-  resolved base provider; the server already supports it from Phase 1.
-  **Pass-through (no exchange) for tokens the endpoint cannot/must not
-  exchange:** a Rise-issued session token (detected by `iss` == backend URL —
-  interactive `rise login`) and an opaque non-JWT bearer both pass through
-  unchanged, so behavior is fully backward-compatible. The legacy raw-token
-  path stays accepted server-side through the cutover release
-  (`auth.allow_raw_external_tokens`, default `true`) so customers can migrate
-  before Phase 3 flips the default. **Shipped for `rise deploy`; remaining:**
-  extend the wrap to the other project-scoped CLI commands
-  (`service_account`, `environment`, `extension`, `encrypt`, deployment
-  list/show via `resolve_token_with_retry`) and add an E2E test that
-  authenticates with a service account and asserts the exchange path
-  succeeds.
+  source). **Pass-through (no exchange) for tokens the endpoint cannot/must
+  not exchange:** a Rise-issued session token (detected by `iss` == backend
+  URL — interactive `rise login`), an opaque non-JWT bearer, and (since an SA
+  exchange is project-bound) any external token used by a command with no
+  project — all pass through unchanged, so behavior is fully
+  backward-compatible. The legacy raw-token path stays accepted server-side
+  through the cutover release (`auth.allow_raw_external_tokens`, default
+  `true`) so customers can migrate before Phase 3 flips the default.
+  **Centralized:** `resolve_token_provider` / `resolve_token_with_retry` take
+  `project: Option<&str>` and always layer the exchange, so every command
+  obtains tokens the same way (no per-command wrap); `describe()` delegates to
+  the inner source so debug logs name the real identity (GitHub Actions OIDC,
+  stored login, …). Project threaded through all project-scoped commands
+  (deploy, deployment list/show/stop/logs/follow, environment, extension,
+  service-account, run). **Remaining:** `rise env` and `rise app-user` resolve
+  their project after the token inside `main()`'s dispatch — they stay on the
+  legacy path pending a dispatch tidy-up; and add an E2E test that
+  authenticates with a service account and asserts the exchange path succeeds.
 
 ## Phase 3 — Remove the legacy path
 
