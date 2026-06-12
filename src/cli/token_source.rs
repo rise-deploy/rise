@@ -468,6 +468,10 @@ impl TokenSource for CommandToken {
 const GRANT_TYPE_TOKEN_EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const SUBJECT_TOKEN_TYPE_JWT: &str = "urn:ietf:params:oauth:token-type:jwt";
 
+/// Maximum runtime for a single token-exchange round-trip (the server fetches
+/// the source issuer's JWKS, so allow more headroom than a local mint).
+const TOKEN_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Decorates a base [`TokenSource`] so that an external (service-account / CI)
 /// OIDC token is exchanged for a short-lived, Rise-signed access token at
 /// `POST /api/v1/auth/token` before use, scoped to a single project.
@@ -511,6 +515,21 @@ impl ExchangingTokenSource {
     }
 
     async fn exchange(&self, subject_token: &str) -> Result<String> {
+        // Bound the whole round-trip: a hung endpoint must not block the deploy
+        // indefinitely (the CLI client carries no default timeout). A timeout is
+        // transient, so it's retryable.
+        match tokio::time::timeout(TOKEN_EXCHANGE_TIMEOUT, self.exchange_once(subject_token)).await
+        {
+            Ok(result) => result,
+            Err(_) => Err(TokenSourceError::retryable(format!(
+                "Token exchange timed out after {} seconds",
+                TOKEN_EXCHANGE_TIMEOUT.as_secs()
+            ))
+            .into()),
+        }
+    }
+
+    async fn exchange_once(&self, subject_token: &str) -> Result<String> {
         let url = format!(
             "{}/api/v1/auth/token",
             self.backend_url.trim_end_matches('/')
@@ -525,7 +544,12 @@ impl ExchangingTokenSource {
                 TokenSourceError::retryable(format!("Token exchange request failed: {e}"))
             })?;
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        // A failed body read on an otherwise-OK response is a transient network
+        // error, not a malformed payload — keep it retryable rather than letting
+        // an empty body fall through to a non-retryable parse failure.
+        let body = response.text().await.map_err(|e| {
+            TokenSourceError::retryable(format!("Failed to read token-exchange response body: {e}"))
+        })?;
         parse_exchange_response(status, &body)
     }
 }
@@ -675,10 +699,10 @@ fn should_exchange(token: &str, backend_url: &str, project: Option<&str>) -> boo
         }
 }
 
-/// Compare a token's issuer to the backend URL. The server matches `iss`
-/// exactly against its public URL; we additionally tolerate a trailing slash
-/// so a config/issuer slash mismatch errs toward pass-through (never toward
-/// exchanging a Rise-issued token, which the endpoint would reject).
+/// Compare a token's issuer to the backend URL, tolerating a trailing slash.
+/// Kept in sync with the server's `is_rise_issued_jwt` (which trims the same
+/// way) so a config/issuer slash mismatch can't make the CLI and server
+/// disagree on whether a token is Rise-issued.
 fn issuer_matches_backend(issuer: &str, backend_url: &str) -> bool {
     issuer.trim_end_matches('/') == backend_url.trim_end_matches('/')
 }
@@ -1081,6 +1105,20 @@ mod tests {
             assert_eq!(src.token().await.unwrap(), jwt_with_iss(BACKEND));
             // describe() reflects the underlying source, not the exchange wrapper.
             assert_eq!(src.describe(), "stored login token");
+        }
+
+        #[test]
+        fn rfc8693_constants_match_spec() {
+            // Guard the CLI's copy of the RFC 8693 URNs against a typo drifting
+            // from the server (which has its own copy behind the backend feature).
+            assert_eq!(
+                GRANT_TYPE_TOKEN_EXCHANGE,
+                "urn:ietf:params:oauth:grant-type:token-exchange"
+            );
+            assert_eq!(
+                SUBJECT_TOKEN_TYPE_JWT,
+                "urn:ietf:params:oauth:token-type:jwt"
+            );
         }
 
         #[test]

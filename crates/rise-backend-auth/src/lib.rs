@@ -32,14 +32,18 @@ pub use verify::{verify_external_jwt, JwksKeySource, RiseToken};
 /// Check whether a JWT issuer is Rise-issued.
 ///
 /// Rise JWTs set `iss` to the Rise public URL (e.g. "https://rise.example.com"),
-/// minted from the signer's configured issuer. The match is **exact**: the
-/// exchange endpoint relies on this predicate to reject Rise-issued tokens, so a
-/// fuzzy prefix/port match could let a sibling-port issuer be treated as
-/// Rise-issued. A non-Rise issuer can never forge a Rise *signature*, but exact
-/// matching keeps the routing decision unambiguous at both call sites
-/// (middleware + exchange).
+/// minted from the signer's configured issuer. The match is exact except for a
+/// tolerated trailing slash, so `https://rise.example.com` and
+/// `https://rise.example.com/` are equivalent — this keeps the predicate in sync
+/// with the CLI's `issuer_matches_backend`, which trims a trailing slash so a
+/// config/issuer slash mismatch can't desync the exchange decision. Everything
+/// else (prefix, port) must match exactly: the exchange endpoint relies on this
+/// to reject Rise-issued source tokens, so a fuzzy prefix/port match could let a
+/// sibling-port issuer be treated as Rise-issued. A non-Rise issuer can never
+/// forge a Rise *signature*, but exactness keeps the routing decision
+/// unambiguous at both call sites (middleware + exchange).
 pub fn is_rise_issued_jwt(issuer: &str, public_url: &str) -> bool {
-    issuer == public_url
+    issuer.trim_end_matches('/') == public_url.trim_end_matches('/')
 }
 
 #[cfg(test)]
@@ -59,6 +63,21 @@ mod tests {
         assert!(is_rise_issued_jwt(
             "https://rise.example.com:8443",
             "https://rise.example.com:8443"
+        ));
+    }
+
+    #[test]
+    fn test_is_rise_issued_jwt_tolerates_trailing_slash() {
+        // Mirrors the CLI's `issuer_matches_backend`: a trailing-slash mismatch
+        // between the token issuer and the configured public URL must not desync
+        // the two sides' Rise-issued decision.
+        assert!(is_rise_issued_jwt(
+            "https://rise.example.com/",
+            "https://rise.example.com"
+        ));
+        assert!(is_rise_issued_jwt(
+            "https://rise.example.com",
+            "https://rise.example.com/"
         ));
     }
 
