@@ -524,14 +524,18 @@ impl ExchangingTokenSource {
 #[async_trait::async_trait]
 impl TokenSource for ExchangingTokenSource {
     async fn token(&self) -> Result<String> {
+        // Hold the cache lock across the whole resolution (as GithubActionsOidc
+        // and CommandToken do) so concurrent callers serialize: a second caller
+        // waits, then sees the access token the first one just exchanged instead
+        // of racing it into a duplicate exchange (extra requests, extra audit
+        // entries, distinct `jti` for one source token).
+        let mut guard = self.cache.lock().await;
+
         // A still-fresh exchanged access token is reused directly; it outlives
         // inner OIDC rotations, so we needn't consult the inner source at all.
-        {
-            let guard = self.cache.lock().await;
-            if let Some(cached) = guard.as_ref() {
-                if cached.is_fresh() {
-                    return Ok(cached.value.clone());
-                }
+        if let Some(cached) = guard.as_ref() {
+            if cached.is_fresh() {
+                return Ok(cached.value.clone());
             }
         }
 
@@ -544,7 +548,7 @@ impl TokenSource for ExchangingTokenSource {
         let access = self.exchange(&subject).await?;
         let cached = CachedToken::new(access);
         let value = cached.value.clone();
-        *self.cache.lock().await = Some(cached);
+        *guard = Some(cached);
         Ok(value)
     }
 
@@ -590,8 +594,10 @@ fn parse_exchange_response(status: reqwest::StatusCode, body: &str) -> Result<St
         struct ExchangeOk {
             access_token: String,
         }
-        let parsed: ExchangeOk =
-            serde_json::from_str(body).context("Failed to parse token-exchange response")?;
+        // A 200 with an unparseable body won't parse on retry — fail fast.
+        let parsed: ExchangeOk = serde_json::from_str(body).map_err(|e| {
+            TokenSourceError::non_retryable(format!("Failed to parse token-exchange response: {e}"))
+        })?;
         if parsed.access_token.trim().is_empty() {
             return Err(TokenSourceError::non_retryable(
                 "Token-exchange endpoint returned an empty access token",
@@ -601,7 +607,7 @@ fn parse_exchange_response(status: reqwest::StatusCode, body: &str) -> Result<St
         return Ok(parsed.access_token);
     }
 
-    let detail = parse_oauth_error(body).unwrap_or_else(|| body.trim().to_string());
+    let detail = parse_oauth_error(body).unwrap_or_else(|| truncate_detail(body));
     let message = format!("Token exchange failed ({status}): {detail}");
     if status.is_server_error()
         || status == reqwest::StatusCode::TOO_MANY_REQUESTS
@@ -625,6 +631,18 @@ fn parse_oauth_error(body: &str) -> Option<String> {
         Some(desc) => format!("{}: {}", parsed.error, desc),
         None => parsed.error,
     })
+}
+
+/// Bound a non-OAuth error body to a sane length for the error message (a
+/// proxy/gateway can return a large HTML page). Char-safe truncation.
+fn truncate_detail(body: &str) -> String {
+    const MAX: usize = 300;
+    let trimmed = body.trim();
+    if trimmed.chars().count() > MAX {
+        format!("{}…", trimmed.chars().take(MAX).collect::<String>())
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Whether `token` should be sent to the exchange endpoint. Only an external
@@ -1049,6 +1067,14 @@ mod tests {
             )
             .unwrap_err();
             assert!(!is_non_retryable_token_error(&err));
+        }
+
+        #[test]
+        fn parse_exchange_response_malformed_200_is_non_retryable() {
+            // A 200 with a non-JSON body won't parse on retry — must fail fast.
+            let err =
+                parse_exchange_response(reqwest::StatusCode::OK, "<html>oops</html>").unwrap_err();
+            assert!(is_non_retryable_token_error(&err));
         }
 
         #[test]
