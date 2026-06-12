@@ -32,18 +32,23 @@ pub use verify::{verify_external_jwt, JwksKeySource, RiseToken};
 /// Check whether a JWT issuer is Rise-issued.
 ///
 /// Rise JWTs set `iss` to the Rise public URL (e.g. "https://rise.example.com"),
-/// minted from the signer's configured issuer. The match is exact except for a
-/// tolerated trailing slash, so `https://rise.example.com` and
-/// `https://rise.example.com/` are equivalent — this keeps the predicate in sync
-/// with the CLI's `issuer_matches_backend`, which trims a trailing slash so a
-/// config/issuer slash mismatch can't desync the exchange decision. Everything
-/// else (prefix, port) must match exactly: the exchange endpoint relies on this
-/// to reject Rise-issued source tokens, so a fuzzy prefix/port match could let a
-/// sibling-port issuer be treated as Rise-issued. A non-Rise issuer can never
-/// forge a Rise *signature*, but exactness keeps the routing decision
-/// unambiguous at both call sites (middleware + exchange).
+/// minted from the signer's configured issuer. The match is **exact**, kept that
+/// way deliberately so this predicate stays consistent with the `aud` checks in
+/// the auth middleware, which compare `claims.aud` to `public_url` exactly. (Both
+/// `iss` and `aud` are minted from the same `public_url`, so they share its form;
+/// matching `iss` loosely here while `aud` is matched strictly would route a
+/// slash-variant token to the Rise path only to reject it at the `aud` check.)
+/// The exchange endpoint also relies on this to reject Rise-issued source tokens,
+/// so a fuzzy prefix/port match could let a sibling-port issuer be treated as
+/// Rise-issued.
+///
+/// The CLI's `issuer_matches_backend` trims a trailing slash — an intentional,
+/// benign asymmetry: it only gates whether the CLI *pre-exchanges* a token, and
+/// trimming there errs toward pass-through (never toward wrongly exchanging a Rise
+/// session under a stray client-config slash). The server never consults the
+/// client's config, so the two need not match byte-for-byte.
 pub fn is_rise_issued_jwt(issuer: &str, public_url: &str) -> bool {
-    issuer.trim_end_matches('/') == public_url.trim_end_matches('/')
+    issuer == public_url
 }
 
 #[cfg(test)]
@@ -67,17 +72,13 @@ mod tests {
     }
 
     #[test]
-    fn test_is_rise_issued_jwt_tolerates_trailing_slash() {
-        // Mirrors the CLI's `issuer_matches_backend`: a trailing-slash mismatch
-        // between the token issuer and the configured public URL must not desync
-        // the two sides' Rise-issued decision.
-        assert!(is_rise_issued_jwt(
+    fn test_is_rise_issued_jwt_rejects_trailing_slash_mismatch() {
+        // Exact match, intentionally: the middleware's `aud` checks compare
+        // exactly too, so loosening only `iss` here would desync routing from
+        // audience validation.
+        assert!(!is_rise_issued_jwt(
             "https://rise.example.com/",
             "https://rise.example.com"
-        ));
-        assert!(is_rise_issued_jwt(
-            "https://rise.example.com",
-            "https://rise.example.com/"
         ));
     }
 

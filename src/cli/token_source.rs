@@ -700,9 +700,13 @@ fn should_exchange(token: &str, backend_url: &str, project: Option<&str>) -> boo
 }
 
 /// Compare a token's issuer to the backend URL, tolerating a trailing slash.
-/// Kept in sync with the server's `is_rise_issued_jwt` (which trims the same
-/// way) so a config/issuer slash mismatch can't make the CLI and server
-/// disagree on whether a token is Rise-issued.
+/// Intentionally more lenient than the server's exact `is_rise_issued_jwt`: this
+/// only gates whether the CLI *pre-exchanges* a token, and trimming errs toward
+/// pass-through — a stray trailing slash in the configured backend URL must never
+/// make the CLI treat a Rise session token as external and try to exchange it
+/// (which the server would reject). The server stays exact so its own routing
+/// agrees with its exact `aud` checks; it never sees the client's config, so the
+/// one-directional leniency here is safe.
 fn issuer_matches_backend(issuer: &str, backend_url: &str) -> bool {
     issuer.trim_end_matches('/') == backend_url.trim_end_matches('/')
 }
