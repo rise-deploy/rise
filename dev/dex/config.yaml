@@ -30,6 +30,15 @@ staticClients:
   - http://rise.local:3000/oidc/oauth-demo/oauth-dex/callback
   name: 'Rise Backend'
   secret: rise-backend-secret
+  # Dev/CI-only: enable the resource-owner password grant so the e2e harness can
+  # mint OIDC id_tokens non-interactively for the static users below (Dex v2.45
+  # gates `password` per-client and drops it from the default set). The listed
+  # demo passwords carry no real exposure. `authorization_code`/`refresh_token`
+  # are repeated because setting grantTypes replaces — not extends — the default.
+  grantTypes:
+  - authorization_code
+  - refresh_token
+  - password
 
 enablePasswordDB: true
 staticPasswords:

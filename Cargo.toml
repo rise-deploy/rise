@@ -6,6 +6,7 @@ members = [
     "crates/rise-resource-api",
     "crates/rise-resource-store",
     "crates/rise-runtime-sync",
+    "tests/e2e",
 ]
 resolver = "2"
 

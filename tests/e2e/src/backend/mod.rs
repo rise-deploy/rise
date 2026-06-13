@@ -1,0 +1,74 @@
+//! The backend driver seam. Scenarios are written once against `dyn Backend`;
+//! Docker and Kubernetes each implement the per-backend bits (bring-up, CLI
+//! invocation, app reach, teardown). Shared behaviour (e.g. wait-for-healthy)
+//! lives as default methods.
+
+use anyhow::Result;
+use std::time::Duration;
+
+use crate::cli::CliOutput;
+use crate::dex::DexEndpoint;
+use crate::http::HttpResponse;
+
+pub use crate::BackendKind;
+
+mod docker;
+mod minikube;
+
+/// Auth override for a single CLI invocation. Passing `None` to
+/// [`Backend::rise_cli`] uses the backend's admin CI bearer and sets no identity.
+pub struct CliAuth<'a> {
+    pub token: &'a str,
+    /// `RISE_IDENTITY` — set to exchange the token for a service account.
+    pub identity: Option<&'a str>,
+}
+
+pub trait Backend {
+    fn kind(&self) -> BackendKind;
+    fn name(&self) -> &'static str {
+        self.kind().as_str()
+    }
+
+    /// Stand up (or connect to) the stack and make the CLI usable.
+    fn bring_up(&mut self) -> Result<()>;
+    /// Best-effort cleanup; safe to call more than once.
+    fn tear_down(&mut self);
+
+    /// Run `rise <args>`. With `auth = None`, uses the admin CI bearer.
+    fn rise_cli(&self, args: &[&str], auth: Option<CliAuth<'_>>) -> Result<CliOutput>;
+
+    /// GET an app path through this backend's ingress. `Ok(None)` means app-HTTP
+    /// reach isn't wired for this backend yet — a *declared* gap the scenario
+    /// logs, never silent drift.
+    fn reach_app(&self, project: &str, path: &str) -> Result<Option<HttpResponse>>;
+
+    fn public_url(&self) -> &str;
+    fn ci_token(&self) -> &str;
+    /// The test Dex reachable from the harness, when this backend exposes one.
+    fn dex(&self) -> Option<&DexEndpoint>;
+
+    /// Poll `rise deployment list` until the project reports a Healthy
+    /// deployment. Shared across backends (reuses `rise_cli`).
+    fn wait_healthy(&self, project: &str) -> Result<()> {
+        crate::http::poll(
+            Duration::from_secs(300),
+            Duration::from_secs(5),
+            &format!("project '{project}' to report Healthy"),
+            || {
+                let out = self.rise_cli(
+                    &["deployment", "list", "--project", project, "--limit", "5"],
+                    None,
+                )?;
+                Ok(out.combined().contains("Healthy"))
+            },
+        )
+    }
+}
+
+/// Construct the driver for the selected backend (does not bring it up).
+pub fn create(kind: BackendKind) -> Result<Box<dyn Backend>> {
+    Ok(match kind {
+        BackendKind::Docker => Box::new(docker::DockerBackend::new()?),
+        BackendKind::Minikube => Box::new(minikube::MinikubeBackend::new()?),
+    })
+}

@@ -1,0 +1,206 @@
+//! Docker-backend driver: a self-contained compose stack. Ports the bring-up,
+//! CLI extraction, Traefik reach, and teardown from `scripts/ci/e2e-docker.sh`.
+
+use anyhow::{Context, Result};
+use std::path::PathBuf;
+use std::process::Command;
+use std::time::Duration;
+
+use super::{Backend, BackendKind, CliAuth};
+use crate::cli::{self, CliOutput};
+use crate::dex::DexEndpoint;
+use crate::http::{self, HttpResponse};
+use crate::token;
+
+// Matches config/docker.yaml + the standalone.local overlay (see e2e-docker.sh).
+const SECRET_B64: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+const PUBLIC_URL: &str = "http://rise.localhost:3000";
+const RISE_URL: &str = "http://localhost:3000";
+const TRAEFIK_URL: &str = "http://localhost";
+
+pub struct DockerBackend {
+    repo_root: PathBuf,
+    image_repository: String,
+    image_tag: String,
+    ci_token: String,
+    dex: DexEndpoint,
+    /// Where the CLI binary is extracted to (set in `bring_up`).
+    cli_bin: Option<PathBuf>,
+    extract_container: String,
+}
+
+impl DockerBackend {
+    pub fn new() -> Result<Self> {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .canonicalize()
+            .context("resolve repo root from CARGO_MANIFEST_DIR")?;
+        let image_repository = std::env::var("RISE_IMAGE_REPOSITORY")
+            .unwrap_or_else(|_| "ghcr.io/rise-deploy/rise".to_string());
+        let image_tag = std::env::var("RISE_IMAGE_TAG")
+            .context("RISE_IMAGE_TAG must be set for the docker backend")?;
+        let ci_token = token::mint_ci_token(SECRET_B64, PUBLIC_URL)?;
+        let dex = DexEndpoint {
+            token_url: "http://127.0.0.1:5556/dex/token".to_string(),
+            client_id: "rise-backend".to_string(),
+            client_secret: "rise-backend-secret".to_string(),
+            issuer: "http://rise-dex:5556/dex".to_string(),
+        };
+        Ok(Self {
+            repo_root,
+            image_repository,
+            image_tag,
+            ci_token,
+            dex,
+            cli_bin: None,
+            extract_container: format!("rise-e2e-cli-{}", std::process::id()),
+        })
+    }
+
+    fn image(&self) -> String {
+        format!("{}:{}", self.image_repository, self.image_tag)
+    }
+
+    /// `docker compose` against the standalone + local overlays, from the repo
+    /// root, with the image env the compose files reference.
+    fn compose(&self) -> Command {
+        let mut c = Command::new("docker");
+        c.current_dir(&self.repo_root)
+            .env("RISE_IMAGE_REPOSITORY", &self.image_repository)
+            .env("RISE_IMAGE_TAG", &self.image_tag)
+            .args([
+                "compose",
+                "-f",
+                "docker-compose.standalone.yaml",
+                "-f",
+                "docker-compose.standalone.local.yaml",
+            ]);
+        c
+    }
+}
+
+impl Backend for DockerBackend {
+    fn kind(&self) -> BackendKind {
+        BackendKind::Docker
+    }
+
+    fn bring_up(&mut self) -> Result<()> {
+        // Fresh volumes (a clean DB exercises org/controller-class bootstrap).
+        let mut down = self.compose();
+        down.args(["down", "-v"]);
+        let _ = cli::run(down);
+
+        let mut up = self.compose();
+        up.args(["up", "-d"]);
+        cli::run_checked(up).context("docker compose up")?;
+
+        http::poll(
+            Duration::from_secs(120),
+            Duration::from_secs(2),
+            "rise backend /health",
+            || Ok(http::get(&format!("{RISE_URL}/health"), None)?.status == 200),
+        )?;
+
+        // Extract the CLI from the image for an exact version match.
+        let tmp = self
+            .repo_root
+            .join("target")
+            .join(format!("e2e-cli-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).context("create CLI extract dir")?;
+        let bin = tmp.join("rise");
+
+        let mut create = Command::new("docker");
+        create.args(["create", "--name", &self.extract_container, &self.image()]);
+        cli::run_checked(create).context("docker create (CLI extract)")?;
+
+        let mut cp = Command::new("docker");
+        cp.arg("cp")
+            .arg(format!("{}:/usr/local/bin/rise", self.extract_container));
+        cp.arg(&bin);
+        cli::run_checked(cp).context("docker cp rise binary")?;
+
+        let mut rm = Command::new("docker");
+        rm.args(["rm", "-f", &self.extract_container]);
+        let _ = cli::run(rm);
+
+        self.cli_bin = Some(bin);
+        Ok(())
+    }
+
+    fn tear_down(&mut self) {
+        // Remove controller-managed app containers, then the stack + volumes.
+        if let Ok(out) = cli::run({
+            let mut c = Command::new("docker");
+            c.args(["ps", "-aq", "--filter", "label=rise.dev/managed-by=rise"]);
+            c
+        }) {
+            for id in out.stdout.split_whitespace() {
+                let mut rm = Command::new("docker");
+                rm.args(["rm", "-f", id]);
+                let _ = cli::run(rm);
+            }
+        }
+        let mut down = self.compose();
+        down.args(["down", "-v"]);
+        let _ = cli::run(down);
+        let mut rm = Command::new("docker");
+        rm.args(["rm", "-f", &self.extract_container]);
+        let _ = cli::run(rm);
+    }
+
+    fn rise_cli(&self, args: &[&str], auth: Option<CliAuth<'_>>) -> Result<CliOutput> {
+        let bin = self
+            .cli_bin
+            .as_ref()
+            .context("CLI binary not extracted (bring_up not run?)")?;
+        let mut c = Command::new(bin);
+        c.current_dir(&self.repo_root)
+            .env("RISE_URL", RISE_URL)
+            .env_remove("RISE_IDENTITY");
+        match &auth {
+            Some(a) => {
+                c.env("RISE_TOKEN", a.token);
+                if let Some(id) = a.identity {
+                    c.env("RISE_IDENTITY", id);
+                }
+            }
+            None => {
+                c.env("RISE_TOKEN", &self.ci_token);
+            }
+        }
+        c.args(args);
+        cli::run(c)
+    }
+
+    fn reach_app(&self, project: &str, path: &str) -> Result<Option<HttpResponse>> {
+        let url = format!("{TRAEFIK_URL}{path}");
+        let host = format!("{project}.rise.localhost");
+        // The controller may not have wired the Traefik route yet → retry on 404.
+        let mut resp = None;
+        http::poll(
+            Duration::from_secs(60),
+            Duration::from_secs(2),
+            &format!("Traefik route for {host}"),
+            || {
+                let r = http::get(&url, Some(&host))?;
+                let ready = r.status != 404;
+                resp = Some(r);
+                Ok(ready)
+            },
+        )?;
+        Ok(resp)
+    }
+
+    fn public_url(&self) -> &str {
+        PUBLIC_URL
+    }
+
+    fn ci_token(&self) -> &str {
+        &self.ci_token
+    }
+
+    fn dex(&self) -> Option<&DexEndpoint> {
+        Some(&self.dex)
+    }
+}

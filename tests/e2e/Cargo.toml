@@ -1,0 +1,26 @@
+[package]
+name = "rise-e2e"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Cross-backend end-to-end test harness for Rise (Docker / Kubernetes)."
+
+[lib]
+path = "src/lib.rs"
+
+# Black-box harness: drives the `rise` CLI + HTTP against a live backend. Gated
+# on RISE_E2E_BACKEND so `cargo test --workspace` skips it instantly.
+[[test]]
+name = "e2e"
+path = "tests/e2e.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+base64 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Blocking HTTP + form bodies (Dex password grant) — sequential harness, no async
+# runtime. Keep default features so the TLS backend unifies with `rise-deploy`'s reqwest.
+reqwest = { version = "0.13", features = ["blocking", "json", "form"] }
+# Reused to mint the HS256 CI bearer the same way the server signs sessions.
+rise-backend-auth = { path = "../../crates/rise-backend-auth" }
