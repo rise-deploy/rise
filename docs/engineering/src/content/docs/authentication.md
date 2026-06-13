@@ -63,8 +63,8 @@ the credential). It follows RFC 8693:
   "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
   "subject_token": "<external OIDC JWT>",
   "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
-  "rise_project": "my-project"   // required for project service-account exchange;
-                                  // "resource" is accepted as an alias
+  "identity": "my-project+0@sa.rise.local"   // the identity to assume (a service
+                                              // account's email); omit for a controller
 }
 // response
 {
@@ -75,10 +75,15 @@ the credential). It follows RFC 8693:
 }
 ```
 
-The exchange verifies the inner OIDC token exactly as the accept paths below do
-(issuer guard → JWKS signature + `exp` → per-identity claim matching), then mints
-the access token. With `rise_project` it resolves a **project service account**;
-without it, a **controller** identity. Lifetime is
+`identity` is a **selector** (which service account to assume); the subject token
+is the **proof**. The exchange looks the SA up by that email, verifies the inner
+OIDC token exactly as the accept paths below do (issuer guard → SA issuer match →
+JWKS signature + `exp` → the SA's claim matching), then mints the access token.
+With an `identity` it resolves a **project service account** (its project is
+derived from the SA); without one, a **controller** identity. Every
+identity-dependent failure (unknown email, not an SA, wrong issuer, claim
+mismatch) returns the same coarse `invalid_grant` so SA emails cannot be
+enumerated. Lifetime is
 `server.auth_token_max_ttl_seconds` (default 600s) — deliberately short, because
 an exchanged token cannot be revoked mid-life (deleting the SA or tightening its
 environment restrictions only takes effect once it expires).

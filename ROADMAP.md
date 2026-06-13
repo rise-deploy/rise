@@ -399,15 +399,22 @@ Phases:
   verify entry points, signing, and pure matchers into
   `crates/rise-backend-auth`. Behavior-preserving with two reviewed deltas;
   no exchange endpoint yet.
-- **Phase 1 — Add the exchange endpoint** (in progress, additive). Ship
-  `POST /api/v1/auth/token`, `AccessClaims`, the `AccessPrincipal` extractor,
-  signer methods, and the `auth.allow_raw_external_tokens` operator toggle
-  (default `true` — old raw-token CI keeps working). Capabilities stays
-  public in this phase. Crate-side scaffolding (claim types, `Access`
-  variant, `header.typ` discriminator, `sign_access_jwt`) shipped in
-  [#367](https://github.com/rise-deploy/rise/pull/367); the handler-side
-  pieces (1A–1D below) remain.
-- **Phase 2 — CLI auto-exchange** (planned). Pure CLI change — an
+- **Phase 1 — Add the exchange endpoint** (effectively complete, additive).
+  Ship `POST /api/v1/auth/token`, `AccessClaims`, access-token consumption in
+  handlers, signer methods, and the `auth.allow_raw_external_tokens` operator
+  toggle (default `true` — old raw-token CI keeps working). Capabilities stays
+  public in this phase. [#367](https://github.com/rise-deploy/rise/pull/367)
+  shipped the crate-side scaffolding (claim types, `Access` variant,
+  `header.typ` discriminator, `sign_access_jwt`) *and*, beyond its title's
+  scope, the server-side endpoint: the live `POST /api/v1/auth/token` handler
+  (`src/server/auth/exchange/`), its `auth_token_max_ttl_seconds` /
+  `auth.allow_raw_external_tokens` settings, the middleware +
+  `platform_access_middleware` Access-token handling, **and access-token
+  consumption** — access tokens flow through the existing `AuthContext::Access`
+  path, so all project-scoped handlers already accept them (see PR 1B). That
+  covers 1A, 1B, and 1C. The only Phase-1 remainder is the optional
+  deprecation metric (1D) — deprioritized; the structured log is enough.
+- **Phase 2 — CLI auto-exchange** (in progress). Pure CLI change — an
   `ExchangingTokenSource` decorator in `cli/token_source.rs` that calls the
   exchange endpoint with the inner OIDC token + project name and caches the
   returned Rise access token, reusing the existing `CachedToken`/`is_fresh`
@@ -462,7 +469,7 @@ Reviewed deltas (deliberate, not "byte-for-byte refactor"):
 
 ## Phase 1 — Add the exchange endpoint
 
-- [x] **Crate-side scaffolding** ([PR #367](https://github.com/rise-deploy/rise/pull/367)
+- [x] **Crate-side scaffolding + exchange endpoint** ([PR #367](https://github.com/rise-deploy/rise/pull/367)
   — Access token kind, `typ` discriminator, exact issuer match).
   `AccessClaims` / `PrincipalClaims` / `Scope`; `RiseToken::Access` arm of
   `verify_rise_jwt` with the `header.typ` discriminator (access typ →
@@ -474,42 +481,61 @@ Reviewed deltas (deliberate, not "byte-for-byte refactor"):
   tightened to exact-issuer match (drops fuzzy port prefix) so the exchange
   can reliably reject Rise-issued source tokens.
   `rise_token_disambiguation_matrix` round-trip/rejection test added.
-- [ ] **PR 1A — Exchange handler + `AccessPrincipal` extractor.** New module
+  Beyond the original "scaffolding" scope, also shipped server-side: the live
+  `POST /api/v1/auth/token` exchange handler (`src/server/auth/exchange/`,
+  mounted in `src/server/mod.rs`), the shared `auth/sa_match.rs` SA-matching
+  module (used by both the exchange handler and the legacy
+  `resolve_for_project`), the `auth_token_max_ttl_seconds` (default 600s) and
+  `auth.allow_raw_external_tokens` (default `true`) settings,
+  `#[serde(deny_unknown_fields)]` on `RiseClaims`, the main-middleware
+  `RiseToken::Access` arm, and `platform_access_middleware` Access handling —
+  i.e. the bulk of PR 1A and all of PR 1C below.
+- [x] **PR 1A — Exchange handler** (folded into
+  [#367](https://github.com/rise-deploy/rise/pull/367)). New module
   `src/server/auth/exchange/` (`mod.rs`, `handlers.rs`, `models.rs`,
-  `routes.rs`) — `POST /api/v1/auth/token` (RFC 8693 token exchange).
-  Relocate the body of `resolve_for_project` here; reuse the crate's
-  `verify_external_jwt` + pure matchers (already shipped),
-  `RiseTokenSigner::sign_access_jwt` (already shipped), plus
-  `oauth_rate_limiter` and `extract_bearer_token`. New extractor
-  `src/server/auth/access.rs` with `AccessPrincipal` consuming the
-  `RiseToken::Access` arm. New settings `auth_token_max_ttl_seconds` and
-  `auth.allow_raw_external_tokens` (default `true`). `#[serde(deny_unknown_fields)]`
-  hardening on `RiseClaims` lands here, paired with the (already shipped)
-  `header.typ` check.
-- [ ] **PR 1B — Mechanical handler swap to `AccessPrincipal`.** ~10
-  project-scoped sites in `src/server/deployment/handlers.rs` and
-  `src/server/registry/handlers.rs` swap `AuthContext` → `AccessPrincipal`
-  and `resolve_for_project(...)` → `require_project(project.id)?`; the env
-  block becomes `auth.allowed_environment_ids()`. The
-  **`AccessPrincipal` extractor, on no `AccessClaims`, falls back** to the
-  legacy `VerifiedExternalToken` resolution, so old raw-token clients keep
-  working unchanged. `update_deployment_status` (the unscoped
-  `PATCH /deployments/{deployment_id}/status` site) discovers its project
-  from `deployment_id`, so it stays on the legacy path until Phase 3.
-  `src/server/resources/handlers.rs` requires per-kind authz preservation
-  (operator-user `update_resource`, controller item-update prohibition,
-  per-resource `enforce_controller_allowed` on status subresources) — not
-  a one-line swap.
-- [ ] **PR 1C — Middleware platform-access compatibility.**
-  `platform_access_middleware` must recognize the `AccessPrincipal`
-  extension (SA/Controller bypass the allowlist, `User` gated as today) or
-  it 500s on every access-token request. Same Phase-1 edit as PR 1A is
-  injecting the extractor.
-- [ ] **PR 1D — Deprecation metric + operator docs.** Emit a deprecation
-  metric and structured log counting raw-token (non-exchanged) requests,
-  keyed by issuer, so operators can see who still needs migrating. Commit
-  to a target version at which `auth.allow_raw_external_tokens` flips to
-  `false`. Update
+  `routes.rs`) — `POST /api/v1/auth/token` (RFC 8693 token exchange), mounted
+  in `src/server/mod.rs`. The SA-matching body of `resolve_for_project` was
+  extracted to the shared `src/server/auth/sa_match.rs` (consumed by both the
+  exchange handler and the still-live legacy path); the handler reuses the
+  crate's `verify_external_jwt` + `match_controller_identity`,
+  `RiseTokenSigner::sign_access_jwt`, plus `oauth_rate_limiter` /
+  `extract_client_ip`. Settings `auth_token_max_ttl_seconds` (default 600s)
+  and `auth.allow_raw_external_tokens` (default `true`);
+  `#[serde(deny_unknown_fields)]` hardening on `RiseClaims`, paired with the
+  `header.typ` check. **No separate `AccessPrincipal` extractor was built** —
+  #367 instead added access-token consumption directly to `AuthContext`
+  (the `Access` variant), so handlers accept access tokens through the
+  existing path (see PR 1B).
+- [x] **PR 1B — Handlers consume access tokens** (satisfied by
+  [#367](https://github.com/rise-deploy/rise/pull/367), implemented
+  differently than originally planned). The goal — every project-scoped
+  handler accepts an exchanged access token — is already met: #367 folded
+  access tokens into the existing `AuthContext` (the `Access(AccessClaims)`
+  variant, picked up by `from_request_parts`, resolved by
+  `resolve_for_project` → `resolve_access_for_project`). All 13 project-scoped
+  sites in `deployment/handlers.rs` + `registry/handlers.rs` already route
+  through `resolve_for_project`, and none call `auth.user()?`, so they consume
+  access tokens unchanged — **no separate `AccessPrincipal` extractor and no
+  handler swap were needed.** The originally-planned snap-decision form
+  (`require_project(project.id)?` with no per-handler DB resolution) buys
+  nothing while the legacy `VerifiedExternalToken` path must coexist, since
+  that path still needs `resolve_for_project`. That simplification — deleting
+  `resolve_for_project` and collapsing the per-handler boilerplate — is folded
+  into **Phase 3 (PR 3A)**, where the legacy path is removed in the same pass.
+- [x] **PR 1C — Middleware platform-access compatibility** (folded into
+  [#367](https://github.com/rise-deploy/rise/pull/367)).
+  `platform_access_middleware` recognizes the `AccessClaims` extension:
+  `ServiceAccount`/`Controller` principals bypass the allowlist exactly as a
+  legacy external token does, and a (reserved, not-yet-minted) `User` access
+  token is rejected explicitly rather than 500ing. See
+  `src/server/auth/middleware.rs`.
+- [ ] **PR 1D — Deprecation metric + operator docs.** The structured
+  deprecation *log* already shipped in
+  [#367](https://github.com/rise-deploy/rise/pull/367)
+  (`middleware.rs`: `"deprecated: accepting raw external token …"`). What
+  remains: emit a real deprecation *metric* (a counter keyed by issuer) so
+  operators can see who still needs migrating; commit to a target version at
+  which `auth.allow_raw_external_tokens` flips to `false`; and update
   [`docs/engineering/src/content/docs/authentication.md`](docs/engineering/src/content/docs/authentication.md):
   add Access to the at-a-glance table, replace the "Forthcoming" section
   with the real exchange endpoint (request/response, relation to the inner
@@ -520,24 +546,53 @@ Reviewed deltas (deliberate, not "byte-for-byte refactor"):
 
 ## Phase 2 — CLI auto-exchange
 
-- [ ] **PR 2A — `ExchangingTokenSource` decorator.** Pure CLI change in
-  `src/cli/token_source.rs`. Wrap the existing provider: on `token()` it
-  calls the exchange endpoint with the inner OIDC token + project name and
-  caches the returned Rise access token, reusing the existing
-  `CachedToken`/`is_fresh` machinery. Nested freshness: re-mint the inner
-  OIDC token only when stale; re-exchange the outer Rise token when stale.
-  The deploy command (which knows the project) constructs it. The server
-  already supports it from Phase 1.
+- [~] **PR 2A — Explicit, identity-triggered token exchange.** Exchange is an
+  **explicit, channel-agnostic** action, modeled on `AssumeRoleWithWebIdentity`:
+  the `RISE_IDENTITY` env var names the identity to assume (a service account's
+  synthetic-user email, `{project}+{seq}@sa.rise.local`); the token is the proof.
+  **Set → exchange** the resolved token (from `RISE_TOKEN`, `RISE_TOKEN_COMMAND`,
+  or GitHub Actions OIDC — source doesn't matter); **unset → pass through.** No
+  content/`iss`/`alg` sniffing (an earlier draft did, and broke CI because the
+  CLI's backend URL legitimately differs from the server's `public_url`). The
+  identity *is* the context: the server resolves the SA by email → its project,
+  so the minted access token carries the full principal and every command
+  (incl. `project list`) works regardless of whether it has a `--project`.
+  - **CLI** (`src/cli/token_source.rs`): `resolve_token_provider` /
+    `resolve_token_with_retry` are back to `(http, config)` (no project param);
+    `select_token_provider` wraps the selected source with
+    `ExchangingTokenSource` iff `RISE_IDENTITY` is set. The decorator sends
+    `{ grant_type, subject_token, subject_token_type, identity }`, keeps the
+    30s timeout + retryable body-read + cache/refresh, and `describe()`
+    delegates to the inner source (debug logs name the real identity).
+  - **Server** (`auth/exchange/`): request field `rise_project` → `identity`.
+    Resolution: `users::find_by_email` → `service_accounts::find_active_by_user_id`
+    → **issuer-match check** (`sa.issuer_url == token issuer`) →
+    `match_service_account` → `projects::find_by_id`. All identity-dependent
+    failures collapse to one coarse `invalid_grant` (no SA-email enumeration).
+    Absent `identity` → controller resolution (unchanged).
+  - **Server** (`project/handlers.rs`): `list_projects` returns the SA's bound
+    project for an `AuthContext::Access` service-account principal.
+  - **Cutover risk (pre-GA):** old CLI (`rise_project`) ↔ new server, and new
+    CLI (`identity`) ↔ old server, both ignore the unknown field → controller
+    branch → `invalid_grant`; **fail closed**, no escalation.
+  - **Remaining:** an E2E test that authenticates with a real service account
+    (e2e-docker's Dex: create an SA trusting Dex, mint a Dex token, set
+    `RISE_IDENTITY`, deploy) and asserts the exchange path succeeds.
 
 ## Phase 3 — Remove the legacy path
 
 - [ ] **PR 3A — Flip the default + delete the external branch.** Flip
   `auth.allow_raw_external_tokens` default to `false`. Delete the middleware
-  external branch, `resolve_for_project`, `VerifiedExternalToken`, and the
-  `AccessPrincipal` extractor's legacy fallback. Move `platform::routes()`
-  from `public_routes` to `auth_only_routes`. Remove `AuthContext` /
-  `AnyAuth` / `VerifiedExternalToken` from
-  `src/server/auth/context.rs`; remove `ControllerAuthContext` /
+  external branch and the legacy raw-token resolution: the
+  `AuthContext::ExternalToken` variant, `VerifiedExternalToken`, and the
+  `ExternalToken` arm of `resolve_for_project` (the SA-matching now reachable
+  only via the exchange endpoint's shared `sa_match.rs`). The
+  `AuthContext::Access` consumption path stays — that is how handlers accept
+  exchanged tokens. This is also where the long-deferred handler
+  simplification lands: with the legacy path gone, the per-handler
+  `resolve_for_project` + 404-masking boilerplate collapses to a snap
+  decision on the resolved access principal. Move `platform::routes()`
+  from `public_routes` to `auth_only_routes`. Remove `ControllerAuthContext` /
   `VerifiedControllerToken` from `src/server/auth/controller.rs`.
   (`match_controller_identity` / `build_controller_indexes` /
   `ControllerIdentity` stay — they relocated to `rise-backend-auth` in
@@ -559,6 +614,19 @@ Listed so they don't fall out of the plan; not currently sequenced.
   `rise-backend-auth` and `rise-resource-api`.** Both crates currently
   carry their own validation logic; consolidate into one shared validator
   to prevent drift.
+- [ ] **Reserve the SA synthetic-email namespace (`@sa.rise.local`).**
+  Service-account synthetic users and human users share the `users.email`
+  unique column with no type discriminator, and `service_accounts::create`
+  reuses an existing user row by email. A human user provisioned (via OIDC)
+  with an `@sa.rise.local` address could therefore collide with an SA's
+  synthetic identity. Not exploitable through the token exchange today (it
+  only ever mints an `AccessClaims::ServiceAccount`, still gated by the SA's
+  issuer + claims, and `RISE_IDENTITY` resolution rejects any email with no
+  active SA), and not introduced by Phase 2 — but the namespace overlap is a
+  latent hygiene gap. Fix by rejecting human registrations into the
+  `@sa.rise.local` domain (and/or adding a `users.kind` discriminator that
+  `find_by_email`/`find_active_by_user_id` filter on). Surfaced by the PR #389
+  review.
 - [ ] **Overlapping previous-key verification window for HS256 rotation.**
   Today the symmetric secret is shared by sessions and access tokens, so
   rotating invalidates everything live at once. Preferred posture is
@@ -569,9 +637,10 @@ Listed so they don't fall out of the plan; not currently sequenced.
 
 ## Open questions
 
-- **Access-token TTL.** Plan says ≤10 minutes. Confirm before Phase 1A —
-  this is the revocation-window bound (an exchanged token can't be revoked
-  mid-life). `jti` field leaves room for a future deny-list.
+- **Access-token TTL.** *Resolved:* shipped as `auth_token_max_ttl_seconds`,
+  default 600s (10 minutes) — the revocation-window bound, since an exchanged
+  token can't be revoked mid-life. `jti` field leaves room for a future
+  deny-list.
 - **Capabilities endpoint timing.** Plan keeps it public through Phase 1
   and flips to auth-only in Phase 3. Could flip earlier (any time after
   Phase 2 ships the CLI auto-exchange so internal callers always bring an
@@ -581,6 +650,40 @@ Listed so they don't fall out of the plan; not currently sequenced.
   (unauthenticated by design). Treat as tier-1 with its own SLO/alerting;
   CLI should retry on 5xx via existing `token_with_retry`. Decide where
   the SLO lives (operator docs vs. SRE-internal).
+
+---
+
+# Cross-backend E2E test consistency
+
+A testing-infra follow-up, not an architectural workstream — but tracked here so
+it isn't lost.
+
+The Docker (`scripts/ci/e2e-docker.sh`) and Kubernetes
+(`scripts/ci/e2e-minikube.sh`) end-to-end suites have drifted: they each cover an
+overlapping-but-inconsistent set of scenarios. Per the **Deployment Backend
+Parity (STRICT)** rule, common features should be exercised the *same way* on
+both backends. The goal: define a shared scenario matrix (deploy/rollback/stop,
+ingress access classes, env vars, custom domains, workload identity, …) driven
+from common helpers (`scripts/ci/lib/`), so a feature is tested identically on
+Docker and K8s and a parity gap shows up as a failing/absent cell rather than
+silent divergence.
+
+- [ ] **Audit & align** the two suites into a shared scenario list + common
+  driver helpers; document the matrix alongside the
+  [Deployment Backends](docs/engineering/src/content/docs/deployment-backends.md)
+  page so the test matrix mirrors the feature matrix.
+- [ ] **Add SA OIDC token exchange to the matrix.** Today neither suite
+  exercises the `RISE_IDENTITY` exchange — both authenticate the CLI with a
+  pre-minted Rise HS256 bearer (`create_rise_ci_token`), so
+  `POST /api/v1/auth/token` and `resolve_service_account`-by-identity are never
+  hit end to end. Add a scenario that: creates a service account trusting the
+  test IdP (the Docker stack already runs **Dex**; the K8s stack needs an
+  equivalent issuer), obtains an OIDC token from it (non-interactive Dex grant —
+  the main implementation hurdle), sets `RISE_IDENTITY` to the SA's email, runs
+  `rise deploy`, and asserts the deploy succeeds **and** `rise project list`
+  returns the SA's bound project. Run it on both backends. Until then, exchange
+  coverage is unit/DB-level only (`token_source` tests + the
+  `resolve_by_identity` `sqlx` tests incl. the issuer-mismatch guard).
 
 ---
 

@@ -32,12 +32,21 @@ pub use verify::{verify_external_jwt, JwksKeySource, RiseToken};
 /// Check whether a JWT issuer is Rise-issued.
 ///
 /// Rise JWTs set `iss` to the Rise public URL (e.g. "https://rise.example.com"),
-/// minted from the signer's configured issuer. The match is **exact**: the
-/// exchange endpoint relies on this predicate to reject Rise-issued tokens, so a
-/// fuzzy prefix/port match could let a sibling-port issuer be treated as
-/// Rise-issued. A non-Rise issuer can never forge a Rise *signature*, but exact
-/// matching keeps the routing decision unambiguous at both call sites
-/// (middleware + exchange).
+/// minted from the signer's configured issuer. The match is **exact**, kept that
+/// way deliberately so this predicate stays consistent with the `aud` checks in
+/// the auth middleware, which compare `claims.aud` to `public_url` exactly. (Both
+/// `iss` and `aud` are minted from the same `public_url`, so they share its form;
+/// matching `iss` loosely here while `aud` is matched strictly would route a
+/// slash-variant token to the Rise path only to reject it at the `aud` check.)
+/// The exchange endpoint also relies on this to reject Rise-issued source tokens,
+/// so a fuzzy prefix/port match could let a sibling-port issuer be treated as
+/// Rise-issued.
+///
+/// The CLI does not compare issuers at all: it decides whether to pre-exchange a
+/// token from the input *channel* (`RISE_TOKEN` / stored login are ready Rise
+/// bearers; `RISE_TOKEN_COMMAND` / GitHub Actions OIDC are external tokens to
+/// exchange), so it never depends on the client's backend URL matching
+/// `public_url`. This predicate is purely server-side and can stay exact.
 pub fn is_rise_issued_jwt(issuer: &str, public_url: &str) -> bool {
     issuer == public_url
 }
@@ -59,6 +68,17 @@ mod tests {
         assert!(is_rise_issued_jwt(
             "https://rise.example.com:8443",
             "https://rise.example.com:8443"
+        ));
+    }
+
+    #[test]
+    fn test_is_rise_issued_jwt_rejects_trailing_slash_mismatch() {
+        // Exact match, intentionally: the middleware's `aud` checks compare
+        // exactly too, so loosening only `iss` here would desync routing from
+        // audience validation.
+        assert!(!is_rise_issued_jwt(
+            "https://rise.example.com/",
+            "https://rise.example.com"
         ));
     }
 

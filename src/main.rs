@@ -1079,15 +1079,18 @@ async fn main() -> Result<()> {
                 project::delete_project(&http_client, &backend_url, &config, &project_name).await?;
             }
             ProjectCommands::AppUser(app_user_cmd) => {
+                // App-user management is project-scoped; resolve the project once
+                // up front, since every subcommand below targets it.
+                let (project, path) = match app_user_cmd {
+                    AppUserCommands::Add { project, path, .. }
+                    | AppUserCommands::Remove { project, path, .. }
+                    | AppUserCommands::List { project, path } => (project, path),
+                };
+                let project_name = resolve_project_name(project.clone(), path)?;
                 let token =
                     cli::token_source::resolve_token_with_retry(&http_client, &config).await?;
                 match app_user_cmd {
-                    AppUserCommands::Add {
-                        project,
-                        identifier,
-                        path,
-                    } => {
-                        let project_name = resolve_project_name(project.clone(), path)?;
+                    AppUserCommands::Add { identifier, .. } => {
                         cli::project::add_app_user(
                             &http_client,
                             &backend_url,
@@ -1097,12 +1100,7 @@ async fn main() -> Result<()> {
                         )
                         .await?;
                     }
-                    AppUserCommands::Remove {
-                        project,
-                        identifier,
-                        path,
-                    } => {
-                        let project_name = resolve_project_name(project.clone(), path)?;
+                    AppUserCommands::Remove { identifier, .. } => {
                         cli::project::remove_app_user(
                             &http_client,
                             &backend_url,
@@ -1112,8 +1110,7 @@ async fn main() -> Result<()> {
                         )
                         .await?;
                     }
-                    AppUserCommands::List { project, path } => {
-                        let project_name = resolve_project_name(project.clone(), path)?;
+                    AppUserCommands::List { .. } => {
                         cli::project::list_app_users(
                             &http_client,
                             &backend_url,
@@ -1599,18 +1596,28 @@ async fn main() -> Result<()> {
                 .await?;
         }
         Commands::Env(env_cmd) => {
+            // Env-var management is project-scoped; resolve the project once up
+            // front, since every subcommand below targets it.
+            let (project, path) = match env_cmd {
+                EnvCommands::Set { project, path, .. }
+                | EnvCommands::List { project, path, .. }
+                | EnvCommands::Get { project, path, .. }
+                | EnvCommands::Delete { project, path, .. }
+                | EnvCommands::Import { project, path, .. }
+                | EnvCommands::Export { project, path, .. }
+                | EnvCommands::ShowDeployment { project, path, .. } => (project, path),
+            };
+            let project_name = resolve_project_name(project.clone(), path)?;
             let token = cli::token_source::resolve_token_with_retry(&http_client, &config).await?;
             match env_cmd {
                 EnvCommands::Set {
-                    project,
-                    path,
                     key,
                     value,
                     secret,
                     protected,
                     environment,
+                    ..
                 } => {
-                    let project_name = resolve_project_name(project.clone(), path)?;
                     // Protected defaults to true for secrets, false for non-secrets
                     // Can be explicitly overridden with --protected flag
                     let is_protected = protected.unwrap_or(*secret);
@@ -1627,12 +1634,7 @@ async fn main() -> Result<()> {
                     )
                     .await?;
                 }
-                EnvCommands::List {
-                    project,
-                    path,
-                    environment,
-                } => {
-                    let project_name = resolve_project_name(project.clone(), path)?;
+                EnvCommands::List { environment, .. } => {
                     env::list_env(
                         &http_client,
                         &backend_url,
@@ -1643,12 +1645,8 @@ async fn main() -> Result<()> {
                     .await?;
                 }
                 EnvCommands::Get {
-                    project,
-                    path,
-                    key,
-                    environment,
+                    key, environment, ..
                 } => {
-                    let project_name = resolve_project_name(project.clone(), path)?;
                     env::get_env(
                         &http_client,
                         &backend_url,
@@ -1660,12 +1658,8 @@ async fn main() -> Result<()> {
                     .await?;
                 }
                 EnvCommands::Delete {
-                    project,
-                    path,
-                    key,
-                    environment,
+                    key, environment, ..
                 } => {
-                    let project_name = resolve_project_name(project.clone(), path)?;
                     env::unset_env(
                         &http_client,
                         &backend_url,
@@ -1677,12 +1671,8 @@ async fn main() -> Result<()> {
                     .await?;
                 }
                 EnvCommands::Import {
-                    project,
-                    path,
-                    file,
-                    environment,
+                    file, environment, ..
                 } => {
-                    let project_name = resolve_project_name(project.clone(), path)?;
                     env::import_env(
                         &http_client,
                         &backend_url,
@@ -1694,16 +1684,11 @@ async fn main() -> Result<()> {
                     .await?;
                 }
                 EnvCommands::Export {
-                    project,
-                    path,
-                    environment,
+                    path, environment, ..
                 } => {
+                    // Reuses the project resolved above; loads config only for
+                    // the environment lookup the export needs.
                     let toml_config = build::config::load_full_project_config(path)?;
-                    let project_name = resolve_project_name_with_config(
-                        project.clone(),
-                        path,
-                        toml_config.as_ref(),
-                    )?;
                     let resolved_env =
                         resolve_environment(environment.clone(), toml_config.as_ref());
                     env::export_env(
@@ -1715,12 +1700,7 @@ async fn main() -> Result<()> {
                     )
                     .await?;
                 }
-                EnvCommands::ShowDeployment {
-                    project,
-                    path,
-                    deployment_id,
-                } => {
-                    let project_name = resolve_project_name(project.clone(), path)?;
+                EnvCommands::ShowDeployment { deployment_id, .. } => {
                     env::list_deployment_env(
                         &http_client,
                         &backend_url,
@@ -1733,15 +1713,21 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Domain(domain_cmd) => {
+            // Custom-domain management is project-scoped; resolve the project once
+            // up front, since every subcommand below targets it.
+            let (project, path) = match domain_cmd {
+                DomainCommands::Add { project, path, .. }
+                | DomainCommands::List { project, path }
+                | DomainCommands::Remove { project, path, .. } => (project, path),
+            };
+            let project_name = resolve_project_name(project.clone(), path)?;
             let token = cli::token_source::resolve_token_with_retry(&http_client, &config).await?;
             match domain_cmd {
                 DomainCommands::Add {
-                    project,
-                    path,
                     domain,
                     environment,
+                    ..
                 } => {
-                    let project_name = resolve_project_name(project.clone(), path)?;
                     domain::add_domain(
                         &http_client,
                         &backend_url,
@@ -1752,16 +1738,10 @@ async fn main() -> Result<()> {
                     )
                     .await?;
                 }
-                DomainCommands::List { project, path } => {
-                    let project_name = resolve_project_name(project.clone(), path)?;
+                DomainCommands::List { .. } => {
                     domain::list_domains(&http_client, &backend_url, &token, &project_name).await?;
                 }
-                DomainCommands::Remove {
-                    project,
-                    path,
-                    domain,
-                } => {
-                    let project_name = resolve_project_name(project.clone(), path)?;
+                DomainCommands::Remove { domain, .. } => {
                     domain::remove_domain(
                         &http_client,
                         &backend_url,

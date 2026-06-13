@@ -23,10 +23,12 @@ pub struct ExchangeRequest {
     pub subject_token: String,
     /// Must be [`TOKEN_TYPE_JWT`].
     pub subject_token_type: String,
-    /// Optional Rise project name; required for project service-account exchange.
-    /// `resource` is accepted as an alias for strict RFC 8693 compatibility.
-    #[serde(default, alias = "resource")]
-    pub rise_project: Option<String>,
+    /// The identity to assume: a service account's synthetic-user email
+    /// (`{project}+{seq}@sa.rise.local`). Present → project service-account
+    /// exchange; absent → controller exchange. The subject token must still
+    /// prove (issuer + claims) it is allowed to assume the named identity.
+    #[serde(default)]
+    pub identity: Option<String>,
 }
 
 /// Success response (RFC 8693 §2.2.1).
@@ -84,15 +86,6 @@ impl ExchangeError {
         Self::OAuth {
             status: StatusCode::BAD_REQUEST,
             error: "invalid_grant",
-            description: Some(desc.into()),
-        }
-    }
-
-    /// `400 invalid_target` — the requested `rise_project` does not exist.
-    pub fn invalid_target(desc: impl Into<String>) -> Self {
-        Self::OAuth {
-            status: StatusCode::BAD_REQUEST,
-            error: "invalid_target",
             description: Some(desc.into()),
         }
     }
