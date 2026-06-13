@@ -8,6 +8,30 @@ dex:
   enabled: true
   config:
     issuer: http://rise-ci-chart-dex.rise-ci.svc.cluster.local:5556/dex
+    # Override the chart's default rise-backend client to add grantTypes. Setting
+    # grantTypes REPLACES — not extends — Dex's default set, so we list the full
+    # default set (authorization_code, refresh_token, device_code, token-exchange)
+    # plus `password`. The resource-owner password grant is CI-only: it lets the
+    # rise-e2e harness mint OIDC id_tokens non-interactively for the static users
+    # (enablePasswordDB / staticPasswords / oauth2.passwordConnector come from the
+    # chart defaults and are deep-merged in). Mirrors dev/dex/config.yaml. Helm
+    # replaces list values, so the whole client must be reproduced here.
+    staticClients:
+      - id: rise-backend
+        redirectURIs:
+          - "http://rise.example.com/"
+          - "http://rise.example.com/api/v1/auth/callback"
+          - "http://localhost:8765/callback"
+          - "http://localhost:8766/callback"
+          - "http://localhost:8767/callback"
+        name: "Rise Backend"
+        secret: "rise-backend-secret"
+        grantTypes:
+          - authorization_code
+          - refresh_token
+          - "urn:ietf:params:oauth:grant-type:device_code"
+          - "urn:ietf:params:oauth:grant-type:token-exchange"
+          - password
 
 logs:
   backend: loki
