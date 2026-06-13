@@ -157,13 +157,10 @@ impl Scenario for SaTokenExchange {
         "sa-token-exchange"
     }
 
-    fn applies_to(&self, kind: BackendKind) -> Applicability {
-        match kind {
-            BackendKind::Docker => Applicability::Run,
-            BackendKind::Minikube => Applicability::Skip(
-                "test Dex not reachable from the harness host in this increment",
-            ),
-        }
+    fn applies_to(&self, _kind: BackendKind) -> Applicability {
+        // Both backends now expose a reachable Dex (Docker via the compose overlay,
+        // minikube via a `kubectl port-forward` to the in-cluster Dex).
+        Applicability::Run
     }
 
     fn run(&self, b: &dyn Backend) -> Result<()> {

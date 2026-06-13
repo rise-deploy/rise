@@ -915,6 +915,55 @@ jobs:
           RISE_IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
         run: bash scripts/ci/e2e-minikube.sh
 
+  # Typed cross-backend harness (crate rise-e2e) on Kubernetes: it self-provisions
+  # its own minikube cluster + Helm release (default oci-client-auth mode) and runs
+  # the same scenarios as the Docker harness. Runs alongside the bash job above
+  # until the harness reaches parity and the bash script is retired.
+  e2e-minikube-harness:
+    name: Minikube end-to-end (rise-e2e harness)
+    runs-on: ubuntu-latest
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && needs.prepare.outputs.is_trusted_pr == 'true')
+    needs:
+      - prepare
+      - package-image
+      - package-helm
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup mise
+        uses: jdx/mise-action@v4
+        with:
+          cache: true
+          experimental: true
+
+      - name: Install mise tools
+        run: mise use -g minikube kubectl helm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run rise-e2e harness (minikube backend)
+        env:
+          RISE_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          RISE_IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
+          RISE_E2E_BACKEND: minikube
+          SQLX_OFFLINE: "true"
+        run: cargo test -p rise-e2e -- --nocapture --test-threads=1
+
   e2e-docker:
     name: Docker backend end-to-end smoke tests
     runs-on: ubuntu-latest
