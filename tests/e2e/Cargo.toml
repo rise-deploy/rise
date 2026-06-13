@@ -20,7 +20,7 @@ base64 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Blocking HTTP + form bodies (Dex password grant) — sequential harness, no async
-# runtime. Keep default features so the TLS backend unifies with `rise-deploy`'s reqwest.
+# runtime. The harness only hits local HTTP, so it just uses reqwest's default TLS.
 reqwest = { version = "0.13", features = ["blocking", "json", "form"] }
 # Reused to mint the HS256 CI bearer the same way the server signs sessions.
 rise-backend-auth = { path = "../../crates/rise-backend-auth" }

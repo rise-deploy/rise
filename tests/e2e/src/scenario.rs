@@ -2,6 +2,8 @@
 //! declares which backends it `applies_to`; an unsupported combo is a logged
 //! `Skip(reason)` — a visible parity gap, never silent drift.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use anyhow::{Context, Result};
 
 use crate::backend::{Backend, BackendKind, CliAuth};
@@ -52,11 +54,15 @@ pub fn run_all(b: &dyn Backend) -> Result<()> {
 
 /// Unique-enough project name per run (DNS-safe), so a stale stack can't collide.
 fn unique(prefix: &str) -> String {
-    let n = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("{prefix}-{}", n % 1_000_000)
+    // Process id + per-process atomic counter: two scenarios in one process can't
+    // collide, and separate runs differ by pid. DNS-safe (starts with the letter
+    // prefix, lowercase alphanumeric + hyphens).
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    format!(
+        "{prefix}-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 fn expect_ok(out: CliOutput, what: &str) -> Result<CliOutput> {
@@ -189,6 +195,11 @@ impl Scenario for SaTokenExchange {
                     &project,
                     "--issuer",
                     &dexep.issuer,
+                    // The CLI requires an `aud` claim plus >=2 claims total; the
+                    // `aud` value must equal the Dex OIDC client_id (`rise-backend`),
+                    // which is the audience of the Dex id_token presented at exchange.
+                    "--claim",
+                    "aud=rise-backend",
                     "--claim",
                     "email=user@example.com",
                 ],

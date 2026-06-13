@@ -184,20 +184,14 @@ impl Backend for DockerBackend {
             &format!("Traefik route for {host}"),
             || {
                 let r = http::get(&url, Some(&host))?;
-                let ready = r.status != 404;
+                // Traefik can transiently return 5xx (502/503) while wiring a
+                // freshly-deployed route — keep polling on those too, not just 404.
+                let ready = r.status != 404 && r.status < 500;
                 resp = Some(r);
                 Ok(ready)
             },
         )?;
         Ok(resp)
-    }
-
-    fn public_url(&self) -> &str {
-        PUBLIC_URL
-    }
-
-    fn ci_token(&self) -> &str {
-        &self.ci_token
     }
 
     fn dex(&self) -> Option<&DexEndpoint> {

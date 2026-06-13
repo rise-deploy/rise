@@ -42,8 +42,6 @@ pub trait Backend {
     /// logs, never silent drift.
     fn reach_app(&self, project: &str, path: &str) -> Result<Option<HttpResponse>>;
 
-    fn public_url(&self) -> &str;
-    fn ci_token(&self) -> &str;
     /// The test Dex reachable from the harness, when this backend exposes one.
     fn dex(&self) -> Option<&DexEndpoint>;
 

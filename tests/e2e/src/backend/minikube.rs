@@ -20,7 +20,6 @@ const DEFAULT_RISE_URL: &str = "http://127.0.0.1:3000";
 
 pub struct MinikubeBackend {
     rise_url: String,
-    public_url: String,
     image: String,
     ci_token: String,
 }
@@ -37,7 +36,6 @@ impl MinikubeBackend {
         let ci_token = token::mint_ci_token(SECRET_B64, &public_url)?;
         Ok(Self {
             rise_url,
-            public_url,
             image: format!("{repo}:{tag}"),
             ci_token,
         })
@@ -94,14 +92,6 @@ impl Backend for MinikubeBackend {
         // App-HTTP reach (per-project `kubectl port-forward` to the app svc) is
         // not yet ported; scenarios assert via wait_healthy here.
         Ok(None)
-    }
-
-    fn public_url(&self) -> &str {
-        &self.public_url
-    }
-
-    fn ci_token(&self) -> &str {
-        &self.ci_token
     }
 
     fn dex(&self) -> Option<&DexEndpoint> {

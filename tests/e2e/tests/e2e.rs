@@ -11,8 +11,13 @@ fn e2e_suite() {
     eprintln!("[e2e] backend = {}", kind.as_str());
 
     let mut backend = backend::create(kind).expect("construct backend driver");
-    backend.bring_up().expect("bring up backend");
-    let result = scenario::run_all(backend.as_ref());
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        backend.bring_up()?;
+        scenario::run_all(backend.as_ref())
+    }));
     backend.tear_down();
-    result.expect("e2e scenarios passed");
+    match outcome {
+        Ok(result) => result.expect("e2e scenarios passed"),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
