@@ -546,30 +546,38 @@ Reviewed deltas (deliberate, not "byte-for-byte refactor"):
 
 ## Phase 2 — CLI auto-exchange
 
-- [~] **PR 2A — `ExchangingTokenSource` decorator.** Pure CLI change in
-  `src/cli/token_source.rs`. **Intent comes from the input *channel*, never
-  from inspecting the token** (an earlier draft sniffed `iss`/`alg` and broke
-  CI — the CLI's backend URL legitimately differs from the server's
-  `public_url`/token issuer, e.g. `127.0.0.1` vs the public host). A source is
-  classified once via `TokenSource::is_external_oidc()`: `RISE_TOKEN_COMMAND`
-  and GitHub Actions OIDC produce **external** tokens that are exchanged;
-  `RISE_TOKEN` and the stored login are **ready Rise bearers** used as-is. Only
-  external sources are wrapped, and only when a project scopes the
-  (project-bound) SA exchange; the decorator then always exchanges, calling the
-  endpoint with the inner OIDC token + project and caching the Rise access
-  token (reusing `CachedToken`/`is_fresh`). Nested freshness: re-mint the inner
-  OIDC token only when stale; re-exchange the outer access token only when
-  stale. The legacy raw-token path stays accepted server-side through the
-  cutover release (`auth.allow_raw_external_tokens`, default `true`).
-  **Centralized:** `resolve_token_provider` / `resolve_token_with_retry` take
-  `project: Option<&str>` and do the wrap, so every command obtains tokens the
-  same way; `describe()` delegates to the inner source so debug logs name the
-  real identity (GitHub Actions OIDC, stored login, …). Project threaded
-  through **all** project-scoped commands (deploy, deployment
-  list/show/stop/logs/follow, environment, extension, service-account, run,
-  env, domain, app-user); project-less commands (team, project CRUD, encrypt)
-  pass `None`. **Remaining:** add an E2E test that authenticates with a service
-  account and asserts the exchange path succeeds.
+- [~] **PR 2A — Explicit, identity-triggered token exchange.** Exchange is an
+  **explicit, channel-agnostic** action, modeled on `AssumeRoleWithWebIdentity`:
+  the `RISE_IDENTITY` env var names the identity to assume (a service account's
+  synthetic-user email, `{project}+{seq}@sa.rise.local`); the token is the proof.
+  **Set → exchange** the resolved token (from `RISE_TOKEN`, `RISE_TOKEN_COMMAND`,
+  or GitHub Actions OIDC — source doesn't matter); **unset → pass through.** No
+  content/`iss`/`alg` sniffing (an earlier draft did, and broke CI because the
+  CLI's backend URL legitimately differs from the server's `public_url`). The
+  identity *is* the context: the server resolves the SA by email → its project,
+  so the minted access token carries the full principal and every command
+  (incl. `project list`) works regardless of whether it has a `--project`.
+  - **CLI** (`src/cli/token_source.rs`): `resolve_token_provider` /
+    `resolve_token_with_retry` are back to `(http, config)` (no project param);
+    `select_token_provider` wraps the selected source with
+    `ExchangingTokenSource` iff `RISE_IDENTITY` is set. The decorator sends
+    `{ grant_type, subject_token, subject_token_type, identity }`, keeps the
+    30s timeout + retryable body-read + cache/refresh, and `describe()`
+    delegates to the inner source (debug logs name the real identity).
+  - **Server** (`auth/exchange/`): request field `rise_project` → `identity`.
+    Resolution: `users::find_by_email` → `service_accounts::find_active_by_user_id`
+    → **issuer-match check** (`sa.issuer_url == token issuer`) →
+    `match_service_account` → `projects::find_by_id`. All identity-dependent
+    failures collapse to one coarse `invalid_grant` (no SA-email enumeration).
+    Absent `identity` → controller resolution (unchanged).
+  - **Server** (`project/handlers.rs`): `list_projects` returns the SA's bound
+    project for an `AuthContext::Access` service-account principal.
+  - **Cutover risk (pre-GA):** old CLI (`rise_project`) ↔ new server, and new
+    CLI (`identity`) ↔ old server, both ignore the unknown field → controller
+    branch → `invalid_grant`; **fail closed**, no escalation.
+  - **Remaining:** an E2E test that authenticates with a real service account
+    (e2e-docker's Dex: create an SA trusting Dex, mint a Dex token, set
+    `RISE_IDENTITY`, deploy) and asserts the exchange path succeeds.
 
 ## Phase 3 — Remove the legacy path
 

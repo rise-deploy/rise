@@ -71,6 +71,36 @@ jobs:
 
 Because GitHub Actions OIDC auto-detection ranks above the stored login token (see [Token source precedence](./cli-reference#token-source-precedence)), a workflow with `id-token: write` and no `RISE_TOKEN`/`RISE_TOKEN_COMMAND` set will **error if `RISE_GHA_AUDIENCE` is unset** rather than fall back to another token. Setting `RISE_TOKEN` overrides this.
 
+## Exchanging the OIDC token (`RISE_IDENTITY`)
+
+By default the CLI sends your token to Rise as-is, and the backend federates it
+per request. To instead **exchange** the external OIDC token up front for a
+short-lived, Rise-issued access token, set `RISE_IDENTITY` to the service
+account's email (shown by `rise sa list` / `rise sa show`, of the form
+`<project>+<n>@sa.rise.local`):
+
+```yaml
+env:
+  RISE_GHA_AUDIENCE: https://rise.example.net
+  RISE_IDENTITY: my-app+0@sa.rise.local   # exchange the OIDC token for this SA
+```
+
+This works with any token source (`RISE_TOKEN`, `RISE_TOKEN_COMMAND`, or GitHub
+Actions OIDC) — it's the explicit, channel-agnostic signal that you want an
+exchange. `RISE_IDENTITY` only *selects* the identity; your OIDC token still has
+to prove (issuer + claims) that it may assume that service account. The resulting
+access token carries the resolved principal, so it works across every command
+(including `rise project list`) without a per-command `--project`.
+
+:::caution[Deprecated: service accounts without exchange]
+Presenting a raw external token **without** `RISE_IDENTITY` (the legacy
+per-request path, where the backend federates the token on every call) is
+**deprecated and will be removed soon**. In an upcoming release the operator
+toggle [`auth.allow_raw_external_tokens`](/operator-docs/authentication/) flips
+to `false`, at which point an un-exchanged external token is rejected. **Set
+`RISE_IDENTITY` now** so your CI keeps working through the cutover.
+:::
+
 ## Creating Service Accounts
 
 ```bash

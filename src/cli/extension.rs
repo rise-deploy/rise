@@ -52,8 +52,7 @@ pub async fn create_extension(
     let config = Config::load()?;
     let backend_url = config.get_backend_url();
     let http_client = Client::new();
-    let token =
-        crate::token_source::resolve_token_with_retry(&http_client, &config, Some(project)).await?;
+    let token = crate::token_source::resolve_token_with_retry(&http_client, &config).await?;
     let url = format!(
         "{}/api/v1/projects/{}/extensions/{}",
         backend_url, project, extension
@@ -106,8 +105,7 @@ pub async fn update_extension(project: &str, extension: &str, spec: Value) -> Re
     let config = Config::load()?;
     let backend_url = config.get_backend_url();
     let http_client = Client::new();
-    let token =
-        crate::token_source::resolve_token_with_retry(&http_client, &config, Some(project)).await?;
+    let token = crate::token_source::resolve_token_with_retry(&http_client, &config).await?;
     let url = format!(
         "{}/api/v1/projects/{}/extensions/{}",
         backend_url, project, extension
@@ -157,8 +155,7 @@ pub async fn patch_extension(project: &str, extension: &str, spec: Value) -> Res
     let config = Config::load()?;
     let backend_url = config.get_backend_url();
     let http_client = Client::new();
-    let token =
-        crate::token_source::resolve_token_with_retry(&http_client, &config, Some(project)).await?;
+    let token = crate::token_source::resolve_token_with_retry(&http_client, &config).await?;
     let url = format!(
         "{}/api/v1/projects/{}/extensions/{}",
         backend_url, project, extension
@@ -208,8 +205,7 @@ pub async fn list_extensions(project: &str) -> Result<()> {
     let config = Config::load()?;
     let backend_url = config.get_backend_url();
     let http_client = Client::new();
-    let token =
-        crate::token_source::resolve_token_with_retry(&http_client, &config, Some(project)).await?;
+    let token = crate::token_source::resolve_token_with_retry(&http_client, &config).await?;
     let url = format!("{}/api/v1/projects/{}/extensions", backend_url, project);
 
     let response = http_client
@@ -273,8 +269,7 @@ pub async fn show_extension(project: &str, extension: &str) -> Result<()> {
     let config = Config::load()?;
     let backend_url = config.get_backend_url();
     let http_client = Client::new();
-    let token =
-        crate::token_source::resolve_token_with_retry(&http_client, &config, Some(project)).await?;
+    let token = crate::token_source::resolve_token_with_retry(&http_client, &config).await?;
     let url = format!(
         "{}/api/v1/projects/{}/extensions/{}",
         backend_url, project, extension
@@ -322,8 +317,7 @@ pub async fn delete_extension(project: &str, extension: &str) -> Result<()> {
     let config = Config::load()?;
     let backend_url = config.get_backend_url();
     let http_client = Client::new();
-    let token =
-        crate::token_source::resolve_token_with_retry(&http_client, &config, Some(project)).await?;
+    let token = crate::token_source::resolve_token_with_retry(&http_client, &config).await?;
     let url = format!(
         "{}/api/v1/projects/{}/extensions/{}",
         backend_url, project, extension

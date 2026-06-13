@@ -40,9 +40,7 @@ pub async fn encrypt_command(config: &Config, plaintext: Option<String>) -> Resu
 
     let http_client = Client::new();
     let backend_url = config.get_backend_url();
-    // No project context: `rise encrypt` targets the global encrypt endpoint,
-    // so an external token (if any) stays on the legacy path.
-    let token = crate::token_source::resolve_token_with_retry(&http_client, config, None).await?;
+    let token = crate::token_source::resolve_token_with_retry(&http_client, config).await?;
     let url = format!("{}/api/v1/encrypt", backend_url);
 
     let response = http_client

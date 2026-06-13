@@ -39,15 +39,6 @@ pub trait TokenSource: Send + Sync {
 
     /// Short human label for diagnostics/tests.
     fn describe(&self) -> &'static str;
-
-    /// Whether this source produces an **external** OIDC token that must be
-    /// exchanged for a Rise access token before use (vs. a ready-to-use Rise
-    /// bearer sent as-is). Intent is carried by the input *channel*, never by
-    /// inspecting token contents: `RISE_TOKEN` and the stored login are bearers;
-    /// `RISE_TOKEN_COMMAND` and GitHub Actions OIDC are external tokens.
-    fn is_external_oidc(&self) -> bool {
-        false
-    }
 }
 
 /// Cheaply-cloneable handle threaded through the deployment path.
@@ -152,15 +143,10 @@ pub async fn token_with_retry(provider: &TokenProvider) -> Result<String> {
 }
 
 /// Resolve the configured token provider and then a bearer token with the
-/// shared retry policy. Use for one-shot backend requests. `project` scopes the
-/// token exchange (see [`resolve_token_provider`]); pass `None` for commands
-/// with no project context.
-pub async fn resolve_token_with_retry(
-    http: &reqwest::Client,
-    config: &Config,
-    project: Option<&str>,
-) -> Result<String> {
-    let provider = resolve_token_provider(http, config, project)?;
+/// shared retry policy. Use for one-shot backend requests. Exchange (when
+/// `RISE_IDENTITY` is set) is handled by [`resolve_token_provider`].
+pub async fn resolve_token_with_retry(http: &reqwest::Client, config: &Config) -> Result<String> {
+    let provider = resolve_token_provider(http, config)?;
     token_with_retry(&provider).await
 }
 
@@ -359,10 +345,6 @@ impl TokenSource for GithubActionsOidc {
     fn describe(&self) -> &'static str {
         "GitHub Actions OIDC"
     }
-
-    fn is_external_oidc(&self) -> bool {
-        true
-    }
 }
 
 /// Default TTL for opaque (non-JWT) tokens produced by `RISE_TOKEN_COMMAND`.
@@ -474,10 +456,6 @@ impl TokenSource for CommandToken {
     fn describe(&self) -> &'static str {
         "RISE_TOKEN_COMMAND"
     }
-
-    fn is_external_oidc(&self) -> bool {
-        true
-    }
 }
 
 /// RFC 8693 grant type / subject-token type for the auth token-exchange
@@ -491,14 +469,14 @@ const SUBJECT_TOKEN_TYPE_JWT: &str = "urn:ietf:params:oauth:token-type:jwt";
 /// the source issuer's JWKS, so allow more headroom than a local mint).
 const TOKEN_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Decorates an external-OIDC base [`TokenSource`] so its token is exchanged for
-/// a short-lived, Rise-signed access token at `POST /api/v1/auth/token` before
-/// use, scoped to a single project.
+/// Decorates a base [`TokenSource`] so its token is exchanged for a short-lived,
+/// Rise-signed access token at `POST /api/v1/auth/token` before use, assuming a
+/// given identity (a service account's email).
 ///
-/// Only sources that produce an external token are wrapped (see
-/// [`TokenSource::is_external_oidc`] and [`resolve_token_provider`]); a ready
-/// Rise bearer (`RISE_TOKEN`, stored login) is never wrapped, so this decorator
-/// always exchanges and never has to second-guess the token's contents.
+/// The wrap is applied by [`resolve_token_provider`] only when `RISE_IDENTITY` is
+/// set — the explicit, channel-agnostic signal that the caller wants to exchange
+/// its token (from any source) for that identity. So this decorator always
+/// exchanges and never inspects the token's contents.
 ///
 /// Nested freshness: the inner source owns its own OIDC mint/refresh cache, so
 /// the inner token is only re-minted when stale; the exchanged access token is
@@ -509,9 +487,9 @@ pub struct ExchangingTokenSource {
     http: reqwest::Client,
     /// Rise backend base URL — used to build the exchange endpoint URL.
     backend_url: String,
-    /// Target project; the access token is bound to it (SA exchange is
-    /// project-scoped).
-    project: String,
+    /// The identity to assume: a service account's synthetic-user email. The
+    /// minted access token is bound to that SA (and its project).
+    identity: String,
     cache: Mutex<Option<CachedToken>>,
 }
 
@@ -520,13 +498,13 @@ impl ExchangingTokenSource {
         inner: TokenProvider,
         http: reqwest::Client,
         backend_url: String,
-        project: String,
+        identity: String,
     ) -> Self {
         Self {
             inner,
             http,
             backend_url,
-            project,
+            identity,
             cache: Mutex::new(None),
         }
     }
@@ -554,7 +532,7 @@ impl ExchangingTokenSource {
         let response = self
             .http
             .post(&url)
-            .json(&build_exchange_body(subject_token, &self.project))
+            .json(&build_exchange_body(subject_token, &self.identity))
             .send()
             .await
             .map_err(|e| {
@@ -589,8 +567,9 @@ impl TokenSource for ExchangingTokenSource {
             }
         }
 
-        // The inner source is always an external-OIDC source (only those are
-        // wrapped), so its token is always exchanged — no content inspection.
+        // The wrap is only applied when an exchange was explicitly requested
+        // (RISE_IDENTITY set), so the inner token is always exchanged — no
+        // content inspection.
         let subject = self.inner.token().await?;
         let access = self.exchange(&subject).await?;
         let cached = CachedToken::new(access);
@@ -607,30 +586,30 @@ impl TokenSource for ExchangingTokenSource {
     }
 }
 
-/// Wrap an external-OIDC `inner` source so its token is exchanged for a Rise
-/// access token scoped to `project` before use. See [`ExchangingTokenSource`].
-/// Applied only to external sources by [`resolve_token_provider`].
+/// Wrap `inner` so its token is exchanged for a Rise access token assuming
+/// `identity` before use. See [`ExchangingTokenSource`]; applied by
+/// [`resolve_token_provider`] when `RISE_IDENTITY` is set.
 fn with_token_exchange(
     inner: TokenProvider,
     http: reqwest::Client,
     backend_url: String,
-    project: String,
+    identity: String,
 ) -> TokenProvider {
     Arc::new(ExchangingTokenSource::new(
         inner,
         http,
         backend_url,
-        project,
+        identity,
     ))
 }
 
 /// Build the RFC 8693 request body for the exchange endpoint.
-fn build_exchange_body(subject_token: &str, project: &str) -> serde_json::Value {
+fn build_exchange_body(subject_token: &str, identity: &str) -> serde_json::Value {
     serde_json::json!({
         "grant_type": GRANT_TYPE_TOKEN_EXCHANGE,
         "subject_token": subject_token,
         "subject_token_type": SUBJECT_TOKEN_TYPE_JWT,
-        "rise_project": project,
+        "identity": identity,
     })
 }
 
@@ -708,74 +687,82 @@ pub struct ProviderInputs {
     pub gha_request_token: Option<String>,
     pub audience: Option<String>,
     pub stored_token: Option<String>,
-    /// Resolved backend URL, used only to enrich the "no audience" error.
+    /// Resolved backend URL — enriches the "no audience" error and is the
+    /// exchange endpoint's base when `identity` is set.
     pub backend_url: String,
+    /// `RISE_IDENTITY`: the service-account identity (synthetic-user email) to
+    /// assume. When set, the selected token is exchanged for it; when unset, the
+    /// token is used as-is.
+    pub identity: Option<String>,
 }
 
-/// Pure precedence: pick a token source from already-resolved inputs.
+/// Pure precedence: pick a token source from already-resolved inputs, and — when
+/// `identity` is set — layer the token exchange on top (channel-agnostic).
 pub fn select_token_provider(
     http: &reqwest::Client,
     inputs: ProviderInputs,
 ) -> Result<TokenProvider> {
-    // 1. Explicit RISE_TOKEN wins (backward compatible).
-    if let Some(token) = inputs.rise_token.filter(|t| !t.is_empty()) {
-        return Ok(Arc::new(StaticToken::new(
-            token,
-            "RISE_TOKEN environment variable",
-        )));
-    }
-    // 2. Generic command escape hatch.
-    if let Some(cmd) = inputs.rise_token_command.filter(|c| !c.is_empty()) {
-        return Ok(Arc::new(CommandToken::new(
+    // Capture the exchange context before the precedence consumes `inputs`.
+    let identity = inputs.identity.clone().filter(|s| !s.trim().is_empty());
+    let backend_url = inputs.backend_url.clone();
+
+    let base: TokenProvider = if let Some(token) = inputs.rise_token.filter(|t| !t.is_empty()) {
+        // 1. Explicit RISE_TOKEN wins (backward compatible).
+        Arc::new(StaticToken::new(token, "RISE_TOKEN environment variable"))
+    } else if let Some(cmd) = inputs.rise_token_command.filter(|c| !c.is_empty()) {
+        // 2. Generic command escape hatch.
+        Arc::new(CommandToken::new(
             cmd,
             inputs.rise_token_command_ttl,
             inputs.rise_token_command_timeout,
-        )));
-    }
-    // 3. GitHub Actions OIDC auto-detection.
-    if let (Some(url), Some(req_token)) = (
+        ))
+    } else if let (Some(url), Some(req_token)) = (
         inputs.gha_request_url.filter(|s| !s.is_empty()),
         inputs.gha_request_token.filter(|s| !s.is_empty()),
     ) {
+        // 3. GitHub Actions OIDC auto-detection.
         let audience = inputs.audience.filter(|a| !a.is_empty()).ok_or_else(|| {
             anyhow!(
                 "GitHub Actions OIDC detected but no audience configured. \
                  Set RISE_GHA_AUDIENCE (recommended: the Rise server URL, e.g. {}).",
-                inputs.backend_url
+                backend_url
             )
         })?;
-        return Ok(Arc::new(GithubActionsOidc::new(
+        Arc::new(GithubActionsOidc::new(
             http.clone(),
             url,
             req_token,
             audience,
-        )));
-    }
-    // 4. Stored login token.
-    if let Some(token) = inputs.stored_token.filter(|t| !t.is_empty()) {
-        return Ok(Arc::new(StaticToken::new(token, "stored login token")));
-    }
-    // 5. Nothing.
-    Err(TokenSourceError::NoSource("Not authenticated. Run 'rise login' first.".to_string()).into())
+        ))
+    } else if let Some(token) = inputs.stored_token.filter(|t| !t.is_empty()) {
+        // 4. Stored login token.
+        Arc::new(StaticToken::new(token, "stored login token"))
+    } else {
+        // 5. Nothing.
+        return Err(TokenSourceError::NoSource(
+            "Not authenticated. Run 'rise login' first.".to_string(),
+        )
+        .into());
+    };
+
+    // `RISE_IDENTITY` set → exchange the resolved token for that identity,
+    // regardless of which source produced it. Unset → use the token as-is.
+    Ok(match identity {
+        Some(identity) => with_token_exchange(base, http.clone(), backend_url, identity),
+        None => base,
+    })
 }
 
 /// Read real env + config and build the token provider for a command.
 ///
 /// This is the single entry point every command uses to obtain a token source.
 /// It selects the base source by precedence (`RISE_TOKEN`, then
-/// `RISE_TOKEN_COMMAND`, then GitHub Actions OIDC, then the stored login). A
-/// source that produces an **external** OIDC token (`RISE_TOKEN_COMMAND`, GitHub
-/// Actions OIDC) is wrapped so its token is exchanged for a Rise access token,
-/// scoped to `project`; a ready Rise bearer (`RISE_TOKEN`, stored login) is used
-/// as-is. Intent comes from the input channel, not from inspecting the token.
-/// Pass `None` for commands with no project (login, team, project, whoami, …);
-/// without a project there is nothing to scope an exchange to, so the external
-/// token is used directly (the server's legacy path still federates it).
-pub fn resolve_token_provider(
-    http: &reqwest::Client,
-    config: &Config,
-    project: Option<&str>,
-) -> Result<TokenProvider> {
+/// `RISE_TOKEN_COMMAND`, then GitHub Actions OIDC, then the stored login). If
+/// `RISE_IDENTITY` is set, the selected token is exchanged for that identity (a
+/// service account, by email) regardless of source; otherwise it is used as-is.
+/// Exchange is thus explicit and channel-agnostic — never inferred from the
+/// token's contents.
+pub fn resolve_token_provider(http: &reqwest::Client, config: &Config) -> Result<TokenProvider> {
     let command_ttl_secs = std::env::var("RISE_TOKEN_COMMAND_TTL")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -796,20 +783,9 @@ pub fn resolve_token_provider(
         audience: std::env::var("RISE_GHA_AUDIENCE").ok(),
         stored_token: config.stored_token(),
         backend_url: config.get_backend_url(),
+        identity: std::env::var("RISE_IDENTITY").ok(),
     };
-    let base = select_token_provider(http, inputs)?;
-    // Only an external-OIDC source is exchanged, and only when scoped to a
-    // project. A ready Rise bearer (or any source on a project-less command) is
-    // used as-is.
-    match project {
-        Some(project) if base.is_external_oidc() => Ok(with_token_exchange(
-            base,
-            http.clone(),
-            config.get_backend_url(),
-            project.to_string(),
-        )),
-        _ => Ok(base),
-    }
+    select_token_provider(http, inputs)
 }
 
 #[cfg(test)]
@@ -843,6 +819,7 @@ mod tests {
             audience: None,
             stored_token: None,
             backend_url: "https://rise.example".to_string(),
+            identity: None,
         }
     }
 
@@ -1035,43 +1012,42 @@ mod tests {
     mod token_exchange {
         use super::*;
 
-        fn gha() -> reqwest::Client {
-            reqwest::Client::new()
-        }
-
-        #[test]
-        fn external_sources_are_marked_for_exchange() {
-            // RISE_TOKEN_COMMAND and GitHub Actions OIDC produce external tokens.
-            let cmd = CommandToken::new(
-                "echo oidc".into(),
-                Duration::from_secs(600),
-                Duration::from_secs(10),
-            );
-            assert!(cmd.is_external_oidc());
-            let gha =
-                GithubActionsOidc::new(gha(), "https://gha".into(), "rt".into(), "aud".into());
-            assert!(gha.is_external_oidc());
-        }
-
-        #[test]
-        fn bearer_sources_are_not_exchanged() {
-            // RISE_TOKEN and the stored login are ready Rise bearers.
-            assert!(
-                !StaticToken::new("tok".into(), "RISE_TOKEN environment variable")
-                    .is_external_oidc()
-            );
-            assert!(!StaticToken::new("tok".into(), "stored login token").is_external_oidc());
-        }
-
-        #[test]
-        fn rise_token_bearer_is_passed_through() {
-            // Regression (e2e-docker): RISE_TOKEN is a ready Rise bearer — the
-            // selected provider must not be flagged for exchange, regardless of
-            // the token's issuer vs. the CLI's backend URL.
+        #[tokio::test]
+        async fn no_identity_passes_token_through() {
+            // Regression (e2e-docker): with RISE_IDENTITY unset, the token is used
+            // as-is — no exchange, regardless of source or the token's contents.
             let mut inputs = base_inputs();
             inputs.rise_token = Some("a-rise-token".into());
             let provider = select_token_provider(&client(), inputs).unwrap();
-            assert!(!provider.is_external_oidc());
+            assert_eq!(provider.token().await.unwrap(), "a-rise-token");
+        }
+
+        #[tokio::test]
+        async fn identity_set_wraps_and_exchanges() {
+            // With RISE_IDENTITY set, the selected token is wrapped and exchanged
+            // (any source). Point at an unroutable backend: a wrapped provider
+            // tries the exchange and fails to reach it, rather than returning the
+            // bearer as-is.
+            let mut inputs = base_inputs();
+            inputs.rise_token = Some("a-rise-token".into());
+            inputs.identity = Some("demo+1@sa.rise.local".into());
+            inputs.backend_url = "http://127.0.0.1:1".into();
+            let provider = select_token_provider(&client(), inputs).unwrap();
+            let err = provider.token().await.unwrap_err();
+            assert!(
+                err.to_string().to_lowercase().contains("token exchange"),
+                "expected an exchange attempt, got: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn blank_identity_does_not_exchange() {
+            // A blank RISE_IDENTITY is treated as unset (no exchange).
+            let mut inputs = base_inputs();
+            inputs.rise_token = Some("a-rise-token".into());
+            inputs.identity = Some("   ".into());
+            let provider = select_token_provider(&client(), inputs).unwrap();
+            assert_eq!(provider.token().await.unwrap(), "a-rise-token");
         }
 
         #[test]
@@ -1080,9 +1056,9 @@ mod tests {
                 Arc::new(StaticToken::new("x".into(), "GitHub Actions OIDC"));
             let src = ExchangingTokenSource::new(
                 inner,
-                gha(),
+                client(),
                 "https://rise.example.com".to_string(),
-                "demo".to_string(),
+                "demo+1@sa.rise.local".to_string(),
             );
             assert_eq!(src.describe(), "GitHub Actions OIDC");
         }
@@ -1103,11 +1079,11 @@ mod tests {
 
         #[test]
         fn build_exchange_body_uses_rfc8693_fields() {
-            let body = build_exchange_body("the-subject", "my-project");
+            let body = build_exchange_body("the-subject", "demo+1@sa.rise.local");
             assert_eq!(body["grant_type"], GRANT_TYPE_TOKEN_EXCHANGE);
             assert_eq!(body["subject_token"], "the-subject");
             assert_eq!(body["subject_token_type"], SUBJECT_TOKEN_TYPE_JWT);
-            assert_eq!(body["rise_project"], "my-project");
+            assert_eq!(body["identity"], "demo+1@sa.rise.local");
         }
 
         #[test]

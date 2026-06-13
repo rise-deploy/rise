@@ -192,8 +192,7 @@ pub async fn list_deployments(
     group: Option<&str>,
     limit: usize,
 ) -> Result<()> {
-    let token =
-        crate::token_source::resolve_token_with_retry(http_client, config, Some(project)).await?;
+    let token = crate::token_source::resolve_token_with_retry(http_client, config).await?;
 
     if let Some(g) = group {
         info!(
@@ -402,9 +401,7 @@ pub async fn show_deployment(
         Ok(())
     } else {
         // One-shot display (no follow)
-        let token =
-            crate::token_source::resolve_token_with_retry(http_client, config, Some(project))
-                .await?;
+        let token = crate::token_source::resolve_token_with_retry(http_client, config).await?;
 
         let deployment =
             fetch_deployment(http_client, backend_url, &token, project, deployment_id).await?;
@@ -443,8 +440,7 @@ pub async fn stop_deployments_by_group(
     project: &str,
     group: &str,
 ) -> Result<()> {
-    let token =
-        crate::token_source::resolve_token_with_retry(http_client, config, Some(project)).await?;
+    let token = crate::token_source::resolve_token_with_retry(http_client, config).await?;
 
     info!(
         "Stopping deployments in group '{}' for project '{}'",
@@ -905,14 +901,10 @@ pub async fn create_deployment(
     // can outlast it. The provider lazily re-mints/refreshes a fresh token before
     // each request (see `token_source`). See issue #352.
     // `resolve_token_provider` layers the token exchange on top of the selected
-    // source, scoped to this project (see `token_source`): an external CI/SA
-    // OIDC token is exchanged for a short-lived Rise access token; a Rise
-    // session or opaque bearer passes through unchanged.
-    let provider = crate::token_source::resolve_token_provider(
-        http_client,
-        config,
-        Some(deploy_opts.project_name),
-    )?;
+    // source (see `token_source`): if `RISE_IDENTITY` is set, the token is
+    // exchanged for that service account's short-lived Rise access token;
+    // otherwise it is used as-is.
+    let provider = crate::token_source::resolve_token_provider(http_client, config)?;
     debug!("Authenticating to backend using {}", provider.describe());
     let token = token_with_retry(&provider).await?;
 

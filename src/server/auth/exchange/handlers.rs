@@ -11,7 +11,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as BASE64URL, Engine as _};
 
-use crate::db::{projects, service_accounts};
+use crate::db::{projects, service_accounts, users};
 use crate::server::auth::sa_match::{match_service_account, SaMatchError};
 use crate::server::rate_limit::extract_client_ip;
 use crate::server::state::AppState;
@@ -150,9 +150,15 @@ async fn exchange_inner(
     };
     let claims = verified.claims();
 
-    // 4 / 5. Resolve the principal.
-    let (sub, principal, audit) = if let Some(project_name) = req.rise_project.as_deref() {
-        resolve_service_account(state, project_name, &issuer, claims).await?
+    // 4 / 5. Resolve the principal. An `identity` selects a service account by
+    // its synthetic-user email; without one, this is a controller exchange.
+    let (sub, principal, audit) = if let Some(identity) = req
+        .identity
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        resolve_service_account(state, identity, &issuer, claims).await?
     } else {
         resolve_controller(state, &issuer, claims)?
     };
@@ -202,16 +208,91 @@ enum AuditSubject {
     Controller { identity_id: String },
 }
 
-/// Resolve a project service-account exchange (the `rise_project` is present).
+/// Resolve a project service-account exchange. `identity` is the SA's
+/// synthetic-user email — a *selector*: the subject token must still prove it
+/// is allowed to assume that SA (its `issuer_url` and expected claims must
+/// match the verified token). Every failure that depends on whether a given
+/// identity exists collapses to the same coarse `invalid_grant` so SA emails
+/// cannot be enumerated through this endpoint.
 async fn resolve_service_account(
     state: &AppState,
-    project_name: &str,
+    identity: &str,
     issuer: &str,
     claims: &serde_json::Value,
 ) -> Result<(String, PrincipalClaims, AuditSubject), ExchangeError> {
-    let project = match projects::find_by_name(&state.db_pool, project_name).await {
+    // The coarse, non-leaky rejection shared by every "this identity can't be
+    // assumed with this token" outcome (unknown email, not-an-SA, wrong issuer,
+    // claim mismatch). Must stay byte-identical so the cases are indistinguishable.
+    let reject = || ExchangeError::invalid_grant("subject_token could not be validated");
+
+    // identity (email) -> synthetic user.
+    let user = match users::find_by_email(&state.db_pool, identity).await {
+        Ok(Some(u)) => u,
+        Ok(None) => return Err(reject()),
+        Err(e) => {
+            tracing::error!("Token exchange: failed to look up identity user: {:?}", e);
+            return Err(ExchangeError::temporarily_unavailable(
+                "identity lookup failed",
+            ));
+        }
+    };
+
+    // synthetic user -> the (single, active) service account.
+    let sa = match service_accounts::find_active_by_user_id(&state.db_pool, user.id).await {
+        Ok(Some(sa)) => sa,
+        Ok(None) => return Err(reject()),
+        Err(e) => {
+            tracing::error!("Token exchange: failed to look up service account: {:?}", e);
+            return Err(ExchangeError::temporarily_unavailable(
+                "service account lookup failed",
+            ));
+        }
+    };
+
+    // SECURITY: the email lookup is not issuer-scoped (unlike the by-project
+    // query), so an SA configured to trust issuer A must not be assumable with a
+    // token from issuer B. Enforce the issuer match before validating claims.
+    if sa.issuer_url != issuer {
+        return Err(reject());
+    }
+
+    // Validate the token's claims against the SA (and reject controller tokens).
+    // The slice is single-element, so `Ambiguous` is unreachable, but it is
+    // handled defensively rather than via `unreachable!`.
+    match match_service_account(
+        claims,
+        issuer,
+        std::slice::from_ref(&sa),
+        &state.controllers_by_issuer,
+    ) {
+        Ok(_) => {}
+        Err(SaMatchError::MalformedClaims(sa_id)) => {
+            tracing::error!(
+                "Token exchange: malformed claims on service account {}",
+                sa_id
+            );
+            return Err(ExchangeError::temporarily_unavailable(
+                "service account claims configuration is invalid",
+            ));
+        }
+        // ControllerToken / NoMatch / Ambiguous(*) all fail closed and coarse.
+        Err(_) => return Err(reject()),
+    };
+
+    // SA -> project (for the principal's project_name).
+    let project = match projects::find_by_id(&state.db_pool, sa.project_id).await {
         Ok(Some(p)) => p,
-        Ok(None) => return Err(ExchangeError::invalid_target("unknown rise_project")),
+        // An active SA always has a project; a missing one is an invariant violation.
+        Ok(None) => {
+            tracing::error!(
+                "Token exchange: service account {} references missing project {}",
+                sa.id,
+                sa.project_id
+            );
+            return Err(ExchangeError::temporarily_unavailable(
+                "project lookup failed",
+            ));
+        }
         Err(e) => {
             tracing::error!("Token exchange: failed to look up project: {:?}", e);
             return Err(ExchangeError::temporarily_unavailable(
@@ -219,62 +300,6 @@ async fn resolve_service_account(
             ));
         }
     };
-
-    let service_accounts = match service_accounts::find_by_project_and_issuer(
-        &state.db_pool,
-        project.id,
-        issuer,
-    )
-    .await
-    {
-        Ok(sas) => sas,
-        Err(e) => {
-            tracing::error!(
-                "Token exchange: failed to look up service accounts: {:?}",
-                e
-            );
-            return Err(ExchangeError::temporarily_unavailable(
-                "service account lookup failed",
-            ));
-        }
-    };
-
-    let sa =
-        match match_service_account(
-            claims,
-            issuer,
-            &service_accounts,
-            &state.controllers_by_issuer,
-        ) {
-            Ok(sa) => sa,
-            Err(SaMatchError::ControllerToken) => {
-                return Err(ExchangeError::invalid_grant(
-                    "controller tokens cannot be exchanged as service accounts",
-                ))
-            }
-            Err(SaMatchError::AmbiguousController) => return Err(ExchangeError::invalid_grant(
-                "subject_token matched multiple controller identities (ambiguous configuration)",
-            )),
-            Err(SaMatchError::Ambiguous(_)) => {
-                return Err(ExchangeError::invalid_grant(
-                    "subject_token matched multiple service accounts (ambiguous configuration)",
-                ))
-            }
-            Err(SaMatchError::MalformedClaims(sa_id)) => {
-                tracing::error!(
-                    "Token exchange: malformed claims on service account {}",
-                    sa_id
-                );
-                return Err(ExchangeError::temporarily_unavailable(
-                    "service account claims configuration is invalid",
-                ));
-            }
-            Err(SaMatchError::NoMatch { .. }) => {
-                return Err(ExchangeError::invalid_grant(
-                    "subject_token could not be validated",
-                ))
-            }
-        };
 
     let principal = PrincipalClaims::ServiceAccount {
         service_account_id: sa.id,
@@ -294,17 +319,17 @@ async fn resolve_service_account(
     ))
 }
 
-/// Resolve a controller exchange (no `rise_project`).
+/// Resolve a controller exchange (no `identity` supplied).
 fn resolve_controller(
     state: &AppState,
     issuer: &str,
     claims: &serde_json::Value,
 ) -> Result<(String, PrincipalClaims, AuditSubject), ExchangeError> {
     let Some(candidates) = state.controllers_by_issuer.get(issuer) else {
-        // Issuer is a known SA issuer but no project was supplied and it is not a
+        // Issuer is a known SA issuer but no identity was supplied and it is not a
         // controller issuer — nothing to exchange.
         return Err(ExchangeError::invalid_grant(
-            "rise_project is required for this token",
+            "identity is required for this token",
         ));
     };
 

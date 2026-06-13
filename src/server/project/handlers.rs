@@ -15,6 +15,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use rise_backend_auth::PrincipalClaims;
 use uuid::Uuid;
 
 /// Validate that a URL uses only http or https schemes.
@@ -285,6 +286,21 @@ pub async fn list_projects(
     State(state): State<AppState>,
     auth: AuthContext,
 ) -> Result<Json<Vec<ApiProject>>, ServerError> {
+    // A service-account access token is bound to a single project and carries the
+    // principal, so it needs no user context: return just that project (or an
+    // empty list if it has since gone away).
+    if let Some(PrincipalClaims::ServiceAccount { project_id, .. }) =
+        auth.access_claims().map(|c| &c.principal)
+    {
+        let projects = projects::find_by_id(&state.db_pool, *project_id)
+            .await
+            .internal_err("Failed to look up service account project")?
+            .into_iter()
+            .collect();
+        let api_projects = projects_to_api(&state, projects).await?;
+        return Ok(Json(api_projects));
+    }
+
     let user = auth.user()?;
     // Admins can see all projects, others only see projects they have access to
     let projects = if state.is_admin(&user.email) {

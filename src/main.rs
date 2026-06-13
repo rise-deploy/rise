@@ -1087,12 +1087,8 @@ async fn main() -> Result<()> {
                     | AppUserCommands::List { project, path } => (project, path),
                 };
                 let project_name = resolve_project_name(project.clone(), path)?;
-                let token = cli::token_source::resolve_token_with_retry(
-                    &http_client,
-                    &config,
-                    Some(&project_name),
-                )
-                .await?;
+                let token =
+                    cli::token_source::resolve_token_with_retry(&http_client, &config).await?;
                 match app_user_cmd {
                     AppUserCommands::Add { identifier, .. } => {
                         cli::project::add_app_user(
@@ -1488,12 +1484,8 @@ async fn main() -> Result<()> {
                 level,
             } => {
                 let project_name = resolve_project_name(project.clone(), path)?;
-                let token = cli::token_source::resolve_token_with_retry(
-                    &http_client,
-                    &config,
-                    Some(&project_name),
-                )
-                .await?;
+                let token =
+                    cli::token_source::resolve_token_with_retry(&http_client, &config).await?;
                 deployment::get_logs(
                     &http_client,
                     &backend_url,
@@ -1616,12 +1608,7 @@ async fn main() -> Result<()> {
                 | EnvCommands::ShowDeployment { project, path, .. } => (project, path),
             };
             let project_name = resolve_project_name(project.clone(), path)?;
-            let token = cli::token_source::resolve_token_with_retry(
-                &http_client,
-                &config,
-                Some(&project_name),
-            )
-            .await?;
+            let token = cli::token_source::resolve_token_with_retry(&http_client, &config).await?;
             match env_cmd {
                 EnvCommands::Set {
                     key,
@@ -1734,12 +1721,7 @@ async fn main() -> Result<()> {
                 | DomainCommands::Remove { project, path, .. } => (project, path),
             };
             let project_name = resolve_project_name(project.clone(), path)?;
-            let token = cli::token_source::resolve_token_with_retry(
-                &http_client,
-                &config,
-                Some(&project_name),
-            )
-            .await?;
+            let token = cli::token_source::resolve_token_with_retry(&http_client, &config).await?;
             match domain_cmd {
                 DomainCommands::Add {
                     domain,

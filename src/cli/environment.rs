@@ -66,9 +66,7 @@ pub async fn handle_environment_command(
         | crate::EnvironmentCommands::Delete { project, path, .. } => (project, path),
     };
     let project_name = crate::resolve_project_name(project.clone(), path)?;
-    let token =
-        crate::token_source::resolve_token_with_retry(http_client, config, Some(&project_name))
-            .await?;
+    let token = crate::token_source::resolve_token_with_retry(http_client, config).await?;
 
     match cmd {
         crate::EnvironmentCommands::Create {
