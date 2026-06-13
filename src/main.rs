@@ -1079,8 +1079,8 @@ async fn main() -> Result<()> {
                 project::delete_project(&http_client, &backend_url, &config, &project_name).await?;
             }
             ProjectCommands::AppUser(app_user_cmd) => {
-                // App-user management is project-scoped; resolve the project up
-                // front so the token exchange can be scoped to it.
+                // App-user management is project-scoped; resolve the project once
+                // up front, since every subcommand below targets it.
                 let (project, path) = match app_user_cmd {
                     AppUserCommands::Add { project, path, .. }
                     | AppUserCommands::Remove { project, path, .. }
@@ -1596,8 +1596,8 @@ async fn main() -> Result<()> {
                 .await?;
         }
         Commands::Env(env_cmd) => {
-            // Env-var management is project-scoped; resolve the project up front
-            // so the token exchange can be scoped to it.
+            // Env-var management is project-scoped; resolve the project once up
+            // front, since every subcommand below targets it.
             let (project, path) = match env_cmd {
                 EnvCommands::Set { project, path, .. }
                 | EnvCommands::List { project, path, .. }
@@ -1713,8 +1713,8 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Domain(domain_cmd) => {
-            // Custom-domain management is project-scoped; resolve the project up
-            // front so the token exchange can be scoped to it.
+            // Custom-domain management is project-scoped; resolve the project once
+            // up front, since every subcommand below targets it.
             let (project, path) = match domain_cmd {
                 DomainCommands::Add { project, path, .. }
                 | DomainCommands::List { project, path }

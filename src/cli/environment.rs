@@ -56,8 +56,7 @@ pub async fn handle_environment_command(
     config: &Config,
     cmd: &crate::EnvironmentCommands,
 ) -> Result<()> {
-    // Every subcommand targets a project; resolve it up front so the token
-    // exchange can be scoped to it.
+    // Every subcommand targets a project; resolve it once up front and reuse it.
     let (project, path) = match cmd {
         crate::EnvironmentCommands::Create { project, path, .. }
         | crate::EnvironmentCommands::List { project, path }

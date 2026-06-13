@@ -354,10 +354,11 @@ const COMMAND_TOKEN_TTL_DEFAULT_SECS: u64 = 10 * 60;
 /// Overridable via `RISE_TOKEN_COMMAND_TIMEOUT` (seconds).
 const COMMAND_TOKEN_TIMEOUT_DEFAULT_SECS: u64 = 10;
 
-/// Runs a user-supplied shell command and uses its trimmed stdout as an
-/// **external OIDC token**, exchanged for a Rise access token before use (see
-/// [`ExchangingTokenSource`]). Generic escape hatch for any CI / identity system
-/// that can print an OIDC token (GitLab `CI_JOB_JWT`, Vault, etc.).
+/// Runs a user-supplied shell command and uses its trimmed stdout as the bearer
+/// token. Generic escape hatch for any CI / identity system. Intended to print
+/// an **external OIDC token**: when `RISE_IDENTITY` is set the output is exchanged
+/// for a Rise access token (see [`ExchangingTokenSource`]); otherwise it is sent
+/// as-is (the legacy raw-token path).
 ///
 /// If the command outputs a JWT, its `exp` claim governs freshness. For opaque
 /// tokens (no decodable `exp`), the command is re-run before `ttl` elapses
