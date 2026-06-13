@@ -1,6 +1,6 @@
 //! RFC 8693 token-exchange handler.
 //!
-//! Exchanges an external OIDC subject token (+ optional Rise project) for a
+//! Exchanges an external OIDC subject token (+ optional Rise identity) for a
 //! short-lived, Rise-signed **access token** that fully encodes the resolved
 //! principal. This is the single place an external CI identity (`iss` + `sub`)
 //! maps to a Rise principal, so every successful mint is audit-logged.
@@ -158,7 +158,14 @@ async fn exchange_inner(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        resolve_service_account(state, identity, &issuer, claims).await?
+        resolve_service_account(
+            &state.db_pool,
+            &state.controllers_by_issuer,
+            identity,
+            &issuer,
+            claims,
+        )
+        .await?
     } else {
         resolve_controller(state, &issuer, claims)?
     };
@@ -203,6 +210,7 @@ async fn exchange_inner(
 }
 
 /// What the audit log records about a successful mint.
+#[derive(Debug)]
 enum AuditSubject {
     ServiceAccount { sa_id: uuid::Uuid, project: String },
     Controller { identity_id: String },
@@ -215,7 +223,11 @@ enum AuditSubject {
 /// identity exists collapses to the same coarse `invalid_grant` so SA emails
 /// cannot be enumerated through this endpoint.
 async fn resolve_service_account(
-    state: &AppState,
+    pool: &sqlx::PgPool,
+    controllers_by_issuer: &std::collections::HashMap<
+        String,
+        Vec<crate::server::auth::controller::ControllerIdentity>,
+    >,
     identity: &str,
     issuer: &str,
     claims: &serde_json::Value,
@@ -226,7 +238,7 @@ async fn resolve_service_account(
     let reject = || ExchangeError::invalid_grant("subject_token could not be validated");
 
     // identity (email) -> synthetic user.
-    let user = match users::find_by_email(&state.db_pool, identity).await {
+    let user = match users::find_by_email(pool, identity).await {
         Ok(Some(u)) => u,
         Ok(None) => return Err(reject()),
         Err(e) => {
@@ -238,7 +250,7 @@ async fn resolve_service_account(
     };
 
     // synthetic user -> the (single, active) service account.
-    let sa = match service_accounts::find_active_by_user_id(&state.db_pool, user.id).await {
+    let sa = match service_accounts::find_active_by_user_id(pool, user.id).await {
         Ok(Some(sa)) => sa,
         Ok(None) => return Err(reject()),
         Err(e) => {
@@ -263,7 +275,7 @@ async fn resolve_service_account(
         claims,
         issuer,
         std::slice::from_ref(&sa),
-        &state.controllers_by_issuer,
+        controllers_by_issuer,
     ) {
         Ok(_) => {}
         Err(SaMatchError::MalformedClaims(sa_id)) => {
@@ -280,7 +292,7 @@ async fn resolve_service_account(
     };
 
     // SA -> project (for the principal's project_name).
-    let project = match projects::find_by_id(&state.db_pool, sa.project_id).await {
+    let project = match projects::find_by_id(pool, sa.project_id).await {
         Ok(Some(p)) => p,
         // An active SA always has a project; a missing one is an invariant violation.
         Ok(None) => {
@@ -382,5 +394,105 @@ mod tests {
         assert_eq!(peek_issuer("not-a-jwt"), None);
         // Two segments only.
         assert_eq!(peek_issuer("a.b"), None);
+    }
+
+    mod resolve_by_identity {
+        use super::*;
+        use crate::db::models::ProjectStatus;
+        use crate::db::{projects, service_accounts, users};
+        use std::collections::HashMap;
+
+        /// Create a project + SA trusting `issuer` with `sub`-matching claims;
+        /// return `(sa_id, project_id, the SA's synthetic-user email)`.
+        async fn setup(pool: &sqlx::PgPool, issuer: &str) -> (uuid::Uuid, uuid::Uuid, String) {
+            let owner = users::create(pool, "owner@example.com").await.unwrap();
+            let project = projects::create(
+                pool,
+                "demo",
+                ProjectStatus::Stopped,
+                "public".to_string(),
+                Some(owner.id),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let claims = HashMap::from([("sub".to_string(), "deploy-bot".to_string())]);
+            let sa = service_accounts::create(pool, project.id, issuer, &claims)
+                .await
+                .unwrap();
+            let email = users::find_by_id(pool, sa.user_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .email;
+            (sa.id, project.id, email)
+        }
+
+        fn is_invalid_grant(err: &ExchangeError) -> bool {
+            matches!(
+                err,
+                ExchangeError::OAuth {
+                    error: "invalid_grant",
+                    ..
+                }
+            )
+        }
+
+        #[sqlx::test]
+        async fn succeeds_for_matching_issuer_and_claims(pool: sqlx::PgPool) {
+            let (sa_id, project_id, email) = setup(&pool, "https://gitlab.com").await;
+            let token_claims =
+                serde_json::json!({ "sub": "deploy-bot", "iss": "https://gitlab.com" });
+            let (sub, principal, _audit) = resolve_service_account(
+                &pool,
+                &HashMap::new(),
+                &email,
+                "https://gitlab.com",
+                &token_claims,
+            )
+            .await
+            .unwrap();
+            assert_eq!(sub, format!("rise:sa:{sa_id}"));
+            match principal {
+                PrincipalClaims::ServiceAccount { project_id: p, .. } => assert_eq!(p, project_id),
+                _ => panic!("expected SA principal"),
+            }
+        }
+
+        #[sqlx::test]
+        async fn rejects_issuer_mismatch(pool: sqlx::PgPool) {
+            // The SA trusts gitlab; a token from another issuer must not assume it
+            // even though the claims match (the security guard the email lookup
+            // needs, since it isn't issuer-scoped).
+            let (_sa, _proj, email) = setup(&pool, "https://gitlab.com").await;
+            let token_claims =
+                serde_json::json!({ "sub": "deploy-bot", "iss": "https://evil.example" });
+            let err = resolve_service_account(
+                &pool,
+                &HashMap::new(),
+                &email,
+                "https://evil.example",
+                &token_claims,
+            )
+            .await
+            .unwrap_err();
+            assert!(is_invalid_grant(&err));
+        }
+
+        #[sqlx::test]
+        async fn rejects_unknown_identity(pool: sqlx::PgPool) {
+            let token_claims = serde_json::json!({ "sub": "x", "iss": "https://gitlab.com" });
+            let err = resolve_service_account(
+                &pool,
+                &HashMap::new(),
+                "nobody+0@sa.rise.local",
+                "https://gitlab.com",
+                &token_claims,
+            )
+            .await
+            .unwrap_err();
+            assert!(is_invalid_grant(&err));
+        }
     }
 }
