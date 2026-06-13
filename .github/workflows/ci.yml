@@ -942,6 +942,24 @@ jobs:
           RISE_IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
         run: bash scripts/ci/e2e-docker.sh
 
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      # Typed cross-backend harness (crate rise-e2e). It stands up its own
+      # self-contained compose stack, so it runs after — and independently of —
+      # the bash smoke tests above. Gated on RISE_E2E_BACKEND; serial because it
+      # owns a single shared stack.
+      - name: Run Rust e2e harness (docker backend)
+        env:
+          RISE_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          RISE_IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
+          RISE_E2E_BACKEND: docker
+          SQLX_OFFLINE: "true"
+        run: cargo test -p rise-e2e -- --nocapture --test-threads=1
+
   e2e-minikube-jfrog-vault:
     name: Minikube JFrog/Vault deploy smoke tests
     runs-on: ubuntu-latest
