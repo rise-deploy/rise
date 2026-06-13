@@ -614,6 +614,19 @@ Listed so they don't fall out of the plan; not currently sequenced.
   `rise-backend-auth` and `rise-resource-api`.** Both crates currently
   carry their own validation logic; consolidate into one shared validator
   to prevent drift.
+- [ ] **Reserve the SA synthetic-email namespace (`@sa.rise.local`).**
+  Service-account synthetic users and human users share the `users.email`
+  unique column with no type discriminator, and `service_accounts::create`
+  reuses an existing user row by email. A human user provisioned (via OIDC)
+  with an `@sa.rise.local` address could therefore collide with an SA's
+  synthetic identity. Not exploitable through the token exchange today (it
+  only ever mints an `AccessClaims::ServiceAccount`, still gated by the SA's
+  issuer + claims, and `RISE_IDENTITY` resolution rejects any email with no
+  active SA), and not introduced by Phase 2 — but the namespace overlap is a
+  latent hygiene gap. Fix by rejecting human registrations into the
+  `@sa.rise.local` domain (and/or adding a `users.kind` discriminator that
+  `find_by_email`/`find_active_by_user_id` filter on). Surfaced by the PR #389
+  review.
 - [ ] **Overlapping previous-key verification window for HS256 rotation.**
   Today the symmetric secret is shared by sessions and access tokens, so
   rotating invalidates everything live at once. Preferred posture is
