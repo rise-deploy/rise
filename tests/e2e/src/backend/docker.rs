@@ -1,5 +1,5 @@
-//! Docker-backend driver: a self-contained compose stack. Ports the bring-up,
-//! CLI extraction, Traefik reach, and teardown from `scripts/ci/e2e-docker.sh`.
+//! Docker-backend driver: a self-contained compose stack handling bring-up, CLI
+//! extraction, Traefik reach, and teardown.
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -12,7 +12,7 @@ use crate::dex::DexEndpoint;
 use crate::http::{self, HttpResponse};
 use crate::token;
 
-// Matches config/docker.yaml + the standalone.local overlay (see e2e-docker.sh).
+// Matches config/docker.yaml + the docker-compose.standalone.local.yaml overlay.
 const SECRET_B64: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 const PUBLIC_URL: &str = "http://rise.localhost:3000";
 const RISE_URL: &str = "http://localhost:3000";

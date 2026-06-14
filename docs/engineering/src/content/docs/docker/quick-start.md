@@ -4,8 +4,8 @@ title: "Quick start"
 
 ## Quick start (local HTTP overlay)
 
-This is the fastest way to try the backend and is exactly what the e2e test
-(`scripts/ci/e2e-docker.sh`) runs. No `RISE_DOMAIN` / `ACME_EMAIL` needed.
+This is the fastest way to try the backend and is exactly what the e2e harness
+(`tests/e2e`, docker backend) runs. No `RISE_DOMAIN` / `ACME_EMAIL` needed.
 
 ```bash
 docker compose -f docker-compose.standalone.yaml \

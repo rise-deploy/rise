@@ -914,40 +914,10 @@ jobs:
       - name: Run e2e build tests (with proxy)
         run: RISE_BIN=./target/release/rise bash tests/e2e-build/run.sh --only-proxy
 
-  e2e-minikube:
-    name: Minikube end-to-end smoke tests
-    runs-on: ubuntu-latest
-    if: (github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && needs.prepare.outputs.is_trusted_pr == 'true')
-    needs:
-      - prepare
-      - package-image
-      - package-helm
-    permissions:
-      contents: read
-      packages: read
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Setup mise
-        uses: jdx/mise-action@v4
-        with:
-          cache: true
-          experimental: true
-
-      - name: Install mise tools
-        run: mise use -g minikube kubectl helm
-
-      - name: Start Minikube and run smoke tests
-        env:
-          RISE_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          RISE_IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
-        run: bash scripts/ci/e2e-minikube.sh
-
   # Typed cross-backend harness (crate rise-e2e) on Kubernetes: it self-provisions
   # its own minikube cluster + Helm release (default oci-client-auth mode) and runs
-  # the same scenarios as the Docker harness. Runs alongside the bash job above
-  # until the harness reaches parity and the bash script is retired.
+  # the same scenarios as the Docker harness. Replaces the former bash
+  # `e2e-minikube` smoke job.
   e2e-minikube-harness:
     name: Minikube end-to-end (rise-e2e harness)
     runs-on: ubuntu-latest
@@ -994,7 +964,7 @@ jobs:
         run: cargo test --manifest-path tests/e2e/Cargo.toml -- --nocapture --test-threads=1
 
   e2e-docker:
-    name: Docker backend end-to-end smoke tests
+    name: Docker backend end-to-end (rise-e2e harness)
     runs-on: ubuntu-latest
     if: (github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && needs.prepare.outputs.is_trusted_pr == 'true')
     needs:
@@ -1014,22 +984,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Run Docker backend e2e smoke tests
-        env:
-          RISE_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          RISE_IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
-        run: bash scripts/ci/e2e-docker.sh
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
-      # Typed cross-backend harness (crate rise-e2e). It stands up its own
-      # self-contained compose stack, so it runs after — and independently of —
-      # the bash smoke tests above. Gated on RISE_E2E_BACKEND; serial because it
-      # owns a single shared stack.
+      # Typed cross-backend harness (crate rise-e2e): self-provisions its own
+      # compose stack and runs every Docker scenario (public deploy, SA token
+      # exchange, private/forwardAuth, health-rolling cutover, workload identity).
+      # Replaces the former bash `e2e-docker.sh` smoke suite.
       - name: Run Rust e2e harness (docker backend)
         env:
           RISE_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
@@ -1038,49 +1002,10 @@ jobs:
           SQLX_OFFLINE: "true"
         run: cargo test --manifest-path tests/e2e/Cargo.toml -- --nocapture --test-threads=1
 
-  e2e-minikube-jfrog-vault:
-    name: Minikube JFrog/Vault deploy smoke tests
-    runs-on: ubuntu-latest
-    if: (github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && needs.prepare.outputs.is_trusted_pr == 'true')
-    needs:
-      - prepare
-      - package-image
-      - package-helm
-    permissions:
-      contents: read
-      packages: read
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Setup mise
-        uses: jdx/mise-action@v4
-        with:
-          cache: true
-          experimental: true
-
-      - name: Install mise tools
-        run: mise use -g minikube kubectl helm
-
-      - name: Start Minikube and run JFrog/Vault deploy tests
-        env:
-          RISE_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          RISE_CLI_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.BUILDER_IMAGE_NAME }}
-          RISE_IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
-          RISE_E2E_REGISTRY_MODE: jfrog-vault
-        run: bash scripts/ci/e2e-minikube.sh
-
-      - name: Upload JFrog/Vault service logs
-        if: always()
-        uses: actions/upload-artifact@v5
-        with:
-          name: jfrog-vault-service-logs-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .rise-e2e-artifacts/jfrog-vault
-          if-no-files-found: ignore
-
   # rise-e2e harness in jfrog-vault mode: self-provisions JFrog + Vault + a minikube
   # cluster whose registry pulls from JFrog, then runs the workload-identity scenario
-  # (which builds the fixture from source). Runs alongside the bash job until parity.
+  # (which builds the fixture from source). Replaces the former bash
+  # `e2e-minikube-jfrog-vault` smoke job.
   e2e-minikube-harness-jfrog-vault:
     name: Minikube JFrog/Vault (rise-e2e harness)
     runs-on: ubuntu-latest
