@@ -4,7 +4,7 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::{Backend, BackendKind, CliAuth, SampleApp};
 use crate::cli::{self, CliOutput};
@@ -234,6 +234,29 @@ impl Backend for DockerBackend {
             },
         )?;
         Ok(resp)
+    }
+
+    fn poll_app(
+        &self,
+        project: &str,
+        path: &str,
+        duration: Duration,
+        interval: Duration,
+        check: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<bool> {
+        // Traefik routes by Host; no port-forward to hold.
+        let host = self.app_host(project);
+        let url = format!("{TRAEFIK_URL}{path}");
+        let start = Instant::now();
+        while start.elapsed() < duration {
+            if let Ok(r) = http::get(&url, Some(&host)) {
+                if r.status == 200 && check(&r.body) {
+                    return Ok(true);
+                }
+            }
+            std::thread::sleep(interval);
+        }
+        Ok(false)
     }
 
     fn dex(&self) -> Option<&DexEndpoint> {

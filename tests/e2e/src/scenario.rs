@@ -602,34 +602,32 @@ impl Scenario for WorkloadIdentity {
             resp.body
         );
 
-        // Prove the controller re-mints the file token in place: poll until a new,
-        // still-valid jti appears (short identity_token_ttl_seconds in values-ci).
+        // Prove the controller re-mints the file token in place: hold one route
+        // open and sample until a new, still-valid jti appears. The window must
+        // comfortably exceed the kubelet projected-volume refresh lag (the token
+        // TTL is short — identity_token_ttl_seconds in values-ci); poll_app exits
+        // as soon as it observes the rotation.
         let first_jti = id["file_token"]["claims"]["jti"]
             .as_str()
             .context("file token has no jti")?
             .to_string();
-        let mut refreshed = false;
-        for _ in 0..36 {
-            std::thread::sleep(std::time::Duration::from_secs(5));
-            let Some(r) = b.reach_app(&project, "/identity?file=e2e")? else {
-                continue;
-            };
-            let Ok(j) = serde_json::from_str::<serde_json::Value>(&r.body) else {
-                continue;
-            };
-            let cur = j["file_token"]["claims"]["jti"].as_str().unwrap_or("");
-            if !cur.is_empty() && cur != first_jti {
-                anyhow::ensure!(
-                    j["file_token"]["signature_valid"] == serde_json::json!(true),
-                    "token rotated (jti={cur}) but signature invalid"
-                );
-                refreshed = true;
-                break;
-            }
-        }
+        let refreshed = b.poll_app(
+            &project,
+            "/identity?file=e2e",
+            std::time::Duration::from_secs(240),
+            std::time::Duration::from_secs(5),
+            &mut |body| {
+                serde_json::from_str::<serde_json::Value>(body).is_ok_and(|j| {
+                    let cur = j["file_token"]["claims"]["jti"].as_str().unwrap_or("");
+                    !cur.is_empty()
+                        && cur != first_jti
+                        && j["file_token"]["signature_valid"] == serde_json::json!(true)
+                })
+            },
+        )?;
         anyhow::ensure!(
             refreshed,
-            "file token did not refresh (jti stayed {first_jti})"
+            "file token did not refresh within the window (jti stayed {first_jti})"
         );
         Ok(())
     }

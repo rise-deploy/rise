@@ -59,6 +59,19 @@ pub trait Backend {
     /// logs, never silent drift.
     fn reach_app(&self, project: &str, path: &str) -> Result<Option<HttpResponse>>;
 
+    /// Reach the app repeatedly through the ingress, holding ONE route open for the
+    /// whole call (no per-sample port-forward churn), invoking `check(body)` on each
+    /// 200 every `interval` until it passes or `duration` elapses. Returns whether
+    /// it passed. Used for the workload-identity jti-refresh observation.
+    fn poll_app(
+        &self,
+        project: &str,
+        path: &str,
+        duration: Duration,
+        interval: Duration,
+        check: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<bool>;
+
     /// The test Dex reachable from the harness, when this backend exposes one.
     fn dex(&self) -> Option<&DexEndpoint>;
 

@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::{Backend, BackendKind, CliAuth, SampleApp};
 use crate::cli::{self, CliOutput};
@@ -552,6 +552,37 @@ impl Backend for MinikubeBackend {
             },
         )?;
         Ok(resp)
+    }
+
+    fn poll_app(
+        &self,
+        project: &str,
+        path: &str,
+        duration: Duration,
+        interval: Duration,
+        check: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<bool> {
+        // Hold ONE port-forward open for the whole window (dense, reliable sampling
+        // — no per-sample forward churn).
+        let ns = format!("rise-{project}");
+        let (svc, port) = self.find_app_svc(&ns)?;
+        let _pf = PortForward::spawn(
+            &ns,
+            &format!("svc/{svc}"),
+            &format!("{APP_LOCAL_PORT}:{port}"),
+            &format!("app {project}"),
+        )?;
+        let url = format!("http://127.0.0.1:{APP_LOCAL_PORT}{path}");
+        let start = Instant::now();
+        while start.elapsed() < duration {
+            if let Ok(r) = http::get(&url, None) {
+                if r.status == 200 && check(&r.body) {
+                    return Ok(true);
+                }
+            }
+            std::thread::sleep(interval);
+        }
+        Ok(false)
     }
 
     fn dex(&self) -> Option<&DexEndpoint> {
