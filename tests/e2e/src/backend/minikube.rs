@@ -364,4 +364,30 @@ impl Backend for MinikubeBackend {
             body_marker: Some("nginx"),
         }
     }
+
+    fn api_base(&self) -> &str {
+        RISE_URL
+    }
+
+    fn ci_bearer(&self) -> &str {
+        &self.ci_token
+    }
+
+    fn wait_workload_removed(&self, project: &str) -> Result<()> {
+        // Stronger than the default: the app namespace must have zero pods, which
+        // proves a post-stop /logs query is served by Loki, not live kubelet.
+        let ns = format!("rise-{project}");
+        http::poll(
+            Duration::from_secs(120),
+            Duration::from_secs(2),
+            &format!("app pods in {ns} to be removed"),
+            || {
+                let mut c = Command::new("kubectl");
+                c.args(["get", "pods", "-n", &ns, "--no-headers"]);
+                let out = cli::run(c)?;
+                // `kubectl` prints "No resources found" to stderr; stdout is empty.
+                Ok(out.stdout.trim().is_empty())
+            },
+        )
+    }
 }

@@ -206,4 +206,12 @@ impl Backend for DockerBackend {
             body_marker: Some("Hostname:"),
         }
     }
+
+    fn api_base(&self) -> &str {
+        RISE_URL
+    }
+
+    fn ci_bearer(&self) -> &str {
+        &self.ci_token
+    }
 }

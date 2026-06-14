@@ -21,10 +21,14 @@ pub trait Scenario {
     fn run(&self, b: &dyn Backend) -> Result<()>;
 }
 
-/// The scenarios in this increment. Workload-identity, health-rolling cutover,
-/// private/forwardAuth and Loki retention are tracked as follow-ups (ROADMAP).
+/// The scenarios the harness runs. Workload-identity, health-rolling cutover and
+/// private/forwardAuth are tracked as follow-ups (ROADMAP).
 pub fn all() -> Vec<Box<dyn Scenario>> {
-    vec![Box::new(PublicDeploy), Box::new(SaTokenExchange)]
+    vec![
+        Box::new(PublicDeploy),
+        Box::new(SaTokenExchange),
+        Box::new(LokiLogRetention),
+    ]
 }
 
 /// Run every scenario applicable to `b`, printing RUN/PASS/FAIL/SKIP lines, and
@@ -249,6 +253,167 @@ impl Scenario for SaTokenExchange {
             !raw.success(),
             "expected the un-exchanged external token to be rejected, but it succeeded:\n{}",
             raw.combined()
+        );
+        Ok(())
+    }
+}
+
+// ---- (d) Loki log retention -----------------------------------------------
+
+struct LokiLogRetention;
+
+impl Scenario for LokiLogRetention {
+    fn id(&self) -> &'static str {
+        "loki-log-retention"
+    }
+
+    fn applies_to(&self, kind: BackendKind) -> Applicability {
+        match kind {
+            BackendKind::Minikube => Applicability::Run,
+            BackendKind::Docker => {
+                Applicability::Skip("the docker compose stack has no Loki log backend")
+            }
+        }
+    }
+
+    fn run(&self, b: &dyn Backend) -> Result<()> {
+        let project = unique("e2e-loki");
+        let app = b.sample_app();
+        expect_ok(
+            b.rise_cli(
+                &[
+                    "project",
+                    "create",
+                    &project,
+                    "--access-class",
+                    "public",
+                    "--no-rise-toml",
+                ],
+                None,
+            )?,
+            "project create",
+        )?;
+        expect_ok(
+            b.rise_cli(
+                &[
+                    "deploy",
+                    "--project",
+                    &project,
+                    "--image",
+                    app.image,
+                    "--http-port",
+                    app.http_port,
+                    "--replicas",
+                    "1",
+                ],
+                None,
+            )?,
+            "deploy",
+        )?;
+        b.wait_healthy(&project)?;
+        // Generate an access-log line, then give the log agent a window to scrape
+        // before the pod is removed.
+        let _ = b.reach_app(&project, "/")?;
+        std::thread::sleep(std::time::Duration::from_secs(5));
+
+        // Resolve the latest deployment id via the API.
+        let deployments = b.api_get(&format!("/api/v1/projects/{project}/deployments"))?;
+        anyhow::ensure!(
+            deployments.status == 200,
+            "deployments API returned {} :\n{}",
+            deployments.status,
+            deployments.body
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&deployments.body).context("parse deployments response")?;
+        let deployment_id = parsed
+            .get(0)
+            .and_then(|d| d.get("deployment_id"))
+            .and_then(|v| v.as_str())
+            .context("no deployment_id in deployments response")?
+            .to_string();
+
+        // Stop the deployment and wait for the workload to actually be gone — with
+        // the pod removed, logs can only come from Loki (not live kubelet).
+        expect_ok(
+            b.rise_cli(
+                &[
+                    "deployment",
+                    "stop",
+                    "--project",
+                    &project,
+                    "--group",
+                    "default",
+                ],
+                None,
+            )?,
+            "deployment stop",
+        )?;
+        b.wait_workload_removed(&project)?;
+
+        // Query the log-volume API over a window around now; retry while Loki
+        // finishes ingesting.
+        let now = chrono::Utc::now();
+        let start = (now - chrono::Duration::minutes(10))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let end =
+            (now + chrono::Duration::minutes(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let volume_path = format!(
+            "/api/v1/projects/{project}/deployments/{deployment_id}/logs/volume\
+             ?start={start}&end={end}&step_seconds=60"
+        );
+        let mut total: i64 = 0;
+        let mut levels: usize = 0;
+        let mut last = String::new();
+        for _ in 0..30 {
+            let resp = b.api_get(&volume_path)?;
+            last = resp.body.clone();
+            if resp.status == 200 {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp.body) {
+                    let buckets = v["buckets"].as_array().cloned().unwrap_or_default();
+                    total = buckets.iter().filter_map(|b| b["total"].as_i64()).sum();
+                    let mut keys = std::collections::BTreeSet::new();
+                    for bucket in &buckets {
+                        if let Some(by_level) = bucket["by_level"].as_object() {
+                            keys.extend(by_level.keys().cloned());
+                        }
+                    }
+                    levels = keys.len();
+                    if total > 0 && levels >= 1 {
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+        anyhow::ensure!(
+            total > 0,
+            "expected /logs/volume total>0 after pod removal; last response:\n{last}"
+        );
+        anyhow::ensure!(
+            levels >= 1,
+            "expected /logs/volume to report >=1 level; last response:\n{last}"
+        );
+
+        // The SSE log stream (non-follow) must still return backlog from Loki.
+        let logs = expect_ok(
+            b.rise_cli(
+                &[
+                    "deployment",
+                    "logs",
+                    "--project",
+                    &project,
+                    &deployment_id,
+                    "--tail",
+                    "20",
+                ],
+                None,
+            )?,
+            "deployment logs",
+        )?;
+        anyhow::ensure!(
+            !logs.stdout.trim().is_empty(),
+            "expected `rise deployment logs` to print >=1 line after pod removal"
         );
         Ok(())
     }

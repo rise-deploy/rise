@@ -58,6 +58,16 @@ pub trait Backend {
     /// A small HTTP app to deploy for the public-deploy scenario.
     fn sample_app(&self) -> SampleApp;
 
+    /// Base URL of the Rise control-plane API as reachable from the harness host.
+    fn api_base(&self) -> &str;
+    /// The admin CI bearer used for authenticated API calls.
+    fn ci_bearer(&self) -> &str;
+
+    /// Authenticated GET against the Rise API (`path` starts with `/`).
+    fn api_get(&self, path: &str) -> Result<HttpResponse> {
+        crate::http::get_auth(&format!("{}{}", self.api_base(), path), self.ci_bearer())
+    }
+
     /// Poll `rise deployment list` until the project reports a Healthy
     /// deployment. Shared across backends (reuses `rise_cli`).
     fn wait_healthy(&self, project: &str) -> Result<()> {
@@ -71,6 +81,24 @@ pub trait Backend {
                     None,
                 )?;
                 Ok(out.combined().contains("Healthy"))
+            },
+        )
+    }
+
+    /// Wait until a stopped deployment's workload is actually gone. The default
+    /// polls `rise deployment list` until it no longer reports Healthy; backends
+    /// can override with a stronger check (e.g. zero pods).
+    fn wait_workload_removed(&self, project: &str) -> Result<()> {
+        crate::http::poll(
+            Duration::from_secs(120),
+            Duration::from_secs(2),
+            &format!("workload for '{project}' to be removed"),
+            || {
+                let out = self.rise_cli(
+                    &["deployment", "list", "--project", project, "--limit", "5"],
+                    None,
+                )?;
+                Ok(!out.combined().contains("Healthy"))
             },
         )
     }
