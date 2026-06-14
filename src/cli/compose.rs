@@ -308,6 +308,33 @@ fn resolve_project_name(
     Ok((toml_config, project_name))
 }
 
+/// Local runtimes have one image store per container CLI. `rise compose` and
+/// `rise run --container` both build and run from one runtime, so per-container
+/// `container_cli` would build into one daemon and run from another.
+pub(crate) fn reject_per_container_container_cli(
+    toml_config: &ProjectBuildConfig,
+    selected_container: Option<&str>,
+) -> Result<()> {
+    for (name, container) in &toml_config.containers {
+        if selected_container.is_some_and(|selected| selected != name) {
+            continue;
+        }
+        if container
+            .build
+            .as_ref()
+            .and_then(|build| build.container_cli.as_ref())
+            .is_some()
+        {
+            bail!(
+                "per-container build.container_cli is not supported for local development \
+                 ([containers.{name}.build]). Set top-level [build].container_cli or pass \
+                 --container-cli so all local containers use one runtime."
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Fetch project preview env vars. Missing credentials (not logged in, no CI
 /// token source) degrade gracefully — warn and return an empty map so
 /// `generate` keeps working offline — but a token source that exists and
@@ -447,6 +474,7 @@ pub async fn generate(
     options: GenerateOptions<'_>,
 ) -> Result<()> {
     let res = load_multi_container(options.path, options.project)?;
+    reject_per_container_container_cli(&res.toml_config, None)?;
     let shared_env =
         fetch_shared_env(http_client, config, &res.project_name, options.environment).await?;
 
@@ -491,6 +519,7 @@ pub struct UpOptions<'a> {
 /// Build all containers locally and run them together via `docker compose up`.
 pub async fn up(http_client: &Client, config: &Config, options: UpOptions<'_>) -> Result<()> {
     let res = load_multi_container(options.path, options.project)?;
+    reject_per_container_container_cli(&res.toml_config, None)?;
     let cli = resolve_container_cli(config, options.build_args, Some(&res.toml_config));
     let compose_project = compose_project_name(&res.project_name);
 
@@ -725,7 +754,7 @@ pub async fn logs(config: &Config, options: LogsOptions<'_>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rise_toml::{ResolvedContainer, ResolvedRoute};
+    use crate::rise_toml::{BuildConfig, ContainerConfig, ResolvedContainer, ResolvedRoute};
 
     fn container(name: &str, port: Option<u16>) -> ResolvedContainer {
         ResolvedContainer {
@@ -882,5 +911,75 @@ mod tests {
             compose.services["web"].environment["RISE_CONTAINER_HOST__API"],
             "api.external:9999"
         );
+    }
+
+    #[test]
+    fn local_dev_rejects_per_container_container_cli_for_compose() {
+        let mut config = ProjectBuildConfig::default();
+        config.containers.insert(
+            "api".to_string(),
+            ContainerConfig {
+                build: Some(BuildConfig {
+                    container_cli: Some("podman".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+
+        let err = reject_per_container_container_cli(&config, None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("per-container build.container_cli is not supported"));
+        assert!(err.contains("[containers.api.build]"));
+    }
+
+    #[test]
+    fn local_dev_rejects_per_container_container_cli_for_selected_run_target() {
+        let mut config = ProjectBuildConfig::default();
+        config.containers.insert(
+            "api".to_string(),
+            ContainerConfig {
+                build: Some(BuildConfig {
+                    container_cli: Some("podman".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        config.containers.insert(
+            "web".to_string(),
+            ContainerConfig {
+                build: Some(BuildConfig::default()),
+                ..Default::default()
+            },
+        );
+
+        assert!(reject_per_container_container_cli(&config, Some("web")).is_ok());
+        let err = reject_per_container_container_cli(&config, Some("api"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[containers.api.build]"));
+    }
+
+    #[test]
+    fn local_dev_allows_top_level_container_cli() {
+        let mut config = ProjectBuildConfig {
+            build: Some(BuildConfig {
+                container_cli: Some("podman".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        config.containers.insert(
+            "api".to_string(),
+            ContainerConfig {
+                build: Some(BuildConfig::default()),
+                ..Default::default()
+            },
+        );
+
+        reject_per_container_container_cli(&config, None).unwrap();
     }
 }

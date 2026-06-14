@@ -70,6 +70,9 @@ pub async fn run_locally(
     // Pick what to run. `None` means the single-container / top-level `[build]`
     // path; `Some(container)` means a specific `[containers.X]` entry.
     let selected = select_run_target(options.container, &resolved, project_name.as_deref())?;
+    if let (Some(cfg), Some(container)) = (&toml_config, &selected) {
+        crate::cli::compose::reject_per_container_container_cli(cfg, Some(&container.name))?;
+    }
 
     // The effective port a routed container listens on drives both PORT and the
     // host mapping. A selected container's own `port` wins over `--http-port`.
