@@ -11,30 +11,36 @@ suites still run in CI today.
 
 ## Running
 
+This is a **standalone Cargo workspace** (excluded from the root workspace so the
+production image build never compiles it), so invoke it with `--manifest-path
+tests/e2e/Cargo.toml` from the repo root.
+
 The harness is gated on `RISE_E2E_BACKEND`. **Unset → every test is an instant
-skip**, so the normal `cargo test --workspace` never tries to stand up a backend.
+skip**, so a plain `cargo test --manifest-path tests/e2e/Cargo.toml` only runs the
+pure unit tests and never tries to stand up a backend.
 
 ```bash
-# Docker backend (self-contained: brings up its own compose stack).
+# Docker backend (self-provisions its own compose stack).
 RISE_E2E_BACKEND=docker \
 RISE_IMAGE_TAG=<tag> \
 RISE_IMAGE_REPOSITORY=ghcr.io/rise-deploy/rise \
-  cargo test -p rise-e2e -- --nocapture --test-threads=1
+  cargo test --manifest-path tests/e2e/Cargo.toml -- --nocapture --test-threads=1
 
-# Minikube backend (thin connector: expects the stack already up + a
-# `kubectl port-forward svc/... 3000:3000`, as the bash CI job arranges).
+# Minikube backend (self-provisions its own cluster: minikube start + helm
+# install + port-forwards). Needs minikube/kubectl/helm on PATH.
 RISE_E2E_BACKEND=minikube RISE_IMAGE_TAG=<tag> \
-  cargo test -p rise-e2e -- --nocapture --test-threads=1
+  cargo test --manifest-path tests/e2e/Cargo.toml -- --nocapture --test-threads=1
 ```
 
 `--test-threads=1` because a backend owns a single shared stack.
 
 ## Layout
 
-- `src/backend/` — the `Backend` driver seam. `DockerBackend` is fully
-  self-contained (compose up/down, CLI extraction via `docker cp`, Traefik reach);
-  `MinikubeBackend` is a thin connector (health-check + `docker run` the CLI; app
-  HTTP reach is a declared gap → `reach_app` returns `Ok(None)`).
+- `src/backend/` — the `Backend` driver seam. Both backends self-provision their
+  own stack: `DockerBackend` via `docker compose` (CLI extraction via `docker cp`,
+  Traefik reach); `MinikubeBackend` via `minikube start` + `helm upgrade --install`
+  + background `kubectl port-forward`s (server, Dex, per-app reach), a Rust port of
+  `scripts/ci/e2e-minikube.sh`.
 - `src/scenario.rs` — backend-agnostic scenarios + the matrix runner. Each
   `Scenario::applies_to(kind)` returns `Run` or `Skip(reason)`.
 - `src/{cli,http,token,dex}.rs` — process/HTTP/token helpers. `token` reuses
@@ -46,8 +52,5 @@ RISE_E2E_BACKEND=minikube RISE_IMAGE_TAG=<tag> \
 
 | id                  | docker | minikube | asserts |
 |---------------------|--------|----------|---------|
-| `public-deploy`     | Run    | Run      | deploy `traefik/whoami` → Healthy; HTTP 200 + `Hostname:` body (Docker; Healthy-only on minikube) |
-| `sa-token-exchange` | Run    | Skip     | SA + Dex password-grant id_token + `RISE_IDENTITY` → `project list` returns the SA's project; un-exchanged token rejected |
-
-`sa-token-exchange` skips on minikube until its in-cluster Dex enables the password
-grant and is reachable from the harness host.
+| `public-deploy`     | Run    | Run      | deploy `traefik/whoami` → Healthy; HTTP 200 (+ `Hostname:` body on Docker) |
+| `sa-token-exchange` | Run    | Run      | SA + Dex password-grant id_token + `RISE_IDENTITY` → `project list` returns the SA's project; un-exchanged token rejected |

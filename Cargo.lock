@@ -4067,7 +4067,6 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "encoding_rs",
- "futures-channel",
  "futures-core",
  "futures-util",
  "h2",
@@ -4227,18 +4226,6 @@ dependencies = [
  "urlencoding",
  "uuid",
  "webbrowser",
-]
-
-[[package]]
-name = "rise-e2e"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "reqwest 0.13.4",
- "rise-backend-auth",
- "serde",
- "serde_json",
 ]
 
 [[package]]
