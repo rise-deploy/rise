@@ -960,7 +960,7 @@ jobs:
           RISE_IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
           RISE_E2E_BACKEND: minikube
           SQLX_OFFLINE: "true"
-        run: cargo test --manifest-path tests/e2e/Cargo.toml -- --nocapture --test-threads=1
+        run: cargo test --manifest-path tests/e2e/Cargo.toml
 
   e2e-docker:
     name: Docker backend end-to-end (rise-e2e harness)
@@ -998,7 +998,7 @@ jobs:
           RISE_IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
           RISE_E2E_BACKEND: docker
           SQLX_OFFLINE: "true"
-        run: cargo test --manifest-path tests/e2e/Cargo.toml -- --nocapture --test-threads=1
+        run: cargo test --manifest-path tests/e2e/Cargo.toml
 
   # rise-e2e harness in jfrog-vault mode: self-provisions JFrog + Vault + a minikube
   # cluster whose registry pulls from JFrog, then runs the workload-identity scenario
@@ -1048,4 +1048,4 @@ jobs:
           RISE_E2E_BACKEND: minikube
           RISE_E2E_REGISTRY_MODE: jfrog-vault
           SQLX_OFFLINE: "true"
-        run: cargo test --manifest-path tests/e2e/Cargo.toml -- --nocapture --test-threads=1
+        run: cargo test --manifest-path tests/e2e/Cargo.toml

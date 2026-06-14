@@ -16,11 +16,15 @@ description = "Cross-backend end-to-end test harness for Rise (Docker / Kubernet
 [lib]
 path = "src/lib.rs"
 
-# Black-box harness: drives the `rise` CLI + HTTP against a live backend. Gated
-# on RISE_E2E_BACKEND so `cargo test --workspace` skips it instantly.
+# Black-box harness: drives the `rise` CLI + HTTP against a live backend. It runs
+# every scenario as one in-order suite under a shared backend bring-up, so it owns
+# its own runner + reporting — `harness = false` skips libtest entirely (no
+# "running 1 test" scaffolding). `cargo test` still builds & runs it and treats a
+# non-zero exit as failure. Gated on RISE_E2E_BACKEND (skips instantly when unset).
 [[test]]
 name = "e2e"
 path = "tests/e2e.rs"
+harness = false
 
 [dependencies]
 anyhow = "1.0.100"

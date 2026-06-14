@@ -611,10 +611,11 @@ impl Scenario for WorkloadIdentity {
             .as_str()
             .context("file token has no jti")?
             .to_string();
+        let first_exp = id["file_token"]["claims"]["exp"].as_i64();
         let refreshed = b.poll_app(
             &project,
             "/identity?file=e2e",
-            std::time::Duration::from_secs(240),
+            std::time::Duration::from_secs(360),
             std::time::Duration::from_secs(5),
             &mut |body| {
                 serde_json::from_str::<serde_json::Value>(body).is_ok_and(|j| {
@@ -625,10 +626,23 @@ impl Scenario for WorkloadIdentity {
                 })
             },
         )?;
-        anyhow::ensure!(
-            refreshed,
-            "file token did not refresh within the window (jti stayed {first_jti})"
-        );
+        if !refreshed {
+            // Decisive diagnostic: did the controller re-mint at all? If `exp`
+            // advanced, the token IS rotating (slow projection); if it's static, the
+            // controller never re-minted (a server/config issue, not propagation lag).
+            let last = b
+                .reach_app(&project, "/identity?file=e2e")?
+                .map(|r| r.body)
+                .unwrap_or_default();
+            let lv: serde_json::Value =
+                serde_json::from_str(&last).unwrap_or(serde_json::Value::Null);
+            let last_jti = lv["file_token"]["claims"]["jti"].as_str().unwrap_or("?");
+            let last_exp = lv["file_token"]["claims"]["exp"].as_i64();
+            anyhow::bail!(
+                "file token did not refresh in 360s — first(jti={first_jti}, exp={first_exp:?}) \
+                 last(jti={last_jti}, exp={last_exp:?})"
+            );
+        }
         Ok(())
     }
 }

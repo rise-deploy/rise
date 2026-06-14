@@ -12,24 +12,26 @@ This is a **standalone Cargo workspace** (excluded from the root workspace so th
 production image build never compiles it), so invoke it with `--manifest-path
 tests/e2e/Cargo.toml` from the repo root.
 
-The harness is gated on `RISE_E2E_BACKEND`. **Unset → every test is an instant
-skip**, so a plain `cargo test --manifest-path tests/e2e/Cargo.toml` only runs the
-pure unit tests and never tries to stand up a backend.
+The suite is a plain binary (`harness = false`), not a libtest test — it owns its
+own runner + reporting (no "running 1 test" scaffolding) and exits non-zero on
+failure. `cargo test` still builds & runs it. It is gated on `RISE_E2E_BACKEND`:
+**unset → it prints a skip and exits 0**, so `cargo test --manifest-path
+tests/e2e/Cargo.toml` only runs the pure unit tests and never stands up a backend.
 
 ```bash
 # Docker backend (self-provisions its own compose stack).
 RISE_E2E_BACKEND=docker \
 RISE_IMAGE_TAG=<tag> \
 RISE_IMAGE_REPOSITORY=ghcr.io/rise-deploy/rise \
-  cargo test --manifest-path tests/e2e/Cargo.toml -- --nocapture --test-threads=1
+  cargo test --manifest-path tests/e2e/Cargo.toml
 
 # Minikube backend (self-provisions its own cluster: minikube start + helm
 # install + port-forwards). Needs minikube/kubectl/helm on PATH.
 RISE_E2E_BACKEND=minikube RISE_IMAGE_TAG=<tag> \
-  cargo test --manifest-path tests/e2e/Cargo.toml -- --nocapture --test-threads=1
+  cargo test --manifest-path tests/e2e/Cargo.toml
 ```
 
-`--test-threads=1` because a backend owns a single shared stack.
+Scenarios run in-order as one suite (they share the single backend bring-up).
 
 ## Layout
 
