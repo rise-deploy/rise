@@ -5,6 +5,7 @@
 //! from the image on the host network.
 
 use anyhow::{Context, Result};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -79,6 +80,9 @@ pub struct MinikubeBackend {
     memory: String,
     ci_token: String,
     dex: DexEndpoint,
+    /// Repo root (the chart + values live here). `cargo test` runs the test binary
+    /// with CWD = the crate dir, so all repo paths must be absolute.
+    repo_root: PathBuf,
     /// Long-lived forwards (server, Dex) kept alive for the whole run.
     forwards: Vec<PortForward>,
 }
@@ -94,6 +98,11 @@ impl MinikubeBackend {
         let public_url =
             std::env::var("RISE_PUBLIC_URL").unwrap_or_else(|_| DEFAULT_PUBLIC_URL.to_string());
         let ci_token = token::mint_ci_token(SECRET_B64, &public_url)?;
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .canonicalize()
+            .context("resolve repo root from CARGO_MANIFEST_DIR")?;
         Ok(Self {
             cli_image: format!("{cli_repo}:{image_tag}"),
             image_repository,
@@ -108,8 +117,14 @@ impl MinikubeBackend {
                 client_secret: "rise-backend-secret".to_string(),
                 issuer: DEX_ISSUER.to_string(),
             },
+            repo_root,
             forwards: Vec::new(),
         })
+    }
+
+    /// Absolute path to a repo file/dir (CWD is the crate dir under `cargo test`).
+    fn repo_path(&self, rel: &str) -> String {
+        self.repo_root.join(rel).to_string_lossy().into_owned()
     }
 
     /// The `helm upgrade --install` flags (default `oci-client-auth` mode).
@@ -119,7 +134,7 @@ impl MinikubeBackend {
             NAMESPACE.into(),
             "--create-namespace".into(),
             "--values".into(),
-            "helm/rise/values-ci.yaml".into(),
+            self.repo_path("helm/rise/values-ci.yaml"),
             "--set".into(),
             format!("image.repository={}", self.image_repository),
             "--set".into(),
@@ -196,7 +211,12 @@ impl Backend for MinikubeBackend {
         cli::run_checked(ingress).context("minikube addons enable ingress")?;
 
         let mut helm = Command::new("helm");
-        helm.args(["upgrade", "--install", RELEASE, "./helm/rise"]);
+        helm.args([
+            "upgrade",
+            "--install",
+            RELEASE,
+            &self.repo_path("helm/rise"),
+        ]);
         helm.args(self.helm_args());
         cli::run_checked(helm).context("helm upgrade --install")?;
 
@@ -277,8 +297,8 @@ impl Backend for MinikubeBackend {
 
     fn rise_cli(&self, args: &[&str], auth: Option<CliAuth<'_>>) -> Result<CliOutput> {
         // Run the CLI from the image on the host network (reaches the port-forward).
-        let pwd = std::env::current_dir().context("cwd")?;
-        let pwd_str = pwd.to_string_lossy().to_string();
+        // Mount the repo root as the workdir so deploy-from-source paths resolve.
+        let pwd_str = self.repo_root.to_string_lossy().to_string();
         let mut c = Command::new("docker");
         c.args(["run", "--rm", "--network", "host"])
             .args(["-e", &format!("RISE_URL={RISE_URL}")])
