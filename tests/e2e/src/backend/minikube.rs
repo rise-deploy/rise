@@ -5,6 +5,7 @@
 //! and the CLI runs from the image on the host network.
 
 use anyhow::{Context, Result};
+use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -60,13 +61,47 @@ struct PortForward {
 
 impl PortForward {
     fn spawn(namespace: &str, target: &str, ports: &str, what: &str) -> Result<Self> {
-        let child = Command::new("kubectl")
+        let mut child = Command::new("kubectl")
             .args(["-n", namespace, "port-forward", target, ports])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .with_context(|| format!("spawn kubectl port-forward for {what}"))?;
-        Ok(Self { child })
+
+        // `spawn` only proves the process launched. A bind conflict — e.g. the
+        // local port not yet released by a just-dropped forward — makes kubectl
+        // exit moments later, and with stdout/stderr nulled that failure is
+        // invisible: callers would see a window of connection-refused and
+        // misread it as the workload itself failing. Block until the local port
+        // actually accepts a connection (or kubectl dies) so a bad bind surfaces
+        // as a clear infra error here instead.
+        let local_port: u16 = ports
+            .split(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .with_context(|| format!("port-forward spec '{ports}' has no local port"))?;
+        let addr = SocketAddr::from(([127, 0, 0, 1], local_port));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(Some(status)) = child.try_wait() {
+                anyhow::bail!(
+                    "kubectl port-forward for {what} exited early ({status}) — \
+                     local port {local_port} is likely already in use"
+                );
+            }
+            if TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok() {
+                return Ok(Self { child });
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!(
+                    "kubectl port-forward for {what} never began listening on \
+                     127.0.0.1:{local_port} within 10s"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 }
 
@@ -311,6 +346,23 @@ impl MinikubeBackend {
         found.context("app Service not found")
     }
 
+    /// Hold one `kubectl port-forward` to the project's app Service open for the
+    /// duration of `f`, passing it the local base URL (`http://127.0.0.1:<port>`).
+    /// Both the one-shot reach and the held-open poll go through here so the
+    /// forward setup — and its liveness guarantee (see `PortForward::spawn`) —
+    /// lives in exactly one place.
+    fn with_app_forward<T>(&self, project: &str, f: impl FnOnce(&str) -> Result<T>) -> Result<T> {
+        let ns = format!("rise-{project}");
+        let (svc, port) = self.find_app_svc(&ns)?;
+        let _pf = PortForward::spawn(
+            &ns,
+            &format!("svc/{svc}"),
+            &format!("{APP_LOCAL_PORT}:{port}"),
+            &format!("app {project}"),
+        )?;
+        f(&format!("http://127.0.0.1:{APP_LOCAL_PORT}"))
+    }
+
     /// Run the CLI from the image on the host network (reaches the port-forward),
     /// with the repo root as the workdir so deploy-from-source paths resolve.
     /// `mount_docker` also bind-mounts the docker socket for `--backend docker:build`.
@@ -525,33 +577,26 @@ impl Backend for MinikubeBackend {
     }
 
     fn reach_app(&self, project: &str, path: &str) -> Result<Option<HttpResponse>> {
-        // Rise namespaces an app as `rise-<project>`; forward its Service locally.
-        let ns = format!("rise-{project}");
-        let (svc, port) = self.find_app_svc(&ns)?;
-        let _pf = PortForward::spawn(
-            &ns,
-            &format!("svc/{svc}"),
-            &format!("{APP_LOCAL_PORT}:{port}"),
-            &format!("app {project}"),
-        )?;
-
-        let url = format!("http://127.0.0.1:{APP_LOCAL_PORT}{path}");
-        let mut resp = None;
-        http::poll(
-            Duration::from_secs(60),
-            Duration::from_secs(2),
-            &format!("app {project} reachable"),
-            || match http::get(&url, None) {
-                // Forward warmup → connection refused; route/pod warmup → 404/5xx.
-                Ok(r) => {
-                    let ready = r.status != 404 && r.status < 500;
-                    resp = Some(r);
-                    Ok(ready)
-                }
-                Err(_) => Ok(false),
-            },
-        )?;
-        Ok(resp)
+        self.with_app_forward(project, |base| {
+            let url = format!("{base}{path}");
+            let mut resp = None;
+            http::poll(
+                Duration::from_secs(60),
+                Duration::from_secs(2),
+                &format!("app {project} reachable"),
+                || match http::get(&url, None) {
+                    // The forward itself is already verified live by
+                    // `PortForward::spawn`; pod/route warmup can still 404/5xx.
+                    Ok(r) => {
+                        let ready = r.status != 404 && r.status < 500;
+                        resp = Some(r);
+                        Ok(ready)
+                    }
+                    Err(_) => Ok(false),
+                },
+            )?;
+            Ok(resp)
+        })
     }
 
     fn poll_app(
@@ -562,27 +607,21 @@ impl Backend for MinikubeBackend {
         interval: Duration,
         check: &mut dyn FnMut(&str) -> bool,
     ) -> Result<bool> {
-        // Hold ONE port-forward open for the whole window (dense, reliable sampling
-        // — no per-sample forward churn).
-        let ns = format!("rise-{project}");
-        let (svc, port) = self.find_app_svc(&ns)?;
-        let _pf = PortForward::spawn(
-            &ns,
-            &format!("svc/{svc}"),
-            &format!("{APP_LOCAL_PORT}:{port}"),
-            &format!("app {project}"),
-        )?;
-        let url = format!("http://127.0.0.1:{APP_LOCAL_PORT}{path}");
-        let start = Instant::now();
-        while start.elapsed() < duration {
-            if let Ok(r) = http::get(&url, None) {
-                if r.status == 200 && check(&r.body) {
-                    return Ok(true);
+        // Hold ONE forward open for the whole window (dense, reliable sampling —
+        // no per-sample forward churn).
+        self.with_app_forward(project, |base| {
+            let url = format!("{base}{path}");
+            let start = Instant::now();
+            while start.elapsed() < duration {
+                if let Ok(r) = http::get(&url, None) {
+                    if r.status == 200 && check(&r.body) {
+                        return Ok(true);
+                    }
                 }
+                std::thread::sleep(interval);
             }
-            std::thread::sleep(interval);
-        }
-        Ok(false)
+            Ok(false)
+        })
     }
 
     fn dex(&self) -> Option<&DexEndpoint> {

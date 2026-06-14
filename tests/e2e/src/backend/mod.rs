@@ -173,21 +173,13 @@ pub trait Backend {
         )
     }
 
-    /// Wait until a stopped deployment's workload is actually gone. The default
-    /// polls the deployments API until the latest deployment is no longer Healthy;
-    /// backends can override with a stronger check (e.g. zero pods).
-    fn wait_workload_removed(&self, project: &str) -> Result<()> {
-        crate::http::poll(
-            Duration::from_secs(120),
-            Duration::from_secs(2),
-            &format!("workload for '{project}' to be removed"),
-            || {
-                Ok(
-                    matches!(latest_deployment_status(self, project)?.as_deref(), Some(s) if s != "Healthy"),
-                )
-            },
-        )
-    }
+    /// Wait until a stopped deployment's workload is actually gone — every pod /
+    /// container removed — so a subsequent logs query can only be served by the
+    /// log store, not a live workload. Each backend checks its own runtime;
+    /// there is deliberately no status-string default, since a not-`Healthy`
+    /// deployment status does not prove the workload has been torn down (it may
+    /// still be terminating).
+    fn wait_workload_removed(&self, project: &str) -> Result<()>;
 }
 
 /// The latest deployment's `status` string for a project, via the deployments API.

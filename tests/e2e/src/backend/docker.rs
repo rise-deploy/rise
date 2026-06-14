@@ -244,12 +244,11 @@ impl Backend for DockerBackend {
         interval: Duration,
         check: &mut dyn FnMut(&str) -> bool,
     ) -> Result<bool> {
-        // Traefik routes by Host; no port-forward to hold.
-        let host = self.app_host(project);
-        let url = format!("{TRAEFIK_URL}{path}");
+        // Traefik routes by Host; no port-forward to hold. Reuse `ingress_get` so
+        // there's a single definition of "reach this app through the ingress".
         let start = Instant::now();
         while start.elapsed() < duration {
-            if let Ok(r) = http::get(&url, Some(&host)) {
+            if let Ok(r) = self.ingress_get(project, path, true, None) {
                 if r.status == 200 && check(&r.body) {
                     return Ok(true);
                 }
@@ -257,6 +256,28 @@ impl Backend for DockerBackend {
             std::thread::sleep(interval);
         }
         Ok(false)
+    }
+
+    fn wait_workload_removed(&self, project: &str) -> Result<()> {
+        // The app's container(s) must be gone — proving a post-stop logs query is
+        // served by the store, not a live container.
+        http::poll(
+            Duration::from_secs(120),
+            Duration::from_secs(2),
+            &format!("app container for {project} to be removed"),
+            || {
+                let mut c = Command::new("docker");
+                c.args([
+                    "ps",
+                    "--filter",
+                    &format!("name=rise_{project}"),
+                    "--format",
+                    "{{.Names}}",
+                ]);
+                let out = cli::run(c)?;
+                Ok(out.success() && out.stdout.trim().is_empty())
+            },
+        )
     }
 
     fn dex(&self) -> Option<&DexEndpoint> {
