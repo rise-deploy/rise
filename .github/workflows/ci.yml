@@ -1077,3 +1077,53 @@ jobs:
           name: jfrog-vault-service-logs-${{ github.run_id }}-${{ github.run_attempt }}
           path: .rise-e2e-artifacts/jfrog-vault
           if-no-files-found: ignore
+
+  # rise-e2e harness in jfrog-vault mode: self-provisions JFrog + Vault + a minikube
+  # cluster whose registry pulls from JFrog, then runs the workload-identity scenario
+  # (which builds the fixture from source). Runs alongside the bash job until parity.
+  e2e-minikube-harness-jfrog-vault:
+    name: Minikube JFrog/Vault (rise-e2e harness)
+    runs-on: ubuntu-latest
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && needs.prepare.outputs.is_trusted_pr == 'true')
+    needs:
+      - prepare
+      - package-image
+      - package-helm
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup mise
+        uses: jdx/mise-action@v4
+        with:
+          cache: true
+          experimental: true
+
+      - name: Install mise tools
+        run: mise use -g minikube kubectl helm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run rise-e2e harness (minikube, jfrog-vault)
+        env:
+          RISE_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          RISE_CLI_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.BUILDER_IMAGE_NAME }}
+          RISE_IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
+          RISE_E2E_BACKEND: minikube
+          RISE_E2E_REGISTRY_MODE: jfrog-vault
+          SQLX_OFFLINE: "true"
+        run: cargo test --manifest-path tests/e2e/Cargo.toml -- --nocapture --test-threads=1

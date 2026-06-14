@@ -17,7 +17,7 @@ pub enum Applicability {
 
 pub trait Scenario {
     fn id(&self) -> &'static str;
-    fn applies_to(&self, kind: BackendKind) -> Applicability;
+    fn applies_to(&self, b: &dyn Backend) -> Applicability;
     fn run(&self, b: &dyn Backend) -> Result<()>;
 }
 
@@ -29,6 +29,7 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
         Box::new(SaTokenExchange),
         Box::new(LokiLogRetention),
         Box::new(HelmIdempotency),
+        Box::new(WorkloadIdentity),
     ]
 }
 
@@ -37,7 +38,7 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
 pub fn run_all(b: &dyn Backend) -> Result<()> {
     let mut failed: Vec<&'static str> = Vec::new();
     for s in all() {
-        match s.applies_to(b.kind()) {
+        match s.applies_to(b) {
             Applicability::Skip(reason) => {
                 eprintln!("[e2e] SKIP {} on {}: {reason}", s.id(), b.name())
             }
@@ -89,7 +90,7 @@ impl Scenario for PublicDeploy {
         "public-deploy"
     }
 
-    fn applies_to(&self, _kind: BackendKind) -> Applicability {
+    fn applies_to(&self, _b: &dyn Backend) -> Applicability {
         Applicability::Run
     }
 
@@ -163,7 +164,7 @@ impl Scenario for SaTokenExchange {
         "sa-token-exchange"
     }
 
-    fn applies_to(&self, _kind: BackendKind) -> Applicability {
+    fn applies_to(&self, _b: &dyn Backend) -> Applicability {
         // Both backends now expose a reachable Dex (Docker via the compose overlay,
         // minikube via a `kubectl port-forward` to the in-cluster Dex).
         Applicability::Run
@@ -268,8 +269,8 @@ impl Scenario for LokiLogRetention {
         "loki-log-retention"
     }
 
-    fn applies_to(&self, kind: BackendKind) -> Applicability {
-        match kind {
+    fn applies_to(&self, b: &dyn Backend) -> Applicability {
+        match b.kind() {
             BackendKind::Minikube => Applicability::Run,
             BackendKind::Docker => {
                 Applicability::Skip("the docker compose stack has no Loki log backend")
@@ -429,8 +430,8 @@ impl Scenario for HelmIdempotency {
         "helm-idempotency"
     }
 
-    fn applies_to(&self, kind: BackendKind) -> Applicability {
-        match kind {
+    fn applies_to(&self, b: &dyn Backend) -> Applicability {
+        match b.kind() {
             BackendKind::Minikube => Applicability::Run,
             BackendKind::Docker => Applicability::Skip("docker backend has no Helm release"),
         }
@@ -439,5 +440,164 @@ impl Scenario for HelmIdempotency {
     fn run(&self, b: &dyn Backend) -> Result<()> {
         // Re-applying the chart must succeed (no immutable-field / diff errors).
         b.reapply_chart()
+    }
+}
+
+// ---- (b) workload identity (jfrog-vault registry mode only) ----------------
+
+struct WorkloadIdentity;
+
+impl Scenario for WorkloadIdentity {
+    fn id(&self) -> &'static str {
+        "workload-identity"
+    }
+
+    fn applies_to(&self, b: &dyn Backend) -> Applicability {
+        match b.kind() {
+            // Builds the fixture from source, which needs a registry the cluster
+            // can pull from — only minikube's jfrog-vault mode provides one.
+            BackendKind::Minikube if b.supports_source_build() => Applicability::Run,
+            BackendKind::Minikube => {
+                Applicability::Skip("requires the jfrog-vault registry mode (source build)")
+            }
+            BackendKind::Docker => {
+                Applicability::Skip("source-build workload identity not ported to docker yet")
+            }
+        }
+    }
+
+    fn run(&self, b: &dyn Backend) -> Result<()> {
+        let project = unique("e2e-id");
+        expect_ok(
+            b.rise_cli(
+                &[
+                    "project",
+                    "create",
+                    &project,
+                    "--access-class",
+                    "public",
+                    "--no-rise-toml",
+                ],
+                None,
+            )?,
+            "project create",
+        )?;
+        // Build & deploy the identity fixture from source (needs the docker socket).
+        expect_ok(
+            b.rise_cli_build(
+                &[
+                    "deploy",
+                    "--project",
+                    &project,
+                    "--backend",
+                    "docker:build",
+                    "--container-cli",
+                    "docker",
+                    "--http-port",
+                    "8080",
+                    "--replicas",
+                    "1",
+                    "tests/e2e-identity-fixture",
+                ],
+                None,
+            )?,
+            "deploy identity fixture",
+        )?;
+        b.wait_healthy(&project)?;
+
+        // The fixture verifies the exchange + JWKS *inside* the container and reports
+        // JSON. file=e2e, file audience=rise-e2e-audience, exchange audience=rise-e2e-exchange.
+        let resp = b
+            .reach_app(&project, "/identity?file=e2e&audience=rise-e2e-exchange")?
+            .context("identity fixture not reachable")?;
+        anyhow::ensure!(resp.status == 200, "/identity returned {}", resp.status);
+        let id: serde_json::Value =
+            serde_json::from_str(&resp.body).context("parse /identity response")?;
+
+        let sub_prefix = format!("rise:proj:{project}:env:");
+        let starts_with = |v: &serde_json::Value, p: &str| -> bool {
+            v.as_str().map(|s| s.starts_with(p)).unwrap_or(false)
+        };
+        let strip_slash = |v: &serde_json::Value| -> String {
+            v.as_str().unwrap_or("").trim_end_matches('/').to_string()
+        };
+        anyhow::ensure!(
+            id["credential_present"] == serde_json::json!(true),
+            "credential not present:\n{}",
+            resp.body
+        );
+        anyhow::ensure!(
+            id["file_token"]["present"] == serde_json::json!(true),
+            "file token absent:\n{}",
+            resp.body
+        );
+        anyhow::ensure!(
+            id["file_token"]["signature_valid"] == serde_json::json!(true),
+            "file token sig invalid:\n{}",
+            resp.body
+        );
+        anyhow::ensure!(
+            id["file_token"]["claims"]["aud"] == serde_json::json!("rise-e2e-audience"),
+            "file token aud mismatch:\n{}",
+            resp.body
+        );
+        anyhow::ensure!(
+            id["exchanged_token"]["signature_valid"] == serde_json::json!(true),
+            "exchanged token sig invalid:\n{}",
+            resp.body
+        );
+        anyhow::ensure!(
+            id["exchanged_token"]["claims"]["aud"] == serde_json::json!("rise-e2e-exchange"),
+            "exchanged token aud mismatch:\n{}",
+            resp.body
+        );
+        anyhow::ensure!(
+            starts_with(&id["exchanged_token"]["claims"]["sub"], &sub_prefix),
+            "exchanged sub not project-bound:\n{}",
+            resp.body
+        );
+        anyhow::ensure!(
+            starts_with(&id["file_token"]["claims"]["sub"], &sub_prefix),
+            "file sub not project-bound:\n{}",
+            resp.body
+        );
+        anyhow::ensure!(
+            !strip_slash(&id["exchanged_token"]["claims"]["iss"]).is_empty()
+                && strip_slash(&id["exchanged_token"]["claims"]["iss"])
+                    == strip_slash(&id["issuer"]),
+            "exchanged iss != fixture issuer:\n{}",
+            resp.body
+        );
+
+        // Prove the controller re-mints the file token in place: poll until a new,
+        // still-valid jti appears (short identity_token_ttl_seconds in values-ci).
+        let first_jti = id["file_token"]["claims"]["jti"]
+            .as_str()
+            .context("file token has no jti")?
+            .to_string();
+        let mut refreshed = false;
+        for _ in 0..36 {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let Some(r) = b.reach_app(&project, "/identity?file=e2e")? else {
+                continue;
+            };
+            let Ok(j) = serde_json::from_str::<serde_json::Value>(&r.body) else {
+                continue;
+            };
+            let cur = j["file_token"]["claims"]["jti"].as_str().unwrap_or("");
+            if !cur.is_empty() && cur != first_jti {
+                anyhow::ensure!(
+                    j["file_token"]["signature_valid"] == serde_json::json!(true),
+                    "token rotated (jti={cur}) but signature invalid"
+                );
+                refreshed = true;
+                break;
+            }
+        }
+        anyhow::ensure!(
+            refreshed,
+            "file token did not refresh (jti stayed {first_jti})"
+        );
+        Ok(())
     }
 }

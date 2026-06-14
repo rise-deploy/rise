@@ -47,6 +47,13 @@ pub trait Backend {
     /// Run `rise <args>`. With `auth = None`, uses the admin CI bearer.
     fn rise_cli(&self, args: &[&str], auth: Option<CliAuth<'_>>) -> Result<CliOutput>;
 
+    /// Like [`Backend::rise_cli`] but for `deploy --backend docker:build` (source
+    /// builds), which need access to a docker daemon. Defaults to `rise_cli`
+    /// (the docker backend runs the CLI on the host, which already has docker).
+    fn rise_cli_build(&self, args: &[&str], auth: Option<CliAuth<'_>>) -> Result<CliOutput> {
+        self.rise_cli(args, auth)
+    }
+
     /// GET an app path through this backend's ingress. `Ok(None)` means app-HTTP
     /// reach isn't wired for this backend yet — a *declared* gap the scenario
     /// logs, never silent drift.
@@ -57,6 +64,13 @@ pub trait Backend {
 
     /// A small HTTP app to deploy for the public-deploy scenario.
     fn sample_app(&self) -> SampleApp;
+
+    /// Whether this backend can build & deploy an app from source
+    /// (`deploy --backend docker:build`) — i.e. it has a registry the runtime can
+    /// pull from. Only minikube's jfrog-vault mode does, in the harness.
+    fn supports_source_build(&self) -> bool {
+        false
+    }
 
     /// Base URL of the Rise control-plane API as reachable from the harness host.
     fn api_base(&self) -> &str;

@@ -57,6 +57,18 @@ pub fn get_auth(url: &str, bearer: &str) -> Result<HttpResponse> {
     Ok(HttpResponse { status, body })
 }
 
+/// GET `url` with a single custom header (e.g. Vault's `X-Vault-Token`).
+pub fn get_auth_header(url: &str, header: &str, value: &str) -> Result<HttpResponse> {
+    let resp = shared_client()
+        .get(url)
+        .header(header, value)
+        .send()
+        .with_context(|| format!("GET {url}"))?;
+    let status = resp.status().as_u16();
+    let body = resp.text().unwrap_or_default();
+    Ok(HttpResponse { status, body })
+}
+
 /// Poll `f` until it returns `Ok(true)`, every `interval`, up to `timeout`.
 /// `f` returning `Ok(false)` or `Err` keeps polling (transient failures are
 /// expected while the system converges). Times out with the last error/message.

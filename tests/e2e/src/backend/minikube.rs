@@ -30,6 +30,12 @@ const RISE_URL: &str = "http://127.0.0.1:3000";
 const DEX_LOCAL_URL: &str = "http://127.0.0.1:5556/dex";
 // Local port for the per-app reach port-forward (scenarios run serially).
 const APP_LOCAL_PORT: u16 = 18080;
+// jfrog-vault mode: deployed app pods reach the issuer at the in-cluster FQDN,
+// so the CI token's iss/aud + server public_url use it (not http://rise.local).
+const JFROG_PUBLIC_URL: &str = "http://rise-ci-chart.rise-ci.svc.cluster.local:3000";
+// The docker network the compose stack + minikube node share (jfrog-vault).
+const COMPOSE_NETWORK: &str = "rise_default";
+const VAULT_ROLE_URL: &str = "http://127.0.0.1:8200/v1/artifactory/roles/rise";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RegistryMode {
@@ -95,8 +101,13 @@ impl MinikubeBackend {
             .context("RISE_IMAGE_TAG must be set for the minikube backend")?;
         let cli_repo =
             std::env::var("RISE_CLI_IMAGE_REPOSITORY").unwrap_or_else(|_| image_repository.clone());
-        let public_url =
-            std::env::var("RISE_PUBLIC_URL").unwrap_or_else(|_| DEFAULT_PUBLIC_URL.to_string());
+        let registry_mode = RegistryMode::from_env();
+        // The CI token's iss/aud must equal the server's public_url, which differs
+        // by mode (jfrog-vault deploys must reach the issuer from inside the cluster).
+        let public_url = std::env::var("RISE_PUBLIC_URL").unwrap_or_else(|_| match registry_mode {
+            RegistryMode::JfrogVault => JFROG_PUBLIC_URL.to_string(),
+            RegistryMode::OciClientAuth => DEFAULT_PUBLIC_URL.to_string(),
+        });
         let ci_token = token::mint_ci_token(SECRET_B64, &public_url)?;
         let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
@@ -107,7 +118,7 @@ impl MinikubeBackend {
             cli_image: format!("{cli_repo}:{image_tag}"),
             image_repository,
             image_tag,
-            registry_mode: RegistryMode::from_env(),
+            registry_mode,
             cpus: std::env::var("MINIKUBE_CPUS").unwrap_or_else(|_| "4".to_string()),
             memory: std::env::var("MINIKUBE_MEMORY").unwrap_or_else(|_| "6144".to_string()),
             ci_token,
@@ -127,9 +138,10 @@ impl MinikubeBackend {
         self.repo_root.join(rel).to_string_lossy().into_owned()
     }
 
-    /// The `helm upgrade --install` flags (default `oci-client-auth` mode).
+    /// The `helm upgrade --install` flags, including the jfrog-vault registry
+    /// overrides when that mode is selected.
     fn helm_args(&self) -> Vec<String> {
-        vec![
+        let mut args = vec![
             "--namespace".into(),
             NAMESPACE.into(),
             "--create-namespace".into(),
@@ -145,7 +157,118 @@ impl MinikubeBackend {
             format!("config.deployment_controller.auth_backend_url=http://{SERVER_FQDN}"),
             "--set-string".into(),
             "config.deployment_controller.auth_signin_url=http://rise.local".into(),
-        ]
+        ];
+        if self.registry_mode == RegistryMode::JfrogVault {
+            let pairs = [
+                ("config.server.public_url", JFROG_PUBLIC_URL),
+                ("config.registry.type", "jfrog"),
+                ("config.registry.registry_host", "rise-jfrog:8082"),
+                ("config.registry.client_registry_url", "localhost:3082"),
+                ("config.registry.docker_repo_key", "rise-docker-local"),
+                ("config.registry.token_provider.type", "vault"),
+                (
+                    "config.registry.token_provider.vault_addr",
+                    "http://host.minikube.internal:8200",
+                ),
+                ("config.registry.token_provider.vault_token", "root"),
+                (
+                    "config.registry.token_provider.vault_mount_path",
+                    "artifactory",
+                ),
+                ("config.registry.token_provider.vault_role", "rise"),
+            ];
+            for (k, v) in pairs {
+                args.push("--set-string".into());
+                args.push(format!("{k}={v}"));
+            }
+            args.push("--set".into());
+            args.push("config.registry.mint_pull_secrets=true".into());
+        }
+        args
+    }
+
+    /// `docker compose --profile jfrog-vault <args>` run from the repo root.
+    fn compose(&self, extra: &[&str]) -> Command {
+        let mut c = Command::new("docker");
+        c.current_dir(&self.repo_root)
+            .args(["compose", "--profile", "jfrog-vault"])
+            .args(extra);
+        c
+    }
+
+    /// Bring up the JFrog + Vault services and wait for Vault to mint the
+    /// Artifactory role (the registry token provider depends on it).
+    fn start_jfrog_vault(&self) -> Result<()> {
+        cli::run_checked(self.compose(&["up", "-d", "jfrog", "vault"]))
+            .context("docker compose up jfrog vault")?;
+        http::poll(
+            Duration::from_secs(600),
+            Duration::from_secs(5),
+            "Vault Artifactory role to be ready",
+            || {
+                Ok(
+                    http::get_auth_header(VAULT_ROLE_URL, "X-Vault-Token", "root")
+                        .map(|r| r.status == 200)
+                        .unwrap_or(false),
+                )
+            },
+        )
+    }
+
+    /// Wire the minikube node's containerd to pull from the JFrog registry over
+    /// the shared docker network (ports the bash `configure_minikube_jfrog_registry`).
+    fn configure_jfrog_registry(&self) -> Result<()> {
+        let nodes = cli::run_checked({
+            let mut c = Command::new("minikube");
+            c.arg("node").arg("list");
+            c
+        })
+        .context("minikube node list")?;
+        for line in nodes.stdout.lines() {
+            let Some(node) = line.split_whitespace().next() else {
+                continue;
+            };
+            // Best-effort: connect the node container to the compose network.
+            let _ = cli::run({
+                let mut c = Command::new("docker");
+                c.args(["network", "connect", COMPOSE_NETWORK, node]);
+                c
+            });
+            cli::run_checked({
+                let mut c = Command::new("docker");
+                c.args([
+                    "exec",
+                    node,
+                    "mkdir",
+                    "-p",
+                    "/etc/containerd/certs.d/rise-jfrog:8082",
+                ]);
+                c
+            })
+            .context("create containerd certs.d dir on node")?;
+            // Write hosts.toml into the node via `docker exec -i ... cp /dev/stdin`.
+            let mut c = Command::new("docker");
+            c.args([
+                "exec",
+                "-i",
+                node,
+                "cp",
+                "/dev/stdin",
+                "/etc/containerd/certs.d/rise-jfrog:8082/hosts.toml",
+            ]);
+            c.stdin(std::process::Stdio::piped());
+            let mut child = c.spawn().context("spawn docker exec cp hosts.toml")?;
+            use std::io::Write as _;
+            child
+                .stdin
+                .take()
+                .context("child stdin")?
+                .write_all(b"[host.\"http://rise-jfrog:8082\"]\n")
+                .context("write hosts.toml")?;
+            let status = child.wait().context("docker exec cp hosts.toml")?;
+            anyhow::ensure!(status.success(), "writing hosts.toml to node {node} failed");
+        }
+        Ok(())
     }
 
     /// Discover the single app Service (name + first port) in `ns`, polling until
@@ -179,6 +302,42 @@ impl MinikubeBackend {
         )?;
         found.context("app Service not found")
     }
+
+    /// Run the CLI from the image on the host network (reaches the port-forward),
+    /// with the repo root as the workdir so deploy-from-source paths resolve.
+    /// `mount_docker` also bind-mounts the docker socket for `--backend docker:build`.
+    fn run_cli(
+        &self,
+        args: &[&str],
+        auth: Option<CliAuth<'_>>,
+        mount_docker: bool,
+    ) -> Result<CliOutput> {
+        let pwd_str = self.repo_root.to_string_lossy().to_string();
+        let mut c = Command::new("docker");
+        c.args(["run", "--rm", "--network", "host"])
+            .args(["-e", &format!("RISE_URL={RISE_URL}")])
+            .args(["-e", &format!("MISE_TRUSTED_CONFIG_PATHS={pwd_str}")])
+            .args(["-v", &format!("{pwd_str}:{pwd_str}")])
+            .args(["-w", &pwd_str]);
+        if mount_docker {
+            c.args(["-v", "/var/run/docker.sock:/var/run/docker.sock"])
+                .args(["-e", "DOCKER_CONFIG=/tmp/rise-docker-config"]);
+        }
+        match &auth {
+            Some(a) => {
+                c.args(["-e", &format!("RISE_TOKEN={}", a.token)]);
+                if let Some(id) = a.identity {
+                    c.args(["-e", &format!("RISE_IDENTITY={id}")]);
+                }
+            }
+            None => {
+                c.args(["-e", &format!("RISE_TOKEN={}", self.ci_token)]);
+            }
+        }
+        c.args(["--entrypoint", "/usr/local/bin/rise", &self.cli_image]);
+        c.args(args);
+        cli::run(c)
+    }
 }
 
 impl Backend for MinikubeBackend {
@@ -187,15 +346,16 @@ impl Backend for MinikubeBackend {
     }
 
     fn bring_up(&mut self) -> Result<()> {
-        anyhow::ensure!(
-            self.registry_mode == RegistryMode::OciClientAuth,
-            "jfrog-vault registry mode is not yet ported to the harness (planned Phase 4)"
-        );
+        let jfrog = self.registry_mode == RegistryMode::JfrogVault;
 
         // Clean slate (a fresh cluster exercises chart bootstrap from scratch).
         let mut del = Command::new("minikube");
         del.arg("delete");
         let _ = cli::run(del);
+
+        if jfrog {
+            self.start_jfrog_vault()?;
+        }
 
         let mut start = Command::new("minikube");
         start.args([
@@ -204,11 +364,18 @@ impl Backend for MinikubeBackend {
             &format!("--cpus={}", self.cpus),
             &format!("--memory={}", self.memory),
         ]);
+        if jfrog {
+            start.arg("--insecure-registry=rise-jfrog:8082");
+        }
         cli::run_checked(start).context("minikube start")?;
 
         let mut ingress = Command::new("minikube");
         ingress.args(["addons", "enable", "ingress"]);
         cli::run_checked(ingress).context("minikube addons enable ingress")?;
+
+        if jfrog {
+            self.configure_jfrog_registry()?;
+        }
 
         let mut helm = Command::new("helm");
         helm.args([
@@ -293,32 +460,18 @@ impl Backend for MinikubeBackend {
         let mut del = Command::new("minikube");
         del.arg("delete");
         let _ = cli::run(del);
+        if self.registry_mode == RegistryMode::JfrogVault {
+            let _ = cli::run(self.compose(&["rm", "-fsv", "jfrog", "vault"]));
+        }
     }
 
     fn rise_cli(&self, args: &[&str], auth: Option<CliAuth<'_>>) -> Result<CliOutput> {
-        // Run the CLI from the image on the host network (reaches the port-forward).
-        // Mount the repo root as the workdir so deploy-from-source paths resolve.
-        let pwd_str = self.repo_root.to_string_lossy().to_string();
-        let mut c = Command::new("docker");
-        c.args(["run", "--rm", "--network", "host"])
-            .args(["-e", &format!("RISE_URL={RISE_URL}")])
-            .args(["-e", &format!("MISE_TRUSTED_CONFIG_PATHS={pwd_str}")])
-            .args(["-v", &format!("{pwd_str}:{pwd_str}")])
-            .args(["-w", &pwd_str]);
-        match &auth {
-            Some(a) => {
-                c.args(["-e", &format!("RISE_TOKEN={}", a.token)]);
-                if let Some(id) = a.identity {
-                    c.args(["-e", &format!("RISE_IDENTITY={id}")]);
-                }
-            }
-            None => {
-                c.args(["-e", &format!("RISE_TOKEN={}", self.ci_token)]);
-            }
-        }
-        c.args(["--entrypoint", "/usr/local/bin/rise", &self.cli_image]);
-        c.args(args);
-        cli::run(c)
+        self.run_cli(args, auth, false)
+    }
+
+    fn rise_cli_build(&self, args: &[&str], auth: Option<CliAuth<'_>>) -> Result<CliOutput> {
+        // Source builds need the host docker socket inside the CLI container.
+        self.run_cli(args, auth, true)
     }
 
     fn reach_app(&self, project: &str, path: &str) -> Result<Option<HttpResponse>> {
@@ -371,6 +524,10 @@ impl Backend for MinikubeBackend {
 
     fn ci_bearer(&self) -> &str {
         &self.ci_token
+    }
+
+    fn supports_source_build(&self) -> bool {
+        self.registry_mode == RegistryMode::JfrogVault
     }
 
     fn reapply_chart(&self) -> Result<()> {
