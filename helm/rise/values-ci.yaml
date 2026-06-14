@@ -1,5 +1,5 @@
-# CI-specific Helm values for Minikube e2e tests
-# Used by scripts/ci/e2e-minikube.sh
+# CI-specific Helm values for Minikube e2e tests.
+# Used by the rise-e2e harness (tests/e2e, minikube backend).
 
 postgresql:
   enabled: true

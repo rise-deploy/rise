@@ -5,7 +5,7 @@ use anyhow::Result;
 
 /// Mint the admin CI bearer the same way the backend signs sessions: HS256 over
 /// the shared secret, `iss = public_url`, `email = admin@example.com` (an admin
-/// user, so it bypasses ownership checks). Mirrors the bash `create_rise_ci_token`.
+/// user, so it bypasses ownership checks).
 pub fn mint_ci_token(secret_b64: &str, public_url: &str) -> Result<String> {
     let signer = rise_backend_auth::RiseTokenSigner::new(
         secret_b64,

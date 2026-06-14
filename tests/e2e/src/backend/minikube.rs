@@ -1,8 +1,8 @@
 //! Kubernetes-backend driver. Self-provisions its own minikube cluster + Rise
-//! Helm release — a Rust port of `scripts/ci/e2e-minikube.sh` — so scenarios run
-//! the same way as on Docker. The in-cluster Rise server and Dex are reached via
-//! background `kubectl port-forward`s (killed on teardown/drop), and the CLI runs
-//! from the image on the host network.
+//! Helm release (minikube start + helm + the JFrog/Vault registry stack), so
+//! scenarios run the same way as on Docker. The in-cluster Rise server and Dex
+//! are reached via background `kubectl port-forward`s (killed on teardown/drop),
+//! and the CLI runs from the image on the host network.
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -216,7 +216,7 @@ impl MinikubeBackend {
     }
 
     /// Wire the minikube node's containerd to pull from the JFrog registry over
-    /// the shared docker network (ports the bash `configure_minikube_jfrog_registry`).
+    /// the shared docker network.
     fn configure_jfrog_registry(&self) -> Result<()> {
         let nodes = cli::run_checked({
             let mut c = Command::new("minikube");
@@ -509,8 +509,7 @@ impl Backend for MinikubeBackend {
     }
 
     fn sample_app(&self) -> SampleApp {
-        // K8s app pods run with runAsNonRoot, so use a non-root image on a high
-        // port (matching the bash minikube suite).
+        // K8s app pods run with runAsNonRoot, so use a non-root image on a high port.
         SampleApp {
             image: "nginxinc/nginx-unprivileged:alpine",
             http_port: "8080",

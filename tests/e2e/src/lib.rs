@@ -2,12 +2,11 @@
 //!
 //! Scenarios are written once against the [`backend::Backend`] driver seam and
 //! run against either backend, so a parity gap shows up as a *declared skip*
-//! (printed with a reason) rather than silent drift between two bash scripts.
+//! (printed with a reason) rather than silent drift.
 //!
 //! The harness is gated on the `RISE_E2E_BACKEND` env var (`docker` | `minikube`).
-//! When it is unset — the default, including the normal `cargo test --workspace`
-//! run — every test returns immediately, so this crate never tries to stand up a
-//! backend it wasn't asked to.
+//! When it is unset, every test returns immediately, so the crate never tries to
+//! stand up a backend it wasn't asked to.
 
 pub mod backend;
 pub mod cli;

@@ -3,11 +3,8 @@
 A typed Rust harness that runs end-to-end scenarios against a real Rise stack.
 Scenarios are written **once** against the [`Backend`](src/backend/mod.rs) driver
 seam and run on either backend, so a parity gap surfaces as a **declared skip**
-(printed with a reason) instead of silent drift between two bash scripts.
-
-It exists to replace the drift-prone `scripts/ci/e2e-*.sh` suites; that migration
-is incremental (see `ROADMAP.md` → *Cross-backend E2E test consistency*). The bash
-suites still run in CI today.
+(printed with a reason) instead of silent drift. It is the sole end-to-end test
+suite for the Docker and Kubernetes deployment backends.
 
 ## Running
 
@@ -39,10 +36,10 @@ RISE_E2E_BACKEND=minikube RISE_IMAGE_TAG=<tag> \
 - `src/backend/` — the `Backend` driver seam. Both backends self-provision their
   own stack: `DockerBackend` via `docker compose` (CLI extraction via `docker cp`,
   Traefik reach); `MinikubeBackend` via `minikube start` + `helm upgrade --install`
-  + background `kubectl port-forward`s (server, Dex, per-app reach), a Rust port of
-  `scripts/ci/e2e-minikube.sh`.
+  + the JFrog/Vault registry stack + background `kubectl port-forward`s (server,
+  Dex, per-app reach).
 - `src/scenario.rs` — backend-agnostic scenarios + the matrix runner. Each
-  `Scenario::applies_to(kind)` returns `Run` or `Skip(reason)`.
+  `Scenario::applies_to(backend)` returns `Run` or `Skip(reason)`.
 - `src/{cli,http,token,dex}.rs` — process/HTTP/token helpers. `token` reuses
   `rise-backend-auth` to mint the CI bearer; `dex` mints OIDC id_tokens via the
   resource-owner password grant.
@@ -52,5 +49,10 @@ RISE_E2E_BACKEND=minikube RISE_IMAGE_TAG=<tag> \
 
 | id                  | docker | minikube | asserts |
 |---------------------|--------|----------|---------|
-| `public-deploy`     | Run    | Run      | deploy `traefik/whoami` → Healthy; HTTP 200 (+ `Hostname:` body on Docker) |
+| `public-deploy`     | Run    | Run      | deploy a sample app → Healthy; HTTP 200 (+ body marker) |
 | `sa-token-exchange` | Run    | Run      | SA + Dex password-grant id_token + `RISE_IDENTITY` → `project list` returns the SA's project; un-exchanged token rejected |
+| `loki-log-retention`| Skip   | Run      | stop deployment, pods gone, `/logs/volume` total>0 + `rise deployment logs` returns backlog (served by Loki) |
+| `helm-idempotency`  | Skip   | Run      | re-run `helm upgrade` applies cleanly |
+| `workload-identity` | Skip   | Run¹     | build fixture from source; `/identity` reports valid file+exchanged tokens, project-bound sub, matching iss; file token re-mints (new jti) |
+
+¹ minikube only in `jfrog-vault` registry mode (source build needs a cluster-pullable registry); otherwise `Skip`.

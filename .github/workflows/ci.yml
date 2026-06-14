@@ -916,8 +916,7 @@ jobs:
 
   # Typed cross-backend harness (crate rise-e2e) on Kubernetes: it self-provisions
   # its own minikube cluster + Helm release (default oci-client-auth mode) and runs
-  # the same scenarios as the Docker harness. Replaces the former bash
-  # `e2e-minikube` smoke job.
+  # the same scenarios as the Docker harness.
   e2e-minikube-harness:
     name: Minikube end-to-end (rise-e2e harness)
     runs-on: ubuntu-latest
@@ -993,7 +992,6 @@ jobs:
       # Typed cross-backend harness (crate rise-e2e): self-provisions its own
       # compose stack and runs every Docker scenario (public deploy, SA token
       # exchange, private/forwardAuth, health-rolling cutover, workload identity).
-      # Replaces the former bash `e2e-docker.sh` smoke suite.
       - name: Run Rust e2e harness (docker backend)
         env:
           RISE_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
@@ -1004,8 +1002,7 @@ jobs:
 
   # rise-e2e harness in jfrog-vault mode: self-provisions JFrog + Vault + a minikube
   # cluster whose registry pulls from JFrog, then runs the workload-identity scenario
-  # (which builds the fixture from source). Replaces the former bash
-  # `e2e-minikube-jfrog-vault` smoke job.
+  # (which builds the fixture from source).
   e2e-minikube-harness-jfrog-vault:
     name: Minikube JFrog/Vault (rise-e2e harness)
     runs-on: ubuntu-latest

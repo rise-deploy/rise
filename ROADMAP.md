@@ -658,14 +658,13 @@ Listed so they don't fall out of the plan; not currently sequenced.
 
 # Cross-backend E2E test consistency
 
-**Done.** The drift-prone bash e2e suites (`e2e-docker.sh`, `e2e-minikube.sh`)
-have been replaced by a typed Rust harness, crate **`rise-e2e`** (`tests/e2e/`, a
-standalone workspace). Scenarios are written once against a `Backend` driver seam;
-each declares which backends it `applies_to`, and an unsupported combo is a
-**logged `Skip(reason)`** — a visible, declared parity gap, never silent drift.
-Both backends **self-provision** their own stack (Docker via compose; minikube via
-`minikube start` + `helm` + the JFrog/Vault registry stack + port-forwards). The
-CI bearer is minted via `rise-backend-auth` (no more openssl-HMAC).
+**Done.** End-to-end tests run through a typed Rust harness, crate **`rise-e2e`**
+(`tests/e2e/`, a standalone workspace). Scenarios are written once against a
+`Backend` driver seam; each declares which backends it `applies_to`, and an
+unsupported combo is a **logged `Skip(reason)`** — a visible, declared parity gap,
+never silent drift. Both backends **self-provision** their own stack (Docker via
+compose; minikube via `minikube start` + `helm` + the JFrog/Vault registry stack +
+port-forwards). The CI bearer is minted via `rise-backend-auth`.
 
 Scenario matrix (`Run` / `Skip`):
 
@@ -681,7 +680,7 @@ Scenario matrix (`Run` / `Skip`):
 
 CI jobs: `e2e-docker`, `e2e-minikube-harness`, `e2e-minikube-harness-jfrog-vault`
 (all `RISE_E2E_BACKEND`-gated), plus a fast `rise-e2e harness quality` lint/test
-job. The bash suites and their jobs have been deleted.
+job.
 
 **`sa-token-exchange`** closes the WS2 Phase 2 gap end to end on **both** backends:
 an SA trusting Dex, a Dex id_token via the password grant, `RISE_IDENTITY` set →
