@@ -2,7 +2,8 @@
 //! declares which backends it `applies_to`; an unsupported combo is a logged
 //! `Skip(reason)` — a visible parity gap, never silent drift.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
@@ -902,24 +903,44 @@ impl Scenario for HealthRollingCutover {
         );
 
         // Force a cutover (changed env → new revision) and assert NO 5xx gap across
-        // the rollout — old servers must keep serving until the new ones are UP.
-        expect_ok(
-            b.rise_cli(
-                &["deploy", &dir, "--project", &project, "--env", "REV=2"],
-                None,
-            )?,
-            "deploy REV=2",
-        )?;
-        for _ in 0..40 {
-            let r = b.ingress_get_once(&project, "/")?;
-            anyhow::ensure!(
-                r.status < 500,
-                "5xx gap during cutover: status {}\n{}",
-                r.status,
-                r.body
-            );
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        }
+        // the rollout. `rise deploy` FOLLOWS the new revision to a terminal state,
+        // so the probe must run CONCURRENTLY with the deploy to span the cutover
+        // window — a probe that started only after the deploy returned would sample
+        // an already-converged stack and never witness a gap. A background thread
+        // hammers the ingress (Host-routed GETs) and records the worst status seen.
+        let base = b
+            .traefik_base()
+            .context("backend has no Traefik ingress")?
+            .to_string();
+        let url = format!("{base}/");
+        let host = format!("{project}.rise.localhost");
+        let stop = Arc::new(AtomicBool::new(false));
+        let worst = Arc::new(AtomicU16::new(0));
+        let probe = {
+            let (stop, worst) = (stop.clone(), worst.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok(r) = http::get(&url, Some(&host)) {
+                        if r.status > worst.load(Ordering::Relaxed) {
+                            worst.store(r.status, Ordering::Relaxed);
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            })
+        };
+        let deployed = b.rise_cli(
+            &["deploy", &dir, "--project", &project, "--env", "REV=2"],
+            None,
+        );
+        stop.store(true, Ordering::Relaxed);
+        let _ = probe.join();
+        expect_ok(deployed?, "deploy REV=2")?;
+        let worst = worst.load(Ordering::Relaxed);
+        anyhow::ensure!(
+            worst < 500,
+            "5xx gap during cutover — worst status observed through Traefik was {worst}"
+        );
         b.wait_healthy(&project)?;
 
         // Assert REV=2 actually took over: every running app container carries REV=2

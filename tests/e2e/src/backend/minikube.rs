@@ -199,6 +199,9 @@ impl MinikubeBackend {
     /// Bring up the JFrog + Vault services and wait for Vault to mint the
     /// Artifactory role (the registry token provider depends on it).
     fn start_jfrog_vault(&self) -> Result<()> {
+        // Start from a clean slate — a prior crashed run can leave a populated
+        // vault_plugins volume / Artifactory state that would be silently reused.
+        let _ = cli::run(self.compose(&["down", "-v"]));
         cli::run_checked(self.compose(&["up", "-d", "jfrog", "vault"]))
             .context("docker compose up jfrog vault")?;
         http::poll(
@@ -461,7 +464,10 @@ impl Backend for MinikubeBackend {
         del.arg("delete");
         let _ = cli::run(del);
         if self.registry_mode == RegistryMode::JfrogVault {
-            let _ = cli::run(self.compose(&["rm", "-fsv", "jfrog", "vault"]));
+            // `down -v` (not `rm`) so the named volumes + the rise_default network
+            // are removed too, leaving no state for the next run. The node was
+            // already removed by `minikube delete` above, so the network is free.
+            let _ = cli::run(self.compose(&["down", "-v"]));
         }
     }
 
@@ -551,8 +557,11 @@ impl Backend for MinikubeBackend {
                 let mut c = Command::new("kubectl");
                 c.args(["get", "pods", "-n", &ns, "--no-headers"]);
                 let out = cli::run(c)?;
+                // Only trust empty stdout when kubectl actually succeeded — on a
+                // transient error kubectl exits non-zero with empty stdout (the
+                // message goes to stderr), which must NOT read as "pods gone".
                 // `kubectl` prints "No resources found" to stderr; stdout is empty.
-                Ok(out.stdout.trim().is_empty())
+                Ok(out.success() && out.stdout.trim().is_empty())
             },
         )
     }

@@ -10,7 +10,10 @@ pub fn mint_ci_token(secret_b64: &str, public_url: &str) -> Result<String> {
     let signer = rise_backend_auth::RiseTokenSigner::new(
         secret_b64,
         public_url.to_string(),
-        3600,
+        // 6h TTL: a full minikube + jfrog-vault run (cluster bring-up, two 10m
+        // kubectl waits, all scenarios) can take well over an hour, and the bearer
+        // is minted once at construction — keep it valid for the whole run.
+        21_600,
         vec!["sub".to_string(), "email".to_string(), "name".to_string()],
         None,
         None,
