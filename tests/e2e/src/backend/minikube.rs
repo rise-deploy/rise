@@ -89,6 +89,9 @@ pub struct MinikubeBackend {
     /// Repo root (the chart + values live here). `cargo test` runs the test binary
     /// with CWD = the crate dir, so all repo paths must be absolute.
     repo_root: PathBuf,
+    /// The minikube node IP (`minikube ip`), set in `bring_up`. The nginx ingress
+    /// addon listens on it at :80 — used for ingress-level reach.
+    node_ip: String,
     /// Long-lived forwards (server, Dex) kept alive for the whole run.
     forwards: Vec<PortForward>,
 }
@@ -129,6 +132,7 @@ impl MinikubeBackend {
                 issuer: DEX_ISSUER.to_string(),
             },
             repo_root,
+            node_ip: String::new(),
             forwards: Vec::new(),
         })
     }
@@ -376,6 +380,16 @@ impl Backend for MinikubeBackend {
         ingress.args(["addons", "enable", "ingress"]);
         cli::run_checked(ingress).context("minikube addons enable ingress")?;
 
+        // The node IP is where the nginx ingress addon listens (:80); used for
+        // ingress-level reach (the private-ingress-auth scenario).
+        let ip = cli::run_checked({
+            let mut c = Command::new("minikube");
+            c.arg("ip");
+            c
+        })
+        .context("minikube ip")?;
+        self.node_ip = ip.stdout.trim().to_string();
+
         if jfrog {
             self.configure_jfrog_registry()?;
         }
@@ -533,6 +547,65 @@ impl Backend for MinikubeBackend {
 
     fn supports_source_build(&self) -> bool {
         self.registry_mode == RegistryMode::JfrogVault
+    }
+
+    fn app_host(&self, project: &str) -> String {
+        // Default-group deploy → the chart's production ingress URL template.
+        format!("{project}.apps.rise.local")
+    }
+
+    fn ingress_get(
+        &self,
+        project: &str,
+        path: &str,
+        follow_redirects: bool,
+        cookie: Option<&str>,
+    ) -> Result<http::Resp> {
+        // Reach the nginx ingress controller on the node IP (:80), Host-routed —
+        // this exercises the ingress auth, unlike reach_app's Service port-forward.
+        let host = self.app_host(project);
+        http::request(
+            &format!("http://{}{path}", self.node_ip),
+            Some(&host),
+            cookie,
+            follow_redirects,
+        )
+    }
+
+    fn assert_ingress_auth_configured(&self, project: &str) -> Result<()> {
+        // The controller stamps nginx auth annotations on the app's Ingress
+        // (resource `default` in namespace `rise-<project>`). Poll until present.
+        let ns = format!("rise-{project}");
+        let mut last = String::new();
+        http::poll(
+            Duration::from_secs(60),
+            Duration::from_secs(2),
+            &format!("nginx auth annotations on ingress in {ns}"),
+            || {
+                let mut c = Command::new("kubectl");
+                c.args(["get", "ingress", "-n", &ns, "-o", "json"]);
+                let out = cli::run(c)?;
+                if !out.success() {
+                    return Ok(false);
+                }
+                last = out.stdout.clone();
+                let v: serde_json::Value =
+                    serde_json::from_str(&out.stdout).unwrap_or(serde_json::Value::Null);
+                // Any Ingress in the namespace carrying the auth-url + response-headers
+                // annotations confirms the Member access class was wired.
+                let ok = v["items"].as_array().is_some_and(|items| {
+                    items.iter().any(|i| {
+                        let ann = &i["metadata"]["annotations"];
+                        ann["nginx.ingress.kubernetes.io/auth-url"]
+                            .as_str()
+                            .is_some_and(|u| u.contains("/api/v1/auth/ingress"))
+                            && ann["nginx.ingress.kubernetes.io/auth-response-headers"].is_string()
+                    })
+                });
+                Ok(ok)
+            },
+        )
+        .with_context(|| format!("ingress missing nginx auth annotations:\n{last}"))
     }
 
     fn reapply_chart(&self) -> Result<()> {

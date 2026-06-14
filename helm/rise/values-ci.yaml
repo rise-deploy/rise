@@ -74,8 +74,8 @@ config:
   deployment_controller:
     type: kubernetes
     # Short identity-token TTL so the e2e workload-identity refresh assertion
-    # (scripts/ci/lib/identity.sh) observes an in-place re-mint (at half-TTL)
-    # inside the test window. CI-only; production keeps the 3600s default.
+    # observes an in-place re-mint (at half-TTL) inside the test window. CI-only;
+    # production keeps the 3600s default.
     identity_token_ttl_seconds: 60
     production_ingress_url_template: "{project_name}.apps.rise.local"
     staging_ingress_url_template: "{project_name}-{deployment_group}.preview.rise.local"
@@ -87,3 +87,10 @@ config:
         description: Public access without authentication
         ingress_class: nginx
         access_requirement: None
+      # Exercised by the private-ingress-auth scenario: the controller stamps the
+      # nginx auth annotations for a Member access requirement.
+      private:
+        display_name: Private
+        description: Requires authentication and project membership.
+        ingress_class: nginx
+        access_requirement: Member

@@ -70,11 +70,32 @@ fn no_redirect_client() -> &'static reqwest::blocking::Client {
     })
 }
 
-/// GET without following redirects, returning the status and `Location` header.
-pub fn get_no_redirect(url: &str, host: Option<&str>) -> Result<(u16, Option<String>)> {
-    let mut req = no_redirect_client().get(url);
+/// A full GET result including the `Location` header (for redirect assertions).
+pub struct Resp {
+    pub status: u16,
+    pub location: Option<String>,
+    pub body: String,
+}
+
+/// Flexible GET for ingress-level checks: optional `Host` override and `Cookie`,
+/// and a toggle for following redirects (off → assert the 3xx + `Location`).
+pub fn request(
+    url: &str,
+    host: Option<&str>,
+    cookie: Option<&str>,
+    follow_redirects: bool,
+) -> Result<Resp> {
+    let client = if follow_redirects {
+        shared_client()
+    } else {
+        no_redirect_client()
+    };
+    let mut req = client.get(url);
     if let Some(h) = host {
         req = req.header(reqwest::header::HOST, h);
+    }
+    if let Some(c) = cookie {
+        req = req.header(reqwest::header::COOKIE, c);
     }
     let resp = req.send().with_context(|| format!("GET {url}"))?;
     let status = resp.status().as_u16();
@@ -83,20 +104,12 @@ pub fn get_no_redirect(url: &str, host: Option<&str>) -> Result<(u16, Option<Str
         .get(reqwest::header::LOCATION)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    Ok((status, location))
-}
-
-/// GET with a `Host` override and a `Cookie` header (Traefik forwardAuth auth check).
-pub fn get_with_cookie(url: &str, host: &str, cookie: &str) -> Result<HttpResponse> {
-    let resp = shared_client()
-        .get(url)
-        .header(reqwest::header::HOST, host)
-        .header(reqwest::header::COOKIE, cookie)
-        .send()
-        .with_context(|| format!("GET {url}"))?;
-    let status = resp.status().as_u16();
     let body = resp.text().unwrap_or_default();
-    Ok(HttpResponse { status, body })
+    Ok(Resp {
+        status,
+        location,
+        body,
+    })
 }
 
 /// GET `url` with a single custom header (e.g. Vault's `X-Vault-Token`).

@@ -278,9 +278,42 @@ impl Backend for DockerBackend {
         })
     }
 
-    fn ingress_get_once(&self, project: &str, path: &str) -> Result<HttpResponse> {
-        let host = format!("{project}.rise.localhost");
-        http::get(&format!("{TRAEFIK_URL}{path}"), Some(&host))
+    fn app_host(&self, project: &str) -> String {
+        format!("{project}.rise.localhost")
+    }
+
+    fn ingress_get(
+        &self,
+        project: &str,
+        path: &str,
+        follow_redirects: bool,
+        cookie: Option<&str>,
+    ) -> Result<http::Resp> {
+        let host = self.app_host(project);
+        http::request(
+            &format!("{TRAEFIK_URL}{path}"),
+            Some(&host),
+            cookie,
+            follow_redirects,
+        )
+    }
+
+    fn assert_ingress_auth_configured(&self, project: &str) -> Result<()> {
+        // Traefik forwardAuth: the controller stamps forwardauth + router-middleware
+        // labels on the app container (it can lag the Healthy mark, so poll).
+        let mut labels = String::new();
+        http::poll(
+            Duration::from_secs(60),
+            Duration::from_secs(2),
+            &format!("forwardAuth labels on {project}"),
+            || {
+                labels = self.app_container_labels(project)?;
+                Ok(labels.contains("forwardauth.address")
+                    && labels.contains(".routers.")
+                    && labels.contains(".middlewares"))
+            },
+        )
+        .with_context(|| format!("private app container missing forwardAuth labels:\n{labels}"))
     }
 
     fn app_container_envs(&self, project: &str) -> Result<Vec<String>> {

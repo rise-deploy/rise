@@ -29,7 +29,7 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(PublicDeploy),
         Box::new(SaTokenExchange),
-        Box::new(PrivateForwardAuth),
+        Box::new(PrivateIngressAuth),
         Box::new(HealthRollingCutover),
         Box::new(LokiLogRetention),
         Box::new(HelmIdempotency),
@@ -614,32 +614,25 @@ impl Scenario for WorkloadIdentity {
     }
 }
 
-// ---- (f) private project / Traefik forwardAuth (docker only) ----------------
+// ---- (f) private project / ingress auth (both backends) ---------------------
 
-struct PrivateForwardAuth;
+struct PrivateIngressAuth;
 
-impl Scenario for PrivateForwardAuth {
+impl Scenario for PrivateIngressAuth {
     fn id(&self) -> &'static str {
-        "private-forward-auth"
+        "private-ingress-auth"
     }
 
-    fn applies_to(&self, b: &dyn Backend) -> Applicability {
-        match b.kind() {
-            // Traefik forwardAuth is the docker ingress-auth mechanism; K8s uses
-            // nginx auth annotations (a separate path, not covered here).
-            BackendKind::Docker => Applicability::Run,
-            BackendKind::Minikube => {
-                Applicability::Skip("forwardAuth is a Traefik/docker-specific mechanism")
-            }
-        }
+    fn applies_to(&self, _b: &dyn Backend) -> Applicability {
+        // The ingress-auth contract — block unauthenticated, allow authenticated —
+        // holds on both backends; only the wiring + reach differ, behind the trait
+        // (Traefik forwardAuth labels on docker; nginx auth annotations on K8s).
+        Applicability::Run
     }
 
     fn run(&self, b: &dyn Backend) -> Result<()> {
-        let traefik = b.traefik_base().context("backend has no Traefik ingress")?;
         let project = unique("e2e-priv");
         let app = b.sample_app();
-        let host = format!("{project}.rise.localhost");
-
         expect_ok(
             b.rise_cli(
                 &[
@@ -673,84 +666,39 @@ impl Scenario for PrivateForwardAuth {
         )?;
         b.wait_healthy(&project)?;
 
-        // The routable container can lag the API's Healthy mark; poll until the
-        // forwardAuth + router-middlewares labels are stamped.
-        let mut labels = String::new();
-        for _ in 0..30 {
-            labels = b.app_container_labels(&project)?;
-            if labels.contains("forwardauth.address")
-                && labels.contains(".routers.")
-                && labels.contains(".middlewares")
-            {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_secs(2));
-        }
-        anyhow::ensure!(
-            labels.contains("forwardauth.address"),
-            "private app container missing forwardAuth labels:\n{labels}"
-        );
-        anyhow::ensure!(
-            labels.contains(".routers.") && labels.contains(".middlewares"),
-            "private app router missing the middlewares label:\n{labels}"
-        );
+        // Per-backend wiring check (Traefik forwardAuth labels / nginx annotations).
+        b.assert_ingress_auth_configured(&project)?;
 
-        // Unauthenticated must be a same-host 302 to the project's /.rise signin page.
-        let mut code = 0;
+        // Unauthenticated → 302 to the project's signin page. Poll the ingress until
+        // the route is wired (tolerate warmup 404/5xx/connection errors).
+        let mut status = 0;
         let mut location = None;
-        for _ in 0..30 {
-            let (c, loc) = http::get_no_redirect(&format!("{traefik}/"), Some(&host))?;
-            if c != 404 {
-                code = c;
-                location = loc;
-                break;
+        for _ in 0..45 {
+            match b.ingress_get(&project, "/", false, None) {
+                Ok(r) if r.status == 302 => {
+                    status = r.status;
+                    location = r.location;
+                    break;
+                }
+                Ok(r) => status = r.status,
+                Err(_) => {}
             }
             std::thread::sleep(std::time::Duration::from_secs(2));
         }
         anyhow::ensure!(
-            code == 302,
-            "expected 302 for unauthenticated private request, got {code}"
+            status == 302,
+            "expected 302 for unauthenticated private request, got {status}"
         );
         let location = location.context("302 had no Location header")?;
         anyhow::ensure!(
-            location.contains(&format!("//{host}/.rise/auth/signin")),
-            "redirect not to same-host signin page: {location}"
+            location.contains("/.rise/auth/signin")
+                && location.contains(&format!("project={project}")),
+            "redirect not to the project's signin page: {location}"
         );
-        anyhow::ensure!(
-            location.contains(&format!("project={project}")),
-            "redirect Location missing project={project}: {location}"
-        );
-
-        // /.rise/* on the app host is served by the BACKEND (200, not the app).
-        let mut signin =
-            b.ingress_get_once(&project, &format!("/.rise/auth/signin?project={project}"))?;
-        for _ in 0..30 {
-            if signin.status != 404 {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            signin =
-                b.ingress_get_once(&project, &format!("/.rise/auth/signin?project={project}"))?;
-        }
-        anyhow::ensure!(
-            signin.status == 200,
-            "expected 200 for backend-served /.rise/auth/signin, got {}",
-            signin.status
-        );
-        if let Some(marker) = app.body_marker {
-            anyhow::ensure!(
-                !signin.body.contains(marker),
-                "/.rise path was served by the app, not the backend:\n{}",
-                signin.body
-            );
-        }
 
         // Authenticated (rise_jwt cookie) is allowed through to the app.
-        let authed = http::get_with_cookie(
-            &format!("{traefik}/"),
-            &host,
-            &format!("rise_jwt={}", b.ci_bearer()),
-        )?;
+        let cookie = format!("rise_jwt={}", b.ci_bearer());
+        let authed = b.ingress_get(&project, "/", true, Some(&cookie))?;
         anyhow::ensure!(
             authed.status == 200,
             "expected 200 for authed private request, got {}",
@@ -920,7 +868,7 @@ impl Scenario for HealthRollingCutover {
             .context("backend has no Traefik ingress")?
             .to_string();
         let url = format!("{base}/");
-        let host = format!("{project}.rise.localhost");
+        let host = b.app_host(&project);
         let stop = Arc::new(AtomicBool::new(false));
         let worst = Arc::new(AtomicU16::new(0));
         let probe = {

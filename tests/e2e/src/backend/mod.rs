@@ -116,14 +116,25 @@ pub trait Backend {
         )
     }
 
-    /// A single GET through the ingress with a `Host` header, NO retry (so a 5xx
-    /// during a cutover is observed, not polled away). Docker only.
-    fn ingress_get_once(&self, _project: &str, _path: &str) -> Result<HttpResponse> {
-        anyhow::bail!(
-            "ingress_get_once is not supported by the {} backend",
-            self.name()
-        )
-    }
+    /// The app's ingress hostname for this backend (Traefik host on docker, the
+    /// chart's ingress URL on minikube).
+    fn app_host(&self, project: &str) -> String;
+
+    /// One GET through the backend's real HTTP ingress (Traefik on docker, the
+    /// nginx ingress controller on minikube), with optional `Cookie` and a toggle
+    /// for following redirects. Unlike `reach_app` (which may port-forward straight
+    /// to the app Service), this traverses the ingress so ingress-level auth runs.
+    fn ingress_get(
+        &self,
+        project: &str,
+        path: &str,
+        follow_redirects: bool,
+        cookie: Option<&str>,
+    ) -> Result<crate::http::Resp>;
+
+    /// Assert the backend wired ingress-level auth for a private (Member) project:
+    /// Traefik forwardAuth labels on docker, nginx auth annotations on minikube.
+    fn assert_ingress_auth_configured(&self, project: &str) -> Result<()>;
 
     /// Each running app container's `Config.Env` as a JSON-array string — to
     /// assert which revision is live after a cutover. Docker only.
