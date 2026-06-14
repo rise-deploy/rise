@@ -29,6 +29,7 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
         Box::new(PublicDeploy),
         Box::new(SaTokenExchange),
         Box::new(PrivateForwardAuth),
+        Box::new(HealthRollingCutover),
         Box::new(LokiLogRetention),
         Box::new(HelmIdempotency),
         // Last: on Docker it recreates the backend with the identity overlay, so
@@ -754,6 +755,192 @@ impl Scenario for PrivateForwardAuth {
                 authed.body
             );
         }
+        Ok(())
+    }
+}
+
+// ---- (g) health-rolling cutover (docker only) ------------------------------
+
+/// Sanitize to a Traefik router/service base name (lowercase; non-alnum runs → `-`).
+fn sanitize_router_name(s: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for ch in s.to_lowercase().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+struct HealthRollingCutover;
+
+impl Scenario for HealthRollingCutover {
+    fn id(&self) -> &'static str {
+        "health-rolling-cutover"
+    }
+
+    fn applies_to(&self, b: &dyn Backend) -> Applicability {
+        match b.kind() {
+            // Reads Traefik serverStatus + per-container env; Traefik/docker-specific.
+            BackendKind::Docker => Applicability::Run,
+            BackendKind::Minikube => {
+                Applicability::Skip("cutover probe reads the Traefik API (docker-specific)")
+            }
+        }
+    }
+
+    fn run(&self, b: &dyn Backend) -> Result<()> {
+        let project = unique("e2e-cut");
+        let app = b.sample_app();
+
+        // A health_check needs a [containers.<name>] block (the --image path has
+        // none), so deploy from a generated project dir.
+        let dir = std::env::temp_dir().join(unique("rise-cut"));
+        std::fs::create_dir_all(&dir).context("create cutover project dir")?;
+        std::fs::write(
+            dir.join("rise.toml"),
+            format!(
+                "[project]\nname = \"{project}\"\n\n[containers.app]\nimage = \"{}\"\nport = {}\nreplicas = 2\n\n[containers.app.deploy.health_check]\npath = \"/\"\n",
+                app.image, app.http_port
+            ),
+        )
+        .context("write cutover rise.toml")?;
+        let dir = dir.to_string_lossy().to_string();
+
+        expect_ok(
+            b.rise_cli(
+                &[
+                    "project",
+                    "create",
+                    &project,
+                    "--access-class",
+                    "public",
+                    "--no-rise-toml",
+                ],
+                None,
+            )?,
+            "project create",
+        )?;
+        expect_ok(
+            b.rise_cli(
+                &["deploy", &dir, "--project", &project, "--env", "REV=1"],
+                None,
+            )?,
+            "deploy REV=1",
+        )?;
+        b.wait_healthy(&project)?;
+
+        // Read the authoritative group-scoped Traefik service name off the app
+        // container's `traefik.http.services.<svc>.loadbalancer.server.port` label.
+        let labels_json = b.app_container_labels(&project)?;
+        let labels: serde_json::Value =
+            serde_json::from_str(&labels_json).context("parse container labels")?;
+        let svc = labels
+            .as_object()
+            .context("labels not an object")?
+            .keys()
+            .find_map(|k| {
+                k.strip_prefix("traefik.http.services.")
+                    .and_then(|r| r.strip_suffix(".loadbalancer.server.port"))
+            })
+            .context("no traefik service label on the app container")?
+            .to_string();
+        // Drift guard: readable base + an injective 16-hex suffix.
+        let base = sanitize_router_name(&format!("{project}-default-app"));
+        let suffix = svc
+            .strip_prefix(&format!("{base}-"))
+            .with_context(|| format!("service '{svc}' does not start with '{base}-'"))?;
+        anyhow::ensure!(
+            suffix.len() == 16
+                && suffix
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            "service '{svc}' suffix is not 16 lowercase hex chars"
+        );
+
+        // The serverStatus gate signal must exist and be correctly shaped (Traefik
+        // v3 puts it at the top level, keyed by server URL → UP/DOWN).
+        let mut status_ok = false;
+        let mut last = String::new();
+        for _ in 0..30 {
+            let resp = b.traefik_api(&format!("/api/http/services/{svc}@docker"))?;
+            last = resp.body.clone();
+            if resp.status == 200 {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp.body) {
+                    if let Some(ss) = v.get("serverStatus").and_then(|s| s.as_object()) {
+                        let well_formed = !ss.is_empty()
+                            && ss.iter().all(|(k, val)| {
+                                k.starts_with("http://")
+                                    && k.rsplit(':').next().is_some_and(|p| {
+                                        !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())
+                                    })
+                                    && val.as_str().is_some_and(|s| {
+                                        s.eq_ignore_ascii_case("UP")
+                                            || s.eq_ignore_ascii_case("DOWN")
+                                    })
+                            });
+                        let any_up = ss
+                            .values()
+                            .any(|v| v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("UP")));
+                        if well_formed && any_up {
+                            status_ok = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        anyhow::ensure!(
+            status_ok,
+            "Traefik API never exposed a valid non-empty serverStatus for {svc}@docker; last:\n{last}"
+        );
+
+        // Force a cutover (changed env → new revision) and assert NO 5xx gap across
+        // the rollout — old servers must keep serving until the new ones are UP.
+        expect_ok(
+            b.rise_cli(
+                &["deploy", &dir, "--project", &project, "--env", "REV=2"],
+                None,
+            )?,
+            "deploy REV=2",
+        )?;
+        for _ in 0..40 {
+            let r = b.ingress_get_once(&project, "/")?;
+            anyhow::ensure!(
+                r.status < 500,
+                "5xx gap during cutover: status {}\n{}",
+                r.status,
+                r.body
+            );
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        b.wait_healthy(&project)?;
+
+        // Assert REV=2 actually took over: every running app container carries REV=2
+        // and none still carries REV=1 (the old replicas were retired).
+        let mut took_over = false;
+        for _ in 0..30 {
+            let envs = b.app_container_envs(&project)?;
+            if !envs.is_empty() {
+                let saw_rev2 = envs.iter().any(|e| e.contains("\"REV=2\""));
+                let saw_rev1 = envs.iter().any(|e| e.contains("\"REV=1\""));
+                if saw_rev2 && !saw_rev1 {
+                    took_over = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        anyhow::ensure!(
+            took_over,
+            "REV=2 did not become the sole active revision after cutover convergence"
+        );
         Ok(())
     }
 }

@@ -130,6 +130,15 @@ pub trait Backend {
         )
     }
 
+    /// Each running app container's `Config.Env` as a JSON-array string — to
+    /// assert which revision is live after a cutover. Docker only.
+    fn app_container_envs(&self, _project: &str) -> Result<Vec<String>> {
+        anyhow::bail!(
+            "app_container_envs is not supported by the {} backend",
+            self.name()
+        )
+    }
+
     /// Backend-specific preparation before the workload-identity scenario (e.g.
     /// Docker recreates the backend with the identity compose overlay). No-op by default.
     fn prepare_workload_identity(&self) -> Result<()> {

@@ -283,6 +283,25 @@ impl Backend for DockerBackend {
         http::get(&format!("{TRAEFIK_URL}{path}"), Some(&host))
     }
 
+    fn app_container_envs(&self, project: &str) -> Result<Vec<String>> {
+        let mut list = Command::new("docker");
+        list.args([
+            "ps",
+            "--filter",
+            &format!("name=rise_{project}"),
+            "--format",
+            "{{.Names}}",
+        ]);
+        let names = cli::run(list)?;
+        let mut envs = Vec::new();
+        for name in names.stdout.lines().filter(|l| !l.trim().is_empty()) {
+            let mut c = Command::new("docker");
+            c.args(["inspect", name.trim(), "--format", "{{json .Config.Env}}"]);
+            envs.push(cli::run_checked(c)?.stdout);
+        }
+        Ok(envs)
+    }
+
     fn prepare_workload_identity(&self) -> Result<()> {
         // Recreate the rise backend with the identity overlay (scoped registry_url +
         // short token TTL) so the workload-identity deploy/build + refresh apply.
