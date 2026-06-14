@@ -738,4 +738,52 @@ impl Backend for MinikubeBackend {
             },
         )
     }
+
+    fn dump_diagnostics(&self) {
+        let mk = |args: &[&str]| {
+            let mut c = Command::new("minikube");
+            c.args(args);
+            c
+        };
+        let kc = |args: &[&str]| {
+            let mut c = Command::new("kubectl");
+            c.args(args);
+            c
+        };
+        cli::dump("minikube status", mk(&["status"]));
+        cli::dump("pods (all namespaces)", kc(&["get", "pods", "-A"]));
+        cli::dump(
+            "recent events",
+            kc(&["get", "events", "-A", "--sort-by=.lastTimestamp"]),
+        );
+        cli::dump(
+            &format!("describe rise pods (ns {NAMESPACE})"),
+            kc(&[
+                "describe",
+                "pods",
+                "-n",
+                NAMESPACE,
+                "-l",
+                &format!("app.kubernetes.io/instance={RELEASE}"),
+            ]),
+        );
+        cli::dump(
+            "rise server logs (last 200 lines)",
+            kc(&[
+                "logs",
+                "-n",
+                NAMESPACE,
+                &format!("deploy/{SERVER_SVC}"),
+                "--tail=200",
+            ]),
+        );
+        cli::dump("minikube logs (tail)", mk(&["logs", "--length=80"]));
+        if self.registry_mode == RegistryMode::JfrogVault {
+            cli::dump("jfrog/vault compose ps", self.compose(&["ps"]));
+            cli::dump(
+                "jfrog/vault compose logs (tail)",
+                self.compose(&["logs", "--no-color", "--tail=100"]),
+            );
+        }
+    }
 }

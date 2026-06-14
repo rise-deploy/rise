@@ -37,6 +37,30 @@ pub fn run(mut cmd: Command) -> Result<CliOutput> {
     })
 }
 
+/// Run a diagnostic command best-effort and print its output to stderr under a
+/// header. Never returns an error — used on the failure path to surface cluster
+/// / container state and logs, so a missing tool or a non-zero exit just prints
+/// what it can and moves on.
+pub fn dump(label: &str, mut cmd: Command) {
+    eprintln!("\n--- {label} ---");
+    match cmd.output() {
+        Ok(o) => {
+            let out = String::from_utf8_lossy(&o.stdout);
+            if !out.trim().is_empty() {
+                eprint!("{out}");
+                if !out.ends_with('\n') {
+                    eprintln!();
+                }
+            }
+            let err = String::from_utf8_lossy(&o.stderr);
+            if !err.trim().is_empty() {
+                eprintln!("[stderr] {}", err.trim_end());
+            }
+        }
+        Err(e) => eprintln!("(could not run {cmd:?}: {e})"),
+    }
+}
+
 /// Run a setup command (compose up, docker cp, …) and fail loudly on non-zero.
 pub fn run_checked(cmd: Command) -> Result<CliOutput> {
     let label = format!("{cmd:?}");

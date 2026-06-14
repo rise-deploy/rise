@@ -180,6 +180,13 @@ pub trait Backend {
     /// deployment status does not prove the workload has been torn down (it may
     /// still be terminating).
     fn wait_workload_removed(&self, project: &str) -> Result<()>;
+
+    /// Dump backend diagnostics (cluster / container state + logs) to stderr.
+    /// Called on the failure path *before* `tear_down` tears the stack down, so a
+    /// bring-up or scenario failure leaves the root cause inline in the run log
+    /// (the failing command's own output rarely explains, e.g., why a pod won't
+    /// start). Best-effort and silent on success; no-op by default.
+    fn dump_diagnostics(&self) {}
 }
 
 /// The latest deployment's `status` string for a project, via the deployments API.

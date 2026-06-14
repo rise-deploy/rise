@@ -280,6 +280,15 @@ impl Backend for DockerBackend {
         )
     }
 
+    fn dump_diagnostics(&self) {
+        let mut ps = self.compose();
+        ps.args(["ps", "-a"]);
+        cli::dump("compose ps", ps);
+        let mut logs = self.compose();
+        logs.args(["logs", "--no-color", "--tail=200"]);
+        cli::dump("compose logs (tail)", logs);
+    }
+
     fn dex(&self) -> Option<&DexEndpoint> {
         Some(&self.dex)
     }

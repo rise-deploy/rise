@@ -43,6 +43,13 @@ fn main() -> ExitCode {
         scenario::run_all(backend.as_ref())
     }));
 
+    // On any failure (scenario error or panic), capture diagnostics while the
+    // stack is still up — teardown below deletes the cluster / compose stack.
+    if !matches!(outcome, Ok(Ok(()))) {
+        report::section("Capturing diagnostics (run failed)");
+        backend.dump_diagnostics();
+    }
+
     report::section("Tearing down");
     let down = Instant::now();
     backend.tear_down();
