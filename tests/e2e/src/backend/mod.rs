@@ -85,6 +85,15 @@ pub trait Backend {
         )
     }
 
+    /// Re-apply the infrastructure (e.g. re-run `helm upgrade`) to assert it's
+    /// idempotent. Only meaningful for backends that provision via a chart.
+    fn reapply_chart(&self) -> Result<()> {
+        anyhow::bail!(
+            "chart reapply is not supported by the {} backend",
+            self.name()
+        )
+    }
+
     /// Wait until a stopped deployment's workload is actually gone. The default
     /// polls `rise deployment list` until it no longer reports Healthy; backends
     /// can override with a stronger check (e.g. zero pods).

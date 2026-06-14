@@ -373,6 +373,16 @@ impl Backend for MinikubeBackend {
         &self.ci_token
     }
 
+    fn reapply_chart(&self) -> Result<()> {
+        // Re-run `helm upgrade` (no --install) with the same args; asserts the
+        // chart applies cleanly a second time.
+        let mut helm = Command::new("helm");
+        helm.args(["upgrade", RELEASE, &self.repo_path("helm/rise")]);
+        helm.args(self.helm_args());
+        cli::run_checked(helm).context("helm upgrade (idempotency)")?;
+        Ok(())
+    }
+
     fn wait_workload_removed(&self, project: &str) -> Result<()> {
         // Stronger than the default: the app namespace must have zero pods, which
         // proves a post-stop /logs query is served by Loki, not live kubelet.

@@ -28,6 +28,7 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
         Box::new(PublicDeploy),
         Box::new(SaTokenExchange),
         Box::new(LokiLogRetention),
+        Box::new(HelmIdempotency),
     ]
 }
 
@@ -416,5 +417,27 @@ impl Scenario for LokiLogRetention {
             "expected `rise deployment logs` to print >=1 line after pod removal"
         );
         Ok(())
+    }
+}
+
+// ---- (e) helm idempotency -------------------------------------------------
+
+struct HelmIdempotency;
+
+impl Scenario for HelmIdempotency {
+    fn id(&self) -> &'static str {
+        "helm-idempotency"
+    }
+
+    fn applies_to(&self, kind: BackendKind) -> Applicability {
+        match kind {
+            BackendKind::Minikube => Applicability::Run,
+            BackendKind::Docker => Applicability::Skip("docker backend has no Helm release"),
+        }
+    }
+
+    fn run(&self, b: &dyn Backend) -> Result<()> {
+        // Re-applying the chart must succeed (no immutable-field / diff errors).
+        b.reapply_chart()
     }
 }
