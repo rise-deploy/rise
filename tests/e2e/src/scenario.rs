@@ -90,6 +90,7 @@ impl Scenario for PublicDeploy {
 
     fn run(&self, b: &dyn Backend) -> Result<()> {
         let project = unique("e2e-pub");
+        let app = b.sample_app();
         expect_ok(
             b.rise_cli(
                 &[
@@ -111,9 +112,9 @@ impl Scenario for PublicDeploy {
                     "--project",
                     &project,
                     "--image",
-                    "traefik/whoami",
+                    app.image,
                     "--http-port",
-                    "80",
+                    app.http_port,
                     "--replicas",
                     "1",
                 ],
@@ -130,10 +131,10 @@ impl Scenario for PublicDeploy {
                     "expected 200 from app, got {}",
                     resp.status
                 );
-                if b.kind() == BackendKind::Docker {
+                if let Some(marker) = app.body_marker {
                     anyhow::ensure!(
-                        resp.body.contains("Hostname:"),
-                        "response did not look like whoami output:\n{}",
+                        resp.body.contains(marker),
+                        "response body missing expected marker {marker:?}:\n{}",
                         resp.body
                     );
                 }

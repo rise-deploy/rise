@@ -23,6 +23,16 @@ pub struct CliAuth<'a> {
     pub identity: Option<&'a str>,
 }
 
+/// A tiny prebuilt HTTP app for the public-deploy scenario. Differs per backend:
+/// Kubernetes enforces `runAsNonRoot`, so it needs a non-root image bound to a
+/// high port, whereas Docker can run `traefik/whoami` on :80.
+pub struct SampleApp {
+    pub image: &'static str,
+    pub http_port: &'static str,
+    /// A stable substring expected in the response body, if any.
+    pub body_marker: Option<&'static str>,
+}
+
 pub trait Backend {
     fn kind(&self) -> BackendKind;
     fn name(&self) -> &'static str {
@@ -44,6 +54,9 @@ pub trait Backend {
 
     /// The test Dex reachable from the harness, when this backend exposes one.
     fn dex(&self) -> Option<&DexEndpoint>;
+
+    /// A small HTTP app to deploy for the public-deploy scenario.
+    fn sample_app(&self) -> SampleApp;
 
     /// Poll `rise deployment list` until the project reports a Healthy
     /// deployment. Shared across backends (reuses `rise_cli`).

@@ -47,6 +47,14 @@ config:
   server:
     public_url: http://rise.local
     jwt_signing_secret: dGVzdC1qd3Qtc2VjcmV0LWtleS1mb3ItY2ktdGVzdGluZy1vbmx5LW5vdC1zZWN1cmU=
+    # CI-only: the in-cluster Dex issuer is plain-HTTP on a private cluster IP
+    # (rise-ci-chart-dex.rise-ci.svc.cluster.local). Relax the SSRF guard so OIDC
+    # discovery / JWKS fetch and service-account issuer validation accept it.
+    # Mirrors the docker standalone overlay (RISE_SSRF_ALLOW_PRIVATE/HTTP). Never
+    # enable in production.
+    ssrf:
+      allow_private_networks: true
+      allow_http: true
 
   auth:
     issuer: http://rise-ci-chart-dex.rise-ci.svc.cluster.local:5556/dex

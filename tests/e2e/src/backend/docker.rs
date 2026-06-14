@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use super::{Backend, BackendKind, CliAuth};
+use super::{Backend, BackendKind, CliAuth, SampleApp};
 use crate::cli::{self, CliOutput};
 use crate::dex::DexEndpoint;
 use crate::http::{self, HttpResponse};
@@ -196,5 +196,14 @@ impl Backend for DockerBackend {
 
     fn dex(&self) -> Option<&DexEndpoint> {
         Some(&self.dex)
+    }
+
+    fn sample_app(&self) -> SampleApp {
+        // Docker runs as root, so whoami on :80 is fine and emits a stable body.
+        SampleApp {
+            image: "traefik/whoami",
+            http_port: "80",
+            body_marker: Some("Hostname:"),
+        }
     }
 }

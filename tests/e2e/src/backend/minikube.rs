@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use super::{Backend, BackendKind, CliAuth};
+use super::{Backend, BackendKind, CliAuth, SampleApp};
 use crate::cli::{self, CliOutput};
 use crate::dex::DexEndpoint;
 use crate::http::{self, HttpResponse};
@@ -353,5 +353,15 @@ impl Backend for MinikubeBackend {
 
     fn dex(&self) -> Option<&DexEndpoint> {
         Some(&self.dex)
+    }
+
+    fn sample_app(&self) -> SampleApp {
+        // K8s app pods run with runAsNonRoot, so use a non-root image on a high
+        // port (matching the bash minikube suite).
+        SampleApp {
+            image: "nginxinc/nginx-unprivileged:alpine",
+            http_port: "8080",
+            body_marker: Some("nginx"),
+        }
     }
 }
