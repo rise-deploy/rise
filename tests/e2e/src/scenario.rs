@@ -620,8 +620,18 @@ impl Scenario for WorkloadIdentity {
             &mut |body| {
                 serde_json::from_str::<serde_json::Value>(body).is_ok_and(|j| {
                     let cur = j["file_token"]["claims"]["jti"].as_str().unwrap_or("");
+                    let cur_exp = j["file_token"]["claims"]["exp"].as_i64();
+                    // A genuine re-mint changes the jti AND advances the expiry. Gating
+                    // on jti alone would accept a token that reused the old `exp`
+                    // (an already-near-expired re-mint); require exp to move forward
+                    // too (when both are present).
+                    let exp_advanced = match (cur_exp, first_exp) {
+                        (Some(c), Some(f)) => c > f,
+                        _ => true,
+                    };
                     !cur.is_empty()
                         && cur != first_jti
+                        && exp_advanced
                         && j["file_token"]["signature_valid"] == serde_json::json!(true)
                 })
             },
@@ -630,8 +640,12 @@ impl Scenario for WorkloadIdentity {
             // Decisive diagnostic: did the controller re-mint at all? If `exp`
             // advanced, the token IS rotating (slow projection); if it's static, the
             // controller never re-minted (a server/config issue, not propagation lag).
+            // Best-effort: a failing diagnostic reach must not mask the jti/exp
+            // bail! below, which is the actual signal we want on failure.
             let last = b
-                .reach_app(&project, "/identity?file=e2e")?
+                .reach_app(&project, "/identity?file=e2e")
+                .ok()
+                .flatten()
                 .map(|r| r.body)
                 .unwrap_or_default();
             let lv: serde_json::Value =
@@ -729,12 +743,16 @@ impl Scenario for PrivateIngressAuth {
             "redirect not to the project's signin page: {location}"
         );
 
-        // Authenticated (rise_jwt cookie) is allowed through to the app.
+        // Authenticated (rise_jwt cookie) is allowed straight through to the app.
+        // Do NOT follow redirects: a rejected cookie answers 302 -> signin (which
+        // itself serves 200), so following would let an auth regression pass the
+        // status check. A 200 here therefore means the ingress let us through.
         let cookie = format!("rise_jwt={}", b.ci_bearer());
-        let authed = b.ingress_get(&project, "/", true, Some(&cookie))?;
+        let authed = b.ingress_get(&project, "/", false, Some(&cookie))?;
         anyhow::ensure!(
             authed.status == 200,
-            "expected 200 for authed private request, got {}",
+            "expected 200 for authed private request, got {} (a redirect means the \
+             cookie was rejected at the ingress)",
             authed.status
         );
         if let Some(marker) = app.body_marker {

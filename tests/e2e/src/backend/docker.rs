@@ -217,7 +217,7 @@ impl Backend for DockerBackend {
 
     fn reach_app(&self, project: &str, path: &str) -> Result<Option<HttpResponse>> {
         let url = format!("{TRAEFIK_URL}{path}");
-        let host = format!("{project}.rise.localhost");
+        let host = self.app_host(project);
         // The controller may not have wired the Traefik route yet → retry on 404.
         let mut resp = None;
         http::poll(
