@@ -10,6 +10,7 @@ use super::{Backend, BackendKind, CliAuth, SampleApp};
 use crate::cli::{self, CliOutput};
 use crate::dex::DexEndpoint;
 use crate::http::{self, HttpResponse};
+use crate::report;
 use crate::token;
 
 // Matches config/docker.yaml + the docker-compose.standalone.local.yaml overlay.
@@ -114,45 +115,59 @@ impl Backend for DockerBackend {
 
     fn bring_up(&mut self) -> Result<()> {
         // Fresh volumes (a clean DB exercises org/controller-class bootstrap).
-        let mut down = self.compose();
-        down.args(["down", "-v"]);
-        let _ = cli::run(down);
+        report::step("docker compose down -v (clean slate)", || {
+            let mut down = self.compose();
+            down.args(["down", "-v"]);
+            let _ = cli::run(down);
+            Ok(())
+        })?;
 
-        let mut up = self.compose();
-        up.args(["up", "-d"]);
-        cli::run_checked(up).context("docker compose up")?;
+        report::step("docker compose up -d", || {
+            let mut up = self.compose();
+            up.args(["up", "-d"]);
+            cli::run_checked(up).context("docker compose up")
+        })?;
 
-        http::poll(
-            Duration::from_secs(120),
-            Duration::from_secs(2),
-            "rise backend /health",
-            || Ok(http::get(&format!("{RISE_URL}/health"), None)?.status == 200),
-        )?;
+        report::step_value("rise /health", || {
+            http::poll(
+                Duration::from_secs(120),
+                Duration::from_secs(2),
+                "rise backend /health",
+                || {
+                    Ok(http::get(&format!("{RISE_URL}/health"), None)
+                        .map(|r| r.status == 200)
+                        .unwrap_or(false))
+                },
+            )?;
+            Ok("200")
+        })?;
 
         // Extract the CLI from the image for an exact version match.
-        let tmp = self
-            .repo_root
-            .join("target")
-            .join(format!("e2e-cli-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).context("create CLI extract dir")?;
-        let bin = tmp.join("rise");
+        report::step("extract rise CLI from image", || {
+            let tmp = self
+                .repo_root
+                .join("target")
+                .join(format!("e2e-cli-{}", std::process::id()));
+            std::fs::create_dir_all(&tmp).context("create CLI extract dir")?;
+            let bin = tmp.join("rise");
 
-        let mut create = Command::new("docker");
-        create.args(["create", "--name", &self.extract_container, &self.image()]);
-        cli::run_checked(create).context("docker create (CLI extract)")?;
+            let mut create = Command::new("docker");
+            create.args(["create", "--name", &self.extract_container, &self.image()]);
+            cli::run_checked(create).context("docker create (CLI extract)")?;
 
-        let mut cp = Command::new("docker");
-        cp.arg("cp")
-            .arg(format!("{}:/usr/local/bin/rise", self.extract_container));
-        cp.arg(&bin);
-        cli::run_checked(cp).context("docker cp rise binary")?;
+            let mut cp = Command::new("docker");
+            cp.arg("cp")
+                .arg(format!("{}:/usr/local/bin/rise", self.extract_container));
+            cp.arg(&bin);
+            cli::run_checked(cp).context("docker cp rise binary")?;
 
-        let mut rm = Command::new("docker");
-        rm.args(["rm", "-f", &self.extract_container]);
-        let _ = cli::run(rm);
+            let mut rm = Command::new("docker");
+            rm.args(["rm", "-f", &self.extract_container]);
+            let _ = cli::run(rm);
 
-        self.cli_bin = Some(bin);
-        Ok(())
+            self.cli_bin = Some(bin);
+            Ok(())
+        })
     }
 
     fn tear_down(&mut self) {

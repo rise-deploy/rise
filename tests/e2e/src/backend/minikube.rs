@@ -13,6 +13,7 @@ use super::{Backend, BackendKind, CliAuth, SampleApp};
 use crate::cli::{self, CliOutput};
 use crate::dex::DexEndpoint;
 use crate::http::{self, HttpResponse};
+use crate::report;
 use crate::token;
 
 // Matches helm/rise/values-ci.yaml (config.server.jwt_signing_secret).
@@ -356,118 +357,147 @@ impl Backend for MinikubeBackend {
         let jfrog = self.registry_mode == RegistryMode::JfrogVault;
 
         // Clean slate (a fresh cluster exercises chart bootstrap from scratch).
-        let mut del = Command::new("minikube");
-        del.arg("delete");
-        let _ = cli::run(del);
+        report::step("minikube delete (clean slate)", || {
+            let mut del = Command::new("minikube");
+            del.arg("delete");
+            let _ = cli::run(del);
+            Ok(())
+        })?;
 
         if jfrog {
-            self.start_jfrog_vault()?;
+            report::step("jfrog + vault up (compose)", || self.start_jfrog_vault())?;
         }
 
-        let mut start = Command::new("minikube");
-        start.args([
-            "start",
-            "--driver=docker",
-            &format!("--cpus={}", self.cpus),
-            &format!("--memory={}", self.memory),
-        ]);
-        if jfrog {
-            start.arg("--insecure-registry=rise-jfrog:8082");
-        }
-        cli::run_checked(start).context("minikube start")?;
+        report::step(
+            &format!("minikube start ({} cpus, {} MB)", self.cpus, self.memory),
+            || {
+                let mut start = Command::new("minikube");
+                start.args([
+                    "start",
+                    "--driver=docker",
+                    &format!("--cpus={}", self.cpus),
+                    &format!("--memory={}", self.memory),
+                ]);
+                if jfrog {
+                    start.arg("--insecure-registry=rise-jfrog:8082");
+                }
+                cli::run_checked(start).context("minikube start")
+            },
+        )?;
 
-        let mut ingress = Command::new("minikube");
-        ingress.args(["addons", "enable", "ingress"]);
-        cli::run_checked(ingress).context("minikube addons enable ingress")?;
+        report::step("enable ingress addon", || {
+            let mut ingress = Command::new("minikube");
+            ingress.args(["addons", "enable", "ingress"]);
+            cli::run_checked(ingress).context("minikube addons enable ingress")
+        })?;
 
         // The node IP is where the nginx ingress addon listens (:80); used for
         // ingress-level reach (the private-ingress-auth scenario).
-        let ip = cli::run_checked({
+        self.node_ip = report::step_value("minikube ip", || {
             let mut c = Command::new("minikube");
             c.arg("ip");
-            c
-        })
-        .context("minikube ip")?;
-        self.node_ip = ip.stdout.trim().to_string();
+            Ok(cli::run_checked(c)
+                .context("minikube ip")?
+                .stdout
+                .trim()
+                .to_string())
+        })?;
 
         if jfrog {
-            self.configure_jfrog_registry()?;
+            report::step("wire node containerd → jfrog registry", || {
+                self.configure_jfrog_registry()
+            })?;
         }
 
-        let mut helm = Command::new("helm");
-        helm.args([
-            "upgrade",
-            "--install",
-            RELEASE,
-            &self.repo_path("helm/rise"),
-        ]);
-        helm.args(self.helm_args());
-        cli::run_checked(helm).context("helm upgrade --install")?;
+        report::step("helm upgrade --install", || {
+            let mut helm = Command::new("helm");
+            helm.args([
+                "upgrade",
+                "--install",
+                RELEASE,
+                &self.repo_path("helm/rise"),
+            ]);
+            helm.args(self.helm_args());
+            cli::run_checked(helm).context("helm upgrade --install")
+        })?;
 
-        let mut wait_dep = Command::new("kubectl");
-        wait_dep.args([
-            "wait",
-            "--namespace",
-            NAMESPACE,
-            "--for=condition=Available",
-            "deployment",
-            "-l",
-            &format!("app.kubernetes.io/instance={RELEASE}"),
-            "--timeout=10m",
-        ]);
-        cli::run_checked(wait_dep).context("kubectl wait deployments Available")?;
+        report::step("wait deployments Available (≤10m)", || {
+            let mut wait_dep = Command::new("kubectl");
+            wait_dep.args([
+                "wait",
+                "--namespace",
+                NAMESPACE,
+                "--for=condition=Available",
+                "deployment",
+                "-l",
+                &format!("app.kubernetes.io/instance={RELEASE}"),
+                "--timeout=10m",
+            ]);
+            cli::run_checked(wait_dep).context("kubectl wait deployments Available")
+        })?;
 
-        let mut wait_pod = Command::new("kubectl");
-        wait_pod.args([
-            "wait",
-            "--namespace",
-            NAMESPACE,
-            "--for=condition=Ready",
-            "pod",
-            "-l",
-            &format!("app.kubernetes.io/instance={RELEASE}"),
-            "--timeout=10m",
-        ]);
-        cli::run_checked(wait_pod).context("kubectl wait pods Ready")?;
+        report::step("wait pods Ready (≤10m)", || {
+            let mut wait_pod = Command::new("kubectl");
+            wait_pod.args([
+                "wait",
+                "--namespace",
+                NAMESPACE,
+                "--for=condition=Ready",
+                "pod",
+                "-l",
+                &format!("app.kubernetes.io/instance={RELEASE}"),
+                "--timeout=10m",
+            ]);
+            cli::run_checked(wait_pod).context("kubectl wait pods Ready")
+        })?;
 
         // Forward the server and Dex for the whole run (killed in tear_down/drop).
-        self.forwards.push(PortForward::spawn(
-            NAMESPACE,
-            &format!("svc/{SERVER_SVC}"),
-            "3000:3000",
-            "rise server",
-        )?);
-        self.forwards.push(PortForward::spawn(
-            NAMESPACE,
-            &format!("svc/{DEX_SVC}"),
-            "5556:5556",
-            "dex",
-        )?);
+        report::step("port-forward server :3000 + dex :5556", || {
+            self.forwards.push(PortForward::spawn(
+                NAMESPACE,
+                &format!("svc/{SERVER_SVC}"),
+                "3000:3000",
+                "rise server",
+            )?);
+            self.forwards.push(PortForward::spawn(
+                NAMESPACE,
+                &format!("svc/{DEX_SVC}"),
+                "5556:5556",
+                "dex",
+            )?);
+            Ok(())
+        })?;
 
         // The forwards take a moment to establish — swallow connection errors.
-        http::poll(
-            Duration::from_secs(60),
-            Duration::from_secs(2),
-            "rise server /health (port-forward)",
-            || {
-                Ok(http::get(&format!("{RISE_URL}/health"), None)
+        report::step_value("rise /health", || {
+            http::poll(
+                Duration::from_secs(60),
+                Duration::from_secs(2),
+                "rise server /health (port-forward)",
+                || {
+                    Ok(http::get(&format!("{RISE_URL}/health"), None)
+                        .map(|r| r.status == 200)
+                        .unwrap_or(false))
+                },
+            )?;
+            Ok("200")
+        })?;
+        report::step_value("dex discovery", || {
+            http::poll(
+                Duration::from_secs(60),
+                Duration::from_secs(2),
+                "dex discovery (port-forward)",
+                || {
+                    Ok(http::get(
+                        &format!("{DEX_LOCAL_URL}/.well-known/openid-configuration"),
+                        None,
+                    )
                     .map(|r| r.status == 200)
                     .unwrap_or(false))
-            },
-        )?;
-        http::poll(
-            Duration::from_secs(60),
-            Duration::from_secs(2),
-            "dex discovery (port-forward)",
-            || {
-                Ok(http::get(
-                    &format!("{DEX_LOCAL_URL}/.well-known/openid-configuration"),
-                    None,
-                )
-                .map(|r| r.status == 200)
-                .unwrap_or(false))
-            },
-        )?;
+                },
+            )?;
+            Ok("200")
+        })?;
         Ok(())
     }
 

@@ -11,6 +11,7 @@ use crate::backend::{Backend, BackendKind, CliAuth};
 use crate::cli::CliOutput;
 use crate::dex;
 use crate::http;
+use crate::report;
 
 pub enum Applicability {
     Run,
@@ -39,27 +40,47 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     ]
 }
 
-/// Run every scenario applicable to `b`, printing RUN/PASS/FAIL/SKIP lines, and
-/// fail if any applicable scenario failed.
+/// Run every scenario applicable to `b` (all share the one backend `bring_up`, so
+/// they run as one suite, in order), reporting each with its duration plus a
+/// final summary; fail if any applicable scenario failed.
 pub fn run_all(b: &dyn Backend) -> Result<()> {
+    report::section(&format!("Scenarios (backend = {})", b.name()));
+    let suite_start = std::time::Instant::now();
+    let mut passed = 0u32;
+    let mut skipped = 0u32;
     let mut failed: Vec<&'static str> = Vec::new();
+
     for s in all() {
         match s.applies_to(b) {
             Applicability::Skip(reason) => {
-                eprintln!("[e2e] SKIP {} on {}: {reason}", s.id(), b.name())
+                skipped += 1;
+                report::note(&format!("SKIP {:.<34} {reason}", s.id()));
             }
             Applicability::Run => {
-                eprintln!("[e2e] RUN  {} on {}", s.id(), b.name());
-                match s.run(b) {
-                    Ok(()) => eprintln!("[e2e] PASS {} on {}", s.id(), b.name()),
+                report::note(&format!("RUN  {}", s.id()));
+                let start = std::time::Instant::now();
+                let result = s.run(b);
+                let took = report::human(start.elapsed());
+                match result {
+                    Ok(()) => {
+                        passed += 1;
+                        report::note(&format!("PASS {:.<34} ({took})", s.id()));
+                    }
                     Err(e) => {
-                        eprintln!("[e2e] FAIL {} on {}: {e:#}", s.id(), b.name());
                         failed.push(s.id());
+                        report::note(&format!("FAIL {:.<34} ({took})", s.id()));
+                        eprintln!("         {e:#}");
                     }
                 }
             }
         }
     }
+
+    report::section(&format!(
+        "Summary: {passed} passed, {} failed, {skipped} skipped in {}",
+        failed.len(),
+        report::human(suite_start.elapsed())
+    ));
     anyhow::ensure!(failed.is_empty(), "scenarios failed: {failed:?}");
     Ok(())
 }
