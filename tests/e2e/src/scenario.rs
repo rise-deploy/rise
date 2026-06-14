@@ -196,7 +196,7 @@ impl Scenario for SaTokenExchange {
         )?;
 
         // Register an SA on this project trusting Dex, keyed on the email claim.
-        let created = expect_ok(
+        expect_ok(
             b.rise_cli(
                 &[
                     "service-account",
@@ -217,11 +217,18 @@ impl Scenario for SaTokenExchange {
             )?,
             "service-account create",
         )?;
-        let sa_email = created
-            .stdout
-            .split_whitespace()
-            .find(|t| t.ends_with("@sa.rise.local"))
-            .context("could not find the SA email in `service-account create` output")?
+        // Read the SA's synthetic email from the API, not the human CLI output.
+        let sas = b.api_get(&format!("/api/v1/projects/{project}/service-accounts"))?;
+        anyhow::ensure!(
+            sas.status == 200,
+            "list service-accounts API returned {} :\n{}",
+            sas.status,
+            sas.body
+        );
+        let sa_email = serde_json::from_str::<serde_json::Value>(&sas.body)
+            .context("parse service-accounts response")?["service_accounts"][0]["email"]
+            .as_str()
+            .context("no service account email in API response")?
             .to_string();
         eprintln!("[e2e] sa-token-exchange: assuming identity {sa_email}");
 

@@ -82,20 +82,15 @@ pub trait Backend {
         crate::http::get_auth(&format!("{}{}", self.api_base(), path), self.ci_bearer())
     }
 
-    /// Poll `rise deployment list` until the project reports a Healthy
-    /// deployment. Shared across backends (reuses `rise_cli`).
+    /// Poll the deployments API until the project's latest deployment reports
+    /// `status == "Healthy"`. Uses the machine-readable API (not the CLI table) so
+    /// the oracle is a typed status check, not a substring match.
     fn wait_healthy(&self, project: &str) -> Result<()> {
         crate::http::poll(
             Duration::from_secs(300),
             Duration::from_secs(5),
-            &format!("project '{project}' to report Healthy"),
-            || {
-                let out = self.rise_cli(
-                    &["deployment", "list", "--project", project, "--limit", "5"],
-                    None,
-                )?;
-                Ok(out.combined().contains("Healthy"))
-            },
+            &format!("project '{project}' to report a Healthy deployment"),
+            || Ok(latest_deployment_status(self, project)?.as_deref() == Some("Healthy")),
         )
     }
 
@@ -155,22 +150,37 @@ pub trait Backend {
     }
 
     /// Wait until a stopped deployment's workload is actually gone. The default
-    /// polls `rise deployment list` until it no longer reports Healthy; backends
-    /// can override with a stronger check (e.g. zero pods).
+    /// polls the deployments API until the latest deployment is no longer Healthy;
+    /// backends can override with a stronger check (e.g. zero pods).
     fn wait_workload_removed(&self, project: &str) -> Result<()> {
         crate::http::poll(
             Duration::from_secs(120),
             Duration::from_secs(2),
             &format!("workload for '{project}' to be removed"),
             || {
-                let out = self.rise_cli(
-                    &["deployment", "list", "--project", project, "--limit", "5"],
-                    None,
-                )?;
-                Ok(!out.combined().contains("Healthy"))
+                Ok(
+                    matches!(latest_deployment_status(self, project)?.as_deref(), Some(s) if s != "Healthy"),
+                )
             },
         )
     }
+}
+
+/// The latest deployment's `status` string for a project, via the deployments API.
+/// `Ok(None)` if the call didn't return a usable status (keep polling).
+fn latest_deployment_status(b: &(impl Backend + ?Sized), project: &str) -> Result<Option<String>> {
+    let resp = b.api_get(&format!("/api/v1/projects/{project}/deployments"))?;
+    if resp.status != 200 {
+        return Ok(None);
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_str(&resp.body).unwrap_or(serde_json::Value::Null);
+    // The API returns deployments ordered created_at DESC, so [0] is the latest.
+    Ok(parsed
+        .get(0)
+        .and_then(|d| d.get("status"))
+        .and_then(|s| s.as_str())
+        .map(str::to_string))
 }
 
 /// Construct the driver for the selected backend (does not bring it up).
