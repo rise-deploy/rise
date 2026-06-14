@@ -57,6 +57,48 @@ pub fn get_auth(url: &str, bearer: &str) -> Result<HttpResponse> {
     Ok(HttpResponse { status, body })
 }
 
+/// A client that does NOT follow redirects — for asserting 3xx + `Location`.
+fn no_redirect_client() -> &'static reqwest::blocking::Client {
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build no-redirect client")
+    })
+}
+
+/// GET without following redirects, returning the status and `Location` header.
+pub fn get_no_redirect(url: &str, host: Option<&str>) -> Result<(u16, Option<String>)> {
+    let mut req = no_redirect_client().get(url);
+    if let Some(h) = host {
+        req = req.header(reqwest::header::HOST, h);
+    }
+    let resp = req.send().with_context(|| format!("GET {url}"))?;
+    let status = resp.status().as_u16();
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    Ok((status, location))
+}
+
+/// GET with a `Host` override and a `Cookie` header (Traefik forwardAuth auth check).
+pub fn get_with_cookie(url: &str, host: &str, cookie: &str) -> Result<HttpResponse> {
+    let resp = shared_client()
+        .get(url)
+        .header(reqwest::header::HOST, host)
+        .header(reqwest::header::COOKIE, cookie)
+        .send()
+        .with_context(|| format!("GET {url}"))?;
+    let status = resp.status().as_u16();
+    let body = resp.text().unwrap_or_default();
+    Ok(HttpResponse { status, body })
+}
+
 /// GET `url` with a single custom header (e.g. Vault's `X-Vault-Token`).
 pub fn get_auth_header(url: &str, header: &str, value: &str) -> Result<HttpResponse> {
     let resp = shared_client()

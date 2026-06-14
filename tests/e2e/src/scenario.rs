@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use crate::backend::{Backend, BackendKind, CliAuth};
 use crate::cli::CliOutput;
 use crate::dex;
+use crate::http;
 
 pub enum Applicability {
     Run,
@@ -27,8 +28,11 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(PublicDeploy),
         Box::new(SaTokenExchange),
+        Box::new(PrivateForwardAuth),
         Box::new(LokiLogRetention),
         Box::new(HelmIdempotency),
+        // Last: on Docker it recreates the backend with the identity overlay, so
+        // it must run after the scenarios that expect the default config.
         Box::new(WorkloadIdentity),
     ]
 }
@@ -453,20 +457,19 @@ impl Scenario for WorkloadIdentity {
     }
 
     fn applies_to(&self, b: &dyn Backend) -> Applicability {
-        match b.kind() {
-            // Builds the fixture from source, which needs a registry the cluster
-            // can pull from — only minikube's jfrog-vault mode provides one.
-            BackendKind::Minikube if b.supports_source_build() => Applicability::Run,
-            BackendKind::Minikube => {
-                Applicability::Skip("requires the jfrog-vault registry mode (source build)")
-            }
-            BackendKind::Docker => {
-                Applicability::Skip("source-build workload identity not ported to docker yet")
-            }
+        // Builds the fixture from source, which needs a registry the runtime can
+        // pull from: the host docker daemon (Docker) or minikube's jfrog-vault mode.
+        if b.supports_source_build() {
+            Applicability::Run
+        } else {
+            Applicability::Skip("requires a source-build registry (minikube jfrog-vault mode)")
         }
     }
 
     fn run(&self, b: &dyn Backend) -> Result<()> {
+        // Docker recreates the backend with the identity compose overlay (short TTL
+        // + scoped registry); minikube's values-ci already configures it (no-op).
+        b.prepare_workload_identity()?;
         let project = unique("e2e-id");
         expect_ok(
             b.rise_cli(
@@ -598,6 +601,159 @@ impl Scenario for WorkloadIdentity {
             refreshed,
             "file token did not refresh (jti stayed {first_jti})"
         );
+        Ok(())
+    }
+}
+
+// ---- (f) private project / Traefik forwardAuth (docker only) ----------------
+
+struct PrivateForwardAuth;
+
+impl Scenario for PrivateForwardAuth {
+    fn id(&self) -> &'static str {
+        "private-forward-auth"
+    }
+
+    fn applies_to(&self, b: &dyn Backend) -> Applicability {
+        match b.kind() {
+            // Traefik forwardAuth is the docker ingress-auth mechanism; K8s uses
+            // nginx auth annotations (a separate path, not covered here).
+            BackendKind::Docker => Applicability::Run,
+            BackendKind::Minikube => {
+                Applicability::Skip("forwardAuth is a Traefik/docker-specific mechanism")
+            }
+        }
+    }
+
+    fn run(&self, b: &dyn Backend) -> Result<()> {
+        let traefik = b.traefik_base().context("backend has no Traefik ingress")?;
+        let project = unique("e2e-priv");
+        let app = b.sample_app();
+        let host = format!("{project}.rise.localhost");
+
+        expect_ok(
+            b.rise_cli(
+                &[
+                    "project",
+                    "create",
+                    &project,
+                    "--access-class",
+                    "private",
+                    "--no-rise-toml",
+                ],
+                None,
+            )?,
+            "project create",
+        )?;
+        expect_ok(
+            b.rise_cli(
+                &[
+                    "deploy",
+                    "--project",
+                    &project,
+                    "--image",
+                    app.image,
+                    "--http-port",
+                    app.http_port,
+                    "--replicas",
+                    "1",
+                ],
+                None,
+            )?,
+            "deploy",
+        )?;
+        b.wait_healthy(&project)?;
+
+        // The routable container can lag the API's Healthy mark; poll until the
+        // forwardAuth + router-middlewares labels are stamped.
+        let mut labels = String::new();
+        for _ in 0..30 {
+            labels = b.app_container_labels(&project)?;
+            if labels.contains("forwardauth.address")
+                && labels.contains(".routers.")
+                && labels.contains(".middlewares")
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        anyhow::ensure!(
+            labels.contains("forwardauth.address"),
+            "private app container missing forwardAuth labels:\n{labels}"
+        );
+        anyhow::ensure!(
+            labels.contains(".routers.") && labels.contains(".middlewares"),
+            "private app router missing the middlewares label:\n{labels}"
+        );
+
+        // Unauthenticated must be a same-host 302 to the project's /.rise signin page.
+        let mut code = 0;
+        let mut location = None;
+        for _ in 0..30 {
+            let (c, loc) = http::get_no_redirect(&format!("{traefik}/"), Some(&host))?;
+            if c != 404 {
+                code = c;
+                location = loc;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        anyhow::ensure!(
+            code == 302,
+            "expected 302 for unauthenticated private request, got {code}"
+        );
+        let location = location.context("302 had no Location header")?;
+        anyhow::ensure!(
+            location.contains(&format!("//{host}/.rise/auth/signin")),
+            "redirect not to same-host signin page: {location}"
+        );
+        anyhow::ensure!(
+            location.contains(&format!("project={project}")),
+            "redirect Location missing project={project}: {location}"
+        );
+
+        // /.rise/* on the app host is served by the BACKEND (200, not the app).
+        let mut signin =
+            b.ingress_get_once(&project, &format!("/.rise/auth/signin?project={project}"))?;
+        for _ in 0..30 {
+            if signin.status != 404 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            signin =
+                b.ingress_get_once(&project, &format!("/.rise/auth/signin?project={project}"))?;
+        }
+        anyhow::ensure!(
+            signin.status == 200,
+            "expected 200 for backend-served /.rise/auth/signin, got {}",
+            signin.status
+        );
+        if let Some(marker) = app.body_marker {
+            anyhow::ensure!(
+                !signin.body.contains(marker),
+                "/.rise path was served by the app, not the backend:\n{}",
+                signin.body
+            );
+        }
+
+        // Authenticated (rise_jwt cookie) is allowed through to the app.
+        let authed = http::get_with_cookie(
+            &format!("{traefik}/"),
+            &host,
+            &format!("rise_jwt={}", b.ci_bearer()),
+        )?;
+        anyhow::ensure!(
+            authed.status == 200,
+            "expected 200 for authed private request, got {}",
+            authed.status
+        );
+        if let Some(marker) = app.body_marker {
+            anyhow::ensure!(
+                authed.body.contains(marker),
+                "authenticated private response not from the app:\n{}",
+                authed.body
+            );
+        }
         Ok(())
     }
 }

@@ -99,6 +99,43 @@ pub trait Backend {
         )
     }
 
+    /// The base URL of this backend's ingress (Docker/Traefik), for raw
+    /// host-routed requests. `None` if the backend has no shared HTTP ingress.
+    fn traefik_base(&self) -> Option<&str> {
+        None
+    }
+
+    /// JSON of the app container's labels (Docker/Traefik label assertions).
+    fn app_container_labels(&self, _project: &str) -> Result<String> {
+        anyhow::bail!(
+            "container-label inspection is not supported by the {} backend",
+            self.name()
+        )
+    }
+
+    /// GET the Traefik API (e.g. `/api/http/services/...`). Docker only.
+    fn traefik_api(&self, _path: &str) -> Result<HttpResponse> {
+        anyhow::bail!(
+            "the Traefik API is not available on the {} backend",
+            self.name()
+        )
+    }
+
+    /// A single GET through the ingress with a `Host` header, NO retry (so a 5xx
+    /// during a cutover is observed, not polled away). Docker only.
+    fn ingress_get_once(&self, _project: &str, _path: &str) -> Result<HttpResponse> {
+        anyhow::bail!(
+            "ingress_get_once is not supported by the {} backend",
+            self.name()
+        )
+    }
+
+    /// Backend-specific preparation before the workload-identity scenario (e.g.
+    /// Docker recreates the backend with the identity compose overlay). No-op by default.
+    fn prepare_workload_identity(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Re-apply the infrastructure (e.g. re-run `helm upgrade`) to assert it's
     /// idempotent. Only meaningful for backends that provision via a chart.
     fn reapply_chart(&self) -> Result<()> {

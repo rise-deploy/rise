@@ -62,6 +62,33 @@ impl DockerBackend {
         format!("{}:{}", self.image_repository, self.image_tag)
     }
 
+    /// First app container name for a project (`rise_<project>…`), polled until present.
+    fn app_container(&self, project: &str) -> Result<String> {
+        let mut name = String::new();
+        http::poll(
+            Duration::from_secs(60),
+            Duration::from_secs(2),
+            &format!("app container for {project}"),
+            || {
+                let mut c = Command::new("docker");
+                c.args([
+                    "ps",
+                    "--filter",
+                    &format!("name=rise_{project}"),
+                    "--format",
+                    "{{.Names}}",
+                ]);
+                let out = cli::run(c)?;
+                if let Some(first) = out.stdout.lines().find(|l| !l.trim().is_empty()) {
+                    name = first.trim().to_string();
+                    return Ok(true);
+                }
+                Ok(false)
+            },
+        )?;
+        Ok(name)
+    }
+
     /// `docker compose` against the standalone + local overlays, from the repo
     /// root, with the image env the compose files reference.
     fn compose(&self) -> Command {
@@ -213,5 +240,72 @@ impl Backend for DockerBackend {
 
     fn ci_bearer(&self) -> &str {
         &self.ci_token
+    }
+
+    fn supports_source_build(&self) -> bool {
+        // The docker CLI runs on the host, which has a docker daemon.
+        true
+    }
+
+    fn traefik_base(&self) -> Option<&str> {
+        Some(TRAEFIK_URL)
+    }
+
+    fn app_container_labels(&self, project: &str) -> Result<String> {
+        let container = self.app_container(project)?;
+        let mut c = Command::new("docker");
+        c.args(["inspect", &container, "--format", "{{json .Config.Labels}}"]);
+        Ok(cli::run_checked(c)?.stdout)
+    }
+
+    fn traefik_api(&self, path: &str) -> Result<HttpResponse> {
+        // Reach the Traefik API from inside the compose network via the dex container.
+        let mut c = self.compose();
+        c.args([
+            "exec",
+            "-T",
+            "dex",
+            "wget",
+            "-q",
+            "-O",
+            "-",
+            &format!("http://rise-traefik:8080{path}"),
+        ]);
+        let out = cli::run(c)?;
+        Ok(HttpResponse {
+            status: if out.success() { 200 } else { 0 },
+            body: out.stdout,
+        })
+    }
+
+    fn ingress_get_once(&self, project: &str, path: &str) -> Result<HttpResponse> {
+        let host = format!("{project}.rise.localhost");
+        http::get(&format!("{TRAEFIK_URL}{path}"), Some(&host))
+    }
+
+    fn prepare_workload_identity(&self) -> Result<()> {
+        // Recreate the rise backend with the identity overlay (scoped registry_url +
+        // short token TTL) so the workload-identity deploy/build + refresh apply.
+        let mut up = self.compose();
+        up.args([
+            "-f",
+            "docker-compose.standalone.identity.yaml",
+            "up",
+            "-d",
+            "--no-deps",
+            "--force-recreate",
+            "rise",
+        ]);
+        cli::run_checked(up).context("recreate rise with identity overlay")?;
+        http::poll(
+            Duration::from_secs(120),
+            Duration::from_secs(2),
+            "rise /health after identity-overlay switch",
+            || {
+                Ok(http::get(&format!("{RISE_URL}/health"), None)
+                    .map(|r| r.status == 200)
+                    .unwrap_or(false))
+            },
+        )
     }
 }
