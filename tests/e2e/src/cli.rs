@@ -1,7 +1,14 @@
 //! Running the `rise` CLI (and other external commands) and capturing output.
 
 use anyhow::{Context, Result};
-use std::process::Command;
+use std::io::Read as _;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// Hard wall-clock cap for a single diagnostic command. The diagnostics path
+/// runs precisely when the cluster is likely unhealthy, so a wedged subprocess
+/// must not hang the whole run — it is killed past this budget.
+const DUMP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Captured result of a CLI invocation. Non-zero exits are *not* errors — the
 /// caller inspects [`CliOutput::success`] / `stderr` (negative-path scenarios
@@ -43,21 +50,66 @@ pub fn run(mut cmd: Command) -> Result<CliOutput> {
 /// what it can and moves on.
 pub fn dump(label: &str, mut cmd: Command) {
     eprintln!("\n--- {label} ---");
-    match cmd.output() {
-        Ok(o) => {
-            let out = String::from_utf8_lossy(&o.stdout);
-            if !out.trim().is_empty() {
-                eprint!("{out}");
-                if !out.ends_with('\n') {
-                    eprintln!();
-                }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("(could not run {cmd:?}: {e})");
+            return;
+        }
+    };
+    // Drain both pipes on threads so a chatty child can't deadlock on a full
+    // pipe buffer while we wait on the wall-clock budget.
+    let mut out_pipe = child.stdout.take().expect("piped stdout");
+    let mut err_pipe = child.stderr.take().expect("piped stderr");
+    let out_h = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = out_pipe.read_to_end(&mut b);
+        b
+    });
+    let err_h = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = err_pipe.read_to_end(&mut b);
+        b
+    });
+
+    let deadline = Instant::now() + DUMP_TIMEOUT;
+    let timed_out = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break false,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break true;
             }
-            let err = String::from_utf8_lossy(&o.stderr);
-            if !err.trim().is_empty() {
-                eprintln!("[stderr] {}", err.trim_end());
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) => {
+                eprintln!("(error waiting on {cmd:?}: {e})");
+                let _ = child.kill();
+                let _ = child.wait();
+                break true;
             }
         }
-        Err(e) => eprintln!("(could not run {cmd:?}: {e})"),
+    };
+
+    let stdout = String::from_utf8_lossy(&out_h.join().unwrap_or_default()).into_owned();
+    let stderr = String::from_utf8_lossy(&err_h.join().unwrap_or_default()).into_owned();
+    if !stdout.trim().is_empty() {
+        eprint!("{stdout}");
+        if !stdout.ends_with('\n') {
+            eprintln!();
+        }
+    }
+    if !stderr.trim().is_empty() {
+        eprintln!("[stderr] {}", stderr.trim_end());
+    }
+    if timed_out {
+        eprintln!(
+            "[diagnostics command exceeded {}s — killed]",
+            DUMP_TIMEOUT.as_secs()
+        );
     }
 }
 

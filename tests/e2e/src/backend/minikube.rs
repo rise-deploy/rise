@@ -5,6 +5,7 @@
 //! and the CLI runs from the image on the host network.
 
 use anyhow::{Context, Result};
+use std::io::Read;
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -61,35 +62,58 @@ struct PortForward {
 
 impl PortForward {
     fn spawn(namespace: &str, target: &str, ports: &str, what: &str) -> Result<Self> {
-        let mut child = Command::new("kubectl")
-            .args(["-n", namespace, "port-forward", target, ports])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .with_context(|| format!("spawn kubectl port-forward for {what}"))?;
-
-        // `spawn` only proves the process launched. A bind conflict — e.g. the
-        // local port not yet released by a just-dropped forward — makes kubectl
-        // exit moments later, and with stdout/stderr nulled that failure is
-        // invisible: callers would see a window of connection-refused and
-        // misread it as the workload itself failing. Block until the local port
-        // actually accepts a connection (or kubectl dies) so a bad bind surfaces
-        // as a clear infra error here instead.
         let local_port: u16 = ports
             .split(':')
             .next()
             .and_then(|p| p.parse().ok())
             .with_context(|| format!("port-forward spec '{ports}' has no local port"))?;
         let addr = SocketAddr::from(([127, 0, 0, 1], local_port));
+
+        // Wait for the local port to be free before binding. A just-dropped
+        // forward may not have released it yet, and binding over a stale listener
+        // would let the liveness probe below pass against the wrong forward.
+        // Clearing it first means a later successful connect can only be ours.
+        let free_by = Instant::now() + Duration::from_secs(5);
+        while TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+            if Instant::now() >= free_by {
+                anyhow::bail!(
+                    "local port {local_port} still in use before starting \
+                     port-forward for {what}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let mut child = Command::new("kubectl")
+            .args(["-n", namespace, "port-forward", target, ports])
+            .stdin(Stdio::null())
+            // Connection-handling logs go to stdout (high volume) → discard;
+            // errors go to stderr (low volume) → capture so a failed bind can be
+            // explained. The successful path drains stderr on a thread so a
+            // long-lived forward never blocks on a full pipe.
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("spawn kubectl port-forward for {what}"))?;
+        let mut stderr = child.stderr.take().expect("piped stderr");
+
+        // `spawn` only proves the process launched; block until the local port
+        // actually accepts a connection (or kubectl dies) so a bad forward
+        // surfaces as a clear infra error here instead of a window of
+        // connection-refused misread as the workload itself failing.
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Ok(Some(status)) = child.try_wait() {
                 anyhow::bail!(
-                    "kubectl port-forward for {what} exited early ({status}) — \
-                     local port {local_port} is likely already in use"
+                    "kubectl port-forward for {what} exited early ({status}) — the \
+                     forward target may have no ready endpoints{}",
+                    err_detail(&mut stderr)
                 );
             }
             if TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok() {
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+                });
                 return Ok(Self { child });
             }
             if Instant::now() >= deadline {
@@ -97,7 +121,8 @@ impl PortForward {
                 let _ = child.wait();
                 anyhow::bail!(
                     "kubectl port-forward for {what} never began listening on \
-                     127.0.0.1:{local_port} within 10s"
+                     127.0.0.1:{local_port} within 10s{}",
+                    err_detail(&mut stderr)
                 );
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -109,6 +134,20 @@ impl Drop for PortForward {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// Read whatever an *already-exited* child wrote to a captured stderr pipe, as a
+/// `": <msg>"` suffix for an error (empty when there's nothing). Blocks only
+/// until EOF, which the dead child has already produced.
+fn err_detail(stderr: &mut impl Read) -> String {
+    let mut s = String::new();
+    let _ = stderr.read_to_string(&mut s);
+    let s = s.trim();
+    if s.is_empty() {
+        String::new()
+    } else {
+        format!(": {s}")
     }
 }
 
@@ -745,8 +784,11 @@ impl Backend for MinikubeBackend {
             c.args(args);
             c
         };
+        // A client-side timeout so a wedged apiserver can't hang a kubectl call
+        // (cli::dump's wall-clock cap is the outer backstop for minikube/docker).
         let kc = |args: &[&str]| {
             let mut c = Command::new("kubectl");
+            c.arg("--request-timeout=20s");
             c.args(args);
             c
         };
@@ -777,6 +819,32 @@ impl Backend for MinikubeBackend {
                 "--tail=200",
             ]),
         );
+
+        // Deployed app workloads live in `rise-<project>` namespaces; the control
+        // plane above won't show why an app pod failed. Describe + log each app
+        // namespace's pods (the `-A` lists give status/events; this adds the app's
+        // own logs, which is often the actual cause of a scenario failure).
+        if let Ok(out) = cli::run(kc(&["get", "ns", "-o", "name"])) {
+            let app_nss = out.stdout.lines().filter_map(|l| {
+                l.strip_prefix("namespace/")
+                    .filter(|ns| ns.starts_with("rise-") && *ns != NAMESPACE)
+            });
+            for ns in app_nss {
+                cli::dump(
+                    &format!("describe pods ({ns})"),
+                    kc(&["describe", "pods", "-n", ns]),
+                );
+                if let Ok(pods) = cli::run(kc(&["get", "pods", "-n", ns, "-o", "name"])) {
+                    for pod in pods.stdout.lines().filter(|l| !l.trim().is_empty()) {
+                        cli::dump(
+                            &format!("logs {ns}/{pod}"),
+                            kc(&["logs", "-n", ns, pod, "--all-containers", "--tail=200"]),
+                        );
+                    }
+                }
+            }
+        }
+
         cli::dump("minikube logs (tail)", mk(&["logs", "--length=80"]));
         if self.registry_mode == RegistryMode::JfrogVault {
             cli::dump("jfrog/vault compose ps", self.compose(&["ps"]));

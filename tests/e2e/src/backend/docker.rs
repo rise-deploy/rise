@@ -259,8 +259,12 @@ impl Backend for DockerBackend {
     }
 
     fn wait_workload_removed(&self, project: &str) -> Result<()> {
-        // The app's container(s) must be gone — proving a post-stop logs query is
-        // served by the store, not a live container.
+        // Provided for parity: no Docker scenario exercises this yet (log
+        // retention runs on minikube), but the trait requires a real per-runtime
+        // check rather than a status-string default. The app's container(s) must
+        // be gone — proving a post-stop logs query is served by the store, not a
+        // live container. `name=` is a substring match, which is the app's own
+        // `rise_<project>…` container(s) in this single-stack test.
         http::poll(
             Duration::from_secs(120),
             Duration::from_secs(2),
