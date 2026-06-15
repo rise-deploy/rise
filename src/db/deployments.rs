@@ -943,6 +943,44 @@ pub async fn set_identity_refresh_due_at(
     Ok(())
 }
 
+/// Push out (advance-only) the next identity-refresh time for a batch of
+/// deployments. Never moves an existing *later* time earlier, so the refresh
+/// controller's retry guard can't clobber the webhook's authoritative
+/// `mint + 2/3*TTL` write regardless of which lands first.
+#[cfg(feature = "backend")]
+pub async fn bump_identity_refresh_due_at(
+    pool: &PgPool,
+    ids: &[Uuid],
+    not_before: DateTime<Utc>,
+) -> Result<()> {
+    sqlx::query!(
+        "UPDATE deployments
+         SET identity_token_refresh_due_at = $2
+         WHERE id = ANY($1)
+           AND (identity_token_refresh_due_at IS NULL OR identity_token_refresh_due_at < $2)",
+        ids,
+        not_before
+    )
+    .execute(pool)
+    .await
+    .context("Failed to advance identity refresh due time")?;
+    Ok(())
+}
+
+/// Clear the identity-refresh schedule for a batch of deployments (e.g. their
+/// `RiseProject` CR is gone), so the refresh controller stops re-picking them.
+#[cfg(feature = "backend")]
+pub async fn clear_identity_refresh_due_at(pool: &PgPool, ids: &[Uuid]) -> Result<()> {
+    sqlx::query!(
+        "UPDATE deployments SET identity_token_refresh_due_at = NULL WHERE id = ANY($1)",
+        ids
+    )
+    .execute(pool)
+    .await
+    .context("Failed to clear identity refresh due time")?;
+    Ok(())
+}
+
 /// Active, identity-bearing deployments whose token Secret is due for re-minting,
 /// paired with their project name (used to trigger a `RiseProject` resync). Only
 /// rows with `[identity].audiences` and a due time in the past are returned.

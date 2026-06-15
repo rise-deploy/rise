@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE deployments\n         SET identity_token_refresh_due_at = $2\n         WHERE id = ANY($1)\n           AND (identity_token_refresh_due_at IS NULL OR identity_token_refresh_due_at < $2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a2270ba968e53b5a112c1e5bd3329f75a1c708b17410b767830d989b5035e0cd"
+}

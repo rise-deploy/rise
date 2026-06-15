@@ -17,6 +17,7 @@
 //!
 //! Kubernetes only: the Docker controller re-mints on its own reconcile loop.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,6 +49,8 @@ pub struct IdentityRefreshController {
     kube_client: kube::Client,
     db_pool: PgPool,
     identity_token_ttl_seconds: u64,
+    /// Cadence, derived once from the TTL.
+    poll_interval: Duration,
 }
 
 impl IdentityRefreshController {
@@ -57,19 +60,16 @@ impl IdentityRefreshController {
         identity_token_ttl_seconds: u64,
     ) -> Self {
         Self {
+            poll_interval: Duration::from_secs(poll_interval_secs(identity_token_ttl_seconds)),
             kube_client,
             db_pool,
             identity_token_ttl_seconds,
         }
     }
 
-    fn poll_interval(&self) -> Duration {
-        Duration::from_secs(poll_interval_secs(self.identity_token_ttl_seconds))
-    }
-
     /// Run the resync loop under leader election until `shutdown` is cancelled.
     pub async fn run(self, shutdown: CancellationToken) -> anyhow::Result<()> {
-        let interval = self.poll_interval();
+        let interval = self.poll_interval;
         info!(
             poll_interval_secs = interval.as_secs(),
             ttl_secs = self.identity_token_ttl_seconds,
@@ -117,26 +117,54 @@ impl IdentityRefreshController {
             return Ok(());
         }
 
-        // Push the due time out by one poll interval so a deployment isn't
-        // re-triggered before the webhook re-mints and writes the real (2/3·TTL)
-        // due time. If the resync fails to re-mint, it's retried next tick.
-        let retry_at =
-            Utc::now() + chrono::Duration::seconds(self.poll_interval().as_secs() as i64);
+        // Trigger one resync per *project* (the sync re-mints all of its
+        // deployments), not per deployment.
+        let mut by_project: HashMap<String, Vec<uuid::Uuid>> = HashMap::new();
+        for (deployment_id, project) in due {
+            by_project.entry(project).or_default().push(deployment_id);
+        }
         debug!(
-            count = due.len(),
+            projects = by_project.len(),
             "Resyncing RiseProjects for due workload-identity tokens"
         );
-        for (deployment_id, project) in due {
-            if let Err(e) = crd::trigger_resync(&self.kube_client, &project).await {
-                // A per-project failure must not abort the sweep.
-                warn!(project = %project, error = ?e, "failed to trigger identity resync");
-                continue;
+
+        let mut advance: Vec<uuid::Uuid> = Vec::new();
+        let mut orphaned: Vec<uuid::Uuid> = Vec::new();
+        for (project, ids) in by_project {
+            match crd::trigger_resync_status(&self.kube_client, &project).await {
+                Ok(crd::ResyncOutcome::Triggered) => advance.extend(ids),
+                Ok(crd::ResyncOutcome::ProjectNotFound) => {
+                    // No CR to refresh; stop re-picking these every tick.
+                    warn!(project = %project, "RiseProject not found; clearing identity refresh schedule");
+                    orphaned.extend(ids);
+                }
+                // Transient error: leave the schedule untouched so it retries.
+                Err(e) => {
+                    warn!(project = %project, error = ?e, "failed to trigger identity resync")
+                }
             }
+        }
+
+        // Push due times out by one poll interval (computed now, after the
+        // triggers) so a deployment isn't re-triggered before the webhook
+        // re-mints and writes the real 2/3·TTL due time. Advance-only: never drag
+        // a webhook-written later time earlier, so the two writers are
+        // order-independent. A failed re-mint just retries next tick.
+        if !advance.is_empty() {
+            let not_before =
+                Utc::now() + chrono::Duration::seconds(self.poll_interval.as_secs() as i64);
             if let Err(e) =
-                db_deployments::set_identity_refresh_due_at(&self.db_pool, deployment_id, retry_at)
+                db_deployments::bump_identity_refresh_due_at(&self.db_pool, &advance, not_before)
                     .await
             {
-                warn!(deployment_id = %deployment_id, error = ?e, "failed to advance identity refresh due time");
+                warn!(error = ?e, "failed to advance identity refresh due times");
+            }
+        }
+        if !orphaned.is_empty() {
+            if let Err(e) =
+                db_deployments::clear_identity_refresh_due_at(&self.db_pool, &orphaned).await
+            {
+                warn!(error = ?e, "failed to clear identity refresh schedule for missing projects");
             }
         }
         Ok(())
