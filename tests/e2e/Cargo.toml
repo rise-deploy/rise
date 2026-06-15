@@ -7,8 +7,7 @@ description = "Cross-backend end-to-end test harness for Rise (Docker / Kubernet
 
 # Standalone workspace: deliberately excluded from the root workspace so the
 # production image build (cargo-chef over the root) never has to resolve or
-# compile this test-only harness or its HTTP/TLS deps. Run it with
-# `cargo test --manifest-path tests/e2e/Cargo.toml`. Dep versions are pinned
+# compile this test-only harness or its HTTP/TLS deps. Dep versions are pinned
 # concretely (no `workspace = true`) since there's no parent workspace; keep them
 # in sync with the root [workspace.dependencies].
 [workspace]
@@ -16,15 +15,14 @@ description = "Cross-backend end-to-end test harness for Rise (Docker / Kubernet
 [lib]
 path = "src/lib.rs"
 
-# Black-box harness: drives the `rise` CLI + HTTP against a live backend. It runs
-# every scenario as one in-order suite under a shared backend bring-up, so it owns
-# its own runner + reporting — `harness = false` skips libtest entirely (no
-# "running 1 test" scaffolding). `cargo test` still builds & runs it and treats a
-# non-zero exit as failure. Gated on RISE_E2E_BACKEND (skips instantly when unset).
-[[test]]
-name = "e2e"
-path = "tests/e2e.rs"
-harness = false
+# The harness is a binary you run explicitly with
+# `cargo run --manifest-path tests/e2e/Cargo.toml`, NOT a `cargo test` target —
+# so its output isn't wrapped in libtest's "running N tests" scaffolding and the
+# e2e run isn't interleaved with unit-test output. `src/main.rs` is auto-detected
+# as the `rise-e2e` binary; it drives the `rise` CLI + HTTP against a live backend,
+# runs every scenario as one in-order suite under a shared bring-up, and is gated
+# on RISE_E2E_BACKEND (prints a skip + exits 0 when unset). Unit tests for the
+# harness's own helpers (e.g. token minting) stay `#[test]`s run by `cargo test`.
 
 [dependencies]
 anyhow = "1.0.100"

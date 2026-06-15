@@ -1,9 +1,9 @@
-//! E2E harness entrypoint — a plain binary (`harness = false`), not a libtest
-//! test. Every scenario shares one expensive backend `bring_up` (a whole compose
-//! stack or minikube cluster), so they run as one in-order suite under our own
-//! reporter rather than independent libtest tests that would each re-provision.
-//! Gated on `RISE_E2E_BACKEND`; skips (exit 0) when unset. Exits non-zero on any
-//! scenario failure so `cargo test` / CI treats it as a failure.
+//! E2E harness entrypoint — a binary you run with `cargo run`. Every scenario
+//! shares one expensive backend `bring_up` (a whole compose stack or minikube
+//! cluster), so they run as one in-order suite under our own reporter rather than
+//! as independent tests that would each re-provision. Gated on `RISE_E2E_BACKEND`;
+//! skips (exit 0) when unset. Exits non-zero on any scenario failure so CI treats
+//! the run as a failure.
 
 use std::process::ExitCode;
 use std::time::Instant;

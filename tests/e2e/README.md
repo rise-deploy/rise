@@ -12,23 +12,26 @@ This is a **standalone Cargo workspace** (excluded from the root workspace so th
 production image build never compiles it), so invoke it with `--manifest-path
 tests/e2e/Cargo.toml` from the repo root.
 
-The suite is a plain binary (`harness = false`), not a libtest test — it owns its
-own runner + reporting (no "running 1 test" scaffolding) and exits non-zero on
-failure. `cargo test` still builds & runs it. It is gated on `RISE_E2E_BACKEND`:
-**unset → it prints a skip and exits 0**, so `cargo test --manifest-path
-tests/e2e/Cargo.toml` only runs the pure unit tests and never stands up a backend.
+The suite is a **binary you run** (`cargo run`), not a `cargo test` target — its
+output is its own timed report, with no libtest scaffolding around it. It is
+gated on `RISE_E2E_BACKEND` (**unset → prints a skip and exits 0**) and exits
+non-zero on any scenario failure. Unit tests for the harness's own helpers (e.g.
+CI-token minting) are plain `#[test]`s run by `cargo test`.
 
 ```bash
 # Docker backend (self-provisions its own compose stack).
 RISE_E2E_BACKEND=docker \
 RISE_IMAGE_TAG=<tag> \
 RISE_IMAGE_REPOSITORY=ghcr.io/rise-deploy/rise \
-  cargo test --manifest-path tests/e2e/Cargo.toml
+  cargo run --manifest-path tests/e2e/Cargo.toml
 
 # Minikube backend (self-provisions its own cluster: minikube start + helm
 # install + port-forwards). Needs minikube/kubectl/helm on PATH.
 RISE_E2E_BACKEND=minikube RISE_IMAGE_TAG=<tag> \
-  cargo test --manifest-path tests/e2e/Cargo.toml
+  cargo run --manifest-path tests/e2e/Cargo.toml
+
+# Unit tests for the harness's own helpers (no backend stood up).
+cargo test --manifest-path tests/e2e/Cargo.toml
 ```
 
 Scenarios run in-order as one suite (they share the single backend bring-up).
@@ -45,7 +48,8 @@ Scenarios run in-order as one suite (they share the single backend bring-up).
 - `src/{cli,http,token,dex}.rs` — process/HTTP/token helpers. `token` reuses
   `rise-backend-auth` to mint the CI bearer; `dex` mints OIDC id_tokens via the
   resource-owner password grant.
-- `tests/e2e.rs` — the `#[test]` entrypoint.
+- `src/main.rs` — the binary entrypoint (`cargo run`): the suite's own runner +
+  timed report.
 
 ## Scenarios
 
