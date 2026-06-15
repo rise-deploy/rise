@@ -452,6 +452,37 @@ jobs:
 # Stage 3 · E2E — gated on a green build (develop pushes / trusted PRs)
 # ==========================================================================
 
+  # Compile the rise-e2e harness once and hand the binary to the harness jobs
+  # below, so they don't each rebuild it (and need no Rust toolchain at all). The
+  # binary bakes its repo-root via CARGO_MANIFEST_DIR, which resolves at run time
+  # because every job checks the repo out to the same $GITHUB_WORKSPACE on
+  # ubuntu-latest; the binary itself links only libc.
+  e2e-harness-build:
+    name: E2E / harness build
+    runs-on: ubuntu-latest
+    needs: prepare
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Rust + tools
+        uses: ./.github/actions/setup-rust
+        with:
+          rust-version: ${{ env.RUST_VERSION }}
+          cache-key: e2e-harness
+
+      - name: Build harness binary
+        run: cargo build --manifest-path tests/e2e/Cargo.toml
+
+      - name: Upload harness binary
+        uses: actions/upload-artifact@v5
+        with:
+          name: rise-e2e-harness
+          path: tests/e2e/target/debug/rise-e2e
+          if-no-files-found: error
+          retention-days: 1
+
   e2e-build:
     name: E2E / build backends
     runs-on: ubuntu-latest
@@ -487,6 +518,7 @@ jobs:
       - package-image
       - rust-quality
       - unit-tests-linux
+      - e2e-harness-build
     timeout-minutes: 40
     permissions:
       contents: read
@@ -495,22 +527,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Set up Rust + tools
-        uses: ./.github/actions/setup-rust
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
         with:
-          rust-version: ${{ env.RUST_VERSION }}
-          cache-key: e2e-docker
-          ghcr-login: "true"
-          github-actor: ${{ github.actor }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Build / unit-test / run as separate steps so compile output stays in the
-      # build step and the harness run isn't interleaved with libtest scaffolding.
-      - name: Build e2e harness
-        run: cargo build --manifest-path tests/e2e/Cargo.toml
-
-      - name: Unit tests
-        run: cargo test --manifest-path tests/e2e/Cargo.toml
+      - name: Download e2e harness binary
+        uses: actions/download-artifact@v5
+        with:
+          name: rise-e2e-harness
+          path: harness
 
       # Self-provisions its own compose stack and runs every Docker scenario
       # (public deploy, SA token exchange, private/forwardAuth, health-rolling
@@ -520,7 +548,9 @@ jobs:
           RISE_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           RISE_IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
           RISE_E2E_BACKEND: docker
-        run: cargo run --manifest-path tests/e2e/Cargo.toml
+        run: |
+          chmod +x harness/rise-e2e
+          ./harness/rise-e2e
 
   # Typed cross-backend harness (crate rise-e2e) on Kubernetes: it self-provisions
   # its own minikube cluster + Helm release (default oci-client-auth mode) and runs
@@ -533,6 +563,7 @@ jobs:
       - prepare
       - package-image
       - package-helm
+      - e2e-harness-build
     timeout-minutes: 45
     permissions:
       contents: read
@@ -541,29 +572,36 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Set up Rust + tools
-        uses: ./.github/actions/setup-rust
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
         with:
-          rust-version: ${{ env.RUST_VERSION }}
-          cache-key: e2e-minikube
-          setup-mise: "true"
-          mise-tools: "minikube kubectl helm"
-          ghcr-login: "true"
-          github-actor: ${{ github.actor }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build e2e harness
-        run: cargo build --manifest-path tests/e2e/Cargo.toml
+      - name: Setup mise
+        uses: jdx/mise-action@v4
+        with:
+          cache: true
+          experimental: true
 
-      - name: Unit tests
-        run: cargo test --manifest-path tests/e2e/Cargo.toml
+      - name: Install mise tools
+        run: mise use -g minikube kubectl helm
+
+      - name: Download e2e harness binary
+        uses: actions/download-artifact@v5
+        with:
+          name: rise-e2e-harness
+          path: harness
 
       - name: Run e2e harness (minikube backend)
         env:
           RISE_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           RISE_IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
           RISE_E2E_BACKEND: minikube
-        run: cargo run --manifest-path tests/e2e/Cargo.toml
+        run: |
+          chmod +x harness/rise-e2e
+          ./harness/rise-e2e
 
   # rise-e2e harness in jfrog-vault mode: self-provisions JFrog + Vault + a minikube
   # cluster whose registry pulls from JFrog, then runs the workload-identity scenario
@@ -579,6 +617,7 @@ jobs:
       - prepare
       - package-image
       - package-helm
+      - e2e-harness-build
     timeout-minutes: 60
     permissions:
       contents: read
@@ -587,22 +626,27 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Set up Rust + tools
-        uses: ./.github/actions/setup-rust
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
         with:
-          rust-version: ${{ env.RUST_VERSION }}
-          cache-key: e2e-jfrog
-          setup-mise: "true"
-          mise-tools: "minikube kubectl helm"
-          ghcr-login: "true"
-          github-actor: ${{ github.actor }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build e2e harness
-        run: cargo build --manifest-path tests/e2e/Cargo.toml
+      - name: Setup mise
+        uses: jdx/mise-action@v4
+        with:
+          cache: true
+          experimental: true
 
-      - name: Unit tests
-        run: cargo test --manifest-path tests/e2e/Cargo.toml
+      - name: Install mise tools
+        run: mise use -g minikube kubectl helm
+
+      - name: Download e2e harness binary
+        uses: actions/download-artifact@v5
+        with:
+          name: rise-e2e-harness
+          path: harness
 
       - name: Run e2e harness (minikube, jfrog-vault)
         env:
@@ -611,7 +655,9 @@ jobs:
           RISE_IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
           RISE_E2E_BACKEND: minikube
           RISE_E2E_REGISTRY_MODE: jfrog-vault
-        run: cargo run --manifest-path tests/e2e/Cargo.toml
+        run: |
+          chmod +x harness/rise-e2e
+          ./harness/rise-e2e
 
 # ==========================================================================
 # Stage 4 · Docs — GitHub Pages (serialized via the pages-deploy concurrency group)
