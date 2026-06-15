@@ -33,7 +33,7 @@ inputs:
     required: false
     default: "false"
   github-actor:
-    description: Actor for GHCR login (pass ${{ github.actor }}). Secrets/contexts aren't inherited by composites.
+    description: Actor for GHCR login (caller passes github.actor; contexts/secrets aren't inherited by composites).
     required: false
     default: ""
   github-token:
