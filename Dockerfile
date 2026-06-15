@@ -1,5 +1,8 @@
-# Stage 1: Use official cargo-chef image as base
-FROM lukemathwalker/cargo-chef:latest-rust-1.94 AS chef
+# Stage 1: Use official cargo-chef image as base.
+# RUST_VERSION is the single source of truth for the build toolchain; keep it in
+# lockstep with .github/workflows/ci.yml (env.RUST_VERSION) and mise.toml.
+ARG RUST_VERSION=1.95
+FROM lukemathwalker/cargo-chef:latest-rust-${RUST_VERSION} AS chef
 WORKDIR /usr/src
 
 # Install build dependencies for Debian (including perl and make for vendored OpenSSL build)

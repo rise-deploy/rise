@@ -1,0 +1,77 @@
+name: Setup Rust + tools
+description: >-
+  Install a pinned Rust toolchain, restore the Rust build cache, and optionally
+  set up mise tools and log in to GHCR. Assumes the repository is already
+  checked out (checkout stays in the job so it can set job-specific options).
+
+inputs:
+  rust-version:
+    description: Exact Rust toolchain version (the single source of truth, e.g. env.RUST_VERSION).
+    required: true
+  components:
+    description: Comma-separated rustup components (e.g. "rustfmt, clippy").
+    required: false
+    default: ""
+  cache:
+    description: Whether to restore the Swatinem/rust-cache.
+    required: false
+    default: "true"
+  cache-key:
+    description: Extra rust-cache key segment, so job classes don't evict each other.
+    required: false
+    default: ""
+  setup-mise:
+    description: Whether to run jdx/mise-action.
+    required: false
+    default: "false"
+  mise-tools:
+    description: Space-separated tools to `mise use -g` (e.g. "cargo:sqlx-cli helm").
+    required: false
+    default: ""
+  ghcr-login:
+    description: Whether to log in to GHCR (ghcr.io).
+    required: false
+    default: "false"
+  github-actor:
+    description: Actor for GHCR login (pass ${{ github.actor }}). Secrets/contexts aren't inherited by composites.
+    required: false
+    default: ""
+  github-token:
+    description: Token for GHCR login (pass secrets.GITHUB_TOKEN).
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: ${{ inputs.rust-version }}
+        components: ${{ inputs.components }}
+
+    - name: Rust cache
+      if: ${{ inputs.cache == 'true' }}
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ inputs.cache-key }}
+
+    - name: Setup mise
+      if: ${{ inputs.setup-mise == 'true' }}
+      uses: jdx/mise-action@v4
+      with:
+        cache: true
+        experimental: true
+
+    - name: Install mise tools
+      if: ${{ inputs.setup-mise == 'true' && inputs.mise-tools != '' }}
+      shell: bash
+      run: mise use -g ${{ inputs.mise-tools }}
+
+    - name: Log in to GHCR
+      if: ${{ inputs.ghcr-login == 'true' }}
+      uses: docker/login-action@v4
+      with:
+        registry: ghcr.io
+        username: ${{ inputs.github-actor }}
+        password: ${{ inputs.github-token }}
