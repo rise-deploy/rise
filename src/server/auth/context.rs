@@ -1,12 +1,11 @@
 use crate::db::models::User;
 use crate::db::service_accounts;
-use crate::server::auth::controller::{
-    match_controller_identity, ControllerAuthContext, ControllerIdentity, ControllerMatch,
-};
-use crate::server::auth::jwt::JwtValidator;
+use crate::server::auth::controller::{ControllerAuthContext, ControllerIdentity};
+use crate::server::auth::sa_match::{match_service_account, SaMatchError};
 use crate::server::error::{ServerError, ServerErrorExt};
 use crate::server::state::AppState;
 use axum::{extract::FromRequestParts, http::request::Parts, http::StatusCode};
+use rise_backend_auth::{AccessClaims, PrincipalClaims};
 use sqlx::PgPool;
 use std::collections::HashMap;
 
@@ -33,19 +32,37 @@ pub struct VerifiedExternalToken {
 pub enum AuthContext {
     User(User),
     ExternalToken(VerifiedExternalToken),
+    /// A Rise access token (RFC 8693 exchanged principal). In Phase 1 this is
+    /// only ever a service account or controller — the exchange never mints a
+    /// `User` access token. Recognized by handlers via `resolve_for_project`.
+    Access(AccessClaims),
 }
 
 impl AuthContext {
     /// Get the authenticated Rise user.
     ///
-    /// Returns the user for Rise JWTs. Returns 401 for external tokens
-    /// (endpoints that don't support service account authentication should call this).
+    /// Returns the user for Rise JWTs. Returns 401 for service-account / access
+    /// tokens (endpoints that don't support service account authentication
+    /// should call this).
     pub fn user(&self) -> Result<&User, ServerError> {
         match self {
             AuthContext::User(user) => Ok(user),
-            AuthContext::ExternalToken(_) => Err(ServerError::unauthorized(
-                "This endpoint does not support service account authentication",
-            )),
+            AuthContext::ExternalToken(_) | AuthContext::Access(_) => {
+                Err(ServerError::unauthorized(
+                    "This endpoint does not support service account authentication",
+                ))
+            }
+        }
+    }
+
+    /// The embedded access-token claims, if this context is a Rise access token.
+    ///
+    /// Used by `create_deployment` to read the service-account environment
+    /// restriction snapshot without a DB lookup.
+    pub fn access_claims(&self) -> Option<&AccessClaims> {
+        match self {
+            AuthContext::Access(claims) => Some(claims),
+            _ => None,
         }
     }
 
@@ -64,106 +81,85 @@ impl AuthContext {
     ) -> Result<(User, bool), ServerError> {
         match self {
             AuthContext::User(user) => Ok((user.clone(), false)),
+            AuthContext::Access(claims) => resolve_access_for_project(pool, project, claims).await,
             AuthContext::ExternalToken(token) => {
-                if let Some(controller_candidates) = controllers_by_issuer.get(&token.issuer) {
-                    match match_controller_identity(&token.claims, controller_candidates) {
-                        ControllerMatch::Single(ident) => {
-                            tracing::warn!(
-                                "Controller token {} from issuer '{}' attempted service-account auth for project '{}'",
-                                ident.id,
-                                token.issuer,
-                                project.name
-                            );
-                            return Err(ServerError::unauthorized(
-                                "Controller tokens cannot be used as service accounts",
-                            ));
-                        }
-                        ControllerMatch::Multiple(matched) => {
-                            let ids: Vec<&str> =
-                                matched.iter().map(|ident| ident.id.as_str()).collect();
-                            tracing::error!(
-                                "Multiple controller identities matched JWT from issuer '{}' during service-account auth: {:?}",
-                                token.issuer,
-                                ids
-                            );
-                            return Err(ServerError::conflict(
-                                "Token matched multiple controller identities; configuration is ambiguous",
-                            ));
-                        }
-                        ControllerMatch::Unmatched(_) => {}
-                    }
-                }
-
-                // Find service accounts for this project + issuer
+                // Find service accounts for this project + issuer, then run the
+                // shared matcher (controller rejection + per-SA claim matching).
                 let service_accounts =
                     service_accounts::find_by_project_and_issuer(pool, project.id, &token.issuer)
                         .await
                         .internal_err("Failed to look up service accounts")?;
 
-                if service_accounts.is_empty() {
-                    return Err(ServerError::unauthorized(format!(
-                        "No service accounts configured for issuer '{}' on project '{}'",
-                        token.issuer, project.name
-                    )));
-                }
-
-                // Try each SA's expected claims against the token
-                let mut matching_sas = Vec::new();
-                let mut last_error = None;
-                for sa in &service_accounts {
-                    let expected_claims: HashMap<String, String> =
-                        match serde_json::from_value(sa.claims.clone()) {
-                            Ok(claims) => claims,
-                            Err(e) => {
-                                tracing::error!(
-                                    "Failed to deserialize claims for service account {}: {}",
-                                    sa.id,
-                                    e
-                                );
-                                return Err(ServerError::internal(
-                                    "Invalid service account claims configuration",
-                                ));
-                            }
-                        };
-
-                    match JwtValidator::validate_custom_claims(&token.claims, &expected_claims) {
-                        Ok(()) => {
-                            matching_sas.push(sa);
-                        }
-                        Err(e) => {
-                            tracing::info!("SA {} claim mismatch: {}", sa.id, e);
-                            last_error = Some(e);
-                        }
+                let sa = match match_service_account(
+                    &token.claims,
+                    &token.issuer,
+                    &service_accounts,
+                    controllers_by_issuer,
+                ) {
+                    Ok(sa) => sa,
+                    Err(SaMatchError::ControllerToken) => {
+                        tracing::warn!(
+                            "Controller token from issuer '{}' attempted service-account auth for project '{}'",
+                            token.issuer,
+                            project.name
+                        );
+                        return Err(ServerError::unauthorized(
+                            "Controller tokens cannot be used as service accounts",
+                        ));
                     }
-                }
-
-                if matching_sas.is_empty() {
-                    // No SA matched — include validation details (safe: same project)
-                    return Err(ServerError::unauthorized(format!(
-                        "Token claims do not match any service account for project '{}': {}",
-                        project.name,
-                        last_error
-                            .map(|e| e.to_string())
-                            .unwrap_or_else(|| "unknown error".to_string()),
-                    )));
-                }
-
-                if matching_sas.len() > 1 {
-                    let sa_ids: Vec<String> =
-                        matching_sas.iter().map(|sa| sa.id.to_string()).collect();
-                    tracing::error!(
-                        "Multiple service accounts matched JWT on project '{}': {:?}. \
-                         This indicates ambiguous claim configuration.",
-                        project.name,
-                        sa_ids
-                    );
-                    return Err(ServerError::conflict(
-                        "Multiple service accounts match the provided claims",
-                    ));
-                }
+                    Err(SaMatchError::AmbiguousController) => {
+                        tracing::error!(
+                            "Multiple controller identities matched JWT from issuer '{}' during service-account auth",
+                            token.issuer
+                        );
+                        return Err(ServerError::conflict(
+                            "Token matched multiple controller identities; configuration is ambiguous",
+                        ));
+                    }
+                    Err(SaMatchError::MalformedClaims(sa_id)) => {
+                        tracing::error!(
+                            "Failed to deserialize claims for service account {}",
+                            sa_id
+                        );
+                        return Err(ServerError::internal(
+                            "Invalid service account claims configuration",
+                        ));
+                    }
+                    Err(SaMatchError::NoMatch {
+                        had_candidates: false,
+                        ..
+                    }) => {
+                        return Err(ServerError::unauthorized(format!(
+                            "No service accounts configured for issuer '{}' on project '{}'",
+                            token.issuer, project.name
+                        )));
+                    }
+                    Err(SaMatchError::NoMatch {
+                        had_candidates: true,
+                        last_error,
+                    }) => {
+                        return Err(ServerError::unauthorized(format!(
+                            "Token claims do not match any service account for project '{}': {}",
+                            project.name,
+                            last_error
+                                .map(|e| e.to_string())
+                                .unwrap_or_else(|| "unknown error".to_string()),
+                        )));
+                    }
+                    Err(SaMatchError::Ambiguous(sa_ids)) => {
+                        tracing::error!(
+                            "Multiple service accounts matched JWT on project '{}': {:?}. \
+                             This indicates ambiguous claim configuration.",
+                            project.name,
+                            sa_ids
+                        );
+                        return Err(ServerError::conflict(
+                            "Multiple service accounts match the provided claims",
+                        ));
+                    }
+                };
 
                 // Exactly one match — look up the SA's synthetic user
-                let sa = matching_sas[0];
                 let user = crate::db::users::find_by_id(pool, sa.user_id)
                     .await
                     .internal_err("Failed to look up service account user")?
@@ -183,11 +179,68 @@ impl AuthContext {
     }
 
     /// Returns `true` if this auth context represents a service account token
-    /// (i.e. an external JWT that has not yet been resolved to a project).
+    /// (an external JWT not yet resolved to a project, or an exchanged access
+    /// token carrying a service-account principal).
     ///
     /// After calling `resolve_for_project`, use the returned `is_sa` bool instead.
     pub fn is_service_account(&self) -> bool {
-        matches!(self, AuthContext::ExternalToken(_))
+        match self {
+            AuthContext::ExternalToken(_) => true,
+            AuthContext::Access(claims) => {
+                matches!(&claims.principal, PrincipalClaims::ServiceAccount { .. })
+            }
+            AuthContext::User(_) => false,
+        }
+    }
+}
+
+/// Resolve a Rise access token for a project-scoped endpoint.
+///
+/// The principal was fully resolved at exchange time, so this is a snap decision
+/// plus a single synthetic-user lookup:
+/// - `ServiceAccount`: the token is bound to one project. Assert the bound
+///   `project_id` matches the project the handler resolved (whether named in the
+///   request or discovered from a deployment id). A mismatch is reported as an
+///   auth failure (masked to 404 by callers) — an SA may act only within its
+///   bound project.
+/// - `Controller` / `User`: not valid service-account principals on these
+///   project-scoped endpoints.
+async fn resolve_access_for_project(
+    pool: &PgPool,
+    project: &crate::db::models::Project,
+    claims: &AccessClaims,
+) -> Result<(User, bool), ServerError> {
+    match &claims.principal {
+        PrincipalClaims::ServiceAccount {
+            synthetic_user_id,
+            project_id,
+            ..
+        } => {
+            if *project_id != project.id {
+                tracing::warn!(
+                    "Access token bound to project {} used against project '{}' ({})",
+                    project_id,
+                    project.name,
+                    project.id
+                );
+                return Err(ServerError::unauthorized(
+                    "Access token is not valid for this project",
+                ));
+            }
+            let user = crate::db::users::find_by_id(pool, *synthetic_user_id)
+                .await
+                .internal_err("Failed to look up service account user")?
+                .ok_or_else(|| {
+                    ServerError::internal("Service account user not found in database")
+                })?;
+            Ok((user, true))
+        }
+        PrincipalClaims::Controller { .. } => Err(ServerError::unauthorized(
+            "Controller tokens cannot be used as service accounts",
+        )),
+        PrincipalClaims::User { .. } => Err(ServerError::unauthorized(
+            "This endpoint does not support user access tokens",
+        )),
     }
 }
 
@@ -203,12 +256,17 @@ impl FromRequestParts<AppState> for AuthContext {
             return Ok(AuthContext::User(user));
         }
 
-        // Try VerifiedExternalToken extension (external JWT path)
+        // Try the exchanged access-token extension (Rise access token path)
+        if let Some(claims) = parts.extensions.get::<AccessClaims>().cloned() {
+            return Ok(AuthContext::Access(claims));
+        }
+
+        // Try VerifiedExternalToken extension (legacy raw external JWT path)
         if let Some(token) = parts.extensions.get::<VerifiedExternalToken>().cloned() {
             return Ok(AuthContext::ExternalToken(token));
         }
 
-        // Neither was set — middleware should have rejected the request
+        // None was set — middleware should have rejected the request
         Err(ServerError::unauthorized("Not authenticated"))
     }
 }
@@ -450,6 +508,92 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(err.message.contains("Invalid service account claims"));
+    }
+
+    /// An access token bound to a project resolves to the SA's synthetic user
+    /// when used against that project.
+    #[sqlx::test]
+    async fn test_resolve_access_token_matching_project(pool: PgPool) {
+        let owner = users::create(&pool, "owner@example.com").await.unwrap();
+        let sa_user = users::create(&pool, "sa@test-project.example.com")
+            .await
+            .unwrap();
+        let project = projects::create(
+            &pool,
+            "test-project",
+            ProjectStatus::Stopped,
+            "public".to_string(),
+            Some(owner.id),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let claims = AccessClaims {
+            iss: "https://rise.test".to_string(),
+            aud: "https://rise.test".to_string(),
+            sub: format!("rise:sa:{}", uuid::Uuid::new_v4()),
+            iat: 0,
+            exp: u64::MAX,
+            jti: "jti".to_string(),
+            principal: PrincipalClaims::ServiceAccount {
+                service_account_id: uuid::Uuid::new_v4(),
+                synthetic_user_id: sa_user.id,
+                project_id: project.id,
+                project_name: project.name.clone(),
+                allowed_environment_ids: None,
+                scopes: vec![],
+            },
+        };
+        let auth = AuthContext::Access(claims);
+        let (user, is_sa) = auth
+            .resolve_for_project(&pool, &project, &empty_controller_index())
+            .await
+            .unwrap();
+        assert!(is_sa);
+        assert_eq!(user.id, sa_user.id);
+    }
+
+    /// An access token bound to project P must NOT resolve against project Q.
+    #[sqlx::test]
+    async fn test_resolve_access_token_project_mismatch(pool: PgPool) {
+        let owner = users::create(&pool, "owner@example.com").await.unwrap();
+        let project = projects::create(
+            &pool,
+            "other-project",
+            ProjectStatus::Stopped,
+            "public".to_string(),
+            Some(owner.id),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let claims = AccessClaims {
+            iss: "https://rise.test".to_string(),
+            aud: "https://rise.test".to_string(),
+            sub: "rise:sa:x".to_string(),
+            iat: 0,
+            exp: u64::MAX,
+            jti: "jti".to_string(),
+            principal: PrincipalClaims::ServiceAccount {
+                service_account_id: uuid::Uuid::new_v4(),
+                synthetic_user_id: uuid::Uuid::new_v4(),
+                // Bound to a different project than `project`.
+                project_id: uuid::Uuid::new_v4(),
+                project_name: "bound-project".to_string(),
+                allowed_environment_ids: None,
+                scopes: vec![],
+            },
+        };
+        let auth = AuthContext::Access(claims);
+        let err = auth
+            .resolve_for_project(&pool, &project, &empty_controller_index())
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
     }
 
     #[sqlx::test]

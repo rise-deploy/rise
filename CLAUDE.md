@@ -53,7 +53,7 @@ Let's outline the architecture and components needed for this Rust-based project
 
 ## Architecture Overview
 
-**Note**: The project is structured as a **single consolidated Rust crate** (`rise-deploy`) that produces the `rise` binary with both CLI and server capabilities enabled via feature flags.
+**Note**: The project is a Cargo **workspace**. The primary crate `rise-deploy` produces the `rise` binary with both CLI and server capabilities enabled via feature flags. A few focused, backend-only support crates live under `crates/` and are depended on as optional, `backend`-feature-gated path deps: `rise-resource-api` / `rise-resource-store` (generic resource API), `rise-backend-auth` (pure-core token signing, verification, and matching — the single home for auth-token logic; see `ROADMAP.md` § "Authentication & Token Exchange"), and `rise-backend-core` (the deployment-backend contract seam: shared deployment models, the `DeploymentBackend` trait, registry/encryption provider traits, the pure `quantity`/`state_machine` helpers, and the `DeploymentStore` trait — the database boundary implemented by `rise-deploy`'s `PgDeploymentStore`; this is the foundation for extracting the Docker/Kubernetes controllers into their own crates, see issue #377).
 
 ### Crate Structure (`rise-deploy`)
 
@@ -100,7 +100,7 @@ cargo build --all-features     # Full build with CLI + backend
 
 ## Implementation Steps
 
-**Project Structure**: Consolidated into single `rise-deploy` crate (formerly separate `rise-backend` and `rise-cli` crates)
+**Project Structure**: A Cargo workspace whose primary crate `rise-deploy` carries both CLI and backend (feature-gated). Focused, backend-only support crates live under `crates/` — `rise-resource-api` / `rise-resource-store` and the pure-core `rise-backend-auth` (the single home for auth-token signing, verification, and matching).
 
 ### Completed Implementation
 
@@ -167,6 +167,30 @@ For user-facing documentation, see the [`/docs`](./docs) directory. Key topics i
 - The default development branch is `develop`. PRs for feature work should target `develop`, not `main`.
 - Always target the branch your feature branch was created from when opening a PR.
 
+## Rollout Tracking
+
+High-impact, multi-PR, or operator-affecting changes are tracked in the **Rise
+Rollout Tracker** GitHub Project: <https://github.com/orgs/rise-deploy/projects/1>.
+Consult it when planning or reviewing large or breaking work to see in-flight
+workstreams, their phase, and outstanding finalization gates (deferred steps that
+flip a default, drop a compat shim, or tighten a constraint).
+
+Keep it current as work merges:
+
+- When a PR advances a tracked workstream, add it to the Project, link it from the
+  PR body, and move the item's `Status`. When you defer a finalization step, file
+  it as a `rollout-gate` issue and add it to the Project.
+- Set `Workstream`, `Breaking?`, `Operator impact`, and `Target release` on every
+  item. If `Operator impact` is not `None`, the item is **not** `Done` until the
+  operator [Upgrade Notes](docs/engineering/src/content/docs/upgrade-notes.md) page
+  has a matching entry for that release.
+- `ROADMAP.md` owns the *why*, phase rationale, and milestone checkboxes
+  for every in-flight architectural workstream (multi-tenancy + generic
+  resource API, authentication & token exchange, future workstreams). The
+  Project owns *live status*. Don't duplicate rationale into the board, and
+  don't create new `<TOPIC>_PLAN.md` / `<TOPIC>_ROADMAP.md` files — add new
+  workstreams as sections in `ROADMAP.md`.
+
 ## Guidelines
 
 - Build features in small increments with frequent commits. Use Git history as a reference for what was done and why.
@@ -176,8 +200,9 @@ For user-facing documentation, see the [`/docs`](./docs) directory. Key topics i
 - Axum capture groups are formatted as `{capture}`
 - Keep the documentation updated. Don't be overly verbose when documenting the project. People can read the code, but things that are not obvious or help getting started and context are usually helpful in documentation, as well as well-placed and lean examples.
 - When removing a feature, do a comprehensive check on the codebase to ensure any remaining references to that feature are removed or updated. This includes documentation files/READMEs, config files, code comments, etc.
+- Don't reference previous versions of the code in comments, docs, or commit-independent artifacts (e.g. "the previous design did X", "vs the old tick counter", "this used to be Y"). Comments must describe what the code does *now* and why — a reader has no access to the version you're contrasting against, and such notes rot. Git history is the place for that context. (Referring to runtime/domain concepts like "the previous leader replica" is fine — that's not code history.)
 - The CLI should first and foremost always accept the names of things (e.g. project names, or project names + deployment timestamp). The UUIDs in our tables are only for internal book-keeping.
-- Admin users (`auth.admin_users`) bypass the regular permission checks on the typed APIs (projects, teams, deployments, etc.) — they have full access there without passing ownership/membership checks. This does **not** extend to the generic resource API (`/api/v1/resources`), which is operator-gated (`auth.operator_users`): admins are not operators and do not bypass its checks. Granting admins access to the resource API is intentionally deferred (see `MULTI_TENANCY_PLAN.md`).
+- Admin users (`auth.admin_users`) bypass the regular permission checks on the typed APIs (projects, teams, deployments, etc.) — they have full access there without passing ownership/membership checks. This does **not** extend to the generic resource API (`/api/v1/resources`), which is operator-gated (`auth.operator_users`): admins are not operators and do not bypass its checks. Granting admins access to the resource API is intentionally deferred (see `ROADMAP.md`).
 - Any SQLX queries are to be wrapped by helper functions in the `rise_deploy::db` crate. No SQLX queries outside of this crate are allowed.
 - When we log errors and don't handle them further, we should include a sensible amount of information about the error. Often logging the error with `{:?}` is good enough.
 - When capturing screenshots, the playwright tool will successfully install the driver even if you might think its install step failed. Always use minimum 1280px width and 800px height for the browser.
@@ -211,7 +236,7 @@ cargo clippy --all-features --all-targets -- -D warnings  # Lint (uses cached bu
 
 | What changed | Command | Why |
 |---|---|---|
-| Any `.rs` file | `cargo test --all-features` | Unit tests (requires `mise run db:migrate` once) |
+| Any `.rs` file | `cargo test --workspace --all-features` | Unit tests (requires `mise run db:migrate` once); `--workspace` ensures crates such as `rise-backend-auth` and `rise-backend-core` are included |
 | SQLX queries (`sqlx::query!` etc.) | `mise run sqlx:prepare` | Regenerate offline query cache (commit the result) |
 | Server settings structs (`src/server/settings.rs`) | `mise run config:schema:generate` | Regenerate `docs/engineering/public/schemas/backend-settings.schema.json` (commit the result) |
 | `src/rise_toml.rs` structs | `mise run rise-toml:schema:generate` | Regenerate `docs/user/public/schemas/rise-toml-v1.schema.json` (commit the result) |
@@ -225,26 +250,41 @@ mise run lint                  # cargo check + clippy + fmt check + sqlx check +
 mise run config:schema:check        # Verify backend config schema is up to date
 mise run rise-toml:schema:check    # Verify rise.toml schema is up to date
 mise run crd:check                 # Verify CRD YAML matches Rust definition
-cargo test --all-features      # Unit tests
+cargo test --workspace --all-features  # Unit tests (all crates)
 ```
 
 The `mise run lint` task runs: `cargo all-features check`, `cargo all-features clippy -- -D warnings`, `cargo fmt --check`, `mise sqlx:check`, and `helm lint helm/rise`.
 
-## Future Enhancements
+## Deployment Backend Parity (STRICT)
 
-### Ingress Authentication (Kubernetes Controller)
+Rise supports multiple deployment backends (currently **Kubernetes** and
+**Docker**). They are equal first-class citizens, and we aim for **semantic
+feature parity and correctness across all of them**.
 
-The project `visibility` field (Public/Private) is currently stored but not enforced at the ingress level. This field is intended for ingress-level authentication:
+**The rule:** any feature configurable through a public Rise API surface
+(`rise.toml`, project/deployment settings, environment variables, the HTTP API)
+must, *where technically possible*, be supported by **every** backend, and must
+behave the **same way** on each. A gap that is a fundamental limitation of a
+backend (e.g. a single-host Docker daemon has no horizontal scale-out or
+per-workload network policy) is acceptable and must be documented; a gap that is
+merely unimplemented is a **parity bug** to track and close.
 
-- **Public projects**: The ingress will serve the application without requiring authentication
-- **Private projects**: The ingress will require user authentication AND verify project access authorization before serving the application
+**How to apply it:**
 
-**Current State**: The visibility field is stored in the database and returned via the API, but does NOT affect:
-- API authorization (all projects require ownership/team membership to access via API)
-- Ingress routing (authentication not yet configured in ingress annotations)
+- **Do not implicitly plan the cross-backend work.** When a feature is requested
+  or implemented for one backend, do **not** silently extend it to the others.
+  Implement what was asked.
+- **Do raise the flag — explicitly.** During **planning** and **review**, call
+  out the parity implication: "this is configurable via <public API> and is now
+  supported on <backend A> but not <backend B> — is that an intentional
+  limitation or a parity gap to track?" Surface it; let the human decide.
+- **Keep the feature matrix current.** The source of truth is the
+  [Deployment Backends](docs/engineering/src/content/docs/deployment-backends.md)
+  overview page (`/operator-docs/deployment-backends/`). Any change that adds or
+  alters a backend feature must update the matrix in the **same** change — add a
+  row for a new feature, flip a cell when support changes, and note the reason
+  for any `⚠️`/`❌`.
 
-**Implementation Plan**:
-- The Kubernetes controller will configure ingress resources based on the visibility field
-- Public projects will have standard ingress rules
-- Private projects will have OAuth2 proxy or similar authentication middleware configured in the ingress
-- The authentication layer will validate both user identity AND project access permissions before proxying requests to the application
+## Ingress Authentication
+
+Ingress-level authentication is driven by each project's **access class** (`access_requirement`: `None` / `Authenticated` / `Member`), not the legacy `visibility` field. The Kubernetes controller is fully wired: for non-`None` access requirements it stamps nginx auth annotations (`nginx.ingress.kubernetes.io/auth-url` → `/api/v1/auth/ingress`, `auth-signin`, `auth-response-headers`) — see `ResourceBuilder::build_ingress_annotations` in `src/server/deployment/resource_builder.rs`. The subrequest is served by the `ingress_auth` handler in `src/server/auth/handlers.rs`, which validates the Rise JWT session cookie, then enforces `Authenticated` (any logged-in user) or `Member` (project owner/team member) and returns `X-Auth-Request-Email`/`X-Auth-Request-User` on success.

@@ -1,5 +1,8 @@
-# Stage 1: Use official cargo-chef image as base
-FROM lukemathwalker/cargo-chef:latest-rust-1.94 AS chef
+# Stage 1: Use official cargo-chef image as base.
+# RUST_VERSION is the single source of truth for the build toolchain; keep it in
+# lockstep with .github/workflows/ci.yml (env.RUST_VERSION) and mise.toml.
+ARG RUST_VERSION=1.95
+FROM lukemathwalker/cargo-chef:latest-rust-${RUST_VERSION} AS chef
 WORKDIR /usr/src
 
 # Install build dependencies for Debian (including perl and make for vendored OpenSSL build)
@@ -17,6 +20,9 @@ FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY crates/rise-resource-api/Cargo.toml ./crates/rise-resource-api/Cargo.toml
 COPY crates/rise-resource-store/Cargo.toml ./crates/rise-resource-store/Cargo.toml
+COPY crates/rise-backend-auth/Cargo.toml ./crates/rise-backend-auth/Cargo.toml
+COPY crates/rise-backend-core/Cargo.toml ./crates/rise-backend-core/Cargo.toml
+COPY crates/rise-runtime-sync/Cargo.toml ./crates/rise-runtime-sync/Cargo.toml
 
 # Create dummy sources for cargo to be happy
 RUN mkdir -p src && \
@@ -24,7 +30,13 @@ RUN mkdir -p src && \
     mkdir -p crates/rise-resource-api/src && \
     echo "" > crates/rise-resource-api/src/lib.rs && \
     mkdir -p crates/rise-resource-store/src && \
-    echo "" > crates/rise-resource-store/src/lib.rs
+    echo "" > crates/rise-resource-store/src/lib.rs && \
+    mkdir -p crates/rise-backend-auth/src && \
+    echo "" > crates/rise-backend-auth/src/lib.rs && \
+    mkdir -p crates/rise-backend-core/src && \
+    echo "" > crates/rise-backend-core/src/lib.rs && \
+    mkdir -p crates/rise-runtime-sync/src && \
+    echo "" > crates/rise-runtime-sync/src/lib.rs
 
 RUN cargo chef prepare --recipe-path recipe.json
 
@@ -128,21 +140,35 @@ RUN curl https://mise.run | sh
 # Set up mise environment
 ENV PATH="/root/.local/bin:/root/.local/share/mise/shims:${PATH}"
 
-# Install build tools via mise
-RUN /root/.local/bin/mise use -g pack@latest && \
-    /root/.local/bin/mise use -g docker-cli@latest && \
-    /root/.local/bin/mise use -g ubi:railwayapp/railpack@latest && \
+# Install build tools via mise.
+#
+# Pin every tool version explicitly — `@latest` here is what broke the image
+# build: a Docker CLI plugin-loading regression in the 29.1.x line makes
+# `docker buildx version` (and `docker trust`) report "unknown command: docker
+# buildx" even though the plugin binary is present in the searched
+# `~/.docker/cli-plugins` directory. See https://github.com/docker/cli/issues/6733.
+# pack/railpack/buildkit mirror the versions pinned in `mise.toml`; docker-cli is
+# held at the last 29.0.x release (29.0.4), the newest line before the regression
+# — buildx itself is fine, so it's pinned to the current latest (0.34.1). Bump
+# docker-cli back to the 29.1+ line once the upstream issue is resolved.
+ARG PACK_VERSION=0.40.6
+ARG DOCKER_CLI_VERSION=29.0.4
+ARG RAILPACK_VERSION=0.15.1
+ARG BUILDX_VERSION=0.34.1
+ARG BUILDKIT_VERSION=0.28.0
+
+RUN /root/.local/bin/mise use -g pack@${PACK_VERSION} && \
+    /root/.local/bin/mise use -g docker-cli@${DOCKER_CLI_VERSION} && \
+    /root/.local/bin/mise use -g ubi:railwayapp/railpack@${RAILPACK_VERSION} && \
     /root/.local/bin/mise install
 
-# Install Docker buildx plugin manually
+# Install Docker buildx plugin manually (pinned).
 RUN mkdir -p /root/.docker/cli-plugins && \
-    BUILDX_VERSION=$(curl -sL https://api.github.com/repos/docker/buildx/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/') && \
     curl -sSL "https://github.com/docker/buildx/releases/download/v${BUILDX_VERSION}/buildx-v${BUILDX_VERSION}.linux-amd64" -o /root/.docker/cli-plugins/docker-buildx && \
     chmod +x /root/.docker/cli-plugins/docker-buildx
 
-# Install buildctl from buildkit
-RUN BUILDKIT_VERSION=$(curl -sL https://api.github.com/repos/moby/buildkit/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/') && \
-    curl -sSL "https://github.com/moby/buildkit/releases/download/v${BUILDKIT_VERSION}/buildkit-v${BUILDKIT_VERSION}.linux-amd64.tar.gz" | tar -xz -C /usr/local bin/buildctl && \
+# Install buildctl from buildkit (pinned).
+RUN curl -sSL "https://github.com/moby/buildkit/releases/download/v${BUILDKIT_VERSION}/buildkit-v${BUILDKIT_VERSION}.linux-amd64.tar.gz" | tar -xz -C /usr/local bin/buildctl && \
     chmod +x /usr/local/bin/buildctl
 
 # Verify installations

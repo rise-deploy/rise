@@ -26,6 +26,7 @@ export default defineConfig({
             { label: 'Overview', slug: 'index' },
             { label: 'Operator Guide', slug: 'operator-guide' },
             { label: 'Configuration', slug: 'configuration' },
+            { label: 'Authentication & Tokens', slug: 'authentication' },
             {
               label: 'Registry Operations',
               items: [
@@ -37,15 +38,33 @@ export default defineConfig({
               ],
             },
             {
-              label: 'Kubernetes',
+              label: 'Deployment Backends',
               items: [
-                { label: 'Overview', slug: 'kubernetes' },
-                { label: 'Configuration', slug: 'kubernetes/configuration' },
-                { label: 'Architecture', slug: 'kubernetes/architecture' },
-                { label: 'Private Project Auth', slug: 'kubernetes/private-auth' },
-                { label: 'Custom Domains & TLS', slug: 'kubernetes/custom-domains' },
-                { label: 'Resources Reference', slug: 'kubernetes/resources' },
-                { label: 'Operations & Security', slug: 'kubernetes/operations' },
+                { label: 'Overview & Feature Matrix', slug: 'deployment-backends' },
+                {
+                  label: 'Kubernetes',
+                  items: [
+                    { label: 'Overview', slug: 'kubernetes' },
+                    { label: 'Configuration', slug: 'kubernetes/configuration' },
+                    { label: 'Architecture', slug: 'kubernetes/architecture' },
+                    { label: 'Private Project Auth', slug: 'kubernetes/private-auth' },
+                    { label: 'Custom Domains & TLS', slug: 'kubernetes/custom-domains' },
+                    { label: 'Resources Reference', slug: 'kubernetes/resources' },
+                    { label: 'Operations & Security', slug: 'kubernetes/operations' },
+                  ],
+                },
+                {
+                  label: 'Docker',
+                  items: [
+                    { label: 'Overview', slug: 'docker' },
+                    { label: 'Architecture', slug: 'docker/architecture' },
+                    { label: 'Quick Start', slug: 'docker/quick-start' },
+                    { label: 'Production Deployment', slug: 'docker/production' },
+                    { label: 'Authentication & Ingress Auth', slug: 'docker/authentication' },
+                    { label: 'Container Registry', slug: 'docker/registry' },
+                    { label: 'Troubleshooting', slug: 'docker/troubleshooting' },
+                  ],
+                },
               ],
             },
             {
@@ -58,6 +77,7 @@ export default defineConfig({
             { label: 'Production Deployment', slug: 'production' },
             { label: 'Database', slug: 'database' },
             { label: 'PostgreSQL Upgrades', slug: 'upgrading-postgresql' },
+            { label: 'Upgrade Notes & Breaking Changes', slug: 'upgrade-notes' },
           ],
         },
         {

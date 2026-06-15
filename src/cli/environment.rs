@@ -56,18 +56,25 @@ pub async fn handle_environment_command(
     config: &Config,
     cmd: &crate::EnvironmentCommands,
 ) -> Result<()> {
+    // Every subcommand targets a project; resolve it once up front and reuse it.
+    let (project, path) = match cmd {
+        crate::EnvironmentCommands::Create { project, path, .. }
+        | crate::EnvironmentCommands::List { project, path }
+        | crate::EnvironmentCommands::Show { project, path, .. }
+        | crate::EnvironmentCommands::Update { project, path, .. }
+        | crate::EnvironmentCommands::Delete { project, path, .. } => (project, path),
+    };
+    let project_name = crate::resolve_project_name(project.clone(), path)?;
     let token = crate::token_source::resolve_token_with_retry(http_client, config).await?;
 
     match cmd {
         crate::EnvironmentCommands::Create {
             name,
-            project,
-            path,
             group,
             production,
             color,
+            ..
         } => {
-            let project_name = crate::resolve_project_name(project.clone(), path)?;
             create_environment(
                 http_client,
                 backend_url,
@@ -80,28 +87,20 @@ pub async fn handle_environment_command(
             )
             .await
         }
-        crate::EnvironmentCommands::List { project, path } => {
-            let project_name = crate::resolve_project_name(project.clone(), path)?;
+        crate::EnvironmentCommands::List { .. } => {
             list_environments(http_client, backend_url, &token, &project_name).await
         }
-        crate::EnvironmentCommands::Show {
-            name,
-            project,
-            path,
-        } => {
-            let project_name = crate::resolve_project_name(project.clone(), path)?;
+        crate::EnvironmentCommands::Show { name, .. } => {
             show_environment(http_client, backend_url, &token, &project_name, name).await
         }
         crate::EnvironmentCommands::Update {
             name,
-            project,
-            path,
             rename,
             group,
             production,
             color,
+            ..
         } => {
-            let project_name = crate::resolve_project_name(project.clone(), path)?;
             update_environment(
                 http_client,
                 backend_url,
@@ -115,12 +114,7 @@ pub async fn handle_environment_command(
             )
             .await
         }
-        crate::EnvironmentCommands::Delete {
-            name,
-            project,
-            path,
-        } => {
-            let project_name = crate::resolve_project_name(project.clone(), path)?;
+        crate::EnvironmentCommands::Delete { name, .. } => {
             delete_environment(http_client, backend_url, &token, &project_name, name).await
         }
     }

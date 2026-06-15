@@ -126,41 +126,50 @@ pub async fn delete_rise_project(client: &Client, project_name: &str) -> anyhow:
     Ok(())
 }
 
-/// Update the trigger annotation on a `RiseProject` CRD to force an immediate resync.
-/// Called when deployment state changes (e.g., image pushed, status updated, stopped).
-pub async fn trigger_resync(client: &Client, project_name: &str) -> anyhow::Result<()> {
+/// Outcome of a [`trigger_resync_status`] call.
+pub enum ResyncOutcome {
+    /// The annotation bump succeeded; Metacontroller will sync the project.
+    Triggered,
+    /// The `RiseProject` CR does not exist (deleted, or never created).
+    ProjectNotFound,
+}
+
+/// Bump the trigger annotation on a `RiseProject` CRD to force a resync, reporting
+/// whether the CR existed — so a caller can distinguish a deleted project from a
+/// transient error (e.g. to stop re-picking an orphaned deployment).
+pub async fn trigger_resync_status(
+    client: &Client,
+    project_name: &str,
+) -> anyhow::Result<ResyncOutcome> {
     let api: Api<RiseProject> = Api::all(client.clone());
     let timestamp = chrono::Utc::now().to_rfc3339();
-
     let patch = serde_json::json!({
-        "metadata": {
-            "annotations": {
-                TRIGGER_ANNOTATION: timestamp,
-            },
-        },
+        "metadata": { "annotations": { TRIGGER_ANNOTATION: timestamp } },
     });
-
     match api
         .patch(project_name, &PatchParams::default(), &Patch::Merge(patch))
         .await
     {
-        Ok(_) => {
-            info!(
-                "Triggered resync for RiseProject '{}' (trigger={})",
-                project_name, timestamp
-            );
+        Ok(_) => Ok(ResyncOutcome::Triggered),
+        Err(kube::Error::Api(err)) if err.code == 404 => Ok(ResyncOutcome::ProjectNotFound),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Update the trigger annotation on a `RiseProject` CRD to force an immediate resync.
+/// Called when deployment state changes (e.g., image pushed, status updated, stopped).
+pub async fn trigger_resync(client: &Client, project_name: &str) -> anyhow::Result<()> {
+    match trigger_resync_status(client, project_name).await? {
+        ResyncOutcome::Triggered => {
+            info!("Triggered resync for RiseProject '{}'", project_name);
         }
-        Err(kube::Error::Api(err)) if err.code == 404 => {
+        ResyncOutcome::ProjectNotFound => {
             warn!(
                 "Cannot trigger resync: RiseProject '{}' not found (project may have been deleted)",
                 project_name
             );
         }
-        Err(e) => {
-            return Err(e.into());
-        }
     }
-
     Ok(())
 }
 

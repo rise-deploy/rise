@@ -11,38 +11,90 @@ title: "Local Development"
 
 ## First-Time Setup
 
-```bash
-# Install mise-managed tools (minikube, helm, kubectl, etc.)
-mise install
+Rise has two deployment backends, and either one can be your local dev
+environment — both are first-class and fully supported. Choose the backend that
+fits what you're working on. Install the mise-managed tools once (both paths
+need them), then follow **Path A (Kubernetes)** or **Path B (Docker)**:
 
-# One-stop dev environment setup. Cross-platform (Linux + macOS), idempotent,
-# and interactive. Configures /etc/hosts (sudo), Docker insecure registries,
-# and brings up a local cluster (minikube by default; offers k3s on Linux).
+```bash
+# Install mise-managed tools (minikube, helm, kubectl, etc.) — both paths
+mise install
+```
+
+### Path A — Kubernetes backend
+
+The original backend. Pick it to work on the Kubernetes controller / Helm /
+metacontroller, or if you already run a cluster.
+
+```bash
+# One-stop dev setup. Cross-platform (Linux + macOS), idempotent, interactive.
+# Configures /etc/hosts (sudo), Docker insecure registries, and brings up a
+# local cluster (minikube by default; offers k3s on Linux).
 mise setup
+
+mise frontend:dev   # Vite dev server
+mise backend:run    # alias: mise br — host backend against the K8s dev config
 ```
 
 `mise setup` is a thin wrapper around `./scripts/dev-setup.sh`. Run individual
-steps with `./scripts/dev-setup.sh <hosts|docker|minikube|k3s|preflight>` if
-you only need one part. The script writes pod-reachable host URLs to `.env`;
+steps with `mise setup <hosts|docker|minikube|k3s|preflight>` (mise passes the
+subcommand through; or run `./scripts/dev-setup.sh <...>` directly) if you only
+need one part. The script writes pod-reachable host URLs to `.env`;
 if you use direnv, run `direnv allow` once and `.envrc` will load them.
 
 On macOS, Docker Desktop's daemon config lives at `~/.docker/daemon.json` and
 the script updates it there. The script offers to restart Docker Desktop for
 you so the new insecure-registries take effect.
 
-## Day-to-Day
+Apps deploy to the cluster and are reachable at `*.rise.local` (resolved via the
+`/etc/hosts` + host-IP wiring `mise setup` provisions).
+
+### Path B — Docker backend
+
+A lighter single-host setup with no cluster — great for backend/frontend feature
+work and for the Docker deployment backend itself.
 
 ```bash
-mise dev
+# Adds ONLY the /etc/hosts aliases (incl. rise-dex → 127.0.0.1). No cluster,
+# no minikube — the full `mise setup` is not needed for this path.
+mise setup hosts
+
+# Brings up the compose support services + runs Rise on the host with the
+# Docker backend (reuses the env-driven config/docker.yaml; no Rise image build).
+mise backend:run docker   # alias: mise br docker
+
+mise frontend:dev         # optional, in another terminal
+```
+
+The registry uses `localhost:5000` (insecure-by-default in Docker — no
+`daemon.json` change), and apps are reachable at `*.rise.localhost` (loopback
+per RFC 6761, so no `/etc/hosts` edits for app hosts). The only setup `mise br docker`
+needs is the `rise-dex` host alias from `mise setup hosts`. See
+[Docker backend (local)](#docker-backend-local) below and the operator guide's
+[Local development](/operator-docs/docker/quick-start/#local-development-run-rise-on-the-host-no-image)
+section for the full reference.
+
+## Day-to-Day
+
+One command runs the full stack; it takes an optional backend arg (`k8s` is the
+default):
+
+```bash
+mise dev          # == mise dev k8s — Kubernetes backend (services + frontend + backend)
+mise dev docker   # Docker backend (support services + frontend + host server, no image build)
 ```
 
 This single command:
 
-1. **Checks prerequisites** — verifies `/etc/hosts` entries, Docker daemon, and Kubernetes connectivity. If anything is missing it lists the issues and asks whether to continue anyway.
-2. **Starts Docker Compose services** — PostgreSQL, Dex (OIDC), container registry.
+1. **Checks prerequisites** — verifies `/etc/hosts` entries, Docker daemon, and (for the Kubernetes backend) Kubernetes connectivity. If anything is missing it lists the issues and asks whether to continue anyway. (The cluster checks only apply to `mise dev` / `mise dev k8s`; `mise dev docker` skips them.)
+2. **Starts Docker Compose services** — PostgreSQL, Dex (OIDC), container registry (plus Traefik on the Docker path).
 3. **Runs database migrations.**
 4. **Starts the Vite frontend dev server** (background).
-5. **Starts the backend server.**
+5. **Starts the backend server** against the chosen backend.
+
+To run just the host server without the frontend, use `mise br` (Kubernetes) or
+`mise br docker` (Docker) — see [Running Components Individually](#running-components-individually)
+and [Docker backend (local)](#docker-backend-local).
 
 Services are then available at:
 
@@ -58,9 +110,13 @@ Services are then available at:
 ### Running Components Individually
 
 ```bash
-mise backend:run   # (alias: mise br) — starts deps + migrations + backend
-mise frontend:dev  # Vite dev server only
+mise backend:run         # (alias: mise br) — K8s backend: starts deps + migrations + backend
+mise backend:run docker  # (alias: mise br docker) — Docker backend on the host (no image build)
+mise frontend:dev        # Vite dev server only
 ```
+
+`mise backend:run` (`mise br`) takes the same optional backend arg as `mise dev`:
+omitted or `k8s` runs the Kubernetes path, `docker` runs the Docker path.
 
 ## Mise Tasks Reference
 
@@ -95,8 +151,8 @@ Everything is driven by `./scripts/dev-setup.sh`. `mise setup` and `mise down` a
 
 | Task | Purpose |
 |------|---------|
-| `dev` | Full dev stack (preflight prompt + services + frontend + backend) |
-| `backend:run` | Backend only (starts deps + migrates) |
+| `dev [k8s\|docker]` | Full dev stack (preflight prompt + services + frontend + backend). Defaults to `k8s`; `dev docker` runs the Docker backend |
+| `backend:run [k8s\|docker]` (alias `br`) | Host server only. Defaults to `k8s` (starts deps + migrates); `br docker` runs the Docker backend (support services + Rise on the host; no image build, no cluster) |
 | `frontend:dev` | Vite frontend dev server |
 | `db:migrate` | Run database migrations |
 | `db:nuke` | Drop and recreate the database |
@@ -191,13 +247,50 @@ Host Machine (127.0.0.1)
   dev Loki/Alloy chart components and forwards Loki to `localhost:3100`, which
   `config/development.yaml` reads through `RISE_LOKI_URL`.
 
+## Docker backend (local)
+
+The Docker backend deploys to a single Docker host with Traefik for routing — the
+lightest local setup, with no cluster. Run it on the host with no Rise image build:
+
+```bash
+mise setup hosts        # one-time: adds /etc/hosts aliases (incl. rise-dex)
+mise backend:run docker # alias: mise br docker
+```
+
+`mise br docker` brings up only the compose support services (Postgres, Dex,
+registry, Traefik — **no** Rise container) and runs Rise on the host against the
+env-driven `config/docker.yaml` (run_mode `docker`). It is the Docker backend of
+the unified `mise br [k8s|docker]` task (`k8s` is the default, against the
+Kubernetes dev config). You no longer hand-edit `config/development.yaml` to switch
+controllers — the task selects the Docker controller via run_mode. See the
+operator guide's
+[Local development](/operator-docs/docker/quick-start/#local-development-run-rise-on-the-host-no-image)
+section for the full reference (gateway-IP / `extra_hosts` wiring, Docker Desktop
+notes, etc.).
+
+How it works:
+
+- The backend runs an **in-process reconcile loop** (replacing Metacontroller): it
+  enumerates projects, drives deployment state transitions, diffs the desired state
+  against the actual Rise-labelled containers, creates/recreates/garbage-collects
+  them, and HTTP-probes for health — all on the shared `rise_default` network. There
+  is **no webhook listener** and no cluster.
+- **`replicas=1` caveat**: the Docker runtime clamps every deployment to a single
+  container; horizontal scaling is a follow-up.
+- Env vars are passed as plain `KEY=VALUE` and are therefore visible via
+  `docker inspect <container>` (Docker has no secret primitive) — acceptable for the
+  single-host scope.
+- Apps are reachable at `http://<project>.rise.localhost` (and the
+  `<group>--<project>` / `<env>--<project>` variants) with no DNS or `/etc/hosts`
+  edits, since `*.localhost` resolves to `127.0.0.1`.
+
 ## Troubleshooting
 
-**`http: server gave HTTP response to HTTPS client`** — insecure registries not configured. Run `./scripts/dev-setup.sh docker`.
+**`http: server gave HTTP response to HTTPS client`** — insecure registries not configured. Run `mise setup docker` (or `./scripts/dev-setup.sh docker` directly).
 
 **BuildKit can't push to registry** — verify `RISE_MANAGED_BUILDKIT_NETWORK_NAME=rise_default` is set in your environment (should be in `.envrc`).
 
-**OAuth redirects fail** — ensure `rise.local` is in `/etc/hosts` (`mise check:hosts` will tell you).
+**OAuth redirects fail** — ensure `rise.local` is in `/etc/hosts` (re-run `mise setup hosts` to add it).
 
 **Minikube pods `ImagePullBackOff`** — verify registry access from inside Minikube:
 ```bash

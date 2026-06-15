@@ -30,6 +30,23 @@ Creates `migrations/<timestamp>_<description>.sql`. Edit and add SQL.
 
 Migrations run automatically on container startup in production.
 
+### Separate-crate schemas
+
+Two backend crates own their own migrations against the same database, each
+isolated in a dedicated Postgres schema with its own `_sqlx_migrations` tracking
+table (sqlx 0.8 hard-codes that table name, so the crates switch `search_path`
+when migrating):
+
+- **`rise-resource-store`** → schema `resource_store` (generic resource storage).
+- **`rise-runtime-sync`** → schema `runtime_sync` (cross-replica synchronization
+  primitives: leader leases and schedules backing `LeaderElection`,
+  `GlobalSchedule`, and `GlobalLock`).
+
+Both run via `run_migrations(&pool)` from `AppState::new`, immediately after the
+root `./migrations/` are applied. Their `cargo sqlx prepare` caches are
+crate-local (`crates/<crate>/.sqlx`), kept separate from the root cache; see the
+`runtime-sync:sqlx:*` mise tasks.
+
 ### Migration Best Practices
 
 1. Test on production copy first
@@ -132,7 +149,7 @@ CREATE INDEX idx_deployments_expires_at ON deployments(expires_at) WHERE expires
 
 ### Connection Pooling
 
-Configure connection pool size in `config/production.toml` based on load and database limits.
+Configure connection pool size in `config/production.yaml` based on load and database limits.
 
 ### Query Optimization
 

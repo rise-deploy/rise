@@ -900,6 +900,10 @@ pub async fn create_deployment(
     // backend token may be a short-lived OIDC token, and a long build+push deploy
     // can outlast it. The provider lazily re-mints/refreshes a fresh token before
     // each request (see `token_source`). See issue #352.
+    // `resolve_token_provider` layers the token exchange on top of the selected
+    // source (see `token_source`): if `RISE_IDENTITY` is set, the token is
+    // exchanged for that service account's short-lived Rise access token;
+    // otherwise it is used as-is.
     let provider = crate::token_source::resolve_token_provider(http_client, config)?;
     debug!("Authenticating to backend using {}", provider.describe());
     let token = token_with_retry(&provider).await?;

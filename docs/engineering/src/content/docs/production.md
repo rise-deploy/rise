@@ -69,7 +69,7 @@ If you use the Helm chart's built-in PostgreSQL, see [Upgrading PostgreSQL](./up
 
 ### Connection Pooling
 
-Rise uses SQLx with connection pooling. Configure pool size based on load in `config/production.toml` if needed.
+Rise uses SQLx with connection pooling. Configure pool size based on load in `config/production.yaml` if needed.
 
 ## High Availability
 

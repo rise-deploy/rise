@@ -1,19 +1,30 @@
 [workspace]
 members = [
     ".",
+    "crates/rise-backend-auth",
+    "crates/rise-backend-core",
     "crates/rise-resource-api",
     "crates/rise-resource-store",
+    "crates/rise-runtime-sync",
 ]
+# The rise-e2e harness is its own standalone workspace (tests/e2e/Cargo.toml) so
+# the production image build (cargo-chef over this root) never resolves or
+# compiles this test-only crate. Excluded so cargo doesn't auto-discover it.
+exclude = ["tests/e2e"]
 resolver = "2"
 
 [workspace.dependencies]
 anyhow = "1.0.100"
 async-trait = "0.1"
+base64 = "0.22"
 chrono = { version = "0.4.38", features = ["serde"] }
+jsonwebtoken = { version = "10.0", features = ["rust_crypto"] }
 rand = "0.10.0"
+rsa = "0.9"
 schemars = { version = "1", features = ["chrono04", "uuid1"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+sha2 = "0.11"
 sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "postgres", "uuid", "chrono", "migrate", "json"] }
 thiserror = "2.0"
 tokio = { version = "1.48.0", features = ["full"] }
@@ -63,14 +74,18 @@ cli = [
 ]
 backend = [
     # Server core (former "server" feature)
+    "dep:rise-backend-auth", # strip-on-publish
+    "dep:rise-backend-core", # strip-on-publish
     "dep:rise-resource-api", # strip-on-publish
     "dep:rise-resource-store", # strip-on-publish
+    "dep:rise-runtime-sync", # strip-on-publish
     "dep:config",
     "dep:openssl",
     "dep:rsa",
     "dep:sqlx",
     "dep:tower",
     "dep:tower-http",
+    "dep:tokio-util",
     "dep:regex",
     "dep:aes-gcm",
     "dep:moka",
@@ -89,6 +104,9 @@ backend = [
     "dep:kube",
     "dep:k8s-openapi",
     "dep:rustls",
+    # Docker runtime (Traefik routing)
+    "dep:bollard",
+    "dep:tar",
     # AWS services (former "aws" feature)
     "dep:aws-config",
     "dep:aws-sdk-ecr",
@@ -104,14 +122,17 @@ backend = [
 [dependencies]
 # --- BEGIN BACKEND (stripped before `cargo publish` in CI; see .github/workflows/ci.yml) ---
 # Workspace crates (backend only)
+rise-backend-auth = { path = "crates/rise-backend-auth", optional = true }
+rise-backend-core = { path = "crates/rise-backend-core", optional = true }
 rise-resource-api = { path = "crates/rise-resource-api", optional = true }
 rise-resource-store = { path = "crates/rise-resource-store", optional = true }
+rise-runtime-sync = { path = "crates/rise-runtime-sync", optional = true }
 # --- END BACKEND ---
 
 # Common (always enabled - shared across features)
 anyhow = "1.0.100"
 async-stream = "0.3"
-base64 = "0.22"
+base64 = { workspace = true }
 bytes = "1.9"
 chrono = { workspace = true }
 futures = "0.3"
@@ -127,8 +148,8 @@ uuid = { workspace = true }
 # Shared: CLI + Server
 axum = "0.8.7"
 axum-extra = { version = "0.10", features = ["query"] }
-jsonwebtoken = { version = "10.0", features = ["rust_crypto"] }
-sha2 = "0.11"
+jsonwebtoken = { workspace = true }
+sha2 = { workspace = true }
 urlencoding = "2.1"
 
 # CLI-only dependencies
@@ -142,13 +163,14 @@ webbrowser = { version = "1.0.2", optional = true }
 serde_ignored = { version = "0.1", optional = true }
 
 # Server core dependencies
-config = { version = "0.15.19", optional = true }
+config = { version = "0.15.19", default-features = false, features = ["yaml"], optional = true }
 openssl = { version = "0.10.75", features = ["vendored"], optional = true }
 sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "postgres", "uuid", "chrono", "migrate"], optional = true }
 tower = { version = "0.5.2", optional = true }
 tower-http = { version = "0.6.7", features = ["trace", "cors"], optional = true }
+tokio-util = { version = "0.7", optional = true }
 regex = { version = "1.11", optional = true }
-rsa = { version = "0.9", optional = true }
+rsa = { workspace = true, optional = true }
 
 # Server: Encryption (non-KMS mode)
 aes-gcm = { version = "0.10", optional = true }
@@ -178,6 +200,11 @@ aws-sdk-sts = { version = "1.80", default-features = false, features = ["default
 kube = { version = "3", features = ["client", "derive"], optional = true }
 k8s-openapi = { version = "0.27", features = ["v1_31", "schemars"], optional = true }
 rustls = { version = "0.23", features = ["ring"], optional = true }
+
+# Docker runtime feature dependency (Traefik routing)
+bollard = { version = "0.18", optional = true }
+# Workload-identity file delivery into Docker containers (archive PUT/GET).
+tar = { version = "0.4", optional = true }
 
 # Snowflake feature dependencies
 snowflake-connector-rs = { version = "0.9", optional = true }

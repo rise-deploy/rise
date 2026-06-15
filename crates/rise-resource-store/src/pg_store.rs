@@ -4,11 +4,11 @@ use uuid::Uuid;
 
 use rise_resource_api::{
     validate_controller_id, validate_resource_name, ResourceDefinitionSpec, API_VERSION_V1ALPHA1,
-    ORGANIZATION_COLLECTION, ORGANIZATION_KIND, RESOURCE_DEFINITION_COLLECTION,
-    RESOURCE_DEFINITION_KIND,
+    ORGANIZATION_KIND, RESOURCE_DEFINITION_KIND,
 };
 use sqlx::{PgPool, Row};
 
+use crate::builtin::BuiltInRegistry;
 use crate::discriminator;
 use crate::error::StoreError;
 use crate::models::ResourceRow;
@@ -18,8 +18,7 @@ use crate::store::{
     SYSTEM_FINALIZER_PREFIX,
 };
 use crate::validation::{
-    JsonSchemaValidator, NoOpValidator, OrganizationValidator, ResourceDefinitionValidator,
-    SpecValidator,
+    JsonSchemaValidator, NoOpValidator, ResourceDefinitionValidator, SpecValidator,
 };
 
 pub struct PgResourceStore {
@@ -27,13 +26,29 @@ pub struct PgResourceStore {
     /// Cache of compiled JSON schema validators keyed by collection plural name.
     /// Populated on first resolve_collection call; invalidated on register/update.
     schema_cache: RwLock<HashMap<String, Arc<dyn SpecValidator>>>,
+    /// Routing table for the typed built-in kinds. Built-ins have no
+    /// `resource_definitions` row, so resolution for them goes through this
+    /// registry rather than the database. See [`crate::builtin`].
+    builtins: Arc<BuiltInRegistry>,
 }
 
 impl PgResourceStore {
+    /// Construct a store backed by `pool` with the canonical built-in registry
+    /// (`Organization` + `ResourceDefinition`). The common case.
     pub fn new(pool: PgPool) -> Self {
+        Self::with_builtin_registry(pool, Arc::new(BuiltInRegistry::defaults()))
+    }
+
+    /// Construct a store with an explicit built-in registry. Intended for
+    /// tests that want a stripped-down or augmented set of built-ins, and for
+    /// future phases that introduce additional built-ins behind a feature
+    /// flag (see roadmap PRs B2/B3/B4). Production code should keep using
+    /// [`Self::new`], which threads through [`BuiltInRegistry::defaults`].
+    pub fn with_builtin_registry(pool: PgPool, builtins: Arc<BuiltInRegistry>) -> Self {
         Self {
             pool,
             schema_cache: RwLock::new(HashMap::new()),
+            builtins,
         }
     }
 
@@ -74,30 +89,14 @@ impl PgResourceStore {
         }
     }
 
-    fn builtin_collection_info(collection: &str) -> Option<CollectionInfo> {
-        match collection {
-            ORGANIZATION_COLLECTION => Some(CollectionInfo {
-                api_version: API_VERSION_V1ALPHA1.to_string(),
-                storage_api_version: API_VERSION_V1ALPHA1.to_string(),
-                served_api_versions: vec![API_VERSION_V1ALPHA1.to_string()],
-                declared_api_versions: vec![API_VERSION_V1ALPHA1.to_string()],
-                kind: ORGANIZATION_KIND.to_string(),
-                parent: None,
-                spec_validator: Arc::new(OrganizationValidator),
-                allowed_status_controller_ids: vec![],
-            }),
-            RESOURCE_DEFINITION_COLLECTION => Some(CollectionInfo {
-                api_version: API_VERSION_V1ALPHA1.to_string(),
-                storage_api_version: API_VERSION_V1ALPHA1.to_string(),
-                served_api_versions: vec![API_VERSION_V1ALPHA1.to_string()],
-                declared_api_versions: vec![API_VERSION_V1ALPHA1.to_string()],
-                kind: RESOURCE_DEFINITION_KIND.to_string(),
-                parent: None,
-                spec_validator: Arc::new(ResourceDefinitionValidator),
-                allowed_status_controller_ids: vec![],
-            }),
-            _ => None,
-        }
+    /// Project this store's built-in registry into a `CollectionInfo` for
+    /// `collection`. Returns `None` when `collection` is not a registered
+    /// built-in; the caller falls through to the `resource_definitions`
+    /// projection table.
+    fn builtin_collection_info(&self, collection: &str) -> Option<CollectionInfo> {
+        self.builtins
+            .lookup_collection(collection)
+            .map(|reg| reg.collection_info())
     }
 
     /// Retry an INSERT into `resources` up to 10 times, generating a fresh discriminator on each
@@ -1153,7 +1152,7 @@ impl ResourceStore for PgResourceStore {
         collection: &str,
     ) -> Result<Option<CollectionInfo>, StoreError> {
         // Built-ins take priority
-        if let Some(info) = Self::builtin_collection_info(collection) {
+        if let Some(info) = self.builtin_collection_info(collection) {
             return Ok(Some(info));
         }
 
@@ -1207,9 +1206,9 @@ impl ResourceStore for PgResourceStore {
     ) -> Result<Option<CollectionInfo>, StoreError> {
         // Built-in collections have no row in the resource_definitions projection and
         // use native validators, so they can't be resolved from the table. The built-in
-        // registry and its api_version live in builtin_collection_info; resolve against
+        // registry and its api_version live in `self.builtins`; resolve against
         // it rather than re-encoding the group/version as string literals here.
-        if let Some(info) = Self::builtin_collection_info(collection) {
+        if let Some(info) = self.builtin_collection_info(collection) {
             let matches = info
                 .api_version
                 .split_once('/')
@@ -1332,18 +1331,12 @@ impl ResourceStore for PgResourceStore {
         group: &str,
         kind: &str,
     ) -> Result<Option<CollectionInfo>, StoreError> {
-        // Built-in kinds are root-scoped and live in the `rise.dev` group; they
-        // have no `resource_definitions` row, so map `(group, kind)` to the
-        // plural and resolve against the built-in registry.
-        if group == Self::group_of(API_VERSION_V1ALPHA1) {
-            let builtin_plural = match kind {
-                ORGANIZATION_KIND => Some(ORGANIZATION_COLLECTION),
-                RESOURCE_DEFINITION_KIND => Some(RESOURCE_DEFINITION_COLLECTION),
-                _ => None,
-            };
-            if let Some(plural) = builtin_plural {
-                return Ok(Self::builtin_collection_info(plural));
-            }
+        // Built-in kinds have no `resource_definitions` row, so resolve them
+        // directly through the registry. The registry's `(group, kind)` index
+        // replaces what used to be a hardcoded match here, so adding a new
+        // built-in does not require touching this method.
+        if let Some(reg) = self.builtins.lookup_by_group_kind(group, kind) {
+            return Ok(Some(reg.collection_info()));
         }
 
         // `(group_name, kind)` is unique (resource_definitions_group_kind_unique).

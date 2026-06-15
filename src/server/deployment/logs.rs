@@ -187,6 +187,8 @@ pub trait RuntimeLogBackend: Send + Sync {
 pub async fn init_runtime_log_backend(
     settings: &DeploymentLogsSettings,
     kube_client: Option<kube::Client>,
+    docker_client: Option<bollard::Docker>,
+    docker_label_namespace: Option<&str>,
 ) -> Result<Arc<dyn RuntimeLogBackend>> {
     match settings {
         DeploymentLogsSettings::Kubernetes { config } => {
@@ -194,6 +196,22 @@ pub async fn init_runtime_log_backend(
             Ok(Arc::new(KubernetesLogBackend {
                 kube_client,
                 config: config.clone(),
+            }))
+        }
+        DeploymentLogsSettings::Docker { .. } => {
+            let docker =
+                docker_client.context("Docker log backend requires a connected Docker client")?;
+            // The Docker log backend resolves containers by the same
+            // bookkeeping labels the reconciler stamps, so it must use the
+            // Docker controller's configured `label_namespace` rather than a
+            // hardcoded literal. Falls back to the default when the Docker
+            // controller isn't the active deployment backend.
+            let label_namespace = docker_label_namespace
+                .map(str::to_string)
+                .unwrap_or_else(crate::server::settings::default_label_namespace);
+            Ok(Arc::new(DockerLogBackend {
+                docker,
+                label_namespace,
             }))
         }
         DeploymentLogsSettings::Loki {
@@ -430,6 +448,209 @@ impl RuntimeLogBackend for KubernetesLogBackend {
 
 fn status_stream(status: LogStatus) -> LogEventStream {
     futures::stream::once(async move { Ok(LogEvent::Status(status)) }).boxed()
+}
+
+/// Runtime log backend that streams directly from the Docker daemon.
+///
+/// Resolves the deployment's container(s) by the namespaced `deployment-id`
+/// label Rise stamps (using the Docker controller's configured
+/// `label_namespace`), then proxies `docker logs` into the shared
+/// [`LogEventStream`]. Mirrors the Kubernetes backend's regex level
+/// classification and lack of historical volume support.
+struct DockerLogBackend {
+    docker: bollard::Docker,
+    /// Label namespace the Docker controller stamps containers with (e.g.
+    /// `rise.dev`). Used to build the `<ns>/deployment-id` filter key.
+    label_namespace: String,
+}
+
+impl DockerLogBackend {
+    /// Find the most relevant container id for a deployment by its
+    /// `<label_namespace>/deployment-id` label, scoped to the owning project.
+    /// Prefers a running container.
+    ///
+    /// `deployment_id` is a `YYYYMMDD-HHMMSS` timestamp that is unique only
+    /// *per project* (DB constraint `UNIQUE (deployment_id, project_id)`), so
+    /// filtering on it alone could resolve to another project's container —
+    /// a tenant-isolation breach. We therefore also scope by the `project`
+    /// label (matching `project.name`, exactly as the reconciler stamps it)
+    /// plus `managed-by=rise` for defense-in-depth, mirroring
+    /// `list_actual_containers`.
+    async fn resolve_container_id(
+        &self,
+        deployment: &Deployment,
+        project: &Project,
+    ) -> Result<Option<String>> {
+        use crate::server::deployment::controller::docker::labels::{
+            self, SUFFIX_DEPLOYMENT_ID, SUFFIX_MANAGED_BY, SUFFIX_PROJECT,
+        };
+        use bollard::container::ListContainersOptions;
+        use std::collections::HashMap as StdHashMap;
+
+        let ns = &self.label_namespace;
+        let mut filters: StdHashMap<String, Vec<String>> = StdHashMap::new();
+        filters.insert(
+            "label".to_string(),
+            vec![
+                format!("{}={}", labels::ns_key(ns, SUFFIX_MANAGED_BY), "rise"),
+                format!("{}={}", labels::ns_key(ns, SUFFIX_PROJECT), project.name),
+                format!(
+                    "{}={}",
+                    labels::ns_key(ns, SUFFIX_DEPLOYMENT_ID),
+                    deployment.deployment_id
+                ),
+            ],
+        );
+        let summaries = self
+            .docker
+            .list_containers(Some(ListContainersOptions {
+                all: true,
+                filters,
+                ..Default::default()
+            }))
+            .await?;
+
+        // Prefer a running container; fall back to any.
+        let chosen = summaries
+            .iter()
+            .find(|c| c.state.as_deref() == Some("running"))
+            .or_else(|| summaries.first())
+            .and_then(|c| c.id.clone());
+        Ok(chosen)
+    }
+}
+
+#[async_trait]
+impl RuntimeLogBackend for DockerLogBackend {
+    fn backend_kind(&self) -> &'static str {
+        "docker"
+    }
+
+    fn levels(&self) -> &'static [&'static str] {
+        KUBERNETES_LEVELS
+    }
+
+    fn supports_volume(&self) -> bool {
+        false
+    }
+
+    async fn stream_logs(
+        &self,
+        deployment: &Deployment,
+        project: &Project,
+        query: LogQuery,
+    ) -> Result<LogEventStream> {
+        use bollard::container::LogsOptions;
+
+        if matches!(
+            deployment.status,
+            DeploymentStatus::Pending
+                | DeploymentStatus::Building
+                | DeploymentStatus::Pushing
+                | DeploymentStatus::Pushed
+        ) {
+            return Ok(status_stream(LogStatus {
+                reason: LogStatusReason::DeploymentNotReady,
+                message: Some(
+                    "Deployment is not ready yet - no runtime logs are available.".into(),
+                ),
+                retention_hint: None,
+            }));
+        }
+
+        let Some(container_id) = self.resolve_container_id(deployment, project).await? else {
+            return Ok(status_stream(LogStatus {
+                reason: LogStatusReason::HistoricalBackendNotConfigured,
+                message: Some(
+                    "No active deployment container was found and historical logs are not \
+                     configured."
+                        .into(),
+                ),
+                retention_hint: None,
+            }));
+        };
+
+        let tail = match query.tail_lines {
+            Some(t) => t.max(1).to_string(),
+            None => "all".to_string(),
+        };
+        // `since_seconds` is a *relative* "N seconds ago" value (matching the
+        // K8s/Loki backends), but bollard's `LogsOptions.since` is an *absolute*
+        // UNIX epoch timestamp. Convert relative → absolute. `start_time` is
+        // already an absolute instant, so it passes through as-is.
+        let since = query
+            .since_seconds
+            .map(|s| Utc::now().timestamp() - s)
+            .or_else(|| query.start_time.map(|t| t.timestamp()).filter(|t| *t > 0))
+            .unwrap_or(0);
+
+        let options = LogsOptions::<String> {
+            follow: query.follow && is_followable_status(&deployment.status),
+            stdout: true,
+            stderr: true,
+            since,
+            timestamps: query.timestamps,
+            tail,
+            ..Default::default()
+        };
+
+        let log_stream = self.docker.logs(&container_id, Some(options));
+        let levels = query.levels.clone();
+        let search = query.search.clone();
+        let stream = async_stream::stream! {
+            futures::pin_mut!(log_stream);
+            while let Some(item) = log_stream.next().await {
+                let output = match item {
+                    Ok(output) => output,
+                    Err(e) => {
+                        yield Err(anyhow::anyhow!("Docker log stream error: {}", e));
+                        break;
+                    }
+                };
+                let raw = output.to_string();
+                for line in raw.split('\n') {
+                    let line = line.trim_end_matches('\r');
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let level = classify_k8s_line(line);
+                    if !levels.is_empty() && !levels.iter().any(|l| l == level) {
+                        continue;
+                    }
+                    if !line_matches_search(line, search.as_deref()) {
+                        continue;
+                    }
+                    yield Ok(LogEvent::Line {
+                        text: line.to_string(),
+                        level: level.to_string(),
+                    });
+                }
+            }
+        };
+
+        Ok(stream.boxed())
+    }
+
+    async fn query_volume(
+        &self,
+        _deployment: &Deployment,
+        _project: &Project,
+        query: LogVolumeQuery,
+    ) -> Result<LogVolumeResponse> {
+        Ok(LogVolumeResponse {
+            status: Some(LogStatus {
+                reason: LogStatusReason::HistoricalBackendNotConfigured,
+                message: Some(
+                    "Historical log volume isn't supported by the configured log backend.".into(),
+                ),
+                retention_hint: None,
+            }),
+            start_time: query.start_time.to_rfc3339(),
+            end_time: query.end_time.to_rfc3339(),
+            step_seconds: query.step_seconds,
+            buckets: vec![],
+        })
+    }
 }
 
 struct LokiLogBackend {

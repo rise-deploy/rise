@@ -39,6 +39,69 @@ fn build_project_url(state: &AppState, project_name: &str) -> Option<String> {
     }
 }
 
+/// Resolve the set of hostnames a post-login `redirect` may target for a given
+/// project: the project's canonical ingress host plus every active deployment's
+/// URL (default host + custom domains).
+///
+/// In the standard project-subdomain layout the app host (e.g.
+/// `secret.example.com`, from `production_ingress_url_template =
+/// {project_name}.example.com`) is a **sibling** of the control-plane host
+/// (`rise.example.com`), not a subdomain of it — so the post-login deep-link
+/// `redirect` would otherwise fail `validate_redirect_url` (which only trusts
+/// `public_url`'s host and its subdomains) and drop to `/`. Scoping the trust to
+/// *this project's own* resolved hosts lets the deep-link through **without**
+/// trusting every sibling under the shared parent domain (which a wildcard
+/// suffix would — a cross-project open-redirect / info-disclosure risk in a
+/// multi-tenant deployment).
+///
+/// Hosts are returned bare (no scheme/port) and lowercased. Lookups are
+/// best-effort: the canonical host is always included, so the common deep-link
+/// keeps working even if the deployment lookups fail.
+async fn project_redirect_hosts(state: &AppState, project_name: &str) -> Vec<String> {
+    fn host_of(url: &str) -> Option<String> {
+        url::Url::parse(url)
+            .ok()?
+            .host_str()
+            .map(|h| h.to_lowercase())
+    }
+    fn add(hosts: &mut Vec<String>, host: Option<String>) {
+        if let Some(host) = host {
+            if !hosts.contains(&host) {
+                hosts.push(host);
+            }
+        }
+    }
+    let mut hosts: Vec<String> = Vec::new();
+    // Canonical ingress host from the template (no DB needed).
+    add(
+        &mut hosts,
+        build_project_url(state, project_name)
+            .as_deref()
+            .and_then(host_of),
+    );
+    // Active deployment URLs (default host + custom domains), across groups.
+    if let Ok(Some(project)) = projects::find_by_name(&state.db_pool, project_name).await {
+        if let Ok(deployments) =
+            crate::db::deployments::get_active_deployments_for_project(&state.db_pool, project.id)
+                .await
+        {
+            for deployment in &deployments {
+                if let Ok(urls) = state
+                    .deployment_backend
+                    .get_deployment_urls(deployment, &project)
+                    .await
+                {
+                    add(&mut hosts, host_of(&urls.default_url));
+                    for custom in &urls.custom_domain_urls {
+                        add(&mut hosts, host_of(custom));
+                    }
+                }
+            }
+        }
+    }
+    hosts
+}
+
 /// Validate and sanitize a redirect URL to prevent open redirect vulnerabilities
 ///
 /// This function ensures that redirect URLs are safe before using them in templates
@@ -51,6 +114,12 @@ fn build_project_url(state: &AppState, project_name: &str) -> Option<String> {
 /// # Arguments
 /// * `redirect_url` - The redirect URL from user input (query params)
 /// * `public_url` - The Rise public URL (trusted domain)
+/// * `allowed_hosts` - This project's own resolved hosts (bare, lowercased; see
+///   [`project_redirect_hosts`]). App hosts are *siblings* of the control-plane
+///   host (`{project}.example.com` vs `rise.example.com`), so they match neither
+///   the public host nor its subdomains; the redirect host must **exactly equal**
+///   one of these to be accepted. Scoping to the specific project's hosts (rather
+///   than the whole ingress parent domain) prevents a cross-project open redirect.
 ///
 /// # Returns
 /// A safe redirect URL, or "/" if the input is invalid
@@ -58,10 +127,12 @@ fn build_project_url(state: &AppState, project_name: &str) -> Option<String> {
 /// # Security
 /// - Relative paths starting with "/" are always allowed
 /// - Absolute URLs must be HTTPS (or HTTP for localhost/development)
-/// - Absolute URLs must match the Rise public domain
+/// - Absolute URLs must match the Rise public domain or one of `allowed_hosts`
+/// - Host matching is exact (case-insensitive), never a string prefix, so
+///   lookalikes like `secret.example.com.evil.com` are rejected
 /// - All dangerous schemes (javascript:, data:, vbscript:, etc.) are blocked
 /// - Invalid or suspicious URLs default to "/"
-fn validate_redirect_url(redirect_url: &str, public_url: &str) -> String {
+fn validate_redirect_url(redirect_url: &str, public_url: &str, allowed_hosts: &[String]) -> String {
     const SAFE_FALLBACK: &str = "/";
 
     // Empty or whitespace-only URLs default to safe fallback
@@ -151,6 +222,20 @@ fn validate_redirect_url(redirect_url: &str, public_url: &str) -> String {
     // Allow redirects to subdomains of the public domain
     // e.g., if public_url is "https://rise.dev", allow "https://app.rise.dev"
     if redirect_host.ends_with(&format!(".{}", public_host)) {
+        return redirect_url.to_string();
+    }
+
+    // Allow redirects to one of this project's own resolved hosts. In the
+    // standard project-subdomain layout app hosts are siblings of the
+    // control-plane host (e.g. `secret.example.com` vs `rise.example.com`), so
+    // they match neither check above. Matching is EXACT host equality
+    // (case-insensitive) against the project's canonical + deployment hosts —
+    // never a string prefix and never the whole parent domain — so a sibling
+    // project's host or a lookalike (`secret.example.com.evil.com`) is rejected.
+    if allowed_hosts
+        .iter()
+        .any(|h| redirect_host.eq_ignore_ascii_case(h))
+    {
         return redirect_url.to_string();
     }
 
@@ -488,11 +573,16 @@ pub async fn code_exchange(
         )
     })?;
 
+    // Resolve the user's team memberships for the groups claim; on a DB error,
+    // fall back to no groups rather than failing the login.
+    let groups = crate::db::teams::get_team_names_for_user(&state.db_pool, user.id)
+        .await
+        .ok();
+
     // Issue Rise JWT for user authentication (consumed by the CLI)
     let rise_jwt = state
         .jwt_signer
-        .sign_user_jwt(&claims, user.id, &state.db_pool, &state.public_url, None)
-        .await
+        .sign_user_jwt(&claims, groups, &state.public_url, None)
         .map_err(|e| {
             tracing::error!("Failed to sign Rise JWT: {:#}", e);
             (
@@ -591,22 +681,28 @@ pub async fn device_exchange(
                 }
             };
 
-            // Issue Rise JWT for user authentication (consumed by the CLI)
-            let rise_jwt = match state
-                .jwt_signer
-                .sign_user_jwt(&claims, user.id, &state.db_pool, &state.public_url, None)
+            // Resolve the user's team memberships for the groups claim; on a DB
+            // error, fall back to no groups rather than failing the login.
+            let groups = crate::db::teams::get_team_names_for_user(&state.db_pool, user.id)
                 .await
-            {
-                Ok(jwt) => jwt,
-                Err(e) => {
-                    tracing::error!("Failed to sign Rise JWT: {:#}", e);
-                    return Json(DeviceExchangeResponse {
-                        token: None,
-                        error: Some("server_error".to_string()),
-                        error_description: Some("Failed to create token".to_string()),
-                    });
-                }
-            };
+                .ok();
+
+            // Issue Rise JWT for user authentication (consumed by the CLI)
+            let rise_jwt =
+                match state
+                    .jwt_signer
+                    .sign_user_jwt(&claims, groups, &state.public_url, None)
+                {
+                    Ok(jwt) => jwt,
+                    Err(e) => {
+                        tracing::error!("Failed to sign Rise JWT: {:#}", e);
+                        return Json(DeviceExchangeResponse {
+                            token: None,
+                            error: Some("server_error".to_string()),
+                            error_description: Some("Failed to create token".to_string()),
+                        });
+                    }
+                };
 
             tracing::info!(
                 "CLI device login successful for user {} - issued Rise JWT",
@@ -765,8 +861,13 @@ pub async fn signin_page(
         .cloned()
         .unwrap_or_else(|| "/".to_string());
 
-    // Validate and sanitize the redirect URL to prevent open redirects
-    let redirect_url = validate_redirect_url(&raw_redirect_url, &state.public_url);
+    // Validate and sanitize the redirect URL to prevent open redirects. The
+    // redirect is scoped to this project's own hosts (not the parent domain).
+    let allowed_hosts = match params.project.as_deref() {
+        Some(p) => project_redirect_hosts(&state, p).await,
+        None => Vec::new(),
+    };
+    let redirect_url = validate_redirect_url(&raw_redirect_url, &state.public_url, &allowed_hosts);
 
     tracing::info!(
         project = %project_name,
@@ -883,8 +984,14 @@ pub async fn oauth_signin_start(
     // Prefer rd (full URL) over redirect (path only)
     let raw_redirect_url = params.rd.as_ref().or(params.redirect.as_ref());
 
-    // Validate and sanitize redirect URL if provided
-    let redirect_url = raw_redirect_url.map(|url| validate_redirect_url(url, &state.public_url));
+    // Validate and sanitize redirect URL if provided. The redirect is scoped to
+    // this project's own hosts (not the parent domain).
+    let allowed_hosts = match params.project.as_deref() {
+        Some(p) => project_redirect_hosts(&state, p).await,
+        None => Vec::new(),
+    };
+    let redirect_url =
+        raw_redirect_url.map(|url| validate_redirect_url(url, &state.public_url, &allowed_hosts));
 
     tracing::info!(
         project = ?params.project,
@@ -1105,10 +1212,15 @@ pub async fn oauth_callback(
             .or_else(|| build_project_url(&state, project))
             .unwrap_or_else(|| state.public_url.trim_end_matches('/').to_string());
 
+        // Resolve the user's team memberships for the groups claim; on a DB
+        // error, fall back to no groups rather than failing the login.
+        let groups = crate::db::teams::get_team_names_for_user(&state.db_pool, user.id)
+            .await
+            .ok();
+
         let rise_jwt = state
             .jwt_signer
-            .sign_ingress_jwt(&claims, user.id, &state.db_pool, &project_url, None)
-            .await
+            .sign_ingress_jwt(&claims, groups, &project_url, None)
             .map_err(|e| {
                 tracing::error!("Failed to sign Rise JWT: {:#}", e);
                 (
@@ -1228,11 +1340,16 @@ pub async fn oauth_callback(
     // Sync groups after login
     sync_groups_after_login(&state, &token_info.id_token).await?;
 
+    // Resolve the user's team memberships for the groups claim; on a DB error,
+    // fall back to no groups rather than failing the login.
+    let groups = crate::db::teams::get_team_names_for_user(&state.db_pool, user.id)
+        .await
+        .ok();
+
     // Issue Rise HS256 JWT for user authentication (consumed by the UI)
     let rise_jwt = state
         .jwt_signer
-        .sign_user_jwt(&claims, user.id, &state.db_pool, &state.public_url, None)
-        .await
+        .sign_user_jwt(&claims, groups, &state.public_url, None)
         .map_err(|e| {
             tracing::error!("Failed to sign user JWT: {:#}", e);
             (
@@ -1433,13 +1550,99 @@ pub async fn oauth_complete(
 #[derive(Debug, Deserialize)]
 pub struct IngressAuthQuery {
     pub project: String,
+    /// Traefik mode. Traefik forwardAuth has no nginx-style `auth-signin`: on a
+    /// non-2xx auth response it returns that response (status + Location) to the
+    /// browser. When set (`signin_redirect=1`), an unauthenticated/invalid
+    /// session yields a `302 Found` to the login page instead of a bare `401`,
+    /// so the browser is sent to sign in. Unset (nginx) keeps the `401` behavior
+    /// byte-identical — nginx itself performs the auth-signin redirect.
+    #[serde(default, deserialize_with = "deserialize_bool_flag")]
+    pub signin_redirect: bool,
 }
 
-/// Nginx ingress auth endpoint
+/// Deserialize a query flag that may be `1`/`true`/`0`/`false` (or absent).
+fn deserialize_bool_flag<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+    Ok(matches!(
+        opt.as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    ))
+}
+
+/// Select the trusted request-path header for the `/.rise/*` allowlist by proxy
+/// mode.
 ///
-/// This handler is called by Nginx for every request to a private project.
-/// It validates the session cookie, checks JWT validity, and verifies
-/// project access authorization.
+/// nginx authoritatively sets `x-auth-request-redirect` (inbound client copies
+/// are stripped), while Traefik forwardAuth (`signin_redirect=true`)
+/// authoritatively overwrites `x-forwarded-uri` with the real request URI. Only
+/// the mode-appropriate header is read: reading the other would trust a
+/// client-controllable value (e.g. under Traefik a client can spoof
+/// `x-auth-request-redirect: /.rise/x` to bypass auth on an arbitrary path).
+fn allowlist_path(headers: &HeaderMap, traefik_mode: bool) -> Option<&str> {
+    if traefik_mode {
+        headers.get("x-forwarded-uri")
+    } else {
+        headers.get("x-auth-request-redirect")
+    }
+    .and_then(|v| v.to_str().ok())
+}
+
+/// Build the browser-facing login redirect URL for Traefik forwardAuth mode.
+///
+/// Mirrors the Kubernetes `backend_address` ingress-auth flow (see
+/// `ResourceBuilder::build_ingress_annotations` in
+/// `src/server/deployment/resource_builder.rs`): the signin page must be served
+/// on the **same host** as the app so the login cookie is set on the app host
+/// that forwardAuth subsequently reads. A cross-host redirect to the control
+/// plane would set the cookie on the wrong host and loop.
+///
+/// Traefik routes `PathPrefix('/.rise')` on every host to the Rise backend, so
+/// `{X-Forwarded-Proto}://{X-Forwarded-Host}/.rise/auth/signin` is served by the
+/// backend even though the host is the app's. The original request URL is
+/// reconstructed from `X-Forwarded-Proto` + `X-Forwarded-Host` +
+/// `X-Forwarded-Uri` and embedded as `redirect` so the user returns to where
+/// they started after signing in.
+///
+/// Falls back to the control-plane `signin_base` URL only when
+/// `X-Forwarded-Host` is absent (degraded path — the same-host redirect cannot
+/// be constructed without the forwarded host).
+fn build_signin_redirect_url(signin_base: &str, project: &str, headers: &HeaderMap) -> String {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let proto = header("x-forwarded-proto").unwrap_or("http");
+    let host = header("x-forwarded-host");
+    let uri = header("x-forwarded-uri").unwrap_or("/");
+
+    let enc_project = urlencoding::encode(project);
+
+    if let Some(host) = host {
+        // Same-host signin page (served by the backend via the /.rise router).
+        let original = format!("{proto}://{host}{uri}");
+        format!(
+            "{proto}://{host}/.rise/auth/signin?project={enc_project}&redirect={}",
+            urlencoding::encode(&original)
+        )
+    } else {
+        // Degraded fallback: no forwarded host → target the control-plane signin
+        // page on the configured base URL (cookie host may be wrong).
+        let base = signin_base.trim_end_matches('/');
+        format!("{base}/api/v1/auth/signin?project={enc_project}")
+    }
+}
+
+/// Ingress auth endpoint (nginx `auth-url` / Traefik `forwardAuth`)
+///
+/// Called by the ingress proxy for every request to a project whose access
+/// class requires authentication. It validates the session cookie, checks JWT
+/// validity, and verifies project access authorization.
+///
+/// Two modes, selected by the `signin_redirect` query flag:
+/// - **nginx** (flag unset): unauthenticated → `401`; nginx redirects to
+///   `auth-signin` itself.
+/// - **Traefik** (`signin_redirect=1`): unauthenticated → `302` to the login
+///   page, since Traefik forwardAuth has no `auth-signin`.
 #[instrument(skip(state, params, headers))]
 pub async fn ingress_auth(
     State(state): State<AppState>,
@@ -1458,43 +1661,70 @@ pub async fn ingress_auth(
         "Ingress auth check"
     );
 
-    // Allow access to /.rise/* paths without authentication (login page, static assets)
-    // This prevents redirect loops when users try to access the signin page
-    // Use x-auth-request-redirect header which contains the request path
-    if let Some(redirect_path) = headers
-        .get("x-auth-request-redirect")
-        .and_then(|v| v.to_str().ok())
-    {
+    // Allow access to /.rise/* paths without authentication (login page, static
+    // assets). This prevents redirect loops when users try to access the signin
+    // page. The trusted path header is selected by proxy mode: nginx authoritatively
+    // sets `x-auth-request-redirect` (inbound client copies are stripped), while
+    // Traefik forwardAuth authoritatively overwrites `x-forwarded-uri` with the real
+    // request URI. Read ONLY the mode-appropriate header — reading the other would
+    // trust a client-controllable value (e.g. under Traefik a client can spoof
+    // `x-auth-request-redirect: /.rise/x` to bypass auth on an arbitrary path).
+    if let Some(redirect_path) = allowlist_path(&headers, params.signin_redirect) {
         if redirect_path.starts_with("/.rise/") {
             tracing::debug!(
                 project = %params.project,
                 redirect_path = %redirect_path,
                 "Allowing unauthenticated access to .rise path"
             );
+            // Emit BOTH identity headers (matching Traefik's authResponseHeaders
+            // list) so a client cannot smuggle a forged X-Auth-Request-User /
+            // X-Auth-Request-Email through the allowlisted /.rise path — the
+            // empty/anonymous values clobber any client-supplied ones.
             return Ok((
                 StatusCode::OK,
-                [("X-Auth-Request-User", "anonymous".to_string())],
+                [
+                    ("X-Auth-Request-User", "anonymous".to_string()),
+                    ("X-Auth-Request-Email", String::new()),
+                ],
             )
                 .into_response());
         }
     }
 
-    // Extract and validate Rise JWT (required)
-    let rise_jwt = cookie_helpers::extract_rise_jwt_cookie(&headers).ok_or_else(|| {
-        tracing::debug!("No Rise JWT cookie found");
-        (StatusCode::UNAUTHORIZED, "No session cookie".to_string())
-    })?;
+    // Helper: build the unauthenticated response. In Traefik mode
+    // (`signin_redirect=1`) return a 302 to the login page (Traefik relays it to
+    // the browser); otherwise keep the bare 401 nginx expects.
+    let unauthenticated = |reason: &str| -> Response {
+        if params.signin_redirect {
+            let location =
+                build_signin_redirect_url(&state.signin_base_url, &params.project, &headers);
+            tracing::debug!(
+                project = %params.project,
+                location = %location,
+                "Unauthenticated ingress request — redirecting to signin (Traefik mode)"
+            );
+            (StatusCode::FOUND, [("Location", location)]).into_response()
+        } else {
+            (StatusCode::UNAUTHORIZED, reason.to_string()).into_response()
+        }
+    };
 
-    let ingress_claims = state
-        .jwt_signer
-        .verify_jwt_skip_aud(&rise_jwt)
-        .map_err(|e| {
+    // Extract and validate Rise JWT (required)
+    let rise_jwt = match cookie_helpers::extract_rise_jwt_cookie(&headers) {
+        Some(jwt) => jwt,
+        None => {
+            tracing::debug!("No Rise JWT cookie found");
+            return Ok(unauthenticated("No session cookie"));
+        }
+    };
+
+    let ingress_claims = match state.jwt_signer.verify_jwt_skip_aud(&rise_jwt) {
+        Ok(claims) => claims,
+        Err(e) => {
             tracing::warn!("Invalid or expired ingress JWT: {:#}", e);
-            (
-                StatusCode::UNAUTHORIZED,
-                "Invalid or expired session".to_string(),
-            )
-        })?;
+            return Ok(unauthenticated("Invalid or expired session"));
+        }
+    };
 
     let email = ingress_claims.email;
 
@@ -1821,23 +2051,113 @@ mod tests {
     use super::*;
 
     #[test]
+    fn signin_redirect_url_reconstructs_from_forwarded_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert("x-forwarded-host", "secret.rise.localhost".parse().unwrap());
+        headers.insert("x-forwarded-uri", "/dashboard?tab=1".parse().unwrap());
+        let url = build_signin_redirect_url("http://localhost:3000", "secret app", &headers);
+        // Same-host signin page served by the /.rise router on the app host,
+        // project (URL-encoded), and redirect (full original URL, encoded).
+        assert!(
+            url.starts_with("https://secret.rise.localhost/.rise/auth/signin?project=secret%20app")
+        );
+        assert!(url.contains("&redirect=https%3A%2F%2Fsecret.rise.localhost%2Fdashboard%3Ftab%3D1"));
+    }
+
+    #[test]
+    fn signin_redirect_url_targets_app_host_not_control_plane() {
+        // The signin page must be served on the SAME (app) host so the login
+        // cookie lands on the host forwardAuth reads — never on the control
+        // plane host from signin_base.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert("x-forwarded-host", "app.rise.localhost".parse().unwrap());
+        headers.insert("x-forwarded-uri", "/".parse().unwrap());
+        let url = build_signin_redirect_url("http://rise.localhost:3000", "app", &headers);
+        let signin_host = url_host(&url);
+        assert_eq!(signin_host, "app.rise.localhost");
+        assert_ne!(signin_host, "rise.localhost:3000");
+        assert!(url.starts_with("https://app.rise.localhost/.rise/auth/signin?project=app"));
+    }
+
+    #[test]
+    fn signin_redirect_url_falls_back_without_forwarded_host() {
+        let headers = HeaderMap::new();
+        let url = build_signin_redirect_url("http://rise.localhost:3000/", "app", &headers);
+        // No forwarded host → degraded fallback to the control-plane signin page.
+        // Trailing slash on base is trimmed; no redirect param when host absent.
+        assert_eq!(
+            url,
+            "http://rise.localhost:3000/api/v1/auth/signin?project=app"
+        );
+    }
+
+    #[test]
+    fn ingress_auth_query_parses_signin_redirect_flag() {
+        let q: IngressAuthQuery =
+            serde_urlencoded::from_str("project=app&signin_redirect=1").unwrap();
+        assert!(q.signin_redirect);
+        let q: IngressAuthQuery = serde_urlencoded::from_str("project=app").unwrap();
+        assert!(!q.signin_redirect);
+        let q: IngressAuthQuery =
+            serde_urlencoded::from_str("project=app&signin_redirect=0").unwrap();
+        assert!(!q.signin_redirect);
+    }
+
+    #[test]
+    fn allowlist_path_ignores_spoofable_header_in_traefik_mode() {
+        // In Traefik forwardAuth mode (signin_redirect=true) only the
+        // authoritative `x-forwarded-uri` is trusted. A client spoofing
+        // `x-auth-request-redirect: /.rise/x` while the real request is `/admin`
+        // must NOT be allowlisted.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-uri", "/admin".parse().unwrap());
+        headers.insert("x-auth-request-redirect", "/.rise/x".parse().unwrap());
+
+        let path = allowlist_path(&headers, true);
+        assert_eq!(path, Some("/admin"));
+        assert!(!path.unwrap().starts_with("/.rise/"));
+    }
+
+    #[test]
+    fn allowlist_path_trusts_forwarded_uri_in_traefik_mode() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-uri", "/.rise/auth/signin".parse().unwrap());
+        assert_eq!(allowlist_path(&headers, true), Some("/.rise/auth/signin"));
+    }
+
+    #[test]
+    fn allowlist_path_uses_auth_request_redirect_in_nginx_mode() {
+        // In nginx mode (signin_redirect=false) the server-set
+        // `x-auth-request-redirect` is authoritative; `x-forwarded-uri` is ignored.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-auth-request-redirect", "/.rise/login".parse().unwrap());
+        headers.insert("x-forwarded-uri", "/admin".parse().unwrap());
+        assert_eq!(allowlist_path(&headers, false), Some("/.rise/login"));
+    }
+
+    #[test]
     fn test_validate_redirect_url_relative_paths() {
         let public_url = "https://rise.dev";
 
         // Valid relative paths
-        assert_eq!(validate_redirect_url("/", public_url), "/");
+        assert_eq!(validate_redirect_url("/", public_url, &[]), "/");
         assert_eq!(
-            validate_redirect_url("/dashboard", public_url),
+            validate_redirect_url("/dashboard", public_url, &[]),
             "/dashboard"
         );
         assert_eq!(
-            validate_redirect_url("/app/project/123", public_url),
+            validate_redirect_url("/app/project/123", public_url, &[]),
             "/app/project/123"
         );
 
         // Protocol-relative URLs should be blocked
-        assert_eq!(validate_redirect_url("//evil.com", public_url), "/");
-        assert_eq!(validate_redirect_url("//evil.com/path", public_url), "/");
+        assert_eq!(validate_redirect_url("//evil.com", public_url, &[]), "/");
+        assert_eq!(
+            validate_redirect_url("//evil.com/path", public_url, &[]),
+            "/"
+        );
     }
 
     #[test]
@@ -1846,19 +2166,23 @@ mod tests {
 
         // JavaScript URLs should be blocked
         assert_eq!(
-            validate_redirect_url("javascript:alert('xss')", public_url),
+            validate_redirect_url("javascript:alert('xss')", public_url, &[]),
             "/"
         );
 
         // Data URLs should be blocked
         assert_eq!(
-            validate_redirect_url("data:text/html,<script>alert('xss')</script>", public_url),
+            validate_redirect_url(
+                "data:text/html,<script>alert('xss')</script>",
+                public_url,
+                &[]
+            ),
             "/"
         );
 
         // vbscript URLs should be blocked
         assert_eq!(
-            validate_redirect_url("vbscript:msgbox('xss')", public_url),
+            validate_redirect_url("vbscript:msgbox('xss')", public_url, &[]),
             "/"
         );
     }
@@ -1869,13 +2193,13 @@ mod tests {
 
         // Same domain should be allowed
         assert_eq!(
-            validate_redirect_url("https://rise.dev/dashboard", public_url),
+            validate_redirect_url("https://rise.dev/dashboard", public_url, &[]),
             "https://rise.dev/dashboard"
         );
 
         // Same domain with port should be allowed
         assert_eq!(
-            validate_redirect_url("https://rise.dev:8080/dashboard", public_url),
+            validate_redirect_url("https://rise.dev:8080/dashboard", public_url, &[]),
             "https://rise.dev:8080/dashboard"
         );
     }
@@ -1886,18 +2210,18 @@ mod tests {
 
         // Subdomain should be allowed
         assert_eq!(
-            validate_redirect_url("https://app.rise.dev/dashboard", public_url),
+            validate_redirect_url("https://app.rise.dev/dashboard", public_url, &[]),
             "https://app.rise.dev/dashboard"
         );
 
         assert_eq!(
-            validate_redirect_url("https://staging.rise.dev/dashboard", public_url),
+            validate_redirect_url("https://staging.rise.dev/dashboard", public_url, &[]),
             "https://staging.rise.dev/dashboard"
         );
 
         // Multi-level subdomain should be allowed
         assert_eq!(
-            validate_redirect_url("https://my-project.app.rise.dev/", public_url),
+            validate_redirect_url("https://my-project.app.rise.dev/", public_url, &[]),
             "https://my-project.app.rise.dev/"
         );
     }
@@ -1907,16 +2231,65 @@ mod tests {
         let public_url = "https://rise.dev";
 
         // External domains should be blocked
-        assert_eq!(validate_redirect_url("https://evil.com", public_url), "/");
+        assert_eq!(
+            validate_redirect_url("https://evil.com", public_url, &[]),
+            "/"
+        );
 
         assert_eq!(
-            validate_redirect_url("https://phishing.site/login", public_url),
+            validate_redirect_url("https://phishing.site/login", public_url, &[]),
             "/"
         );
 
         // Domains that look similar but are not subdomains should be blocked
         assert_eq!(
-            validate_redirect_url("https://rise.dev.evil.com", public_url),
+            validate_redirect_url("https://rise.dev.evil.com", public_url, &[]),
+            "/"
+        );
+    }
+
+    #[test]
+    fn test_validate_redirect_url_project_scoped() {
+        // Control plane is rise.example.com; the app being authenticated lives at
+        // secret.example.com (a sibling, not a subdomain). Only THIS project's
+        // resolved hosts are trusted — not the whole parent domain.
+        let public_url = "https://rise.example.com";
+        let allowed = vec!["secret.example.com".to_string()];
+
+        // The project's own host is accepted.
+        assert_eq!(
+            validate_redirect_url("https://secret.example.com/dashboard", public_url, &allowed),
+            "https://secret.example.com/dashboard"
+        );
+        // Case-insensitive host match (url crate lowercases the parsed host).
+        assert_eq!(
+            validate_redirect_url("https://SECRET.EXAMPLE.COM/x", public_url, &allowed),
+            "https://SECRET.EXAMPLE.COM/x"
+        );
+        // Without the project host in the allow-set it drops to "/".
+        assert_eq!(
+            validate_redirect_url("https://secret.example.com/dashboard", public_url, &[]),
+            "/"
+        );
+        // A DIFFERENT project's host under the same parent domain is rejected:
+        // redirects are gated by exact membership in the allow-set, not by a
+        // shared parent domain.
+        assert_eq!(
+            validate_redirect_url("https://other.example.com/", public_url, &allowed),
+            "/"
+        );
+        // Lookalikes remain blocked — exact host equality, not a string prefix.
+        assert_eq!(
+            validate_redirect_url("https://secret.example.com.evil.com/", public_url, &allowed),
+            "/"
+        );
+        // Userinfo trick: the real host is evil.com, so it is rejected.
+        assert_eq!(
+            validate_redirect_url("https://secret.example.com@evil.com/", public_url, &allowed),
+            "/"
+        );
+        assert_eq!(
+            validate_redirect_url("https://notexample.com/", public_url, &allowed),
             "/"
         );
     }
@@ -1927,24 +2300,27 @@ mod tests {
 
         // localhost to localhost should be allowed
         assert_eq!(
-            validate_redirect_url("http://localhost:3000/dashboard", public_url),
+            validate_redirect_url("http://localhost:3000/dashboard", public_url, &[]),
             "http://localhost:3000/dashboard"
         );
 
         assert_eq!(
-            validate_redirect_url("http://127.0.0.1:3000/dashboard", public_url),
+            validate_redirect_url("http://127.0.0.1:3000/dashboard", public_url, &[]),
             "http://127.0.0.1:3000/dashboard"
         );
 
         // Malicious localhost URLs with invalid ports should be rejected during parsing
         // The URL parser will fail to parse "localhost:evil.com" as a valid port
         assert_eq!(
-            validate_redirect_url("http://localhost:evil.com/path", public_url),
+            validate_redirect_url("http://localhost:evil.com/path", public_url, &[]),
             "/"
         );
 
         // But external URLs should still be blocked even when public_url is localhost
-        assert_eq!(validate_redirect_url("https://evil.com", public_url), "/");
+        assert_eq!(
+            validate_redirect_url("https://evil.com", public_url, &[]),
+            "/"
+        );
     }
 
     #[test]
@@ -1953,12 +2329,12 @@ mod tests {
 
         // localhost should be blocked when public_url is not localhost
         assert_eq!(
-            validate_redirect_url("http://localhost:3000/dashboard", public_url),
+            validate_redirect_url("http://localhost:3000/dashboard", public_url, &[]),
             "/"
         );
 
         assert_eq!(
-            validate_redirect_url("http://127.0.0.1:3000/dashboard", public_url),
+            validate_redirect_url("http://127.0.0.1:3000/dashboard", public_url, &[]),
             "/"
         );
     }
@@ -1968,13 +2344,13 @@ mod tests {
         let public_url = "https://rise.dev";
 
         // Empty string should return fallback
-        assert_eq!(validate_redirect_url("", public_url), "/");
+        assert_eq!(validate_redirect_url("", public_url, &[]), "/");
 
         // Whitespace only should return fallback
-        assert_eq!(validate_redirect_url("   ", public_url), "/");
+        assert_eq!(validate_redirect_url("   ", public_url, &[]), "/");
 
         // Invalid URLs should return fallback
-        assert_eq!(validate_redirect_url("not a url", public_url), "/");
+        assert_eq!(validate_redirect_url("not a url", public_url, &[]), "/");
     }
 
     #[test]
@@ -1983,13 +2359,13 @@ mod tests {
 
         // HTTP URLs should be allowed for same domain
         assert_eq!(
-            validate_redirect_url("http://rise.dev/dashboard", public_url),
+            validate_redirect_url("http://rise.dev/dashboard", public_url, &[]),
             "http://rise.dev/dashboard"
         );
 
         // HTTPS URLs should be allowed for same domain
         assert_eq!(
-            validate_redirect_url("https://rise.dev/dashboard", public_url),
+            validate_redirect_url("https://rise.dev/dashboard", public_url, &[]),
             "https://rise.dev/dashboard"
         );
     }

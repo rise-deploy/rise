@@ -21,9 +21,9 @@
 //!     no longer hide newer tombstones at the tail of the deterministically
 //!     sorted feed. Stuck rows (controllers whose finalizer never clears)
 //!     therefore cannot starve newer rows within one tick.
-//!   - **Panic supervisor**: `start()` wraps the GC loop in a supervisor that
-//!     respawns it after a brief backoff if it panics, so a single bad row
-//!     cannot silently stop garbage collection.
+//!   - **Panic supervisor**: `run()` supervises the GC loop, respawning it
+//!     after a brief backoff if it panics, so a single bad row cannot silently
+//!     stop garbage collection.
 //!   - **Per-row leadership check**: leadership is re-verified immediately
 //!     before each destructive `try_collect` call via `ensure_leader_for`.
 //!     The heartbeat publishes a cached lease horizon after every successful
@@ -35,9 +35,7 @@
 //!   - **Sweep-error backoff**: consecutive sweep failures (e.g. DB outage)
 //!     trigger an exponential backoff capped at 60s, preventing log spam.
 //!
-//! Out of scope for this PR (per `MULTI_TENANCY_PLAN.md`):
-//!   - Application-layer block on deleting an Organization with typed children
-//!     (teams/projects via `organization_resource_uid`) — lands with PR 5.
+//! Not covered here:
 //!   - Real Prometheus/OpenTelemetry metrics — not yet present in the codebase.
 //!     Structured `tracing` fields stand in until that lands.
 
@@ -52,9 +50,11 @@ use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::db::leader_leases::{LeaderElection, LeaderStatus, LeaseError, LEASE_DURATION};
-use crate::db::leader_schedules::GlobalSchedule;
 use crate::server::settings::ResourceGcSettings;
+use rise_runtime_sync::{
+    with_leader_election, GlobalSchedule, LeaderElection, LeaderStatus, LeaseError, LEASE_DURATION,
+};
+use tokio_util::sync::CancellationToken;
 
 const ACTOR: &str = "system:resource-gc";
 const LEASE_NAME: &str = "rise-resource-gc";
@@ -76,64 +76,73 @@ pub struct ResourceGcController {
 }
 
 impl ResourceGcController {
-    pub fn new(pool: PgPool, store: Arc<dyn ResourceStore>, settings: ResourceGcSettings) -> Self {
-        let election =
-            LeaderElection::spawn(pool.clone(), LEASE_NAME, Uuid::new_v4(), LEASE_DURATION);
-        let schedule = GlobalSchedule::new(
+    /// Run the resource GC under a leader election until `shutdown` is
+    /// cancelled, releasing the lease on exit so a peer replica can take over
+    /// promptly instead of waiting out the lease TTL (default 60s).
+    pub async fn run(
+        pool: PgPool,
+        store: Arc<dyn ResourceStore>,
+        settings: ResourceGcSettings,
+        shutdown: CancellationToken,
+    ) -> anyhow::Result<()> {
+        let schedule_pool = pool.clone();
+        with_leader_election(
             pool,
-            SCHEDULE_NAME,
-            Duration::from_secs(settings.interval_secs),
-        );
-        Self {
-            store,
-            election,
-            schedule,
-            settings,
-        }
+            LEASE_NAME,
+            Uuid::new_v4(),
+            LEASE_DURATION,
+            shutdown.clone(),
+            move |election| async move {
+                let controller = Arc::new(ResourceGcController {
+                    store,
+                    election,
+                    schedule: GlobalSchedule::new(
+                        schedule_pool,
+                        SCHEDULE_NAME,
+                        Duration::from_secs(settings.interval_secs),
+                    ),
+                    settings,
+                });
+                controller.supervise(shutdown).await;
+                Ok(())
+            },
+        )
+        .await
     }
 
-    /// Best-effort release of the leader lease on graceful shutdown so a
-    /// peer replica can acquire immediately rather than waiting for the
-    /// lease TTL to decay (default 60s). Safe to call multiple times; safe
-    /// to call from outside the GC task (e.g. from the server's shutdown
-    /// signal handler).
-    pub async fn shutdown(&self) {
-        match self.election.release().await {
-            Ok(()) => debug!("released resource GC lease on shutdown"),
-            Err(e) => warn!(error = ?e, "failed to release resource GC lease on shutdown"),
-        }
-    }
-
-    /// Spawn the GC loop under a supervisor. If `gc_loop` panics the
-    /// supervisor logs the panic and respawns it after a short backoff. This
-    /// is the classic Erlang/OTP "let it crash" pattern adapted to tokio: a
-    /// single poisoned row cannot silently stop garbage collection (which
-    /// would leave tombstoned rows accumulating forever while `/health` keeps
-    /// returning OK).
-    pub fn start(self: Arc<Self>) {
-        tokio::spawn(async move {
-            loop {
-                let me = self.clone();
-                let handle = tokio::spawn(async move { me.gc_loop().await });
-                match handle.await {
-                    Ok(()) => {
-                        info!("resource GC loop exited normally");
-                        break;
-                    }
-                    Err(e) if e.is_panic() => {
-                        error!(error = ?e, "resource GC loop panicked; restarting after 5s");
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                    }
-                    Err(e) => {
-                        info!(error = ?e, "resource GC loop cancelled");
-                        break;
-                    }
+    /// Supervise the sweep loop: if `gc_loop` panics the supervisor logs it and
+    /// respawns it after a short backoff — the classic Erlang/OTP "let it crash"
+    /// pattern, so a single poisoned row cannot silently stop garbage collection
+    /// (which would leave tombstoned rows accumulating forever while `/health`
+    /// keeps returning OK). The election outlives respawns; only the sweep loop
+    /// restarts. Returns once `shutdown` is cancelled so the caller releases the
+    /// lease.
+    async fn supervise(self: Arc<Self>, shutdown: CancellationToken) {
+        loop {
+            if shutdown.is_cancelled() {
+                break;
+            }
+            let me = Arc::clone(&self);
+            let loop_shutdown = shutdown.clone();
+            let handle = tokio::spawn(async move { me.gc_loop(loop_shutdown).await });
+            match handle.await {
+                Ok(()) => {
+                    info!("resource GC loop exited");
+                    break;
+                }
+                Err(e) if e.is_panic() => {
+                    error!(error = ?e, "resource GC loop panicked; restarting after 5s");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+                Err(e) => {
+                    info!(error = ?e, "resource GC loop cancelled");
+                    break;
                 }
             }
-        });
+        }
     }
 
-    async fn gc_loop(&self) {
+    async fn gc_loop(&self, shutdown: CancellationToken) {
         info!(
             interval_secs = self.settings.interval_secs,
             batch_size = self.settings.batch_size,
@@ -149,7 +158,10 @@ impl ResourceGcController {
 
         let mut consecutive_failures: u32 = 0;
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = ticker.tick() => {}
+            }
             if !self.election.is_leader() {
                 continue;
             }
@@ -179,8 +191,8 @@ impl ResourceGcController {
                     );
                     // 2, 4, 8, 16, 32, 60, 60 ... — capped at 60s after the
                     // 6th consecutive failure. Recovery still happens within
-                    // ~1 minute of the dependency returning, but a sustained
-                    // outage no longer produces 360 identical log lines/hour.
+                    // ~1 minute of the dependency returning, while the cap keeps
+                    // a sustained outage to ~1 log line/minute.
                     let exp = consecutive_failures.min(6);
                     let backoff_secs = std::cmp::min(60u64, 2u64.saturating_pow(exp));
                     tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
@@ -444,6 +456,29 @@ mod tests {
         }
     }
 
+    /// Build a controller with its own election for unit tests that drive
+    /// `sweep()` directly. Production goes through [`ResourceGcController::run`],
+    /// which owns the election via `with_leader_election`.
+    fn gc_controller(
+        pool: PgPool,
+        store: Arc<dyn ResourceStore>,
+        settings: ResourceGcSettings,
+    ) -> ResourceGcController {
+        let election =
+            LeaderElection::spawn(pool.clone(), LEASE_NAME, Uuid::new_v4(), LEASE_DURATION);
+        let schedule = GlobalSchedule::new(
+            pool,
+            SCHEDULE_NAME,
+            Duration::from_secs(settings.interval_secs),
+        );
+        ResourceGcController {
+            store,
+            election,
+            schedule,
+            settings,
+        }
+    }
+
     /// Wait until the controller's election task has acquired the lease.
     /// `sweep()` asserts leadership at the start of every batch (and before
     /// every destructive write) via `ensure_leader_for`, so tests that drive
@@ -460,13 +495,19 @@ mod tests {
         panic!("resource GC election did not acquire leadership within 5s");
     }
 
-    /// Layer the resource-store schema on top of the root migrations that
-    /// `#[sqlx::test]` already ran, mirroring the pattern in
-    /// `src/server/resources/handlers.rs` tests.
+    /// Layer the resource-store and runtime-sync schemas on top of the root
+    /// migrations that `#[sqlx::test]` already ran, mirroring the pattern in
+    /// `src/server/resources/handlers.rs` tests. The runtime-sync schema is
+    /// required because the GC controller runs under a `LeaderElection` and
+    /// `GlobalSchedule`, which write to `runtime_sync.leader_leases` /
+    /// `runtime_sync.leader_schedules`.
     async fn store_for(pool: PgPool) -> Arc<dyn ResourceStore> {
         rise_resource_store::run_migrations(&pool)
             .await
             .expect("resource store migrations");
+        rise_runtime_sync::run_migrations(&pool)
+            .await
+            .expect("runtime sync migrations");
         Arc::new(PgResourceStore::new(pool))
     }
 
@@ -573,7 +614,7 @@ mod tests {
         // transaction. With one child, both are tombstoned and on the
         // `list_pending_collection` feed immediately.
 
-        let gc = ResourceGcController::new(pool.clone(), store.clone(), default_settings());
+        let gc = gc_controller(pool.clone(), store.clone(), default_settings());
         wait_for_leader(&gc).await;
 
         // First sweep: parent has a child → MarkedForDeletion. Child has its
@@ -654,7 +695,7 @@ mod tests {
             inner: inner.clone(),
             fail_for: b.uid,
         });
-        let gc = ResourceGcController::new(pool.clone(), failing, default_settings());
+        let gc = gc_controller(pool.clone(), failing, default_settings());
         wait_for_leader(&gc).await;
 
         let stats = gc.sweep().await.unwrap();
@@ -695,7 +736,7 @@ mod tests {
 
         let mut settings = default_settings();
         settings.stuck_threshold_secs = 60;
-        let gc = ResourceGcController::new(pool.clone(), store.clone(), settings);
+        let gc = gc_controller(pool.clone(), store.clone(), settings);
         wait_for_leader(&gc).await;
 
         let stats = gc.sweep().await.unwrap();
@@ -760,7 +801,7 @@ mod tests {
             max_batches_per_tick: 3,
             stuck_threshold_secs: 3600,
         };
-        let gc = ResourceGcController::new(pool.clone(), store.clone(), settings);
+        let gc = gc_controller(pool.clone(), store.clone(), settings);
         wait_for_leader(&gc).await;
 
         let stats = gc.sweep().await.unwrap();
@@ -803,7 +844,7 @@ mod tests {
         let racy: Arc<dyn ResourceStore> = Arc::new(NotFoundStore {
             inner: inner.clone(),
         });
-        let gc = ResourceGcController::new(pool.clone(), racy, default_settings());
+        let gc = gc_controller(pool.clone(), racy, default_settings());
         wait_for_leader(&gc).await;
 
         let stats = gc.sweep().await.unwrap();

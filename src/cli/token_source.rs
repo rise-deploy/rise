@@ -143,7 +143,8 @@ pub async fn token_with_retry(provider: &TokenProvider) -> Result<String> {
 }
 
 /// Resolve the configured token provider and then a bearer token with the
-/// shared retry policy. Use for one-shot backend requests.
+/// shared retry policy. Use for one-shot backend requests. Exchange (when
+/// `RISE_IDENTITY` is set) is handled by [`resolve_token_provider`].
 pub async fn resolve_token_with_retry(http: &reqwest::Client, config: &Config) -> Result<String> {
     let provider = resolve_token_provider(http, config)?;
     token_with_retry(&provider).await
@@ -353,8 +354,11 @@ const COMMAND_TOKEN_TTL_DEFAULT_SECS: u64 = 10 * 60;
 /// Overridable via `RISE_TOKEN_COMMAND_TIMEOUT` (seconds).
 const COMMAND_TOKEN_TIMEOUT_DEFAULT_SECS: u64 = 10;
 
-/// Runs a user-supplied shell command and uses its trimmed stdout as the
-/// bearer token. Generic escape hatch for any CI / identity system.
+/// Runs a user-supplied shell command and uses its trimmed stdout as the bearer
+/// token. Generic escape hatch for any CI / identity system. Intended to print
+/// an **external OIDC token**: when `RISE_IDENTITY` is set the output is exchanged
+/// for a Rise access token (see [`ExchangingTokenSource`]); otherwise it is sent
+/// as-is (the legacy raw-token path).
 ///
 /// If the command outputs a JWT, its `exp` claim governs freshness. For opaque
 /// tokens (no decodable `exp`), the command is re-run before `ttl` elapses
@@ -455,6 +459,221 @@ impl TokenSource for CommandToken {
     }
 }
 
+/// RFC 8693 grant type / subject-token type for the auth token-exchange
+/// endpoint (`POST /api/v1/auth/token`). These mirror the server-side
+/// constants in `server::auth::exchange::models`, which live behind the
+/// `backend` feature and so can't be shared with the CLI build.
+const GRANT_TYPE_TOKEN_EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
+const SUBJECT_TOKEN_TYPE_JWT: &str = "urn:ietf:params:oauth:token-type:jwt";
+
+/// Maximum runtime for a single token-exchange round-trip (the server fetches
+/// the source issuer's JWKS, so allow more headroom than a local mint).
+const TOKEN_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Decorates a base [`TokenSource`] so its token is exchanged for a short-lived,
+/// Rise-signed access token at `POST /api/v1/auth/token` before use, assuming a
+/// given identity (a service account's email).
+///
+/// The wrap is applied by [`resolve_token_provider`] only when `RISE_IDENTITY` is
+/// set — the explicit, channel-agnostic signal that the caller wants to exchange
+/// its token (from any source) for that identity. So this decorator always
+/// exchanges and never inspects the token's contents.
+///
+/// Nested freshness: the inner source owns its own OIDC mint/refresh cache, so
+/// the inner token is only re-minted when stale; the exchanged access token is
+/// cached here and re-exchanged only once it nears its own `exp`. A still-fresh
+/// access token is returned without even consulting the inner source.
+pub struct ExchangingTokenSource {
+    inner: TokenProvider,
+    http: reqwest::Client,
+    /// Rise backend base URL — used to build the exchange endpoint URL.
+    backend_url: String,
+    /// The identity to assume: a service account's synthetic-user email. The
+    /// minted access token is bound to that SA (and its project).
+    identity: String,
+    cache: Mutex<Option<CachedToken>>,
+}
+
+impl ExchangingTokenSource {
+    fn new(
+        inner: TokenProvider,
+        http: reqwest::Client,
+        backend_url: String,
+        identity: String,
+    ) -> Self {
+        Self {
+            inner,
+            http,
+            backend_url,
+            identity,
+            cache: Mutex::new(None),
+        }
+    }
+
+    async fn exchange(&self, subject_token: &str) -> Result<String> {
+        // Bound the whole round-trip: a hung endpoint must not block the deploy
+        // indefinitely (the CLI client carries no default timeout). A timeout is
+        // transient, so it's retryable.
+        match tokio::time::timeout(TOKEN_EXCHANGE_TIMEOUT, self.exchange_once(subject_token)).await
+        {
+            Ok(result) => result,
+            Err(_) => Err(TokenSourceError::retryable(format!(
+                "Token exchange timed out after {} seconds",
+                TOKEN_EXCHANGE_TIMEOUT.as_secs()
+            ))
+            .into()),
+        }
+    }
+
+    async fn exchange_once(&self, subject_token: &str) -> Result<String> {
+        let url = format!(
+            "{}/api/v1/auth/token",
+            self.backend_url.trim_end_matches('/')
+        );
+        let response = self
+            .http
+            .post(&url)
+            .json(&build_exchange_body(subject_token, &self.identity))
+            .send()
+            .await
+            .map_err(|e| {
+                TokenSourceError::retryable(format!("Token exchange request failed: {e}"))
+            })?;
+        let status = response.status();
+        // A failed body read on an otherwise-OK response is a transient network
+        // error, not a malformed payload — keep it retryable rather than letting
+        // an empty body fall through to a non-retryable parse failure.
+        let body = response.text().await.map_err(|e| {
+            TokenSourceError::retryable(format!("Failed to read token-exchange response body: {e}"))
+        })?;
+        parse_exchange_response(status, &body)
+    }
+}
+
+#[async_trait::async_trait]
+impl TokenSource for ExchangingTokenSource {
+    async fn token(&self) -> Result<String> {
+        // Hold the cache lock across the whole resolution (as GithubActionsOidc
+        // and CommandToken do) so concurrent callers serialize: a second caller
+        // waits, then sees the access token the first one just exchanged instead
+        // of racing it into a duplicate exchange (extra requests, extra audit
+        // entries, distinct `jti` for one source token).
+        let mut guard = self.cache.lock().await;
+
+        // A still-fresh exchanged access token is reused directly; it outlives
+        // inner OIDC rotations, so we needn't consult the inner source at all.
+        if let Some(cached) = guard.as_ref() {
+            if cached.is_fresh() {
+                return Ok(cached.value.clone());
+            }
+        }
+
+        // The wrap is only applied when an exchange was explicitly requested
+        // (RISE_IDENTITY set), so the inner token is always exchanged — no
+        // content inspection.
+        let subject = self.inner.token().await?;
+        let access = self.exchange(&subject).await?;
+        let cached = CachedToken::new(access);
+        let value = cached.value.clone();
+        *guard = Some(cached);
+        Ok(value)
+    }
+
+    /// Reports the underlying source, not the exchange wrapper: the exchange is
+    /// always in play in this CLI, so what an operator wants in the logs is
+    /// which identity is being presented (GitHub Actions OIDC, stored login, …).
+    fn describe(&self) -> &'static str {
+        self.inner.describe()
+    }
+}
+
+/// Wrap `inner` so its token is exchanged for a Rise access token assuming
+/// `identity` before use. See [`ExchangingTokenSource`]; applied by
+/// [`resolve_token_provider`] when `RISE_IDENTITY` is set.
+fn with_token_exchange(
+    inner: TokenProvider,
+    http: reqwest::Client,
+    backend_url: String,
+    identity: String,
+) -> TokenProvider {
+    Arc::new(ExchangingTokenSource::new(
+        inner,
+        http,
+        backend_url,
+        identity,
+    ))
+}
+
+/// Build the RFC 8693 request body for the exchange endpoint.
+fn build_exchange_body(subject_token: &str, identity: &str) -> serde_json::Value {
+    serde_json::json!({
+        "grant_type": GRANT_TYPE_TOKEN_EXCHANGE,
+        "subject_token": subject_token,
+        "subject_token_type": SUBJECT_TOKEN_TYPE_JWT,
+        "identity": identity,
+    })
+}
+
+/// Parse the exchange endpoint's response into the minted access token, mapping
+/// the HTTP status onto retryable vs. non-retryable token errors so
+/// [`token_with_retry`] only retries transient failures (`5xx`, `429`).
+fn parse_exchange_response(status: reqwest::StatusCode, body: &str) -> Result<String> {
+    if status.is_success() {
+        #[derive(serde::Deserialize)]
+        struct ExchangeOk {
+            access_token: String,
+        }
+        // A 200 with an unparseable body won't parse on retry — fail fast.
+        let parsed: ExchangeOk = serde_json::from_str(body).map_err(|e| {
+            TokenSourceError::non_retryable(format!("Failed to parse token-exchange response: {e}"))
+        })?;
+        if parsed.access_token.trim().is_empty() {
+            return Err(TokenSourceError::non_retryable(
+                "Token-exchange endpoint returned an empty access token",
+            )
+            .into());
+        }
+        return Ok(parsed.access_token);
+    }
+
+    let detail = parse_oauth_error(body).unwrap_or_else(|| truncate_detail(body));
+    let message = format!("Token exchange failed ({status}): {detail}");
+    if status.is_server_error()
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+    {
+        Err(TokenSourceError::retryable(message).into())
+    } else {
+        Err(TokenSourceError::non_retryable(message).into())
+    }
+}
+
+/// Extract a readable `error: description` from an OAuth/RFC 8693 error body.
+fn parse_oauth_error(body: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct OAuthErr {
+        error: String,
+        error_description: Option<String>,
+    }
+    let parsed: OAuthErr = serde_json::from_str(body).ok()?;
+    Some(match parsed.error_description {
+        Some(desc) => format!("{}: {}", parsed.error, desc),
+        None => parsed.error,
+    })
+}
+
+/// Bound a non-OAuth error body to a sane length for the error message (a
+/// proxy/gateway can return a large HTML page). Char-safe truncation.
+fn truncate_detail(body: &str) -> String {
+    const MAX: usize = 300;
+    let trimmed = body.trim();
+    if trimmed.chars().count() > MAX {
+        format!("{}…", trimmed.chars().take(MAX).collect::<String>())
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Inputs to the token-source selection, separated from env/IO so the
 /// precedence logic is unit-testable without mutating process env.
 pub struct ProviderInputs {
@@ -469,58 +688,81 @@ pub struct ProviderInputs {
     pub gha_request_token: Option<String>,
     pub audience: Option<String>,
     pub stored_token: Option<String>,
-    /// Resolved backend URL, used only to enrich the "no audience" error.
+    /// Resolved backend URL — enriches the "no audience" error and is the
+    /// exchange endpoint's base when `identity` is set.
     pub backend_url: String,
+    /// `RISE_IDENTITY`: the service-account identity (synthetic-user email) to
+    /// assume. When set, the selected token is exchanged for it; when unset, the
+    /// token is used as-is.
+    pub identity: Option<String>,
 }
 
-/// Pure precedence: pick a token source from already-resolved inputs.
+/// Pure precedence: pick a token source from already-resolved inputs, and — when
+/// `identity` is set — layer the token exchange on top (channel-agnostic).
 pub fn select_token_provider(
     http: &reqwest::Client,
     inputs: ProviderInputs,
 ) -> Result<TokenProvider> {
-    // 1. Explicit RISE_TOKEN wins (backward compatible).
-    if let Some(token) = inputs.rise_token.filter(|t| !t.is_empty()) {
-        return Ok(Arc::new(StaticToken::new(
-            token,
-            "RISE_TOKEN environment variable",
-        )));
-    }
-    // 2. Generic command escape hatch.
-    if let Some(cmd) = inputs.rise_token_command.filter(|c| !c.is_empty()) {
-        return Ok(Arc::new(CommandToken::new(
+    // Capture the exchange context before the precedence consumes `inputs`.
+    let identity = inputs.identity.clone().filter(|s| !s.trim().is_empty());
+    let backend_url = inputs.backend_url.clone();
+
+    let base: TokenProvider = if let Some(token) = inputs.rise_token.filter(|t| !t.is_empty()) {
+        // 1. Explicit RISE_TOKEN wins (backward compatible).
+        Arc::new(StaticToken::new(token, "RISE_TOKEN environment variable"))
+    } else if let Some(cmd) = inputs.rise_token_command.filter(|c| !c.is_empty()) {
+        // 2. Generic command escape hatch.
+        Arc::new(CommandToken::new(
             cmd,
             inputs.rise_token_command_ttl,
             inputs.rise_token_command_timeout,
-        )));
-    }
-    // 3. GitHub Actions OIDC auto-detection.
-    if let (Some(url), Some(req_token)) = (
+        ))
+    } else if let (Some(url), Some(req_token)) = (
         inputs.gha_request_url.filter(|s| !s.is_empty()),
         inputs.gha_request_token.filter(|s| !s.is_empty()),
     ) {
+        // 3. GitHub Actions OIDC auto-detection.
         let audience = inputs.audience.filter(|a| !a.is_empty()).ok_or_else(|| {
             anyhow!(
                 "GitHub Actions OIDC detected but no audience configured. \
                  Set RISE_GHA_AUDIENCE (recommended: the Rise server URL, e.g. {}).",
-                inputs.backend_url
+                backend_url
             )
         })?;
-        return Ok(Arc::new(GithubActionsOidc::new(
+        Arc::new(GithubActionsOidc::new(
             http.clone(),
             url,
             req_token,
             audience,
-        )));
-    }
-    // 4. Stored login token.
-    if let Some(token) = inputs.stored_token.filter(|t| !t.is_empty()) {
-        return Ok(Arc::new(StaticToken::new(token, "stored login token")));
-    }
-    // 5. Nothing.
-    Err(TokenSourceError::NoSource("Not authenticated. Run 'rise login' first.".to_string()).into())
+        ))
+    } else if let Some(token) = inputs.stored_token.filter(|t| !t.is_empty()) {
+        // 4. Stored login token.
+        Arc::new(StaticToken::new(token, "stored login token"))
+    } else {
+        // 5. Nothing.
+        return Err(TokenSourceError::NoSource(
+            "Not authenticated. Run 'rise login' first.".to_string(),
+        )
+        .into());
+    };
+
+    // `RISE_IDENTITY` set → exchange the resolved token for that identity,
+    // regardless of which source produced it. Unset → use the token as-is.
+    Ok(match identity {
+        Some(identity) => with_token_exchange(base, http.clone(), backend_url, identity),
+        None => base,
+    })
 }
 
-/// Read real env + config and build the token provider.
+/// Read real env + config and build the token provider for a command.
+///
+/// This is the single entry point every command uses to obtain a token source.
+/// It selects the base source by precedence (`RISE_TOKEN`, then
+/// `RISE_TOKEN_COMMAND`, then GitHub Actions OIDC, then the stored login). If
+/// `RISE_IDENTITY` is set, the selected token is exchanged for that identity (a
+/// service account, by email) regardless of source; otherwise it is used as-is.
+/// Exchange is thus explicit and channel-agnostic — never inferred from the
+/// token's contents.
 pub fn resolve_token_provider(http: &reqwest::Client, config: &Config) -> Result<TokenProvider> {
     let command_ttl_secs = std::env::var("RISE_TOKEN_COMMAND_TTL")
         .ok()
@@ -542,6 +784,7 @@ pub fn resolve_token_provider(http: &reqwest::Client, config: &Config) -> Result
         audience: std::env::var("RISE_GHA_AUDIENCE").ok(),
         stored_token: config.stored_token(),
         backend_url: config.get_backend_url(),
+        identity: std::env::var("RISE_IDENTITY").ok(),
     };
     select_token_provider(http, inputs)
 }
@@ -577,6 +820,7 @@ mod tests {
             audience: None,
             stored_token: None,
             backend_url: "https://rise.example".to_string(),
+            identity: None,
         }
     }
 
@@ -764,6 +1008,132 @@ mod tests {
 
         assert_eq!(token, "token-2");
         assert_eq!(source.attempts.load(Ordering::SeqCst), 2);
+    }
+
+    mod token_exchange {
+        use super::*;
+
+        #[tokio::test]
+        async fn no_identity_passes_token_through() {
+            // Regression (e2e-docker): with RISE_IDENTITY unset, the token is used
+            // as-is — no exchange, regardless of source or the token's contents.
+            let mut inputs = base_inputs();
+            inputs.rise_token = Some("a-rise-token".into());
+            let provider = select_token_provider(&client(), inputs).unwrap();
+            assert_eq!(provider.token().await.unwrap(), "a-rise-token");
+        }
+
+        #[tokio::test]
+        async fn identity_set_wraps_and_exchanges() {
+            // With RISE_IDENTITY set, the selected token is wrapped and exchanged
+            // (any source). Point at an unroutable backend: a wrapped provider
+            // tries the exchange and fails to reach it, rather than returning the
+            // bearer as-is.
+            let mut inputs = base_inputs();
+            inputs.rise_token = Some("a-rise-token".into());
+            inputs.identity = Some("demo+1@sa.rise.local".into());
+            inputs.backend_url = "http://127.0.0.1:1".into();
+            let provider = select_token_provider(&client(), inputs).unwrap();
+            let err = provider.token().await.unwrap_err();
+            assert!(
+                err.to_string().to_lowercase().contains("token exchange"),
+                "expected an exchange attempt, got: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn blank_identity_does_not_exchange() {
+            // A blank RISE_IDENTITY is treated as unset (no exchange).
+            let mut inputs = base_inputs();
+            inputs.rise_token = Some("a-rise-token".into());
+            inputs.identity = Some("   ".into());
+            let provider = select_token_provider(&client(), inputs).unwrap();
+            assert_eq!(provider.token().await.unwrap(), "a-rise-token");
+        }
+
+        #[test]
+        fn describe_delegates_to_inner_source() {
+            let inner: TokenProvider =
+                Arc::new(StaticToken::new("x".into(), "GitHub Actions OIDC"));
+            let src = ExchangingTokenSource::new(
+                inner,
+                client(),
+                "https://rise.example.com".to_string(),
+                "demo+1@sa.rise.local".to_string(),
+            );
+            assert_eq!(src.describe(), "GitHub Actions OIDC");
+        }
+
+        #[test]
+        fn rfc8693_constants_match_spec() {
+            // Guard the CLI's copy of the RFC 8693 URNs against a typo drifting
+            // from the server (which has its own copy behind the backend feature).
+            assert_eq!(
+                GRANT_TYPE_TOKEN_EXCHANGE,
+                "urn:ietf:params:oauth:grant-type:token-exchange"
+            );
+            assert_eq!(
+                SUBJECT_TOKEN_TYPE_JWT,
+                "urn:ietf:params:oauth:token-type:jwt"
+            );
+        }
+
+        #[test]
+        fn build_exchange_body_uses_rfc8693_fields() {
+            let body = build_exchange_body("the-subject", "demo+1@sa.rise.local");
+            assert_eq!(body["grant_type"], GRANT_TYPE_TOKEN_EXCHANGE);
+            assert_eq!(body["subject_token"], "the-subject");
+            assert_eq!(body["subject_token_type"], SUBJECT_TOKEN_TYPE_JWT);
+            assert_eq!(body["identity"], "demo+1@sa.rise.local");
+        }
+
+        #[test]
+        fn parse_exchange_response_success_returns_access_token() {
+            let token = parse_exchange_response(
+                reqwest::StatusCode::OK,
+                r#"{"access_token":"rise-access","token_type":"Bearer","issued_token_type":"urn:ietf:params:oauth:token-type:jwt","expires_in":600}"#,
+            )
+            .unwrap();
+            assert_eq!(token, "rise-access");
+        }
+
+        #[test]
+        fn parse_exchange_response_400_is_non_retryable_with_detail() {
+            let err = parse_exchange_response(
+                reqwest::StatusCode::BAD_REQUEST,
+                r#"{"error":"invalid_grant","error_description":"no matching service account"}"#,
+            )
+            .unwrap_err();
+            assert!(is_non_retryable_token_error(&err));
+            let msg = err.to_string();
+            assert!(msg.contains("invalid_grant"));
+            assert!(msg.contains("no matching service account"));
+        }
+
+        #[test]
+        fn parse_exchange_response_503_is_retryable() {
+            let err = parse_exchange_response(
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":"temporarily_unavailable"}"#,
+            )
+            .unwrap_err();
+            assert!(!is_non_retryable_token_error(&err));
+        }
+
+        #[test]
+        fn parse_exchange_response_malformed_200_is_non_retryable() {
+            // A 200 with a non-JSON body won't parse on retry — must fail fast.
+            let err =
+                parse_exchange_response(reqwest::StatusCode::OK, "<html>oops</html>").unwrap_err();
+            assert!(is_non_retryable_token_error(&err));
+        }
+
+        #[test]
+        fn parse_exchange_response_empty_token_is_non_retryable() {
+            let err = parse_exchange_response(reqwest::StatusCode::OK, r#"{"access_token":""}"#)
+                .unwrap_err();
+            assert!(is_non_retryable_token_error(&err));
+        }
     }
 
     mod command_token_ttl {

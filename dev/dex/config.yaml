@@ -1,4 +1,4 @@
-issuer: http://localhost:5556/dex
+issuer: http://rise-dex:5556/dex
 
 storage:
   type: memory
@@ -9,8 +9,19 @@ web:
 staticClients:
 - id: rise-backend
   redirectURIs:
-  # Server-side OAuth callback (UI and ingress auth)
+  # Server-side OAuth callback for the control plane. The backend always builds
+  # this from server.public_url (`{public_url}/api/v1/auth/callback`), so each
+  # entry MUST match a public_url host used by one of the stacks.
+  # Dev stack (docker-compose.yml) + legacy host dev:
   - http://rise.local:3000/api/v1/auth/callback
+  # Standalone local/e2e stack (config/docker.yaml, run_mode docker, local defaults):
+  # The backend registers only this callback even for the custom-domain `/.rise`
+  # flow (the IdP callback always lands here, then redirects to /.rise/auth/complete).
+  - http://rise.localhost:3000/api/v1/auth/callback
+  # PRODUCTION (bundled Dex only): if you run this demo Dex in production you
+  # MUST also add the prod callback here, or login fails with `invalid
+  # redirect_uri`. See the operator docs "Production caveat". e.g.:
+  #   - https://rise.example.com/api/v1/auth/callback
   # CLI Auth
   - http://localhost:8765/callback
   - http://localhost:8766/callback
@@ -19,6 +30,19 @@ staticClients:
   - http://rise.local:3000/oidc/oauth-demo/oauth-dex/callback
   name: 'Rise Backend'
   secret: rise-backend-secret
+  # Because setting `grantTypes` REPLACES — not extends — Dex's default set, this
+  # list reproduces the full default grants (authorization_code, refresh_token,
+  # device_code, token-exchange) so flows like `rise login --device` keep working,
+  # and then adds `password`. The resource-owner password grant is Dev/CI-only: it
+  # lets the e2e harness mint OIDC id_tokens non-interactively for the static users
+  # below (Dex v2.45 gates `password` per-client and drops it from the default
+  # set). The listed demo passwords carry no real exposure.
+  grantTypes:
+  - authorization_code
+  - refresh_token
+  - "urn:ietf:params:oauth:grant-type:device_code"
+  - "urn:ietf:params:oauth:grant-type:token-exchange"
+  - password
 
 enablePasswordDB: true
 staticPasswords:

@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO runtime_sync.leader_schedules (name, last_run_at)\n             VALUES ($1, NOW())\n             ON CONFLICT (name) DO UPDATE\n               SET last_run_at = NOW()\n               WHERE runtime_sync.leader_schedules.last_run_at + ($2 * INTERVAL '1 second') <= NOW()\n             RETURNING name",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Float8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "764ed1bced9efa56a5f9aba59e55bc7fbf40adc2b0ead738816023546173823b"
+}

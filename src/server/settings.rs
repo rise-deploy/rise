@@ -202,6 +202,11 @@ pub enum DeploymentLogsSettings {
         #[serde(flatten)]
         config: KubernetesLogBackendSettings,
     },
+    /// Stream logs directly from the Docker daemon (`docker logs`). Used with
+    /// the Docker deployment controller. Requires no kube client — the bollard
+    /// client is shared from the Docker deployment controller, so this variant
+    /// carries no connection fields of its own.
+    Docker {},
     Loki {
         url: String,
         #[serde(default)]
@@ -235,11 +240,22 @@ pub struct ServerSettings {
     pub public_url: String,
     /// Development-only frontend proxy target (for Vite), e.g. "http://localhost:5173"
     /// When set, non-API frontend routes are proxied to this URL instead of serving embedded assets.
-    #[serde(default)]
+    /// An empty/whitespace value (e.g. an unset `${VAR:-}` env default) is treated as `None`
+    /// so a production config can env-drive this without accidentally proxying to "".
+    #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
     pub frontend_dev_proxy_url: Option<String>,
 
     /// Whether to set Secure flag on cookies (true for HTTPS, false for HTTP development)
-    #[serde(default = "default_cookie_secure")]
+    // Accepts a native YAML boolean or a string ("true"/"false") via
+    // deserialize_bool_flexible, so it can be driven by an env-interpolated
+    // config value (e.g. cookie_secure: "${RISE_COOKIE_SECURE:-false}"), which
+    // the loader resolves to a string before deserialization. Kept as `//` (not
+    // `///`) so the generated JSON schema description is unchanged.
+    #[serde(
+        default = "default_cookie_secure",
+        deserialize_with = "crate::server::ssrf::deserialize_bool_flexible"
+    )]
+    #[schemars(with = "bool")]
     pub cookie_secure: bool,
 
     /// Cookie domain for migration from deployments that previously used domain-scoped cookies.
@@ -299,6 +315,12 @@ pub struct ServerSettings {
     /// Default: 900 (15 minutes).
     #[serde(default = "default_workload_token_max_ttl_seconds")]
     pub workload_token_max_ttl_seconds: u64,
+
+    /// Lifetime in seconds of Rise access tokens minted by the auth
+    /// token-exchange endpoint (`POST /api/v1/auth/token`). Kept short because an
+    /// exchanged token cannot be revoked mid-life. Default: 600 (10 minutes).
+    #[serde(default = "default_auth_token_max_ttl_seconds")]
+    pub auth_token_max_ttl_seconds: u64,
 }
 
 /// Rate limiting configuration for OAuth endpoints (authorize, callback, token).
@@ -362,6 +384,64 @@ fn default_cookie_secure() -> bool {
     true
 }
 
+/// Deserialize an `Option<String>` where a blank/whitespace-only value is `None`.
+///
+/// Lets a config env-drive an optional field via `${VAR:-}`: when the env var is
+/// unset the loader yields the empty string `""`, which would otherwise become
+/// `Some("")`. Trimming it to `None` keeps the "unset" semantics (e.g. so a
+/// production config never proxies the frontend to "").
+fn deserialize_optional_nonempty_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+    Ok(opt.filter(|s| !s.trim().is_empty()))
+}
+
+/// Accept a `u32` from either a JSON number or a numeric string, so a field can
+/// be env-driven via `${VAR:-N}`. The settings loader interpolates `${VAR}` into
+/// a JSON string, so `max_replicas: "${RISE_MAX_REPLICAS:-10}"` reaches serde as
+/// the string `"10"`; serde won't coerce string→u32, so accept both forms.
+fn deserialize_u32_flexible<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum U32OrString {
+        Num(u32),
+        Str(String),
+    }
+
+    match U32OrString::deserialize(deserializer)? {
+        U32OrString::Num(n) => Ok(n),
+        U32OrString::Str(s) => s
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| D::Error::custom(format!("invalid integer string {s:?}; expected a u32"))),
+    }
+}
+
+/// Deserialize a list of strings, dropping blank/whitespace-only entries.
+///
+/// The settings loader interpolates `${VAR}` per string element, so an
+/// env-driven single-element list like
+/// `app_backend_host_aliases: ["${RISE_APP_BACKEND_HOST_ALIAS:-}"]` reaches
+/// serde as `[""]` when the env var is unset (production) and `["rise.localhost"]`
+/// when set (local). Filtering blanks turns the unset case into an empty list
+/// while preserving real entries — sidestepping the inability to express an
+/// *empty* YAML list via a scalar env var. Reused for any env-driven list whose
+/// "off" state must be an empty list (host aliases, platform-access allowlists).
+fn deserialize_blank_filtered_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Vec::<String>::deserialize(deserializer)?;
+    Ok(raw.into_iter().filter(|s| !s.trim().is_empty()).collect())
+}
+
 fn default_static_dir() -> Option<String> {
     std::env::var("RISE_STATIC_DIR").ok()
 }
@@ -380,6 +460,14 @@ fn default_jwt_expiry_seconds() -> u64 {
 
 fn default_workload_token_max_ttl_seconds() -> u64 {
     900 // 15 minutes
+}
+
+fn default_auth_token_max_ttl_seconds() -> u64 {
+    600 // 10 minutes
+}
+
+fn default_allow_raw_external_tokens() -> bool {
+    true
 }
 
 fn default_identity_token_ttl_seconds() -> u64 {
@@ -465,8 +553,9 @@ pub struct AuthSettings {
     pub admin_users: Vec<String>,
     /// List of Operator user emails. Operators have full access to generic
     /// resource storage and built-in resource management. This is a separate
-    /// role from `admin_users`. Matching is case-insensitive.
-    #[serde(default)]
+    /// role from `admin_users`. Matching is case-insensitive. Blank entries are
+    /// filtered out so an unset `${VAR}` default collapses to an empty list.
+    #[serde(default, deserialize_with = "deserialize_blank_filtered_list")]
     pub operator_users: Vec<String>,
     /// Trusted external controller identities. Each entry binds a stable
     /// controller ID to an OIDC issuer plus required claim constraints.
@@ -476,6 +565,21 @@ pub struct AuthSettings {
     /// Platform access control configuration
     #[serde(default)]
     pub platform_access: PlatformAccessConfig,
+    /// Accept raw external OIDC tokens directly at request time (default: true).
+    ///
+    /// When `true`, a CI service account may present its external OIDC token
+    /// directly to project-scoped endpoints, and Rise resolves the service
+    /// account per request (the legacy two-phase path). When `false`, callers
+    /// must first exchange their token at `POST /api/v1/auth/token` for a Rise
+    /// access token.
+    ///
+    /// Leaving this `true` keeps the legacy attack surface and forfeits the
+    /// security benefits of the exchange (no service-account DB lookups in the
+    /// request hot path, and an authenticated `platform/capabilities`). It is
+    /// slated to default to `false` in a future release; migrate CI to
+    /// pre-exchange before then.
+    #[serde(default = "default_allow_raw_external_tokens")]
+    pub allow_raw_external_tokens: bool,
     /// Allow regular users to create teams (default: true).
     /// When false, only admin users can create teams.
     #[serde(default = "default_allow_team_creation")]
@@ -600,6 +704,44 @@ fn default_metacontroller_webhook_port() -> u16 {
     3001
 }
 
+// ── Docker deployment controller defaults ──────────────────────────────
+
+#[cfg(feature = "backend")]
+fn default_traefik_entrypoint() -> String {
+    "web".to_string()
+}
+
+#[cfg(feature = "backend")]
+pub(crate) fn default_label_namespace() -> String {
+    "rise.dev".to_string()
+}
+
+#[cfg(feature = "backend")]
+fn default_container_prefix() -> String {
+    "rise".to_string()
+}
+
+#[cfg(feature = "backend")]
+fn default_docker_access_classes() -> std::collections::HashMap<String, Option<AccessClass>> {
+    let mut classes = std::collections::HashMap::new();
+    classes.insert(
+        "public".to_string(),
+        Some(AccessClass {
+            display_name: "Public".to_string(),
+            description: "Fully public — no authentication required.".to_string(),
+            ingress_class: "traefik".to_string(),
+            access_requirement: AccessRequirement::None,
+            custom_annotations: std::collections::HashMap::new(),
+        }),
+    );
+    classes
+}
+
+#[cfg(feature = "backend")]
+fn default_reconcile_interval_secs() -> u64 {
+    5
+}
+
 fn default_crd_upsert_interval_ms() -> u64 {
     1000
 }
@@ -640,6 +782,39 @@ pub struct AccessClass {
     pub custom_annotations: std::collections::HashMap<String, String>,
 }
 
+/// Validate that a Docker deployment controller can actually enforce the
+/// authentication required by its configured access classes.
+///
+/// The Docker backend wires ingress authentication via a Traefik forwardAuth
+/// middleware whose address is derived from `auth_backend_url`. If that URL is
+/// empty/blank, no middleware is stamped and any access class requiring
+/// `Authenticated`/`Member` would be served PUBLICLY — failing open. To fail
+/// closed instead, this rejects the configuration up-front, naming the
+/// offending access class(es).
+///
+/// `null`-valued access classes (used to remove inherited entries) are ignored.
+/// Returns the names of offending access classes (sorted) when the config is
+/// invalid, or an empty `Vec` when it is acceptable.
+pub fn docker_access_classes_missing_auth_backend_url(
+    access_classes: &std::collections::HashMap<String, Option<AccessClass>>,
+    auth_backend_url: &str,
+) -> Vec<String> {
+    if !auth_backend_url.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let mut offending: Vec<String> = access_classes
+        .iter()
+        .filter_map(|(name, ac)| {
+            ac.as_ref().and_then(|ac| {
+                (ac.access_requirement != AccessRequirement::None).then(|| name.clone())
+            })
+        })
+        .collect();
+    offending.sort();
+    offending
+}
+
 /// Default resource values for new deployments when not specified by the user
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct DeploymentDefaults {
@@ -674,8 +849,13 @@ pub struct DeploymentConstraints {
     #[serde(default = "default_min_replicas")]
     pub min_replicas: u32,
 
-    /// Maximum replicas allowed (default: 1)
-    #[serde(default = "default_max_replicas")]
+    /// Maximum replicas allowed (default: 1). Accepts a number or a numeric
+    /// string so it can be env-driven (e.g. `"${RISE_MAX_REPLICAS:-10}"`).
+    #[serde(
+        default = "default_max_replicas",
+        deserialize_with = "deserialize_u32_flexible"
+    )]
+    #[schemars(with = "u32")]
     pub max_replicas: u32,
 
     /// Minimum CPU allowed (default: "100m")
@@ -824,6 +1004,11 @@ fn default_failure_threshold() -> i32 {
 }
 
 /// Deployment controller configuration
+// Config enums are read once at startup, never stored in hot collections, so the
+// size disparity between the (large) Kubernetes variant and the (small) Docker
+// variant doesn't matter — boxing every Kubernetes field would only obscure the
+// settings schema.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum DeploymentControllerSettings {
@@ -1036,6 +1221,200 @@ pub enum DeploymentControllerSettings {
         /// gradually rather than all at once. Defaults to 1000 (1 per second).
         #[serde(default = "default_crd_upsert_interval_ms")]
         crd_upsert_interval_ms: u64,
+    },
+
+    /// Docker deployment controller.
+    ///
+    /// Deploys app containers to a single Docker host and lets Traefik's Docker
+    /// provider route to them via container labels Rise stamps. No Kubernetes,
+    /// no Metacontroller — reconciliation runs in-process (see
+    /// `controller::docker::DockerReconciler`).
+    #[cfg(feature = "backend")]
+    Docker {
+        /// Docker daemon connection. `None` uses bollard's local defaults
+        /// (unix socket / npipe, or `DOCKER_HOST`). May be a unix socket path
+        /// (`unix:///var/run/docker.sock`) or a TCP URL (`tcp://host:2375`).
+        #[serde(default)]
+        docker_host: Option<String>,
+
+        /// Ingress URL template for the production (default) deployment group.
+        /// Same semantics as the Kubernetes variant. Must contain
+        /// `{project_name}`. Drives both the computed app URLs and the Traefik
+        /// `Host(...)` router rules.
+        production_ingress_url_template: String,
+
+        /// Ingress URL template for staging (non-default) deployment groups.
+        /// Must contain both `{project_name}` and `{deployment_group}`.
+        #[serde(default)]
+        staging_ingress_url_template: Option<String>,
+
+        /// Ingress URL template for named environments.
+        /// Must contain both `{project_name}` and `{environment}`.
+        #[serde(default)]
+        environment_ingress_url_template: Option<String>,
+
+        /// Access classes defining ingress authentication levels, keyed by
+        /// identifier (e.g. "public", "private"). Mirrors the Kubernetes variant
+        /// so the typed project API can validate a project's access class. For
+        /// access classes whose `access_requirement` is `Authenticated`/`Member`,
+        /// the Docker controller stamps Traefik forwardAuth middleware labels
+        /// (requires `auth_backend_url` to be set). A permissive "public" class
+        /// is provided by default; operators may override.
+        /// Use `null` in YAML to remove an inherited access class.
+        #[serde(default = "default_docker_access_classes")]
+        access_classes: std::collections::HashMap<String, Option<AccessClass>>,
+
+        /// Internal URL Traefik uses to reach the Rise backend for the
+        /// forwardAuth subrequest (e.g. `http://rise:3000` on the compose
+        /// network). Used to build the `forwardauth.address` middleware label
+        /// pointing at `/api/v1/auth/ingress`. Required when any configured
+        /// access class has a non-`None` access requirement
+        /// (`Authenticated`/`Member`); the backend refuses to start otherwise,
+        /// to avoid serving those projects publicly with no auth enforced.
+        #[serde(default)]
+        auth_backend_url: String,
+
+        /// Browser-facing base URL for the login redirect (e.g. the public URL
+        /// `http://localhost:3000`). Traefik forwardAuth has no nginx-style
+        /// `auth-signin`, so the `ingress_auth` handler 302-redirects
+        /// unauthenticated browsers to `{auth_signin_url}/api/v1/auth/signin`.
+        /// If empty, falls back to the server `public_url`.
+        #[serde(default)]
+        auth_signin_url: String,
+
+        /// Optional port appended to all generated ingress URLs (e.g. `8080`).
+        #[serde(default)]
+        ingress_port: Option<u16>,
+
+        /// URL scheme for generated ingress URLs (`http` or `https`).
+        /// Defaults to `https`.
+        #[serde(default = "default_ingress_schema")]
+        ingress_schema: String,
+
+        /// Docker network shared with Traefik. App containers are attached to
+        /// this network so Traefik can reach them, and it is emitted as the
+        /// `traefik.docker.network` label.
+        traefik_network: String,
+
+        /// Traefik entrypoint name routers bind to (e.g. `web`, `websecure`).
+        /// Defaults to `web`.
+        #[serde(default = "default_traefik_entrypoint")]
+        traefik_entrypoint: String,
+
+        /// Optional Traefik certresolver name. When set, routers get
+        /// `tls=true` + `tls.certresolver=<name>` labels for automatic TLS.
+        #[serde(default)]
+        traefik_certresolver: Option<String>,
+
+        /// **LOCAL-DEV ONLY.** Hostname(s) to alias to the Rise backend's IP on
+        /// the shared `traefik_network`, injected as `extra_hosts` on every
+        /// managed app container the controller creates.
+        ///
+        /// Apps that validate the `rise_jwt` cookie or perform OIDC discovery
+        /// against the public issuer host (e.g. `rise.localhost`) must be able
+        /// to reach the Rise backend at that host. In a local stack the public
+        /// host resolves to the container's own loopback, not the backend, so
+        /// the controller stamps `HostConfig.extra_hosts` mapping each alias to
+        /// the backend's reachable IP (resolved at reconcile time from the
+        /// `auth_backend_url` host via Docker DNS).
+        ///
+        /// **Leave empty in production.** Production relies on public DNS +
+        /// Traefik for the issuer host (with correct TLS termination); injecting
+        /// an `extra_hosts` override there would wrongly bypass Traefik and break
+        /// TLS. Empty/absent (the default) → no injection.
+        ///
+        /// Mirrors the Kubernetes `host_aliases` mechanism (see
+        /// `resource_builder.rs`, which injects `rise.local → host IP` into pods).
+        ///
+        /// Blank entries are filtered out at load time, so an env-driven
+        /// single-element list (`["${RISE_APP_BACKEND_HOST_ALIAS:-}"]`) collapses
+        /// to an empty list — and no injection — when the env var is unset
+        /// (production).
+        #[serde(default, deserialize_with = "deserialize_blank_filtered_list")]
+        app_backend_host_aliases: Vec<String>,
+
+        /// **LOCAL-DEV ONLY.** Explicit IP/value to alias the
+        /// `app_backend_host_aliases` hosts to (injected as `extra_hosts` on
+        /// managed app containers), used VERBATIM instead of resolving the
+        /// `auth_backend_url` host via DNS.
+        ///
+        /// Set to Docker's special `host-gateway` so apps reach a host-run
+        /// backend (`mise br docker`) on both Docker Desktop and Linux — Docker
+        /// replaces `host-gateway` with the host gateway per container at create
+        /// time. Empty/absent (the default) → fall back to DNS resolution of the
+        /// `auth_backend_url` host. **Leave unset in production** (the
+        /// containerized backend is resolved by Docker DNS).
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        app_backend_ip: Option<String>,
+
+        /// Label namespace prefix for Rise bookkeeping labels
+        /// (e.g. `rise.dev/managed-by`). Defaults to `rise.dev`.
+        #[serde(default = "default_label_namespace")]
+        label_namespace: String,
+
+        /// Prefix for generated container names (`<prefix>_<project>_...`).
+        /// Defaults to `rise`.
+        #[serde(default = "default_container_prefix")]
+        container_prefix: String,
+
+        /// Stable identifier for this deployment controller. The reconciler only
+        /// reconciles projects matching this class. Defaults to `default`.
+        #[serde(default = "default_controller_class_name")]
+        controller_class_name: String,
+
+        /// Interval in seconds between reconcile ticks. Defaults to 5.
+        #[serde(default = "default_reconcile_interval_secs")]
+        reconcile_interval_secs: u64,
+
+        /// Default resource values for new deployments when not specified.
+        #[serde(default)]
+        deployment_defaults: DeploymentDefaults,
+
+        /// Platform-level constraints for deployment resources.
+        #[serde(default)]
+        deployment_constraints: DeploymentConstraints,
+
+        /// Health probe configuration. The reconciler probes routable
+        /// containers over the shared network using these settings.
+        #[serde(default)]
+        health_probes: Option<HealthProbeConfig>,
+
+        /// Lifetime in seconds of workload identity tokens minted for
+        /// deployments. Default: 3600 (1 hour).
+        #[serde(default = "default_identity_token_ttl_seconds")]
+        identity_token_ttl_seconds: u64,
+
+        /// **Dev-only.** Publish each app container's HTTP port to a random
+        /// `127.0.0.1` host port so a host-run backend (`mise br docker` /
+        /// Docker Desktop, where container bridge IPs aren't routable from the
+        /// host) can health-probe the app directly. Leave off in production —
+        /// the containerized backend reaches app containers over the
+        /// `rise_default` network.
+        // Accepts a native YAML boolean or a string ("true"/"false") via
+        // deserialize_bool_flexible, so it can be driven by an env-interpolated
+        // config value (e.g. publish_app_ports:
+        // "${RISE_PUBLISH_APP_PORTS:-false}"), which the loader resolves to a
+        // string before deserialization. Kept as `//` (not `///`) so the
+        // generated JSON schema description is unchanged.
+        #[serde(
+            default,
+            deserialize_with = "crate::server::ssrf::deserialize_bool_flexible"
+        )]
+        #[schemars(with = "bool")]
+        publish_app_ports: bool,
+
+        /// Base URL of Traefik's API (e.g. `http://rise-traefik:8080` in-network
+        /// or `http://localhost:8090` for a host-run dev backend). Read to learn
+        /// per-server health status (the top-level `serverStatus` map) from
+        /// Traefik so the old deployment is retired only once the new servers are
+        /// actually in Traefik's rotation. Optional basic-auth may be embedded in
+        /// the URL (userinfo). **Required for projects that set a `health_check`**:
+        /// Traefik's `serverStatus` is the authoritative readiness signal (no
+        /// fallback), so without a reachable API a health-checked deployment never
+        /// becomes Healthy. May be left empty only when no project uses health
+        /// checks (ready-when-running gates on run-state alone).
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        traefik_api_url: Option<String>,
     },
 }
 
@@ -1273,7 +1652,7 @@ impl Settings {
         }
     }
 
-    /// Try to add a config file with multiple extension attempts (.toml, .yaml, .yml)
+    /// Try to add a `.yaml` config file.
     /// Returns Ok(true) if a file was loaded, Ok(false) if no file found (when not required)
     fn try_add_config_file(
         builder: &mut config::ConfigBuilder<config::builder::DefaultState>,
@@ -1281,31 +1660,24 @@ impl Settings {
         name: &str,
         required: bool,
     ) -> Result<bool, ConfigError> {
-        // Try extensions in order of preference
-        let extensions = ["toml", "yaml", "yml"];
-
-        for ext in extensions {
-            let path = format!("{}/{}.{}", config_dir, name, ext);
-            if std::path::Path::new(&path).exists() {
-                tracing::info!("Loading config file: {}", path);
-                *builder = builder
-                    .clone()
-                    .add_source(config::File::with_name(&format!("{}/{}", config_dir, name)));
-                return Ok(true);
-            }
+        let path = format!("{}/{}.yaml", config_dir, name);
+        if std::path::Path::new(&path).exists() {
+            tracing::info!("Loading config file: {}", path);
+            // Pass the explicit path and format so the loader can't pick up a
+            // sibling file with a different extension.
+            *builder = builder
+                .clone()
+                .add_source(config::File::with_name(&path).format(config::FileFormat::Yaml));
+            return Ok(true);
         }
 
         if required {
             Err(ConfigError::Message(format!(
-                "Required config file not found: {}/{}.{{toml,yaml,yml}}",
-                config_dir, name
+                "Required config file not found: {}",
+                path
             )))
         } else {
-            tracing::debug!(
-                "Optional config file not found: {}/{}.{{toml,yaml,yml}}",
-                config_dir,
-                name
-            );
+            tracing::debug!("Optional config file not found: {}", path);
             Ok(false)
         }
     }
@@ -1356,8 +1728,7 @@ impl Settings {
     ) -> Result<Self, ConfigError> {
         let mut builder = Config::builder();
 
-        // Load config files in order, trying both .toml and .yaml/.yml extensions.
-        // TOML takes precedence if both exist.
+        // Load `.yaml` config files in order. Later files override earlier ones.
 
         // 1. Load shipped defaults (optional). Carries the built-in quickstart
         //    catalog and other defaults that operators can override. Loaded
@@ -1507,6 +1878,56 @@ impl Settings {
             }
         }
 
+        // Validate the Docker deployment controller variant with the same
+        // contract as the Kubernetes variant: the ingress templates must carry
+        // their placeholders (otherwise every project collides on one Traefik
+        // Host(...) rule) and the controller class name must be a valid label.
+        if let Some(DeploymentControllerSettings::Docker {
+            ref production_ingress_url_template,
+            ref staging_ingress_url_template,
+            ref environment_ingress_url_template,
+            ref controller_class_name,
+            ..
+        }) = settings.deployment_controller
+        {
+            Self::validate_format_string(
+                production_ingress_url_template,
+                "production_ingress_url_template",
+                "{project_name}",
+            )?;
+
+            Self::validate_label_value(
+                controller_class_name,
+                "deployment_controller.controller_class_name",
+            )?;
+
+            if let Some(ref staging_template) = staging_ingress_url_template {
+                Self::validate_format_string(
+                    staging_template,
+                    "staging_ingress_url_template",
+                    "{project_name}",
+                )?;
+                Self::validate_format_string(
+                    staging_template,
+                    "staging_ingress_url_template",
+                    "{deployment_group}",
+                )?;
+            }
+
+            if let Some(ref environment_template) = environment_ingress_url_template {
+                Self::validate_format_string(
+                    environment_template,
+                    "environment_ingress_url_template",
+                    "{project_name}",
+                )?;
+                Self::validate_format_string(
+                    environment_template,
+                    "environment_ingress_url_template",
+                    "{environment}",
+                )?;
+            }
+        }
+
         if let Some(ref resource_gc) = settings.resource_gc {
             resource_gc.validate()?;
         }
@@ -1581,6 +2002,23 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deserialize_u32_flexible_accepts_number_and_numeric_string() {
+        #[derive(Deserialize)]
+        struct Holder {
+            #[serde(deserialize_with = "deserialize_u32_flexible")]
+            n: u32,
+        }
+        // Plain number (e.g. config/default.yaml).
+        let from_num: Holder = serde_yaml::from_str("n: 7").unwrap();
+        assert_eq!(from_num.n, 7);
+        // Numeric string (e.g. an interpolated `${RISE_MAX_REPLICAS:-10}`).
+        let from_str: Holder = serde_yaml::from_str("n: \"10\"").unwrap();
+        assert_eq!(from_str.n, 10);
+        // A non-numeric string is rejected.
+        assert!(serde_yaml::from_str::<Holder>("n: \"abc\"").is_err());
+    }
 
     fn ok_template(id: &str) -> QuickstartTemplateConfig {
         QuickstartTemplateConfig {
@@ -2153,6 +2591,363 @@ auth:
                 .expect("config should load without resource_gc section");
         assert!(settings.resource_gc.is_none());
     }
+
+    fn access_class(req: AccessRequirement) -> AccessClass {
+        AccessClass {
+            display_name: "Disp".to_string(),
+            description: "Desc".to_string(),
+            ingress_class: "traefik".to_string(),
+            access_requirement: req,
+            custom_annotations: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn docker_controller_with_member_class_and_empty_auth_backend_url_is_rejected() {
+        let mut classes = std::collections::HashMap::new();
+        classes.insert(
+            "public".to_string(),
+            Some(access_class(AccessRequirement::None)),
+        );
+        classes.insert(
+            "private".to_string(),
+            Some(access_class(AccessRequirement::Member)),
+        );
+
+        let offending = docker_access_classes_missing_auth_backend_url(&classes, "");
+        assert_eq!(offending, vec!["private".to_string()]);
+
+        // Whitespace-only is treated as blank.
+        let offending_ws = docker_access_classes_missing_auth_backend_url(&classes, "   ");
+        assert_eq!(offending_ws, vec!["private".to_string()]);
+    }
+
+    #[test]
+    fn docker_controller_with_authenticated_class_and_empty_auth_backend_url_is_rejected() {
+        let mut classes = std::collections::HashMap::new();
+        classes.insert(
+            "authed".to_string(),
+            Some(access_class(AccessRequirement::Authenticated)),
+        );
+
+        let offending = docker_access_classes_missing_auth_backend_url(&classes, "");
+        assert_eq!(offending, vec!["authed".to_string()]);
+    }
+
+    #[test]
+    fn docker_controller_with_only_public_class_is_accepted() {
+        let mut classes = std::collections::HashMap::new();
+        classes.insert(
+            "public".to_string(),
+            Some(access_class(AccessRequirement::None)),
+        );
+
+        assert!(docker_access_classes_missing_auth_backend_url(&classes, "").is_empty());
+    }
+
+    #[test]
+    fn docker_controller_with_member_class_and_auth_backend_url_is_accepted() {
+        let mut classes = std::collections::HashMap::new();
+        classes.insert(
+            "public".to_string(),
+            Some(access_class(AccessRequirement::None)),
+        );
+        classes.insert(
+            "private".to_string(),
+            Some(access_class(AccessRequirement::Member)),
+        );
+
+        // Mirrors config/docker.yaml (private + auth URL set).
+        assert!(
+            docker_access_classes_missing_auth_backend_url(&classes, "http://rise:3000").is_empty()
+        );
+    }
+
+    /// Stage the real shipped `config/docker.yaml` plus a minimal `default.yaml`
+    /// in a temp dir and load it through the settings overlay chain with
+    /// `run_mode=docker`, returning the parsed `Settings`. `env` supplies the
+    /// env vars the config interpolates (`${VAR}` / `${VAR:-default}`).
+    fn load_shipped_docker_config(
+        env: &std::collections::HashMap<&'static str, &'static str>,
+    ) -> Result<Settings, ConfigError> {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let docker_yaml = fs::read_to_string(format!("{manifest_dir}/config/docker.yaml"))
+            .expect("config/docker.yaml must exist");
+
+        let temp_dir = TempDir::new().unwrap();
+        // Minimal default.yaml so the overlay's first (optional) layer exists;
+        // the docker.yaml layer carries everything the assertions check.
+        fs::write(temp_dir.path().join("default.yaml"), "{}\n").unwrap();
+        fs::write(temp_dir.path().join("docker.yaml"), docker_yaml).unwrap();
+
+        let owned: std::collections::HashMap<String, String> = env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let env_lookup = move |name: &str| owned.get(name).cloned();
+
+        Settings::new_with_env(temp_dir.path().to_str().unwrap(), "docker", &env_lookup)
+    }
+
+    #[test]
+    fn shipped_docker_config_loads_with_local_defaults() {
+        // LOCAL: only DATABASE_URL set — everything else falls back to the
+        // local-friendly defaults baked into config/docker.yaml.
+        let mut env = std::collections::HashMap::new();
+        env.insert("DATABASE_URL", "postgres://u@rise-postgres/rise");
+        // The local overlay sets this so app containers get rise.localhost ->
+        // backend via extra_hosts.
+        env.insert("RISE_APP_BACKEND_HOST_ALIAS", "rise.localhost");
+        // `mise br docker` sets this so the alias is stamped verbatim as
+        // rise.localhost:host-gateway (host-run backend, portable across
+        // Docker Desktop and Linux) instead of being DNS-resolved.
+        env.insert("RISE_APP_BACKEND_IP", "host-gateway");
+        // The local overlay opens the SSRF guard to reach the internal
+        // http://rise-dex:5556 issuer. Set as string "true" (env-interpolated) to
+        // exercise the string->bool flexible deserialization.
+        env.insert("RISE_SSRF_ALLOW_PRIVATE", "true");
+        env.insert("RISE_SSRF_ALLOW_HTTP", "true");
+        let settings = load_shipped_docker_config(&env)
+            .expect("shipped docker.yaml must load with only DATABASE_URL set");
+
+        assert_eq!(settings.server.public_url, "http://rise.localhost:3000");
+        assert!(!settings.server.cookie_secure, "local: cookie_secure false");
+        // LOCAL: SSRF guard opened via the overlay's string "true" env values.
+        assert!(
+            settings.server.ssrf.allow_private_networks,
+            "local: ssrf.allow_private_networks must be true via overlay env"
+        );
+        assert!(
+            settings.server.ssrf.allow_http,
+            "local: ssrf.allow_http must be true via overlay env"
+        );
+        // trusted_hosts allowlists the internal services regardless of mode.
+        assert!(
+            settings
+                .server
+                .ssrf
+                .trusted_hosts
+                .iter()
+                .any(|h| h == "rise-dex"),
+            "ssrf.trusted_hosts must include rise-dex"
+        );
+
+        let Some(DeploymentControllerSettings::Docker {
+            ingress_schema,
+            traefik_certresolver,
+            traefik_entrypoint,
+            production_ingress_url_template,
+            ingress_port,
+            app_backend_host_aliases,
+            app_backend_ip,
+            deployment_constraints,
+            traefik_api_url,
+            ..
+        }) = &settings.deployment_controller
+        else {
+            panic!("expected docker deployment_controller");
+        };
+        // traefik_api_url: env-driven `${RISE_TRAEFIK_API_URL:-http://rise-traefik:8080}`
+        // defaults to the in-network standalone Traefik API (the serverStatus
+        // rolling gate works out of the box). Host-run dev overrides it to the
+        // published dashboard port.
+        assert_eq!(
+            traefik_api_url.as_deref(),
+            Some("http://rise-traefik:8080"),
+            "local: traefik_api_url must default to the in-network Traefik API"
+        );
+        // Replicas: env-driven max (RISE_MAX_REPLICAS) defaults to 10 so the
+        // Docker backend allows horizontal scale-out out of the box (the
+        // platform default of 1 would reject replicas>1 at the API).
+        assert_eq!(
+            deployment_constraints.max_replicas, 10,
+            "docker default max_replicas must be 10 (env-driven, unset)"
+        );
+        // LOCAL: alias populated so the controller injects rise.localhost ->
+        // backend into app containers.
+        assert_eq!(
+            app_backend_host_aliases,
+            &vec!["rise.localhost".to_string()],
+            "local: app_backend_host_aliases must contain the issuer host"
+        );
+        // LOCAL: explicit host-gateway override (used verbatim, skips DNS).
+        assert_eq!(
+            app_backend_ip.as_deref(),
+            Some("host-gateway"),
+            "local: app_backend_ip must be the host-gateway override"
+        );
+        assert_eq!(ingress_schema, "http");
+        assert_eq!(traefik_entrypoint, "web");
+        // ingress_port is omitted from docker.yaml -> defaults to None.
+        assert_eq!(*ingress_port, None);
+        // Empty `${RISE_CERTRESOLVER:-}` -> after normalization this means no TLS.
+        // The raw parsed value is Some("") here; normalize_certresolver collapses
+        // it to None (asserted via the labels module test). Assert it's blank.
+        assert!(
+            traefik_certresolver
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty(),
+            "local certresolver must be blank, got {traefik_certresolver:?}"
+        );
+        assert_eq!(
+            crate::server::deployment::controller::docker::labels::normalize_certresolver(
+                traefik_certresolver.clone()
+            ),
+            None
+        );
+        // Rise's own `{project_name}` placeholder is preserved literally.
+        assert_eq!(
+            production_ingress_url_template,
+            "{project_name}.rise.localhost"
+        );
+    }
+
+    #[test]
+    fn shipped_docker_config_loads_with_prod_env() {
+        // PROD: env vars flip the same file to https / le / the real domain.
+        let mut env = std::collections::HashMap::new();
+        env.insert("DATABASE_URL", "postgres://u@rise-postgres/rise");
+        env.insert("PUBLIC_URL", "https://rise.example.com");
+        env.insert("RISE_INGRESS_DOMAIN", "example.com");
+        env.insert("RISE_INGRESS_SCHEME", "https");
+        env.insert("RISE_CERTRESOLVER", "le");
+        env.insert("RISE_TRAEFIK_ENTRYPOINT", "websecure");
+        env.insert("RISE_COOKIE_SECURE", "true");
+        let settings = load_shipped_docker_config(&env)
+            .expect("shipped docker.yaml must load with prod env set");
+
+        assert_eq!(settings.server.public_url, "https://rise.example.com");
+        assert!(settings.server.cookie_secure, "prod: cookie_secure true");
+        // PROD: SSRF guard is fail-closed by default (the local overlay sets
+        // RISE_SSRF_ALLOW_PRIVATE / RISE_SSRF_ALLOW_HTTP=true, neither set here).
+        assert!(
+            !settings.server.ssrf.allow_private_networks,
+            "prod: ssrf.allow_private_networks must default closed"
+        );
+        assert!(
+            !settings.server.ssrf.allow_http,
+            "prod: ssrf.allow_http must default closed"
+        );
+
+        let Some(DeploymentControllerSettings::Docker {
+            ingress_schema,
+            traefik_certresolver,
+            traefik_entrypoint,
+            production_ingress_url_template,
+            app_backend_host_aliases,
+            app_backend_ip,
+            traefik_api_url,
+            ..
+        }) = &settings.deployment_controller
+        else {
+            panic!("expected docker deployment_controller");
+        };
+        // PROD: traefik_api_url unset -> defaults to the in-network standalone
+        // Traefik API (rise-traefik:8080), reached over rise_default. The
+        // standalone Traefik enables its API internally (--api.insecure=true)
+        // without publishing :8080, so the serverStatus gate works with no extra
+        // env on the backend.
+        assert_eq!(
+            traefik_api_url.as_deref(),
+            Some("http://rise-traefik:8080"),
+            "prod: traefik_api_url must default to the in-network Traefik API"
+        );
+        // PROD: RISE_APP_BACKEND_HOST_ALIAS unset -> the single blank entry is
+        // filtered out -> empty list -> NO extra_hosts injection (public DNS +
+        // Traefik handle the issuer host with correct TLS).
+        assert!(
+            app_backend_host_aliases.is_empty(),
+            "prod: app_backend_host_aliases must be empty, got {app_backend_host_aliases:?}"
+        );
+        // PROD: RISE_APP_BACKEND_IP unset -> blank `${...:-}` -> None, so the
+        // controller falls back to DNS resolution (containerized backend), and
+        // never injects a host-gateway override.
+        assert!(
+            app_backend_ip.is_none(),
+            "prod: app_backend_ip must be None, got {app_backend_ip:?}"
+        );
+        assert_eq!(ingress_schema, "https");
+        assert_eq!(traefik_entrypoint, "websecure");
+        assert_eq!(
+            crate::server::deployment::controller::docker::labels::normalize_certresolver(
+                traefik_certresolver.clone()
+            ),
+            Some("le".to_string())
+        );
+        // Env-interpolated host, with `{project_name}` still literal.
+        assert_eq!(
+            production_ingress_url_template,
+            "{project_name}.example.com"
+        );
+    }
+
+    #[test]
+    fn docker_e2e_local_overlay_overrides_only_identity_ttl() {
+        // The e2e mounts config/docker-e2e.local.yaml as /etc/rise/local.yaml so
+        // the backend loads it as the optional `local` layer over docker.yaml.
+        // Assert the real override file deep-merges: it lowers
+        // identity_token_ttl_seconds while leaving sibling deployment_controller
+        // fields (and the docker variant tag) intact. Guards against a
+        // config-merge regression that would wipe the rest of the section.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let docker_yaml = fs::read_to_string(format!("{manifest_dir}/config/docker.yaml")).unwrap();
+        let local_yaml =
+            fs::read_to_string(format!("{manifest_dir}/config/docker-e2e.local.yaml")).unwrap();
+
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("default.yaml"), "{}\n").unwrap();
+        fs::write(temp_dir.path().join("docker.yaml"), docker_yaml).unwrap();
+        fs::write(temp_dir.path().join("local.yaml"), local_yaml).unwrap();
+
+        let env: std::collections::HashMap<String, String> =
+            [("DATABASE_URL", "postgres://u@rise-postgres/rise")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+        let settings =
+            Settings::new_with_env(temp_dir.path().to_str().unwrap(), "docker", &|name| {
+                env.get(name).cloned()
+            })
+            .expect("docker.yaml + e2e local overlay must load");
+
+        let Some(DeploymentControllerSettings::Docker {
+            identity_token_ttl_seconds,
+            production_ingress_url_template,
+            ..
+        }) = &settings.deployment_controller
+        else {
+            panic!("expected docker deployment_controller after local overlay merge");
+        };
+        // Overridden by the local overlay.
+        assert_eq!(*identity_token_ttl_seconds, 60);
+        // Sibling key preserved from docker.yaml (deep merge, not replace).
+        assert_eq!(
+            production_ingress_url_template,
+            "{project_name}.rise.localhost"
+        );
+    }
+
+    #[test]
+    fn docker_controller_ignores_null_access_classes() {
+        // A `null` entry (used to remove an inherited class) must not trip the
+        // check even when auth_backend_url is empty.
+        let mut classes = std::collections::HashMap::new();
+        classes.insert(
+            "public".to_string(),
+            Some(access_class(AccessRequirement::None)),
+        );
+        classes.insert("private".to_string(), None);
+
+        assert!(docker_access_classes_missing_auth_backend_url(&classes, "").is_empty());
+    }
 }
 
 /// Extensions configuration
@@ -2364,11 +3159,11 @@ pub struct PlatformAccessConfig {
     pub policy: PlatformAccessPolicy,
 
     /// User emails explicitly granted platform access
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_blank_filtered_list")]
     pub allowed_user_emails: Vec<String>,
 
     /// IdP groups whose members get platform access
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_blank_filtered_list")]
     pub allowed_idp_groups: Vec<String>,
 }
 

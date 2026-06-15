@@ -2,23 +2,21 @@
 title: "Configuration Guide"
 ---
 
-Rise backend uses YAML configuration files with environment variable substitution support. TOML is also supported for backward compatibility.
+Rise backend uses YAML configuration files with environment variable substitution support.
 
 ## Configuration Files
 
 Configuration files are located in `config/` and loaded in this order:
 
-1. `default.{toml,yaml,yml}` - Shipped defaults (optional). Ships with the Rise image at `/etc/rise/default.yaml` and carries built-in defaults such as the quickstart catalog.
-2. `{RISE_CONFIG_RUN_MODE}.{toml,yaml,yml}` - Environment-specific config (**required**)
-   - `development.toml` or `development.yaml` when `RISE_CONFIG_RUN_MODE=development`
-   - `production.toml` or `production.yaml` when `RISE_CONFIG_RUN_MODE=production`
-3. `local.{toml,yaml,yml}` - Local overrides (not checked into git, optional)
+1. `default.yaml` - Shipped defaults (optional). Ships with the Rise image at `/etc/rise/default.yaml` and carries built-in defaults such as the quickstart catalog.
+2. `{RISE_CONFIG_RUN_MODE}.yaml` - Environment-specific config (**required**)
+   - `development.yaml` when `RISE_CONFIG_RUN_MODE=development`
+   - `production.yaml` when `RISE_CONFIG_RUN_MODE=production`
+3. `local.yaml` - Local overrides (not checked into git, optional)
 
 Later files override earlier ones.
 
 In container deployments, `RISE_CONFIG_DIR` is typically `/etc/rise`.
-
-**File Format**: The backend supports both YAML and TOML formats. When multiple formats exist for the same config file name (for example `development.yaml` and `development.toml`), TOML takes precedence. YAML is the recommended format as it integrates seamlessly with Kubernetes/Helm deployments.
 
 ## Environment Variable Substitution
 
@@ -40,31 +38,27 @@ server:
 
 ### How It Works
 
-1. Configuration files are parsed as TOML or YAML
+1. Configuration files are parsed as YAML
 2. String values are scanned for `${...}` patterns
 3. Patterns are replaced with environment variable values
 4. Resulting configuration is deserialized into Settings struct
 
-This happens **after** TOML/YAML parsing but **before** deserialization, so:
+This happens **after** YAML parsing but **before** deserialization, so:
 - ✅ Works in all string values (including nested tables/maps and arrays)
 - ✅ Preserves structure and types
 - ✅ Clear error messages if required variables are missing
 
 ## Configuration Precedence
 
-Configuration is loaded in this order (later values override earlier ones):
+Values are resolved in this order (later steps override earlier ones):
 
-1. `default.{toml,yaml,yml}` - Shipped defaults (optional, e.g. the quickstart catalog)
-2. `{RISE_CONFIG_RUN_MODE}.{toml,yaml,yml}` - Active environment config (required)
-3. `local.{toml,yaml,yml}` - Local overrides (not in git, optional)
-4. Environment variable substitution - `${VAR}` patterns are replaced
-5. DATABASE_URL special case - Overrides `[database] url` if set
+1. The config files described in [Configuration Files](#configuration-files), in their loading order
+2. Environment variable substitution - `${VAR}` patterns are replaced
+3. DATABASE_URL special case - Overrides `[database] url` if set
 
 ### Merge semantics
 
 The config loader uses the [`config`](https://crates.io/crates/config) crate, which deep-merges *maps* but **replaces** *arrays*. Practically: if `default.yaml` defines `quickstart.templates` with four entries and `local.yaml` defines `quickstart.templates` with one entry, the resulting catalog contains only that one entry — the defaults are not preserved. To extend a shipped list, copy the entries from `default.yaml` into your override and add to the list.
-
-**Note**: When multiple file formats exist for the same config file, TOML takes precedence over YAML.
 
 Example:
 ```yaml
@@ -391,6 +385,65 @@ cancellation_interval_secs = 5
 expiration_interval_secs = 60
 secret_refresh_interval_secs = 3600
 ```
+
+### Deployment Controller (Docker)
+
+As an alternative to the Kubernetes controller, the Docker controller deploys apps as
+containers on a single Docker host, routed by Traefik. Select it with
+`deployment_controller.type: "docker"`. Supported fields:
+
+- `type: "docker"` — required discriminator.
+- `traefik_network` — Docker network Traefik watches (e.g. `rise_default`).
+- `traefik_entrypoint` — Traefik entrypoint name (default `web`).
+- `traefik_certresolver?` — optional Traefik certresolver for TLS (omit for plain HTTP).
+- `production_ingress_url_template` — host template for production deployments.
+- `staging_ingress_url_template?` / `environment_ingress_url_template?` — host
+  templates for staging / per-environment deployments.
+- `ingress_schema` — `http` or `https` (default `https`).
+- `ingress_port?` — external port apps are served on (e.g. `80` locally).
+- `controller_class_name` — controller ownership class (default `default`).
+- `reconcile_interval_secs` — in-process reconcile loop interval in seconds (default `5`).
+- `traefik_api_url?` — base URL of Traefik's API, read to drain old replicas via
+  the top-level `serverStatus` map during a rolling cutover.
+- `deployment_constraints.max_replicas` — upper bound on requested replicas (default `10`).
+  The Docker controller additionally clamps every request to a hard backstop of `50`
+  regardless of this value, so raising it above `50` silently clamps (with only a
+  server-side log).
+- `access_classes` — ingress access classes (keyed by identifier) defining
+  authentication levels, mirroring the Kubernetes variant.
+- `auth_backend_url` — internal URL Traefik uses to reach the Rise backend for the
+  forwardAuth subrequest; required when any access class is `Authenticated`/`Member`.
+- `auth_signin_url` — browser-facing base URL for the login redirect (falls back to
+  the server `public_url` when empty).
+- `publish_app_ports` — **dev-only.** Publish each app container's HTTP port to a
+  random `127.0.0.1` host port so a host-run backend can health-probe it directly.
+- `app_backend_host_aliases` / `app_backend_ip` — **dev-only** host-alias knobs that
+  inject `extra_hosts` so app containers can reach the Rise backend at the issuer host.
+
+See the [Docker operator guide](/operator-docs/docker/) for the full controller
+configuration, including TLS/ACME and the rolling-cutover gate.
+
+Kubernetes-only fields (namespace prefix, ingress annotations, network policies, host
+aliases, node selectors, etc.) do not apply to the Docker variant.
+
+Example:
+
+```yaml
+deployment_controller:
+  type: "docker"
+  traefik_network: "rise_default"
+  traefik_entrypoint: "web"
+  production_ingress_url_template: "{project_name}.rise.localhost"
+  staging_ingress_url_template: "{deployment_group}--{project_name}.rise.localhost"
+  environment_ingress_url_template: "{environment}--{project_name}.rise.localhost"
+  ingress_schema: "http"
+  ingress_port: 80
+  reconcile_interval_secs: 5
+  controller_class_name: "default"
+```
+
+The configuration schema is regenerated via `mise run config:schema:generate`, and CI
+verifies it is up to date on every PR.
 
 ## Validation
 

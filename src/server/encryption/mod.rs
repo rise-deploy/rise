@@ -2,15 +2,7 @@ pub mod handlers;
 pub mod providers;
 pub mod routes;
 
-use anyhow::Result;
-use async_trait::async_trait;
-
-/// Encryption provider trait for encrypting/decrypting secrets
-#[async_trait]
-pub trait EncryptionProvider: Send + Sync {
-    /// Encrypt plaintext and return base64-encoded ciphertext
-    async fn encrypt(&self, plaintext: &str) -> Result<String>;
-
-    /// Decrypt base64-encoded ciphertext and return plaintext
-    async fn decrypt(&self, ciphertext: &str) -> Result<String>;
-}
+/// The `EncryptionProvider` contract lives in `rise-backend-core`; re-exported
+/// here so existing `crate::server::encryption::EncryptionProvider` references
+/// keep working.
+pub use rise_backend_core::EncryptionProvider;

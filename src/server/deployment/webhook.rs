@@ -31,7 +31,6 @@ use crate::db::{
     deployments as db_deployments, env_vars as db_env_vars, environments as db_environments,
     projects as db_projects,
 };
-use crate::server::auth::jwt_signer::WorkloadSubjectInfo;
 use crate::server::deployment::crd;
 use crate::server::deployment::resource_builder::{
     IdentityMount, ResourceBuilder, ANNOTATION_ENV_SECRET_HASH, ANNOTATION_LAST_REFRESH,
@@ -41,6 +40,7 @@ use crate::server::deployment::resource_builder::{
 use crate::server::deployment::state_machine;
 use crate::server::state::AppState;
 use crate::server::workload_tokens::{sha256_hex, workload_subject, NO_ENVIRONMENT};
+use rise_backend_auth::WorkloadSubjectInfo;
 
 // ── Metacontroller webhook protocol types ──────────────────────────────
 
@@ -101,18 +101,18 @@ pub struct FinalizeResponse {
 // ── Deployment timeout ─────────────────────────────────────────────────
 
 /// Duration a deployment can be in Deploying state before timing out
-const DEPLOYING_TIMEOUT_MINUTES: i64 = 5;
+pub(crate) const DEPLOYING_TIMEOUT_MINUTES: i64 = 5;
 /// Duration a deployment can be in pre-Pushed states before timing out
-const PRE_PUSHED_TIMEOUT_MINUTES: i64 = 10;
+pub(crate) const PRE_PUSHED_TIMEOUT_MINUTES: i64 = 10;
 /// Duration after which image pull secret is refreshed (6 hours)
 const SECRET_REFRESH_HOURS: i64 = 6;
 /// Maximum number of terminating/terminated pods to carry forward in controller_metadata
 const MAX_INACTIVE_PODS: usize = 5;
 
 #[derive(Debug, Default)]
-struct ResolvedDeploymentEnvVars {
-    plain_env_vars: Vec<EnvVar>,
-    secret_env_vars: BTreeMap<String, ByteString>,
+pub(crate) struct ResolvedDeploymentEnvVars {
+    pub(crate) plain_env_vars: Vec<EnvVar>,
+    pub(crate) secret_env_vars: BTreeMap<String, ByteString>,
 }
 
 #[derive(Debug)]
@@ -1831,7 +1831,7 @@ fn apply_container_port_env(env: &mut Vec<EnvVar>, container_port: Option<u16>) 
 /// the synthesised `app`. A `Some` column that fails to deserialize is treated
 /// as a hard error for *this* deployment (returned `Err`): silently collapsing
 /// it to the single-container fallback would drop every per-container resource.
-fn resolve_runtime_containers(
+pub(crate) fn resolve_runtime_containers(
     deployment: &Deployment,
 ) -> anyhow::Result<(
     Vec<crate::server::deployment::models::ContainerSpec>,
@@ -2074,9 +2074,6 @@ async fn prepare_identity_secret(
     environment_name: Option<&str>,
     observed: &ObservedChildren,
 ) -> anyhow::Result<PreparedIdentitySecret> {
-    use base64::Engine;
-    use rand::Rng;
-
     let secret_name = ResourceBuilder::deployment_identity_secret_name(project, deployment);
     let secret_key = format!("{}/{}", namespace, secret_name);
 
@@ -2117,9 +2114,7 @@ async fn prepare_identity_secret(
             // a DB hash that does not match the Secret that actually got applied.
             // The hash is written on the next sync via the reuse path above, once
             // some replica's Secret has been applied and is observed by all.
-            let mut bytes = [0u8; 32];
-            rand::rng().fill_bytes(&mut bytes);
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+            crate::server::workload_tokens::generate_bootstrap_credential()
         }
     };
 
@@ -2159,7 +2154,7 @@ async fn prepare_identity_secret(
             .unwrap_or_default();
 
         let ttl_secs = state.identity_token_ttl_seconds;
-        let refresh_secs = (ttl_secs / 2) as i64;
+        let refresh_secs = crate::server::workload_tokens::remint_after_secs(ttl_secs) as i64;
 
         let fresh = observed_refresh
             .map(|ts| {
@@ -2179,14 +2174,25 @@ async fn prepare_identity_secret(
                 deployment_group: &deployment.deployment_group,
                 deployment_id: &deployment.deployment_id,
             };
-            let mut minted = BTreeMap::new();
-            for (filename, audience) in &audiences {
-                let jwt = state
-                    .jwt_signer
-                    .sign_workload_jwt(&subject_info, audience, ttl_secs)?;
-                minted.insert(filename.clone(), jwt);
-            }
-            (minted, Utc::now())
+            let minted = crate::server::workload_tokens::sign_audience_tokens(
+                &state.jwt_signer,
+                &subject_info,
+                &audiences,
+                ttl_secs,
+            )?;
+            let refreshed_at = Utc::now();
+            // Schedule the next re-mint at ~2/3 of the TTL: the identity-refresh
+            // controller resyncs this project once this is due, just before the
+            // token would expire (Metacontroller won't resync a steady project on
+            // its own). Only set when we actually mint — the reuse path keeps the
+            // existing schedule.
+            let due_at = refreshed_at
+                + chrono::Duration::seconds(
+                    crate::server::workload_tokens::refresh_due_after_secs(ttl_secs) as i64,
+                );
+            db_deployments::set_identity_refresh_due_at(&state.db_pool, deployment.id, due_at)
+                .await?;
+            (minted, refreshed_at)
         }
     };
 
@@ -2372,7 +2378,7 @@ async fn load_env_vars(
     resolve_deployment_env_vars(env_vars, state.encryption_provider.as_deref()).await
 }
 
-async fn resolve_deployment_env_vars(
+pub(crate) async fn resolve_deployment_env_vars(
     env_vars: Vec<DeploymentEnvVar>,
     encryption_provider: Option<&dyn crate::server::encryption::EncryptionProvider>,
 ) -> anyhow::Result<ResolvedDeploymentEnvVars> {

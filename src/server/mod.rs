@@ -145,12 +145,31 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
     // Spawn enabled controllers as background tasks
     let mut controller_handles = vec![];
 
+    // Cooperative shutdown signal for all background controllers and extension
+    // loops. Created in `AppState::new` (extensions start there) and shared here.
+    let shutdown = state.shutdown.clone();
+
+    // Cancel the shared token the moment a SIGINT/SIGTERM arrives, so the HTTP
+    // drain and the controllers'/extensions' lease release proceed concurrently
+    // — rather than the controllers holding their leases for the whole HTTP
+    // drain and only stopping once `axum::serve` returns.
+    {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            info!("Shutdown signal received; stopping background tasks");
+            shutdown.cancel();
+        });
+    }
+
     // Start project controller (always enabled)
     info!("Starting project controller");
-    let settings_clone = settings.clone();
     let controller_state_clone = controller_state.clone();
+    let shutdown_clone = shutdown.clone();
     let handle = tokio::spawn(async move {
-        if let Err(e) = run_project_controller_loop(controller_state_clone, settings_clone).await {
+        if let Err(e) =
+            project::ProjectController::run(Arc::new(controller_state_clone), shutdown_clone).await
+        {
             tracing::error!("Project controller error: {:#}", e);
         }
     });
@@ -162,8 +181,12 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         info!("Starting ECR controller");
         let settings_clone = settings.clone();
         let controller_state_clone = controller_state.clone();
+        let shutdown_clone = shutdown.clone();
         let handle = tokio::spawn(async move {
-            if let Err(e) = run_ecr_controller_loop(controller_state_clone, settings_clone).await {
+            if let Err(e) =
+                run_ecr_controller_loop(controller_state_clone, settings_clone, shutdown_clone)
+                    .await
+            {
                 tracing::error!("ECR controller error: {:#}", e);
             }
         });
@@ -181,16 +204,38 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         let store = state.resource_store.clone();
         let pool = state.db_pool.clone();
         let gc_settings = settings.resource_gc.clone().unwrap_or_default();
-        let controller = Arc::new(resources::gc::ResourceGcController::new(
-            pool,
-            store,
-            gc_settings,
-        ));
-        controller.clone().start();
+        let shutdown_clone = shutdown.clone();
         let handle = tokio::spawn(async move {
-            shutdown_signal().await;
-            info!("Resource GC controller shutting down");
-            controller.shutdown().await;
+            if let Err(e) =
+                resources::gc::ResourceGcController::run(pool, store, gc_settings, shutdown_clone)
+                    .await
+            {
+                tracing::error!("Resource GC controller error: {:#}", e);
+            }
+        });
+        controller_handles.push(handle);
+    }
+
+    // Start the workload-identity refresh controller (Kubernetes only). It
+    // periodically resyncs RiseProjects so the sync webhook re-mints pre-minted
+    // identity tokens before they expire — Metacontroller won't resync a steady
+    // project on its own, so without this a long-lived pod's identity file token
+    // would never refresh. (Docker re-mints via its own reconcile loop.)
+    #[cfg(feature = "backend")]
+    if let Some(kube_client) = state.kube_client.clone() {
+        info!("Starting workload-identity refresh controller");
+        let db_pool = state.db_pool.clone();
+        let ttl = state.identity_token_ttl_seconds;
+        let shutdown_clone = shutdown.clone();
+        let handle = tokio::spawn(async move {
+            let controller = deployment::identity_refresh::IdentityRefreshController::new(
+                kube_client,
+                db_pool,
+                ttl,
+            );
+            if let Err(e) = controller.run(shutdown_clone).await {
+                tracing::error!("Identity refresh controller error: {:#}", e);
+            }
         });
         controller_handles.push(handle);
     }
@@ -201,9 +246,15 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         let pool = state.db_pool.clone();
         let auth_settings = settings.auth.clone();
         let default_organization_uid = state.default_organization_uid;
+        let shutdown_clone = shutdown.clone();
         let handle = tokio::spawn(async move {
-            auth::entra_sync::run_entra_sync_loop(pool, auth_settings, default_organization_uid)
-                .await;
+            auth::entra_sync::run_entra_sync_loop(
+                pool,
+                auth_settings,
+                default_organization_uid,
+                shutdown_clone,
+            )
+            .await;
         });
         controller_handles.push(handle);
     }
@@ -221,6 +272,9 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         // route is public.
         .merge(platform::routes::routes())
         .merge(auth::routes::public_routes())
+        // RFC 8693 token exchange — the source token is the credential, so the
+        // endpoint is public.
+        .merge(auth::exchange::routes::routes())
         .merge(workload_tokens::routes::routes());
 
     // Auth-only routes (require authentication but NOT platform access)
@@ -306,21 +360,26 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         info!("Metacontroller webhook listener on http://{}", webhook_addr);
         let webhook_listener = tokio::net::TcpListener::bind(&webhook_addr).await?;
 
+        let webhook_shutdown = shutdown.clone();
         Some(tokio::spawn(async move {
             axum::serve(
                 webhook_listener,
                 webhook_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
-            .with_graceful_shutdown(shutdown_signal())
+            .with_graceful_shutdown(async move { webhook_shutdown.cancelled().await })
             .await
         }))
     } else {
         None
     };
 
-    // Graceful shutdown support
+    // Graceful shutdown driven off the shared token (cancelled by the signal
+    // watcher above), so the HTTP drain and lease release run concurrently.
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown({
+            let shutdown = shutdown.clone();
+            async move { shutdown.cancelled().await }
+        })
         .await?;
 
     #[cfg(feature = "backend")]
@@ -330,26 +389,17 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
 
     info!("HTTP server shutdown complete");
 
-    // Wait for all controller tasks to complete
+    // Wait for all controller tasks AND the extension reconciliation tasks to
+    // complete. Each observes the cancelled token, breaks its loop, and releases
+    // its leader lease before its handle resolves — so a peer replica can take
+    // over promptly instead of waiting out the lease TTL.
+    controller_handles.extend(std::mem::take(
+        &mut *state.extension_handles.lock().unwrap(),
+    ));
     for handle in controller_handles {
         let _ = handle.await;
     }
 
-    Ok(())
-}
-
-/// Run the project controller loop (for embedding in server process)
-async fn run_project_controller_loop(
-    controller_state: ControllerState,
-    _settings: settings::Settings,
-) -> Result<()> {
-    let controller = Arc::new(project::ProjectController::new(Arc::new(controller_state)));
-    controller.start();
-    info!("Project controller started");
-
-    // Wait for shutdown signal
-    shutdown_signal().await;
-    info!("Project controller shutdown complete");
     Ok(())
 }
 
@@ -362,6 +412,7 @@ async fn run_project_controller_loop(
 async fn run_ecr_controller_loop(
     controller_state: ControllerState,
     settings: settings::Settings,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     use crate::server::registry::models::EcrConfig;
     use crate::server::settings::RegistrySettings;
@@ -391,14 +442,8 @@ async fn run_ecr_controller_loop(
     };
     let manager = Arc::new(ecr::EcrRepoManager::new(ecr_config).await?);
 
-    let controller = Arc::new(ecr::EcrController::new(Arc::new(controller_state), manager));
-    controller.start();
     info!("ECR controller started");
-
-    // Wait for shutdown signal
-    shutdown_signal().await;
-    info!("ECR controller shutdown complete");
-    Ok(())
+    ecr::EcrController::run(Arc::new(controller_state), manager, shutdown).await
 }
 
 async fn health_check() -> &'static str {

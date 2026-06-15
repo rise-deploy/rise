@@ -1,0 +1,27 @@
+# Identity-scenario overlay for the standalone Rise stack, layered on TOP of
+# docker-compose.standalone.yaml + docker-compose.standalone.local.yaml.
+#
+# scripts/ci/e2e-docker.sh applies this ONLY when it recreates the rise backend
+# just before the workload-identity scenario, so the earlier scenarios run on
+# the exact default config (no global changes). It scopes two identity-specific
+# settings to that scenario:
+#
+#   * registry_url -> the loopback-published registry (127.0.0.1:5000). The
+#     Docker controller pulls built images via the HOST daemon (the backend
+#     mounts the host socket), and the compose-internal rise-registry:5000 is
+#     not resolvable from the host daemon; the loopback registry is, and Docker
+#     treats 127.0.0.1 as insecure. Push (client_registry_url=localhost:5000)
+#     and pull hit the same published registry.
+#   * a short identity-token TTL via the local config overlay
+#     (config/docker-e2e.local.yaml mounted as /etc/rise/local.yaml), so the
+#     refresh assertion observes the controller's half-TTL re-mint quickly.
+#
+# The volumes list repeats the host Docker socket so it survives whichever
+# compose merge strategy applies (merge or replace).
+services:
+  rise:
+    environment:
+      - RISE_REGISTRY_URL=127.0.0.1:5000
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./config/docker-e2e.local.yaml:/etc/rise/local.yaml:ro

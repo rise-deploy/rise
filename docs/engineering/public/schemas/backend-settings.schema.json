@@ -99,6 +99,11 @@
           "description": "Allow all users to list all teams (default: false).\nWhen false, non-admin users only see teams they are members of.",
           "type": "boolean"
         },
+        "allow_raw_external_tokens": {
+          "default": true,
+          "description": "Accept raw external OIDC tokens directly at request time (default: true).\n\nWhen `true`, a CI service account may present its external OIDC token\ndirectly to project-scoped endpoints, and Rise resolves the service\naccount per request (the legacy two-phase path). When `false`, callers\nmust first exchange their token at `POST /api/v1/auth/token` for a Rise\naccess token.\n\nLeaving this `true` keeps the legacy attack surface and forfeits the\nsecurity benefits of the exchange (no service-account DB lookups in the\nrequest hot path, and an authenticated `platform/capabilities`). It is\nslated to default to `false` in a future release; migrate CI to\npre-exchange before then.",
+          "type": "boolean"
+        },
         "allow_team_creation": {
           "default": true,
           "description": "Allow regular users to create teams (default: true).\nWhen false, only admin users can create teams.",
@@ -136,7 +141,7 @@
         },
         "operator_users": {
           "default": [],
-          "description": "List of Operator user emails. Operators have full access to generic\nresource storage and built-in resource management. This is a separate\nrole from `admin_users`. Matching is case-insensitive.",
+          "description": "List of Operator user emails. Operators have full access to generic\nresource storage and built-in resource management. This is a separate\nrole from `admin_users`. Matching is case-insensitive. Blank entries are\nfiltered out so an unset `${VAR}` default collapses to an empty list.",
           "items": {
             "type": "string"
           },
@@ -175,7 +180,7 @@
       "type": "object"
     },
     "ControllerIdentity": {
-      "description": "A trusted external controller identity configured under `auth.controllers`.\n\nEach entry binds a stable controller ID (the key used under\n`status.controllers`) to an OIDC issuer plus required claim constraints.\n`claims.aud` is mandatory. Wildcards follow `JwtValidator::validate_custom_claims`\nglob rules (`*` matches any sequence of characters).",
+      "description": "A trusted external controller identity configured under `auth.controllers`.\n\nEach entry binds a stable controller ID (the key used under\n`status.controllers`) to an OIDC issuer plus required claim constraints.\n`claims.aud` is mandatory. Wildcards follow [`validate_custom_claims`]\nglob rules (`*` matches any sequence of characters).",
       "properties": {
         "claims": {
           "additionalProperties": {
@@ -271,7 +276,7 @@
         },
         "max_replicas": {
           "default": 1,
-          "description": "Maximum replicas allowed (default: 1)",
+          "description": "Maximum replicas allowed (default: 1). Accepts a number or a numeric\nstring so it can be env-driven (e.g. `\"${RISE_MAX_REPLICAS:-10}\"`).",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
@@ -534,6 +539,192 @@
             "network_policy"
           ],
           "type": "object"
+        },
+        {
+          "description": "Docker deployment controller.\n\nDeploys app containers to a single Docker host and lets Traefik's Docker\nprovider route to them via container labels Rise stamps. No Kubernetes,\nno Metacontroller — reconciliation runs in-process (see\n`controller::docker::DockerReconciler`).",
+          "properties": {
+            "access_classes": {
+              "additionalProperties": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/AccessClass"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "default": {
+                "public": {
+                  "access_requirement": "None",
+                  "custom_annotations": {},
+                  "description": "Fully public — no authentication required.",
+                  "display_name": "Public",
+                  "ingress_class": "traefik"
+                }
+              },
+              "description": "Access classes defining ingress authentication levels, keyed by\nidentifier (e.g. \"public\", \"private\"). Mirrors the Kubernetes variant\nso the typed project API can validate a project's access class. For\naccess classes whose `access_requirement` is `Authenticated`/`Member`,\nthe Docker controller stamps Traefik forwardAuth middleware labels\n(requires `auth_backend_url` to be set). A permissive \"public\" class\nis provided by default; operators may override.\nUse `null` in YAML to remove an inherited access class.",
+              "type": "object"
+            },
+            "app_backend_host_aliases": {
+              "default": [],
+              "description": "**LOCAL-DEV ONLY.** Hostname(s) to alias to the Rise backend's IP on\nthe shared `traefik_network`, injected as `extra_hosts` on every\nmanaged app container the controller creates.\n\nApps that validate the `rise_jwt` cookie or perform OIDC discovery\nagainst the public issuer host (e.g. `rise.localhost`) must be able\nto reach the Rise backend at that host. In a local stack the public\nhost resolves to the container's own loopback, not the backend, so\nthe controller stamps `HostConfig.extra_hosts` mapping each alias to\nthe backend's reachable IP (resolved at reconcile time from the\n`auth_backend_url` host via Docker DNS).\n\n**Leave empty in production.** Production relies on public DNS +\nTraefik for the issuer host (with correct TLS termination); injecting\nan `extra_hosts` override there would wrongly bypass Traefik and break\nTLS. Empty/absent (the default) → no injection.\n\nMirrors the Kubernetes `host_aliases` mechanism (see\n`resource_builder.rs`, which injects `rise.local → host IP` into pods).\n\nBlank entries are filtered out at load time, so an env-driven\nsingle-element list (`[\"${RISE_APP_BACKEND_HOST_ALIAS:-}\"]`) collapses\nto an empty list — and no injection — when the env var is unset\n(production).",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "app_backend_ip": {
+              "default": null,
+              "description": "**LOCAL-DEV ONLY.** Explicit IP/value to alias the\n`app_backend_host_aliases` hosts to (injected as `extra_hosts` on\nmanaged app containers), used VERBATIM instead of resolving the\n`auth_backend_url` host via DNS.\n\nSet to Docker's special `host-gateway` so apps reach a host-run\nbackend (`mise br docker`) on both Docker Desktop and Linux — Docker\nreplaces `host-gateway` with the host gateway per container at create\ntime. Empty/absent (the default) → fall back to DNS resolution of the\n`auth_backend_url` host. **Leave unset in production** (the\ncontainerized backend is resolved by Docker DNS).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "auth_backend_url": {
+              "default": "",
+              "description": "Internal URL Traefik uses to reach the Rise backend for the\nforwardAuth subrequest (e.g. `http://rise:3000` on the compose\nnetwork). Used to build the `forwardauth.address` middleware label\npointing at `/api/v1/auth/ingress`. Required when any configured\naccess class has a non-`None` access requirement\n(`Authenticated`/`Member`); the backend refuses to start otherwise,\nto avoid serving those projects publicly with no auth enforced.",
+              "type": "string"
+            },
+            "auth_signin_url": {
+              "default": "",
+              "description": "Browser-facing base URL for the login redirect (e.g. the public URL\n`http://localhost:3000`). Traefik forwardAuth has no nginx-style\n`auth-signin`, so the `ingress_auth` handler 302-redirects\nunauthenticated browsers to `{auth_signin_url}/api/v1/auth/signin`.\nIf empty, falls back to the server `public_url`.",
+              "type": "string"
+            },
+            "container_prefix": {
+              "default": "rise",
+              "description": "Prefix for generated container names (`<prefix>_<project>_...`).\nDefaults to `rise`.",
+              "type": "string"
+            },
+            "controller_class_name": {
+              "default": "default",
+              "description": "Stable identifier for this deployment controller. The reconciler only\nreconciles projects matching this class. Defaults to `default`.",
+              "type": "string"
+            },
+            "deployment_constraints": {
+              "$ref": "#/$defs/DeploymentConstraints",
+              "description": "Platform-level constraints for deployment resources."
+            },
+            "deployment_defaults": {
+              "$ref": "#/$defs/DeploymentDefaults",
+              "description": "Default resource values for new deployments when not specified."
+            },
+            "docker_host": {
+              "default": null,
+              "description": "Docker daemon connection. `None` uses bollard's local defaults\n(unix socket / npipe, or `DOCKER_HOST`). May be a unix socket path\n(`unix:///var/run/docker.sock`) or a TCP URL (`tcp://host:2375`).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "environment_ingress_url_template": {
+              "default": null,
+              "description": "Ingress URL template for named environments.\nMust contain both `{project_name}` and `{environment}`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "health_probes": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/HealthProbeConfig"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Health probe configuration. The reconciler probes routable\ncontainers over the shared network using these settings."
+            },
+            "identity_token_ttl_seconds": {
+              "default": 3600,
+              "description": "Lifetime in seconds of workload identity tokens minted for\ndeployments. Default: 3600 (1 hour).",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "ingress_port": {
+              "default": null,
+              "description": "Optional port appended to all generated ingress URLs (e.g. `8080`).",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "ingress_schema": {
+              "default": "https",
+              "description": "URL scheme for generated ingress URLs (`http` or `https`).\nDefaults to `https`.",
+              "type": "string"
+            },
+            "label_namespace": {
+              "default": "rise.dev",
+              "description": "Label namespace prefix for Rise bookkeeping labels\n(e.g. `rise.dev/managed-by`). Defaults to `rise.dev`.",
+              "type": "string"
+            },
+            "production_ingress_url_template": {
+              "description": "Ingress URL template for the production (default) deployment group.\nSame semantics as the Kubernetes variant. Must contain\n`{project_name}`. Drives both the computed app URLs and the Traefik\n`Host(...)` router rules.",
+              "type": "string"
+            },
+            "publish_app_ports": {
+              "default": false,
+              "description": "**Dev-only.** Publish each app container's HTTP port to a random\n`127.0.0.1` host port so a host-run backend (`mise br docker` /\nDocker Desktop, where container bridge IPs aren't routable from the\nhost) can health-probe the app directly. Leave off in production —\nthe containerized backend reaches app containers over the\n`rise_default` network.",
+              "type": "boolean"
+            },
+            "reconcile_interval_secs": {
+              "default": 5,
+              "description": "Interval in seconds between reconcile ticks. Defaults to 5.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "staging_ingress_url_template": {
+              "default": null,
+              "description": "Ingress URL template for staging (non-default) deployment groups.\nMust contain both `{project_name}` and `{deployment_group}`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "traefik_api_url": {
+              "default": null,
+              "description": "Base URL of Traefik's API (e.g. `http://rise-traefik:8080` in-network\nor `http://localhost:8090` for a host-run dev backend). Read to learn\nper-server health status (the top-level `serverStatus` map) from\nTraefik so the old deployment is retired only once the new servers are\nactually in Traefik's rotation. Optional basic-auth may be embedded in\nthe URL (userinfo). **Required for projects that set a `health_check`**:\nTraefik's `serverStatus` is the authoritative readiness signal (no\nfallback), so without a reachable API a health-checked deployment never\nbecomes Healthy. May be left empty only when no project uses health\nchecks (ready-when-running gates on run-state alone).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "traefik_certresolver": {
+              "default": null,
+              "description": "Optional Traefik certresolver name. When set, routers get\n`tls=true` + `tls.certresolver=<name>` labels for automatic TLS.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "traefik_entrypoint": {
+              "default": "web",
+              "description": "Traefik entrypoint name routers bind to (e.g. `web`, `websecure`).\nDefaults to `web`.",
+              "type": "string"
+            },
+            "traefik_network": {
+              "description": "Docker network shared with Traefik. App containers are attached to\nthis network so Traefik can reach them, and it is emitted as the\n`traefik.docker.network` label.",
+              "type": "string"
+            },
+            "type": {
+              "const": "docker",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "production_ingress_url_template",
+            "traefik_network"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -572,6 +763,19 @@
             },
             "type": {
               "const": "kubernetes",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Stream logs directly from the Docker daemon (`docker logs`). Used with\nthe Docker deployment controller. Requires no kube client — the bollard\nclient is shared from the Docker deployment controller, so this variant\ncarries no connection fields of its own.",
+          "properties": {
+            "type": {
+              "const": "docker",
               "type": "string"
             }
           },
@@ -1563,6 +1767,13 @@
     },
     "ServerSettings": {
       "properties": {
+        "auth_token_max_ttl_seconds": {
+          "default": 600,
+          "description": "Lifetime in seconds of Rise access tokens minted by the auth\ntoken-exchange endpoint (`POST /api/v1/auth/token`). Kept short because an\nexchanged token cannot be revoked mid-life. Default: 600 (10 minutes).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "cookie_domain": {
           "default": null,
           "description": "Cookie domain for migration from deployments that previously used domain-scoped cookies.\nWhen configured, responses that set a new host-only `rise_jwt` cookie also include a\n`Max-Age=0` Set-Cookie with this Domain attribute to expire any stale domain-scoped\ncookies browsers may still be sending. Remove once the migration window has passed.",
@@ -1586,7 +1797,7 @@
         },
         "frontend_dev_proxy_url": {
           "default": null,
-          "description": "Development-only frontend proxy target (for Vite), e.g. \"http://localhost:5173\"\nWhen set, non-API frontend routes are proxied to this URL instead of serving embedded assets.",
+          "description": "Development-only frontend proxy target (for Vite), e.g. \"http://localhost:5173\"\nWhen set, non-API frontend routes are proxied to this URL instead of serving embedded assets.\nAn empty/whitespace value (e.g. an unset `${VAR:-}` env default) is treated as `None`\nso a production config can env-drive this without accidentally proxying to \"\".",
           "type": [
             "string",
             "null"

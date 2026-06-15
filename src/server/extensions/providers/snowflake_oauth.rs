@@ -1,18 +1,18 @@
-use crate::db::{
-    extensions as db_extensions, leader_leases::LeaderElection, projects as db_projects,
-};
+use crate::db::{extensions as db_extensions, projects as db_projects};
 use crate::server::encryption::EncryptionProvider;
 use crate::server::extensions::{Extension, InjectedEnvVar};
 use crate::server::settings::{PrivateKeySource, SnowflakeAuth};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
+use rise_runtime_sync::{with_leader_election, LeaderElection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -1392,75 +1392,94 @@ Deletion removes all resources: Snowflake integration and OAuth extension.
         Ok(vec![])
     }
 
-    fn start(&self) {
+    fn start(&self, shutdown: CancellationToken) -> tokio::task::JoinHandle<()> {
         let provisioner = self.clone();
 
         tokio::spawn(async move {
             info!("Starting Snowflake OAuth provisioner reconciliation loop");
 
-            let election = LeaderElection::spawn(
-                provisioner.db_pool.clone(),
+            let pool = provisioner.db_pool.clone();
+            let result = with_leader_election(
+                pool,
                 "rise-ext-snowflake",
                 Uuid::new_v4(),
                 std::time::Duration::from_secs(60),
-            );
+                shutdown.clone(),
+                move |election| async move {
+                    let mut error_state: HashMap<Uuid, (usize, DateTime<Utc>)> = HashMap::new();
 
-            let mut error_state: HashMap<Uuid, (usize, DateTime<Utc>)> = HashMap::new();
+                    loop {
+                        if !election.is_leader() {
+                            tokio::select! {
+                                _ = shutdown.cancelled() => break,
+                                _ = sleep(std::time::Duration::from_secs(5)) => {}
+                            }
+                            continue;
+                        }
 
-            loop {
-                if !election.is_leader() {
-                    sleep(std::time::Duration::from_secs(5)).await;
-                    continue;
-                }
+                        match db_extensions::list_by_extension_type(
+                            &provisioner.db_pool,
+                            "snowflake-oauth-provisioner",
+                        )
+                        .await
+                        {
+                            Ok(extensions) => {
+                                for ext in extensions {
+                                    // Apply exponential backoff for errors
+                                    if let Some((error_count, last_error)) =
+                                        error_state.get(&ext.project_id)
+                                    {
+                                        let backoff_seconds =
+                                            2_i64.pow(*error_count as u32).min(300);
+                                        let backoff_until =
+                                            *last_error + Duration::seconds(backoff_seconds);
 
-                match db_extensions::list_by_extension_type(
-                    &provisioner.db_pool,
-                    "snowflake-oauth-provisioner",
-                )
-                .await
-                {
-                    Ok(extensions) => {
-                        for ext in extensions {
-                            // Apply exponential backoff for errors
-                            if let Some((error_count, last_error)) =
-                                error_state.get(&ext.project_id)
-                            {
-                                let backoff_seconds = 2_i64.pow(*error_count as u32).min(300);
-                                let backoff_until =
-                                    *last_error + Duration::seconds(backoff_seconds);
+                                        if Utc::now() < backoff_until {
+                                            continue;
+                                        }
+                                    }
 
-                                if Utc::now() < backoff_until {
-                                    continue;
+                                    if !election.is_leader() {
+                                        warn!("Lost leadership before Snowflake reconcile");
+                                        break;
+                                    }
+
+                                    match provisioner.reconcile_single(ext.clone(), &election).await
+                                    {
+                                        Ok(_) => {
+                                            error_state.remove(&ext.project_id);
+                                        }
+                                        Err(e) => {
+                                            error!("Reconciliation failed: {:?}", e);
+                                            let entry = error_state
+                                                .entry(ext.project_id)
+                                                .or_insert((0, Utc::now()));
+                                            entry.0 += 1;
+                                            entry.1 = Utc::now();
+                                        }
+                                    }
                                 }
                             }
-
-                            if !election.is_leader() {
-                                warn!("Lost leadership before Snowflake reconcile");
-                                break;
-                            }
-
-                            match provisioner.reconcile_single(ext.clone(), &election).await {
-                                Ok(_) => {
-                                    error_state.remove(&ext.project_id);
-                                }
-                                Err(e) => {
-                                    error!("Reconciliation failed: {:?}", e);
-                                    let entry = error_state
-                                        .entry(ext.project_id)
-                                        .or_insert((0, Utc::now()));
-                                    entry.0 += 1;
-                                    entry.1 = Utc::now();
-                                }
+                            Err(e) => {
+                                error!("Failed to list Snowflake OAuth extensions: {:?}", e);
                             }
                         }
-                    }
-                    Err(e) => {
-                        error!("Failed to list Snowflake OAuth extensions: {:?}", e);
-                    }
-                }
 
-                sleep(std::time::Duration::from_secs(5)).await;
+                        tokio::select! {
+                            _ = shutdown.cancelled() => break,
+                            _ = sleep(std::time::Duration::from_secs(5)) => {}
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .await;
+            if let Err(e) = result {
+                error!(
+                    "Snowflake OAuth extension reconciliation loop error: {:?}",
+                    e
+                );
             }
-        });
+        })
     }
 }
