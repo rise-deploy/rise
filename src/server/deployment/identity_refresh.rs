@@ -39,6 +39,14 @@ const MAX_POLL_INTERVAL_SECS: u64 = 300;
 /// Lease validity verified before each sweep's external (K8s) writes.
 const SWEEP_MIN_VALIDITY: Duration = Duration::from_secs(5);
 
+/// Worst-case delay for the kubelet to project an updated Secret into a running
+/// pod's mounted volume: the kubelet sync period (default 60s) plus the
+/// configmap/secret cache propagation delay (watch delay, or up to the cache TTL
+/// — default 60s). If the re-mint margin (TTL − 2/3·TTL = TTL/3) is below this, a
+/// refreshed token may not reach the pod before the old one expires. See the
+/// Kubernetes docs on automatic Secret-volume updates.
+const KUBELET_SECRET_PROPAGATION_CEILING_SECS: u64 = 120;
+
 /// How often to check for due deployments: ~1/6 of the TTL (clamped), small
 /// enough that a deployment due at 2/3·TTL is picked up well before it expires.
 fn poll_interval_secs(ttl_secs: u64) -> u64 {
@@ -75,6 +83,24 @@ impl IdentityRefreshController {
             ttl_secs = self.identity_token_ttl_seconds,
             "Starting workload-identity refresh controller"
         );
+
+        // A short TTL can leave less re-mint margin than the kubelet takes to
+        // project a refreshed Secret into the pod — warn the operator once.
+        let margin = self.identity_token_ttl_seconds.saturating_sub(
+            crate::server::workload_tokens::refresh_due_after_secs(self.identity_token_ttl_seconds),
+        );
+        if margin < KUBELET_SECRET_PROPAGATION_CEILING_SECS {
+            warn!(
+                ttl_secs = self.identity_token_ttl_seconds,
+                refresh_margin_secs = margin,
+                propagation_ceiling_secs = KUBELET_SECRET_PROPAGATION_CEILING_SECS,
+                "identity_token_ttl_seconds is short: the workload-identity re-mint \
+                 margin may be smaller than the kubelet Secret-volume propagation \
+                 delay, so a refreshed token can expire in the pod before the new one \
+                 is projected; consider raising identity_token_ttl_seconds"
+            );
+        }
+
         let pool = self.db_pool.clone();
         let me = Arc::new(self);
         leader_controller! {
