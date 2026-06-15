@@ -5,6 +5,7 @@
 //! and the CLI runs from the image on the host network.
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
 use std::io::Read;
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
@@ -663,6 +664,34 @@ impl Backend for MinikubeBackend {
         })
     }
 
+    fn minted_token_jti(&self, project: &str, filename: &str) -> Result<Option<String>> {
+        // Read the per-deployment identity Secret the controller writes — the
+        // source, before kubelet propagates it to the pod's mounted file. Find the
+        // Secret in the app namespace carrying the `token-<filename>` key, base64-
+        // decode the JWT, and return its jti so a scenario can observe re-minting
+        // independent of mount propagation.
+        let ns = format!("rise-{project}");
+        let key = format!("token-{filename}");
+        let mut c = Command::new("kubectl");
+        c.args(["get", "secret", "-n", &ns, "-o", "json"]);
+        let out = cli::run(c)?;
+        if !out.success() {
+            return Ok(None);
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(&out.stdout).unwrap_or(serde_json::Value::Null);
+        for secret in v["items"].as_array().into_iter().flatten() {
+            if let Some(b64) = secret["data"][&key].as_str() {
+                let jwt = base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok());
+                return Ok(jwt.as_deref().and_then(token::jwt_unverified_jti));
+            }
+        }
+        Ok(None)
+    }
+
     fn dex(&self) -> Option<&DexEndpoint> {
         Some(&self.dex)
     }
@@ -819,11 +848,26 @@ impl Backend for MinikubeBackend {
                 "--tail=200",
             ]),
         );
+        // Metacontroller drives the reconcile that re-mints workload-identity
+        // Secrets; its logs show whether the periodic resync actually fired (the
+        // decisive signal when the identity token stops refreshing).
+        cli::dump(
+            "metacontroller operator logs (last 200 lines)",
+            kc(&[
+                "logs",
+                "-n",
+                NAMESPACE,
+                &format!("statefulset/{RELEASE}-metacontroller-operator"),
+                "--tail=200",
+            ]),
+        );
 
         // Deployed app workloads live in `rise-<project>` namespaces; the control
         // plane above won't show why an app pod failed. Describe + log each app
         // namespace's pods (the `-A` lists give status/events; this adds the app's
-        // own logs, which is often the actual cause of a scenario failure).
+        // own logs, which is often the actual cause of a scenario failure), plus
+        // the identity Secret's `last-refresh` annotation — whether it advances
+        // tells re-mint-stalled (controller) apart from propagation-stalled (kubelet).
         if let Ok(out) = cli::run(kc(&["get", "ns", "-o", "name"])) {
             let app_nss = out.stdout.lines().filter_map(|l| {
                 l.strip_prefix("namespace/")
@@ -833,6 +877,17 @@ impl Backend for MinikubeBackend {
                 cli::dump(
                     &format!("describe pods ({ns})"),
                     kc(&["describe", "pods", "-n", ns]),
+                );
+                cli::dump(
+                    &format!("identity secret refresh ({ns})"),
+                    kc(&[
+                        "get",
+                        "secret",
+                        "-n",
+                        ns,
+                        "-o",
+                        r#"jsonpath={range .items[*]}{.metadata.name}{"  last-refresh="}{.metadata.annotations.rise\.dev/last-refresh}{"\n"}{end}"#,
+                    ]),
                 );
                 if let Ok(pods) = cli::run(kc(&["get", "pods", "-n", ns, "-o", "name"])) {
                     for pod in pods.stdout.lines().filter(|l| !l.trim().is_empty()) {

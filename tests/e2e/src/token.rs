@@ -2,6 +2,21 @@
 //! same way the backend signs sessions.
 
 use anyhow::Result;
+use base64::Engine as _;
+
+/// Extract the `jti` claim from a JWT *without* verifying its signature. The
+/// harness only needs to tell tokens apart (e.g. to observe the controller
+/// re-minting a workload-identity token), so it decodes the payload — the second
+/// `.`-separated segment, base64url-no-pad — and reads `jti`. Returns `None` if
+/// the input isn't a well-formed JWT or has no `jti`.
+pub fn jwt_unverified_jti(jwt: &str) -> Option<String> {
+    let payload = jwt.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    claims.get("jti")?.as_str().map(str::to_string)
+}
 
 /// Mint the admin CI bearer the same way the backend signs sessions: HS256 over
 /// the shared secret, `iss = public_url`, `email = admin@example.com` (an admin
@@ -32,7 +47,6 @@ pub fn mint_ci_token(secret_b64: &str, public_url: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
 
     // 32 zero-bytes, base64 — the local/e2e Docker signing secret.
     const SECRET_B64: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
@@ -66,5 +80,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(hdr["alg"], "HS256");
+    }
+
+    #[test]
+    fn extracts_jti_without_verifying() {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"jti":"abc-123","exp":42}"#);
+        let jwt = format!("header.{payload}.sig");
+        assert_eq!(jwt_unverified_jti(&jwt).as_deref(), Some("abc-123"));
+        // Not a JWT / no jti → None, never a panic.
+        assert_eq!(jwt_unverified_jti("not-a-jwt"), None);
+        let no_jti = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"exp":1}"#);
+        assert_eq!(jwt_unverified_jti(&format!("h.{no_jti}.s")), None);
     }
 }

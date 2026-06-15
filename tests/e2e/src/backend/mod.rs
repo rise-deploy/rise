@@ -181,6 +181,16 @@ pub trait Backend {
     /// still be terminating).
     fn wait_workload_removed(&self, project: &str) -> Result<()>;
 
+    /// The `jti` of the workload-identity token the controller has minted for
+    /// `filename`, read at the *source* it writes (the K8s Secret on minikube) —
+    /// before in-pod mount propagation. Lets a scenario assert the controller
+    /// re-mints separately from delivery to the pod. `Ok(None)` when the backend
+    /// has no source distinct from the in-pod file (Docker bind-mounts the
+    /// controller's file directly), or when it isn't present yet.
+    fn minted_token_jti(&self, _project: &str, _filename: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Dump backend diagnostics (cluster / container state + logs) to stderr.
     /// Called on the failure path *before* `tear_down` tears the stack down, so a
     /// bring-up or scenario failure leaves the root cause inline in the run log

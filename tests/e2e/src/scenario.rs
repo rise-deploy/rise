@@ -602,16 +602,43 @@ impl Scenario for WorkloadIdentity {
             resp.body
         );
 
-        // Prove the controller re-mints the file token in place: hold one route
-        // open and sample until a new, still-valid jti appears. The window must
-        // comfortably exceed the kubelet projected-volume refresh lag (the token
-        // TTL is short — identity_token_ttl_seconds in values-ci); poll_app exits
-        // as soon as it observes the rotation.
+        // The controller re-mints the file token in place at half its (short) TTL
+        // (identity_token_ttl_seconds in values-ci). Assert this in two stages so a
+        // failure pinpoints *where* it broke:
+        //   1. the controller re-mints at the source it writes (the K8s Secret) —
+        //      deterministic, independent of in-pod mount propagation;
+        //   2. the pod's mounted file then reflects the new token — exercising the
+        //      Kubernetes secret-volume propagation deployed apps depend on.
+        // On a backend with no source distinct from the mounted file (Docker
+        // bind-mounts the controller's file directly), stage 1 is a no-op
+        // (`minted_token_jti` → None) and stage 2 alone proves re-minting.
         let first_jti = id["file_token"]["claims"]["jti"]
             .as_str()
             .context("file token has no jti")?
             .to_string();
         let first_exp = id["file_token"]["claims"]["exp"].as_i64();
+
+        // Stage 1: controller re-mints the Secret (the source).
+        if let Some(secret_first) = b.minted_token_jti(&project, "e2e")? {
+            http::poll(
+                std::time::Duration::from_secs(180),
+                std::time::Duration::from_secs(5),
+                "controller to re-mint the identity Secret",
+                || {
+                    Ok(b.minted_token_jti(&project, "e2e")?
+                        .is_some_and(|j| j != secret_first))
+                },
+            )
+            .with_context(|| {
+                format!(
+                    "controller did not re-mint the identity Secret within 180s \
+                     (jti stuck at {secret_first}) — the controller/reconcile re-mint, \
+                     not in-pod propagation, is the problem"
+                )
+            })?;
+        }
+
+        // Stage 2: the pod's mounted file reflects a re-minted, still-valid token.
         let refreshed = b.poll_app(
             &project,
             "/identity?file=e2e",
