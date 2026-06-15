@@ -42,6 +42,18 @@ In-flight PRs with operator impact (not yet merged):
   self-heals already-running containers that lack them on the next reconcile, so
   apps running before the upgrade pick up their identity material without a
   redeploy (mirroring the Kubernetes controller re-establishing it on each sync).
+- **Behavior change — workload identity token refresh on Kubernetes** ([#390](https://github.com/rise-deploy/rise/pull/390)).
+  The Kubernetes controller now runs a leader-elected loop that periodically
+  resyncs every `RiseProject` (at ~2/3 of
+  `deployment_controller.identity_token_ttl_seconds`) so the sync webhook re-mints
+  each deployment's pre-minted identity token files before they expire.
+  Metacontroller does not resync a steady project on its own, so previously a
+  long-lived pod's identity *file* token could expire without being refreshed
+  (the on-demand token-exchange endpoint was unaffected). No new configuration and
+  no action required; the only operational change is a periodic `rise.dev/trigger`
+  annotation write per project (a no-op sync for projects with fresh or no identity
+  tokens) and one more background lease (`rise-identity-refresh`). Docker already
+  refreshed via its own reconcile loop, so this closes the gap on Kubernetes.
 - **Config change — auth token exchange (phase 1)** ([#367](https://github.com/rise-deploy/rise/pull/367)).
   Adds the RFC 8693 exchange endpoint and a Rise `Access` token kind. Purely
   additive; existing token flows are unchanged, legacy in-handler verification
