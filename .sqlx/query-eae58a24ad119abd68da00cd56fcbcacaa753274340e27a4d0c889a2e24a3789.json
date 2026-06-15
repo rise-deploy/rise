@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT d.id AS \"id!\", p.name AS \"name!\"\n        FROM deployments d\n        JOIN projects p ON p.id = d.project_id\n        WHERE d.is_active\n          AND d.identity_audiences <> '{}'::jsonb\n          AND d.identity_token_refresh_due_at IS NOT NULL\n          AND d.identity_token_refresh_due_at <= NOW()\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "name!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "eae58a24ad119abd68da00cd56fcbcacaa753274340e27a4d0c889a2e24a3789"
+}

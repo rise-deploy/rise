@@ -164,23 +164,6 @@ pub async fn trigger_resync(client: &Client, project_name: &str) -> anyhow::Resu
     Ok(())
 }
 
-/// List the names of the `RiseProject` CRs this controller manages. When a
-/// `controller_class` is configured, filters by the `rise.dev/controller-class`
-/// label so a multi-controller install only resyncs its own projects; an empty
-/// or absent class lists every CR.
-pub async fn list_rise_project_names(
-    client: &Client,
-    controller_class: Option<&str>,
-) -> anyhow::Result<Vec<String>> {
-    let api: Api<RiseProject> = Api::all(client.clone());
-    let mut lp = ListParams::default();
-    if let Some(class) = controller_class.filter(|c| !c.is_empty()) {
-        lp = lp.labels(&format!("{CONTROLLER_CLASS_LABEL}={class}"));
-    }
-    let list = api.list(&lp).await?;
-    Ok(list.items.iter().map(|rp| rp.name_any()).collect())
-}
-
 /// Reconcile `RiseProject` CRDs for every active project in the database.
 ///
 /// Handles three scenarios in one pass:
