@@ -575,9 +575,12 @@ Reviewed deltas (deliberate, not "byte-for-byte refactor"):
   - **Cutover risk (pre-GA):** old CLI (`rise_project`) ↔ new server, and new
     CLI (`identity`) ↔ old server, both ignore the unknown field → controller
     branch → `invalid_grant`; **fail closed**, no escalation.
-  - **Remaining:** an E2E test that authenticates with a real service account
-    (e2e-docker's Dex: create an SA trusting Dex, mint a Dex token, set
-    `RISE_IDENTITY`, deploy) and asserts the exchange path succeeds.
+  - **E2E coverage:** delivered by the `rise-e2e` harness (see *Cross-backend
+    E2E test consistency* below) — its `sa-token-exchange` scenario creates an
+    SA trusting the Docker stack's Dex, mints a Dex id_token via the password
+    grant, sets `RISE_IDENTITY`, and asserts `project list` returns the SA's
+    bound project (plus a negative: the un-exchanged token is rejected).
+    Docker `Run`; minikube `Skip` until its in-cluster Dex is reachable.
 
 ## Phase 3 — Remove the legacy path
 
@@ -655,35 +658,39 @@ Listed so they don't fall out of the plan; not currently sequenced.
 
 # Cross-backend E2E test consistency
 
-A testing-infra follow-up, not an architectural workstream — but tracked here so
-it isn't lost.
+**Done.** End-to-end tests run through a typed Rust harness, crate **`rise-e2e`**
+(`tests/e2e/`, a standalone workspace). Scenarios are written once against a
+`Backend` driver seam; each declares which backends it `applies_to`, and an
+unsupported combo is a **logged `Skip(reason)`** — a visible, declared parity gap,
+never silent drift. Both backends **self-provision** their own stack (Docker via
+compose; minikube via `minikube start` + `helm` + the JFrog/Vault registry stack +
+port-forwards). The CI bearer is minted via `rise-backend-auth`.
 
-The Docker (`scripts/ci/e2e-docker.sh`) and Kubernetes
-(`scripts/ci/e2e-minikube.sh`) end-to-end suites have drifted: they each cover an
-overlapping-but-inconsistent set of scenarios. Per the **Deployment Backend
-Parity (STRICT)** rule, common features should be exercised the *same way* on
-both backends. The goal: define a shared scenario matrix (deploy/rollback/stop,
-ingress access classes, env vars, custom domains, workload identity, …) driven
-from common helpers (`scripts/ci/lib/`), so a feature is tested identically on
-Docker and K8s and a parity gap shows up as a failing/absent cell rather than
-silent divergence.
+Scenario matrix (`Run` / `Skip`):
 
-- [ ] **Audit & align** the two suites into a shared scenario list + common
-  driver helpers; document the matrix alongside the
-  [Deployment Backends](docs/engineering/src/content/docs/deployment-backends.md)
-  page so the test matrix mirrors the feature matrix.
-- [ ] **Add SA OIDC token exchange to the matrix.** Today neither suite
-  exercises the `RISE_IDENTITY` exchange — both authenticate the CLI with a
-  pre-minted Rise HS256 bearer (`create_rise_ci_token`), so
-  `POST /api/v1/auth/token` and `resolve_service_account`-by-identity are never
-  hit end to end. Add a scenario that: creates a service account trusting the
-  test IdP (the Docker stack already runs **Dex**; the K8s stack needs an
-  equivalent issuer), obtains an OIDC token from it (non-interactive Dex grant —
-  the main implementation hurdle), sets `RISE_IDENTITY` to the SA's email, runs
-  `rise deploy`, and asserts the deploy succeeds **and** `rise project list`
-  returns the SA's bound project. Run it on both backends. Until then, exchange
-  coverage is unit/DB-level only (`token_source` tests + the
-  `resolve_by_identity` `sqlx` tests incl. the issuer-mismatch guard).
+| scenario | docker | minikube |
+|---|---|---|
+| public-deploy | Run | Run |
+| sa-token-exchange | Run | Run |
+| private/forwardAuth | Run | Skip (nginx auth path) |
+| health-rolling cutover | Run | Skip (Traefik-specific) |
+| loki log-retention | Skip (no Loki) | Run |
+| helm idempotency | Skip (no chart) | Run |
+| workload-identity | Run | Run (jfrog-vault mode) |
+
+CI jobs: `e2e-docker`, `e2e-minikube-harness`, `e2e-minikube-harness-jfrog-vault`
+(all `RISE_E2E_BACKEND`-gated), plus a fast `rise-e2e harness quality` lint/test
+job.
+
+**`sa-token-exchange`** closes the WS2 Phase 2 gap end to end on **both** backends:
+an SA trusting Dex, a Dex id_token via the password grant, `RISE_IDENTITY` set →
+`project list` returns the SA's project (+ negative: un-exchanged token rejected).
+
+Remaining follow-ups (not blocking):
+- [ ] Port the secondary bash assertions not yet modeled (rollback/stop, env vars,
+  custom domains) as the feature matrix grows.
+- [ ] `tests/e2e-build/run.sh` (CLI build backends) is a separate domain and is
+  intentionally **not** part of this harness.
 
 ---
 

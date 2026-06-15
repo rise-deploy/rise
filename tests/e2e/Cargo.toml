@@ -1,0 +1,38 @@
+[package]
+name = "rise-e2e"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Cross-backend end-to-end test harness for Rise (Docker / Kubernetes)."
+
+# Standalone workspace: deliberately excluded from the root workspace so the
+# production image build (cargo-chef over the root) never has to resolve or
+# compile this test-only harness or its HTTP/TLS deps. Dep versions are pinned
+# concretely (no `workspace = true`) since there's no parent workspace; keep them
+# in sync with the root [workspace.dependencies].
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+# The harness is a binary you run explicitly with
+# `cargo run --manifest-path tests/e2e/Cargo.toml`, NOT a `cargo test` target —
+# so its output isn't wrapped in libtest's "running N tests" scaffolding and the
+# e2e run isn't interleaved with unit-test output. `src/main.rs` is auto-detected
+# as the `rise-e2e` binary; it drives the `rise` CLI + HTTP against a live backend,
+# runs every scenario as one in-order suite under a shared bring-up, and is gated
+# on RISE_E2E_BACKEND (prints a skip + exits 0 when unset). Unit tests for the
+# harness's own helpers (e.g. token minting) stay `#[test]`s run by `cargo test`.
+
+[dependencies]
+anyhow = "1.0.100"
+base64 = "0.22"
+# RFC3339 timestamps for the Loki log-volume query window.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+# Blocking HTTP + form bodies (Dex password grant) — sequential harness, no async
+# runtime. The harness only hits local HTTP, so it just uses reqwest's default TLS.
+reqwest = { version = "0.13", features = ["blocking", "json", "form"] }
+# Reused to mint the HS256 CI bearer the same way the server signs sessions.
+rise-backend-auth = { path = "../../crates/rise-backend-auth" }

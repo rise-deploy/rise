@@ -5,8 +5,9 @@
 # Nested tables deep-merge, so this overrides only the named keys.
 #
 # Purpose: shorten the workload-identity token TTL so the e2e refresh assertion
-# (scripts/ci/lib/identity.sh) observes the controller's in-place re-mint (which
-# happens at half the TTL) within the test window. This is intentionally NOT in
+# (the rise-e2e harness's `workload-identity` scenario, tests/e2e) observes the
+# controller's in-place re-mint (which happens at half the TTL) within the test
+# window. This is intentionally NOT in
 # the shipped config/docker.yaml: the Docker workload-identity feature is
 # unreleased and operators should not need to tune it yet.
 deployment_controller:

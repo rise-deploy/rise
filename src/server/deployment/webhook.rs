@@ -2154,7 +2154,7 @@ async fn prepare_identity_secret(
             .unwrap_or_default();
 
         let ttl_secs = state.identity_token_ttl_seconds;
-        let refresh_secs = (ttl_secs / 2) as i64;
+        let refresh_secs = crate::server::workload_tokens::remint_after_secs(ttl_secs) as i64;
 
         let fresh = observed_refresh
             .map(|ts| {
@@ -2180,7 +2180,19 @@ async fn prepare_identity_secret(
                 &audiences,
                 ttl_secs,
             )?;
-            (minted, Utc::now())
+            let refreshed_at = Utc::now();
+            // Schedule the next re-mint at ~2/3 of the TTL: the identity-refresh
+            // controller resyncs this project once this is due, just before the
+            // token would expire (Metacontroller won't resync a steady project on
+            // its own). Only set when we actually mint — the reuse path keeps the
+            // existing schedule.
+            let due_at = refreshed_at
+                + chrono::Duration::seconds(
+                    crate::server::workload_tokens::refresh_due_after_secs(ttl_secs) as i64,
+                );
+            db_deployments::set_identity_refresh_due_at(&state.db_pool, deployment.id, due_at)
+                .await?;
+            (minted, refreshed_at)
         }
     };
 

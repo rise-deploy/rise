@@ -7,6 +7,10 @@ members = [
     "crates/rise-resource-store",
     "crates/rise-runtime-sync",
 ]
+# The rise-e2e harness is its own standalone workspace (tests/e2e/Cargo.toml) so
+# the production image build (cargo-chef over this root) never resolves or
+# compiles this test-only crate. Excluded so cargo doesn't auto-discover it.
+exclude = ["tests/e2e"]
 resolver = "2"
 
 [workspace.dependencies]

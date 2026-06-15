@@ -2518,7 +2518,9 @@ fn identity_refresh_due(
     ttl_seconds: u64,
     now: DateTime<Utc>,
 ) -> bool {
-    let half = chrono::Duration::seconds((ttl_seconds / 2).max(1) as i64);
+    let half = chrono::Duration::seconds(crate::server::workload_tokens::remint_after_secs(
+        ttl_seconds,
+    ) as i64);
     match last_refresh {
         Some(ts) => now.signed_duration_since(ts) >= half,
         None => true,

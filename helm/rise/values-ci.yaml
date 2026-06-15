@@ -1,5 +1,5 @@
-# CI-specific Helm values for Minikube e2e tests
-# Used by scripts/ci/e2e-minikube.sh
+# CI-specific Helm values for Minikube e2e tests.
+# Used by the rise-e2e harness (tests/e2e, minikube backend).
 
 postgresql:
   enabled: true
@@ -8,6 +8,30 @@ dex:
   enabled: true
   config:
     issuer: http://rise-ci-chart-dex.rise-ci.svc.cluster.local:5556/dex
+    # Override the chart's default rise-backend client to add grantTypes. Setting
+    # grantTypes REPLACES — not extends — Dex's default set, so we list the full
+    # default set (authorization_code, refresh_token, device_code, token-exchange)
+    # plus `password`. The resource-owner password grant is CI-only: it lets the
+    # rise-e2e harness mint OIDC id_tokens non-interactively for the static users
+    # (enablePasswordDB / staticPasswords / oauth2.passwordConnector come from the
+    # chart defaults and are deep-merged in). Mirrors dev/dex/config.yaml. Helm
+    # replaces list values, so the whole client must be reproduced here.
+    staticClients:
+      - id: rise-backend
+        redirectURIs:
+          - "http://rise.example.com/"
+          - "http://rise.example.com/api/v1/auth/callback"
+          - "http://localhost:8765/callback"
+          - "http://localhost:8766/callback"
+          - "http://localhost:8767/callback"
+        name: "Rise Backend"
+        secret: "rise-backend-secret"
+        grantTypes:
+          - authorization_code
+          - refresh_token
+          - "urn:ietf:params:oauth:grant-type:device_code"
+          - "urn:ietf:params:oauth:grant-type:token-exchange"
+          - password
 
 logs:
   backend: loki
@@ -23,6 +47,14 @@ config:
   server:
     public_url: http://rise.local
     jwt_signing_secret: dGVzdC1qd3Qtc2VjcmV0LWtleS1mb3ItY2ktdGVzdGluZy1vbmx5LW5vdC1zZWN1cmU=
+    # CI-only: the in-cluster Dex issuer is plain-HTTP on a private cluster IP
+    # (rise-ci-chart-dex.rise-ci.svc.cluster.local). Relax the SSRF guard so OIDC
+    # discovery / JWKS fetch and service-account issuer validation accept it.
+    # Mirrors the docker standalone overlay (RISE_SSRF_ALLOW_PRIVATE/HTTP). Never
+    # enable in production.
+    ssrf:
+      allow_private_networks: true
+      allow_http: true
 
   auth:
     issuer: http://rise-ci-chart-dex.rise-ci.svc.cluster.local:5556/dex
@@ -42,8 +74,8 @@ config:
   deployment_controller:
     type: kubernetes
     # Short identity-token TTL so the e2e workload-identity refresh assertion
-    # (scripts/ci/lib/identity.sh) observes an in-place re-mint (at half-TTL)
-    # inside the test window. CI-only; production keeps the 3600s default.
+    # observes an in-place re-mint (at half-TTL) inside the test window. CI-only;
+    # production keeps the 3600s default.
     identity_token_ttl_seconds: 60
     production_ingress_url_template: "{project_name}.apps.rise.local"
     staging_ingress_url_template: "{project_name}-{deployment_group}.preview.rise.local"
@@ -55,3 +87,10 @@ config:
         description: Public access without authentication
         ingress_class: nginx
         access_requirement: None
+      # Exercised by the private-ingress-auth scenario: the controller stamps the
+      # nginx auth annotations for a Member access requirement.
+      private:
+        display_name: Private
+        description: Requires authentication and project membership.
+        ingress_class: nginx
+        access_requirement: Member

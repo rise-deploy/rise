@@ -13,6 +13,24 @@ pub mod routes;
 /// that a real environment name cannot, so it can never collide with one.
 pub(crate) const NO_ENVIRONMENT: &str = "<null>";
 
+/// A pre-minted workload-identity token is re-minted once it is older than half
+/// its TTL — both the Kubernetes sync webhook (reuse-guard) and the Docker
+/// reconciler gate re-minting on this, leaving ~half the lifetime as margin for
+/// delivery to the running workload. Floored at 1s so a degenerate `ttl <= 1`
+/// can't trigger a re-mint on every reconcile.
+pub fn remint_after_secs(ttl_secs: u64) -> u64 {
+    (ttl_secs / 2).max(1)
+}
+
+/// How long after a mint the Kubernetes identity-refresh controller schedules the
+/// project's resync — strictly *later* than [`remint_after_secs`] so the
+/// triggered sync actually re-mints: 2/3 of the TTL, leaving ~1/3 of the lifetime
+/// for the resync round-trip + kubelet Secret-volume propagation before the old
+/// token expires.
+pub fn refresh_due_after_secs(ttl_secs: u64) -> u64 {
+    ttl_secs * 2 / 3
+}
+
 /// Build the subject claim for a workload identity token.
 ///
 /// Fixed and environment-aware: `rise:proj:<project>:env:<environment>`.

@@ -216,6 +216,30 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         controller_handles.push(handle);
     }
 
+    // Start the workload-identity refresh controller (Kubernetes only). It
+    // periodically resyncs RiseProjects so the sync webhook re-mints pre-minted
+    // identity tokens before they expire — Metacontroller won't resync a steady
+    // project on its own, so without this a long-lived pod's identity file token
+    // would never refresh. (Docker re-mints via its own reconcile loop.)
+    #[cfg(feature = "backend")]
+    if let Some(kube_client) = state.kube_client.clone() {
+        info!("Starting workload-identity refresh controller");
+        let db_pool = state.db_pool.clone();
+        let ttl = state.identity_token_ttl_seconds;
+        let shutdown_clone = shutdown.clone();
+        let handle = tokio::spawn(async move {
+            let controller = deployment::identity_refresh::IdentityRefreshController::new(
+                kube_client,
+                db_pool,
+                ttl,
+            );
+            if let Err(e) = controller.run(shutdown_clone).await {
+                tracing::error!("Identity refresh controller error: {:#}", e);
+            }
+        });
+        controller_handles.push(handle);
+    }
+
     // Start Entra active sync if configured
     if let Some(settings::ActiveSyncSource::Entra) = &settings.auth.active_sync_source {
         info!("Starting Entra ID active sync");

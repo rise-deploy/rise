@@ -3,6 +3,8 @@ pub mod controller;
 pub mod crd;
 pub mod handlers;
 #[cfg(feature = "backend")]
+pub mod identity_refresh;
+#[cfg(feature = "backend")]
 pub mod ip_validator;
 #[cfg(feature = "backend")]
 pub mod logs;
