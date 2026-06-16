@@ -1465,7 +1465,7 @@ export function AwsS3DetailView({ extension, projectName }) {
 }
 
 const AwsS3ExtensionAPI = {
-    icon: null,
+    icon: '/assets/aws_s3.svg',
 
     renderStatusBadge(extension) {
         const status = extension.status || {};
