@@ -538,12 +538,6 @@ fn validate_env_override(env_override: &models::EnvOverride) -> Result<bool, Ser
         )));
     }
 
-    if env_override.key == "PORT" {
-        return Err(ServerError::bad_request(
-            "PORT cannot be set via env overrides. Use http_port/--http-port instead.",
-        ));
-    }
-
     let is_protected = normalize_env_override_is_protected(env_override);
     if is_protected && !env_override.is_secret {
         return Err(ServerError::bad_request(format!(
@@ -799,19 +793,33 @@ async fn resolve_deployment_target(
 ///
 /// Priority:
 /// 1. Explicit http_port from request (if provided)
-/// 2. PORT env var from project (if set and valid)
-/// 3. Default: 8080
+/// 2. PORT from deployment-level env overrides (if set and valid)
+/// 3. PORT env var from project (if set and valid)
+/// 4. Default: 8080
 async fn resolve_effective_http_port(
     state: &AppState,
     project_id: uuid::Uuid,
     explicit_port: Option<u16>,
+    port_from_env_override: Option<u16>,
 ) -> Result<u16, ServerError> {
-    // 1. Explicit port takes precedence
+    // 1. Explicit port takes precedence; warn if a PORT env override is also present
     if let Some(port) = explicit_port {
+        if port_from_env_override.is_some() {
+            warn!(
+                "Both --http-port ({}) and PORT env override are set; --http-port takes precedence and PORT override is ignored",
+                port
+            );
+        }
         return Ok(port);
     }
 
-    // 2. Check project's PORT env var
+    // 2. PORT from deployment env overrides
+    if let Some(port) = port_from_env_override {
+        debug!("Using PORT {} from deployment env override", port);
+        return Ok(port);
+    }
+
+    // 3. Check project's PORT env var
     let project_env_vars =
         crate::db::env_vars::list_project_env_vars(&state.db_pool, project_id, None)
             .await
@@ -831,7 +839,7 @@ async fn resolve_effective_http_port(
         );
     }
 
-    // 3. Default to 8080
+    // 4. Default to 8080
     debug!("No explicit port or PORT env var, defaulting to 8080");
     Ok(8080)
 }
@@ -1095,7 +1103,7 @@ pub async fn create_deployment(
     // (no `containers`) pass through unchanged.
     models::validate_containers_and_routes(payload.containers.as_deref(), &payload.routes)?;
 
-    // Per-container env overrides go through the same key/`PORT`/protected
+    // Per-container env overrides go through the same key/protected
     // validation as top-level overrides (`validate_containers_and_routes` only
     // enforces the is_secret restriction). An invalid key would otherwise reach
     // the pod spec and wedge the reconcile.
@@ -1238,11 +1246,41 @@ pub async fn create_deployment(
 
     // Resolve effective http_port:
     // 1. Explicit http_port from request (if provided)
-    // 2. Source deployment's http_port (if --from is used, handled below)
-    // 3. PORT env var from project (if set and valid)
-    // 4. Default: 8080
-    let effective_http_port =
-        resolve_effective_http_port(&state, project.id, payload.http_port).await?;
+    // 2. PORT from deployment-level env overrides (if set and valid)
+    // 3. Source deployment's http_port (if --from is used, handled below)
+    // 4. PORT env var from project (if set and valid)
+    // 5. Default: 8080
+
+    // Extract PORT from top-level env overrides (filtered by resolved environment).
+    // If the value is present but invalid, warn so users know it was ignored.
+    let port_from_env_override: Option<u16> = {
+        let filtered = filter_env_overrides_by_environment(
+            &payload.env_overrides,
+            resolved_environment.as_ref().map(|e| e.name.as_str()),
+        );
+        if let Some(port_override) = filtered.iter().rfind(|o| o.key == "PORT") {
+            match port_override.value.parse::<u16>() {
+                Ok(p) if p > 0 => Some(p),
+                _ => {
+                    warn!(
+                        "PORT env override '{}' is not a valid port number (1-65535), ignoring",
+                        port_override.value
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
+    let effective_http_port = resolve_effective_http_port(
+        &state,
+        project.id,
+        payload.http_port,
+        port_from_env_override,
+    )
+    .await?;
     info!(
         "Using http_port {} for deployment {}",
         effective_http_port, deployment_id
@@ -3239,22 +3277,18 @@ mod tests {
     }
 
     #[test]
-    fn env_override_validation_rejects_port_overrides() {
-        let err = validate_env_override(&EnvOverride {
+    fn env_override_validation_allows_port_overrides() {
+        // PORT is now accepted as an env override; it informs http_port resolution
+        let result = validate_env_override(&EnvOverride {
             key: "PORT".to_string(),
             value: "3000".to_string(),
             is_secret: false,
             is_protected: Some(false),
             source: None,
             for_environment: None,
-        })
-        .unwrap_err();
+        });
 
-        assert_eq!(err.status, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            err.message,
-            "PORT cannot be set via env overrides. Use http_port/--http-port instead."
-        );
+        assert!(result.is_ok(), "PORT env override should be accepted");
     }
 
     #[test]
