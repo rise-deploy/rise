@@ -29,7 +29,7 @@ use crate::config::Config;
 use crate::rise_toml::{ProjectBuildConfig, ResolvedDeploy};
 
 /// Default Traefik image used for the local router service.
-const TRAEFIK_IMAGE: &str = "traefik:v3.1";
+const TRAEFIK_IMAGE: &str = "traefik:v3.7.4";
 
 // ── Compose data model (a small, serializable subset of the spec) ──────────
 
@@ -173,6 +173,10 @@ fn build_compose(
                     "--entrypoints.web.address=:80".to_string(),
                 ],
                 ports: vec![format!("{}:80", router_port)],
+                environment: BTreeMap::from([(
+                    "DOCKER_API_VERSION".to_string(),
+                    "1.44".to_string(),
+                )]),
                 volumes: vec!["/var/run/docker.sock:/var/run/docker.sock:ro".to_string()],
                 ..Default::default()
             },
@@ -818,7 +822,9 @@ mod tests {
 
         // Router publishes the host port and mounts the docker socket.
         let router = &compose.services["rise-router"];
+        assert_eq!(router.image, "traefik:v3.7.4");
         assert_eq!(router.ports, vec!["8080:80".to_string()]);
+        assert_eq!(router.environment["DOCKER_API_VERSION"], "1.44");
         assert!(router.volumes.iter().any(|v| v.contains("docker.sock")));
     }
 

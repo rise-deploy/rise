@@ -1,20 +1,29 @@
-//! E2E harness entrypoint — a binary you run with `cargo run`. Every scenario
-//! shares one expensive backend `bring_up` (a whole compose stack or minikube
+//! E2E harness entrypoint — a binary you run with `cargo run`. Backend scenarios
+//! share one expensive backend `bring_up` (a whole compose stack or minikube
 //! cluster), so they run as one in-order suite under our own reporter rather than
-//! as independent tests that would each re-provision. Gated on `RISE_E2E_BACKEND`;
-//! skips (exit 0) when unset. Exits non-zero on any scenario failure so CI treats
-//! the run as a failure.
+//! as independent tests that would each re-provision. Standalone suites, such as
+//! local `rise compose`, run without a backend. Gated on `RISE_E2E_BACKEND` or
+//! `RISE_E2E_SUITE`; skips (exit 0) when neither is set.
 
 use std::process::ExitCode;
 use std::time::Instant;
 
-use rise_e2e::{backend, report, scenario, BackendKind};
+use rise_e2e::{backend, compose, report, scenario, BackendKind};
 
 fn main() -> ExitCode {
+    match std::env::var("RISE_E2E_SUITE").ok().as_deref() {
+        Some("compose") => return run_standalone_compose(),
+        Some(other) if !other.is_empty() => {
+            eprintln!("[e2e] RISE_E2E_SUITE={other:?} is not known (expected: compose)");
+            return ExitCode::FAILURE;
+        }
+        _ => {}
+    }
+
     let Some(kind) = BackendKind::from_env() else {
         eprintln!(
-            "[e2e] RISE_E2E_BACKEND unset — skipping the e2e harness \
-             (set RISE_E2E_BACKEND=docker|minikube to run it)"
+            "[e2e] RISE_E2E_BACKEND and RISE_E2E_SUITE unset — skipping the e2e harness \
+             (set RISE_E2E_BACKEND=docker|minikube or RISE_E2E_SUITE=compose to run it)"
         );
         return ExitCode::SUCCESS;
     };
@@ -69,6 +78,24 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
         // The panic message was already printed by the default hook; just fail.
+        Err(_) => ExitCode::FAILURE,
+    }
+}
+
+fn run_standalone_compose() -> ExitCode {
+    let total = Instant::now();
+    let outcome = std::panic::catch_unwind(compose::run);
+    report::note(&format!(
+        "total wall-clock {}",
+        report::human(total.elapsed())
+    ));
+
+    match outcome {
+        Ok(Ok(())) => ExitCode::SUCCESS,
+        Ok(Err(e)) => {
+            eprintln!("\n[e2e] FAILED: {e:#}");
+            ExitCode::FAILURE
+        }
         Err(_) => ExitCode::FAILURE,
     }
 }

@@ -509,6 +509,30 @@ jobs:
       - name: Run e2e build tests (with proxy)
         run: RISE_BIN=./target/release/rise bash tests/e2e-build/run.sh --only-proxy
 
+  e2e-compose:
+    name: E2E / Compose
+    runs-on: ubuntu-latest
+    needs: prepare
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Rust + tools
+        uses: ./.github/actions/setup-rust
+        with:
+          rust-version: ${{ env.RUST_VERSION }}
+          cache-key: e2e-compose
+
+      - name: Build Rise CLI
+        run: cargo build --release --package rise-deploy --features cli
+
+      - name: Run rise compose e2e suite
+        env:
+          RISE_E2E_SUITE: compose
+          RISE_BIN: ./target/release/rise
+        run: cargo run --manifest-path tests/e2e/Cargo.toml
+
   e2e-docker:
     name: E2E / Docker
     runs-on: ubuntu-latest
