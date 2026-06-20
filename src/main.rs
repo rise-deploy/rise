@@ -249,7 +249,8 @@ enum Commands {
         /// HTTP port the application listens on (also sets PORT env var)
         #[arg(long, default_value = "8080")]
         http_port: u16,
-        /// Port to expose on the host (defaults to same as http-port)
+        /// Port to publish on the host. Defaults to the selected container's
+        /// port for --container, otherwise to --http-port.
         #[arg(long)]
         expose: Option<u16>,
         /// Runtime environment variables (format: KEY=VALUE, can be specified multiple times)
