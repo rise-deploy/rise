@@ -12,7 +12,7 @@ The Rise CLI (`rise`) provides commands for managing projects, deployments, team
 | `rise deploy` | | | [Deployments](../deployments) |
 | `rise build` | | | [Building Images](../builds) |
 | `rise run` | | | [Local Development](../local-development) |
-| `rise compose` | | `up`, `down`, `ps`, `logs`, `generate` | [Local Development](../local-development#multi-container-projects) |
+| `rise compose` | | `up`, `down`, `ps`, `logs`, `generate` | [Local Development](../local-development#compose-stacks) |
 | `rise project` | `p` | `create` (`c`), `list` (`ls`), `show` (`s`), `update` (`u`), `delete` (`rm`) | [Configuration](../configuration) |
 | `rise project app-user` | | `add` (`a`), `list` (`ls`), `remove` (`rm`) | [Authentication](../authentication#app-users) |
 | `rise deployment` | `d` | `create` (`c`), `list` (`ls`), `show` (`s`), `stop`, `logs` | [Deployments](../deployments) |

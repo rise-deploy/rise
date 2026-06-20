@@ -258,7 +258,7 @@ enum Commands {
         #[command(flatten)]
         build_args: build::BuildArgs,
     },
-    /// Run a multi-container project locally via Docker Compose
+    /// Run a project locally via Docker Compose
     #[command(subcommand)]
     Compose(ComposeCommands),
     /// Service account (workload identity) management commands
@@ -276,8 +276,8 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum ComposeCommands {
-    /// Build all containers locally and run them together (ephemeral — no file
-    /// is written to disk).
+    /// Build a project locally and run it via Docker Compose (ephemeral — no
+    /// file is written to disk).
     Up {
         /// Path to the directory containing the application
         #[arg(default_value = ".")]
@@ -288,6 +288,9 @@ enum ComposeCommands {
         /// Target environment (e.g., 'staging'). Resolved from rise.toml if not specified.
         #[arg(long, short = 'E')]
         environment: Option<String>,
+        /// HTTP port a single-container application listens on (also sets PORT env var).
+        #[arg(long, default_value = "8080")]
+        http_port: u16,
         /// Host port the Traefik router publishes (replicates `[routes]`).
         #[arg(long, default_value = "8080")]
         router_port: u16,
@@ -350,6 +353,9 @@ enum ComposeCommands {
         /// Target environment (e.g., 'staging'). Resolved from rise.toml if not specified.
         #[arg(long, short = 'E')]
         environment: Option<String>,
+        /// HTTP port a single-container application listens on (also sets PORT env var).
+        #[arg(long, default_value = "8080")]
+        http_port: u16,
         /// Host port the Traefik router publishes (replicates `[routes]`).
         #[arg(long, default_value = "8080")]
         router_port: u16,
@@ -1971,6 +1977,7 @@ async fn main() -> Result<()> {
                 path,
                 project,
                 environment,
+                http_port,
                 router_port,
                 detach,
                 build_args,
@@ -1984,6 +1991,7 @@ async fn main() -> Result<()> {
                         path,
                         project: project.as_deref(),
                         environment: resolved_env.as_deref(),
+                        http_port: *http_port,
                         router_port: *router_port,
                         detach: *detach,
                         build_args,
@@ -2046,6 +2054,7 @@ async fn main() -> Result<()> {
                 path,
                 project,
                 environment,
+                http_port,
                 router_port,
                 stdout,
                 output,
@@ -2059,6 +2068,7 @@ async fn main() -> Result<()> {
                         path,
                         project: project.as_deref(),
                         environment: resolved_env.as_deref(),
+                        http_port: *http_port,
                         router_port: *router_port,
                         stdout: *stdout,
                         output: output.as_deref(),

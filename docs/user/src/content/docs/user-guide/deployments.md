@@ -288,7 +288,7 @@ Notes:
 - Each container's `PORT` env var is set to **that container's own `port`** (e.g. `frontend` gets `PORT=8080`, `backend` gets `PORT=9090`) — not a single deployment-wide value. Containers without a `port` (workers) keep whatever deployment-wide `PORT` was set, if any.
 - When a deployment has two or more containers, each is also given a `RISE_CONTAINER_HOST__<NAME>` env var for every sibling that exposes a `port` (including a port-having container that isn't routed, such as a database) — pointing at that sibling's in-cluster Service. See [Environment Variables](../environment-variables#auto-injected-variables).
 
-To run a multi-container project locally, use `rise compose up` (or `rise run --container <name>` for a single container). See [Local Development](../local-development#multi-container-projects).
+To run this project locally as a stack, use `rise compose up`; to run just one container, use `rise run --container <name>`. See [Local Development](../local-development#compose-stacks).
 
 ## CPU & Memory
 

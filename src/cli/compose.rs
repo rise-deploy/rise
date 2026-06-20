@@ -1,12 +1,11 @@
-//! `rise compose` — run a multi-container project locally via Docker Compose.
+//! `rise compose` — run a Rise project locally via Docker Compose.
 //!
-//! Multi-container projects (those with a `[containers]` table in rise.toml)
-//! can't be run as a single container. This module builds each container's
-//! image locally and generates a Compose file that wires them together on a
-//! shared network, mirroring production:
+//! This module builds project containers locally and generates a Compose file
+//! that wires them together on a shared network, mirroring production:
 //!
-//! - sibling containers reach each other by service name, and each gets the
-//!   same `RISE_CONTAINER_HOST__<NAME>` env vars the deployed app would see;
+//! - single-container projects run as the implicit `app` container;
+//! - multi-container siblings reach each other by service name, and each gets
+//!   the same `RISE_CONTAINER_HOST__<NAME>` env vars the deployed app would see;
 //! - path-based `[routes]` are replicated by a Traefik router that discovers
 //!   routing rules from Docker **labels** (no mounted config file), published
 //!   on a single host port.
@@ -26,7 +25,9 @@ use tracing::{info, warn};
 use crate::build::{self, BuildOptions};
 use crate::cli::env;
 use crate::config::Config;
-use crate::rise_toml::{ProjectBuildConfig, ResolvedDeploy};
+use crate::rise_toml::{
+    ProjectBuildConfig, ResolvedContainer, ResolvedDeploy, ResolvedRoute, DEFAULT_CONTAINER_NAME,
+};
 
 /// Default Traefik image used for the local router service.
 const TRAEFIK_IMAGE: &str = "traefik:v3.7.4";
@@ -55,7 +56,7 @@ struct Service {
 
 // ── Pure generator ─────────────────────────────────────────────────────────
 
-/// Build the Compose model for a resolved multi-container project.
+/// Build the Compose model for a resolved project.
 ///
 /// `shared_env` is the project-level environment (e.g. the deployment preview
 /// vars); per-container `[containers.X.env]` overrides are layered on top.
@@ -250,20 +251,42 @@ struct Resolved {
     project_name: String,
 }
 
-/// Load rise.toml, ensure it's a multi-container project, and resolve names.
-fn load_multi_container(path: &str, explicit_project: Option<&str>) -> Result<Resolved> {
+/// Load rise.toml and resolve the container layout for Compose.
+///
+/// Multi-container projects use their explicit `[containers]` table. A
+/// single-container project is represented as the same implicit `app` container
+/// that the backend and `rise run` use, with the CLI `--http-port` value as its
+/// local port.
+fn load_compose_project(
+    path: &str,
+    explicit_project: Option<&str>,
+    single_container_http_port: u16,
+) -> Result<Resolved> {
     let toml_config = build::config::load_full_project_config(path)?
         .ok_or_else(|| anyhow::anyhow!("no rise.toml found in '{}'", path))?;
 
-    let resolved = toml_config
+    let mut resolved = toml_config
         .resolve_deploy()
         .map_err(|e| anyhow::anyhow!(e))?;
     if resolved.containers.is_empty() {
-        bail!(
-            "'{}' is not a multi-container project (no [containers] table). \
-             Use `rise run` instead.",
-            path
-        );
+        let deploy = toml_config.deploy.clone().unwrap_or_default();
+        resolved = ResolvedDeploy {
+            containers: vec![ResolvedContainer {
+                name: DEFAULT_CONTAINER_NAME.to_string(),
+                image: None,
+                build: toml_config.build.clone(),
+                port: Some(single_container_http_port),
+                replicas: deploy.replicas,
+                cpu: deploy.cpu,
+                memory: deploy.memory,
+                env: BTreeMap::new(),
+                health_check: deploy.health_check,
+            }],
+            routes: vec![ResolvedRoute {
+                path: "/".to_string(),
+                container: DEFAULT_CONTAINER_NAME.to_string(),
+            }],
+        };
     }
 
     let project_name = explicit_project
@@ -390,8 +413,11 @@ async fn fetch_shared_env(
     Ok(env_vars)
 }
 
-/// Build every `[containers.X]` with a `build` section locally (push=false).
-/// Pre-built (`image`) containers are referenced verbatim and skipped.
+/// Build every local container image (push=false).
+///
+/// Pre-built (`image`) containers are referenced verbatim and skipped. An
+/// implicit single-container app may have no explicit `[build]` table; it still
+/// builds with the same defaults as `rise run`.
 fn build_all_local(
     config: &Config,
     path: &str,
@@ -400,11 +426,10 @@ fn build_all_local(
     res: &Resolved,
 ) -> Result<()> {
     for container in &res.resolved.containers {
-        if container.build.is_none() {
+        if let Some(image) = &container.image {
             info!(
                 "Container '{}' uses pre-built image '{}', skipping build",
-                container.name,
-                container.image.as_deref().unwrap_or("<none>")
+                container.name, image
             );
             continue;
         }
@@ -464,6 +489,7 @@ pub struct GenerateOptions<'a> {
     pub path: &'a str,
     pub project: Option<&'a str>,
     pub environment: Option<&'a str>,
+    pub http_port: u16,
     pub router_port: u16,
     /// Write to stdout instead of a file.
     pub stdout: bool,
@@ -471,13 +497,13 @@ pub struct GenerateOptions<'a> {
     pub output: Option<&'a str>,
 }
 
-/// Generate a persistent Compose file for a multi-container project.
+/// Generate a persistent Compose file for a Rise project.
 pub async fn generate(
     http_client: &Client,
     config: &Config,
     options: GenerateOptions<'_>,
 ) -> Result<()> {
-    let res = load_multi_container(options.path, options.project)?;
+    let res = load_compose_project(options.path, options.project, options.http_port)?;
     reject_per_container_container_cli(&res.toml_config, None)?;
     let shared_env =
         fetch_shared_env(http_client, config, &res.project_name, options.environment).await?;
@@ -515,14 +541,15 @@ pub struct UpOptions<'a> {
     pub path: &'a str,
     pub project: Option<&'a str>,
     pub environment: Option<&'a str>,
+    pub http_port: u16,
     pub router_port: u16,
     pub detach: bool,
     pub build_args: &'a build::BuildArgs,
 }
 
-/// Build all containers locally and run them together via `docker compose up`.
+/// Build the project locally and run it via `docker compose up`.
 pub async fn up(http_client: &Client, config: &Config, options: UpOptions<'_>) -> Result<()> {
-    let res = load_multi_container(options.path, options.project)?;
+    let res = load_compose_project(options.path, options.project, options.http_port)?;
     reject_per_container_container_cli(&res.toml_config, None)?;
     let cli = resolve_container_cli(config, options.build_args, Some(&res.toml_config));
     let compose_project = compose_project_name(&res.project_name);
@@ -837,6 +864,53 @@ mod tests {
         let compose = build_compose("app", &resolved, &BTreeMap::new(), 8080);
         assert!(!compose.services.contains_key("rise-router"));
         assert_eq!(compose.services.len(), 2);
+    }
+
+    #[test]
+    fn load_compose_project_synthesizes_single_container_app() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("rise.toml"),
+            r#"
+[project]
+name = "solo"
+
+[build]
+backend = "docker"
+
+[deploy]
+replicas = 2
+"#,
+        )
+        .unwrap();
+
+        let loaded = load_compose_project(dir.path().to_str().unwrap(), None, 3000).unwrap();
+
+        assert_eq!(loaded.project_name, "solo");
+        assert_eq!(loaded.resolved.containers.len(), 1);
+        let app = &loaded.resolved.containers[0];
+        assert_eq!(app.name, DEFAULT_CONTAINER_NAME);
+        assert_eq!(app.port, Some(3000));
+        assert_eq!(app.replicas, Some(2));
+        assert!(app.build.is_some());
+        assert_eq!(loaded.resolved.routes.len(), 1);
+        assert_eq!(loaded.resolved.routes[0].path, "/");
+        assert_eq!(loaded.resolved.routes[0].container, DEFAULT_CONTAINER_NAME);
+
+        let compose = build_compose(
+            &loaded.project_name,
+            &loaded.resolved,
+            &BTreeMap::new(),
+            8080,
+        );
+        assert!(compose.services.contains_key("app"));
+        assert!(compose.services.contains_key("rise-router"));
+        assert_eq!(compose.services["app"].environment["PORT"], "3000");
+        assert_eq!(compose.services["app"].environment["RISE_CONTAINER"], "app");
+        assert_eq!(
+            compose.services["rise-router"].ports,
+            vec!["8080:80".to_string()]
+        );
     }
 
     #[test]
