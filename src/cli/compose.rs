@@ -15,6 +15,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
@@ -125,8 +126,8 @@ fn build_compose(
             for route in &routes {
                 let router = router_name(&container.name, &route.path);
                 labels.push(format!(
-                    "traefik.http.routers.{router}.rule=PathPrefix(`{}`)",
-                    route.path
+                    "traefik.http.routers.{router}.rule={}",
+                    route_rule(&route.path)
                 ));
                 // Longest-prefix-first, matching the controller's route sort.
                 labels.push(format!(
@@ -229,6 +230,20 @@ fn short_path_hash(path: &str) -> String {
         hash = hash.wrapping_mul(0x0100_0193);
     }
     format!("{hash:08x}")
+}
+
+/// Traefik rule matching Kubernetes Prefix path semantics.
+///
+/// Kubernetes `Prefix` paths are element-wise: `/api` matches `/api` and
+/// `/api/users`, but not `/apix`. Traefik's `PathPrefix(`/api`)` is purely
+/// byte-prefix based, so non-root routes need an exact match plus a slash-bound
+/// prefix.
+fn route_rule(path: &str) -> String {
+    if path == "/" {
+        "PathPrefix(`/`)".to_string()
+    } else {
+        format!("Path(`{path}`) || PathPrefix(`{path}/`)")
+    }
 }
 
 /// Compose project name (`-p`): stable across up/down so `down` matches `up`.
@@ -634,6 +649,36 @@ pub async fn up(http_client: &Client, config: &Config, options: UpOptions<'_>) -
     Ok(())
 }
 
+fn write_temp_compose_file(compose: &ComposeFile) -> Result<tempfile::NamedTempFile> {
+    let yaml = serde_yaml::to_string(compose).context("Failed to serialize compose file")?;
+    let mut file = tempfile::Builder::new()
+        .prefix("rise-compose-")
+        .suffix(".yaml")
+        .tempfile()
+        .context("Failed to create temporary compose file")?;
+    file.write_all(yaml.as_bytes())
+        .context("Failed to write temporary compose file")?;
+    Ok(file)
+}
+
+fn compose_file_for_existing_stack(
+    path: &str,
+    explicit_project: Option<&str>,
+) -> Result<Option<tempfile::NamedTempFile>> {
+    match load_compose_project(path, explicit_project, 8080) {
+        Ok(res) => {
+            let compose = build_compose(&res.project_name, &res.resolved, &BTreeMap::new(), 8080);
+            write_temp_compose_file(&compose).map(Some)
+        }
+        Err(err) => {
+            warn!(
+                "Could not regenerate compose file for existing stack; falling back to project-only compose command: {err:#}"
+            );
+            Ok(None)
+        }
+    }
+}
+
 /// Options for `rise compose down`.
 pub struct DownOptions<'a> {
     pub path: &'a str,
@@ -649,11 +694,15 @@ pub async fn down(config: &Config, options: DownOptions<'_>) -> Result<()> {
     let cli = resolve_container_cli(config, options.build_args, toml_config.as_ref());
     let compose_project = compose_project_name(&project_name);
 
-    let status = Command::new(&cli)
-        .arg("compose")
-        .arg("-p")
-        .arg(&compose_project)
+    let compose_file = compose_file_for_existing_stack(options.path, options.project)?;
+    let mut cmd = Command::new(&cli);
+    cmd.arg("compose").arg("-p").arg(&compose_project);
+    if let Some(file) = compose_file.as_ref() {
+        cmd.arg("-f").arg(file.path());
+    }
+    let status = cmd
         .arg("down")
+        .arg("--remove-orphans")
         .status()
         .context("Failed to run docker compose down")?;
 
@@ -669,12 +718,13 @@ pub async fn down(config: &Config, options: DownOptions<'_>) -> Result<()> {
 
 /// A `<cli> compose -p <project>` command with stdio inherited, ready for a
 /// subcommand (`ps`, `logs`, …) to target a running stack by project name.
-fn compose_for_project(cli: &str, project: &str) -> Command {
+fn compose_for_project(cli: &str, project: &str, compose_file: Option<&Path>) -> Command {
     let mut cmd = Command::new(cli);
-    cmd.arg("compose")
-        .arg("-p")
-        .arg(project)
-        .stdin(Stdio::inherit())
+    cmd.arg("compose").arg("-p").arg(project);
+    if let Some(path) = compose_file {
+        cmd.arg("-f").arg(path);
+    }
+    cmd.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     cmd
@@ -694,10 +744,15 @@ pub async fn ps(config: &Config, options: PsOptions<'_>) -> Result<()> {
     let cli = resolve_container_cli(config, options.build_args, toml_config.as_ref());
     let compose_project = compose_project_name(&project_name);
 
-    let status = compose_for_project(&cli, &compose_project)
-        .arg("ps")
-        .status()
-        .context("Failed to run docker compose ps")?;
+    let compose_file = compose_file_for_existing_stack(options.path, options.project)?;
+    let status = compose_for_project(
+        &cli,
+        &compose_project,
+        compose_file.as_ref().map(|file| file.path()),
+    )
+    .arg("ps")
+    .status()
+    .context("Failed to run docker compose ps")?;
 
     if !status.success() {
         if let Some(code) = status.code() {
@@ -749,7 +804,12 @@ pub async fn logs(config: &Config, options: LogsOptions<'_>) -> Result<()> {
         }
     }
 
-    let mut cmd = compose_for_project(&cli, &compose_project);
+    let compose_file = compose_file_for_existing_stack(options.path, options.project)?;
+    let mut cmd = compose_for_project(
+        &cli,
+        &compose_project,
+        compose_file.as_ref().map(|file| file.path()),
+    );
     cmd.arg("logs");
     if options.follow {
         cmd.arg("--follow");
@@ -833,6 +893,11 @@ mod tests {
         // Routed: traefik labels present.
         assert!(web.labels.contains(&"traefik.enable=true".to_string()));
         assert!(web.labels.iter().any(|l| l.contains("PathPrefix(`/`)")));
+        let api = &compose.services["api"];
+        assert!(api
+            .labels
+            .iter()
+            .any(|l| { l.contains("Path(`/api`) || PathPrefix(`/api/`)") }));
 
         // Port-only, unrouted container: no traefik labels, no host publish.
         let redis = &compose.services["redis"];
@@ -922,6 +987,12 @@ replicas = 2
         assert_eq!(unique.len(), names.len());
         // Deterministic across calls.
         assert_eq!(router_name("api", "/api/v1"), router_name("api", "/api/v1"));
+    }
+
+    #[test]
+    fn route_rule_matches_kubernetes_prefix_boundaries() {
+        assert_eq!(route_rule("/"), "PathPrefix(`/`)");
+        assert_eq!(route_rule("/api"), "Path(`/api`) || PathPrefix(`/api/`)");
     }
 
     #[test]
