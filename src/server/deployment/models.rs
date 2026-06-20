@@ -1,5 +1,9 @@
 use super::controller::DeploymentUrls;
 use crate::server::error::ServerError;
+pub use rise_deployment_spec::request_spec::{
+    ContainerSpec, EnvOverride, HealthCheckSpec, RouteSpec,
+};
+pub use rise_deployment_spec::side_data::{decode_side_data, encode_side_data};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
@@ -219,306 +223,15 @@ pub fn rise_system_env_vars(
     vars
 }
 
-/// A runtime environment variable override included in a deployment request
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct EnvOverride {
-    pub key: String,
-    pub value: String,
-    #[serde(default)]
-    pub is_secret: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub is_protected: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-    /// Target environment name. When set, this override is only applied if the
-    /// resolved deployment environment matches. `None` means the override is global.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub for_environment: Option<String>,
-}
-
-/// Per-container probe configuration. All fields are optional and fall back to
-/// the server's `HealthProbeConfig` defaults. `disabled = true` turns probes
-/// off entirely (`health_check = false` in rise.toml).
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
-pub struct HealthCheckSpec {
-    #[serde(default)]
-    pub disabled: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub initial_delay_seconds: Option<i32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub period_seconds: Option<i32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_seconds: Option<i32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub failure_threshold: Option<i32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub liveness_enabled: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub readiness_enabled: Option<bool>,
-}
-
-/// One container in a multi-container deployment.
-///
-/// In a `CreateDeploymentRequest` `image` is `None` when the CLI is going to
-/// build and push the container from source; the server then derives the
-/// internal image tag (`<deployment_id>-<container_name>`) and stores the
-/// fully-qualified reference on the persisted spec. Containers that point at
-/// a pre-built image set `image = Some("<external>:<tag>")` and skip the
-/// build/push.
-///
-/// In the persisted JSON (and any response from the server) every container
-/// has `image`, `cpu`, `memory`, and `replicas` filled in: the server applies
-/// the resolution order `[containers.<name>]` → deployment-level effective
-/// value (CLI flag / rise.toml env override / rise.toml global / platform
-/// default) before writing the row.
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct ContainerSpec {
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image: Option<String>,
-    /// Port the container listens on. Drives the per-container Service and
-    /// ingress routing. Need not be HTTP — the Service is plain TCP. `None`
-    /// for workers (no Service, no probes).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub port: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub replicas: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cpu: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory: Option<String>,
-    /// Container-scoped env vars (from `[containers.X.env]`). These are added
-    /// on top of the project-global env vars and override on conflict.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub env_overrides: Vec<EnvOverride>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub health_check: Option<HealthCheckSpec>,
-}
-
-/// One ingress route mapping. Paths are matched longest-prefix-first by the
-/// reconciler; the request may list them in any order. A route maps a path to a
-/// target container; the effective port is always the target container's `port`.
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct RouteSpec {
-    pub path: String,
-    pub container: String,
-}
-
-/// On-disk schema version for the `containers` / `routes` JSONB side-data on the
-/// `deployments` row. Bump this whenever the persisted [`ContainerSpec`] /
-/// [`RouteSpec`] shape changes in a way older code cannot read, and add a
-/// matching arm in [`decode_side_data`] that maps the old shape forward.
-///
-/// Multi-container is an unreleased feature, so every persisted value is a
-/// versioned envelope — there is no un-versioned "bare array" shape to read.
-pub const CONTAINER_SIDE_DATA_VERSION: u32 = 1;
-
-/// Borrowed envelope used to *write* side-data: `{ "version": N, "items": [...] }`.
-#[derive(Serialize)]
-struct SideDataWrite<'a, T> {
-    version: u32,
-    items: &'a [T],
-}
-
-/// Owned envelope used to *read* side-data. `items` is kept as a raw value so
-/// the version can be checked before committing to a concrete item type.
-#[derive(Deserialize)]
-struct SideDataRead {
-    version: u32,
-    items: serde_json::Value,
-}
-
-/// Wrap a list of container/route specs in the versioned envelope for storage
-/// in the `containers` / `routes` JSONB columns.
-pub fn encode_side_data<T: Serialize>(items: &[T]) -> Result<serde_json::Value, serde_json::Error> {
-    serde_json::to_value(SideDataWrite {
-        version: CONTAINER_SIDE_DATA_VERSION,
-        items,
-    })
-}
-
-/// Decode a persisted `containers` / `routes` envelope into its item list.
-///
-/// Every persisted value is a versioned envelope (multi-container is unreleased,
-/// so there is no legacy bare-array shape to accept). An unknown/future version
-/// is a hard error rather than a silent empty list — callers map it to their own
-/// failure mode (mark the deployment Failed, return a 500, or render without the
-/// side-data).
-pub fn decode_side_data<T: serde::de::DeserializeOwned>(
-    value: &serde_json::Value,
-) -> anyhow::Result<Vec<T>> {
-    let envelope: SideDataRead = serde_json::from_value(value.clone())
-        .map_err(|e| anyhow::anyhow!("side-data envelope could not be deserialized: {e}"))?;
-    if envelope.version != CONTAINER_SIDE_DATA_VERSION {
-        anyhow::bail!(
-            "unsupported container side-data version {} (this build understands version {})",
-            envelope.version,
-            CONTAINER_SIDE_DATA_VERSION
-        );
-    }
-    serde_json::from_value(envelope.items).map_err(|e| {
-        anyhow::anyhow!(
-            "side-data items (version {}) could not be deserialized: {e}",
-            envelope.version
-        )
-    })
-}
-
-/// Validate `^[a-z][a-z0-9-]{0,14}$` (max 15 chars, RFC 1123 label, starts
-/// with letter, lowercase alphanumeric + dash; no trailing dash).
-///
-/// Kept short so `<project>-<deployment_id(15)>-<container>` fits the K8s
-/// 63-char resource name limit.
-fn is_valid_container_name(name: &str) -> bool {
-    if name.is_empty() || name.len() > 15 {
-        return false;
-    }
-    if name.ends_with('-') {
-        return false;
-    }
-    let mut chars = name.chars();
-    let first = chars.next().expect("non-empty by len() check above");
-    if !first.is_ascii_lowercase() {
-        return false;
-    }
-    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-}
-
-/// Validate an ingress route path at the server trust boundary.
-///
-/// The path flows verbatim into the Kubernetes Ingress, in the same host rule
-/// where the platform appends `/.rise -> rise-backend` for auth/workload-token
-/// endpoints. Two guards:
-///  - The `/.rise` prefix is reserved for the platform; a tenant route there
-///    (e.g. `/.rise` or `/.rise/auth`) could shadow the platform auth backend.
-///  - The path must match a conservative URL-path charset
-///    (`^/[A-Za-z0-9._~/-]*$`, still allowing root `/`) so control chars,
-///    whitespace, quotes, `;`, `#`, backslashes, etc. can't be injected.
-fn validate_route_path(path: &str) -> Result<(), ServerError> {
-    if !path.starts_with('/') {
-        return Err(ServerError::bad_request(format!(
-            "Route path '{}' must start with '/'",
-            path
-        )));
-    }
-    if path == "/.rise" || path.starts_with("/.rise/") {
-        return Err(ServerError::bad_request(format!(
-            "Route path '{}' uses the reserved '/.rise' platform prefix",
-            path
-        )));
-    }
-    // ^/[A-Za-z0-9._~/-]*$ — leading '/' already checked above.
-    if !path[1..]
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '~' | '/' | '-'))
-    {
-        return Err(ServerError::bad_request(format!(
-            "Route path '{}' contains invalid characters; allowed: letters, digits, and '. _ ~ / -'",
-            path
-        )));
-    }
-    Ok(())
-}
-
 /// Validate the wire-level multi-container spec (containers + routes) from a
 /// `CreateDeploymentRequest`. Returns `Ok(())` for legacy single-container
 /// requests (`containers` is `None`).
-///
-/// Rules (see docstrings on `ContainerSpec`/`RouteSpec`):
-/// - Container name must match `^[a-z][a-z0-9-]{0,14}$`.
-/// - Container names must be unique within the request.
-/// - Each container must set exactly one of `image` (non-empty) or `build`
-///   (handled implicitly: `image == None` ⇒ CLI will build).
-/// - `env_overrides` entries with `is_secret = true` are rejected; per-container
-///   secret overrides are not yet supported on the wire. (Key/`PORT`/protected
-///   validation of per-container overrides happens in the request handler,
-///   reusing the same `validate_env_override` as top-level overrides.)
-/// - `health_check.is_some()` requires `port.is_some()`.
-/// - Each route's `container` must match a container in the request.
-/// - The route's target container must have `port.is_some()`.
-/// - Each route's `path` must start with `/`, must not use the reserved
-///   `/.rise` platform prefix, and must match a conservative URL-path charset.
 pub fn validate_containers_and_routes(
     containers: Option<&[ContainerSpec]>,
     routes: &[RouteSpec],
 ) -> Result<(), ServerError> {
-    let Some(containers) = containers else {
-        if !routes.is_empty() {
-            return Err(ServerError::bad_request(
-                "routes requires at least one container",
-            ));
-        }
-        return Ok(());
-    };
-
-    if containers.is_empty() {
-        return Err(ServerError::bad_request(
-            "containers list must not be empty when present",
-        ));
-    }
-
-    let mut seen_names = std::collections::HashSet::with_capacity(containers.len());
-    for spec in containers {
-        if !is_valid_container_name(&spec.name) {
-            return Err(ServerError::bad_request(format!(
-                "Invalid container name '{}': must match ^[a-z][a-z0-9-]{{0,14}}$ (max 15 chars, no trailing dash)",
-                spec.name
-            )));
-        }
-        if !seen_names.insert(spec.name.clone()) {
-            return Err(ServerError::bad_request(format!(
-                "Duplicate container name '{}'",
-                spec.name
-            )));
-        }
-        if let Some(ref img) = spec.image {
-            if img.is_empty() {
-                return Err(ServerError::bad_request(format!(
-                    "Container '{}' has an empty image; either omit it (build from source) or set a non-empty value",
-                    spec.name
-                )));
-            }
-        }
-        if spec.health_check.is_some() && spec.port.is_none() {
-            return Err(ServerError::bad_request(format!(
-                "Container '{}' has health_check but no port; set port or remove health_check",
-                spec.name
-            )));
-        }
-        for over in &spec.env_overrides {
-            if over.is_secret {
-                return Err(ServerError::bad_request(format!(
-                    "Per-container secret env overrides are not yet supported (container '{}', key '{}'). Use a project-level secret env var, or include the secret in the per-container plain env after appropriate handling.",
-                    spec.name, over.key
-                )));
-            }
-        }
-    }
-
-    let container_by_name: std::collections::HashMap<&str, &ContainerSpec> =
-        containers.iter().map(|c| (c.name.as_str(), c)).collect();
-
-    for route in routes {
-        validate_route_path(&route.path)?;
-        let target = container_by_name
-            .get(route.container.as_str())
-            .ok_or_else(|| {
-                ServerError::bad_request(format!(
-                    "Route '{}' targets unknown container '{}'",
-                    route.path, route.container
-                ))
-            })?;
-        if target.port.is_none() {
-            return Err(ServerError::bad_request(format!(
-                "Route '{}' targets container '{}' which has no port",
-                route.path, route.container
-            )));
-        }
-    }
-
-    Ok(())
+    rise_deployment_spec::validation::validate_containers_and_routes(containers, routes)
+        .map_err(|e| ServerError::bad_request(e.message))
 }
 
 // Request to create a deployment
@@ -614,6 +327,7 @@ pub struct UpdateDeploymentStatusRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rise_deployment_spec::side_data::CONTAINER_SIDE_DATA_VERSION;
     use serde_json::json;
 
     #[test]
@@ -934,6 +648,38 @@ mod tests {
             "got: {}",
             err.message
         );
+    }
+
+    #[test]
+    fn create_deployment_request_deserializes_legacy_absent_and_null_containers() {
+        let absent: CreateDeploymentRequest = serde_json::from_value(serde_json::json!({
+            "project": "app"
+        }))
+        .unwrap();
+        assert!(absent.containers.is_none());
+        assert!(absent.routes.is_empty());
+
+        let null_containers: CreateDeploymentRequest = serde_json::from_value(serde_json::json!({
+            "project": "app",
+            "containers": null
+        }))
+        .unwrap();
+        assert!(null_containers.containers.is_none());
+        assert!(null_containers.routes.is_empty());
+    }
+
+    #[test]
+    fn create_deployment_request_deserializes_empty_containers_as_invalid_present_list() {
+        let request: CreateDeploymentRequest = serde_json::from_value(serde_json::json!({
+            "project": "app",
+            "containers": [],
+            "routes": []
+        }))
+        .unwrap();
+        assert!(request.containers.as_ref().is_some_and(Vec::is_empty));
+        let err = validate_containers_and_routes(request.containers.as_deref(), &request.routes)
+            .unwrap_err();
+        assert!(err.message.contains("must not be empty"));
     }
 
     // ── Versioned side-data envelope (encode/decode round-trip) ─────────────
