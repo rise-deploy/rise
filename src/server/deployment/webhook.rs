@@ -1871,22 +1871,37 @@ pub(crate) fn resolve_runtime_containers(
     // Single-container deployment: synthesise the implicit `app` container.
     // A single-container deployment always has an http port (NOT NULL, default
     // 8080), so it is always routable at `/`.
-    let port = deployment.http_port as u16;
-    let app = ContainerSpec {
-        name: crate::rise_toml::DEFAULT_CONTAINER_NAME.to_string(),
-        image: None,
-        port: Some(port),
-        replicas: Some(deployment.replicas as u32),
-        cpu: Some(deployment.cpu.clone()),
-        memory: Some(deployment.memory.clone()),
-        env_overrides: Vec::new(),
-        health_check: None,
-    };
-    let routes = vec![RouteSpec {
-        path: "/".to_string(),
-        container: crate::rise_toml::DEFAULT_CONTAINER_NAME.to_string(),
-    }];
-    Ok((vec![app], routes))
+    let resolved =
+        crate::rise_toml::ResolvedDeploy::implicit_app(crate::rise_toml::ImplicitAppContainer {
+            port: deployment.http_port as u16,
+            replicas: Some(deployment.replicas as u32),
+            cpu: Some(deployment.cpu.clone()),
+            memory: Some(deployment.memory.clone()),
+            ..Default::default()
+        });
+    let specs = resolved
+        .containers
+        .into_iter()
+        .map(|container| ContainerSpec {
+            name: container.name,
+            image: container.image,
+            port: container.port,
+            replicas: container.replicas,
+            cpu: container.cpu,
+            memory: container.memory,
+            env_overrides: Vec::new(),
+            health_check: None,
+        })
+        .collect();
+    let routes = resolved
+        .routes
+        .into_iter()
+        .map(|route| RouteSpec {
+            path: route.path,
+            container: route.container,
+        })
+        .collect();
+    Ok((specs, routes))
 }
 
 /// Returns true if this deployment should have K8s infrastructure (K8s Deployment resource).

@@ -192,6 +192,48 @@ pub struct ResolvedDeploy {
     pub routes: Vec<ResolvedRoute>,
 }
 
+/// Inputs for synthesising the implicit `app` container used by single-container
+/// projects at local-runtime/reconcile time.
+#[derive(Debug, Clone, Default)]
+pub struct ImplicitAppContainer {
+    pub image: Option<String>,
+    pub build: Option<BuildConfig>,
+    pub port: u16,
+    pub replicas: Option<u32>,
+    pub cpu: Option<String>,
+    pub memory: Option<String>,
+    pub env: BTreeMap<String, String>,
+    pub health_check: Option<HealthCheckSetting>,
+}
+
+impl ResolvedDeploy {
+    /// Synthesize the runtime container layout for a single-container project.
+    ///
+    /// Single-container deployments are represented as one implicit `app`
+    /// container routed at `/`. Callers provide the already-resolved source of
+    /// truth for port/resources: `rise compose` uses CLI/rise.toml values, while
+    /// the backend uses the persisted deployment row.
+    pub fn implicit_app(input: ImplicitAppContainer) -> Self {
+        Self {
+            containers: vec![ResolvedContainer {
+                name: DEFAULT_CONTAINER_NAME.to_string(),
+                image: input.image,
+                build: input.build,
+                port: Some(input.port),
+                replicas: input.replicas,
+                cpu: input.cpu,
+                memory: input.memory,
+                env: input.env,
+                health_check: input.health_check,
+            }],
+            routes: vec![ResolvedRoute {
+                path: "/".to_string(),
+                container: DEFAULT_CONTAINER_NAME.to_string(),
+            }],
+        }
+    }
+}
+
 impl ProjectBuildConfig {
     /// Resolve the explicit `[containers]` + `[routes]` from rise.toml.
     ///
@@ -336,6 +378,28 @@ mod tests {
             err.contains("no port") && err.contains("worker") && err.contains("'/'"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn implicit_app_synthesizes_container_and_root_route() {
+        let rd = ResolvedDeploy::implicit_app(ImplicitAppContainer {
+            port: 3000,
+            replicas: Some(2),
+            cpu: Some("250m".to_string()),
+            memory: Some("512Mi".to_string()),
+            ..Default::default()
+        });
+
+        assert_eq!(rd.containers.len(), 1);
+        let app = &rd.containers[0];
+        assert_eq!(app.name, DEFAULT_CONTAINER_NAME);
+        assert_eq!(app.port, Some(3000));
+        assert_eq!(app.replicas, Some(2));
+        assert_eq!(app.cpu.as_deref(), Some("250m"));
+        assert_eq!(app.memory.as_deref(), Some("512Mi"));
+        assert_eq!(rd.routes.len(), 1);
+        assert_eq!(rd.routes[0].path, "/");
+        assert_eq!(rd.routes[0].container, DEFAULT_CONTAINER_NAME);
     }
 
     fn resolved_named<'a>(rd: &'a ResolvedDeploy, name: &str) -> &'a ResolvedContainer {

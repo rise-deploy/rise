@@ -25,9 +25,7 @@ use tracing::{info, warn};
 use crate::build::{self, BuildOptions};
 use crate::cli::env;
 use crate::config::Config;
-use crate::rise_toml::{
-    ProjectBuildConfig, ResolvedContainer, ResolvedDeploy, ResolvedRoute, DEFAULT_CONTAINER_NAME,
-};
+use crate::rise_toml::{ImplicitAppContainer, ProjectBuildConfig, ResolvedDeploy};
 
 /// Default Traefik image used for the local router service.
 const TRAEFIK_IMAGE: &str = "traefik:v3.7.4";
@@ -270,23 +268,15 @@ fn load_compose_project(
         .map_err(|e| anyhow::anyhow!(e))?;
     if resolved.containers.is_empty() {
         let deploy = toml_config.deploy.clone().unwrap_or_default();
-        resolved = ResolvedDeploy {
-            containers: vec![ResolvedContainer {
-                name: DEFAULT_CONTAINER_NAME.to_string(),
-                image: None,
-                build: toml_config.build.clone(),
-                port: Some(single_container_http_port),
-                replicas: deploy.replicas,
-                cpu: deploy.cpu,
-                memory: deploy.memory,
-                env: BTreeMap::new(),
-                health_check: deploy.health_check,
-            }],
-            routes: vec![ResolvedRoute {
-                path: "/".to_string(),
-                container: DEFAULT_CONTAINER_NAME.to_string(),
-            }],
-        };
+        resolved = ResolvedDeploy::implicit_app(ImplicitAppContainer {
+            build: toml_config.build.clone(),
+            port: single_container_http_port,
+            replicas: deploy.replicas,
+            cpu: deploy.cpu,
+            memory: deploy.memory,
+            health_check: deploy.health_check,
+            ..Default::default()
+        });
     }
 
     let project_name = explicit_project
@@ -785,7 +775,9 @@ pub async fn logs(config: &Config, options: LogsOptions<'_>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rise_toml::{BuildConfig, ContainerConfig, ResolvedContainer, ResolvedRoute};
+    use crate::rise_toml::{
+        BuildConfig, ContainerConfig, ResolvedContainer, ResolvedRoute, DEFAULT_CONTAINER_NAME,
+    };
 
     fn container(name: &str, port: Option<u16>) -> ResolvedContainer {
         ResolvedContainer {
