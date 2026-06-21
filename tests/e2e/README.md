@@ -1,10 +1,10 @@
 # `rise-e2e` — cross-backend end-to-end harness
 
-A typed Rust harness that runs end-to-end scenarios against a real Rise stack.
-Scenarios are written **once** against the [`Backend`](src/backend/mod.rs) driver
-seam and run on either backend, so a parity gap surfaces as a **declared skip**
-(printed with a reason) instead of silent drift. It is the sole end-to-end test
-suite for the Docker and Kubernetes deployment backends.
+A typed Rust harness that runs end-to-end scenarios. Backend scenarios run
+against a real Rise stack through the [`Backend`](src/backend/mod.rs) driver seam
+on either backend, so a parity gap surfaces as a **declared skip** (printed with
+a reason) instead of silent drift. Standalone suites, such as local
+`rise compose`, stay in this crate but run without provisioning a backend.
 
 ## Running
 
@@ -14,9 +14,10 @@ tests/e2e/Cargo.toml` from the repo root.
 
 The suite is a **binary you run** (`cargo run`), not a `cargo test` target — its
 output is its own timed report, with no libtest scaffolding around it. It is
-gated on `RISE_E2E_BACKEND` (**unset → prints a skip and exits 0**) and exits
-non-zero on any scenario failure. Unit tests for the harness's own helpers (e.g.
-CI-token minting) are plain `#[test]`s run by `cargo test`.
+gated on `RISE_E2E_BACKEND` or `RISE_E2E_SUITE` (**both unset → prints a skip
+and exits 0**) and exits non-zero on any scenario failure. Unit tests for the
+harness's own helpers (e.g. CI-token minting) are plain `#[test]`s run by
+`cargo test`.
 
 ```bash
 # Docker backend (self-provisions its own compose stack).
@@ -30,11 +31,17 @@ RISE_IMAGE_REPOSITORY=ghcr.io/rise-deploy/rise \
 RISE_E2E_BACKEND=minikube RISE_IMAGE_TAG=<tag> \
   cargo run --manifest-path tests/e2e/Cargo.toml
 
+# Local compose suite (no Rise backend; needs Docker and a rise CLI).
+RISE_E2E_SUITE=compose \
+RISE_BIN=./target/debug/rise \
+  cargo run --manifest-path tests/e2e/Cargo.toml
+
 # Unit tests for the harness's own helpers (no backend stood up).
 cargo test --manifest-path tests/e2e/Cargo.toml
 ```
 
-Scenarios run in-order as one suite (they share the single backend bring-up).
+Backend scenarios run in-order as one suite (they share the single backend
+bring-up). Standalone suites run separately via `RISE_E2E_SUITE`.
 
 ## Layout
 
@@ -45,6 +52,9 @@ Scenarios run in-order as one suite (they share the single backend bring-up).
   Dex, per-app reach).
 - `src/scenario.rs` — backend-agnostic scenarios + the matrix runner. Each
   `Scenario::applies_to(backend)` returns `Run` or `Skip(reason)`.
+- `src/compose.rs` — standalone `rise compose` suite. It runs the CLI directly
+  against `example/multi-container`, starts Docker Compose, and asserts the
+  frontend/API/worker/Redis path without a Rise backend.
 - `src/{cli,http,token,dex}.rs` — process/HTTP/token helpers. `token` reuses
   `rise-backend-auth` to mint the CI bearer; `dex` mints OIDC id_tokens via the
   resource-owner password grant.
@@ -62,3 +72,9 @@ Scenarios run in-order as one suite (they share the single backend bring-up).
 | `workload-identity` | Skip   | Run¹     | build fixture from source; `/identity` reports valid file+exchanged tokens, project-bound sub, matching iss; file token re-mints (new jti) |
 
 ¹ minikube only in `jfrog-vault` registry mode (source build needs a cluster-pullable registry); otherwise `Skip`.
+
+## Standalone Suites
+
+| suite     | backend required | asserts |
+|-----------|------------------|---------|
+| `compose` | No               | `rise compose up` builds and starts `example/multi-container`; frontend and API routes respond; API reaches Redis; worker completes a Redis-backed job |

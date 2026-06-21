@@ -10,6 +10,7 @@
 
 pub mod backend;
 pub mod cli;
+pub mod compose;
 pub mod dex;
 pub mod http;
 pub mod report;

@@ -4207,6 +4207,7 @@ dependencies = [
  "reqwest 0.13.4",
  "rise-backend-auth",
  "rise-backend-core",
+ "rise-deployment-spec",
  "rise-resource-api",
  "rise-resource-store",
  "rise-runtime-sync",
@@ -4238,6 +4239,16 @@ dependencies = [
  "urlencoding",
  "uuid",
  "webbrowser",
+]
+
+[[package]]
+name = "rise-deployment-spec"
+version = "0.1.0"
+dependencies = [
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "toml",
 ]
 
 [[package]]

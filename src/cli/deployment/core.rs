@@ -2547,7 +2547,10 @@ pub(super) async fn open_log_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_log_event, normalize_git_url, token_with_retry, ByteLineBuffer};
+    use super::{
+        build_multi_container_payload, extract_log_event, normalize_git_url, token_with_retry,
+        ByteLineBuffer,
+    };
     use crate::token_source::{TokenProvider, TokenSource, TokenSourceError};
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
@@ -2774,6 +2777,102 @@ mod tests {
         assert_eq!(normalize_git_url(""), None);
         assert_eq!(normalize_git_url("not-a-url"), None);
         assert_eq!(normalize_git_url("/local/path/repo"), None);
+    }
+
+    #[test]
+    fn multi_container_payload_serializes_expected_request_shape() {
+        use crate::rise_toml::{
+            BuildConfig, ContainerConfig, DeployConfig, HealthCheckConfig, HealthCheckSetting,
+            ProjectBuildConfig, RouteConfig,
+        };
+        use std::collections::BTreeMap;
+
+        let mut config = ProjectBuildConfig {
+            build: Some(BuildConfig {
+                backend: Some("docker".to_string()),
+                ..Default::default()
+            }),
+            deploy: Some(DeployConfig {
+                replicas: Some(2),
+                cpu: Some("500m".to_string()),
+                memory: Some("256Mi".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        config.containers.insert(
+            "api".to_string(),
+            ContainerConfig {
+                port: Some(8080),
+                env: BTreeMap::from([("LOG_LEVEL".to_string(), "debug".to_string())]),
+                deploy: Some(DeployConfig {
+                    health_check: Some(HealthCheckSetting::Config(HealthCheckConfig {
+                        path: Some("/health".to_string()),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        config.containers.insert(
+            "worker".to_string(),
+            ContainerConfig {
+                image: Some("busybox:latest".to_string()),
+                ..Default::default()
+            },
+        );
+        config.routes.insert(
+            "/api".to_string(),
+            RouteConfig {
+                container: "api".to_string(),
+            },
+        );
+
+        let (containers, routes) = build_multi_container_payload(Some(&config)).unwrap();
+        let json = serde_json::json!({
+            "containers": containers,
+            "routes": routes,
+        });
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "containers": [
+                    {
+                        "name": "api",
+                        "port": 8080,
+                        "replicas": 2,
+                        "cpu": "500m",
+                        "memory": "256Mi",
+                        "env_overrides": [ { "key": "LOG_LEVEL", "value": "debug", "is_secret": false, "source": "toml" } ],
+                        "health_check": { "disabled": false, "path": "/health" }
+                    },
+                    {
+                        "name": "worker",
+                        "image": "busybox:latest",
+                        "replicas": 2,
+                        "cpu": "500m",
+                        "memory": "256Mi"
+                    }
+                ],
+                "routes": [ { "path": "/api", "container": "api" } ]
+            })
+        );
+    }
+
+    #[test]
+    fn single_container_payload_preserves_legacy_request_shape() {
+        use crate::rise_toml::{BuildConfig, ProjectBuildConfig};
+
+        let config = ProjectBuildConfig {
+            build: Some(BuildConfig::default()),
+            ..Default::default()
+        };
+
+        let (containers, routes) = build_multi_container_payload(Some(&config)).unwrap();
+        assert!(containers.is_none());
+        assert!(routes.is_empty());
     }
 
     mod registry_credential_reuse {

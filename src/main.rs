@@ -232,6 +232,11 @@ enum Commands {
         /// Project name (optional, used to load environment variables)
         #[arg(long, short)]
         project: Option<String>,
+        /// Container to run (required for multi-container projects). Selects
+        /// which `[containers.X]` to build and run; use `rise compose up` to run
+        /// all containers together.
+        #[arg(long)]
+        container: Option<String>,
         /// Load environment variables from the associated Rise project (non-secret only). Defaults to true.
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         use_project_env: bool,
@@ -244,7 +249,8 @@ enum Commands {
         /// HTTP port the application listens on (also sets PORT env var)
         #[arg(long, default_value = "8080")]
         http_port: u16,
-        /// Port to expose on the host (defaults to same as http-port)
+        /// Port to publish on the host. Defaults to the selected container's
+        /// port for --container, otherwise to --http-port.
         #[arg(long)]
         expose: Option<u16>,
         /// Runtime environment variables (format: KEY=VALUE, can be specified multiple times)
@@ -253,6 +259,9 @@ enum Commands {
         #[command(flatten)]
         build_args: build::BuildArgs,
     },
+    /// Run a project locally via Docker Compose
+    #[command(subcommand)]
+    Compose(ComposeCommands),
     /// Service account (workload identity) management commands
     #[command(subcommand)]
     #[command(visible_alias = "sa")]
@@ -264,6 +273,100 @@ enum Commands {
     #[command(subcommand)]
     #[command(visible_alias = "t")]
     Team(TeamCommands),
+}
+
+#[derive(Subcommand, Debug)]
+enum ComposeCommands {
+    /// Build a project locally and run it via Docker Compose (ephemeral — no
+    /// file is written to disk).
+    Up {
+        /// Path to the directory containing the application
+        #[arg(default_value = ".")]
+        path: String,
+        /// Project name (optional, used to load environment variables)
+        #[arg(long, short)]
+        project: Option<String>,
+        /// Target environment (e.g., 'staging'). Resolved from rise.toml if not specified.
+        #[arg(long, short = 'E')]
+        environment: Option<String>,
+        /// HTTP port a single-container application listens on (also sets PORT env var).
+        #[arg(long, default_value = "8080")]
+        http_port: u16,
+        /// Host port the Traefik router publishes (replicates `[routes]`).
+        #[arg(long, default_value = "8080")]
+        router_port: u16,
+        /// Run in the background instead of streaming logs in the foreground.
+        #[arg(long, short = 'd')]
+        detach: bool,
+        #[command(flatten)]
+        build_args: build::BuildArgs,
+    },
+    /// Tear down a stack started by `rise compose up`.
+    Down {
+        /// Path to the directory containing the application
+        #[arg(default_value = ".")]
+        path: String,
+        /// Project name (optional, used to derive the compose project name)
+        #[arg(long, short)]
+        project: Option<String>,
+        #[command(flatten)]
+        build_args: build::BuildArgs,
+    },
+    /// List the containers of a running stack.
+    Ps {
+        /// Path to the directory containing the application
+        #[arg(default_value = ".")]
+        path: String,
+        /// Project name (optional, used to derive the compose project name)
+        #[arg(long, short)]
+        project: Option<String>,
+        #[command(flatten)]
+        build_args: build::BuildArgs,
+    },
+    /// Show logs from a running stack.
+    Logs {
+        /// Path to the directory containing the application
+        #[arg(default_value = ".")]
+        path: String,
+        /// Project name (optional, used to derive the compose project name)
+        #[arg(long, short)]
+        project: Option<String>,
+        /// Stream new log output until interrupted.
+        #[arg(long, short)]
+        follow: bool,
+        /// Number of lines to show from the end of each container's log.
+        #[arg(long)]
+        tail: Option<String>,
+        /// Restrict output to these containers (defaults to all).
+        #[arg(long = "container", short = 'c')]
+        containers: Vec<String>,
+        #[command(flatten)]
+        build_args: build::BuildArgs,
+    },
+    /// Write a persistent `compose.yaml` you can customize and run yourself.
+    Generate {
+        /// Path to the directory containing the application
+        #[arg(default_value = ".")]
+        path: String,
+        /// Project name (optional, used to load environment variables)
+        #[arg(long, short)]
+        project: Option<String>,
+        /// Target environment (e.g., 'staging'). Resolved from rise.toml if not specified.
+        #[arg(long, short = 'E')]
+        environment: Option<String>,
+        /// HTTP port a single-container application listens on (also sets PORT env var).
+        #[arg(long, default_value = "8080")]
+        http_port: u16,
+        /// Host port the Traefik router publishes (replicates `[routes]`).
+        #[arg(long, default_value = "8080")]
+        router_port: u16,
+        /// Write to stdout instead of a file.
+        #[arg(long)]
+        stdout: bool,
+        /// Output file path (defaults to `<path>/compose.yaml`).
+        #[arg(long, short = 'o')]
+        output: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1840,6 +1943,7 @@ async fn main() -> Result<()> {
         }
         Commands::Run {
             project,
+            container,
             use_project_env,
             path,
             environment,
@@ -1848,8 +1952,6 @@ async fn main() -> Result<()> {
             run_env,
             build_args,
         } => {
-            let expose_port = expose.unwrap_or(*http_port);
-
             // Resolve environment from --environment flag or rise.toml default
             let toml_config = build::config::load_full_project_config(path)?;
             let resolved_env = resolve_environment(environment.clone(), toml_config.as_ref());
@@ -1859,17 +1961,123 @@ async fn main() -> Result<()> {
                 &config,
                 cli::run::RunOptions {
                     project_name: project.as_deref(),
+                    container: container.as_deref(),
                     use_project_env: *use_project_env,
                     path,
                     environment: resolved_env.as_deref(),
                     http_port: *http_port,
-                    expose: expose_port,
+                    expose: *expose,
                     run_env,
                     build_args,
                 },
             )
             .await?;
         }
+        Commands::Compose(compose_cmd) => match compose_cmd {
+            ComposeCommands::Up {
+                path,
+                project,
+                environment,
+                http_port,
+                router_port,
+                detach,
+                build_args,
+            } => {
+                let toml_config = build::config::load_full_project_config(path)?;
+                let resolved_env = resolve_environment(environment.clone(), toml_config.as_ref());
+                cli::compose::up(
+                    &http_client,
+                    &config,
+                    cli::compose::UpOptions {
+                        path,
+                        project: project.as_deref(),
+                        environment: resolved_env.as_deref(),
+                        http_port: *http_port,
+                        router_port: *router_port,
+                        detach: *detach,
+                        build_args,
+                    },
+                )
+                .await?;
+            }
+            ComposeCommands::Down {
+                path,
+                project,
+                build_args,
+            } => {
+                cli::compose::down(
+                    &config,
+                    cli::compose::DownOptions {
+                        path,
+                        project: project.as_deref(),
+                        build_args,
+                    },
+                )
+                .await?;
+            }
+            ComposeCommands::Ps {
+                path,
+                project,
+                build_args,
+            } => {
+                cli::compose::ps(
+                    &config,
+                    cli::compose::PsOptions {
+                        path,
+                        project: project.as_deref(),
+                        build_args,
+                    },
+                )
+                .await?;
+            }
+            ComposeCommands::Logs {
+                path,
+                project,
+                follow,
+                tail,
+                containers,
+                build_args,
+            } => {
+                cli::compose::logs(
+                    &config,
+                    cli::compose::LogsOptions {
+                        path,
+                        project: project.as_deref(),
+                        follow: *follow,
+                        tail: tail.clone(),
+                        containers,
+                        build_args,
+                    },
+                )
+                .await?;
+            }
+            ComposeCommands::Generate {
+                path,
+                project,
+                environment,
+                http_port,
+                router_port,
+                stdout,
+                output,
+            } => {
+                let toml_config = build::config::load_full_project_config(path)?;
+                let resolved_env = resolve_environment(environment.clone(), toml_config.as_ref());
+                cli::compose::generate(
+                    &http_client,
+                    &config,
+                    cli::compose::GenerateOptions {
+                        path,
+                        project: project.as_deref(),
+                        environment: resolved_env.as_deref(),
+                        http_port: *http_port,
+                        router_port: *router_port,
+                        stdout: *stdout,
+                        output: output.as_deref(),
+                    },
+                )
+                .await?;
+            }
+        },
         Commands::Deploy { .. } => {
             // Already transformed to Deployment(Create) above
             unreachable!("Deploy command should have been transformed to Deployment(Create)")
