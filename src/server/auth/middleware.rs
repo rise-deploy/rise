@@ -251,27 +251,33 @@ pub async fn auth_middleware(
             issuer
         );
 
-        // Now that the raw token is accepted, emit a metric-shaped deprecation
-        // signal so operators can see which workload identities still need to
-        // migrate to the token-exchange flow. Keyed by `(issuer, sub)` from the
-        // *validated* claims (not the unvalidated peek) so an attacker cannot
-        // grow the counter map with forged tokens; only `sub`/`aud` identifier
-        // claims are logged, not the full payload.
+        // Now that the raw token is accepted, emit one metric-shaped
+        // deprecation event per request so operators can aggregate it in their
+        // log pipeline (count, group by issuer/sub) to see which workload
+        // identities still need to migrate to the token-exchange flow. Read
+        // from the *validated* claims; only the `sub`/`aud` identifier claims
+        // are logged, not the full payload.
         let sub = claims
             .get("sub")
             .and_then(|v| v.as_str())
             .unwrap_or("<none>");
-        let aud = claims.get("aud");
-        let count = state
-            .deprecation_counters
-            .record_raw_external_token(&issuer, sub);
+        // `aud` may be a string or an array; render a bare string for the
+        // common single-audience case and compact JSON otherwise, so the field
+        // stays parseable.
+        let aud = claims
+            .get("aud")
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| v.to_string())
+            })
+            .unwrap_or_else(|| "<none>".to_string());
         tracing::warn!(
             target: "rise::deprecation",
             metric = "raw_external_token",
             issuer = %issuer,
             sub = %sub,
-            aud = ?aud,
-            count,
+            aud = %aud,
             "deprecated: accepting raw external token (not pre-exchanged); migrate to \
              POST /api/v1/auth/token. auth.allow_raw_external_tokens defaults to false \
              starting in 0.25.0"

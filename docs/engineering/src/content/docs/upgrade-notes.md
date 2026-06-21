@@ -57,15 +57,15 @@ In-flight PRs with operator impact (not yet merged):
   (`rise-identity-refresh`). Docker already refreshed via its own reconcile loop,
   so this closes the gap on Kubernetes. Adds a nullable
   `deployments.identity_token_refresh_due_at` column (additive migration).
-- **Action required — raw external token deprecation metric** ([#374](https://github.com/rise-deploy/rise/issues/374)).
-  While `auth.allow_raw_external_tokens` is `true`, each raw-token request is now
-  counted per `(issuer, sub)` and surfaced as a metric-shaped `tracing` event
-  (`target=rise::deprecation`, `metric=raw_external_token`), with a periodic
-  aggregate rollup (`metric=raw_external_token_total`). Use it to find which CI
-  workload identities still present raw external tokens: the default flips to
-  `false` in **0.25.0**, after which those callers must pre-exchange at
-  `POST /api/v1/auth/token`. No config change; migrate CI before upgrading to
-  0.25.0.
+- **Action required — raw external token deprecation signal** ([#374](https://github.com/rise-deploy/rise/issues/374)).
+  While `auth.allow_raw_external_tokens` is `true`, each *accepted* raw-token
+  request now emits one metric-shaped `tracing` event
+  (`target=rise::deprecation`, `metric=raw_external_token`) carrying the
+  validated `issuer`/`sub`. Aggregate it in your log pipeline (count, group by
+  `issuer`/`sub`) to find which CI workload identities still present raw external
+  tokens: the default flips to `false` in **0.25.0**, after which those callers
+  must pre-exchange at `POST /api/v1/auth/token`. No config change; migrate CI
+  before upgrading to 0.25.0.
 - **Config change — auth token exchange (phase 1)** ([#367](https://github.com/rise-deploy/rise/pull/367)).
   Adds the RFC 8693 exchange endpoint and a Rise `Access` token kind. Purely
   additive; existing token flows are unchanged, legacy in-handler verification

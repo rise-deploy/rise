@@ -576,9 +576,9 @@ pub struct AuthSettings {
     /// Leaving this `true` keeps the legacy attack surface and forfeits the
     /// security benefits of the exchange (no service-account DB lookups in the
     /// request hot path, and an authenticated `platform/capabilities`). While it
-    /// is `true`, every *accepted* raw-token request is counted per
-    /// `(issuer, sub)` from the validated claims and surfaced as a
-    /// `rise::deprecation` `tracing` event so operators can see which workload
+    /// is `true`, every *accepted* raw-token request emits one
+    /// `rise::deprecation` `tracing` event carrying the validated `issuer`/`sub`,
+    /// so operators can aggregate it in their log pipeline to see which workload
     /// identities still need migrating. Defaults to `false` starting in 0.25.0;
     /// migrate CI to pre-exchange before upgrading.
     #[serde(default = "default_allow_raw_external_tokens")]

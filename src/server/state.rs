@@ -57,10 +57,6 @@ pub struct AppState {
     pub admin_users: Arc<Vec<String>>,
     /// Operator role allowlist (case-insensitive email match).
     pub operator_users: Arc<Vec<String>>,
-    /// Counters for deprecated auth paths (currently raw external tokens).
-    /// Surfaced as metric-shaped `tracing` events for operators tracking
-    /// migration off `auth.allow_raw_external_tokens`.
-    pub deprecation_counters: Arc<crate::server::auth::deprecation::DeprecationCounters>,
     /// Controller identities keyed by `id`. Consumed by future generic
     /// resource endpoints; unused in PR3.
     #[allow(dead_code)]
@@ -1574,9 +1570,6 @@ impl AppState {
             oci_client,
             admin_users,
             operator_users,
-            deprecation_counters: Arc::new(
-                crate::server::auth::deprecation::DeprecationCounters::default(),
-            ),
             controllers,
             controllers_by_issuer,
             #[cfg(feature = "backend")]

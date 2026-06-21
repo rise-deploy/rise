@@ -2,7 +2,6 @@ pub mod admin;
 pub mod context;
 pub mod controller;
 pub mod cookie_helpers;
-pub mod deprecation;
 pub mod entra_sync;
 pub mod exchange;
 pub mod group_sync;

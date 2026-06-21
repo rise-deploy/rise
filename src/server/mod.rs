@@ -259,45 +259,6 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         controller_handles.push(handle);
     }
 
-    // Periodic rollup of the raw-external-token deprecation counters. Emits one
-    // aggregate `tracing` event per `(issuer, sub)` with traffic so operators
-    // can track migration off `auth.allow_raw_external_tokens` before its
-    // default flips to `false` in 0.25.0. Per-replica, cumulative-since-boot —
-    // no leader election needed for a deprecation signal.
-    {
-        use auth::deprecation::DEPRECATION_ROLLUP_INTERVAL;
-        let counters = state.deprecation_counters.clone();
-        let shutdown_clone = shutdown.clone();
-        let handle = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(DEPRECATION_ROLLUP_INTERVAL);
-            // Skip the immediate first tick; the per-request events already
-            // cover startup.
-            ticker.tick().await;
-            loop {
-                tokio::select! {
-                    _ = shutdown_clone.cancelled() => break,
-                    _ = ticker.tick() => {
-                        for (issuer, sub, count) in counters.snapshot_raw_external_tokens() {
-                            if count == 0 {
-                                continue;
-                            }
-                            tracing::warn!(
-                                target: "rise::deprecation",
-                                metric = "raw_external_token_total",
-                                issuer = %issuer,
-                                sub = %sub,
-                                count,
-                                "raw external tokens accepted since startup (deprecated; \
-                                 flips to rejected in 0.25.0)"
-                            );
-                        }
-                    }
-                }
-            }
-        });
-        controller_handles.push(handle);
-    }
-
     // Public routes (no authentication)
     let public_routes = Router::new()
         .route("/health", axum::routing::get(health_check))
