@@ -97,9 +97,12 @@ environment restrictions only takes effect once it expires).
 to project-scoped endpoints (the legacy per-request path), which Rise resolves as
 before. Set it to `false` to require pre-exchange — callers must obtain an access
 token from `/api/v1/auth/token` first. While it is `true`, every raw-token
-request is logged as deprecated (keyed by issuer) so you can see who still needs
-migrating; leaving it `true` forfeits the security benefits above. It is slated
-to default to `false` in a future release.
+request is counted per `(issuer, sub)` and surfaced as a metric-shaped
+`tracing` event (`target=rise::deprecation`, `metric=raw_external_token`), with
+a periodic aggregate rollup (`metric=raw_external_token_total`) — so you can see
+which workload identities still need migrating, not just their issuer. Leaving
+it `true` forfeits the security benefits above. Defaults to `false` starting in
+**0.25.0**; migrate CI to pre-exchange before upgrading.
 
 ### Ingress (RS256)
 

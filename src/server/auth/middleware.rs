@@ -30,10 +30,19 @@ fn extract_rise_jwt_from_cookie(headers: &HeaderMap) -> Option<String> {
     cookie_helpers::extract_rise_jwt_cookie(headers)
 }
 
-/// Minimal JWT claims structure just to peek at the issuer
+/// Minimal JWT claims structure to peek at source-identifying claims without
+/// validation. `iss` drives the Rise-vs-external dispatch; `sub`/`aud` are
+/// surfaced on the raw-external-token deprecation signal so operators can
+/// pinpoint the specific workload identity behind a token (not just its issuer).
 #[derive(Debug, Deserialize)]
 struct MinimalClaims {
     iss: String,
+    #[serde(default)]
+    sub: Option<String>,
+    /// JWT `aud` may be a string or an array of strings, so keep it as a raw
+    /// JSON value for best-effort logging rather than a typed field.
+    #[serde(default)]
+    aud: Option<serde_json::Value>,
 }
 
 /// Authentication middleware that validates JWT and injects User or VerifiedExternalToken
@@ -75,8 +84,10 @@ pub async fn auth_middleware(
         ));
     };
 
-    // Peek at the issuer to determine authentication method
-    let issuer = {
+    // Peek at the unvalidated claims to determine the authentication method.
+    // `issuer` drives dispatch; `peeked_sub`/`peeked_aud` are only consumed by
+    // the raw-external-token deprecation signal further down.
+    let (issuer, peeked_sub, peeked_aud) = {
         // Decode header to check if JWT is well-formed
         decode_header(&token).map_err(|e| {
             tracing::warn!("Failed to decode JWT header: {:#}", e);
@@ -108,7 +119,7 @@ pub async fn auth_middleware(
             (StatusCode::UNAUTHORIZED, "Invalid token claims".to_string())
         })?;
 
-        claims.iss
+        (claims.iss, claims.sub, claims.aud)
     };
 
     tracing::debug!(
@@ -196,11 +207,24 @@ pub async fn auth_middleware(
         ));
     } else {
         // External issuer — legacy path: JWKS validation only, resolved per
-        // project later. Emit a deprecation signal so operators can see who
-        // still needs to migrate to the token-exchange flow.
+        // project later. Emit a metric-shaped deprecation signal so operators
+        // can see which workload identities still need to migrate to the
+        // token-exchange flow. Keyed by `(issuer, sub)`; only those identifier
+        // claims are logged, not the full payload.
+        let sub = peeked_sub.as_deref().unwrap_or("<none>");
+        let count = state
+            .deprecation_counters
+            .record_raw_external_token(&issuer, sub);
         tracing::warn!(
+            target: "rise::deprecation",
+            metric = "raw_external_token",
             issuer = %issuer,
-            "deprecated: accepting raw external token (not pre-exchanged); migrate to POST /api/v1/auth/token"
+            sub = %sub,
+            aud = ?peeked_aud,
+            count,
+            "deprecated: accepting raw external token (not pre-exchanged); migrate to \
+             POST /api/v1/auth/token. auth.allow_raw_external_tokens defaults to false \
+             starting in 0.25.0"
         );
         tracing::debug!(
             "Auth middleware: external JWT from issuer '{}', performing JWKS validation",

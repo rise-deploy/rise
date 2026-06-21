@@ -412,8 +412,9 @@ Phases:
   `platform_access_middleware` Access-token handling, **and access-token
   consumption** — access tokens flow through the existing `AuthContext::Access`
   path, so all project-scoped handlers already accept them (see PR 1B). That
-  covers 1A, 1B, and 1C. The only Phase-1 remainder is the optional
-  deprecation metric (1D) — deprioritized; the structured log is enough.
+  covers 1A, 1B, and 1C. The Phase-1 remainder is the deprecation metric (1D):
+  a per-`(issuer, sub)` counter surfaced as a `rise::deprecation` `tracing`
+  event, plus committing the `auth.allow_raw_external_tokens` flip to 0.25.0.
 - **Phase 2 — CLI auto-exchange** (in progress). Pure CLI change — an
   `ExchangingTokenSource` decorator in `cli/token_source.rs` that calls the
   exchange endpoint with the inner OIDC token + project name and caches the
@@ -443,7 +444,7 @@ Phases:
 - **Phase 3 cannot land until the deprecation metric in Phase 1 shows raw-
   token traffic has drained.** The `auth.allow_raw_external_tokens` toggle
   defaults `true` initially specifically to avoid breakage; the deprecation
-  metric (counted by issuer) tells operators when it's safe to flip.
+  metric (counted per `(issuer, sub)`) tells operators when it's safe to flip.
 
 ## Phase 0 — Pure-core crate extraction (shipped)
 
@@ -530,19 +531,19 @@ Reviewed deltas (deliberate, not "byte-for-byte refactor"):
   token is rejected explicitly rather than 500ing. See
   `src/server/auth/middleware.rs`.
 - [ ] **PR 1D — Deprecation metric + operator docs.** The structured
-  deprecation *log* already shipped in
+  deprecation *log* shipped in
   [#367](https://github.com/rise-deploy/rise/pull/367)
-  (`middleware.rs`: `"deprecated: accepting raw external token …"`). What
-  remains: emit a real deprecation *metric* (a counter keyed by issuer) so
-  operators can see who still needs migrating; commit to a target version at
-  which `auth.allow_raw_external_tokens` flips to `false`; and update
-  [`docs/engineering/src/content/docs/authentication.md`](docs/engineering/src/content/docs/authentication.md):
-  add Access to the at-a-glance table, replace the "Forthcoming" section
-  with the real exchange endpoint (request/response, relation to the inner
-  OIDC token, the `header.typ` discriminator), and document
-  `auth.allow_raw_external_tokens` including the deprecation guidance.
-  Cross-link the design rationale — do not duplicate the
-  `crates/rise-backend-auth/README.md` disambiguation matrix.
+  (`middleware.rs`: `"deprecated: accepting raw external token …"`). This PR
+  turns it into a real deprecation *metric*: a per-`(issuer, sub)` counter
+  (`src/server/auth/deprecation.rs`) surfaced as a metric-shaped `tracing`
+  event (`target=rise::deprecation`, `metric=raw_external_token`) plus a
+  periodic aggregate rollup (`metric=raw_external_token_total`) — Rise has no
+  metrics endpoint, so logs are the metric transport. It also commits the flip:
+  `auth.allow_raw_external_tokens` defaults to `false` starting in **0.25.0**
+  (settings doc comment, `authentication.md`, and `upgrade-notes.md` updated;
+  the [#374](https://github.com/rise-deploy/rise/issues/374) drain gate names
+  0.25.0). The `authentication.md` table/exchange-endpoint docs already landed
+  with #367.
 
 ## Phase 2 — CLI auto-exchange
 

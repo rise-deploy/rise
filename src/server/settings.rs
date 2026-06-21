@@ -575,9 +575,11 @@ pub struct AuthSettings {
     ///
     /// Leaving this `true` keeps the legacy attack surface and forfeits the
     /// security benefits of the exchange (no service-account DB lookups in the
-    /// request hot path, and an authenticated `platform/capabilities`). It is
-    /// slated to default to `false` in a future release; migrate CI to
-    /// pre-exchange before then.
+    /// request hot path, and an authenticated `platform/capabilities`). While it
+    /// is `true`, every raw-token request is counted per `(issuer, sub)` and
+    /// surfaced as a `rise::deprecation` `tracing` event so operators can see
+    /// which workload identities still need migrating. Defaults to `false`
+    /// starting in 0.25.0; migrate CI to pre-exchange before upgrading.
     #[serde(default = "default_allow_raw_external_tokens")]
     pub allow_raw_external_tokens: bool,
     /// Allow regular users to create teams (default: true).
