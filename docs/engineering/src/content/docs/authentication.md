@@ -96,10 +96,14 @@ environment restrictions only takes effect once it expires).
 `true`: a service account may still present its raw external OIDC token directly
 to project-scoped endpoints (the legacy per-request path), which Rise resolves as
 before. Set it to `false` to require pre-exchange — callers must obtain an access
-token from `/api/v1/auth/token` first. While it is `true`, every raw-token
-request is logged as deprecated (keyed by issuer) so you can see who still needs
-migrating; leaving it `true` forfeits the security benefits above. It is slated
-to default to `false` in a future release.
+token from `/api/v1/auth/token` first. While it is `true`, every *accepted*
+raw-token request (after JWKS validation) emits one metric-shaped `tracing`
+event (`target=rise::deprecation`, `metric=raw_external_token`) carrying the
+validated `issuer`/`sub` (and `aud`) — aggregate it in your log pipeline (count,
+group by `issuer`/`sub`) to see which workload identities still need migrating,
+not just their issuer. Leaving it `true` forfeits the security benefits above.
+Defaults to `false` starting in **0.25.0**; migrate CI to pre-exchange before
+upgrading.
 
 ### Ingress (RS256)
 

@@ -95,9 +95,9 @@ access token carries the resolved principal, so it works across every command
 :::caution[Deprecated: service accounts without exchange]
 Presenting a raw external token **without** `RISE_IDENTITY` (the legacy
 per-request path, where the backend federates the token on every call) is
-**deprecated and will be removed soon**. In an upcoming release the operator
-toggle [`auth.allow_raw_external_tokens`](/operator-docs/authentication/) flips
-to `false`, at which point an un-exchanged external token is rejected. **Set
+**deprecated**. Starting in **0.25.0** the operator toggle
+[`auth.allow_raw_external_tokens`](/operator-docs/authentication/) defaults to
+`false`, at which point an un-exchanged external token is rejected. **Set
 `RISE_IDENTITY` now** so your CI keeps working through the cutover.
 :::
 

@@ -57,6 +57,15 @@ In-flight PRs with operator impact (not yet merged):
   (`rise-identity-refresh`). Docker already refreshed via its own reconcile loop,
   so this closes the gap on Kubernetes. Adds a nullable
   `deployments.identity_token_refresh_due_at` column (additive migration).
+- **Action required — raw external token deprecation signal** ([#374](https://github.com/rise-deploy/rise/issues/374)).
+  While `auth.allow_raw_external_tokens` is `true`, each *accepted* raw-token
+  request now emits one metric-shaped `tracing` event
+  (`target=rise::deprecation`, `metric=raw_external_token`) carrying the
+  validated `issuer`/`sub`. Aggregate it in your log pipeline (count, group by
+  `issuer`/`sub`) to find which CI workload identities still present raw external
+  tokens: the default flips to `false` in **0.25.0**, after which those callers
+  must pre-exchange at `POST /api/v1/auth/token`. No config change; migrate CI
+  before upgrading to 0.25.0.
 - **Config change — auth token exchange (phase 1)** ([#367](https://github.com/rise-deploy/rise/pull/367)).
   Adds the RFC 8693 exchange endpoint and a Rise `Access` token kind. Purely
   additive; existing token flows are unchanged, legacy in-handler verification
@@ -119,7 +128,9 @@ listed here so operators can anticipate them:
   `organization_resource_uid` to `NOT NULL` after backfill, and migrating typed
   tables onto the generic resource model. Tracked in
   [#372](https://github.com/rise-deploy/rise/issues/372).
-- **Breaking (future, behind operator toggle) — removal of the legacy auth path.**
-  Auth token-exchange phase 3 removes the legacy in-handler verification path,
-  gated behind an operator toggle for a transparent fallback window. Tracked in
+- **Breaking (0.25.0, behind operator toggle) — removal of the legacy auth path.**
+  `auth.allow_raw_external_tokens` defaults to `false` starting in **0.25.0**,
+  and auth token-exchange phase 3 removes the legacy in-handler verification
+  path. The `rise::deprecation` raw-external-token metric (above) tells you when
+  raw-token traffic has drained and it is safe to upgrade. Tracked in
   [#374](https://github.com/rise-deploy/rise/issues/374).
