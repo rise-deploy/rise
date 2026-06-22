@@ -416,11 +416,11 @@ Phases:
   a per-request `rise::deprecation` `tracing` event carrying the validated
   `issuer`/`sub` (aggregated in the operator's log pipeline), plus committing
   the `auth.allow_raw_external_tokens` flip to 0.25.0.
-- **Phase 2 — CLI auto-exchange** (in progress). Pure CLI change — an
-  `ExchangingTokenSource` decorator in `cli/token_source.rs` that calls the
-  exchange endpoint with the inner OIDC token + project name and caches the
-  returned Rise access token, reusing the existing `CachedToken`/`is_fresh`
-  machinery.
+- **Phase 2 — CLI auto-exchange** (shipped). Pure CLI change — an
+  `ExchangingTokenSource` decorator in `cli/token_source.rs` that, when
+  `RISE_IDENTITY` is set, calls the exchange endpoint with the inner OIDC token
+  + identity and caches the returned Rise access token, reusing the existing
+  `CachedToken`/`is_fresh` machinery.
 - **Phase 3 — Remove the legacy path** (planned, breaking). Flip
   `auth.allow_raw_external_tokens` default to `false`. Delete the middleware
   external branch, `resolve_for_project`, `VerifiedExternalToken`, and the
@@ -550,7 +550,10 @@ Reviewed deltas (deliberate, not "byte-for-byte refactor"):
 
 ## Phase 2 — CLI auto-exchange
 
-- [~] **PR 2A — Explicit, identity-triggered token exchange.** Exchange is an
+- [x] **PR 2A — Explicit, identity-triggered token exchange**
+  ([#389](https://github.com/rise-deploy/rise/pull/389) — CLI/server;
+  [#390](https://github.com/rise-deploy/rise/pull/390) — `rise-e2e` harness +
+  `sa-token-exchange` scenario). Exchange is an
   **explicit, channel-agnostic** action, modeled on `AssumeRoleWithWebIdentity`:
   the `RISE_IDENTITY` env var names the identity to assume (a service account's
   synthetic-user email, `{project}+{seq}@sa.rise.local`); the token is the proof.
@@ -584,7 +587,7 @@ Reviewed deltas (deliberate, not "byte-for-byte refactor"):
     SA trusting the Docker stack's Dex, mints a Dex id_token via the password
     grant, sets `RISE_IDENTITY`, and asserts `project list` returns the SA's
     bound project (plus a negative: the un-exchanged token is rejected).
-    Docker `Run`; minikube `Skip` until its in-cluster Dex is reachable.
+    Runs on both backends (Docker and minikube).
 
 ## Phase 3 — Remove the legacy path
 
