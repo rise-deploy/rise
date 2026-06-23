@@ -4175,6 +4175,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "rise-backend-docker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bollard",
+ "chrono",
+ "futures",
+ "reqwest 0.13.4",
+ "rise-backend-auth",
+ "rise-backend-core",
+ "rise-deployment-spec",
+ "rise-resource-api",
+ "rise-resource-store",
+ "rise-runtime-sync",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sqlx",
+ "tar",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "urlencoding",
+ "uuid",
+]
+
+[[package]]
 name = "rise-deploy"
 version = "0.23.0-rc4"
 dependencies = [
@@ -4212,6 +4241,7 @@ dependencies = [
  "reqwest 0.13.4",
  "rise-backend-auth",
  "rise-backend-core",
+ "rise-backend-docker",
  "rise-deployment-spec",
  "rise-resource-api",
  "rise-resource-store",

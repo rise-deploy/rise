@@ -344,7 +344,7 @@ pub(crate) fn spec_key(project: &str, group: &str, deployment_id: &str, containe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::deployment::controller::docker::test_helpers::*;
+    use crate::test_helpers::*;
 
     #[test]
     fn diff_creates_missing() {

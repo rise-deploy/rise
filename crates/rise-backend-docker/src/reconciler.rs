@@ -34,17 +34,17 @@ use super::health::{effective_health_path, probe_error_detail};
 use super::labels::{self, SUFFIX_ENV_HASH, SUFFIX_IMAGE, SUFFIX_MANAGED_BY};
 use super::pod_status::build_controller_metadata;
 use super::rolling::{filter_rolling_actions, replica_ready, service_names_for_spec, ReadyVerdict};
-use crate::db::models::{Deployment, DeploymentStatus, Project, TerminationReason};
-use crate::server::deployment::models::rise_system_env_vars;
-use crate::server::deployment::state_machine;
-use crate::server::deployment::webhook::{
+use rise_backend_auth::{sha256_hex, workload_subject, NO_ENVIRONMENT};
+use rise_backend_core::models::{Deployment, DeploymentStatus, Project, TerminationReason};
+use rise_backend_core::rise_system_env_vars;
+use rise_backend_core::runtime::{
     resolve_deployment_env_vars, resolve_runtime_containers, should_have_infrastructure,
     DEPLOYING_TIMEOUT_MINUTES, PRE_PUSHED_TIMEOUT_MINUTES,
 };
-use crate::server::encryption::EncryptionProvider;
-use crate::server::registry::RegistryProvider;
-use crate::server::workload_tokens::{sha256_hex, workload_subject, NO_ENVIRONMENT};
+use rise_backend_core::state_machine;
 use rise_backend_core::DeploymentUrlBuilder;
+use rise_backend_core::EncryptionProvider;
+use rise_backend_core::RegistryProvider;
 
 /// Controller HARD cap on the number of replicas the Docker backend will run for
 /// a single container spec. A single-host daemon can run many containers behind
@@ -85,7 +85,7 @@ pub struct ReconcilerConfig {
     /// Access-class name → access requirement, derived from the configured
     /// `access_classes`. The container builder reads this to decide whether to
     /// stamp Traefik forwardAuth middleware labels for a project's access class.
-    pub access_classes: HashMap<String, crate::server::settings::AccessRequirement>,
+    pub access_classes: HashMap<String, rise_backend_core::AccessRequirement>,
     /// **LOCAL-DEV ONLY.** Hostname(s) to alias to `app_backend_ip` via
     /// `extra_hosts` on each managed app container, so apps can reach the public
     /// issuer host (e.g. `rise.localhost`) at the Rise backend. Empty in
@@ -1445,17 +1445,14 @@ impl DockerReconciler {
                 return (credential, true);
             }
         }
-        (
-            crate::server::workload_tokens::generate_bootstrap_credential(),
-            false,
-        )
+        (rise_backend_auth::generate_bootstrap_credential(), false)
     }
 
     /// Mint one Rise-signed workload JWT per `[identity].audiences` entry
     /// (filename → JWT). Empty when the deployment declares no (safe) audiences.
     /// Unsafe filenames (path-traversal defense) are dropped before minting so we
     /// never sign a token we'd then refuse to deliver. The actual signing uses the
-    /// shared [`crate::server::workload_tokens::sign_audience_tokens`] helper, so
+    /// shared [`rise_backend_auth::sign_audience_tokens`] helper, so
     /// the claim set can't drift from the K8s webhook.
     fn mint_audience_tokens(
         &self,
@@ -1491,7 +1488,7 @@ impl DockerReconciler {
             deployment_group: &deployment.deployment_group,
             deployment_id: &deployment.deployment_id,
         };
-        Ok(crate::server::workload_tokens::sign_audience_tokens(
+        Ok(rise_backend_auth::sign_audience_tokens(
             &self.jwt_signer,
             &info,
             &safe,
@@ -2521,7 +2518,7 @@ fn identity_refresh_due(
     ttl_seconds: u64,
     now: DateTime<Utc>,
 ) -> bool {
-    let half = chrono::Duration::seconds(crate::server::workload_tokens::remint_after_secs(
+    let half = chrono::Duration::seconds(rise_backend_core::token_ttl::remint_after_secs(
         ttl_seconds,
     ) as i64);
     match last_refresh {
@@ -2650,7 +2647,7 @@ mod tests {
 
     #[test]
     fn identity_targets_are_the_create_and_recreate_deployment_uuids() {
-        use crate::server::deployment::controller::docker::test_helpers::{desired, identity_of};
+        use crate::test_helpers::{desired, identity_of};
 
         // A Create targeting the desired slot resolves to that deployment's UUID;
         // a Remove never needs identity material. Resolving through `desired`

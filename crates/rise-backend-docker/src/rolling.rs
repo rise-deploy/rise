@@ -115,8 +115,8 @@ pub(crate) fn filter_rolling_actions(
 /// Group-scoped Traefik service name(s) a container spec's routes emit, used by
 /// the reconciler's `serverStatus` lookup so it queries the SAME service(s) the
 /// labels stamp. Mirrors [`container_builder::group_service_names`] but derives
-/// from the runtime [`crate::server::deployment::models::ContainerSpec`] +
-/// [`crate::server::deployment::models::RouteSpec`] set (what `reconcile_health`
+/// from the runtime [`rise_deployment_spec::request_spec::ContainerSpec`] +
+/// [`rise_deployment_spec::request_spec::RouteSpec`] set (what `reconcile_health`
 /// has on hand): a single-route container yields the bare base
 /// `{project}-{group}-{container}`; a multi-route container yields per-route
 /// `{base}-{idx}` names (longest path-prefix first, matching the renderer).
@@ -134,8 +134,8 @@ pub(crate) fn filter_rolling_actions(
 pub(crate) fn service_names_for_spec(
     project: &str,
     deployment_group: &str,
-    spec: &crate::server::deployment::models::ContainerSpec,
-    route_specs: &[crate::server::deployment::models::RouteSpec],
+    spec: &rise_deployment_spec::request_spec::ContainerSpec,
+    route_specs: &[rise_deployment_spec::request_spec::RouteSpec],
     primary_hosts: &[String],
 ) -> Vec<String> {
     // No routable host → no router stamped → no service to query (mirrors the
@@ -147,7 +147,7 @@ pub(crate) fn service_names_for_spec(
     let base = container_builder::group_service_base(project, deployment_group, &spec.name);
     // Routes for this container, sorted longest-path-prefix-first — the SAME
     // ordering `render_traefik_labels_for` uses to index per-route services.
-    let mut routes: Vec<&crate::server::deployment::models::RouteSpec> = route_specs
+    let mut routes: Vec<&rise_deployment_spec::request_spec::RouteSpec> = route_specs
         .iter()
         .filter(|r| r.container == spec.name)
         .collect();
@@ -278,8 +278,8 @@ pub(crate) fn rolling_rotation_decision(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::deployment::controller::docker::diff::diff_desired_vs_actual;
-    use crate::server::deployment::controller::docker::test_helpers::*;
+    use crate::diff::diff_desired_vs_actual;
+    use crate::test_helpers::*;
 
     #[test]
     fn rolling_throttle_running_drifted_emits_exactly_one_recreate() {
@@ -507,7 +507,7 @@ mod tests {
 
     #[test]
     fn service_names_for_spec_single_route_is_bare_base() {
-        use crate::server::deployment::models::{ContainerSpec, RouteSpec};
+        use rise_deployment_spec::request_spec::{ContainerSpec, RouteSpec};
         let spec = ContainerSpec {
             name: "app".to_string(),
             image: None,
@@ -536,7 +536,7 @@ mod tests {
 
     #[test]
     fn service_names_for_spec_multi_route_uses_per_route_indices() {
-        use crate::server::deployment::models::{ContainerSpec, RouteSpec};
+        use rise_deployment_spec::request_spec::{ContainerSpec, RouteSpec};
         let spec = ContainerSpec {
             name: "api".to_string(),
             image: None,
@@ -583,8 +583,8 @@ mod tests {
         // The reconciler-side derivation must agree with the builder-side
         // `group_service_names` (the labels) for the same routes — single AND
         // multi-route — so the lookup never drifts from what's stamped.
-        use crate::server::deployment::models::{ContainerSpec, RouteSpec};
         use container_builder::{group_service_names, DesiredRoute};
+        use rise_deployment_spec::request_spec::{ContainerSpec, RouteSpec};
 
         let mk_desired = |container: &str, paths: &[&str]| {
             let mut d = desired(container, "img:1", "h1");
@@ -634,7 +634,7 @@ mod tests {
 
     #[test]
     fn service_names_for_spec_worker_has_no_services() {
-        use crate::server::deployment::models::ContainerSpec;
+        use rise_deployment_spec::request_spec::ContainerSpec;
         let worker = ContainerSpec {
             name: "worker".to_string(),
             image: None,
@@ -656,7 +656,7 @@ mod tests {
         // non-empty host set), so the reconciler must query NO service — otherwise
         // it would hit `serverStatus` for a service Traefik never registered and
         // log a misleading WARN every tick. Mirrors `render_traefik_labels_for`.
-        use crate::server::deployment::models::{ContainerSpec, RouteSpec};
+        use rise_deployment_spec::request_spec::{ContainerSpec, RouteSpec};
         let spec = ContainerSpec {
             name: "app".to_string(),
             image: None,

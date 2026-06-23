@@ -25,12 +25,11 @@ pub mod traefik_api;
 #[cfg(test)]
 mod test_helpers;
 
-use super::{DeploymentBackend, DeploymentUrls};
-use crate::db::models::{Deployment, Project};
 use anyhow::Result;
 use async_trait::async_trait;
 use bollard::Docker;
-use rise_backend_core::{DeploymentStore, DeploymentUrlBuilder};
+use rise_backend_core::models::{Deployment, Project};
+use rise_backend_core::{DeploymentBackend, DeploymentStore, DeploymentUrlBuilder, DeploymentUrls};
 use std::sync::Arc;
 
 /// Slim Docker backend wrapping a bollard client + `DeploymentUrlBuilder`.
