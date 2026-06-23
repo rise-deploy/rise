@@ -21,6 +21,7 @@ pub mod runtime;
 pub mod state_machine;
 pub mod store;
 pub mod system_env;
+pub mod token_ttl;
 pub mod url_builder;
 
 pub use access::AccessRequirement;
@@ -36,4 +37,5 @@ pub use runtime::{
 };
 pub use store::DeploymentStore;
 pub use system_env::rise_system_env_vars;
+pub use token_ttl::{refresh_due_after_secs, remint_after_secs};
 pub use url_builder::{DeploymentUrlBuilder, IngressUrl};

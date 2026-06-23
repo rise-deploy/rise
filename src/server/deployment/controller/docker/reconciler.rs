@@ -1491,12 +1491,12 @@ impl DockerReconciler {
             deployment_group: &deployment.deployment_group,
             deployment_id: &deployment.deployment_id,
         };
-        crate::server::workload_tokens::sign_audience_tokens(
+        Ok(crate::server::workload_tokens::sign_audience_tokens(
             &self.jwt_signer,
             &info,
             &safe,
             self.identity_token_ttl_seconds,
-        )
+        )?)
     }
 
     /// Re-mint and re-upload the `[identity]` token files for long-running
