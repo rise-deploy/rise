@@ -17,6 +17,9 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
 2. [Authentication & Token Exchange](#workstream-2--authentication--token-exchange)
    — Centralized JWT verify, `POST /api/v1/auth/token` exchange, snap-
    decision middleware, removal of the legacy in-handler verification path.
+3. [Codebase Decomposition into Crates](#workstream-3--codebase-decomposition-into-crates)
+   — Carve the deployment backends (Docker, Kubernetes) out of the
+   monolithic `rise-deploy` crate behind the `DeploymentStore` seam.
 
 ---
 
@@ -660,6 +663,159 @@ Listed so they don't fall out of the plan; not currently sequenced.
   (unauthenticated by design). Treat as tier-1 with its own SLO/alerting;
   CLI should retry on 5xx via existing `token_with_retry`. Decide where
   the SLO lives (operator docs vs. SRE-internal).
+
+---
+
+# Workstream 3 — Codebase Decomposition into Crates
+
+## The arc
+
+`rise-deploy` is a single large crate carrying the CLI, the HTTP server, and
+both deployment backends (Kubernetes and Docker). The deployment backends are
+the headline target: they live in `src/server/deployment/controller/`, but reach
+deep into the crate's internals — `settings` types, `db::models`, ~22 `db_*`
+helpers, `resource_builder`, the `DeploymentBackend` trait, and the
+registry/encryption provider traits — while `rise-deploy` itself constructs and
+registers them. A naive `rise-backend-docker` crate would therefore be a
+**circular dependency** (issue [#377](https://github.com/rise-deploy/rise/issues/377),
+follow-up from [#358](https://github.com/rise-deploy/rise/pull/358)).
+
+The principle: extract the **shared contracts** into pure support crates first
+(no DB connection, no circular edge), express the database as a **trait** that
+lives in core and is *implemented* in `rise-deploy` over SQLX, and only then move
+each controller out to depend on core alone. `rise-deploy` keeps the
+`DeploymentStore` impl, constructs the backends, and registers them. Re-exports
+from `rise-deploy` keep the blast radius of each move small. The
+workspace-with-SQLX-in-a-subcrate pattern is already precedented by
+`rise-resource-store`, `rise-runtime-sync`, and `rise-backend-auth`.
+
+This is in-process decomposition. It is deliberately aligned with — but does not
+require — Workstream 1's out-of-process controller direction: the
+`DeploymentStore` trait is the same seam an external controller would cross over
+the wire, so this workstream front-loads that boundary without committing to a
+network hop.
+
+Phases:
+
+- **Phase 0 — Shared-contract crates** (shipped). The support crates the
+  backends depend on, including the `DeploymentStore` trait — the DB boundary.
+- **Phase 1 — Extract `rise-backend-docker`.** Move the Docker controller out
+  behind core, routing its DB access through `DeploymentStore`.
+- **Phase 2 — Extract `rise-backend-kubernetes`.** Same treatment for the K8s
+  controller, reusing the seam Phase 1 hardened.
+- **Phase 3 — Thin the seam (forward-looking).** Collapse the in-tree re-export
+  shims, and decide whether the `DeploymentStore` boundary graduates to the
+  out-of-process controller transport (hands off to Workstream 1 Phase C).
+
+## Dependency rules
+
+- **Phase 0 → Phase 1/2.** Both controller extractions depend on core's
+  contracts and the `DeploymentStore` trait being in place. ✅ satisfied.
+- **Phase 1 → Phase 2.** Not a hard code dependency, but Docker goes first
+  deliberately: it is the smaller, newer controller, so it shakes out the
+  shared-surface gaps (resource_builder, webhook notifications, settings types)
+  cheaply before the K8s controller — the larger blast radius — follows.
+- **`DeploymentStore` consumption precedes the move.** A controller cannot move
+  to its own crate while it still imports `crate::db::*` helpers directly; it
+  must first route every DB call through the trait. Do this *in-tree* (still
+  inside `rise-deploy`, no behavior change) so the move itself is a near-pure
+  file relocation.
+- **WS1 A9 (`rise-resource-client`) → Phase 3 transport.** Only relevant if the
+  seam graduates to a network boundary; in-process extraction needs none of it.
+
+## Phase 0 — Shared-contract crates (shipped)
+
+- [x] **`crates/rise-deployment-spec`** — the deployment specification and
+  project-config model: `project_config`, `request_spec` (`ContainerSpec`,
+  `RouteSpec`, `EnvOverride`, `HealthCheckSpec`), `side_data`, `validation`.
+  Pure types shared by the CLI, server, and backends.
+- [x] **`crates/rise-runtime-sync`** ([PR #362](https://github.com/rise-deploy/rise/pull/362))
+  — Postgres-backed cross-replica primitives (`GlobalLock`, `LeaderElection`,
+  `GlobalSchedule`) the controllers' reconcile loops run under. Owns its
+  migrations in an isolated `runtime_sync` schema.
+- [x] **`crates/rise-backend-core`** ([PR #380](https://github.com/rise-deploy/rise/pull/380))
+  — the dependency seam between `rise-deploy` and the backends: `models` (the
+  SQLX row structs), the `DeploymentBackend` trait + `DeploymentUrls`, the
+  registry/encryption provider traits, pure `quantity`/`state_machine` helpers,
+  and the **`DeploymentStore` trait** (23 methods) implemented by
+  `PgDeploymentStore` in `src/db/deployment_store.rs`. The in-tree
+  `deployment::quantity` / `deployment::state_machine` modules are now
+  re-export shims over core.
+
+## Phase 1 — Extract `rise-backend-docker`
+
+The controller lives in `src/server/deployment/controller/docker.rs` +
+`docker/` and still imports `rise-deploy` internals. The extraction is two
+movements — first finish the seam in-tree, then relocate.
+
+- [ ] **PR 1A — Route the Docker controller's DB access through
+  `DeploymentStore`.** Replace direct `db_deployments` / `db_env_vars` /
+  `db_environments` / `db_projects` / `db_custom_domains` calls in the
+  controller with trait calls. No crate move yet; behavior-preserving. This is
+  the bulk of the cost.
+- [ ] **PR 1B — Relocate the remaining shared surface** the controller pulls
+  from `crate::server` into core (or a new shared crate), with re-export shims
+  left behind:
+  - `deployment::resource_builder::ResourceBuilder` (desired-state construction)
+  - `deployment::webhook` notification types
+  - the `settings` types the backends read (`AccessRequirement`, …)
+  - `workload_tokens::{sha256_hex, workload_subject, NO_ENVIRONMENT}`
+  - confirm `db::models::{Deployment, Project, …}` resolve to `core::models` as
+    the canonical home.
+- [ ] **PR 1C — Create `crates/rise-backend-docker`.** Move the controller into
+  the new crate depending only on `core` + `deployment-spec`. `rise-deploy`
+  depends on it, supplies the `DeploymentStore` impl, and constructs/registers
+  the backend.
+
+**Parity note:** the Docker/Kubernetes split is a refactor, not a feature
+change — no public API surface (`rise.toml`, settings, HTTP) changes, so the
+[deployment-backends feature matrix](docs/engineering/src/content/docs/deployment-backends.md)
+should be unaffected. Confirm this holds at review time.
+
+## Phase 2 — Extract `rise-backend-kubernetes`
+
+- [ ] **PR 2A — Route the K8s controller's DB access through
+  `DeploymentStore`** (mirror of 1A; larger surface).
+- [ ] **PR 2B — Create `crates/rise-backend-kubernetes`.** Move
+  `controller/kubernetes.rs` and the K8s-specific resource-builder/CRD wiring
+  into the new crate. The shared surface relocated in 1B should already cover
+  most of what it needs; close any remaining gaps the same way.
+
+## Phase 3 — Thin the seam (forward-looking)
+
+- [ ] **Collapse the re-export shims** left by Phases 1–2 once all in-tree
+  references have migrated to the crate paths, per the "describe what the code
+  does now" guideline.
+- [ ] **Decide the seam's future.** Either the `DeploymentStore` boundary stays
+  an in-process trait, or it graduates to the out-of-process controller
+  transport — at which point this folds into Workstream 1 Phase C
+  (`rise-k8s-controller` over `rise-resource-client`). Resolve when C1 is
+  planned; until then the in-process trait is the supported shape.
+
+## Verification
+
+- **Per PR** — `cargo fmt --all` + `cargo clippy --workspace --all-features
+  --all-targets -- -D warnings` + `cargo test --workspace --all-features`.
+  Each extraction PR must be **behavior-preserving**: the `rise-e2e` matrix
+  (public-deploy, health-rolling cutover, workload-identity on both backends)
+  must stay green with no scenario newly `Skip`ped.
+- **Phase 1 done** — the Docker controller compiles and runs from
+  `rise-backend-docker` with no `crate::db::*` or `crate::server::*` imports;
+  `rise-deploy` reaches it only through `core` traits + construction.
+- **Phase 2 done** — same for `rise-backend-kubernetes`; the only crate
+  depending on both backend crates is `rise-deploy`, which supplies the
+  `DeploymentStore` impl and nothing backend-specific.
+
+## Open questions
+
+- **Where does relocated `settings` live?** The backends read a handful of
+  settings types (`AccessRequirement`, resource defaults). Options: move them
+  into `core`, or a thin `rise-backend-settings`. Leaning `core` to avoid crate
+  sprawl unless the type graph forces a split.
+- **One `rise-backend-*` per runtime, or a shared `controller` crate?** Docker
+  and K8s share reconcile scaffolding (rolling logic, health gating). Decide
+  whether that lives in `core` or a sibling crate both backends depend on,
+  rather than being duplicated.
 
 ---
 
