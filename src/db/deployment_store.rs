@@ -159,4 +159,8 @@ impl DeploymentStore for PgDeploymentStore {
         )
         .await
     }
+
+    async fn set_identity_credential_hash(&self, id: Uuid, hash: &str) -> Result<()> {
+        crate::db::deployments::set_identity_credential_hash(&self.pool, id, hash).await
+    }
 }

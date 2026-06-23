@@ -16,6 +16,7 @@ use bollard::Docker;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use rise_backend_auth::{RiseTokenSigner, WorkloadSubjectInfo};
+use rise_backend_core::DeploymentStore;
 use rise_runtime_sync::{
     with_leader_election, LeaderElection, LeaderStatus, LeaseError, LEASE_DURATION,
 };
@@ -44,12 +45,6 @@ use crate::server::deployment::webhook::{
 use crate::server::encryption::EncryptionProvider;
 use crate::server::registry::RegistryProvider;
 use crate::server::workload_tokens::{sha256_hex, workload_subject, NO_ENVIRONMENT};
-
-use crate::db::custom_domains as db_custom_domains;
-use crate::db::deployments as db_deployments;
-use crate::db::env_vars as db_env_vars;
-use crate::db::environments as db_environments;
-use crate::db::projects as db_projects;
 
 /// Controller HARD cap on the number of replicas the Docker backend will run for
 /// a single container spec. A single-host daemon can run many containers behind
@@ -126,6 +121,11 @@ pub struct ReconcilerConfig {
 /// the DB on each tick.
 pub struct DockerReconciler {
     docker: Docker,
+    /// Deployment-state database access through the backend-agnostic seam.
+    store: Arc<dyn DeploymentStore>,
+    /// Connection pool, retained solely for leader election
+    /// (`with_leader_election`); all deployment-state access goes through
+    /// [`Self::store`].
     db_pool: PgPool,
     resource_builder: Arc<ResourceBuilder>,
     registry_provider: Arc<dyn RegistryProvider>,
@@ -181,6 +181,7 @@ impl DockerReconciler {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         docker: Docker,
+        store: Arc<dyn DeploymentStore>,
         db_pool: PgPool,
         resource_builder: Arc<ResourceBuilder>,
         registry_provider: Arc<dyn RegistryProvider>,
@@ -210,6 +211,7 @@ impl DockerReconciler {
             .and_then(super::traefik_api::TraefikApiClient::new);
         Self {
             docker,
+            store,
             db_pool,
             resource_builder,
             registry_provider,
@@ -318,7 +320,7 @@ impl DockerReconciler {
     /// are skipped entirely — neither reconciled nor GC'd. This mirrors the K8s
     /// webhook's `enforce_controller_class`.
     async fn tick(&self, election: &LeaderElection) -> Result<()> {
-        let projects = db_projects::list(&self.db_pool, None).await?;
+        let projects = self.store.list_projects(None).await?;
         // Memoize org_uid → controller-class for the duration of this tick so N
         // projects sharing one Organization don't each trigger a store read.
         let mut org_class_cache: HashMap<uuid::Uuid, Option<String>> = HashMap::new();
@@ -411,9 +413,7 @@ impl DockerReconciler {
         project: &Project,
         org_class_cache: &mut HashMap<uuid::Uuid, Option<String>>,
     ) -> Result<bool> {
-        let org_uid =
-            crate::db::organization_links::organization_uid_for_project(&self.db_pool, project.id)
-                .await?;
+        let org_uid = self.store.organization_uid_for_project(project.id).await?;
         let Some(org_uid) = org_uid else {
             // No Organization linkage — bootstrap should have backfilled this.
             // Treat as not-owned so we never GC containers for an unlinked
@@ -458,8 +458,10 @@ impl DockerReconciler {
     }
 
     async fn reconcile_project(&self, project: &Project, election: &LeaderElection) -> Result<()> {
-        let non_terminal =
-            db_deployments::list_non_terminal_for_project(&self.db_pool, project.id).await?;
+        let non_terminal = self
+            .store
+            .list_non_terminal_deployments_for_project(project.id)
+            .await?;
 
         // 1. Status transitions (port of webhook::perform_status_transitions).
         // Isolate per-deployment so one transient DB-write error can't abort the
@@ -474,8 +476,10 @@ impl DockerReconciler {
         }
         // Re-read after transitions so the desired set reflects status changes
         // (e.g. Pushed → Deploying).
-        let non_terminal =
-            db_deployments::list_non_terminal_for_project(&self.db_pool, project.id).await?;
+        let non_terminal = self
+            .store
+            .list_non_terminal_deployments_for_project(project.id)
+            .await?;
 
         // 2. Compute desired containers across all infra-bearing deployments.
         // Track deployments whose desired computation FAILED this tick: their
@@ -571,8 +575,10 @@ impl DockerReconciler {
         }
 
         // 4. Health → status (probe routable containers, transition).
-        let non_terminal =
-            db_deployments::list_non_terminal_for_project(&self.db_pool, project.id).await?;
+        let non_terminal = self
+            .store
+            .list_non_terminal_deployments_for_project(project.id)
+            .await?;
         // Memoize Traefik `serverStatus` per service for THIS reconcile pass:
         // during a rollout a group has 2+ non-terminal deployments sharing one
         // group-scoped service, so without this each `reconcile_health` would
@@ -616,8 +622,12 @@ impl DockerReconciler {
                         PRE_PUSHED_TIMEOUT_MINUTES, deployment.status
                     );
                     warn!(deployment_id = %deployment.deployment_id, "{}", msg);
-                    db_deployments::mark_failed(&self.db_pool, deployment.id, &msg).await?;
-                    db_projects::update_calculated_status(&self.db_pool, project.id).await?;
+                    self.store
+                        .mark_deployment_failed(deployment.id, &msg)
+                        .await?;
+                    self.store
+                        .update_project_calculated_status(project.id)
+                        .await?;
                 }
             }
             DeploymentStatus::Cancelling => {
@@ -625,8 +635,10 @@ impl DockerReconciler {
                     deployment_id = %deployment.deployment_id,
                     "Cancelling deployment — marking as Cancelled"
                 );
-                db_deployments::mark_cancelled(&self.db_pool, deployment.id).await?;
-                db_projects::update_calculated_status(&self.db_pool, project.id).await?;
+                self.store.mark_deployment_cancelled(deployment.id).await?;
+                self.store
+                    .update_project_calculated_status(project.id)
+                    .await?;
             }
             DeploymentStatus::Terminating => {
                 self.complete_termination(project, deployment).await?;
@@ -636,13 +648,12 @@ impl DockerReconciler {
                     deployment_id = %deployment.deployment_id,
                     "Deployment image pushed, transitioning to Deploying"
                 );
-                db_deployments::update_status(
-                    &self.db_pool,
-                    deployment.id,
-                    DeploymentStatus::Deploying,
-                )
-                .await?;
-                db_projects::update_calculated_status(&self.db_pool, project.id).await?;
+                self.store
+                    .update_deployment_status(deployment.id, DeploymentStatus::Deploying)
+                    .await?;
+                self.store
+                    .update_project_calculated_status(project.id)
+                    .await?;
             }
             DeploymentStatus::Deploying => {
                 if let Some(started) = deployment.deploying_started_at {
@@ -653,8 +664,12 @@ impl DockerReconciler {
                             elapsed.num_seconds()
                         );
                         warn!(deployment_id = %deployment.deployment_id, "{}", msg);
-                        db_deployments::mark_failed(&self.db_pool, deployment.id, &msg).await?;
-                        db_projects::update_calculated_status(&self.db_pool, project.id).await?;
+                        self.store
+                            .mark_deployment_failed(deployment.id, &msg)
+                            .await?;
+                        self.store
+                            .update_project_calculated_status(project.id)
+                            .await?;
                     }
                 }
             }
@@ -673,13 +688,12 @@ impl DockerReconciler {
                     deployment_id = %deployment.deployment_id,
                     "Deployment has expired, marking as Terminating"
                 );
-                db_deployments::mark_terminating(
-                    &self.db_pool,
-                    deployment.id,
-                    TerminationReason::Expired,
-                )
-                .await?;
-                db_projects::update_calculated_status(&self.db_pool, project.id).await?;
+                self.store
+                    .mark_deployment_terminating(deployment.id, TerminationReason::Expired)
+                    .await?;
+                self.store
+                    .update_project_calculated_status(project.id)
+                    .await?;
             }
         }
 
@@ -690,33 +704,35 @@ impl DockerReconciler {
     async fn complete_termination(&self, project: &Project, deployment: &Deployment) -> Result<()> {
         match deployment.termination_reason {
             Some(TerminationReason::Superseded) => {
-                db_deployments::mark_superseded(&self.db_pool, deployment.id).await?;
+                self.store.mark_deployment_superseded(deployment.id).await?;
             }
             Some(TerminationReason::UserStopped) => {
-                db_deployments::mark_stopped(&self.db_pool, deployment.id).await?;
+                self.store.mark_deployment_stopped(deployment.id).await?;
             }
             Some(TerminationReason::Expired) => {
-                db_deployments::mark_expired(&self.db_pool, deployment.id).await?;
+                self.store.mark_deployment_expired(deployment.id).await?;
             }
             Some(TerminationReason::Failed) => {
-                db_deployments::mark_failed(
-                    &self.db_pool,
-                    deployment.id,
-                    deployment
-                        .error_message
-                        .as_deref()
-                        .unwrap_or("Deployment failed"),
-                )
-                .await?;
+                self.store
+                    .mark_deployment_failed(
+                        deployment.id,
+                        deployment
+                            .error_message
+                            .as_deref()
+                            .unwrap_or("Deployment failed"),
+                    )
+                    .await?;
             }
             Some(TerminationReason::Cancelled) => {
-                db_deployments::mark_cancelled(&self.db_pool, deployment.id).await?;
+                self.store.mark_deployment_cancelled(deployment.id).await?;
             }
             None => {
-                db_deployments::mark_stopped(&self.db_pool, deployment.id).await?;
+                self.store.mark_deployment_stopped(deployment.id).await?;
             }
         }
-        db_projects::update_calculated_status(&self.db_pool, project.id).await?;
+        self.store
+            .update_project_calculated_status(project.id)
+            .await?;
         // The container itself is GC'd on the next diff pass (no longer in the
         // desired set once the deployment is terminal).
         Ok(())
@@ -753,14 +769,13 @@ impl DockerReconciler {
 
         // Environment context.
         let environment = if let Some(env_id) = deployment.environment_id {
-            db_environments::find_by_id(&self.db_pool, env_id).await?
+            self.store.find_environment(env_id).await?
         } else {
             None
         };
         let env_name = environment.as_ref().map(|e| e.name.clone());
-        let all_environments = db_environments::list_for_project(&self.db_pool, project.id).await?;
-        let custom_domains =
-            db_custom_domains::list_project_custom_domains(&self.db_pool, project.id).await?;
+        let all_environments = self.store.list_environments_for_project(project.id).await?;
+        let custom_domains = self.store.list_project_custom_domains(project.id).await?;
 
         // URLs (drives Traefik hosts + RISE_* system env vars).
         let urls = self.resource_builder.compute_deployment_urls(
@@ -788,8 +803,7 @@ impl DockerReconciler {
 
         // Env vars: plain + decrypted secret (merged into plain — Docker has no
         // secret concept) + system env vars.
-        let raw_env_vars =
-            db_env_vars::list_deployment_env_vars(&self.db_pool, deployment.id).await?;
+        let raw_env_vars = self.store.list_deployment_env_vars(deployment.id).await?;
         let resolved =
             resolve_deployment_env_vars(raw_env_vars, self.encryption_provider.as_deref()).await?;
 
@@ -816,7 +830,8 @@ impl DockerReconciler {
         // Resolve the deployment's base image (used for the synthesised `app`).
         let source_deployment_id =
             if let Some(source_id) = deployment.rolled_back_from_deployment_id {
-                db_deployments::find_by_id(&self.db_pool, source_id)
+                self.store
+                    .find_deployment(source_id)
                     .await?
                     .map(|d| d.deployment_id)
             } else {
@@ -1308,10 +1323,7 @@ impl DockerReconciler {
             if !identity.read_back {
                 if let Ok(uuid) = Uuid::parse_str(&desired.deployment_uuid) {
                     let hash = sha256_hex(identity.credential.as_bytes());
-                    if let Err(e) =
-                        db_deployments::set_identity_credential_hash(&self.db_pool, uuid, &hash)
-                            .await
-                    {
+                    if let Err(e) = self.store.set_identity_credential_hash(uuid, &hash).await {
                         warn!(
                             container = %built.name,
                             "Failed to persist identity credential hash after delivery: {:?}", e
@@ -1398,7 +1410,8 @@ impl DockerReconciler {
         if read_back {
             let hash = sha256_hex(credential.as_bytes());
             if deployment.identity_credential_hash.as_deref() != Some(hash.as_str()) {
-                db_deployments::set_identity_credential_hash(&self.db_pool, deployment.id, &hash)
+                self.store
+                    .set_identity_credential_hash(deployment.id, &hash)
                     .await
                     .context("Failed to persist identity credential hash")?;
             }
@@ -1665,12 +1678,10 @@ impl DockerReconciler {
             }
             if all_delivered {
                 let hash = sha256_hex(prepared.credential.as_bytes());
-                if let Err(e) = db_deployments::set_identity_credential_hash(
-                    &self.db_pool,
-                    deployment.id,
-                    &hash,
-                )
-                .await
+                if let Err(e) = self
+                    .store
+                    .set_identity_credential_hash(deployment.id, &hash)
+                    .await
                 {
                     warn!(deployment_id = %deployment.deployment_id, "Identity remediation: failed to persist hash: {:?}", e);
                 } else if !prepared.tokens.is_empty() {
@@ -1702,9 +1713,7 @@ impl DockerReconciler {
     /// case), shared by identity preparation and refresh.
     async fn resolve_environment_name(&self, deployment: &Deployment) -> Result<Option<String>> {
         match deployment.environment_id {
-            Some(env_id) => Ok(db_environments::find_by_id(&self.db_pool, env_id)
-                .await?
-                .map(|e| e.name)),
+            Some(env_id) => Ok(self.store.find_environment(env_id).await?.map(|e| e.name)),
             None => Ok(None),
         }
     }
@@ -1837,13 +1846,12 @@ impl DockerReconciler {
         deployment: &Deployment,
     ) -> Result<Vec<String>> {
         let environment = if let Some(env_id) = deployment.environment_id {
-            db_environments::find_by_id(&self.db_pool, env_id).await?
+            self.store.find_environment(env_id).await?
         } else {
             None
         };
-        let all_environments = db_environments::list_for_project(&self.db_pool, project.id).await?;
-        let custom_domains =
-            db_custom_domains::list_project_custom_domains(&self.db_pool, project.id).await?;
+        let all_environments = self.store.list_environments_for_project(project.id).await?;
+        let custom_domains = self.store.list_project_custom_domains(project.id).await?;
         Ok(self
             .resource_builder
             .primary_ingress_hosts(
@@ -2106,9 +2114,10 @@ impl DockerReconciler {
         // existing status APIs/UI render unchanged. Built from the per-replica
         // inspections captured above (no second inspect).
         let metadata = build_controller_metadata(&pods, &deployment.status, is_ready);
-        if let Err(e) =
-            db_deployments::update_controller_metadata(&self.db_pool, deployment.id, &metadata)
-                .await
+        if let Err(e) = self
+            .store
+            .update_deployment_controller_metadata(deployment.id, &metadata)
+            .await
         {
             warn!(
                 deployment_id = %deployment.deployment_id,
@@ -2130,17 +2139,22 @@ impl DockerReconciler {
                     deployment_id = %deployment.deployment_id,
                     "Healthy deployment is now unhealthy: {unhealthy_reason}"
                 );
-                db_deployments::mark_unhealthy(&self.db_pool, deployment.id, unhealthy_reason)
+                self.store
+                    .mark_deployment_unhealthy(deployment.id, unhealthy_reason)
                     .await?;
-                db_projects::update_calculated_status(&self.db_pool, project.id).await?;
+                self.store
+                    .update_project_calculated_status(project.id)
+                    .await?;
             }
             DeploymentStatus::Unhealthy if is_ready => {
                 info!(
                     deployment_id = %deployment.deployment_id,
                     "Unhealthy deployment has recovered, marking as Healthy"
                 );
-                db_deployments::mark_healthy(&self.db_pool, deployment.id).await?;
-                db_projects::update_calculated_status(&self.db_pool, project.id).await?;
+                self.store.mark_deployment_healthy(deployment.id).await?;
+                self.store
+                    .update_project_calculated_status(project.id)
+                    .await?;
             }
             _ => {}
         }
@@ -2362,14 +2376,12 @@ impl DockerReconciler {
         project: &Project,
         deployment: &Deployment,
     ) -> Result<()> {
-        let active_in_group = db_deployments::find_active_for_project_and_group(
-            &self.db_pool,
-            project.id,
-            &deployment.deployment_group,
-        )
-        .await?;
+        let active_in_group = self
+            .store
+            .find_active_deployment_for_project_and_group(project.id, &deployment.deployment_group)
+            .await?;
 
-        db_deployments::mark_healthy(&self.db_pool, deployment.id).await?;
+        self.store.mark_deployment_healthy(deployment.id).await?;
 
         if let Some(old_active) = active_in_group {
             if old_active.id != deployment.id && !state_machine::is_terminal(&old_active.status) {
@@ -2377,21 +2389,19 @@ impl DockerReconciler {
                     "Deployment {} replacing {} in group '{}', marking old as Terminating",
                     deployment.deployment_id, old_active.deployment_id, deployment.deployment_group
                 );
-                db_deployments::mark_terminating(
-                    &self.db_pool,
-                    old_active.id,
-                    TerminationReason::Superseded,
-                )
-                .await?;
+                self.store
+                    .mark_deployment_terminating(old_active.id, TerminationReason::Superseded)
+                    .await?;
             }
         }
 
-        let others = db_deployments::find_non_terminal_for_project_and_group(
-            &self.db_pool,
-            project.id,
-            &deployment.deployment_group,
-        )
-        .await?;
+        let others = self
+            .store
+            .find_non_terminal_deployments_for_project_and_group(
+                project.id,
+                &deployment.deployment_group,
+            )
+            .await?;
         for other in others {
             if other.id != deployment.id
                 && state_machine::is_active(&other.status)
@@ -2401,23 +2411,18 @@ impl DockerReconciler {
                     "Cleaning up non-active deployment {} in group '{}', marking as Terminating",
                     other.deployment_id, deployment.deployment_group
                 );
-                db_deployments::mark_terminating(
-                    &self.db_pool,
-                    other.id,
-                    TerminationReason::Superseded,
-                )
-                .await?;
+                self.store
+                    .mark_deployment_terminating(other.id, TerminationReason::Superseded)
+                    .await?;
             }
         }
 
-        db_deployments::mark_as_active(
-            &self.db_pool,
-            deployment.id,
-            project.id,
-            &deployment.deployment_group,
-        )
-        .await?;
-        db_projects::update_calculated_status(&self.db_pool, project.id).await?;
+        self.store
+            .mark_deployment_as_active(deployment.id, project.id, &deployment.deployment_group)
+            .await?;
+        self.store
+            .update_project_calculated_status(project.id)
+            .await?;
         Ok(())
     }
 }

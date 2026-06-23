@@ -418,10 +418,10 @@ async fn init_docker_backend(
     // Connect bollard.
     let docker = client::connect(docker_host.as_deref())?;
 
-    let store = Arc::new(crate::db::deployment_store::PgDeploymentStore::new(
-        db_pool.clone(),
-    ));
-    let backend = DockerBackend::new(docker.clone(), resource_builder.clone(), store);
+    let store: Arc<dyn rise_backend_core::DeploymentStore> = Arc::new(
+        crate::db::deployment_store::PgDeploymentStore::new(db_pool.clone()),
+    );
+    let backend = DockerBackend::new(docker.clone(), resource_builder.clone(), store.clone());
     backend.test_connection().await?;
     tracing::info!("Docker deployment backend initialized and connection tested");
 
@@ -522,6 +522,7 @@ async fn init_docker_backend(
 
     let reconciler = DockerReconciler::new(
         docker.clone(),
+        store,
         db_pool,
         resource_builder,
         registry_provider,
