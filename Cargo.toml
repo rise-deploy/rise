@@ -103,6 +103,7 @@ backend = [
     "dep:serde_yaml",
     "dep:tokio-tungstenite",
     "rise-deployment-spec/schema",
+    "rise-backend-core/schema",
     # Kubernetes (former "k8s" feature)
     "dep:kube",
     "dep:k8s-openapi",

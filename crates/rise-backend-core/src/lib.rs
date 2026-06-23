@@ -9,15 +9,21 @@
 //! It never opens a database connection or runs a query; `sqlx` is a dependency
 //! only for the `FromRow`/`Type` derives on the moved models.
 
+pub mod access;
 pub mod backend;
+pub mod group;
 pub mod models;
 pub mod providers;
 pub mod quantity;
 pub mod state_machine;
 pub mod store;
+pub mod system_env;
 
+pub use access::AccessRequirement;
 pub use backend::{DeploymentBackend, DeploymentUrls};
+pub use group::{normalize_deployment_group, DEFAULT_DEPLOYMENT_GROUP};
 pub use providers::{
     EncryptionProvider, ImageTagType, RegistryAuthMethod, RegistryCredentials, RegistryProvider,
 };
 pub use store::DeploymentStore;
+pub use system_env::rise_system_env_vars;

@@ -37,7 +37,7 @@
       "type": "object"
     },
     "AccessRequirement": {
-      "description": "Access requirement level for project ingress",
+      "description": "Access requirement level for project ingress.",
       "oneOf": [
         {
           "const": "None",

@@ -7,10 +7,17 @@ repository = "https://github.com/rise-deploy/rise"
 description = "Shared deployment-backend contracts for Rise (models, traits, URL/quantity helpers)"
 publish = false
 
+[features]
+default = []
+# Enables `schemars::JsonSchema` derives on the shared settings types so
+# `rise-deploy` can include them in the generated backend-config schema.
+schema = ["dep:schemars"]
+
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
+schemars = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Only for `#[derive(sqlx::FromRow)]` / `#[derive(sqlx::Type)]` on the moved
