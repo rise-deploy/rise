@@ -11,7 +11,9 @@
 
 pub mod access;
 pub mod backend;
+pub mod custom_domain;
 pub mod group;
+pub mod identity;
 pub mod models;
 pub mod providers;
 pub mod quantity;
@@ -19,9 +21,11 @@ pub mod runtime;
 pub mod state_machine;
 pub mod store;
 pub mod system_env;
+pub mod url_builder;
 
 pub use access::AccessRequirement;
 pub use backend::{DeploymentBackend, DeploymentUrls};
+pub use custom_domain::validate_custom_domain;
 pub use group::{normalize_deployment_group, DEFAULT_DEPLOYMENT_GROUP};
 pub use providers::{
     EncryptionProvider, ImageTagType, RegistryAuthMethod, RegistryCredentials, RegistryProvider,
@@ -32,3 +36,4 @@ pub use runtime::{
 };
 pub use store::DeploymentStore;
 pub use system_env::rise_system_env_vars;
+pub use url_builder::{DeploymentUrlBuilder, IngressUrl};

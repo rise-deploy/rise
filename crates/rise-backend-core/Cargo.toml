@@ -17,6 +17,7 @@ schema = ["dep:schemars"]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
+regex = "1.11"
 rise-deployment-spec = { path = "../rise-deployment-spec" }
 schemars = { workspace = true, optional = true }
 serde = { workspace = true }

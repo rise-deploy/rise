@@ -1261,7 +1261,10 @@ async fn compute_desired_children(
 
     // 2. Image pull secret (if needed)
     if resource_builder.image_pull_secret_name.is_none()
-        && resource_builder.registry_provider.requires_pull_secret()
+        && resource_builder
+            .url_builder
+            .registry_provider
+            .requires_pull_secret()
     {
         if let Some(secret) =
             build_image_pull_secret(resource_builder, project, &namespace, observed).await?
@@ -1957,10 +1960,14 @@ async fn build_image_pull_secret(
 
     // Fetch fresh pull credentials (scoped to this project's repository)
     let credentials = resource_builder
+        .url_builder
         .registry_provider
         .get_k8s_pull_credentials(&project.name)
         .await?;
-    let registry_host = resource_builder.registry_provider.registry_host();
+    let registry_host = resource_builder
+        .url_builder
+        .registry_provider
+        .registry_host();
 
     let secret = resource_builder.create_dockerconfigjson_secret(
         IMAGE_PULL_SECRET_NAME,
@@ -2643,12 +2650,14 @@ mod tests {
 
     fn test_resource_builder() -> ResourceBuilder {
         ResourceBuilder {
-            production_ingress_url_template: "{project_name}.example.test".to_string(),
-            staging_ingress_url_template: None,
-            environment_ingress_url_template: None,
-            ingress_port: None,
-            ingress_schema: "https".to_string(),
-            registry_provider: Arc::new(TestRegistryProvider),
+            url_builder: rise_backend_core::DeploymentUrlBuilder {
+                production_ingress_url_template: "{project_name}.example.test".to_string(),
+                staging_ingress_url_template: None,
+                environment_ingress_url_template: None,
+                ingress_port: None,
+                ingress_schema: "https".to_string(),
+                registry_provider: Arc::new(TestRegistryProvider),
+            },
             auth_backend_url: "https://auth.example.test".to_string(),
             auth_signin_url: "https://signin.example.test".to_string(),
             backend_address: None,

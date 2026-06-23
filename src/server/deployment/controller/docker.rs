@@ -27,33 +27,32 @@ mod test_helpers;
 
 use super::{DeploymentBackend, DeploymentUrls};
 use crate::db::models::{Deployment, Project};
-use crate::server::deployment::resource_builder::ResourceBuilder;
 use anyhow::Result;
 use async_trait::async_trait;
 use bollard::Docker;
-use rise_backend_core::DeploymentStore;
+use rise_backend_core::{DeploymentStore, DeploymentUrlBuilder};
 use std::sync::Arc;
 
-/// Slim Docker backend wrapping a bollard client + `ResourceBuilder`.
+/// Slim Docker backend wrapping a bollard client + `DeploymentUrlBuilder`.
 ///
 /// Provides URL computation and environment cleanup for HTTP handlers.
 /// Reconciliation/health checks/termination run in
 /// [`reconciler::DockerReconciler`], spawned at startup (see `state.rs`).
 pub struct DockerBackend {
     docker: Docker,
-    resource_builder: Arc<ResourceBuilder>,
+    url_builder: Arc<DeploymentUrlBuilder>,
     store: Arc<dyn DeploymentStore>,
 }
 
 impl DockerBackend {
     pub fn new(
         docker: Docker,
-        resource_builder: Arc<ResourceBuilder>,
+        url_builder: Arc<DeploymentUrlBuilder>,
         store: Arc<dyn DeploymentStore>,
     ) -> Self {
         Self {
             docker,
-            resource_builder,
+            url_builder,
             store,
         }
     }
@@ -83,7 +82,7 @@ impl DeploymentBackend for DockerBackend {
         let all_environments = self.store.list_environments_for_project(project.id).await?;
         let custom_domains = self.store.list_project_custom_domains(project.id).await?;
 
-        Ok(self.resource_builder.compute_deployment_urls(
+        Ok(self.url_builder.compute_deployment_urls(
             project,
             deployment,
             environment.as_ref(),
@@ -100,7 +99,7 @@ impl DeploymentBackend for DockerBackend {
         let custom_domains = self.store.list_project_custom_domains(project.id).await?;
 
         Ok(self
-            .resource_builder
+            .url_builder
             .compute_project_urls(project, deployment_group, &custom_domains))
     }
 

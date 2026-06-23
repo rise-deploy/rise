@@ -36,7 +36,6 @@ use super::pod_status::build_controller_metadata;
 use super::rolling::{filter_rolling_actions, replica_ready, service_names_for_spec, ReadyVerdict};
 use crate::db::models::{Deployment, DeploymentStatus, Project, TerminationReason};
 use crate::server::deployment::models::rise_system_env_vars;
-use crate::server::deployment::resource_builder::ResourceBuilder;
 use crate::server::deployment::state_machine;
 use crate::server::deployment::webhook::{
     resolve_deployment_env_vars, resolve_runtime_containers, should_have_infrastructure,
@@ -45,6 +44,7 @@ use crate::server::deployment::webhook::{
 use crate::server::encryption::EncryptionProvider;
 use crate::server::registry::RegistryProvider;
 use crate::server::workload_tokens::{sha256_hex, workload_subject, NO_ENVIRONMENT};
+use rise_backend_core::DeploymentUrlBuilder;
 
 /// Controller HARD cap on the number of replicas the Docker backend will run for
 /// a single container spec. A single-host daemon can run many containers behind
@@ -127,7 +127,7 @@ pub struct DockerReconciler {
     /// (`with_leader_election`); all deployment-state access goes through
     /// [`Self::store`].
     db_pool: PgPool,
-    resource_builder: Arc<ResourceBuilder>,
+    url_builder: Arc<DeploymentUrlBuilder>,
     registry_provider: Arc<dyn RegistryProvider>,
     encryption_provider: Option<Arc<dyn EncryptionProvider>>,
     /// Resource store used to read each project's owning Organization so the
@@ -183,7 +183,7 @@ impl DockerReconciler {
         docker: Docker,
         store: Arc<dyn DeploymentStore>,
         db_pool: PgPool,
-        resource_builder: Arc<ResourceBuilder>,
+        url_builder: Arc<DeploymentUrlBuilder>,
         registry_provider: Arc<dyn RegistryProvider>,
         encryption_provider: Option<Arc<dyn EncryptionProvider>>,
         resource_store: Arc<dyn rise_resource_store::ResourceStore>,
@@ -213,7 +213,7 @@ impl DockerReconciler {
             docker,
             store,
             db_pool,
-            resource_builder,
+            url_builder,
             registry_provider,
             encryption_provider,
             resource_store,
@@ -778,7 +778,7 @@ impl DockerReconciler {
         let custom_domains = self.store.list_project_custom_domains(project.id).await?;
 
         // URLs (drives Traefik hosts + RISE_* system env vars).
-        let urls = self.resource_builder.compute_deployment_urls(
+        let urls = self.url_builder.compute_deployment_urls(
             project,
             deployment,
             environment.as_ref(),
@@ -786,7 +786,7 @@ impl DockerReconciler {
             &custom_domains,
         );
         let primary_hosts: Vec<String> = self
-            .resource_builder
+            .url_builder
             .primary_ingress_hosts(
                 project,
                 &deployment.deployment_group,
@@ -837,11 +837,9 @@ impl DockerReconciler {
             } else {
                 None
             };
-        let base_image = self.resource_builder.resolve_image(
-            project,
-            deployment,
-            source_deployment_id.as_deref(),
-        );
+        let base_image =
+            self.url_builder
+                .resolve_image(project, deployment, source_deployment_id.as_deref());
 
         // Every infra-bearing deployment is routable: both the old active and the
         // new Deploying deployment join the ONE group-scoped Traefik service and
@@ -1853,7 +1851,7 @@ impl DockerReconciler {
         let all_environments = self.store.list_environments_for_project(project.id).await?;
         let custom_domains = self.store.list_project_custom_domains(project.id).await?;
         Ok(self
-            .resource_builder
+            .url_builder
             .primary_ingress_hosts(
                 project,
                 &deployment.deployment_group,
