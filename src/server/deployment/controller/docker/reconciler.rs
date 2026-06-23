@@ -808,15 +808,15 @@ impl DockerReconciler {
             resolve_deployment_env_vars(raw_env_vars, self.encryption_provider.as_deref()).await?;
 
         let mut base_env: Vec<(String, String)> = Vec::new();
-        for ev in &resolved.plain_env_vars {
-            base_env.push((ev.name.clone(), ev.value.clone().unwrap_or_default()));
+        for (name, value) in &resolved.plain_env_vars {
+            base_env.push((name.clone(), value.clone()));
         }
         // Secret env vars become plain KEY=VALUE entries (documented caveat:
         // visible in `docker inspect`). They're included in the per-container
         // env hash below alongside plain + system vars so drift in any kind of
         // variable forces recreation.
         for (key, value) in &resolved.secret_env_vars {
-            let plain = String::from_utf8_lossy(&value.0).to_string();
+            let plain = String::from_utf8_lossy(value).to_string();
             base_env.push((key.clone(), plain));
         }
 

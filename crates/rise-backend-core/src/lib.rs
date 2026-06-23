@@ -15,6 +15,7 @@ pub mod group;
 pub mod models;
 pub mod providers;
 pub mod quantity;
+pub mod runtime;
 pub mod state_machine;
 pub mod store;
 pub mod system_env;
@@ -24,6 +25,10 @@ pub use backend::{DeploymentBackend, DeploymentUrls};
 pub use group::{normalize_deployment_group, DEFAULT_DEPLOYMENT_GROUP};
 pub use providers::{
     EncryptionProvider, ImageTagType, RegistryAuthMethod, RegistryCredentials, RegistryProvider,
+};
+pub use runtime::{
+    resolve_deployment_env_vars, resolve_runtime_containers, should_have_infrastructure,
+    ResolvedDeploymentEnvVars, DEPLOYING_TIMEOUT_MINUTES, PRE_PUSHED_TIMEOUT_MINUTES,
 };
 pub use store::DeploymentStore;
 pub use system_env::rise_system_env_vars;
