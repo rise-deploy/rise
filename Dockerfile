@@ -22,6 +22,7 @@ COPY crates/rise-resource-api/Cargo.toml ./crates/rise-resource-api/Cargo.toml
 COPY crates/rise-resource-store/Cargo.toml ./crates/rise-resource-store/Cargo.toml
 COPY crates/rise-backend-auth/Cargo.toml ./crates/rise-backend-auth/Cargo.toml
 COPY crates/rise-backend-core/Cargo.toml ./crates/rise-backend-core/Cargo.toml
+COPY crates/rise-backend-docker/Cargo.toml ./crates/rise-backend-docker/Cargo.toml
 COPY crates/rise-deployment-spec/Cargo.toml ./crates/rise-deployment-spec/Cargo.toml
 COPY crates/rise-runtime-sync/Cargo.toml ./crates/rise-runtime-sync/Cargo.toml
 
@@ -36,6 +37,8 @@ RUN mkdir -p src && \
     echo "" > crates/rise-backend-auth/src/lib.rs && \
     mkdir -p crates/rise-backend-core/src && \
     echo "" > crates/rise-backend-core/src/lib.rs && \
+    mkdir -p crates/rise-backend-docker/src && \
+    echo "" > crates/rise-backend-docker/src/lib.rs && \
     mkdir -p crates/rise-deployment-spec/src && \
     echo "" > crates/rise-deployment-spec/src/lib.rs && \
     mkdir -p crates/rise-runtime-sync/src && \
