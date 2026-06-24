@@ -160,10 +160,6 @@ impl ResourceBuilder {
         format!("{namespace_prefix}{}", project.name)
     }
 
-    pub fn sanitize_label_value(value: &str) -> String {
-        DeploymentUrlBuilder::sanitize_label_value(value)
-    }
-
     pub fn escaped_group_name(deployment_group: &str) -> String {
         DeploymentUrlBuilder::escaped_group_name(deployment_group)
     }
@@ -206,31 +202,9 @@ impl ResourceBuilder {
     // ── URL resolution + deployment URLs ───────────────────────────────
     //
     // Backend-agnostic; the implementations live on the composed
-    // `DeploymentUrlBuilder`. Thin wrappers are kept for the methods the K8s
-    // resource builders and the HTTP handlers still call.
-
-    pub(crate) fn ingress_url_components(
-        &self,
-        project: &Project,
-        deployment: &Deployment,
-    ) -> IngressUrl {
-        self.url_builder.ingress_url_components(project, deployment)
-    }
-
-    fn host_conflicts_with_other_env(
-        &self,
-        project: &Project,
-        deployment_group: &str,
-        host: &str,
-        all_environments: &[crate::db::models::Environment],
-    ) -> bool {
-        self.url_builder.host_conflicts_with_other_env(
-            project,
-            deployment_group,
-            host,
-            all_environments,
-        )
-    }
+    // `DeploymentUrlBuilder`. Thin wrappers below cover the methods the K8s
+    // resource builders and the HTTP handlers call through `ResourceBuilder`;
+    // other URL/image work goes through `self.url_builder` directly.
 
     pub fn primary_ingress_hosts(
         &self,
@@ -297,7 +271,7 @@ impl ResourceBuilder {
         if let Some(env) = environment_name {
             labels.insert(
                 LABEL_ENVIRONMENT.to_string(),
-                Self::sanitize_label_value(env),
+                DeploymentUrlBuilder::sanitize_label_value(env),
             );
         }
         labels
@@ -311,7 +285,7 @@ impl ResourceBuilder {
         let mut labels = Self::common_labels(project, environment_name);
         labels.insert(
             LABEL_DEPLOYMENT_GROUP.to_string(),
-            Self::sanitize_label_value(&deployment.deployment_group),
+            DeploymentUrlBuilder::sanitize_label_value(&deployment.deployment_group),
         );
         labels
     }
@@ -324,7 +298,7 @@ impl ResourceBuilder {
         let mut labels = Self::common_labels(project, environment_name);
         labels.insert(
             LABEL_DEPLOYMENT_GROUP.to_string(),
-            Self::sanitize_label_value(&deployment.deployment_group),
+            DeploymentUrlBuilder::sanitize_label_value(&deployment.deployment_group),
         );
         labels.insert(
             LABEL_DEPLOYMENT_ID.to_string(),
@@ -1430,8 +1404,8 @@ impl ResourceBuilder {
         // collide with another env's URL — nginx would reject it and we'd
         // rather emit no ingress than spin on admission failures.
         if hosts.is_empty() {
-            let fallback = self.ingress_url_components(project, deployment);
-            if self.host_conflicts_with_other_env(
+            let fallback = self.url_builder.ingress_url_components(project, deployment);
+            if self.url_builder.host_conflicts_with_other_env(
                 project,
                 &deployment.deployment_group,
                 &fallback.host,

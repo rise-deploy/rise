@@ -71,7 +71,12 @@ pub fn sign_audience_tokens(
 ) -> Result<BTreeMap<String, String>, JwtSignerError> {
     let mut out = BTreeMap::new();
     for (filename, audience) in audiences {
-        let jwt = signer.sign_workload_jwt(info, audience, ttl_secs)?;
+        let jwt = signer
+            .sign_workload_jwt(info, audience, ttl_secs)
+            .map_err(|e| JwtSignerError::WorkloadAudience {
+                audience: audience.clone(),
+                source: Box::new(e),
+            })?;
         out.insert(filename.clone(), jwt);
     }
     Ok(out)
