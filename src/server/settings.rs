@@ -753,17 +753,7 @@ fn default_custom_domain_tls_mode() -> CustomDomainTlsMode {
     CustomDomainTlsMode::PerDomain
 }
 
-/// Access requirement level for project ingress
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
-#[serde(rename_all = "PascalCase")]
-pub enum AccessRequirement {
-    /// No authentication required - fully public access
-    None,
-    /// Must be authenticated, but no project membership required
-    Authenticated,
-    /// Must be authenticated AND have project membership (owner or team member)
-    Member,
-}
+pub use rise_backend_core::AccessRequirement;
 
 /// Access class configuration for ingress authentication
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]

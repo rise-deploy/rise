@@ -11,10 +11,10 @@ use bollard::container::Config;
 use bollard::secret::{EndpointSettings, HostConfig, RestartPolicy, RestartPolicyNameEnum};
 
 use super::labels::{self, BookkeepingLabels, ForwardAuth, TraefikRoute};
-use crate::server::deployment::quantity::{
+use rise_backend_core::quantity::{
     parse_cpu_millicores, parse_cpu_request_limit, parse_memory_bytes, parse_memory_request_limit,
 };
-use crate::server::settings::AccessRequirement;
+use rise_backend_core::AccessRequirement;
 
 /// One ingress route attached to a routable container.
 #[derive(Debug, Clone)]
@@ -1887,7 +1887,7 @@ mod tests {
 
     #[test]
     fn router_withheld_predicate_matches_render_and_reconciler_contract() {
-        use crate::server::settings::AccessRequirement;
+        use rise_backend_core::AccessRequirement;
         let mut classes: HashMap<String, AccessRequirement> = HashMap::new();
         classes.insert("public".into(), AccessRequirement::None);
         classes.insert("members".into(), AccessRequirement::Member);

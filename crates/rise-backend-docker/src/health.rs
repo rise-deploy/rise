@@ -38,7 +38,7 @@ pub(crate) fn probe_error_detail(e: &reqwest::Error) -> String {
 /// Docker — only `path` and `disabled` are. See the deployment-backends feature
 /// matrix.
 pub(crate) fn effective_health_path(
-    spec: &crate::server::deployment::models::ContainerSpec,
+    spec: &rise_deployment_spec::request_spec::ContainerSpec,
     default_path: &str,
 ) -> Option<String> {
     // Probing is opt-in: no `health_check` declared → no probe (ready when
@@ -60,7 +60,7 @@ mod tests {
 
     #[test]
     fn effective_health_path_honors_spec() {
-        use crate::server::deployment::models::{ContainerSpec, HealthCheckSpec};
+        use rise_deployment_spec::request_spec::{ContainerSpec, HealthCheckSpec};
         let base = ContainerSpec {
             name: "app".to_string(),
             image: None,

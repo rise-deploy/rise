@@ -349,8 +349,8 @@ async fn init_docker_backend(
         DockerReconciler, ReconcilerConfig,
     };
     use crate::server::deployment::controller::{docker::client, DockerBackend};
-    use crate::server::deployment::resource_builder::ResourceBuilder;
     use crate::server::settings::DeploymentControllerSettings;
+    use rise_backend_core::DeploymentUrlBuilder;
 
     let DeploymentControllerSettings::Docker {
         docker_host,
@@ -382,46 +382,25 @@ async fn init_docker_backend(
         ));
     };
 
-    // ResourceBuilder for the Docker runtime. The Kubernetes-only fields are
-    // empty/None — `compute_*_urls` and `primary_ingress_hosts` only read the
-    // URL templates, schema, port and registry provider.
-    let resource_builder = Arc::new(ResourceBuilder {
+    // URL/image resolver for the Docker runtime — the backend-agnostic subset
+    // of deployment-spec computation the Docker controller needs. The K8s-only
+    // resource-spec fields don't apply here.
+    let url_builder = Arc::new(DeploymentUrlBuilder {
         production_ingress_url_template: production_ingress_url_template.clone(),
         staging_ingress_url_template: staging_ingress_url_template.clone(),
         environment_ingress_url_template: environment_ingress_url_template.clone(),
         ingress_port: *ingress_port,
         ingress_schema: ingress_schema.clone(),
         registry_provider: registry_provider.clone(),
-        auth_backend_url: String::new(),
-        auth_signin_url: String::new(),
-        backend_address: None,
-        namespace_labels: HashMap::new(),
-        namespace_annotations: HashMap::new(),
-        ingress_annotations: HashMap::new(),
-        ingress_tls_secret_name: None,
-        custom_domain_tls_mode: crate::server::settings::CustomDomainTlsMode::PerDomain,
-        custom_domain_ingress_annotations: HashMap::new(),
-        node_selector: HashMap::new(),
-        image_pull_secret_name: None,
-        access_classes: HashMap::new(),
-        host_aliases: HashMap::new(),
-        extra_service_token_audiences: HashMap::new(),
-        use_default_service_account_for_production: true,
-        network_policy: crate::server::settings::NetworkPolicyConfig {
-            ingress: Vec::new(),
-            egress: None,
-        },
-        pod_security_enabled: true,
-        health_probes: health_probes.clone(),
     });
 
     // Connect bollard.
     let docker = client::connect(docker_host.as_deref())?;
 
-    let store = Arc::new(crate::db::deployment_store::PgDeploymentStore::new(
-        db_pool.clone(),
-    ));
-    let backend = DockerBackend::new(docker.clone(), resource_builder.clone(), store);
+    let store: Arc<dyn rise_backend_core::DeploymentStore> = Arc::new(
+        crate::db::deployment_store::PgDeploymentStore::new(db_pool.clone()),
+    );
+    let backend = DockerBackend::new(docker.clone(), url_builder.clone(), store.clone());
     backend.test_connection().await?;
     tracing::info!("Docker deployment backend initialized and connection tested");
 
@@ -522,8 +501,9 @@ async fn init_docker_backend(
 
     let reconciler = DockerReconciler::new(
         docker.clone(),
+        store,
         db_pool,
-        resource_builder,
+        url_builder,
         registry_provider,
         encryption_provider,
         resource_store,
@@ -1041,12 +1021,14 @@ impl AppState {
                 // string.
 
                 let rb = ResourceBuilder {
-                    production_ingress_url_template: production_ingress_url_template.clone(),
-                    staging_ingress_url_template: staging_ingress_url_template.clone(),
-                    environment_ingress_url_template: environment_ingress_url_template.clone(),
-                    ingress_port: *ingress_port,
-                    ingress_schema: ingress_schema.clone(),
-                    registry_provider: registry_provider.clone(),
+                    url_builder: rise_backend_core::DeploymentUrlBuilder {
+                        production_ingress_url_template: production_ingress_url_template.clone(),
+                        staging_ingress_url_template: staging_ingress_url_template.clone(),
+                        environment_ingress_url_template: environment_ingress_url_template.clone(),
+                        ingress_port: *ingress_port,
+                        ingress_schema: ingress_schema.clone(),
+                        registry_provider: registry_provider.clone(),
+                    },
                     auth_backend_url: auth_backend_url.clone(),
                     auth_signin_url: auth_signin_url.clone(),
                     backend_address: Some(parsed_backend_address),

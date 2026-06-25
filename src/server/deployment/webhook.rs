@@ -24,9 +24,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 
-use crate::db::models::{
-    Deployment, DeploymentEnvVar, DeploymentStatus, Project, TerminationReason,
-};
+use crate::db::models::{Deployment, DeploymentStatus, Project, TerminationReason};
 use crate::db::{
     deployments as db_deployments, env_vars as db_env_vars, environments as db_environments,
     projects as db_projects,
@@ -41,6 +39,12 @@ use crate::server::deployment::state_machine;
 use crate::server::state::AppState;
 use crate::server::workload_tokens::{sha256_hex, workload_subject, NO_ENVIRONMENT};
 use rise_backend_auth::WorkloadSubjectInfo;
+// Backend-agnostic runtime helpers live in `rise-backend-core`; re-exported here
+// so existing `crate::server::deployment::webhook::*` callers stay unchanged.
+pub(crate) use rise_backend_core::runtime::{
+    resolve_deployment_env_vars, resolve_runtime_containers, should_have_infrastructure,
+    ResolvedDeploymentEnvVars, DEPLOYING_TIMEOUT_MINUTES, PRE_PUSHED_TIMEOUT_MINUTES,
+};
 
 // ── Metacontroller webhook protocol types ──────────────────────────────
 
@@ -100,20 +104,10 @@ pub struct FinalizeResponse {
 
 // ── Deployment timeout ─────────────────────────────────────────────────
 
-/// Duration a deployment can be in Deploying state before timing out
-pub(crate) const DEPLOYING_TIMEOUT_MINUTES: i64 = 5;
-/// Duration a deployment can be in pre-Pushed states before timing out
-pub(crate) const PRE_PUSHED_TIMEOUT_MINUTES: i64 = 10;
 /// Duration after which image pull secret is refreshed (6 hours)
 const SECRET_REFRESH_HOURS: i64 = 6;
 /// Maximum number of terminating/terminated pods to carry forward in controller_metadata
 const MAX_INACTIVE_PODS: usize = 5;
-
-#[derive(Debug, Default)]
-pub(crate) struct ResolvedDeploymentEnvVars {
-    pub(crate) plain_env_vars: Vec<EnvVar>,
-    pub(crate) secret_env_vars: BTreeMap<String, ByteString>,
-}
 
 #[derive(Debug)]
 struct PreparedDeploymentEnvSecret {
@@ -1267,7 +1261,10 @@ async fn compute_desired_children(
 
     // 2. Image pull secret (if needed)
     if resource_builder.image_pull_secret_name.is_none()
-        && resource_builder.registry_provider.requires_pull_secret()
+        && resource_builder
+            .url_builder
+            .registry_provider
+            .requires_pull_secret()
     {
         if let Some(secret) =
             build_image_pull_secret(resource_builder, project, &namespace, observed).await?
@@ -1420,7 +1417,11 @@ async fn compute_desired_children(
                 &namespace,
                 env_name.as_deref(),
                 &observed.secrets,
-                env_vars.secret_env_vars,
+                env_vars
+                    .secret_env_vars
+                    .into_iter()
+                    .map(|(k, v)| (k, ByteString(v)))
+                    .collect(),
             ))
         };
 
@@ -1538,7 +1539,15 @@ async fn compute_desired_children(
         };
 
         for spec in &container_specs {
-            let mut per_container_env = env_vars.plain_env_vars.clone();
+            let mut per_container_env: Vec<EnvVar> = env_vars
+                .plain_env_vars
+                .iter()
+                .map(|(name, value)| EnvVar {
+                    name: name.clone(),
+                    value: Some(value.clone()),
+                    ..Default::default()
+                })
+                .collect();
             for var in &injected_host_env {
                 if per_container_env.iter().any(|v| v.name == var.name) {
                     continue;
@@ -1818,93 +1827,6 @@ fn apply_container_port_env(env: &mut Vec<EnvVar>, container_port: Option<u16>) 
     }
 }
 
-/// Resolve the container + route list the reconciler should emit for a
-/// deployment. A multi-container deployment parses its persisted side-data; a
-/// single-container deployment (`containers IS NULL`) synthesises an implicit
-/// `app` container from the row's columns plus a `/` route. The synthesised
-/// `app` carries no image (`image: None`) — the reconciler fills it from the
-/// deployment's resolved image, so the existing single-container image (tagged
-/// with the deployment ID) is reused with no rebuild.
-///
-/// `containers`/`routes` come folded onto the [`Deployment`] row. A `None`
-/// `containers` column is a legitimate single-container deployment and triggers
-/// the synthesised `app`. A `Some` column that fails to deserialize is treated
-/// as a hard error for *this* deployment (returned `Err`): silently collapsing
-/// it to the single-container fallback would drop every per-container resource.
-pub(crate) fn resolve_runtime_containers(
-    deployment: &Deployment,
-) -> anyhow::Result<(
-    Vec<crate::server::deployment::models::ContainerSpec>,
-    Vec<crate::server::deployment::models::RouteSpec>,
-)> {
-    use crate::server::deployment::models::{decode_side_data, ContainerSpec, RouteSpec};
-
-    if let Some(containers_value) = deployment.containers.as_ref() {
-        let specs: Vec<ContainerSpec> = decode_side_data(containers_value).with_context(|| {
-            format!(
-                "deployment {} ({}) has a non-NULL `containers` column that could not be \
-                 decoded into Vec<ContainerSpec>",
-                deployment.id, deployment.deployment_id
-            )
-        })?;
-        if specs.is_empty() {
-            anyhow::bail!(
-                "deployment {} ({}) has a non-NULL `containers` column with an empty items list; \
-                 this is a degenerate state that should have been rejected at write time",
-                deployment.id,
-                deployment.deployment_id
-            );
-        }
-        let routes: Vec<RouteSpec> = match deployment.routes.as_ref() {
-            Some(routes_value) => decode_side_data(routes_value).with_context(|| {
-                format!(
-                    "deployment {} ({}) has a non-NULL `routes` column that could not be \
-                     decoded into Vec<RouteSpec>",
-                    deployment.id, deployment.deployment_id
-                )
-            })?,
-            None => Vec::new(),
-        };
-        return Ok((specs, routes));
-    }
-
-    // Single-container deployment: synthesise the implicit `app` container.
-    // A single-container deployment always has an http port (NOT NULL, default
-    // 8080), so it is always routable at `/`.
-    let resolved =
-        crate::rise_toml::ResolvedDeploy::implicit_app(crate::rise_toml::ImplicitAppContainer {
-            port: deployment.http_port as u16,
-            replicas: Some(deployment.replicas as u32),
-            cpu: Some(deployment.cpu.clone()),
-            memory: Some(deployment.memory.clone()),
-            ..Default::default()
-        });
-    let specs = resolved
-        .containers
-        .into_iter()
-        .map(|container| ContainerSpec {
-            name: container.name,
-            image: container.image,
-            port: container.port,
-            replicas: container.replicas,
-            cpu: container.cpu,
-            memory: container.memory,
-            env_overrides: Vec::new(),
-            health_check: None,
-        })
-        .collect();
-    let routes = resolved
-        .routes
-        .into_iter()
-        .map(|route| RouteSpec {
-            path: route.path,
-            container: route.container,
-        })
-        .collect();
-    Ok((specs, routes))
-}
-
-/// Returns true if this deployment should have K8s infrastructure (K8s Deployment resource).
 /// Compute Service ownership per (group, container_name) across the project's
 /// in-play deployments. The owner is the deployment whose labels/port the
 /// canonical Service `<group>-<container>` points at.
@@ -1974,17 +1896,6 @@ pub(crate) fn compute_service_owner_per_container(
     owner
 }
 
-pub(crate) fn should_have_infrastructure(deployment: &Deployment) -> bool {
-    matches!(
-        deployment.status,
-        DeploymentStatus::Pushed
-            | DeploymentStatus::Deploying
-            | DeploymentStatus::Healthy
-            | DeploymentStatus::Unhealthy
-            | DeploymentStatus::Terminating
-    )
-}
-
 /// Build image pull secret, refreshing if stale.
 async fn build_image_pull_secret(
     resource_builder: &ResourceBuilder,
@@ -2049,10 +1960,14 @@ async fn build_image_pull_secret(
 
     // Fetch fresh pull credentials (scoped to this project's repository)
     let credentials = resource_builder
+        .url_builder
         .registry_provider
         .get_k8s_pull_credentials(&project.name)
         .await?;
-    let registry_host = resource_builder.registry_provider.registry_host();
+    let registry_host = resource_builder
+        .url_builder
+        .registry_provider
+        .registry_host();
 
     let secret = resource_builder.create_dockerconfigjson_secret(
         IMAGE_PULL_SECRET_NAME,
@@ -2393,59 +2308,6 @@ async fn load_env_vars(
     resolve_deployment_env_vars(env_vars, state.encryption_provider.as_deref()).await
 }
 
-pub(crate) async fn resolve_deployment_env_vars(
-    env_vars: Vec<DeploymentEnvVar>,
-    encryption_provider: Option<&dyn crate::server::encryption::EncryptionProvider>,
-) -> anyhow::Result<ResolvedDeploymentEnvVars> {
-    let mut resolved = ResolvedDeploymentEnvVars::default();
-
-    for var in env_vars {
-        let key = var.key.trim().to_string();
-        if key != var.key {
-            tracing::warn!(
-                "Environment variable key {:?} has surrounding whitespace; trimming to {:?}",
-                var.key,
-                key
-            );
-        }
-
-        let value = if var.is_secret {
-            match encryption_provider {
-                Some(provider) => provider
-                    .decrypt(&var.value)
-                    .await
-                    .with_context(|| format!("Failed to decrypt secret variable '{}'", key))?,
-                None => {
-                    tracing::error!(
-                        "Encountered secret variable '{}' but no encryption provider configured",
-                        key
-                    );
-                    return Err(anyhow::anyhow!(
-                        "Cannot decrypt secret variable '{}': no encryption provider",
-                        key
-                    ));
-                }
-            }
-        } else {
-            var.value
-        };
-
-        if var.is_secret {
-            resolved
-                .secret_env_vars
-                .insert(key, ByteString(value.into_bytes()));
-        } else {
-            resolved.plain_env_vars.push(EnvVar {
-                name: key,
-                value: Some(value),
-                ..Default::default()
-            });
-        }
-    }
-
-    Ok(resolved)
-}
-
 // ── Finalize webhook handler ───────────────────────────────────────────
 
 pub async fn handle_finalize(
@@ -2547,7 +2409,7 @@ async fn process_finalize(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::models::{DeploymentStatus, Project, ProjectStatus};
+    use crate::db::models::{DeploymentEnvVar, DeploymentStatus, Project, ProjectStatus};
     use crate::server::deployment::resource_builder::ResourceBuilder;
     use crate::server::encryption::EncryptionProvider;
     use crate::server::registry::models::RegistryCredentials;
@@ -2704,15 +2566,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(resolved.plain_env_vars.len(), 1);
-        assert_eq!(resolved.plain_env_vars[0].name, "PORT");
-        assert_eq!(resolved.plain_env_vars[0].value.as_deref(), Some("8080"));
+        assert_eq!(resolved.plain_env_vars[0].0, "PORT");
+        assert_eq!(resolved.plain_env_vars[0].1, "8080");
         assert_eq!(resolved.secret_env_vars.len(), 2);
         assert_eq!(
-            resolved.secret_env_vars["API_KEY"].0,
+            resolved.secret_env_vars["API_KEY"],
             b"ciphertext-a".to_vec()
         );
         assert_eq!(
-            resolved.secret_env_vars["SESSION_SECRET"].0,
+            resolved.secret_env_vars["SESSION_SECRET"],
             b"ciphertext-b".to_vec()
         );
     }
@@ -2788,12 +2650,14 @@ mod tests {
 
     fn test_resource_builder() -> ResourceBuilder {
         ResourceBuilder {
-            production_ingress_url_template: "{project_name}.example.test".to_string(),
-            staging_ingress_url_template: None,
-            environment_ingress_url_template: None,
-            ingress_port: None,
-            ingress_schema: "https".to_string(),
-            registry_provider: Arc::new(TestRegistryProvider),
+            url_builder: rise_backend_core::DeploymentUrlBuilder {
+                production_ingress_url_template: "{project_name}.example.test".to_string(),
+                staging_ingress_url_template: None,
+                environment_ingress_url_template: None,
+                ingress_port: None,
+                ingress_schema: "https".to_string(),
+                registry_provider: Arc::new(TestRegistryProvider),
+            },
             auth_backend_url: "https://auth.example.test".to_string(),
             auth_signin_url: "https://signin.example.test".to_string(),
             backend_address: None,
@@ -2906,7 +2770,7 @@ mod tests {
         let names: Vec<&str> = resolved
             .plain_env_vars
             .iter()
-            .map(|v| v.name.as_str())
+            .map(|(name, _)| name.as_str())
             .collect();
         assert!(
             names.contains(&"LEADING_SPACE"),

@@ -27,7 +27,7 @@ use bollard::Docker;
 use futures::StreamExt;
 use tracing::warn;
 
-use crate::server::deployment::resource_builder::{
+use rise_backend_core::identity::{
     IDENTITY_CREDENTIAL_KEY, IDENTITY_MOUNT_PATH, IDENTITY_TOKENS_SUBDIR,
 };
 

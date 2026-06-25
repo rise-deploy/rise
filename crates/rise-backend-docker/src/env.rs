@@ -10,7 +10,7 @@ pub(crate) fn merge_container_env(
     base_env: &[(String, String)],
     system_env: &[(String, String)],
     injected_hosts: &[(String, String)],
-    spec: &crate::server::deployment::models::ContainerSpec,
+    spec: &rise_deployment_spec::request_spec::ContainerSpec,
     env_name: Option<&str>,
 ) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = base_env.to_vec();
@@ -94,7 +94,7 @@ mod tests {
 
     #[test]
     fn merge_env_precedence() {
-        use crate::server::deployment::models::{ContainerSpec, EnvOverride};
+        use rise_deployment_spec::request_spec::{ContainerSpec, EnvOverride};
         let base = vec![("FOO".to_string(), "base".to_string())];
         let system = vec![
             ("FOO".to_string(), "system".to_string()),
@@ -127,7 +127,7 @@ mod tests {
 
     #[test]
     fn merge_env_injects_container_hosts_unless_user_set() {
-        use crate::server::deployment::models::{ContainerSpec, EnvOverride};
+        use rise_deployment_spec::request_spec::{ContainerSpec, EnvOverride};
         // A user global and a per-container override both targeting the same
         // discovery key must win over the auto-injected sibling host.
         let base = vec![(
@@ -181,7 +181,7 @@ mod tests {
 
     #[test]
     fn merge_env_skips_non_matching_environment_override() {
-        use crate::server::deployment::models::{ContainerSpec, EnvOverride};
+        use rise_deployment_spec::request_spec::{ContainerSpec, EnvOverride};
         let spec = ContainerSpec {
             name: "app".to_string(),
             image: None,

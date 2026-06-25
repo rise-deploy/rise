@@ -3,6 +3,7 @@ members = [
     ".",
     "crates/rise-backend-auth",
     "crates/rise-backend-core",
+    "crates/rise-backend-docker",
     "crates/rise-deployment-spec",
     "crates/rise-resource-api",
     "crates/rise-resource-store",
@@ -78,6 +79,7 @@ backend = [
     # Server core (former "server" feature)
     "dep:rise-backend-auth", # strip-on-publish
     "dep:rise-backend-core", # strip-on-publish
+    "dep:rise-backend-docker", # strip-on-publish
     "dep:rise-resource-api", # strip-on-publish
     "dep:rise-resource-store", # strip-on-publish
     "dep:rise-runtime-sync", # strip-on-publish
@@ -103,6 +105,7 @@ backend = [
     "dep:serde_yaml",
     "dep:tokio-tungstenite",
     "rise-deployment-spec/schema",
+    "rise-backend-core/schema",
     # Kubernetes (former "k8s" feature)
     "dep:kube",
     "dep:k8s-openapi",
@@ -127,6 +130,7 @@ backend = [
 # Workspace crates (backend only)
 rise-backend-auth = { path = "crates/rise-backend-auth", optional = true }
 rise-backend-core = { path = "crates/rise-backend-core", optional = true }
+rise-backend-docker = { path = "crates/rise-backend-docker", optional = true }
 rise-resource-api = { path = "crates/rise-resource-api", optional = true }
 rise-resource-store = { path = "crates/rise-resource-store", optional = true }
 rise-runtime-sync = { path = "crates/rise-runtime-sync", optional = true }

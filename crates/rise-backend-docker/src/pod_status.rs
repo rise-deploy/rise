@@ -5,7 +5,7 @@
 use chrono::Utc;
 
 use super::diff::InspectedContainer;
-use crate::db::models::DeploymentStatus;
+use rise_backend_core::models::DeploymentStatus;
 
 /// Assemble the `controller_metadata` JSON for the deployment: a
 /// K8s-pod-status-shaped `pod_status` block (so the Pods tab renders unchanged —

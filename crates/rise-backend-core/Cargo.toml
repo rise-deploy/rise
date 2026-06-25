@@ -7,14 +7,27 @@ repository = "https://github.com/rise-deploy/rise"
 description = "Shared deployment-backend contracts for Rise (models, traits, URL/quantity helpers)"
 publish = false
 
+[features]
+default = []
+# Enables `schemars::JsonSchema` derives on the shared settings types so
+# `rise-deploy` can include them in the generated backend-config schema.
+schema = ["dep:schemars"]
+
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
+regex = "1.11"
+rise-deployment-spec = { path = "../rise-deployment-spec" }
+schemars = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Only for `#[derive(sqlx::FromRow)]` / `#[derive(sqlx::Type)]` on the moved
 # models. This crate never opens a connection or runs a query — the
 # `DeploymentStore` implementation lives in `rise-deploy`.
 sqlx = { workspace = true }
+tracing = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

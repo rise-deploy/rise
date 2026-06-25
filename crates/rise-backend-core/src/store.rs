@@ -131,4 +131,8 @@ pub trait DeploymentStore: Send + Sync {
         project_id: Uuid,
         deployment_group: &str,
     ) -> Result<()>;
+
+    /// Persist the hash of a deployment's workload-identity bootstrap credential
+    /// once it has been delivered to a running container.
+    async fn set_identity_credential_hash(&self, id: Uuid, hash: &str) -> Result<()>;
 }
