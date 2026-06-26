@@ -774,8 +774,13 @@ should be unaffected. Confirm this holds at review time.
 
 ## Phase 2 — Extract `rise-backend-kubernetes`
 
-- [ ] **PR 2A — Route the K8s controller's DB access through
-  `DeploymentStore`** (mirror of 1A; larger surface).
+- [x] **PR 2A — Route the K8s controller's DB access through
+  `DeploymentStore`** (mirror of 1A; larger surface). The Metacontroller
+  sync/finalize webhook, the CRD backfill, and the identity-refresh controller
+  now read and mutate deployment state exclusively through the trait; the seam
+  gained `find_project_by_name`, `list_active_projects`,
+  `mark_deployment_cancelling`, and the workload-identity refresh-scheduling
+  methods. In-tree, behavior-preserving — no crate move.
 - [ ] **PR 2B — Create `crates/rise-backend-kubernetes`.** Move
   `controller/kubernetes.rs` and the K8s-specific resource-builder/CRD wiring
   into the new crate. The shared surface relocated in 1B should already cover
