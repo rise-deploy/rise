@@ -10,7 +10,6 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::models::{
@@ -145,23 +144,4 @@ pub trait DeploymentStore: Send + Sync {
     /// Persist the hash of a deployment's workload-identity bootstrap credential
     /// once it has been delivered to a running container.
     async fn set_identity_credential_hash(&self, id: Uuid, hash: &str) -> Result<()>;
-
-    // --- workload-identity refresh scheduling ---
-
-    /// Set the next workload-identity-token re-mint time for a deployment.
-    async fn set_identity_refresh_due_at(&self, id: Uuid, due_at: DateTime<Utc>) -> Result<()>;
-
-    /// Advance-only push-out of the re-mint time for a batch of deployments.
-    async fn bump_identity_refresh_due_at(
-        &self,
-        ids: &[Uuid],
-        not_before: DateTime<Utc>,
-    ) -> Result<()>;
-
-    /// Clear the re-mint schedule for a batch of deployments.
-    async fn clear_identity_refresh_due_at(&self, ids: &[Uuid]) -> Result<()>;
-
-    /// Active, identity-bearing deployments due for re-mint, each paired with its
-    /// project name.
-    async fn list_due_identity_refresh(&self) -> Result<Vec<(Uuid, String)>>;
 }

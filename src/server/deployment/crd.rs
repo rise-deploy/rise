@@ -31,6 +31,14 @@ pub struct RiseProjectStatus {
     /// Set by Metacontroller to track which generation of the spec has been observed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<i64>,
+    /// Earliest time (RFC 3339) at which one of this project's deployments needs
+    /// its workload-identity token Secret re-minted (~2/3 of
+    /// `identity_token_ttl_seconds` after the last mint). Written by the sync
+    /// webhook; read by the identity-refresh controller, which resyncs the
+    /// project once this is due so the webhook re-mints before the token expires.
+    /// Absent when no deployment has identity tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_refresh_due_at: Option<String>,
 }
 
 /// Annotation key used to trigger an immediate Metacontroller resync.

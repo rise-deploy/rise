@@ -28,6 +28,16 @@ spec:
           status:
             nullable: true
             properties:
+              identityRefreshDueAt:
+                description: |-
+                  Earliest time (RFC 3339) at which one of this project's deployments needs
+                  its workload-identity token Secret re-minted (~2/3 of
+                  `identity_token_ttl_seconds` after the last mint). Written by the sync
+                  webhook; read by the identity-refresh controller, which resyncs the
+                  project once this is due so the webhook re-mints before the token expires.
+                  Absent when no deployment has identity tokens.
+                nullable: true
+                type: string
               lastSyncTime:
                 nullable: true
                 type: string

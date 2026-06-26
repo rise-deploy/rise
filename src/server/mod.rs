@@ -225,14 +225,12 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
     if let Some(kube_client) = state.kube_client.clone() {
         info!("Starting workload-identity refresh controller");
         let db_pool = state.db_pool.clone();
-        let deployment_store = state.deployment_store.clone();
         let ttl = state.identity_token_ttl_seconds;
         let shutdown_clone = shutdown.clone();
         let handle = tokio::spawn(async move {
             let controller = deployment::identity_refresh::IdentityRefreshController::new(
                 kube_client,
                 db_pool,
-                deployment_store,
                 ttl,
             );
             if let Err(e) = controller.run(shutdown_clone).await {

@@ -8,7 +8,6 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use rise_backend_core::models::{
     CustomDomain, Deployment, DeploymentEnvVar, DeploymentStatus, Environment, Project,
     TerminationReason,
@@ -175,25 +174,5 @@ impl DeploymentStore for PgDeploymentStore {
 
     async fn set_identity_credential_hash(&self, id: Uuid, hash: &str) -> Result<()> {
         crate::db::deployments::set_identity_credential_hash(&self.pool, id, hash).await
-    }
-
-    async fn set_identity_refresh_due_at(&self, id: Uuid, due_at: DateTime<Utc>) -> Result<()> {
-        crate::db::deployments::set_identity_refresh_due_at(&self.pool, id, due_at).await
-    }
-
-    async fn bump_identity_refresh_due_at(
-        &self,
-        ids: &[Uuid],
-        not_before: DateTime<Utc>,
-    ) -> Result<()> {
-        crate::db::deployments::bump_identity_refresh_due_at(&self.pool, ids, not_before).await
-    }
-
-    async fn clear_identity_refresh_due_at(&self, ids: &[Uuid]) -> Result<()> {
-        crate::db::deployments::clear_identity_refresh_due_at(&self.pool, ids).await
-    }
-
-    async fn list_due_identity_refresh(&self) -> Result<Vec<(Uuid, String)>> {
-        crate::db::deployments::list_due_identity_refresh(&self.pool).await
     }
 }

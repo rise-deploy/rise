@@ -15,7 +15,7 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use k8s_openapi::api::apps::v1::Deployment as K8sDeployment;
 use k8s_openapi::api::core::v1::{EnvVar, Secret};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -299,7 +299,7 @@ async fn process_sync(
     };
 
     // 6. Compute desired children
-    let children = compute_desired_children(
+    let (children, identity_refresh_due_at) = compute_desired_children(
         state,
         resource_builder,
         &project,
@@ -309,10 +309,15 @@ async fn process_sync(
     )
     .await?;
 
+    let mut status = serde_json::json!({
+        "lastSyncTime": Utc::now().to_rfc3339(),
+    });
+    if let Some(due) = identity_refresh_due_at {
+        status["identityRefreshDueAt"] = serde_json::json!(due.to_rfc3339());
+    }
+
     Ok(SyncResponse {
-        status: serde_json::json!({
-            "lastSyncTime": Utc::now().to_rfc3339(),
-        }),
+        status,
         children,
         resync_after_seconds: None,
     })
@@ -1307,8 +1312,12 @@ async fn compute_desired_children(
     all_deployments: &[Deployment],
     observed: &ObservedChildren,
     namespace_prefix: &str,
-) -> anyhow::Result<Vec<serde_json::Value>> {
+) -> anyhow::Result<(Vec<serde_json::Value>, Option<DateTime<Utc>>)> {
     let mut children: Vec<serde_json::Value> = Vec::new();
+    // Earliest re-mint time across this project's identity-bearing deployments,
+    // returned for the `RiseProject` status so the identity-refresh controller
+    // knows when to resync. `None` when no deployment has identity tokens.
+    let mut identity_refresh_due_at: Option<DateTime<Utc>> = None;
     let namespace = ResourceBuilder::namespace_name(project, namespace_prefix);
 
     // Preload all environments for this project to avoid per-deployment DB lookups
@@ -1585,6 +1594,10 @@ async fn compute_desired_children(
         )
         .await?;
         children.push(serde_json::to_value(&identity.secret)?);
+        if let Some(due) = identity.identity_refresh_due_at {
+            identity_refresh_due_at =
+                Some(identity_refresh_due_at.map_or(due, |earliest| earliest.min(due)));
+        }
 
         // Emit one K8s Deployment per container. A single-container deployment
         // has a single synthesised `app` container (see `resolve_runtime_containers`);
@@ -1847,7 +1860,7 @@ async fn compute_desired_children(
         children.push(serde_json::to_value(&np)?);
     }
 
-    Ok(children)
+    Ok((children, identity_refresh_due_at))
 }
 
 /// Returns true if ANY of a deployment's per-container K8s Deployments has been
@@ -2053,6 +2066,11 @@ async fn build_image_pull_secret(
 struct PreparedIdentitySecret {
     secret: Secret,
     mount: IdentityMount,
+    /// When this deployment's identity tokens next need re-minting (~2/3 of the
+    /// TTL after the last mint), or `None` when the deployment has no tokens.
+    /// Folded into the project's `RiseProject` status so the identity-refresh
+    /// controller knows when to resync.
+    identity_refresh_due_at: Option<DateTime<Utc>>,
 }
 
 /// Build the per-deployment workload-identity Secret.
@@ -2179,21 +2197,28 @@ async fn prepare_identity_secret(
                 ttl_secs,
             )?;
             let refreshed_at = Utc::now();
-            // Schedule the next re-mint at ~2/3 of the TTL: the identity-refresh
-            // controller resyncs this project once this is due, just before the
-            // token would expire (Metacontroller won't resync a steady project on
-            // its own). Only set when we actually mint — the reuse path keeps the
-            // existing schedule.
-            let due_at = refreshed_at
-                + chrono::Duration::seconds(
-                    crate::server::workload_tokens::refresh_due_after_secs(ttl_secs) as i64,
-                );
-            state
-                .deployment_store
-                .set_identity_refresh_due_at(deployment.id, due_at)
-                .await?;
             (minted, refreshed_at)
         }
+    };
+
+    // When this deployment's tokens next need re-minting: ~2/3 of the TTL after
+    // the last mint (`refreshed_at`). Computed on every sync (mint or reuse) so
+    // the value the webhook returns into the `RiseProject` status is stable until
+    // a real re-mint moves it forward. `None` when there's nothing to refresh.
+    // The identity-refresh controller resyncs a project once this is due, just
+    // before the token would expire (Metacontroller won't resync a steady project
+    // on its own).
+    let identity_refresh_due_at = if audiences.is_empty() {
+        None
+    } else {
+        Some(
+            refreshed_at
+                + chrono::Duration::seconds(
+                    crate::server::workload_tokens::refresh_due_after_secs(
+                        state.identity_token_ttl_seconds,
+                    ) as i64,
+                ),
+        )
     };
 
     let secret = resource_builder.create_identity_secret(
@@ -2212,6 +2237,7 @@ async fn prepare_identity_secret(
             secret_name,
             token_filenames,
         },
+        identity_refresh_due_at,
     })
 }
 
