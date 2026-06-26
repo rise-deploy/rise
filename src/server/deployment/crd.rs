@@ -6,7 +6,6 @@ use kube::CustomResource;
 use kube::ResourceExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
 use tracing::{debug, info, warn};
 
 /// CRD spec for RiseProject — intentionally empty.
@@ -192,7 +191,7 @@ pub async fn trigger_resync(client: &Client, project_name: &str) -> anyhow::Resu
 /// projects.
 pub async fn backfill_rise_projects(
     client: &Client,
-    db_pool: &PgPool,
+    store: &dyn rise_backend_core::DeploymentStore,
     controller_class: Option<&str>,
     interval: std::time::Duration,
 ) -> anyhow::Result<()> {
@@ -216,7 +215,7 @@ pub async fn backfill_rise_projects(
         })
         .collect();
 
-    let active_projects = crate::db::projects::list_active(db_pool).await?;
+    let active_projects = store.list_active_projects().await?;
 
     let total = active_projects.len();
     info!(

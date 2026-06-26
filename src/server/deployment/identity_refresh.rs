@@ -28,8 +28,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::db::deployments as db_deployments;
 use crate::server::deployment::crd;
+use rise_backend_core::DeploymentStore;
 
 /// Floor/ceiling on the poll cadence regardless of the configured TTL, so a
 /// pathological TTL can't make the loop hammer the DB or sleep for too long.
@@ -55,7 +55,10 @@ fn poll_interval_secs(ttl_secs: u64) -> u64 {
 
 pub struct IdentityRefreshController {
     kube_client: kube::Client,
+    /// Connection pool — used solely for the leader-election lease, which needs a
+    /// concrete `PgPool`. Deployment reads/writes go through `store`.
     db_pool: PgPool,
+    store: Arc<dyn DeploymentStore>,
     identity_token_ttl_seconds: u64,
     /// Cadence, derived once from the TTL.
     poll_interval: Duration,
@@ -65,12 +68,14 @@ impl IdentityRefreshController {
     pub fn new(
         kube_client: kube::Client,
         db_pool: PgPool,
+        store: Arc<dyn DeploymentStore>,
         identity_token_ttl_seconds: u64,
     ) -> Self {
         Self {
             poll_interval: Duration::from_secs(poll_interval_secs(identity_token_ttl_seconds)),
             kube_client,
             db_pool,
+            store,
             identity_token_ttl_seconds,
         }
     }
@@ -132,7 +137,7 @@ impl IdentityRefreshController {
             }
         }
 
-        let due = match db_deployments::list_due_identity_refresh(&self.db_pool).await {
+        let due = match self.store.list_due_identity_refresh().await {
             Ok(due) => due,
             Err(e) => {
                 warn!(error = ?e, "failed to query deployments due for identity refresh");
@@ -179,17 +184,16 @@ impl IdentityRefreshController {
         if !advance.is_empty() {
             let not_before =
                 Utc::now() + chrono::Duration::seconds(self.poll_interval.as_secs() as i64);
-            if let Err(e) =
-                db_deployments::bump_identity_refresh_due_at(&self.db_pool, &advance, not_before)
-                    .await
+            if let Err(e) = self
+                .store
+                .bump_identity_refresh_due_at(&advance, not_before)
+                .await
             {
                 warn!(error = ?e, "failed to advance identity refresh due times");
             }
         }
         if !orphaned.is_empty() {
-            if let Err(e) =
-                db_deployments::clear_identity_refresh_due_at(&self.db_pool, &orphaned).await
-            {
+            if let Err(e) = self.store.clear_identity_refresh_due_at(&orphaned).await {
                 warn!(error = ?e, "failed to clear identity refresh schedule for missing projects");
             }
         }

@@ -10,6 +10,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::models::{
@@ -30,6 +31,12 @@ pub trait DeploymentStore: Send + Sync {
 
     /// Look up a project by its primary key.
     async fn find_project(&self, id: Uuid) -> Result<Option<Project>>;
+
+    /// Look up a project by its (unique) name.
+    async fn find_project_by_name(&self, name: &str) -> Result<Option<Project>>;
+
+    /// List active (non-terminated) projects — used by the CRD backfill.
+    async fn list_active_projects(&self) -> Result<Vec<Project>>;
 
     /// Recompute and persist a project's status from its deployments.
     async fn update_project_calculated_status(&self, project_id: Uuid) -> Result<Project>;
@@ -99,6 +106,9 @@ pub trait DeploymentStore: Send + Sync {
     /// Mark a deployment failed with an error message.
     async fn mark_deployment_failed(&self, id: Uuid, error_message: &str) -> Result<Deployment>;
 
+    /// Transition a deployment into the cancelling state.
+    async fn mark_deployment_cancelling(&self, id: Uuid) -> Result<Deployment>;
+
     /// Mark a deployment cancelled.
     async fn mark_deployment_cancelled(&self, id: Uuid) -> Result<Deployment>;
 
@@ -135,4 +145,23 @@ pub trait DeploymentStore: Send + Sync {
     /// Persist the hash of a deployment's workload-identity bootstrap credential
     /// once it has been delivered to a running container.
     async fn set_identity_credential_hash(&self, id: Uuid, hash: &str) -> Result<()>;
+
+    // --- workload-identity refresh scheduling ---
+
+    /// Set the next workload-identity-token re-mint time for a deployment.
+    async fn set_identity_refresh_due_at(&self, id: Uuid, due_at: DateTime<Utc>) -> Result<()>;
+
+    /// Advance-only push-out of the re-mint time for a batch of deployments.
+    async fn bump_identity_refresh_due_at(
+        &self,
+        ids: &[Uuid],
+        not_before: DateTime<Utc>,
+    ) -> Result<()>;
+
+    /// Clear the re-mint schedule for a batch of deployments.
+    async fn clear_identity_refresh_due_at(&self, ids: &[Uuid]) -> Result<()>;
+
+    /// Active, identity-bearing deployments due for re-mint, each paired with its
+    /// project name.
+    async fn list_due_identity_refresh(&self) -> Result<Vec<(Uuid, String)>>;
 }

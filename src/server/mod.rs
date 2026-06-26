@@ -126,12 +126,12 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
             _ => 1000,
         };
         let kube_client = kube_client.clone();
-        let db_pool = state.db_pool.clone();
+        let deployment_store = state.deployment_store.clone();
         let controller_class = state.deployment_controller_class_name.clone();
         tokio::spawn(async move {
             if let Err(e) = deployment::crd::backfill_rise_projects(
                 &kube_client,
-                &db_pool,
+                deployment_store.as_ref(),
                 controller_class.as_deref(),
                 std::time::Duration::from_millis(interval_ms),
             )
@@ -225,12 +225,14 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
     if let Some(kube_client) = state.kube_client.clone() {
         info!("Starting workload-identity refresh controller");
         let db_pool = state.db_pool.clone();
+        let deployment_store = state.deployment_store.clone();
         let ttl = state.identity_token_ttl_seconds;
         let shutdown_clone = shutdown.clone();
         let handle = tokio::spawn(async move {
             let controller = deployment::identity_refresh::IdentityRefreshController::new(
                 kube_client,
                 db_pool,
+                deployment_store,
                 ttl,
             );
             if let Err(e) = controller.run(shutdown_clone).await {

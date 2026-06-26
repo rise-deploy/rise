@@ -8,6 +8,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use rise_backend_core::models::{
     CustomDomain, Deployment, DeploymentEnvVar, DeploymentStatus, Environment, Project,
     TerminationReason,
@@ -36,6 +37,14 @@ impl DeploymentStore for PgDeploymentStore {
 
     async fn find_project(&self, id: Uuid) -> Result<Option<Project>> {
         crate::db::projects::find_by_id(&self.pool, id).await
+    }
+
+    async fn find_project_by_name(&self, name: &str) -> Result<Option<Project>> {
+        crate::db::projects::find_by_name(&self.pool, name).await
+    }
+
+    async fn list_active_projects(&self) -> Result<Vec<Project>> {
+        crate::db::projects::list_active(&self.pool).await
     }
 
     async fn update_project_calculated_status(&self, project_id: Uuid) -> Result<Project> {
@@ -113,6 +122,10 @@ impl DeploymentStore for PgDeploymentStore {
         crate::db::deployments::mark_failed(&self.pool, id, error_message).await
     }
 
+    async fn mark_deployment_cancelling(&self, id: Uuid) -> Result<Deployment> {
+        crate::db::deployments::mark_cancelling(&self.pool, id).await
+    }
+
     async fn mark_deployment_cancelled(&self, id: Uuid) -> Result<Deployment> {
         crate::db::deployments::mark_cancelled(&self.pool, id).await
     }
@@ -162,5 +175,25 @@ impl DeploymentStore for PgDeploymentStore {
 
     async fn set_identity_credential_hash(&self, id: Uuid, hash: &str) -> Result<()> {
         crate::db::deployments::set_identity_credential_hash(&self.pool, id, hash).await
+    }
+
+    async fn set_identity_refresh_due_at(&self, id: Uuid, due_at: DateTime<Utc>) -> Result<()> {
+        crate::db::deployments::set_identity_refresh_due_at(&self.pool, id, due_at).await
+    }
+
+    async fn bump_identity_refresh_due_at(
+        &self,
+        ids: &[Uuid],
+        not_before: DateTime<Utc>,
+    ) -> Result<()> {
+        crate::db::deployments::bump_identity_refresh_due_at(&self.pool, ids, not_before).await
+    }
+
+    async fn clear_identity_refresh_due_at(&self, ids: &[Uuid]) -> Result<()> {
+        crate::db::deployments::clear_identity_refresh_due_at(&self.pool, ids).await
+    }
+
+    async fn list_due_identity_refresh(&self) -> Result<Vec<(Uuid, String)>> {
+        crate::db::deployments::list_due_identity_refresh(&self.pool).await
     }
 }
