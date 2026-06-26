@@ -277,9 +277,12 @@ async fn process_sync(
         None => {
             // Project was deleted between initial lookup and now — return empty children
             return Ok(SyncResponse {
-                status: serde_json::json!({
-                    "lastSyncTime": Utc::now().to_rfc3339(),
-                }),
+                status: serde_json::to_value(crd::RiseProjectStatus {
+                    last_sync_time: Some(Utc::now().to_rfc3339()),
+                    identity_refresh_due_at: None,
+                    observed_generation: None,
+                })
+                .map_err(anyhow::Error::from)?,
                 children: vec![],
                 resync_after_seconds: Some(300.0),
             });
@@ -309,12 +312,15 @@ async fn process_sync(
     )
     .await?;
 
-    let mut status = serde_json::json!({
-        "lastSyncTime": Utc::now().to_rfc3339(),
-    });
-    if let Some(due) = identity_refresh_due_at {
-        status["identityRefreshDueAt"] = serde_json::json!(due.to_rfc3339());
-    }
+    // Build the status from the typed struct so its serde naming (camelCase) is
+    // the single source of truth shared with the identity-refresh controller,
+    // which reads it back as `RiseProjectStatus`.
+    let status = serde_json::to_value(crd::RiseProjectStatus {
+        last_sync_time: Some(Utc::now().to_rfc3339()),
+        identity_refresh_due_at: identity_refresh_due_at.map(|due| due.to_rfc3339()),
+        observed_generation: None,
+    })
+    .map_err(anyhow::Error::from)?;
 
     Ok(SyncResponse {
         status,

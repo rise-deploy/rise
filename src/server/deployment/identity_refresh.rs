@@ -153,14 +153,28 @@ impl IdentityRefreshController {
         let due_projects: Vec<String> = projects
             .items
             .iter()
-            .filter(|rp| {
-                rp.status
+            .filter_map(|rp| {
+                let raw = rp
+                    .status
                     .as_ref()
-                    .and_then(|s| s.identity_refresh_due_at.as_deref())
-                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                    .is_some_and(|due| due.with_timezone(&Utc) <= now)
+                    .and_then(|s| s.identity_refresh_due_at.as_deref())?;
+                match chrono::DateTime::parse_from_rfc3339(raw) {
+                    Ok(due) if due.with_timezone(&Utc) <= now => Some(rp.name_any()),
+                    Ok(_) => None,
+                    Err(e) => {
+                        // The webhook always writes a valid RFC 3339 timestamp; a
+                        // bad value means external tampering or a format change.
+                        // Surface it rather than silently never refreshing.
+                        warn!(
+                            project = %rp.name_any(),
+                            value = %raw,
+                            "unparseable identityRefreshDueAt in RiseProject status; skipping: {:?}",
+                            e
+                        );
+                        None
+                    }
+                }
             })
-            .map(|rp| rp.name_any())
             .collect();
 
         if due_projects.is_empty() {
