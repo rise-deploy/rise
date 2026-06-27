@@ -526,18 +526,33 @@ impl MinikubeBackend {
         })?;
 
         report::step("wait pods Ready (≤10m)", || {
-            let mut wait_pod = Command::new("kubectl");
-            wait_pod.args([
-                "wait",
-                "--namespace",
-                NAMESPACE,
-                "--for=condition=Ready",
-                "pod",
-                "-l",
-                &format!("app.kubernetes.io/instance={RELEASE}"),
-                "--timeout=10m",
-            ]);
-            cli::run_checked(wait_pod).context("kubectl wait pods Ready")
+            // `kubectl wait` snapshots the matching pods up front, so during a
+            // `helm upgrade` rollout the old server/dex pods it's watching get
+            // deleted mid-wait and it fails with "pods ... not found" rather than
+            // re-evaluating. Retry: the NotFound race fails fast, and once the
+            // rollout settles only the new (Ready) pods remain and the wait passes.
+            // On the initial bring-up (no rollout) the first attempt succeeds.
+            let mut last = String::new();
+            for _ in 0..6 {
+                let mut wait_pod = Command::new("kubectl");
+                wait_pod.args([
+                    "wait",
+                    "--namespace",
+                    NAMESPACE,
+                    "--for=condition=Ready",
+                    "pod",
+                    "-l",
+                    &format!("app.kubernetes.io/instance={RELEASE}"),
+                    "--timeout=4m",
+                ]);
+                let out = cli::run(wait_pod)?;
+                if out.success() {
+                    return Ok(());
+                }
+                last = out.combined();
+                std::thread::sleep(Duration::from_secs(10));
+            }
+            anyhow::bail!("kubectl wait pods Ready did not converge after retries:\n{last}")
         })?;
 
         // (Re-)forward the server and Dex for the whole run (killed in

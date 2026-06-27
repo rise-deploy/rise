@@ -8,9 +8,9 @@
 //!   - Docker recreates the `rise` service on the new image against the existing
 //!     Postgres volume (image + DB-migration upgrade), keeping the in-repo compose
 //!     topology.
-//!   - Kubernetes installs the OLD released chart from the OCI registry, then
-//!     `helm upgrade`s to the in-repo chart on the new image (a full chart + image
-//!     + DB-migration upgrade).
+//!   - Kubernetes builds the OLD chart from its source at the release tag (with
+//!     that version's own values-ci.yaml), then `helm upgrade`s to the in-repo
+//!     chart on the new image (a full chart + image + DB-migration upgrade).
 
 use anyhow::{Context, Result};
 
