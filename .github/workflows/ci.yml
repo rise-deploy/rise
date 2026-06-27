@@ -554,6 +554,9 @@ jobs:
           RISE_BIN: ./target/release/rise
         run: cargo run --manifest-path tests/e2e/Cargo.toml
 
+  # Self-provisions its own compose stack and runs every Docker scenario
+  # (public deploy, SA token exchange, private/forwardAuth, health-rolling
+  # cutover, workload identity).
   e2e-docker:
     name: E2E / Docker
     runs-on: ubuntu-latest
@@ -571,31 +574,14 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Download e2e harness binary
-        uses: actions/download-artifact@v5
-        with:
-          name: rise-e2e-harness
-          path: harness
-
-      # Self-provisions its own compose stack and runs every Docker scenario
-      # (public deploy, SA token exchange, private/forwardAuth, health-rolling
-      # cutover, workload identity).
       - name: Run e2e harness (docker backend)
-        env:
-          RISE_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          RISE_IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
-          RISE_E2E_BACKEND: docker
-        run: |
-          chmod +x harness/rise-e2e
-          ./harness/rise-e2e
+        uses: ./.github/actions/run-e2e-harness
+        with:
+          backend: docker
+          image-repository: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          image-tag: ${{ needs.prepare.outputs.image_tag }}
+          github-actor: ${{ github.actor }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
   # Typed cross-backend harness (crate rise-e2e) on Kubernetes: it self-provisions
   # its own minikube cluster + Helm release (default oci-client-auth mode) and runs
@@ -616,37 +602,14 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Setup mise
-        uses: jdx/mise-action@v4
-        with:
-          cache: true
-          experimental: true
-
-      - name: Install mise tools
-        run: mise use -g minikube kubectl helm
-
-      - name: Download e2e harness binary
-        uses: actions/download-artifact@v5
-        with:
-          name: rise-e2e-harness
-          path: harness
-
       - name: Run e2e harness (minikube backend)
-        env:
-          RISE_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          RISE_IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
-          RISE_E2E_BACKEND: minikube
-        run: |
-          chmod +x harness/rise-e2e
-          ./harness/rise-e2e
+        uses: ./.github/actions/run-e2e-harness
+        with:
+          backend: minikube
+          image-repository: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          image-tag: ${{ needs.prepare.outputs.image_tag }}
+          github-actor: ${{ github.actor }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
   # rise-e2e harness in jfrog-vault mode: self-provisions JFrog + Vault + a minikube
   # cluster whose registry pulls from JFrog, then runs the workload-identity scenario
@@ -670,39 +633,16 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Setup mise
-        uses: jdx/mise-action@v4
-        with:
-          cache: true
-          experimental: true
-
-      - name: Install mise tools
-        run: mise use -g minikube kubectl helm
-
-      - name: Download e2e harness binary
-        uses: actions/download-artifact@v5
-        with:
-          name: rise-e2e-harness
-          path: harness
-
       - name: Run e2e harness (minikube, jfrog-vault)
-        env:
-          RISE_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          RISE_CLI_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.BUILDER_IMAGE_NAME }}
-          RISE_IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
-          RISE_E2E_BACKEND: minikube
-          RISE_E2E_REGISTRY_MODE: jfrog-vault
-        run: |
-          chmod +x harness/rise-e2e
-          ./harness/rise-e2e
+        uses: ./.github/actions/run-e2e-harness
+        with:
+          backend: minikube
+          registry-mode: jfrog-vault
+          image-repository: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          cli-image-repository: ${{ env.REGISTRY }}/${{ env.BUILDER_IMAGE_NAME }}
+          image-tag: ${{ needs.prepare.outputs.image_tag }}
+          github-actor: ${{ github.actor }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
   # Upgrade test: stand the stack up on the latest published stable release, seed a
   # project + deployment, then upgrade in place to this build (running the DB
@@ -730,29 +670,15 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Download e2e harness binary
-        uses: actions/download-artifact@v5
-        with:
-          name: rise-e2e-harness
-          path: harness
-
       - name: Run e2e upgrade harness (docker backend)
-        env:
-          RISE_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          RISE_IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
-          RISE_E2E_UPGRADE_FROM: ${{ needs.prepare.outputs.latest_stable }}
-          RISE_E2E_BACKEND: docker
-        run: |
-          chmod +x harness/rise-e2e
-          ./harness/rise-e2e
+        uses: ./.github/actions/run-e2e-harness
+        with:
+          backend: docker
+          upgrade-from: ${{ needs.prepare.outputs.latest_stable }}
+          image-repository: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          image-tag: ${{ needs.prepare.outputs.image_tag }}
+          github-actor: ${{ github.actor }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
   e2e-upgrade-minikube:
     name: E2E / Upgrade (Minikube)
@@ -773,42 +699,15 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Setup mise
-        uses: jdx/mise-action@v4
-        with:
-          cache: true
-          experimental: true
-
-      - name: Install mise tools
-        run: mise use -g minikube kubectl helm
-
-      # Helm needs its own registry login to pull the old released chart over OCI.
-      - name: Log in to GHCR for Helm OCI pull
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ${{ env.REGISTRY }} -u "${{ github.actor }}" --password-stdin
-
-      - name: Download e2e harness binary
-        uses: actions/download-artifact@v5
-        with:
-          name: rise-e2e-harness
-          path: harness
-
       - name: Run e2e upgrade harness (minikube backend)
-        env:
-          RISE_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          RISE_IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
-          RISE_E2E_UPGRADE_FROM: ${{ needs.prepare.outputs.latest_stable }}
-          RISE_E2E_BACKEND: minikube
-        run: |
-          chmod +x harness/rise-e2e
-          ./harness/rise-e2e
+        uses: ./.github/actions/run-e2e-harness
+        with:
+          backend: minikube
+          upgrade-from: ${{ needs.prepare.outputs.latest_stable }}
+          image-repository: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          image-tag: ${{ needs.prepare.outputs.image_tag }}
+          github-actor: ${{ github.actor }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
 # ==========================================================================
 # Stage 4 · Docs — GitHub Pages (serialized via the pages-deploy concurrency group)

@@ -199,8 +199,11 @@ impl MinikubeBackend {
             Some(old) => (old, Some(target_tag)),
             None => (target_tag, None),
         };
-        let cli_repo =
-            std::env::var("RISE_CLI_IMAGE_REPOSITORY").unwrap_or_else(|_| image_repository.clone());
+        // Treat an empty value as unset (CI passes "" when not overriding it).
+        let cli_repo = std::env::var("RISE_CLI_IMAGE_REPOSITORY")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| image_repository.clone());
         let registry_mode = RegistryMode::from_env();
         // The CI token's iss/aud must equal the server's public_url, which differs
         // by mode (jfrog-vault deploys must reach the issuer from inside the cluster).
