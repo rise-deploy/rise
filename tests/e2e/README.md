@@ -37,8 +37,9 @@ RISE_BIN=./target/debug/rise \
   cargo run --manifest-path tests/e2e/Cargo.toml
 
 # Upgrade suite: bring the stack up on an OLDER released version, seed a project,
-# then upgrade in place to RISE_IMAGE_TAG. Works on either backend.
-RISE_E2E_BACKEND=docker \
+# then upgrade in place to RISE_IMAGE_TAG. (Docker support exists in the harness
+# but has no released stack to upgrade from yet — see "Upgrade Suite" below.)
+RISE_E2E_BACKEND=minikube \
 RISE_E2E_UPGRADE_FROM=0.22.1 \
 RISE_IMAGE_TAG=<target-tag> \
 RISE_IMAGE_REPOSITORY=ghcr.io/rise-deploy/rise \
@@ -94,9 +95,7 @@ the harness from the scenario matrix to the in-place upgrade suite
 ([`src/upgrade.rs`](src/upgrade.rs)): it brings the stack up on the old version,
 seeds a project + deployment, upgrades the control plane to `RISE_IMAGE_TAG`
 (running its DB migrations against the seeded data), then asserts the seeded
-project + its deployment history survived and a fresh deploy still works. CI runs
-it from the latest published stable release on every develop push / trusted PR
-(`e2e-upgrade-docker`, `e2e-upgrade-minikube`).
+project + its deployment history survived and a fresh deploy still works.
 
 What each backend faithfully versions differs (a documented limitation, not a
 parity bug): Docker recreates the `rise` service on the new image against the
@@ -104,3 +103,13 @@ existing Postgres volume — keeping the in-repo compose topology — so it exer
 the **image + DB-migration** upgrade; minikube installs the **old released chart**
 from the OCI registry and `helm upgrade`s to the in-repo chart on the new image,
 exercising a full **chart + image + DB-migration** upgrade.
+
+In CI, only the **minikube** upgrade runs (`e2e-upgrade-minikube`), from the
+latest published stable release on every develop push / trusted PR. There is no
+Docker upgrade job **yet**: the Docker deployment backend
+(`docker-compose.standalone.yaml` + `config/docker.yaml`) landed after the latest
+stable release, so no released version ships a Docker stack to upgrade *from* (the
+old image can't even boot under the current compose, which expects the baked-in
+`/etc/rise/docker.yaml`). The harness keeps the Docker `upgrade()` path, so the
+job can be added once the Docker backend ships in a stable release — a tracked
+parity gap, not a missing capability.

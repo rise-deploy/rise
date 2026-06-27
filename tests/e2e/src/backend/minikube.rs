@@ -40,10 +40,12 @@ const JFROG_PUBLIC_URL: &str = "http://rise-ci-chart.rise-ci.svc.cluster.local:3
 // The docker network the compose stack + minikube node share (jfrog-vault).
 const COMPOSE_NETWORK: &str = "rise_default";
 const VAULT_ROLE_URL: &str = "http://127.0.0.1:8200/v1/artifactory/roles/rise";
-// Where released charts are published (matches CHART_REGISTRY in the CI workflow);
-// the chart name is `chart` (helm/rise/Chart.yaml). Used by the upgrade flow to
-// install the OLD released chart before upgrading to the in-repo one.
-const OLD_CHART_REF: &str = "oci://ghcr.io/rise-deploy/chart";
+// Where released charts are published. The `package-helm` CI job renames the
+// chart to `rise-helm` before pushing it to CHART_REGISTRY (ghcr.io/rise-deploy),
+// so the published artifact is `rise-helm`, not the in-repo Chart.yaml name
+// (`chart`). Used by the upgrade flow to install the OLD released chart before
+// upgrading to the in-repo one.
+const OLD_CHART_REF: &str = "oci://ghcr.io/rise-deploy/rise-helm";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RegistryMode {

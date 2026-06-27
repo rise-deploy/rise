@@ -647,39 +647,16 @@ jobs:
   # Upgrade test: stand the stack up on the latest published stable release, seed a
   # project + deployment, then upgrade in place to this build (running the DB
   # migrations against the seeded data) and assert the project survived and a fresh
-  # deploy still works. Docker recreates the rise service on the new image; the
-  # minikube job below upgrades from the old released chart to the in-repo chart.
-  # Skipped when no stable release exists yet (latest_stable empty).
-  e2e-upgrade-docker:
-    name: E2E / Upgrade (Docker)
-    runs-on: ubuntu-latest
-    if: >-
-      needs.prepare.outputs.latest_stable != '' &&
-      ((github.event_name == 'push' && github.ref == 'refs/heads/develop') ||
-       (github.event_name == 'pull_request' && needs.prepare.outputs.is_trusted_pr == 'true'))
-    needs:
-      - prepare
-      - package-image
-      - rust-quality
-      - unit-tests-linux
-      - e2e-harness-build
-    timeout-minutes: 40
-    permissions:
-      contents: read
-      packages: read
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-      - name: Run e2e upgrade harness (docker backend)
-        uses: ./.github/actions/run-e2e-harness
-        with:
-          backend: docker
-          upgrade-from: ${{ needs.prepare.outputs.latest_stable }}
-          image-repository: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          image-tag: ${{ needs.prepare.outputs.image_tag }}
-          github-actor: ${{ github.actor }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
+  # deploy still works. Skipped when no stable release exists yet (latest_stable
+  # empty). The minikube job installs the old released chart from the OCI registry
+  # and `helm upgrade`s to the in-repo chart on the new image.
+  #
+  # NOTE: there is deliberately no Docker upgrade job yet. The Docker deployment
+  # backend (docker-compose.standalone.yaml + config/docker.yaml) landed after the
+  # latest stable release, so no released version has a Docker stack to upgrade
+  # *from*. The harness keeps the Docker `upgrade()` path (DockerBackend::upgrade),
+  # so a Docker upgrade job can be added here once the Docker backend ships in a
+  # stable release. Tracked as a parity gap (see tests/e2e/README.md).
   e2e-upgrade-minikube:
     name: E2E / Upgrade (Minikube)
     runs-on: ubuntu-latest
