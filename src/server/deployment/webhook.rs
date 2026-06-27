@@ -15,7 +15,7 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use k8s_openapi::api::apps::v1::Deployment as K8sDeployment;
 use k8s_openapi::api::core::v1::{EnvVar, Secret};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -25,10 +25,6 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 
 use crate::db::models::{Deployment, DeploymentStatus, Project, TerminationReason};
-use crate::db::{
-    deployments as db_deployments, env_vars as db_env_vars, environments as db_environments,
-    projects as db_projects,
-};
 use crate::server::deployment::crd;
 use crate::server::deployment::resource_builder::{
     IdentityMount, ResourceBuilder, ANNOTATION_ENV_SECRET_HASH, ANNOTATION_LAST_REFRESH,
@@ -213,7 +209,11 @@ async fn process_sync(
     observed: &ObservedChildren,
 ) -> Result<SyncResponse, SyncError> {
     // 1. Load project from DB
-    let project = match db_projects::find_by_name(&state.db_pool, project_name).await? {
+    let project = match state
+        .deployment_store
+        .find_project_by_name(project_name)
+        .await?
+    {
         Some(p) => p,
         None => {
             warn!(project = %project_name, "Project not found in DB, deleting orphaned RiseProject CRD");
@@ -257,8 +257,10 @@ async fn process_sync(
     let namespace_prefix = resolve_project_namespace_prefix(state, &project, org_uid).await?;
 
     // 2. Load non-terminal deployments for this project (avoids loading full history)
-    let non_terminal_deployments =
-        db_deployments::list_non_terminal_for_project(&state.db_pool, project.id).await?;
+    let non_terminal_deployments = state
+        .deployment_store
+        .list_non_terminal_deployments_for_project(project.id)
+        .await?;
 
     let non_terminal: Vec<&Deployment> = non_terminal_deployments.iter().collect();
 
@@ -266,16 +268,21 @@ async fn process_sync(
     perform_status_transitions(state, &project, &non_terminal, observed, &namespace_prefix).await?;
 
     // 4. Re-load non-terminal deployments since statuses may have changed
-    let all_deployments =
-        db_deployments::list_non_terminal_for_project(&state.db_pool, project.id).await?;
-    let project = match db_projects::find_by_id(&state.db_pool, project.id).await? {
+    let all_deployments = state
+        .deployment_store
+        .list_non_terminal_deployments_for_project(project.id)
+        .await?;
+    let project = match state.deployment_store.find_project(project.id).await? {
         Some(p) => p,
         None => {
             // Project was deleted between initial lookup and now — return empty children
             return Ok(SyncResponse {
-                status: serde_json::json!({
-                    "lastSyncTime": Utc::now().to_rfc3339(),
-                }),
+                status: serde_json::to_value(crd::RiseProjectStatus {
+                    last_sync_time: Some(Utc::now().to_rfc3339()),
+                    identity_refresh_due_at: None,
+                    observed_generation: None,
+                })
+                .map_err(anyhow::Error::from)?,
                 children: vec![],
                 resync_after_seconds: Some(300.0),
             });
@@ -295,7 +302,7 @@ async fn process_sync(
     };
 
     // 6. Compute desired children
-    let children = compute_desired_children(
+    let (children, identity_refresh_due_at) = compute_desired_children(
         state,
         resource_builder,
         &project,
@@ -305,10 +312,18 @@ async fn process_sync(
     )
     .await?;
 
+    // Build the status from the typed struct so its serde naming (camelCase) is
+    // the single source of truth shared with the identity-refresh controller,
+    // which reads it back as `RiseProjectStatus`.
+    let status = serde_json::to_value(crd::RiseProjectStatus {
+        last_sync_time: Some(Utc::now().to_rfc3339()),
+        identity_refresh_due_at: identity_refresh_due_at.map(|due| due.to_rfc3339()),
+        observed_generation: None,
+    })
+    .map_err(anyhow::Error::from)?;
+
     Ok(SyncResponse {
-        status: serde_json::json!({
-            "lastSyncTime": Utc::now().to_rfc3339(),
-        }),
+        status,
         children,
         resync_after_seconds: None,
     })
@@ -404,7 +419,7 @@ pub async fn resolve_project_organization_uid(
     state: &AppState,
     project: &Project,
 ) -> anyhow::Result<uuid::Uuid> {
-    crate::db::organization_links::organization_uid_for_project(&state.db_pool, project.id)
+    state.deployment_store.organization_uid_for_project(project.id)
         .await?
         .ok_or_else(|| {
             error!(
@@ -512,8 +527,14 @@ async fn perform_status_transitions(
                 deployment_id = %deployment.deployment_id,
                 "Cancelling deployment — marking as Cancelled"
             );
-            db_deployments::mark_cancelled(&state.db_pool, deployment.id).await?;
-            db_projects::update_calculated_status(&state.db_pool, project.id).await?;
+            state
+                .deployment_store
+                .mark_deployment_cancelled(deployment.id)
+                .await?;
+            state
+                .deployment_store
+                .update_project_calculated_status(project.id)
+                .await?;
             continue;
         }
 
@@ -532,13 +553,14 @@ async fn perform_status_transitions(
                     deployment_id = %deployment.deployment_id,
                     "Deployment image pushed, transitioning to Deploying"
                 );
-                db_deployments::update_status(
-                    &state.db_pool,
-                    deployment.id,
-                    DeploymentStatus::Deploying,
-                )
-                .await?;
-                db_projects::update_calculated_status(&state.db_pool, project.id).await?;
+                state
+                    .deployment_store
+                    .update_deployment_status(deployment.id, DeploymentStatus::Deploying)
+                    .await?;
+                state
+                    .deployment_store
+                    .update_project_calculated_status(project.id)
+                    .await?;
             }
 
             DeploymentStatus::Deploying => {
@@ -592,8 +614,14 @@ async fn check_pre_pushed_timeout(state: &AppState, deployment: &Deployment) -> 
              This usually indicates the CLI was interrupted during build/push.",
             PRE_PUSHED_TIMEOUT_MINUTES, deployment.status
         );
-        db_deployments::mark_failed(&state.db_pool, deployment.id, &error_msg).await?;
-        db_projects::update_calculated_status(&state.db_pool, deployment.project_id).await?;
+        state
+            .deployment_store
+            .mark_deployment_failed(deployment.id, &error_msg)
+            .await?;
+        state
+            .deployment_store
+            .update_project_calculated_status(deployment.project_id)
+            .await?;
     }
     Ok(())
 }
@@ -615,8 +643,14 @@ async fn check_deploying_timeout(
                 deployment_id = %deployment.deployment_id,
                 "{}", error_msg
             );
-            db_deployments::mark_failed(&state.db_pool, deployment.id, &error_msg).await?;
-            db_projects::update_calculated_status(&state.db_pool, project.id).await?;
+            state
+                .deployment_store
+                .mark_deployment_failed(deployment.id, &error_msg)
+                .await?;
+            state
+                .deployment_store
+                .update_project_calculated_status(project.id)
+                .await?;
         }
     }
     Ok(())
@@ -630,34 +664,53 @@ async fn complete_termination(
 ) -> anyhow::Result<()> {
     match deployment.termination_reason {
         Some(TerminationReason::Superseded) => {
-            db_deployments::mark_superseded(&state.db_pool, deployment.id).await?;
+            state
+                .deployment_store
+                .mark_deployment_superseded(deployment.id)
+                .await?;
         }
         Some(TerminationReason::UserStopped) => {
-            db_deployments::mark_stopped(&state.db_pool, deployment.id).await?;
+            state
+                .deployment_store
+                .mark_deployment_stopped(deployment.id)
+                .await?;
         }
         Some(TerminationReason::Expired) => {
-            db_deployments::mark_expired(&state.db_pool, deployment.id).await?;
+            state
+                .deployment_store
+                .mark_deployment_expired(deployment.id)
+                .await?;
         }
         Some(TerminationReason::Failed) => {
-            db_deployments::mark_failed(
-                &state.db_pool,
-                deployment.id,
-                deployment
-                    .error_message
-                    .as_deref()
-                    .unwrap_or("Deployment failed"),
-            )
-            .await?;
+            state
+                .deployment_store
+                .mark_deployment_failed(
+                    deployment.id,
+                    deployment
+                        .error_message
+                        .as_deref()
+                        .unwrap_or("Deployment failed"),
+                )
+                .await?;
         }
         Some(TerminationReason::Cancelled) => {
-            db_deployments::mark_cancelled(&state.db_pool, deployment.id).await?;
+            state
+                .deployment_store
+                .mark_deployment_cancelled(deployment.id)
+                .await?;
         }
         None => {
             // Missing termination reason resolves to Stopped
-            db_deployments::mark_stopped(&state.db_pool, deployment.id).await?;
+            state
+                .deployment_store
+                .mark_deployment_stopped(deployment.id)
+                .await?;
         }
     }
-    db_projects::update_calculated_status(&state.db_pool, project.id).await?;
+    state
+        .deployment_store
+        .update_project_calculated_status(project.id)
+        .await?;
     Ok(())
 }
 
@@ -692,13 +745,17 @@ async fn check_deployment_health_from_observed(
                 deployment_id = %deployment.deployment_id,
                 "container side-data could not be deserialized; marking deployment Failed: {:?}", e
             );
-            db_deployments::mark_failed(
-                &state.db_pool,
-                deployment.id,
-                "container side-data could not be deserialized",
-            )
-            .await?;
-            db_projects::update_calculated_status(&state.db_pool, project.id).await?;
+            state
+                .deployment_store
+                .mark_deployment_failed(
+                    deployment.id,
+                    "container side-data could not be deserialized",
+                )
+                .await?;
+            state
+                .deployment_store
+                .update_project_calculated_status(project.id)
+                .await?;
             return Ok(());
         }
     };
@@ -763,9 +820,10 @@ async fn check_deployment_health_from_observed(
                 "healthy": is_healthy,
             },
         });
-        if let Err(e) =
-            db_deployments::update_controller_metadata(&state.db_pool, deployment.id, &metadata)
-                .await
+        if let Err(e) = state
+            .deployment_store
+            .update_deployment_controller_metadata(deployment.id, &metadata)
+            .await
         {
             warn!(
                 deployment_id = %deployment.deployment_id,
@@ -786,8 +844,14 @@ async fn check_deployment_health_from_observed(
                     deployment_id = %deployment.deployment_id,
                     "Deployment has irrecoverable pod error: {}", error_msg
                 );
-                db_deployments::mark_failed(&state.db_pool, deployment.id, &error_msg).await?;
-                db_projects::update_calculated_status(&state.db_pool, project.id).await?;
+                state
+                    .deployment_store
+                    .mark_deployment_failed(deployment.id, &error_msg)
+                    .await?;
+                state
+                    .deployment_store
+                    .update_project_calculated_status(project.id)
+                    .await?;
             } else if is_ready {
                 info!(
                     deployment_id = %deployment.deployment_id,
@@ -810,8 +874,14 @@ async fn check_deployment_health_from_observed(
                 deployment_id = %deployment.deployment_id,
                 "Healthy deployment is now unhealthy: {}", msg
             );
-            db_deployments::mark_unhealthy(&state.db_pool, deployment.id, msg).await?;
-            db_projects::update_calculated_status(&state.db_pool, project.id).await?;
+            state
+                .deployment_store
+                .mark_deployment_unhealthy(deployment.id, msg)
+                .await?;
+            state
+                .deployment_store
+                .update_project_calculated_status(project.id)
+                .await?;
         }
 
         DeploymentStatus::Unhealthy if !pod_check.has_error && is_ready => {
@@ -819,8 +889,14 @@ async fn check_deployment_health_from_observed(
                 deployment_id = %deployment.deployment_id,
                 "Unhealthy deployment has recovered, marking as Healthy"
             );
-            db_deployments::mark_healthy(&state.db_pool, deployment.id).await?;
-            db_projects::update_calculated_status(&state.db_pool, project.id).await?;
+            state
+                .deployment_store
+                .mark_deployment_healthy(deployment.id)
+                .await?;
+            state
+                .deployment_store
+                .update_project_calculated_status(project.id)
+                .await?;
         }
 
         _ => {}
@@ -1133,15 +1209,16 @@ async fn handle_deployment_became_healthy(
     project: &Project,
 ) -> anyhow::Result<()> {
     // Find currently active deployment in this group BEFORE marking new as Healthy
-    let active_in_group = db_deployments::find_active_for_project_and_group(
-        &state.db_pool,
-        project.id,
-        &deployment.deployment_group,
-    )
-    .await?;
+    let active_in_group = state
+        .deployment_store
+        .find_active_deployment_for_project_and_group(project.id, &deployment.deployment_group)
+        .await?;
 
     // Mark the new deployment as healthy
-    db_deployments::mark_healthy(&state.db_pool, deployment.id).await?;
+    state
+        .deployment_store
+        .mark_deployment_healthy(deployment.id)
+        .await?;
 
     // Supersede the old active deployment
     if let Some(old_active) = active_in_group {
@@ -1150,22 +1227,21 @@ async fn handle_deployment_became_healthy(
                 "Deployment {} replacing {} in group '{}', marking old as Terminating",
                 deployment.deployment_id, old_active.deployment_id, deployment.deployment_group
             );
-            db_deployments::mark_terminating(
-                &state.db_pool,
-                old_active.id,
-                TerminationReason::Superseded,
-            )
-            .await?;
+            state
+                .deployment_store
+                .mark_deployment_terminating(old_active.id, TerminationReason::Superseded)
+                .await?;
         }
     }
 
     // Clean up other active (Healthy/Unhealthy) deployments in the group
-    let others = db_deployments::find_non_terminal_for_project_and_group(
-        &state.db_pool,
-        project.id,
-        &deployment.deployment_group,
-    )
-    .await?;
+    let others = state
+        .deployment_store
+        .find_non_terminal_deployments_for_project_and_group(
+            project.id,
+            &deployment.deployment_group,
+        )
+        .await?;
 
     for other in others {
         if other.id != deployment.id
@@ -1176,25 +1252,23 @@ async fn handle_deployment_became_healthy(
                 "Cleaning up non-active deployment {} in group '{}', marking as Terminating",
                 other.deployment_id, deployment.deployment_group
             );
-            db_deployments::mark_terminating(
-                &state.db_pool,
-                other.id,
-                TerminationReason::Superseded,
-            )
-            .await?;
+            state
+                .deployment_store
+                .mark_deployment_terminating(other.id, TerminationReason::Superseded)
+                .await?;
         }
     }
 
     // Mark deployment as active
-    db_deployments::mark_as_active(
-        &state.db_pool,
-        deployment.id,
-        project.id,
-        &deployment.deployment_group,
-    )
-    .await?;
+    state
+        .deployment_store
+        .mark_deployment_as_active(deployment.id, project.id, &deployment.deployment_group)
+        .await?;
 
-    db_projects::update_calculated_status(&state.db_pool, project.id).await?;
+    state
+        .deployment_store
+        .update_project_calculated_status(project.id)
+        .await?;
 
     Ok(())
 }
@@ -1218,13 +1292,14 @@ async fn check_expirations(
                     deployment_id = %deployment.deployment_id,
                     "Deployment has expired, marking as Terminating"
                 );
-                db_deployments::mark_terminating(
-                    &state.db_pool,
-                    deployment.id,
-                    TerminationReason::Expired,
-                )
-                .await?;
-                db_projects::update_calculated_status(&state.db_pool, project.id).await?;
+                state
+                    .deployment_store
+                    .mark_deployment_terminating(deployment.id, TerminationReason::Expired)
+                    .await?;
+                state
+                    .deployment_store
+                    .update_project_calculated_status(project.id)
+                    .await?;
             }
         }
     }
@@ -1243,17 +1318,22 @@ async fn compute_desired_children(
     all_deployments: &[Deployment],
     observed: &ObservedChildren,
     namespace_prefix: &str,
-) -> anyhow::Result<Vec<serde_json::Value>> {
+) -> anyhow::Result<(Vec<serde_json::Value>, Option<DateTime<Utc>>)> {
     let mut children: Vec<serde_json::Value> = Vec::new();
+    // Earliest re-mint time across this project's identity-bearing deployments,
+    // returned for the `RiseProject` status so the identity-refresh controller
+    // knows when to resync. `None` when no deployment has identity tokens.
+    let mut identity_refresh_due_at: Option<DateTime<Utc>> = None;
     let namespace = ResourceBuilder::namespace_name(project, namespace_prefix);
 
     // Preload all environments for this project to avoid per-deployment DB lookups
-    let environments: HashMap<uuid::Uuid, crate::db::models::Environment> =
-        db_environments::list_for_project(&state.db_pool, project.id)
-            .await?
-            .into_iter()
-            .map(|env| (env.id, env))
-            .collect();
+    let environments: HashMap<uuid::Uuid, crate::db::models::Environment> = state
+        .deployment_store
+        .list_environments_for_project(project.id)
+        .await?
+        .into_iter()
+        .map(|env| (env.id, env))
+        .collect();
 
     // 1. Namespace (always)
     let ns = resource_builder.create_namespace(project, namespace_prefix);
@@ -1351,18 +1431,19 @@ async fn compute_desired_children(
                     deployment_id = %d.deployment_id,
                     "container side-data could not be deserialized; marking deployment Failed: {:?}", e
                 );
-                db_deployments::mark_failed(
-                    &state.db_pool,
-                    d.id,
-                    "container side-data could not be deserialized",
-                )
-                .await?;
+                state
+                    .deployment_store
+                    .mark_deployment_failed(d.id, "container side-data could not be deserialized")
+                    .await?;
                 failed_to_parse.insert(d.id);
             }
         }
     }
     if !failed_to_parse.is_empty() {
-        db_projects::update_calculated_status(&state.db_pool, project.id).await?;
+        state
+            .deployment_store
+            .update_project_calculated_status(project.id)
+            .await?;
         infra_deployments.retain(|d| !failed_to_parse.contains(&d.id));
     }
 
@@ -1477,7 +1558,9 @@ async fn compute_desired_children(
         // Resolve image
         let source_deployment_id =
             if let Some(source_id) = deployment.rolled_back_from_deployment_id {
-                db_deployments::find_by_id(&state.db_pool, source_id)
+                state
+                    .deployment_store
+                    .find_deployment(source_id)
                     .await?
                     .map(|d| d.deployment_id)
             } else {
@@ -1517,6 +1600,10 @@ async fn compute_desired_children(
         )
         .await?;
         children.push(serde_json::to_value(&identity.secret)?);
+        if let Some(due) = identity.identity_refresh_due_at {
+            identity_refresh_due_at =
+                Some(identity_refresh_due_at.map_or(due, |earliest| earliest.min(due)));
+        }
 
         // Emit one K8s Deployment per container. A single-container deployment
         // has a single synthesised `app` container (see `resolve_runtime_containers`);
@@ -1646,8 +1733,10 @@ async fn compute_desired_children(
     }
 
     // Services, Ingresses, NetworkPolicies — one per group with an active deployment
-    let custom_domains =
-        crate::db::custom_domains::list_project_custom_domains(&state.db_pool, project.id).await?;
+    let custom_domains = state
+        .deployment_store
+        .list_project_custom_domains(project.id)
+        .await?;
     let valid_custom_domains = resource_builder.filter_valid_custom_domains(&custom_domains);
 
     // Index custom domains by environment_id.
@@ -1777,7 +1866,7 @@ async fn compute_desired_children(
         children.push(serde_json::to_value(&np)?);
     }
 
-    Ok(children)
+    Ok((children, identity_refresh_due_at))
 }
 
 /// Returns true if ANY of a deployment's per-container K8s Deployments has been
@@ -1983,6 +2072,11 @@ async fn build_image_pull_secret(
 struct PreparedIdentitySecret {
     secret: Secret,
     mount: IdentityMount,
+    /// When this deployment's identity tokens next need re-minting (~2/3 of the
+    /// TTL after the last mint), or `None` when the deployment has no tokens.
+    /// Folded into the project's `RiseProject` status so the identity-refresh
+    /// controller knows when to resync.
+    identity_refresh_due_at: Option<DateTime<Utc>>,
 }
 
 /// Build the per-deployment workload-identity Secret.
@@ -2027,13 +2121,11 @@ async fn prepare_identity_secret(
             // same applied Secret and writes the same hash.
             let credential_hash = sha256_hex(c.as_bytes());
             if deployment.identity_credential_hash.as_deref() != Some(credential_hash.as_str()) {
-                db_deployments::set_identity_credential_hash(
-                    &state.db_pool,
-                    deployment.id,
-                    &credential_hash,
-                )
-                .await
-                .context("Failed to persist identity credential hash")?;
+                state
+                    .deployment_store
+                    .set_identity_credential_hash(deployment.id, &credential_hash)
+                    .await
+                    .context("Failed to persist identity credential hash")?;
             }
             c
         }
@@ -2111,19 +2203,28 @@ async fn prepare_identity_secret(
                 ttl_secs,
             )?;
             let refreshed_at = Utc::now();
-            // Schedule the next re-mint at ~2/3 of the TTL: the identity-refresh
-            // controller resyncs this project once this is due, just before the
-            // token would expire (Metacontroller won't resync a steady project on
-            // its own). Only set when we actually mint — the reuse path keeps the
-            // existing schedule.
-            let due_at = refreshed_at
-                + chrono::Duration::seconds(
-                    crate::server::workload_tokens::refresh_due_after_secs(ttl_secs) as i64,
-                );
-            db_deployments::set_identity_refresh_due_at(&state.db_pool, deployment.id, due_at)
-                .await?;
             (minted, refreshed_at)
         }
+    };
+
+    // When this deployment's tokens next need re-minting: ~2/3 of the TTL after
+    // the last mint (`refreshed_at`). Computed on every sync (mint or reuse) so
+    // the value the webhook returns into the `RiseProject` status is stable until
+    // a real re-mint moves it forward. `None` when there's nothing to refresh.
+    // The identity-refresh controller resyncs a project once this is due, just
+    // before the token would expire (Metacontroller won't resync a steady project
+    // on its own).
+    let identity_refresh_due_at = if audiences.is_empty() {
+        None
+    } else {
+        Some(
+            refreshed_at
+                + chrono::Duration::seconds(
+                    crate::server::workload_tokens::refresh_due_after_secs(
+                        state.identity_token_ttl_seconds,
+                    ) as i64,
+                ),
+        )
     };
 
     let secret = resource_builder.create_identity_secret(
@@ -2142,6 +2243,7 @@ async fn prepare_identity_secret(
             secret_name,
             token_filenames,
         },
+        identity_refresh_due_at,
     })
 }
 
@@ -2304,7 +2406,10 @@ async fn load_env_vars(
     _project: &Project,
     deployment: &Deployment,
 ) -> anyhow::Result<ResolvedDeploymentEnvVars> {
-    let env_vars = db_env_vars::list_deployment_env_vars(&state.db_pool, deployment.id).await?;
+    let env_vars = state
+        .deployment_store
+        .list_deployment_env_vars(deployment.id)
+        .await?;
     resolve_deployment_env_vars(env_vars, state.encryption_provider.as_deref()).await
 }
 
@@ -2368,10 +2473,16 @@ async fn process_finalize(
 ) -> anyhow::Result<FinalizeResponse> {
     info!(project = %project_name, "Processing finalize webhook — marking all deployments as stopped");
 
-    if let Some(project) = db_projects::find_by_name(&state.db_pool, project_name).await? {
+    if let Some(project) = state
+        .deployment_store
+        .find_project_by_name(project_name)
+        .await?
+    {
         // Mark all non-terminal deployments as Stopped
-        let deployments =
-            db_deployments::list_non_terminal_for_project(&state.db_pool, project.id).await?;
+        let deployments = state
+            .deployment_store
+            .list_non_terminal_deployments_for_project(project.id)
+            .await?;
         for deployment in deployments {
             {
                 info!(
@@ -2383,20 +2494,30 @@ async fn process_finalize(
                     &deployment.status,
                     &DeploymentStatus::Cancelling,
                 ) {
-                    db_deployments::mark_cancelling(&state.db_pool, deployment.id).await?;
-                    db_deployments::mark_cancelled(&state.db_pool, deployment.id).await?;
+                    state
+                        .deployment_store
+                        .mark_deployment_cancelling(deployment.id)
+                        .await?;
+                    state
+                        .deployment_store
+                        .mark_deployment_cancelled(deployment.id)
+                        .await?;
                 } else {
-                    db_deployments::mark_terminating(
-                        &state.db_pool,
-                        deployment.id,
-                        TerminationReason::UserStopped,
-                    )
-                    .await?;
-                    db_deployments::mark_stopped(&state.db_pool, deployment.id).await?;
+                    state
+                        .deployment_store
+                        .mark_deployment_terminating(deployment.id, TerminationReason::UserStopped)
+                        .await?;
+                    state
+                        .deployment_store
+                        .mark_deployment_stopped(deployment.id)
+                        .await?;
                 }
             }
         }
-        db_projects::update_calculated_status(&state.db_pool, project.id).await?;
+        state
+            .deployment_store
+            .update_project_calculated_status(project.id)
+            .await?;
     }
 
     Ok(FinalizeResponse {

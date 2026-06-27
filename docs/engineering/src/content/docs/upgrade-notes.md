@@ -55,8 +55,9 @@ In-flight PRs with operator impact (not yet merged):
   per *due* deployment (so projects are touched only when a refresh is needed, and
   the work is naturally staggered) and one more background lease
   (`rise-identity-refresh`). Docker already refreshed via its own reconcile loop,
-  so this closes the gap on Kubernetes. Adds a nullable
-  `deployments.identity_token_refresh_due_at` column (additive migration).
+  so this closes the gap on Kubernetes. The per-project re-mint due time is
+  tracked on the `RiseProject` CR's `status.identityRefreshDueAt` (written by the
+  sync webhook), so there is no deployments-table schema change.
 - **Action required — raw external token deprecation signal** ([#374](https://github.com/rise-deploy/rise/issues/374)).
   While `auth.allow_raw_external_tokens` is `true`, each *accepted* raw-token
   request now emits one metric-shaped `tracing` event

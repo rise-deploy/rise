@@ -95,6 +95,13 @@ pub struct AppState {
     pub public_url: String,
     pub encryption_provider: Option<Arc<dyn EncryptionProvider>>,
     pub deployment_backend: Arc<dyn crate::server::deployment::controller::DeploymentBackend>,
+    /// The deployment persistence boundary (`DeploymentStore` trait, implemented
+    /// by `PgDeploymentStore`). The Metacontroller webhook and the
+    /// identity-refresh/CRD-backfill controllers read and mutate deployment
+    /// state through this trait rather than reaching into `crate::db` directly,
+    /// so they can move into a backend crate later.
+    #[cfg(feature = "backend")]
+    pub deployment_store: Arc<dyn rise_backend_core::DeploymentStore>,
     #[cfg(feature = "backend")]
     pub runtime_log_backend: Arc<dyn crate::server::deployment::logs::RuntimeLogBackend>,
     pub extension_registry: Arc<crate::server::extensions::registry::ExtensionRegistry>,
@@ -243,11 +250,10 @@ async fn test_encryption_provider(provider: &dyn EncryptionProvider) -> Result<(
 async fn init_kubernetes_backend(
     resource_builder: Arc<crate::server::deployment::resource_builder::ResourceBuilder>,
     kube_client: kube::Client,
-    db_pool: PgPool,
+    store: Arc<dyn rise_backend_core::DeploymentStore>,
 ) -> Result<Arc<dyn DeploymentBackend>> {
     use crate::server::deployment::controller::KubernetesBackend;
 
-    let store = Arc::new(crate::db::deployment_store::PgDeploymentStore::new(db_pool));
     let backend = KubernetesBackend::new(kube_client, resource_builder, store);
 
     // Test Kubernetes API connection
@@ -338,6 +344,7 @@ async fn init_docker_backend(
     resource_store: Arc<dyn rise_resource_store::ResourceStore>,
     jwt_signer: Arc<RiseTokenSigner>,
     db_pool: PgPool,
+    store: Arc<dyn rise_backend_core::DeploymentStore>,
     public_url: &str,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<(
@@ -397,9 +404,6 @@ async fn init_docker_backend(
     // Connect bollard.
     let docker = client::connect(docker_host.as_deref())?;
 
-    let store: Arc<dyn rise_backend_core::DeploymentStore> = Arc::new(
-        crate::db::deployment_store::PgDeploymentStore::new(db_pool.clone()),
-    );
     let backend = DockerBackend::new(docker.clone(), url_builder.clone(), store.clone());
     backend.test_connection().await?;
     tracing::info!("Docker deployment backend initialized and connection tested");
@@ -1119,6 +1123,15 @@ impl AppState {
         // election can be wired to it.
         let shutdown = tokio_util::sync::CancellationToken::new();
 
+        // The single `DeploymentStore` implementation, shared by the deployment
+        // backend, the Metacontroller webhook, and the identity-refresh/CRD
+        // controllers. Constructed once here and threaded everywhere those need
+        // deployment persistence.
+        #[cfg(feature = "backend")]
+        let deployment_store: Arc<dyn rise_backend_core::DeploymentStore> = Arc::new(
+            crate::db::deployment_store::PgDeploymentStore::new(db_pool.clone()),
+        );
+
         // Initialize the deployment backend by matching on the configured
         // controller variant. Kubernetes uses the slim Metacontroller-backed
         // backend; Docker connects bollard, builds its own ResourceBuilder, and
@@ -1135,7 +1148,7 @@ impl AppState {
                         .clone()
                         .ok_or_else(|| anyhow::anyhow!("Kubernetes client not initialized"))?;
                     (
-                        init_kubernetes_backend(rb, kc, db_pool.clone()).await?,
+                        init_kubernetes_backend(rb, kc, deployment_store.clone()).await?,
                         None,
                         None,
                     )
@@ -1148,6 +1161,7 @@ impl AppState {
                         resource_store.clone(),
                         jwt_signer.clone(),
                         db_pool.clone(),
+                        deployment_store.clone(),
                         &public_url,
                         shutdown.clone(),
                     )
@@ -1569,6 +1583,8 @@ impl AppState {
             public_url,
             encryption_provider,
             deployment_backend,
+            #[cfg(feature = "backend")]
+            deployment_store,
             #[cfg(feature = "backend")]
             runtime_log_backend,
             extension_registry,
