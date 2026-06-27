@@ -173,6 +173,21 @@ pub trait Backend {
         )
     }
 
+    /// Upgrade the running stack in place to the target version (`RISE_IMAGE_TAG`)
+    /// and make the CLI usable again, then wait for the control plane to be
+    /// healthy. Only meaningful in the upgrade flow, where `bring_up` first stood
+    /// the stack up at the older `RISE_E2E_UPGRADE_FROM` version: Docker recreates
+    /// the `rise` service on the new image (the DB volume — and its data — is kept,
+    /// so the new server runs its migrations against it); Kubernetes `helm
+    /// upgrade`s from the old released chart to the in-repo chart on the new image.
+    /// Default: unsupported.
+    fn upgrade(&mut self) -> Result<()> {
+        anyhow::bail!(
+            "in-place upgrade is not supported by the {} backend",
+            self.name()
+        )
+    }
+
     /// Wait until a stopped deployment's workload is actually gone — every pod /
     /// container removed — so a subsequent logs query can only be served by the
     /// log store, not a live workload. Each backend checks its own runtime;

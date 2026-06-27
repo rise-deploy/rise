@@ -8,7 +8,7 @@
 use std::process::ExitCode;
 use std::time::Instant;
 
-use rise_e2e::{backend, compose, report, scenario, BackendKind};
+use rise_e2e::{backend, compose, report, scenario, upgrade, BackendKind};
 
 fn main() -> ExitCode {
     match std::env::var("RISE_E2E_SUITE").ok().as_deref() {
@@ -28,9 +28,18 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     };
     let mode = std::env::var("RISE_E2E_REGISTRY_MODE").unwrap_or_else(|_| "oci-client-auth".into());
+    // When set, run the in-place upgrade suite (bring up at this old version, then
+    // upgrade to RISE_IMAGE_TAG) instead of the normal scenario suite.
+    let upgrade_from = std::env::var("RISE_E2E_UPGRADE_FROM")
+        .ok()
+        .filter(|s| !s.is_empty());
     report::section(&format!(
-        "rise-e2e harness — backend={}, registry={mode}",
-        kind.as_str()
+        "rise-e2e harness — backend={}, registry={mode}{}",
+        kind.as_str(),
+        match &upgrade_from {
+            Some(from) => format!(", upgrade-from={from}"),
+            None => String::new(),
+        }
     ));
 
     let total = Instant::now();
@@ -49,7 +58,10 @@ fn main() -> ExitCode {
             "bring-up complete ({})",
             report::human(up.elapsed())
         ));
-        scenario::run_all(backend.as_ref())
+        match &upgrade_from {
+            Some(from) => upgrade::run(backend.as_mut(), from),
+            None => scenario::run_all(backend.as_ref()),
+        }
     }));
 
     // On any failure (scenario error or panic), capture diagnostics while the
