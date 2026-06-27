@@ -2316,15 +2316,15 @@ fn prepare_deployment_env_secret(
     }
 }
 
-/// Add backend service + endpoints resources.
+/// Add backend service + EndpointSlice resources.
 ///
 /// The Service is returned as a Metacontroller child. For IP-based backends,
-/// the Endpoints are applied directly via kube-rs because Endpoints cannot be
-/// a Metacontroller child resource type — Kubernetes auto-creates Endpoints
-/// for Services with selectors (e.g. the deployment `default` Service), and
-/// Metacontroller would thrash deleting/adopting those in an infinite loop.
-/// Since child resource types are all-or-nothing, we manage the `rise-backend`
-/// Endpoints outside of Metacontroller as well.
+/// the EndpointSlice is applied directly via kube-rs because EndpointSlices
+/// cannot be a Metacontroller child resource type — Kubernetes auto-creates
+/// EndpointSlices for Services with selectors (e.g. the deployment `default`
+/// Service), and Metacontroller would thrash deleting/adopting those in an
+/// infinite loop. Since child resource types are all-or-nothing, we manage the
+/// `rise-backend` EndpointSlice outside of Metacontroller as well.
 async fn add_backend_resources(
     state: &AppState,
     children: &mut Vec<serde_json::Value>,
@@ -2334,7 +2334,7 @@ async fn add_backend_resources(
     backend_address: &crate::server::settings::BackendAddress,
 ) -> anyhow::Result<()> {
     if backend_address.is_ip_address() {
-        // IP address → ClusterIP Service (as child) + Endpoints (applied directly)
+        // IP address → ClusterIP Service (as child) + EndpointSlice (applied directly)
         let svc = resource_builder.create_backend_service_clusterip(
             project,
             namespace,
@@ -2342,13 +2342,13 @@ async fn add_backend_resources(
         );
         children.push(serde_json::to_value(&svc)?);
 
-        let endpoints = resource_builder.create_backend_endpoints(
+        let endpoint_slice = resource_builder.create_backend_endpoint_slice(
             project,
             namespace,
             &backend_address.host,
             backend_address.port,
         );
-        apply_backend_endpoints(state, &endpoints, namespace).await;
+        apply_backend_endpoint_slice(state, &endpoint_slice, namespace).await;
     } else {
         // DNS name → ExternalName
         let svc = resource_builder.create_backend_service_externalname(
@@ -2362,39 +2362,43 @@ async fn add_backend_resources(
     Ok(())
 }
 
-/// Apply backend Endpoints directly via kube-rs server-side apply.
+/// Apply backend EndpointSlice directly via kube-rs server-side apply.
 ///
 /// On the first sync for a new project the namespace returned in this sync's
 /// children list has not yet been applied by Metacontroller, so the apply
 /// 404s. That's expected and self-heals on the next resync, so the 404 is
 /// logged at debug instead of warning.
-async fn apply_backend_endpoints(
+async fn apply_backend_endpoint_slice(
     state: &AppState,
-    endpoints: &k8s_openapi::api::core::v1::Endpoints,
+    endpoint_slice: &k8s_openapi::api::discovery::v1::EndpointSlice,
     namespace: &str,
 ) {
     let Some(ref kube_client) = state.kube_client else {
         return;
     };
-    let api: kube::Api<k8s_openapi::api::core::v1::Endpoints> =
+    let api: kube::Api<k8s_openapi::api::discovery::v1::EndpointSlice> =
         kube::Api::namespaced(kube_client.clone(), namespace);
-    let name = endpoints.metadata.name.as_deref().unwrap_or("rise-backend");
+    let name = endpoint_slice
+        .metadata
+        .name
+        .as_deref()
+        .unwrap_or("rise-backend");
     let params = kube::api::PatchParams::apply("rise-controller").force();
     match api
-        .patch(name, &params, &kube::api::Patch::Apply(endpoints))
+        .patch(name, &params, &kube::api::Patch::Apply(endpoint_slice))
         .await
     {
         Ok(_) => {}
         Err(kube::Error::Api(err)) if err.code == 404 => {
             debug!(
                 namespace = %namespace,
-                "Backend Endpoints apply deferred: namespace not yet created (will retry on next resync)"
+                "Backend EndpointSlice apply deferred: namespace not yet created (will retry on next resync)"
             );
         }
         Err(e) => {
             warn!(
                 namespace = %namespace,
-                "Failed to apply backend Endpoints: {:?}", e
+                "Failed to apply backend EndpointSlice: {:?}", e
             );
         }
     }

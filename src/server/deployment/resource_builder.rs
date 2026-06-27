@@ -655,33 +655,45 @@ impl ResourceBuilder {
         }
     }
 
-    pub fn create_backend_endpoints(
+    pub fn create_backend_endpoint_slice(
         &self,
         project: &Project,
         namespace: &str,
         ip: &str,
         port: u16,
-    ) -> k8s_openapi::api::core::v1::Endpoints {
-        use k8s_openapi::api::core::v1::{EndpointAddress, EndpointPort, EndpointSubset};
+    ) -> k8s_openapi::api::discovery::v1::EndpointSlice {
+        use k8s_openapi::api::discovery::v1::{Endpoint, EndpointPort, EndpointSlice};
 
-        k8s_openapi::api::core::v1::Endpoints {
+        // An EndpointSlice is associated with its Service via the
+        // `kubernetes.io/service-name` label (not by name-matching as core/v1
+        // Endpoints were), so it must be stamped for kube-proxy to route to it.
+        let mut labels = Self::common_labels(project, None);
+        labels.insert(
+            "kubernetes.io/service-name".to_string(),
+            "rise-backend".to_string(),
+        );
+
+        let address_type = match ip.parse::<std::net::IpAddr>() {
+            Ok(addr) if addr.is_ipv6() => "IPv6",
+            _ => "IPv4",
+        };
+
+        EndpointSlice {
             metadata: ObjectMeta {
                 name: Some("rise-backend".to_string()),
                 namespace: Some(namespace.to_string()),
-                labels: Some(Self::common_labels(project, None)),
+                labels: Some(labels),
                 ..Default::default()
             },
-            subsets: Some(vec![EndpointSubset {
-                addresses: Some(vec![EndpointAddress {
-                    ip: ip.to_string(),
-                    ..Default::default()
-                }]),
-                ports: Some(vec![EndpointPort {
-                    name: Some("http".to_string()),
-                    port: port as i32,
-                    protocol: Some("TCP".to_string()),
-                    ..Default::default()
-                }]),
+            address_type: address_type.to_string(),
+            endpoints: vec![Endpoint {
+                addresses: vec![ip.to_string()],
+                ..Default::default()
+            }],
+            ports: Some(vec![EndpointPort {
+                name: Some("http".to_string()),
+                port: Some(port as i32),
+                protocol: Some("TCP".to_string()),
                 ..Default::default()
             }]),
         }
@@ -1790,6 +1802,50 @@ mod tests {
             Some("abc123")
         );
         assert_eq!(secret.data, Some(data));
+    }
+
+    #[test]
+    fn create_backend_endpoint_slice_ipv4() {
+        let builder = test_resource_builder();
+        let project = test_project();
+
+        let slice = builder.create_backend_endpoint_slice(&project, "demo", "10.0.0.5", 3000);
+
+        assert_eq!(slice.metadata.name.as_deref(), Some("rise-backend"));
+        assert_eq!(slice.metadata.namespace.as_deref(), Some("demo"));
+        assert_eq!(slice.address_type, "IPv4");
+
+        // The `kubernetes.io/service-name` label is what associates the slice
+        // with the `rise-backend` Service so kube-proxy routes to it.
+        assert_eq!(
+            slice
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("kubernetes.io/service-name"))
+                .map(String::as_str),
+            Some("rise-backend")
+        );
+
+        assert_eq!(slice.endpoints.len(), 1);
+        assert_eq!(slice.endpoints[0].addresses, vec!["10.0.0.5".to_string()]);
+
+        let ports = slice.ports.expect("ports present");
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].name.as_deref(), Some("http"));
+        assert_eq!(ports[0].port, Some(3000));
+        assert_eq!(ports[0].protocol.as_deref(), Some("TCP"));
+    }
+
+    #[test]
+    fn create_backend_endpoint_slice_ipv6() {
+        let builder = test_resource_builder();
+        let project = test_project();
+
+        let slice = builder.create_backend_endpoint_slice(&project, "demo", "fd00::1", 3000);
+
+        assert_eq!(slice.address_type, "IPv6");
+        assert_eq!(slice.endpoints[0].addresses, vec!["fd00::1".to_string()]);
     }
 
     /// Test helper: build the single implicit `app` container Deployment the
