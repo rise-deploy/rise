@@ -59,7 +59,7 @@ fn seed(b: &dyn Backend) -> Result<Seeded> {
     create_public_project(b, &project).context("project create (old version)")?;
     deploy_image(b, &project, &app).context("deploy (old version)")?;
     b.wait_healthy(&project)?;
-    assert_app_reachable(b, &app, &project).context("pre-upgrade app reach")?;
+    assert_app_reachable(b, &app, &project, "pre-upgrade")?;
 
     // The deployment record must exist so we can prove it survives the migration.
     anyhow::ensure!(
@@ -96,7 +96,7 @@ fn verify(b: &dyn Backend, seeded: &Seeded) -> Result<()> {
     );
     b.wait_healthy(&seeded.project)?;
     let app = b.sample_app();
-    assert_app_reachable(b, &app, &seeded.project).context("post-upgrade app reach")?;
+    assert_app_reachable(b, &app, &seeded.project, "post-upgrade")?;
 
     // A fresh deploy on the upgraded control plane works end to end.
     report::note("deploying a fresh project on the upgraded version");
@@ -104,7 +104,7 @@ fn verify(b: &dyn Backend, seeded: &Seeded) -> Result<()> {
     create_public_project(b, &fresh).context("project create (post-upgrade)")?;
     deploy_image(b, &fresh, &app).context("deploy (post-upgrade)")?;
     b.wait_healthy(&fresh)?;
-    assert_app_reachable(b, &app, &fresh).context("fresh post-upgrade app reach")?;
+    assert_app_reachable(b, &app, &fresh, "fresh post-upgrade")?;
 
     Ok(())
 }

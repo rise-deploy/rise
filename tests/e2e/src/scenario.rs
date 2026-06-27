@@ -152,24 +152,31 @@ pub(crate) fn deploy_image(b: &dyn Backend, project: &str, app: &SampleApp) -> R
 
 /// Assert the app answers 200 (and carries its body marker, if any) through the
 /// backend's reach path, or log a declared gap when app-HTTP reach isn't wired.
-pub(crate) fn assert_app_reachable(b: &dyn Backend, app: &SampleApp, project: &str) -> Result<()> {
+/// `label` prefixes the messages so a caller running several reach checks (e.g.
+/// the upgrade suite's pre-/post-upgrade phases) can tell which one spoke.
+pub(crate) fn assert_app_reachable(
+    b: &dyn Backend,
+    app: &SampleApp,
+    project: &str,
+    label: &str,
+) -> Result<()> {
     match b.reach_app(project, "/")? {
         Some(resp) => {
             anyhow::ensure!(
                 resp.status == 200,
-                "expected 200 from app, got {}",
+                "{label}: expected 200 from app, got {}",
                 resp.status
             );
             if let Some(marker) = app.body_marker {
                 anyhow::ensure!(
                     resp.body.contains(marker),
-                    "response body missing expected marker {marker:?}:\n{}",
+                    "{label}: response body missing expected marker {marker:?}:\n{}",
                     resp.body
                 );
             }
         }
         None => eprintln!(
-            "[e2e] app-HTTP reach not wired for {} — asserted via Healthy only",
+            "[e2e] {label}: app-HTTP reach not wired for {} — asserted via Healthy only",
             b.name()
         ),
     }
@@ -209,7 +216,7 @@ impl Scenario for PublicDeploy {
         create_public_project(b, &project)?;
         deploy_image(b, &project, &app)?;
         b.wait_healthy(&project)?;
-        assert_app_reachable(b, &app, &project)?;
+        assert_app_reachable(b, &app, &project, self.id())?;
         Ok(())
     }
 }
