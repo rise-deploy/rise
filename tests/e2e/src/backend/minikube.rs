@@ -246,21 +246,23 @@ impl MinikubeBackend {
     /// rather than the renamed published OCI artifact. `image_tag` is the old
     /// version at this point in the flow (before `upgrade()` swaps it).
     fn materialize_old_chart(&self) -> Result<String> {
-        let old_tag = format!("v{}", self.image_tag);
-        let dest = self
-            .repo_root
-            .join("target")
-            .join(format!("e2e-old-chart-{}", std::process::id()));
+        // Accept the version with or without a leading `v`: CI passes a bare
+        // `0.22.1` (prepare strips it), but a hand-set RISE_E2E_UPGRADE_FROM may
+        // include the `v`. Always normalize to the `vX.Y.Z` git tag.
+        let old_tag = format!("v{}", self.image_tag.trim_start_matches('v'));
+        let dest = self.old_chart_dir();
         let _ = std::fs::remove_dir_all(&dest);
         std::fs::create_dir_all(&dest).context("create old-chart dir")?;
 
         // Make sure the tag is present (no-op on a full clone; a shallow CI
-        // checkout fetches just it), then export the chart tree at that tag.
+        // checkout fetches just it). Keep the outcome: a failed fetch is the most
+        // likely reason the export below can't find the tag, so fold it into that
+        // error rather than letting it surface as an opaque "unknown revision".
         let mut fetch = Command::new("git");
         fetch
             .current_dir(&self.repo_root)
             .args(["fetch", "--depth", "1", "origin", "tag", &old_tag]);
-        let _ = cli::run(fetch);
+        let fetch_out = cli::run(fetch)?;
 
         let tar = dest.join("chart.tar");
         let mut archive = Command::new("git");
@@ -269,7 +271,18 @@ impl MinikubeBackend {
             .args(["archive", "--format=tar", "-o"])
             .arg(&tar)
             .args([&old_tag, "helm/rise"]);
-        cli::run_checked(archive).with_context(|| format!("git archive {old_tag} helm/rise"))?;
+        let archive_out = cli::run(archive)?;
+        anyhow::ensure!(
+            archive_out.success(),
+            "git archive {old_tag} helm/rise failed (exit {:?}):\n{}\n(prior `git fetch` {})",
+            archive_out.status,
+            archive_out.combined(),
+            if fetch_out.success() {
+                "succeeded".to_string()
+            } else {
+                format!("also failed:\n{}", fetch_out.combined())
+            }
+        );
 
         let mut untar = Command::new("tar");
         untar.arg("-xf").arg(&tar).arg("-C").arg(&dest);
@@ -280,6 +293,13 @@ impl MinikubeBackend {
             .join("rise")
             .to_string_lossy()
             .into_owned())
+    }
+
+    /// Temp dir the upgrade flow exports the old chart into (cleaned in `tear_down`).
+    fn old_chart_dir(&self) -> PathBuf {
+        self.repo_root
+            .join("target")
+            .join(format!("e2e-old-chart-{}", std::process::id()))
     }
 
     /// The `helm upgrade --install` flags, including the jfrog-vault registry
@@ -510,49 +530,48 @@ impl MinikubeBackend {
     /// and `upgrade` (after a `helm upgrade` the server pod is recreated, so the
     /// existing forwards are stale and must be replaced).
     fn await_control_plane(&mut self) -> Result<()> {
-        report::step("wait deployments Available (≤10m)", || {
-            let mut wait_dep = Command::new("kubectl");
-            wait_dep.args([
-                "wait",
+        // Wait for each workload's rollout to complete. `kubectl rollout status`
+        // tracks the rollout by revision rather than snapshotting pods by name, so
+        // it's immune to the race that breaks `kubectl wait pod` during a
+        // `helm upgrade` (old pods get deleted mid-wait → "pods ... not found").
+        // A completed rollout means the new replicas are Available/Ready, so this
+        // also subsumes a separate pod-readiness wait.
+        report::step("wait rollouts complete (≤8m each)", || {
+            let mut get = Command::new("kubectl");
+            get.args([
+                "get",
+                "deployment,statefulset,daemonset",
                 "--namespace",
                 NAMESPACE,
-                "--for=condition=Available",
-                "deployment",
                 "-l",
                 &format!("app.kubernetes.io/instance={RELEASE}"),
-                "--timeout=10m",
+                "-o",
+                "name",
             ]);
-            cli::run_checked(wait_dep).context("kubectl wait deployments Available")
-        })?;
-
-        report::step("wait pods Ready (≤10m)", || {
-            // `kubectl wait` snapshots the matching pods up front, so during a
-            // `helm upgrade` rollout the old server/dex pods it's watching get
-            // deleted mid-wait and it fails with "pods ... not found" rather than
-            // re-evaluating. Retry: the NotFound race fails fast, and once the
-            // rollout settles only the new (Ready) pods remain and the wait passes.
-            // On the initial bring-up (no rollout) the first attempt succeeds.
-            let mut last = String::new();
-            for _ in 0..6 {
-                let mut wait_pod = Command::new("kubectl");
-                wait_pod.args([
-                    "wait",
+            let workloads = cli::run_checked(get).context("kubectl get workloads")?;
+            let names: Vec<&str> = workloads
+                .stdout
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect();
+            anyhow::ensure!(
+                !names.is_empty(),
+                "no workloads found for release {RELEASE} — helm install/upgrade may not have created them"
+            );
+            for res in names {
+                let mut st = Command::new("kubectl");
+                st.args([
+                    "rollout",
+                    "status",
                     "--namespace",
                     NAMESPACE,
-                    "--for=condition=Ready",
-                    "pod",
-                    "-l",
-                    &format!("app.kubernetes.io/instance={RELEASE}"),
-                    "--timeout=4m",
+                    res,
+                    "--timeout=8m",
                 ]);
-                let out = cli::run(wait_pod)?;
-                if out.success() {
-                    return Ok(());
-                }
-                last = out.combined();
-                std::thread::sleep(Duration::from_secs(10));
+                cli::run_checked(st).with_context(|| format!("kubectl rollout status {res}"))?;
             }
-            anyhow::bail!("kubectl wait pods Ready did not converge after retries:\n{last}")
+            Ok(())
         })?;
 
         // (Re-)forward the server and Dex for the whole run (killed in
@@ -683,7 +702,11 @@ impl Backend for MinikubeBackend {
             let old_values = format!("{old_chart}/values-ci.yaml");
             report::step("helm dependency update (old chart)", || {
                 // The old chart doesn't vendor its deps (metacontroller), so pull
-                // them; the in-repo chart vendors them under charts/.
+                // them; the in-repo chart vendors them under charts/. This resolves
+                // the OLD chart's dependency repositories as they were at the release
+                // tag — if a dependency's upstream repo has since moved or gone, this
+                // step fails. That's a property of how old the upgrade-from release
+                // is, not the upgrade itself; bump RISE_E2E_UPGRADE_FROM if it does.
                 let mut dep = Command::new("helm");
                 dep.args(["dependency", "update", &old_chart]);
                 cli::run_checked(dep).context("helm dependency update (old chart)")
@@ -714,6 +737,8 @@ impl Backend for MinikubeBackend {
     fn tear_down(&mut self) {
         // Drop the port-forwards (kills the kubectl children), then nuke the cluster.
         self.forwards.clear();
+        // Remove the old-chart export (no-op outside the upgrade flow).
+        let _ = std::fs::remove_dir_all(self.old_chart_dir());
         let mut del = Command::new("minikube");
         del.arg("delete");
         let _ = cli::run(del);

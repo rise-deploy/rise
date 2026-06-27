@@ -112,6 +112,25 @@ impl DockerBackend {
         Ok(())
     }
 
+    /// Poll the rise backend `/health` until it returns 200 (≤120s). `step` names
+    /// the reporter line (bring-up vs post-upgrade).
+    fn wait_health(&self, step: &str) -> Result<()> {
+        report::step_value(step, || {
+            http::poll(
+                Duration::from_secs(120),
+                Duration::from_secs(2),
+                "rise backend /health",
+                || {
+                    Ok(http::get(&format!("{RISE_URL}/health"), None)
+                        .map(|r| r.status == 200)
+                        .unwrap_or(false))
+                },
+            )?;
+            Ok("200")
+        })?;
+        Ok(())
+    }
+
     /// First app container name for a project (`rise_<project>…`), polled until present.
     fn app_container(&self, project: &str) -> Result<String> {
         let mut name = String::new();
@@ -177,19 +196,7 @@ impl Backend for DockerBackend {
             cli::run_checked(up).context("docker compose up")
         })?;
 
-        report::step_value("rise /health", || {
-            http::poll(
-                Duration::from_secs(120),
-                Duration::from_secs(2),
-                "rise backend /health",
-                || {
-                    Ok(http::get(&format!("{RISE_URL}/health"), None)
-                        .map(|r| r.status == 200)
-                        .unwrap_or(false))
-                },
-            )?;
-            Ok("200")
-        })?;
+        self.wait_health("rise /health")?;
 
         // Extract the CLI from the image for an exact version match.
         report::step("extract rise CLI from image", || self.extract_cli())
@@ -210,19 +217,7 @@ impl Backend for DockerBackend {
             cli::run_checked(up).context("docker compose up (upgrade)")
         })?;
 
-        report::step_value("rise /health (post-upgrade)", || {
-            http::poll(
-                Duration::from_secs(120),
-                Duration::from_secs(2),
-                "rise backend /health after upgrade",
-                || {
-                    Ok(http::get(&format!("{RISE_URL}/health"), None)
-                        .map(|r| r.status == 200)
-                        .unwrap_or(false))
-                },
-            )?;
-            Ok("200")
-        })?;
+        self.wait_health("rise /health (post-upgrade)")?;
 
         report::step("re-extract rise CLI from upgraded image", || {
             self.extract_cli()
