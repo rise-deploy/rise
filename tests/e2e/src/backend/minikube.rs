@@ -40,6 +40,10 @@ const JFROG_PUBLIC_URL: &str = "http://rise-ci-chart.rise-ci.svc.cluster.local:3
 // The docker network the compose stack + minikube node share (jfrog-vault).
 const COMPOSE_NETWORK: &str = "rise_default";
 const VAULT_ROLE_URL: &str = "http://127.0.0.1:8200/v1/artifactory/roles/rise";
+// Where released charts are published (matches CHART_REGISTRY in the CI workflow);
+// the chart name is `chart` (helm/rise/Chart.yaml). Used by the upgrade flow to
+// install the OLD released chart before upgrading to the in-repo one.
+const OLD_CHART_REF: &str = "oci://ghcr.io/rise-deploy/chart";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RegistryMode {
@@ -154,9 +158,17 @@ fn err_detail(stderr: &mut impl Read) -> String {
 
 pub struct MinikubeBackend {
     image_repository: String,
+    /// The image tag the release currently runs. In the upgrade flow this starts
+    /// at the older `RISE_E2E_UPGRADE_FROM` version and `upgrade` flips it to the
+    /// target; otherwise it's always the target (`RISE_IMAGE_TAG`).
     image_tag: String,
+    /// Repository the CLI image is pulled from (used to recompute `cli_image` on
+    /// upgrade).
+    cli_repo: String,
     /// `repo:tag` for the CLI image (defaults to the server image).
     cli_image: String,
+    /// The target tag to switch to on `upgrade`; `Some` only in the upgrade flow.
+    upgrade_target: Option<String>,
     registry_mode: RegistryMode,
     cpus: String,
     memory: String,
@@ -176,8 +188,17 @@ impl MinikubeBackend {
     pub fn new() -> Result<Self> {
         let image_repository = std::env::var("RISE_IMAGE_REPOSITORY")
             .unwrap_or_else(|_| "ghcr.io/rise-deploy/rise".to_string());
-        let image_tag = std::env::var("RISE_IMAGE_TAG")
+        let target_tag = std::env::var("RISE_IMAGE_TAG")
             .context("RISE_IMAGE_TAG must be set for the minikube backend")?;
+        // In the upgrade flow the release first comes up on the older version and
+        // `upgrade` switches it to the target tag (and the in-repo chart).
+        let upgrade_from = std::env::var("RISE_E2E_UPGRADE_FROM")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let (image_tag, upgrade_target) = match upgrade_from {
+            Some(old) => (old, Some(target_tag)),
+            None => (target_tag, None),
+        };
         let cli_repo =
             std::env::var("RISE_CLI_IMAGE_REPOSITORY").unwrap_or_else(|_| image_repository.clone());
         let registry_mode = RegistryMode::from_env();
@@ -197,6 +218,8 @@ impl MinikubeBackend {
             cli_image: format!("{cli_repo}:{image_tag}"),
             image_repository,
             image_tag,
+            cli_repo,
+            upgrade_target,
             registry_mode,
             cpus: std::env::var("MINIKUBE_CPUS").unwrap_or_else(|_| "4".to_string()),
             memory: std::env::var("MINIKUBE_MEMORY").unwrap_or_else(|_| "6144".to_string()),
@@ -438,6 +461,94 @@ impl MinikubeBackend {
         c.args(args);
         cli::run(c)
     }
+
+    /// Wait for the Rise release to roll out, then (re-)establish the long-lived
+    /// server + Dex port-forwards and confirm both answer. Shared by `bring_up`
+    /// and `upgrade` (after a `helm upgrade` the server pod is recreated, so the
+    /// existing forwards are stale and must be replaced).
+    fn await_control_plane(&mut self) -> Result<()> {
+        report::step("wait deployments Available (≤10m)", || {
+            let mut wait_dep = Command::new("kubectl");
+            wait_dep.args([
+                "wait",
+                "--namespace",
+                NAMESPACE,
+                "--for=condition=Available",
+                "deployment",
+                "-l",
+                &format!("app.kubernetes.io/instance={RELEASE}"),
+                "--timeout=10m",
+            ]);
+            cli::run_checked(wait_dep).context("kubectl wait deployments Available")
+        })?;
+
+        report::step("wait pods Ready (≤10m)", || {
+            let mut wait_pod = Command::new("kubectl");
+            wait_pod.args([
+                "wait",
+                "--namespace",
+                NAMESPACE,
+                "--for=condition=Ready",
+                "pod",
+                "-l",
+                &format!("app.kubernetes.io/instance={RELEASE}"),
+                "--timeout=10m",
+            ]);
+            cli::run_checked(wait_pod).context("kubectl wait pods Ready")
+        })?;
+
+        // (Re-)forward the server and Dex for the whole run (killed in
+        // tear_down/drop). Clearing first drops any stale forwards to a pod the
+        // upgrade replaced.
+        report::step("port-forward server :3000 + dex :5556", || {
+            self.forwards.clear();
+            self.forwards.push(PortForward::spawn(
+                NAMESPACE,
+                &format!("svc/{SERVER_SVC}"),
+                "3000:3000",
+                "rise server",
+            )?);
+            self.forwards.push(PortForward::spawn(
+                NAMESPACE,
+                &format!("svc/{DEX_SVC}"),
+                "5556:5556",
+                "dex",
+            )?);
+            Ok(())
+        })?;
+
+        // The forwards take a moment to establish — swallow connection errors.
+        report::step_value("rise /health", || {
+            http::poll(
+                Duration::from_secs(60),
+                Duration::from_secs(2),
+                "rise server /health (port-forward)",
+                || {
+                    Ok(http::get(&format!("{RISE_URL}/health"), None)
+                        .map(|r| r.status == 200)
+                        .unwrap_or(false))
+                },
+            )?;
+            Ok("200")
+        })?;
+        report::step_value("dex discovery", || {
+            http::poll(
+                Duration::from_secs(60),
+                Duration::from_secs(2),
+                "dex discovery (port-forward)",
+                || {
+                    Ok(http::get(
+                        &format!("{DEX_LOCAL_URL}/.well-known/openid-configuration"),
+                        None,
+                    )
+                    .map(|r| r.status == 200)
+                    .unwrap_or(false))
+                },
+            )?;
+            Ok("200")
+        })?;
+        Ok(())
+    }
 }
 
 impl Backend for MinikubeBackend {
@@ -503,94 +614,24 @@ impl Backend for MinikubeBackend {
 
         report::step("helm upgrade --install", || {
             let mut helm = Command::new("helm");
-            helm.args([
-                "upgrade",
-                "--install",
-                RELEASE,
-                &self.repo_path("helm/rise"),
-            ]);
+            helm.args(["upgrade", "--install", RELEASE]);
+            // Upgrade flow: come up on the OLD released chart (pulled from the OCI
+            // registry, version == the old tag) before upgrading to the in-repo
+            // chart. Otherwise install the in-repo chart directly.
+            match &self.upgrade_target {
+                Some(_) => {
+                    helm.arg(OLD_CHART_REF);
+                    helm.args(["--version", &self.image_tag]);
+                }
+                None => {
+                    helm.arg(self.repo_path("helm/rise"));
+                }
+            }
             helm.args(self.helm_args());
             cli::run_checked(helm).context("helm upgrade --install")
         })?;
 
-        report::step("wait deployments Available (≤10m)", || {
-            let mut wait_dep = Command::new("kubectl");
-            wait_dep.args([
-                "wait",
-                "--namespace",
-                NAMESPACE,
-                "--for=condition=Available",
-                "deployment",
-                "-l",
-                &format!("app.kubernetes.io/instance={RELEASE}"),
-                "--timeout=10m",
-            ]);
-            cli::run_checked(wait_dep).context("kubectl wait deployments Available")
-        })?;
-
-        report::step("wait pods Ready (≤10m)", || {
-            let mut wait_pod = Command::new("kubectl");
-            wait_pod.args([
-                "wait",
-                "--namespace",
-                NAMESPACE,
-                "--for=condition=Ready",
-                "pod",
-                "-l",
-                &format!("app.kubernetes.io/instance={RELEASE}"),
-                "--timeout=10m",
-            ]);
-            cli::run_checked(wait_pod).context("kubectl wait pods Ready")
-        })?;
-
-        // Forward the server and Dex for the whole run (killed in tear_down/drop).
-        report::step("port-forward server :3000 + dex :5556", || {
-            self.forwards.push(PortForward::spawn(
-                NAMESPACE,
-                &format!("svc/{SERVER_SVC}"),
-                "3000:3000",
-                "rise server",
-            )?);
-            self.forwards.push(PortForward::spawn(
-                NAMESPACE,
-                &format!("svc/{DEX_SVC}"),
-                "5556:5556",
-                "dex",
-            )?);
-            Ok(())
-        })?;
-
-        // The forwards take a moment to establish — swallow connection errors.
-        report::step_value("rise /health", || {
-            http::poll(
-                Duration::from_secs(60),
-                Duration::from_secs(2),
-                "rise server /health (port-forward)",
-                || {
-                    Ok(http::get(&format!("{RISE_URL}/health"), None)
-                        .map(|r| r.status == 200)
-                        .unwrap_or(false))
-                },
-            )?;
-            Ok("200")
-        })?;
-        report::step_value("dex discovery", || {
-            http::poll(
-                Duration::from_secs(60),
-                Duration::from_secs(2),
-                "dex discovery (port-forward)",
-                || {
-                    Ok(http::get(
-                        &format!("{DEX_LOCAL_URL}/.well-known/openid-configuration"),
-                        None,
-                    )
-                    .map(|r| r.status == 200)
-                    .unwrap_or(false))
-                },
-            )?;
-            Ok("200")
-        })?;
-        Ok(())
+        self.await_control_plane()
     }
 
     fn tear_down(&mut self) {
@@ -784,6 +825,33 @@ impl Backend for MinikubeBackend {
         helm.args(self.helm_args());
         cli::run_checked(helm).context("helm upgrade (idempotency)")?;
         Ok(())
+    }
+
+    fn upgrade(&mut self) -> Result<()> {
+        let target = self
+            .upgrade_target
+            .take()
+            .context("minikube backend is not in upgrade mode (RISE_E2E_UPGRADE_FROM unset)")?;
+        self.image_tag = target;
+        self.cli_image = format!("{}:{}", self.cli_repo, self.image_tag);
+
+        // Helm does not upgrade CRDs on `helm upgrade`, so apply the in-repo CRDs
+        // first — the same step an operator runs to pick up new CRD fields.
+        report::step("apply in-repo CRDs", || {
+            let mut apply = Command::new("kubectl");
+            apply.args(["apply", "-f", &self.repo_path("helm/rise/crds")]);
+            cli::run_checked(apply).context("kubectl apply CRDs")
+        })?;
+
+        // Upgrade from the old released chart to the in-repo chart on the new image.
+        report::step("helm upgrade (to in-repo chart + target image)", || {
+            let mut helm = Command::new("helm");
+            helm.args(["upgrade", RELEASE, &self.repo_path("helm/rise")]);
+            helm.args(self.helm_args());
+            cli::run_checked(helm).context("helm upgrade (target)")
+        })?;
+
+        self.await_control_plane()
     }
 
     fn wait_workload_removed(&self, project: &str) -> Result<()> {

@@ -86,7 +86,7 @@ pub fn run_all(b: &dyn Backend) -> Result<()> {
 }
 
 /// Unique-enough project name per run (DNS-safe), so a stale stack can't collide.
-fn unique(prefix: &str) -> String {
+pub(crate) fn unique(prefix: &str) -> String {
     // Process id + per-process atomic counter: two scenarios in one process can't
     // collide, and separate runs differ by pid. DNS-safe (starts with the letter
     // prefix, lowercase alphanumeric + hyphens).
@@ -98,7 +98,7 @@ fn unique(prefix: &str) -> String {
     )
 }
 
-fn expect_ok(out: CliOutput, what: &str) -> Result<CliOutput> {
+pub(crate) fn expect_ok(out: CliOutput, what: &str) -> Result<CliOutput> {
     anyhow::ensure!(
         out.success(),
         "{what} failed (exit {:?}):\n{}",

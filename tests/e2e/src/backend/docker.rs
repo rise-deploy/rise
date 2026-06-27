@@ -22,7 +22,12 @@ const TRAEFIK_URL: &str = "http://localhost";
 pub struct DockerBackend {
     repo_root: PathBuf,
     image_repository: String,
+    /// The image tag the stack currently runs. In the upgrade flow this starts at
+    /// the older `RISE_E2E_UPGRADE_FROM` version and `upgrade` flips it to the
+    /// target; otherwise it's always the target (`RISE_IMAGE_TAG`).
     image_tag: String,
+    /// The target tag to switch to on `upgrade`; `Some` only in the upgrade flow.
+    upgrade_target: Option<String>,
     ci_token: String,
     dex: DexEndpoint,
     /// Where the CLI binary is extracted to (set in `bring_up`).
@@ -39,8 +44,17 @@ impl DockerBackend {
             .context("resolve repo root from CARGO_MANIFEST_DIR")?;
         let image_repository = std::env::var("RISE_IMAGE_REPOSITORY")
             .unwrap_or_else(|_| "ghcr.io/rise-deploy/rise".to_string());
-        let image_tag = std::env::var("RISE_IMAGE_TAG")
+        let target_tag = std::env::var("RISE_IMAGE_TAG")
             .context("RISE_IMAGE_TAG must be set for the docker backend")?;
+        // In the upgrade flow the stack first comes up on the older version and
+        // `upgrade` switches it to the target tag in place.
+        let upgrade_from = std::env::var("RISE_E2E_UPGRADE_FROM")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let (image_tag, upgrade_target) = match upgrade_from {
+            Some(old) => (old, Some(target_tag)),
+            None => (target_tag, None),
+        };
         let ci_token = token::mint_ci_token(SECRET_B64, PUBLIC_URL)?;
         let dex = DexEndpoint {
             token_url: "http://127.0.0.1:5556/dex/token".to_string(),
@@ -52,6 +66,7 @@ impl DockerBackend {
             repo_root,
             image_repository,
             image_tag,
+            upgrade_target,
             ci_token,
             dex,
             cli_bin: None,
@@ -61,6 +76,40 @@ impl DockerBackend {
 
     fn image(&self) -> String {
         format!("{}:{}", self.image_repository, self.image_tag)
+    }
+
+    /// Extract the `rise` CLI from the currently-configured image so the harness
+    /// runs a CLI that exactly matches the running server. Called on bring-up and
+    /// again after an upgrade (to pick up the new version's CLI).
+    fn extract_cli(&mut self) -> Result<()> {
+        let tmp = self
+            .repo_root
+            .join("target")
+            .join(format!("e2e-cli-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).context("create CLI extract dir")?;
+        let bin = tmp.join("rise");
+
+        // A previous extraction (e.g. on bring-up) may have left the container behind.
+        let mut pre_rm = Command::new("docker");
+        pre_rm.args(["rm", "-f", &self.extract_container]);
+        let _ = cli::run(pre_rm);
+
+        let mut create = Command::new("docker");
+        create.args(["create", "--name", &self.extract_container, &self.image()]);
+        cli::run_checked(create).context("docker create (CLI extract)")?;
+
+        let mut cp = Command::new("docker");
+        cp.arg("cp")
+            .arg(format!("{}:/usr/local/bin/rise", self.extract_container));
+        cp.arg(&bin);
+        cli::run_checked(cp).context("docker cp rise binary")?;
+
+        let mut rm = Command::new("docker");
+        rm.args(["rm", "-f", &self.extract_container]);
+        let _ = cli::run(rm);
+
+        self.cli_bin = Some(bin);
+        Ok(())
     }
 
     /// First app container name for a project (`rise_<project>…`), polled until present.
@@ -143,30 +192,40 @@ impl Backend for DockerBackend {
         })?;
 
         // Extract the CLI from the image for an exact version match.
-        report::step("extract rise CLI from image", || {
-            let tmp = self
-                .repo_root
-                .join("target")
-                .join(format!("e2e-cli-{}", std::process::id()));
-            std::fs::create_dir_all(&tmp).context("create CLI extract dir")?;
-            let bin = tmp.join("rise");
+        report::step("extract rise CLI from image", || self.extract_cli())
+    }
 
-            let mut create = Command::new("docker");
-            create.args(["create", "--name", &self.extract_container, &self.image()]);
-            cli::run_checked(create).context("docker create (CLI extract)")?;
+    fn upgrade(&mut self) -> Result<()> {
+        let target = self
+            .upgrade_target
+            .take()
+            .context("docker backend is not in upgrade mode (RISE_E2E_UPGRADE_FROM unset)")?;
+        self.image_tag = target;
 
-            let mut cp = Command::new("docker");
-            cp.arg("cp")
-                .arg(format!("{}:/usr/local/bin/rise", self.extract_container));
-            cp.arg(&bin);
-            cli::run_checked(cp).context("docker cp rise binary")?;
+        // Recreate ONLY the `rise` service on the new image (`--no-deps` keeps
+        // Postgres + its volume, so the upgraded server migrates the existing DB).
+        report::step("docker compose up -d rise (upgrade image)", || {
+            let mut up = self.compose();
+            up.args(["up", "-d", "--no-deps", "--force-recreate", "rise"]);
+            cli::run_checked(up).context("docker compose up (upgrade)")
+        })?;
 
-            let mut rm = Command::new("docker");
-            rm.args(["rm", "-f", &self.extract_container]);
-            let _ = cli::run(rm);
+        report::step_value("rise /health (post-upgrade)", || {
+            http::poll(
+                Duration::from_secs(120),
+                Duration::from_secs(2),
+                "rise backend /health after upgrade",
+                || {
+                    Ok(http::get(&format!("{RISE_URL}/health"), None)
+                        .map(|r| r.status == 200)
+                        .unwrap_or(false))
+                },
+            )?;
+            Ok("200")
+        })?;
 
-            self.cli_bin = Some(bin);
-            Ok(())
+        report::step("re-extract rise CLI from upgraded image", || {
+            self.extract_cli()
         })
     }
 

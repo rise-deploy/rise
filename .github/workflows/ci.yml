@@ -42,7 +42,28 @@ jobs:
       short_sha: ${{ steps.meta.outputs.short_sha }}
       is_trusted_pr: ${{ steps.meta.outputs.is_trusted_pr }}
       should_publish: ${{ steps.meta.outputs.should_publish }}
+      latest_stable: ${{ steps.tags.outputs.latest_stable }}
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Compute latest stable release tag
+        id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The newest published stable release (vMAJOR.MINOR.PATCH, no -rc suffix)
+          # — the version the upgrade E2E starts from. Empty if none exists yet, in
+          # which case the upgrade jobs skip.
+          latest=$(git tag -l 'v*' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V | tail -1 || true)
+          echo "latest_stable=${latest#v}" >> "$GITHUB_OUTPUT"
+          echo "Latest stable release: ${latest:-<none>}"
+
       - name: Compute metadata
         id: meta
         shell: bash
@@ -679,6 +700,112 @@ jobs:
           RISE_IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
           RISE_E2E_BACKEND: minikube
           RISE_E2E_REGISTRY_MODE: jfrog-vault
+        run: |
+          chmod +x harness/rise-e2e
+          ./harness/rise-e2e
+
+  # Upgrade test: stand the stack up on the latest published stable release, seed a
+  # project + deployment, then upgrade in place to this build (running the DB
+  # migrations against the seeded data) and assert the project survived and a fresh
+  # deploy still works. Docker recreates the rise service on the new image; the
+  # minikube job below upgrades from the old released chart to the in-repo chart.
+  # Skipped when no stable release exists yet (latest_stable empty).
+  e2e-upgrade-docker:
+    name: E2E / Upgrade (Docker)
+    runs-on: ubuntu-latest
+    if: >-
+      needs.prepare.outputs.latest_stable != '' &&
+      ((github.event_name == 'push' && github.ref == 'refs/heads/develop') ||
+       (github.event_name == 'pull_request' && needs.prepare.outputs.is_trusted_pr == 'true'))
+    needs:
+      - prepare
+      - package-image
+      - rust-quality
+      - unit-tests-linux
+      - e2e-harness-build
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download e2e harness binary
+        uses: actions/download-artifact@v5
+        with:
+          name: rise-e2e-harness
+          path: harness
+
+      - name: Run e2e upgrade harness (docker backend)
+        env:
+          RISE_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          RISE_IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
+          RISE_E2E_UPGRADE_FROM: ${{ needs.prepare.outputs.latest_stable }}
+          RISE_E2E_BACKEND: docker
+        run: |
+          chmod +x harness/rise-e2e
+          ./harness/rise-e2e
+
+  e2e-upgrade-minikube:
+    name: E2E / Upgrade (Minikube)
+    runs-on: ubuntu-latest
+    if: >-
+      needs.prepare.outputs.latest_stable != '' &&
+      ((github.event_name == 'push' && github.ref == 'refs/heads/develop') ||
+       (github.event_name == 'pull_request' && needs.prepare.outputs.is_trusted_pr == 'true'))
+    needs:
+      - prepare
+      - package-image
+      - package-helm
+      - e2e-harness-build
+    timeout-minutes: 50
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup mise
+        uses: jdx/mise-action@v4
+        with:
+          cache: true
+          experimental: true
+
+      - name: Install mise tools
+        run: mise use -g minikube kubectl helm
+
+      # Helm needs its own registry login to pull the old released chart over OCI.
+      - name: Log in to GHCR for Helm OCI pull
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ${{ env.REGISTRY }} -u "${{ github.actor }}" --password-stdin
+
+      - name: Download e2e harness binary
+        uses: actions/download-artifact@v5
+        with:
+          name: rise-e2e-harness
+          path: harness
+
+      - name: Run e2e upgrade harness (minikube backend)
+        env:
+          RISE_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          RISE_IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
+          RISE_E2E_UPGRADE_FROM: ${{ needs.prepare.outputs.latest_stable }}
+          RISE_E2E_BACKEND: minikube
         run: |
           chmod +x harness/rise-e2e
           ./harness/rise-e2e
