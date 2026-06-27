@@ -648,8 +648,9 @@ jobs:
   # project + deployment, then upgrade in place to this build (running the DB
   # migrations against the seeded data) and assert the project survived and a fresh
   # deploy still works. Skipped when no stable release exists yet (latest_stable
-  # empty). The minikube job installs the old released chart from the OCI registry
-  # and `helm upgrade`s to the in-repo chart on the new image.
+  # empty). The minikube job builds the OLD chart from its source at the release tag
+  # (with that version's own values-ci.yaml) and `helm upgrade`s to the in-repo
+  # chart on the new image — a clean in-place upgrade (same chart name throughout).
   #
   # NOTE: there is deliberately no Docker upgrade job yet. The Docker deployment
   # backend (docker-compose.standalone.yaml + config/docker.yaml) landed after the

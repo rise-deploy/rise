@@ -100,9 +100,15 @@ project + its deployment history survived and a fresh deploy still works.
 What each backend faithfully versions differs (a documented limitation, not a
 parity bug): Docker recreates the `rise` service on the new image against the
 existing Postgres volume — keeping the in-repo compose topology — so it exercises
-the **image + DB-migration** upgrade; minikube installs the **old released chart**
-from the OCI registry and `helm upgrade`s to the in-repo chart on the new image,
-exercising a full **chart + image + DB-migration** upgrade.
+the **image + DB-migration** upgrade; minikube builds the **old chart from its
+source** at the release tag (`git archive v<old> helm/rise`, with that version's
+own `values-ci.yaml` and a `helm dependency update`), pins it to the old image,
+then `helm upgrade`s to the in-repo chart on the new image — a full **chart +
+image + DB-migration** upgrade. The old chart is built from source (not the
+published OCI artifact) because the published chart is renamed `rise-helm` while
+the values files assume the in-repo name `chart`; installing from source keeps the
+chart name — and the `rise-ci-chart-*` resource names — consistent across the
+upgrade.
 
 In CI, only the **minikube** upgrade runs (`e2e-upgrade-minikube`), from the
 latest published stable release on every develop push / trusted PR. There is no

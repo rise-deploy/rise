@@ -40,12 +40,6 @@ const JFROG_PUBLIC_URL: &str = "http://rise-ci-chart.rise-ci.svc.cluster.local:3
 // The docker network the compose stack + minikube node share (jfrog-vault).
 const COMPOSE_NETWORK: &str = "rise_default";
 const VAULT_ROLE_URL: &str = "http://127.0.0.1:8200/v1/artifactory/roles/rise";
-// Where released charts are published. The `package-helm` CI job renames the
-// chart to `rise-helm` before pushing it to CHART_REGISTRY (ghcr.io/rise-deploy),
-// so the published artifact is `rise-helm`, not the in-repo Chart.yaml name
-// (`chart`). Used by the upgrade flow to install the OLD released chart before
-// upgrading to the in-repo one.
-const OLD_CHART_REF: &str = "oci://ghcr.io/rise-deploy/rise-helm";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RegistryMode {
@@ -246,15 +240,59 @@ impl MinikubeBackend {
         self.repo_root.join(rel).to_string_lossy().into_owned()
     }
 
+    /// Export `helm/rise` at the old release tag (`v<image_tag>`, e.g. `v0.22.1`)
+    /// into a temp dir and return the chart path, so the upgrade flow installs the
+    /// OLD chart from its own source (matching that version's values-ci.yaml)
+    /// rather than the renamed published OCI artifact. `image_tag` is the old
+    /// version at this point in the flow (before `upgrade()` swaps it).
+    fn materialize_old_chart(&self) -> Result<String> {
+        let old_tag = format!("v{}", self.image_tag);
+        let dest = self
+            .repo_root
+            .join("target")
+            .join(format!("e2e-old-chart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::create_dir_all(&dest).context("create old-chart dir")?;
+
+        // Make sure the tag is present (no-op on a full clone; a shallow CI
+        // checkout fetches just it), then export the chart tree at that tag.
+        let mut fetch = Command::new("git");
+        fetch
+            .current_dir(&self.repo_root)
+            .args(["fetch", "--depth", "1", "origin", "tag", &old_tag]);
+        let _ = cli::run(fetch);
+
+        let tar = dest.join("chart.tar");
+        let mut archive = Command::new("git");
+        archive
+            .current_dir(&self.repo_root)
+            .args(["archive", "--format=tar", "-o"])
+            .arg(&tar)
+            .args([&old_tag, "helm/rise"]);
+        cli::run_checked(archive).with_context(|| format!("git archive {old_tag} helm/rise"))?;
+
+        let mut untar = Command::new("tar");
+        untar.arg("-xf").arg(&tar).arg("-C").arg(&dest);
+        cli::run_checked(untar).context("untar old chart")?;
+
+        Ok(dest
+            .join("helm")
+            .join("rise")
+            .to_string_lossy()
+            .into_owned())
+    }
+
     /// The `helm upgrade --install` flags, including the jfrog-vault registry
-    /// overrides when that mode is selected.
-    fn helm_args(&self) -> Vec<String> {
+    /// overrides when that mode is selected. `values` is the values file to apply
+    /// (the in-repo `values-ci.yaml` normally; the old release's own values file
+    /// during the upgrade flow's initial install).
+    fn helm_args(&self, values: &str) -> Vec<String> {
         let mut args = vec![
             "--namespace".into(),
             NAMESPACE.into(),
             "--create-namespace".into(),
             "--values".into(),
-            self.repo_path("helm/rise/values-ci.yaml"),
+            values.to_string(),
             "--set".into(),
             format!("image.repository={}", self.image_repository),
             "--set".into(),
@@ -617,24 +655,43 @@ impl Backend for MinikubeBackend {
             })?;
         }
 
-        report::step("helm upgrade --install", || {
-            let mut helm = Command::new("helm");
-            helm.args(["upgrade", "--install", RELEASE]);
-            // Upgrade flow: come up on the OLD released chart (pulled from the OCI
-            // registry, version == the old tag) before upgrading to the in-repo
-            // chart. Otherwise install the in-repo chart directly.
-            match &self.upgrade_target {
-                Some(_) => {
-                    helm.arg(OLD_CHART_REF);
-                    helm.args(["--version", &self.image_tag]);
-                }
-                None => {
-                    helm.arg(self.repo_path("helm/rise"));
-                }
-            }
-            helm.args(self.helm_args());
-            cli::run_checked(helm).context("helm upgrade --install")
-        })?;
+        if self.upgrade_target.is_some() {
+            // Upgrade flow: come up on the OLD release, built from its source chart
+            // at the old tag with that version's own values-ci.yaml, pinned to the
+            // old image. The published chart is renamed (`rise-helm`) and the values
+            // files assume the in-repo name (`chart`), so installing from source —
+            // not the OCI artifact — keeps the chart name `chart` and the
+            // `rise-ci-chart-*` resource names consistent across the upgrade.
+            let old_chart = report::step_value("materialize old chart from git", || {
+                self.materialize_old_chart()
+            })?;
+            let old_values = format!("{old_chart}/values-ci.yaml");
+            report::step("helm dependency update (old chart)", || {
+                // The old chart doesn't vendor its deps (metacontroller), so pull
+                // them; the in-repo chart vendors them under charts/.
+                let mut dep = Command::new("helm");
+                dep.args(["dependency", "update", &old_chart]);
+                cli::run_checked(dep).context("helm dependency update (old chart)")
+            })?;
+            report::step("helm install (old release)", || {
+                let mut helm = Command::new("helm");
+                helm.args(["upgrade", "--install", RELEASE, &old_chart]);
+                helm.args(self.helm_args(&old_values));
+                cli::run_checked(helm).context("helm install (old release)")
+            })?;
+        } else {
+            report::step("helm upgrade --install", || {
+                let mut helm = Command::new("helm");
+                helm.args([
+                    "upgrade",
+                    "--install",
+                    RELEASE,
+                    &self.repo_path("helm/rise"),
+                ]);
+                helm.args(self.helm_args(&self.repo_path("helm/rise/values-ci.yaml")));
+                cli::run_checked(helm).context("helm upgrade --install")
+            })?;
+        }
 
         self.await_control_plane()
     }
@@ -827,7 +884,7 @@ impl Backend for MinikubeBackend {
         // chart applies cleanly a second time.
         let mut helm = Command::new("helm");
         helm.args(["upgrade", RELEASE, &self.repo_path("helm/rise")]);
-        helm.args(self.helm_args());
+        helm.args(self.helm_args(&self.repo_path("helm/rise/values-ci.yaml")));
         cli::run_checked(helm).context("helm upgrade (idempotency)")?;
         Ok(())
     }
@@ -848,11 +905,13 @@ impl Backend for MinikubeBackend {
             cli::run_checked(apply).context("kubectl apply CRDs")
         })?;
 
-        // Upgrade from the old released chart to the in-repo chart on the new image.
+        // Upgrade the same release (chart name `chart`) to the in-repo chart on the
+        // new image and current values — a clean in-place upgrade (resource names
+        // are unchanged from the old install).
         report::step("helm upgrade (to in-repo chart + target image)", || {
             let mut helm = Command::new("helm");
             helm.args(["upgrade", RELEASE, &self.repo_path("helm/rise")]);
-            helm.args(self.helm_args());
+            helm.args(self.helm_args(&self.repo_path("helm/rise/values-ci.yaml")));
             cli::run_checked(helm).context("helm upgrade (target)")
         })?;
 
