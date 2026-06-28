@@ -156,7 +156,23 @@ pub async fn handle_sync(
         }
     };
 
-    match process_sync(&state, &project_name, &request.children).await {
+    // The parent RiseProject CR's UID is the GC anchor for resources we apply
+    // directly (outside Metacontroller), e.g. the backend EndpointSlice.
+    let project_uid = request
+        .parent
+        .get("metadata")
+        .and_then(|m| m.get("uid"))
+        .and_then(|u| u.as_str())
+        .map(|s| s.to_string());
+
+    match process_sync(
+        &state,
+        &project_name,
+        project_uid.as_deref(),
+        &request.children,
+    )
+    .await
+    {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(SyncError::WrongController {
             project,
@@ -206,6 +222,7 @@ pub async fn handle_sync(
 async fn process_sync(
     state: &AppState,
     project_name: &str,
+    rise_project_uid: Option<&str>,
     observed: &ObservedChildren,
 ) -> Result<SyncResponse, SyncError> {
     // 1. Load project from DB
@@ -306,6 +323,7 @@ async fn process_sync(
         state,
         resource_builder,
         &project,
+        rise_project_uid,
         &all_deployments,
         observed,
         &namespace_prefix,
@@ -1315,6 +1333,7 @@ async fn compute_desired_children(
     state: &AppState,
     resource_builder: &ResourceBuilder,
     project: &Project,
+    rise_project_uid: Option<&str>,
     all_deployments: &[Deployment],
     observed: &ObservedChildren,
     namespace_prefix: &str,
@@ -1360,6 +1379,7 @@ async fn compute_desired_children(
             &mut children,
             resource_builder,
             project,
+            rise_project_uid,
             &namespace,
             backend_address,
         )
@@ -2330,6 +2350,7 @@ async fn add_backend_resources(
     children: &mut Vec<serde_json::Value>,
     resource_builder: &ResourceBuilder,
     project: &Project,
+    rise_project_uid: Option<&str>,
     namespace: &str,
     backend_address: &crate::server::settings::BackendAddress,
 ) -> anyhow::Result<()> {
@@ -2347,6 +2368,7 @@ async fn add_backend_resources(
             namespace,
             &backend_address.host,
             backend_address.port,
+            rise_project_uid,
         );
         apply_backend_endpoint_slice(state, &endpoint_slice, namespace).await;
     } else {

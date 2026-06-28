@@ -19,7 +19,7 @@ use k8s_openapi::api::networking::v1::{
     HTTPIngressPath, HTTPIngressRuleValue, Ingress, IngressBackend, IngressRule,
     IngressServiceBackend, IngressSpec, NetworkPolicy, NetworkPolicySpec, ServiceBackendPort,
 };
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
 use k8s_openapi::ByteString;
 use std::collections::BTreeMap;
 use tracing::warn;
@@ -661,6 +661,7 @@ impl ResourceBuilder {
         namespace: &str,
         ip: &str,
         port: u16,
+        rise_project_uid: Option<&str>,
     ) -> k8s_openapi::api::discovery::v1::EndpointSlice {
         use k8s_openapi::api::discovery::v1::{Endpoint, EndpointPort, EndpointSlice};
 
@@ -678,11 +679,32 @@ impl ResourceBuilder {
             _ => "IPv4",
         };
 
+        // The slice is applied directly (outside Metacontroller), so anchor it to
+        // the cluster-scoped `RiseProject` CR for garbage collection: a
+        // cluster-scoped owner can be referenced by a namespaced dependent in any
+        // namespace, so Kubernetes deletes the slice when the project's CR is
+        // removed. Only emit the reference when the UID is known — an owner
+        // reference with an empty UID would make the GC delete the slice
+        // immediately (owner treated as not found).
+        let owner_references = rise_project_uid.map(|uid| {
+            vec![OwnerReference {
+                // Mirrors the RiseProject CRD definition in crd.rs (group
+                // `rise.dev`, version `v1alpha1`).
+                api_version: "rise.dev/v1alpha1".to_string(),
+                kind: "RiseProject".to_string(),
+                name: project.name.clone(),
+                uid: uid.to_string(),
+                controller: Some(false),
+                block_owner_deletion: None,
+            }]
+        });
+
         EndpointSlice {
             metadata: ObjectMeta {
                 name: Some("rise-backend".to_string()),
                 namespace: Some(namespace.to_string()),
                 labels: Some(labels),
+                owner_references,
                 ..Default::default()
             },
             address_type: address_type.to_string(),
@@ -1809,7 +1831,13 @@ mod tests {
         let builder = test_resource_builder();
         let project = test_project();
 
-        let slice = builder.create_backend_endpoint_slice(&project, "demo", "10.0.0.5", 3000);
+        let slice = builder.create_backend_endpoint_slice(
+            &project,
+            "demo",
+            "10.0.0.5",
+            3000,
+            Some("rp-uid-1"),
+        );
 
         assert_eq!(slice.metadata.name.as_deref(), Some("rise-backend"));
         assert_eq!(slice.metadata.namespace.as_deref(), Some("demo"));
@@ -1827,6 +1855,18 @@ mod tests {
             Some("rise-backend")
         );
 
+        // GC anchor: owned by the cluster-scoped RiseProject CR.
+        let owners = slice
+            .metadata
+            .owner_references
+            .as_ref()
+            .expect("owner reference present");
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].kind, "RiseProject");
+        assert_eq!(owners[0].api_version, "rise.dev/v1alpha1");
+        assert_eq!(owners[0].name, "demo");
+        assert_eq!(owners[0].uid, "rp-uid-1");
+
         assert_eq!(slice.endpoints.len(), 1);
         assert_eq!(slice.endpoints[0].addresses, vec!["10.0.0.5".to_string()]);
 
@@ -1842,10 +1882,28 @@ mod tests {
         let builder = test_resource_builder();
         let project = test_project();
 
-        let slice = builder.create_backend_endpoint_slice(&project, "demo", "fd00::1", 3000);
+        let slice = builder.create_backend_endpoint_slice(
+            &project,
+            "demo",
+            "fd00::1",
+            3000,
+            Some("rp-uid-1"),
+        );
 
         assert_eq!(slice.address_type, "IPv6");
         assert_eq!(slice.endpoints[0].addresses, vec!["fd00::1".to_string()]);
+    }
+
+    #[test]
+    fn create_backend_endpoint_slice_without_uid_has_no_owner_reference() {
+        let builder = test_resource_builder();
+        let project = test_project();
+
+        // A missing UID must yield no owner reference at all — an owner reference
+        // with an empty UID would make the GC delete the slice immediately.
+        let slice = builder.create_backend_endpoint_slice(&project, "demo", "10.0.0.5", 3000, None);
+
+        assert!(slice.metadata.owner_references.is_none());
     }
 
     /// Test helper: build the single implicit `app` container Deployment the
