@@ -42,9 +42,9 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["get", "list", "watch"]
-  # Endpoints for backend service routing (applied directly via kube-rs)
-  - apiGroups: [""]
-    resources: ["endpoints"]
+  # EndpointSlices for backend service routing (applied directly via kube-rs)
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
     verbs: ["get", "patch"]
 ```
 

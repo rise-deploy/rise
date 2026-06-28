@@ -156,7 +156,23 @@ pub async fn handle_sync(
         }
     };
 
-    match process_sync(&state, &project_name, &request.children).await {
+    // The parent RiseProject CR's UID is the GC anchor for resources we apply
+    // directly (outside Metacontroller), e.g. the backend EndpointSlice.
+    let project_uid = request
+        .parent
+        .get("metadata")
+        .and_then(|m| m.get("uid"))
+        .and_then(|u| u.as_str())
+        .map(|s| s.to_string());
+
+    match process_sync(
+        &state,
+        &project_name,
+        project_uid.as_deref(),
+        &request.children,
+    )
+    .await
+    {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(SyncError::WrongController {
             project,
@@ -206,6 +222,7 @@ pub async fn handle_sync(
 async fn process_sync(
     state: &AppState,
     project_name: &str,
+    rise_project_uid: Option<&str>,
     observed: &ObservedChildren,
 ) -> Result<SyncResponse, SyncError> {
     // 1. Load project from DB
@@ -306,6 +323,7 @@ async fn process_sync(
         state,
         resource_builder,
         &project,
+        rise_project_uid,
         &all_deployments,
         observed,
         &namespace_prefix,
@@ -1315,6 +1333,7 @@ async fn compute_desired_children(
     state: &AppState,
     resource_builder: &ResourceBuilder,
     project: &Project,
+    rise_project_uid: Option<&str>,
     all_deployments: &[Deployment],
     observed: &ObservedChildren,
     namespace_prefix: &str,
@@ -1360,6 +1379,7 @@ async fn compute_desired_children(
             &mut children,
             resource_builder,
             project,
+            rise_project_uid,
             &namespace,
             backend_address,
         )
@@ -2316,25 +2336,26 @@ fn prepare_deployment_env_secret(
     }
 }
 
-/// Add backend service + endpoints resources.
+/// Add backend service + EndpointSlice resources.
 ///
 /// The Service is returned as a Metacontroller child. For IP-based backends,
-/// the Endpoints are applied directly via kube-rs because Endpoints cannot be
-/// a Metacontroller child resource type — Kubernetes auto-creates Endpoints
-/// for Services with selectors (e.g. the deployment `default` Service), and
-/// Metacontroller would thrash deleting/adopting those in an infinite loop.
-/// Since child resource types are all-or-nothing, we manage the `rise-backend`
-/// Endpoints outside of Metacontroller as well.
+/// the EndpointSlice is applied directly via kube-rs because EndpointSlices
+/// cannot be a Metacontroller child resource type — Kubernetes auto-creates
+/// EndpointSlices for Services with selectors (e.g. the deployment `default`
+/// Service), and Metacontroller would thrash deleting/adopting those in an
+/// infinite loop. Since child resource types are all-or-nothing, we manage the
+/// `rise-backend` EndpointSlice outside of Metacontroller as well.
 async fn add_backend_resources(
     state: &AppState,
     children: &mut Vec<serde_json::Value>,
     resource_builder: &ResourceBuilder,
     project: &Project,
+    rise_project_uid: Option<&str>,
     namespace: &str,
     backend_address: &crate::server::settings::BackendAddress,
 ) -> anyhow::Result<()> {
     if backend_address.is_ip_address() {
-        // IP address → ClusterIP Service (as child) + Endpoints (applied directly)
+        // IP address → ClusterIP Service (as child) + EndpointSlice (applied directly)
         let svc = resource_builder.create_backend_service_clusterip(
             project,
             namespace,
@@ -2342,13 +2363,14 @@ async fn add_backend_resources(
         );
         children.push(serde_json::to_value(&svc)?);
 
-        let endpoints = resource_builder.create_backend_endpoints(
+        let endpoint_slice = resource_builder.create_backend_endpoint_slice(
             project,
             namespace,
             &backend_address.host,
             backend_address.port,
+            rise_project_uid,
         );
-        apply_backend_endpoints(state, &endpoints, namespace).await;
+        apply_backend_endpoint_slice(state, &endpoint_slice, namespace).await;
     } else {
         // DNS name → ExternalName
         let svc = resource_builder.create_backend_service_externalname(
@@ -2362,39 +2384,43 @@ async fn add_backend_resources(
     Ok(())
 }
 
-/// Apply backend Endpoints directly via kube-rs server-side apply.
+/// Apply backend EndpointSlice directly via kube-rs server-side apply.
 ///
 /// On the first sync for a new project the namespace returned in this sync's
 /// children list has not yet been applied by Metacontroller, so the apply
 /// 404s. That's expected and self-heals on the next resync, so the 404 is
 /// logged at debug instead of warning.
-async fn apply_backend_endpoints(
+async fn apply_backend_endpoint_slice(
     state: &AppState,
-    endpoints: &k8s_openapi::api::core::v1::Endpoints,
+    endpoint_slice: &k8s_openapi::api::discovery::v1::EndpointSlice,
     namespace: &str,
 ) {
     let Some(ref kube_client) = state.kube_client else {
         return;
     };
-    let api: kube::Api<k8s_openapi::api::core::v1::Endpoints> =
+    let api: kube::Api<k8s_openapi::api::discovery::v1::EndpointSlice> =
         kube::Api::namespaced(kube_client.clone(), namespace);
-    let name = endpoints.metadata.name.as_deref().unwrap_or("rise-backend");
+    let name = endpoint_slice
+        .metadata
+        .name
+        .as_deref()
+        .unwrap_or("rise-backend");
     let params = kube::api::PatchParams::apply("rise-controller").force();
     match api
-        .patch(name, &params, &kube::api::Patch::Apply(endpoints))
+        .patch(name, &params, &kube::api::Patch::Apply(endpoint_slice))
         .await
     {
         Ok(_) => {}
         Err(kube::Error::Api(err)) if err.code == 404 => {
             debug!(
                 namespace = %namespace,
-                "Backend Endpoints apply deferred: namespace not yet created (will retry on next resync)"
+                "Backend EndpointSlice apply deferred: namespace not yet created (will retry on next resync)"
             );
         }
         Err(e) => {
             warn!(
                 namespace = %namespace,
-                "Failed to apply backend Endpoints: {:?}", e
+                "Failed to apply backend EndpointSlice: {:?}", e
             );
         }
     }
