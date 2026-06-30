@@ -16,6 +16,10 @@ Supported providers:
 - [JFrog Artifactory](jfrog)
 - [Docker/OCI Registry](docker-oci)
 
+Cross-cutting:
+
+- [Shared External Registry (strict_external_hosts)](shared-external-host) — when source repos opt into [client-controlled push](../../user-guide/client-push) to a shared external registry (e.g. JFrog), this policy + `image_pull_secret_name` wiring keeps the cross-project image-substitution check intact.
+
 ## Backend Configuration
 
 Registry configuration is loaded from backend config files under `config/`.

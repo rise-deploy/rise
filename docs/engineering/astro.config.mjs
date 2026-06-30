@@ -34,6 +34,7 @@ export default defineConfig({
                 { label: 'GitLab Container Registry', slug: 'operator-registry-operations/gitlab' },
                 { label: 'JFrog Artifactory', slug: 'operator-registry-operations/jfrog' },
                 { label: 'Docker/OCI Registry', slug: 'operator-registry-operations/docker-oci' },
+                { label: 'Shared External Registry', slug: 'operator-registry-operations/shared-external-host' },
               ],
             },
             {

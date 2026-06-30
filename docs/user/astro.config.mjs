@@ -45,6 +45,7 @@ export default defineConfig({
             },
             { label: 'Environment Variables', slug: 'user-guide/environment-variables' },
             { label: 'Custom Domains', slug: 'user-guide/custom-domains' },
+            { label: 'Client-Controlled Push', slug: 'user-guide/client-push' },
             { label: 'Local Development', slug: 'user-guide/local-development' },
           ],
         },

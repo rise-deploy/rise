@@ -161,6 +161,20 @@ When listing with `-E`, scoped variables override global variables with the same
 
 Environment-scoped variables can also be defined declaratively in `rise.toml` under `[environments.<name>.env]`. See [Environment Variables](../environment-variables#per-environment-variables-in-risetoml) for details.
 
+## Per-Environment Registry Override
+
+Source repos using [client-controlled push](../client-push) can override the registry image base per environment. Common pattern: MR/staging deploys land in a playground repo (anyone can push), production deploys in a snapshot repo (write-token gated to the protected branch).
+
+```toml
+[registry]
+image_base = "jfrog.example.com/team-playground/team-apps"
+
+[environments.production.registry]
+image_base = "jfrog.example.com/team-snapshot/team-apps"
+```
+
+When `rise deploy --environment production` resolves to the `production` env, the CLI uses `[environments.production.registry]`. Other environments fall back to the top-level `[registry]`. See [Client-Controlled Push](../client-push#per-environment-override) for the full flow.
+
 ## Auto-Injected Variable
 
 Rise injects `RISE_ENVIRONMENT` into every deployment that has an associated environment. The value is the environment name (e.g., `"production"`, `"staging"`).
