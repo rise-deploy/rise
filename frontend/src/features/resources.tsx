@@ -1775,10 +1775,7 @@ export function ExtensionsList({ projectName }) {
                                         {hasExtensionUI(selectedExtension.extension_type) && <span> Use the Configure tab for a form-based interface.</span>}
                                     </p>
                                     <p className="text-sm text-gray-600 dark:text-gray-500">
-                                        Extension docs: <a href={extensionDocsHref(selectedExtension.extension_type)} onClick={(e) => {
-                                            e.preventDefault();
-                                            navigate(extensionDocsHref(selectedExtension.extension_type));
-                                        }} className="underline">Open {selectedExtension.extension_type} documentation</a>
+                                        Extension docs: <a href={extensionDocsHref(selectedExtension.extension_type)} target="_blank" rel="noopener noreferrer" className="underline">Open {selectedExtension.extension_type} documentation</a>
                                     </p>
                                 </div>
                             )}
@@ -2252,7 +2249,7 @@ export function ExtensionDetailPage({ projectName, extensionType: extensionTypeP
                         <Button
                             variant="secondary"
                             size="sm"
-                            onClick={() => navigate(extensionDocsHref(extensionType.extension_type))}
+                            onClick={() => { window.open(extensionDocsHref(extensionType.extension_type), '_blank', 'noopener,noreferrer'); }}
                         >
                             Extension Docs
                         </Button>
@@ -2390,10 +2387,7 @@ export function ExtensionDetailPage({ projectName, extensionType: extensionTypeP
                             {hasExtensionUI(extensionType.extension_type) && <span> Use the Configure tab for a form-based interface.</span>}
                         </p>
                         <p className="text-sm text-gray-600 dark:text-gray-500">
-                            Extension docs: <a href={extensionDocsHref(extensionType.extension_type)} onClick={(e) => {
-                                e.preventDefault();
-                                navigate(extensionDocsHref(extensionType.extension_type));
-                            }} className="underline">Open {extensionType.extension_type} documentation</a>
+                            Extension docs: <a href={extensionDocsHref(extensionType.extension_type)} target="_blank" rel="noopener noreferrer" className="underline">Open {extensionType.extension_type} documentation</a>
                         </p>
                         <div className="flex justify-end gap-3 pt-4 border-t border-gray-300 dark:border-gray-700">
                             <Button
