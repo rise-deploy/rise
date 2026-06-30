@@ -12,4 +12,5 @@ pub mod project;
 pub mod run;
 pub mod service_account;
 pub mod team;
+pub mod vault;
 pub mod version;

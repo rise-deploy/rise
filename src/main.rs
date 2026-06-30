@@ -14,6 +14,9 @@ mod cli;
 #[cfg(any(feature = "cli", feature = "backend"))]
 mod rise_toml;
 
+#[cfg(any(feature = "cli", feature = "backend"))]
+mod deployment_id;
+
 #[cfg(feature = "backend")]
 mod db;
 #[cfg(feature = "backend")]
@@ -63,7 +66,7 @@ fn resolve_project_name_with_config(
     let config = if let Some(cfg) = preloaded_config {
         Some(cfg)
     } else {
-        owned_config = build::config::load_full_project_config(path)?;
+        owned_config = build::config::load_full_project_config_with_workspace(path)?;
         owned_config.as_ref()
     };
 
@@ -256,6 +259,35 @@ enum Commands {
     #[command(subcommand)]
     #[command(visible_alias = "t")]
     Team(TeamCommands),
+    /// Vault session and configuration commands
+    #[command(subcommand)]
+    Vault(VaultCommands),
+}
+
+#[derive(Subcommand, Debug)]
+enum VaultCommands {
+    /// Persist the Vault address (and optional OIDC auth path/role) used by
+    /// `rise deploy` to auto-mint JFrog tokens. Idempotent — re-run to update.
+    Configure {
+        /// Vault address (e.g. `https://vault.example.com:8200`)
+        #[arg(long)]
+        address: String,
+        /// OIDC mount path passed as `-path=...` to `vault login`
+        #[arg(long)]
+        auth_path: Option<String>,
+        /// OIDC role passed as `role=...` to `vault login`
+        #[arg(long)]
+        auth_role: Option<String>,
+        /// Vault path that yields a JFrog access token. Supports `{email}`
+        /// placeholder. Set together with `--address` to enable auto-mint
+        /// on every `rise deploy` whose rise.toml has `[registry]`.
+        /// Example: `global/artifactory/user_token/{email}`.
+        #[arg(long)]
+        artifactory_token_path: Option<String>,
+    },
+    /// (Re-)authenticate with Vault using OIDC. Opens a browser. Same path as
+    /// the auto-trigger inside `rise deploy` — useful for warming a session.
+    Login,
 }
 
 #[derive(Subcommand, Debug)]
@@ -481,7 +513,7 @@ enum DeploymentCommands {
         /// Path to rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
-        /// Deployment ID (YYYYMMDD-HHMMSS format)
+        /// Deployment ID (YYYYMMDD-HHMMSS-XXXXXX format)
         deployment_id: String,
         /// Follow log output (stream continuously)
         #[arg(short, long)]
@@ -1177,8 +1209,9 @@ async fn main() -> Result<()> {
             DeploymentCommands::Create { args } => {
                 // Load rise.toml once — reused for project name resolution,
                 // environment resolution, env var collection, and build config.
-                let toml_config = build::config::load_full_project_config(&args.path)
-                    .context("Failed to load rise.toml")?;
+                let toml_config =
+                    build::config::load_full_project_config_with_workspace(&args.path)
+                        .context("Failed to load rise.toml")?;
 
                 let project_name = resolve_project_name_with_config(
                     args.project.clone(),
@@ -1633,7 +1666,7 @@ async fn main() -> Result<()> {
                     path,
                     environment,
                 } => {
-                    let toml_config = build::config::load_full_project_config(path)?;
+                    let toml_config = build::config::load_full_project_config_with_workspace(path)?;
                     let project_name = resolve_project_name_with_config(
                         project.clone(),
                         path,
@@ -1788,7 +1821,7 @@ async fn main() -> Result<()> {
             let expose_port = expose.unwrap_or(*http_port);
 
             // Resolve environment from --environment flag or rise.toml default
-            let toml_config = build::config::load_full_project_config(path)?;
+            let toml_config = build::config::load_full_project_config_with_workspace(path)?;
             let resolved_env = resolve_environment(environment.clone(), toml_config.as_ref());
 
             cli::run::run_locally(
@@ -1811,6 +1844,39 @@ async fn main() -> Result<()> {
             // Already transformed to Deployment(Create) above
             unreachable!("Deploy command should have been transformed to Deployment(Create)")
         }
+        Commands::Vault(vault_cmd) => match vault_cmd {
+            VaultCommands::Configure {
+                address,
+                auth_path,
+                auth_role,
+                artifactory_token_path,
+            } => {
+                config.set_vault_address(address.clone())?;
+                if let Some(p) = auth_path {
+                    config.set_vault_auth_path(p.clone())?;
+                }
+                if let Some(r) = auth_role {
+                    config.set_vault_auth_role(r.clone())?;
+                }
+                if let Some(p) = artifactory_token_path {
+                    config.set_vault_artifactory_token_path(p.clone())?;
+                }
+                println!(
+                    "✓ Vault config saved to {}",
+                    config::Config::config_path()?.display(),
+                );
+            }
+            VaultCommands::Login => {
+                let addr = config.get_vault_address().context(
+                    "Vault address not set — run `rise vault configure --address <url>` first",
+                )?;
+                let auth_path = config.get_vault_auth_path();
+                let auth_role = config.get_vault_auth_role();
+                cli::vault::ensure_session(&addr, &auth_path, &auth_role)?;
+                let email = cli::vault::identity(&addr, &auth_path)?;
+                println!("✓ Vault session active for {email}");
+            }
+        },
     }
 
     Ok(())

@@ -126,12 +126,33 @@ fn probe_runtime(command: &str) -> Option<ContainerRuntime> {
 // - Linux: Secret Service API / libsecret
 // - Windows: Credential Manager
 
+/// Default Vault OIDC mount path for `vault login -path=...`. Override per-laptop
+/// via `rise vault configure --auth-path ...` or `$RISE_VAULT_AUTH_PATH`.
+pub const DEFAULT_VAULT_AUTH_PATH: &str = "global/entra";
+/// Default Vault OIDC role passed as `role=<...>` to `vault login`.
+pub const DEFAULT_VAULT_AUTH_ROLE: &str = "developer";
+
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct Config {
     pub token: Option<String>,
     pub backend_url: Option<String>,
     pub container_cli: Option<String>,
     pub managed_buildkit: Option<bool>,
+    /// Vault address (e.g. `https://vault.example.com:8200`). Persisted so
+    /// `rise deploy` can auto-mint JFrog tokens without prompting per-invocation.
+    pub vault_address: Option<String>,
+    /// Vault OIDC auth mount path used by `rise vault login`. Defaults to
+    /// `DEFAULT_VAULT_AUTH_PATH` when unset.
+    pub vault_auth_path: Option<String>,
+    /// Vault OIDC role passed as `role=...` to `vault login`. Defaults to
+    /// `DEFAULT_VAULT_AUTH_ROLE` when unset.
+    pub vault_auth_role: Option<String>,
+    /// Vault KV/secret path that yields a JFrog access token. Supports the
+    /// `{email}` placeholder, substituted with the authenticated user's email
+    /// at runtime. When set together with `vault_address`, `rise deploy`
+    /// auto-mints a fresh JFrog token via this path before each client-
+    /// controlled push.
+    pub vault_artifactory_token_path: Option<String>,
 }
 
 impl Config {
@@ -296,6 +317,74 @@ impl Config {
         self.managed_buildkit = Some(enabled);
         self.save()
     }
+
+    /// Persist the Vault address (idempotent).
+    pub fn set_vault_address(&mut self, addr: String) -> Result<()> {
+        self.vault_address = Some(addr.trim_end_matches('/').to_string());
+        self.save()
+    }
+
+    /// Read the Vault address. Env var `RISE_VAULT_ADDR` wins over the config
+    /// file. Returns `None` when neither is set — caller should error and tell
+    /// the user to run `rise vault configure --address <url>`.
+    pub fn get_vault_address(&self) -> Option<String> {
+        #[cfg(not(test))]
+        if let Ok(addr) = std::env::var("RISE_VAULT_ADDR") {
+            return Some(addr.trim_end_matches('/').to_string());
+        }
+        self.vault_address.clone()
+    }
+
+    /// Persist the Vault OIDC auth path.
+    pub fn set_vault_auth_path(&mut self, path: String) -> Result<()> {
+        self.vault_auth_path = Some(path);
+        self.save()
+    }
+
+    /// Read the Vault OIDC auth path with env override + default fallback.
+    pub fn get_vault_auth_path(&self) -> String {
+        #[cfg(not(test))]
+        if let Ok(path) = std::env::var("RISE_VAULT_AUTH_PATH") {
+            return path;
+        }
+        self.vault_auth_path
+            .clone()
+            .unwrap_or_else(|| DEFAULT_VAULT_AUTH_PATH.to_string())
+    }
+
+    /// Persist the Vault OIDC role.
+    pub fn set_vault_auth_role(&mut self, role: String) -> Result<()> {
+        self.vault_auth_role = Some(role);
+        self.save()
+    }
+
+    /// Read the Vault OIDC role with env override + default fallback.
+    pub fn get_vault_auth_role(&self) -> String {
+        #[cfg(not(test))]
+        if let Ok(role) = std::env::var("RISE_VAULT_AUTH_ROLE") {
+            return role;
+        }
+        self.vault_auth_role
+            .clone()
+            .unwrap_or_else(|| DEFAULT_VAULT_AUTH_ROLE.to_string())
+    }
+
+    /// Persist the Vault path used to mint JFrog tokens.
+    pub fn set_vault_artifactory_token_path(&mut self, path: String) -> Result<()> {
+        self.vault_artifactory_token_path = Some(path);
+        self.save()
+    }
+
+    /// Read the Vault artifactory-token path. Env `RISE_VAULT_ARTIFACTORY_TOKEN_PATH`
+    /// wins over the config file. Returns `None` when unset — caller treats
+    /// that as "auto-mint disabled".
+    pub fn get_vault_artifactory_token_path(&self) -> Option<String> {
+        #[cfg(not(test))]
+        if let Ok(p) = std::env::var("RISE_VAULT_ARTIFACTORY_TOKEN_PATH") {
+            return Some(p);
+        }
+        self.vault_artifactory_token_path.clone()
+    }
 }
 
 /// Auto-detect which container CLI is available.
@@ -362,6 +451,84 @@ mod tests {
         assert_eq!(
             normalize_backend_url("https://api.example.com///"),
             "https://api.example.com"
+        );
+    }
+
+    #[test]
+    fn test_vault_address_none_by_default() {
+        assert_eq!(Config::default().get_vault_address(), None);
+    }
+
+    #[test]
+    fn test_vault_address_from_config() {
+        let c = config(|c| c.vault_address = Some("https://vault.example.com:8200".to_string()));
+        assert_eq!(
+            c.get_vault_address().as_deref(),
+            Some("https://vault.example.com:8200"),
+        );
+    }
+
+    #[test]
+    fn test_set_vault_address_trims_trailing_slash() {
+        // Avoid `set_vault_address` here — it persists to disk. Verify the
+        // normalisation by mimicking what the setter does in-memory.
+        let c = config(|c| {
+            c.vault_address = Some(
+                "https://vault.example.com:8200/"
+                    .trim_end_matches('/')
+                    .to_string(),
+            )
+        });
+        assert_eq!(
+            c.get_vault_address().as_deref(),
+            Some("https://vault.example.com:8200"),
+        );
+    }
+
+    #[test]
+    fn test_vault_auth_path_defaults_when_unset() {
+        assert_eq!(
+            Config::default().get_vault_auth_path(),
+            DEFAULT_VAULT_AUTH_PATH,
+        );
+    }
+
+    #[test]
+    fn test_vault_auth_path_from_config_overrides_default() {
+        let c = config(|c| c.vault_auth_path = Some("custom/oidc".to_string()));
+        assert_eq!(c.get_vault_auth_path(), "custom/oidc");
+    }
+
+    #[test]
+    fn test_vault_auth_role_defaults_when_unset() {
+        assert_eq!(
+            Config::default().get_vault_auth_role(),
+            DEFAULT_VAULT_AUTH_ROLE,
+        );
+    }
+
+    #[test]
+    fn test_vault_auth_role_from_config_overrides_default() {
+        let c = config(|c| c.vault_auth_role = Some("ops".to_string()));
+        assert_eq!(c.get_vault_auth_role(), "ops");
+    }
+
+    #[test]
+    fn test_vault_artifactory_token_path_none_by_default() {
+        assert!(Config::default()
+            .get_vault_artifactory_token_path()
+            .is_none());
+    }
+
+    #[test]
+    fn test_vault_artifactory_token_path_from_config() {
+        let c = config(|c| {
+            c.vault_artifactory_token_path =
+                Some("global/artifactory/user_token/{email}".to_string())
+        });
+        assert_eq!(
+            c.get_vault_artifactory_token_path().as_deref(),
+            Some("global/artifactory/user_token/{email}"),
         );
     }
 
