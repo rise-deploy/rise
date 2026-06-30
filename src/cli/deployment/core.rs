@@ -563,6 +563,26 @@ pub async fn create_deployment(
         info!("Deployment pull request URL: {}", url);
     }
 
+    // Client-controlled push: if rise.toml declares a [registry] block and the
+    // caller hasn't asked for a rollback or supplied --image, build + push the
+    // image locally then defer to Rise's pre-built-image API path. Rise stays
+    // registry-agnostic; the source repo's rise.toml is the only thing that
+    // knows the target path. Auth must already be present in the container CLI
+    // config (ambient — typically a Vault-minted JFrog token from CI or laptop).
+    let client_pushed = client_controlled_push_if_configured(config, &deploy_opts)?;
+    if let Some(ref pushed) = client_pushed {
+        info!(
+            "Built and pushed image to {} (digest {})",
+            pushed.image_tag, pushed.image_digest
+        );
+    }
+    let effective_image: Option<&str> = client_pushed
+        .as_ref()
+        .map(|p| p.image_tag.as_str())
+        .or(deploy_opts.image);
+    let client_supplied_digest: Option<&str> =
+        client_pushed.as_ref().map(|p| p.image_digest.as_str());
+
     // Step 1: Create deployment and get deployment ID + credentials
     info!(
         "Creating deployment for project '{}'",
@@ -573,7 +593,8 @@ pub async fn create_deployment(
         backend_url,
         &token,
         deploy_opts.project_name,
-        deploy_opts.image,
+        effective_image,
+        client_supplied_digest,
         deploy_opts.group,
         deploy_opts.environment,
         deploy_opts.expires_in,
@@ -623,7 +644,7 @@ pub async fn create_deployment(
         }
     });
 
-    if let Some(source_image) = &deploy_opts.image {
+    if let Some(source_image) = effective_image {
         if deploy_opts.push_image {
             // Push-image path: pull image locally, tag it, and push to Rise registry
             info!(
@@ -967,6 +988,153 @@ fn detect_ci_pull_request_url() -> Option<String> {
     None
 }
 
+/// Outcome of a successful client-controlled build + push.
+struct ClientPushed {
+    /// Tag-form image reference: `{image_base}/{project}:{deployment_id}`.
+    image_tag: String,
+    /// `sha256:...` digest captured from the local image after push. Forwarded
+    /// to Rise so it doesn't need its own registry credentials to resolve.
+    image_digest: String,
+}
+
+/// Build + push the project image to the registry configured in rise.toml's
+/// `[registry]` block. Returns `Ok(None)` when the client-controlled path
+/// doesn't apply: no rise.toml, no `[registry]`, `--image` was supplied, or
+/// this is a rollback (`--from-deployment`).
+///
+/// Auth comes from whatever lives in `~/.docker/config.json` (or the podman
+/// equivalent) — typically a Vault-minted JFrog token. No `docker login` here.
+fn client_controlled_push_if_configured(
+    config: &Config,
+    deploy_opts: &DeploymentOptions<'_>,
+) -> Result<Option<ClientPushed>> {
+    if deploy_opts.image.is_some() || deploy_opts.from_deployment.is_some() {
+        return Ok(None);
+    }
+    let Some(toml) = deploy_opts.toml_config.as_ref() else {
+        return Ok(None);
+    };
+    let env_registry = deploy_opts
+        .environment
+        .and_then(|name| toml.environments.get(name))
+        .and_then(|env| env.registry.as_ref());
+    let Some(registry) = env_registry.or(toml.registry.as_ref()) else {
+        return Ok(None);
+    };
+
+    let deployment_id = crate::deployment_id::generate_deployment_id();
+    let image_tag = format!(
+        "{}/{}:{}",
+        registry.image_base.trim_end_matches('/'),
+        deploy_opts.project_name,
+        deployment_id
+    );
+
+    info!("Client-controlled push: building {image_tag}");
+
+    let options = BuildOptions::from_build_args(
+        config,
+        image_tag.clone(),
+        deploy_opts.path.to_string(),
+        deploy_opts.build_args,
+        deploy_opts.toml_config.clone(),
+    );
+    let container_cli = options.container_cli.command().to_string();
+
+    // If the operator has configured Vault-backed JFrog minting
+    // (`rise vault configure --address ... --artifactory-token-path ...`),
+    // freshen `docker login` for the push host before handing off to buildkit.
+    // Ambient docker auth still works when vault config is absent (CI flow,
+    // or a laptop where the operator manages docker login by hand).
+    ensure_jfrog_docker_login_if_configured(config, registry, &container_cli)?;
+
+    let options = options.with_push(true);
+
+    build::build_image(options).context("Client-controlled build/push failed")?;
+
+    let image_digest = build::inspect_push_digest(&container_cli, &image_tag)
+        .context("Failed to inspect pushed image for digest")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Pushed image {image_tag} has no RepoDigests — push may not have completed"
+            )
+        })?;
+
+    Ok(Some(ClientPushed {
+        image_tag,
+        image_digest,
+    }))
+}
+
+/// Auto-mint a fresh JFrog token via Vault and run `docker login` against the
+/// push host. No-op when Vault isn't configured — the caller falls back to
+/// ambient docker auth.
+///
+/// Triggers when **both** `vault_address` and `vault_artifactory_token_path`
+/// are set in `~/.config/rise/config.json` (or via env). Either alone is
+/// treated as "not configured" — half-set is almost certainly a config error
+/// we'd rather surface as "skipped" than as a half-broken mint attempt.
+///
+/// Steps when triggered:
+/// 1. Ensure a valid Vault session — trigger `vault login -method=oidc` if not.
+/// 2. Look up the user's email from the Vault token.
+/// 3. Substitute `{email}` in the configured artifactory token path and read
+///    the JFrog access token.
+/// 4. `docker login <host>` with username=email, password=token. Host is
+///    derived from `image_base`'s first slash-separated segment.
+fn ensure_jfrog_docker_login_if_configured(
+    config: &Config,
+    registry: &crate::rise_toml::RegistryConfig,
+    container_cli: &str,
+) -> Result<()> {
+    let (Some(addr), Some(token_path_template)) = (
+        config.get_vault_address(),
+        config.get_vault_artifactory_token_path(),
+    ) else {
+        return Ok(());
+    };
+
+    let auth_path = config.get_vault_auth_path();
+    let auth_role = config.get_vault_auth_role();
+
+    crate::vault::ensure_session(&addr, &auth_path, &auth_role)?;
+    let email = crate::vault::identity(&addr, &auth_path)?;
+
+    let token_path = crate::vault::substitute_path(&token_path_template, &email);
+    info!(
+        "Minting JFrog token via Vault (path={}, user={})",
+        token_path, email
+    );
+    let token = crate::vault::read_artifactory_token(&addr, &token_path)?;
+
+    let host = host_from_image_base(&registry.image_base).context(
+        "Could not determine push host from rise.toml [registry].image_base (no '/' in value)",
+    )?;
+
+    info!("Logging in to {host} as {email}");
+    build::docker_login(container_cli, &host, &email, &token)
+        .with_context(|| format!("docker login to {host} failed after Vault mint"))?;
+    Ok(())
+}
+
+/// Return the first slash-separated segment of `image_base` (the registry
+/// host). `jfrog.example.com/repo/path` → `jfrog.example.com`.
+fn host_from_image_base(image_base: &str) -> Option<String> {
+    image_base
+        .trim_end_matches('/')
+        .split_once('/')
+        .map(|(host, _)| host.to_string())
+        .or_else(|| {
+            // No slash at all — image_base might be just a host with no repo path.
+            let trimmed = image_base.trim_end_matches('/');
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn call_create_deployment_api(
     http_client: &Client,
@@ -974,6 +1142,7 @@ async fn call_create_deployment_api(
     token: &str,
     project_name: &str,
     image: Option<&str>,
+    image_digest: Option<&str>,
     group: Option<&str>,
     environment: Option<&str>,
     expires_in: Option<&str>,
@@ -1002,6 +1171,11 @@ async fn call_create_deployment_api(
     // Add image field if provided
     if let Some(image_ref) = image {
         payload["image"] = serde_json::json!(image_ref);
+    }
+
+    // Add caller-supplied digest if provided (client-controlled push flow)
+    if let Some(digest) = image_digest {
+        payload["image_digest"] = serde_json::json!(digest);
     }
 
     // Add group field if provided (defaults to "default" on backend)
@@ -1486,4 +1660,46 @@ pub(super) async fn open_log_stream(
         stream: response.bytes_stream().boxed(),
         buffer: String::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::host_from_image_base;
+
+    #[test]
+    fn host_from_image_base_extracts_first_segment() {
+        assert_eq!(
+            host_from_image_base("jfrog.example.com/org-docker-playground/team-apps").as_deref(),
+            Some("jfrog.example.com"),
+        );
+    }
+
+    #[test]
+    fn host_from_image_base_with_port() {
+        assert_eq!(
+            host_from_image_base("registry.example.com:5000/team/app").as_deref(),
+            Some("registry.example.com:5000"),
+        );
+    }
+
+    #[test]
+    fn host_from_image_base_no_slash_returns_whole_string() {
+        assert_eq!(
+            host_from_image_base("jfrog.example.com").as_deref(),
+            Some("jfrog.example.com"),
+        );
+    }
+
+    #[test]
+    fn host_from_image_base_trims_trailing_slash() {
+        assert_eq!(
+            host_from_image_base("jfrog.example.com/").as_deref(),
+            Some("jfrog.example.com"),
+        );
+    }
+
+    #[test]
+    fn host_from_image_base_empty_returns_none() {
+        assert_eq!(host_from_image_base(""), None);
+    }
 }

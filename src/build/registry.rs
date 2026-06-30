@@ -45,6 +45,84 @@ pub(crate) fn docker_pull(container_cli: &str, image: &str, platform: &str) -> R
     Ok(())
 }
 
+/// Inspect a locally-tagged image and return its sha256 digest as it lives in
+/// the registry after a `docker push`. Reads `.RepoDigests[]` and returns the
+/// `sha256:...` portion for the entry whose ref matches `image_tag` (ignoring
+/// the tag suffix). When no entry matches (local image carries digests only
+/// from prior pushes to unrelated repos), falls back to `buildx imagetools`
+/// rather than picking an arbitrary digest — picking the wrong one would
+/// deploy unrelated content under a trusted digest.
+pub(crate) fn inspect_push_digest(container_cli: &str, image_tag: &str) -> Result<Option<String>> {
+    let output = Command::new(container_cli)
+        .arg("inspect")
+        .arg("--format")
+        .arg("{{json .RepoDigests}}")
+        .arg(image_tag)
+        .output()
+        .with_context(|| format!("Failed to execute {container_cli} inspect"))?;
+
+    // Fall back to buildx imagetools when the image isn't in the local daemon's
+    // image store — happens when buildx pushed directly from a remote/container
+    // driver (railpack, pack) without loading locally.
+    if !output.status.success() {
+        return inspect_push_digest_via_buildx(container_cli, image_tag).map(Some);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let repo_digests: Vec<String> = serde_json::from_str(stdout.trim())
+        .with_context(|| format!("Failed to parse RepoDigests JSON: {stdout}"))?;
+
+    // Strip tag part of image_tag for matching: `host/repo/app:tag` → `host/repo/app`.
+    let image_repo = image_tag
+        .rsplit_once(':')
+        .map(|(repo, _)| repo)
+        .unwrap_or(image_tag);
+
+    let matching = repo_digests
+        .iter()
+        .find(|d| d.starts_with(&format!("{image_repo}@")));
+
+    if let Some(d) = matching {
+        return Ok(d.rsplit_once('@').map(|(_, digest)| digest.to_string()));
+    }
+
+    // No RepoDigests entry matches the pushed repo — fall back to buildx
+    // imagetools so we never pin an unrelated repo's digest from the local
+    // image store.
+    inspect_push_digest_via_buildx(container_cli, image_tag).map(Some)
+}
+
+fn inspect_push_digest_via_buildx(container_cli: &str, image_tag: &str) -> Result<String> {
+    let output = Command::new(container_cli)
+        .arg("buildx")
+        .arg("imagetools")
+        .arg("inspect")
+        .arg(image_tag)
+        .output()
+        .with_context(|| format!("Failed to execute {container_cli} buildx imagetools inspect"))?;
+
+    if !output.status.success() {
+        bail!(
+            "{container_cli} buildx imagetools inspect failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    // Parse the first top-level "Digest: sha256:..." line — this is the
+    // manifest list / image index digest, which is what `image_tag` resolves to.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix("Digest:") {
+            let digest = rest.trim();
+            if digest.starts_with("sha256:") {
+                return Ok(digest.to_string());
+            }
+        }
+    }
+
+    bail!("Could not find Digest in buildx imagetools output:\n{stdout}");
+}
+
 /// Tag a container image
 pub(crate) fn docker_tag(container_cli: &str, source: &str, target: &str) -> Result<()> {
     info!("Tagging image: {} -> {}", source, target);

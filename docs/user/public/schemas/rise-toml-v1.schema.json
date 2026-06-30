@@ -149,6 +149,18 @@
           "default": {},
           "description": "Plain-text environment variables scoped to this environment",
           "type": "object"
+        },
+        "registry": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RegistryConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Environment-specific registry override. When set, takes precedence\nover the top-level `[registry]` for deploys to this environment.\nLets a workspace pin a `playground` JFrog repo as the default for\nMR/staging deploys and override to `snapshot`/`release` for the\nproduction environment."
         }
       },
       "type": "object"
@@ -171,6 +183,19 @@
       },
       "required": [
         "name"
+      ],
+      "type": "object"
+    },
+    "RegistryConfig": {
+      "description": "Source-repo–scoped registry config for client-controlled push.",
+      "properties": {
+        "image_base": {
+          "description": "Image reference base. The CLI tags pushed images as\n`{image_base}/{project}:{deployment_id}` and reports that ref to Rise.\nExample: `jfrog.helsing-dev.ai/hdf-docker-playground/hs-hdf-rise-apps`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "image_base"
       ],
       "type": "object"
     }
@@ -221,6 +246,18 @@
       ],
       "default": null,
       "description": "Project metadata (optional)"
+    },
+    "registry": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RegistryConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Optional registry configuration. When present, the CLI takes the\nclient-controlled push path: builds the image, pushes it to\n`{image_base}/{project}:{deployment_id}`, and tells Rise about the\nresulting reference. Rise then records it as a pre-built image deploy\n(resolves digest, creates at Pushed). Use this to keep registry path\nconventions in source-repo config rather than in Rise's settings."
     },
     "version": {
       "description": "Optional version (must be 1 if present)",

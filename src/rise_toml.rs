@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
 /// Root structure for rise.toml / .rise.toml configuration file
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 #[cfg_attr(feature = "backend", derive(schemars::JsonSchema))]
 pub struct ProjectBuildConfig {
     /// Optional version (must be 1 if present)
@@ -25,9 +25,28 @@ pub struct ProjectBuildConfig {
     #[serde(default)]
     pub deploy: Option<DeployConfig>,
 
+    /// Optional registry configuration. When present, the CLI takes the
+    /// client-controlled push path: builds the image, pushes it to
+    /// `{image_base}/{project}:{deployment_id}`, and tells Rise about the
+    /// resulting reference. Rise then records it as a pre-built image deploy
+    /// (resolves digest, creates at Pushed). Use this to keep registry path
+    /// conventions in source-repo config rather than in Rise's settings.
+    #[serde(default)]
+    pub registry: Option<RegistryConfig>,
+
     /// Per-environment configuration (optional)
     #[serde(default)]
     pub environments: BTreeMap<String, EnvironmentConfig>,
+}
+
+/// Source-repo–scoped registry config for client-controlled push.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[cfg_attr(feature = "backend", derive(schemars::JsonSchema))]
+pub struct RegistryConfig {
+    /// Image reference base. The CLI tags pushed images as
+    /// `{image_base}/{project}:{deployment_id}` and reports that ref to Rise.
+    /// Example: `jfrog.helsing-dev.ai/hdf-docker-playground/hs-hdf-rise-apps`.
+    pub image_base: String,
 }
 
 /// Per-environment configuration
@@ -45,6 +64,14 @@ pub struct EnvironmentConfig {
     /// Environment-specific deployment resource overrides
     #[serde(default)]
     pub deploy: Option<DeployConfig>,
+
+    /// Environment-specific registry override. When set, takes precedence
+    /// over the top-level `[registry]` for deploys to this environment.
+    /// Lets a workspace pin a `playground` JFrog repo as the default for
+    /// MR/staging deploys and override to `snapshot`/`release` for the
+    /// production environment.
+    #[serde(default)]
+    pub registry: Option<RegistryConfig>,
 }
 
 /// Deployment resource configuration
@@ -74,7 +101,7 @@ pub struct ProjectConfig {
 }
 
 /// Build configuration options for a project
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 #[cfg_attr(feature = "backend", derive(schemars::JsonSchema))]
 pub struct BuildConfig {
     /// Build backend (docker, docker:build, docker:buildx, buildctl, pack, railpack[:buildx], railpack:buildctl)

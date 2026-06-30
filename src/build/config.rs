@@ -1,11 +1,16 @@
 // Project-level build configuration (rise.toml / .rise.toml)
 
 use anyhow::Result;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 // Re-export shared config types from rise_toml module
 pub use crate::rise_toml::{ProjectBuildConfig, ProjectConfig};
+
+/// Workspace-config filename. Lives at an ancestor directory of `rise.toml`
+/// (typically the source-repo root) and provides defaults that apply to every
+/// app under it — e.g. a shared `[registry] image_base` so apps don't repeat it.
+pub const WORKSPACE_CONFIG_FILENAME: &str = "rise.workspace.toml";
 
 /// Load full project configuration from rise.toml or .rise.toml
 ///
@@ -30,58 +35,146 @@ pub fn load_full_project_config(app_path: &str) -> Result<Option<ProjectBuildCon
         None
     };
 
-    // Parse if found
     if let Some(path) = config_path {
         info!("Loading project config from {}", path.display());
         let content = std::fs::read_to_string(&path)?;
-
-        // Deserialize and collect any unused fields
-        let mut unused_fields = Vec::new();
-        let deserializer = toml::Deserializer::parse(&content)
-            .map_err(|e| anyhow::Error::new(e).context("Failed to parse TOML"))?;
-        let config: ProjectBuildConfig = serde_ignored::deserialize(deserializer, |path| {
-            unused_fields.push(path.to_string());
-        })?;
-
-        // Warn about unused fields
-        for field in &unused_fields {
-            warn!(
-                "Unknown configuration field in {}: {}",
-                path.display(),
-                field
-            );
-        }
-
-        // Validate version
-        if let Some(version) = config.version {
-            if version != 1 {
-                anyhow::bail!(
-                    "Unsupported rise.toml version: {}. This CLI supports version 1.",
-                    version
-                );
-            }
-        } else {
-            debug!("No version specified in rise.toml, using latest");
-        }
-
-        // Validate at most one environment has default = true
-        let default_envs: Vec<&str> = config
-            .environments
-            .iter()
-            .filter(|(_, env)| env.default)
-            .map(|(name, _)| name.as_str())
-            .collect();
-        if default_envs.len() > 1 {
-            anyhow::bail!(
-                "Multiple environments have default = true: {}. Only one is allowed.",
-                default_envs.join(", ")
-            );
-        }
-
-        Ok(Some(config))
+        Ok(Some(parse_project_config(&content, &path)?))
     } else {
         Ok(None)
     }
+}
+
+/// Walk up from `app_path` looking for a `rise.workspace.toml`. Stops at the
+/// first `.git` directory encountered (so a stray rise.workspace.toml outside
+/// the source repo can never silently leak in) or at the filesystem root.
+///
+/// `app_path`'s own directory is searched too — a workspace file colocated with
+/// `rise.toml` is unusual but not forbidden.
+fn find_workspace_config(app_path: &Path) -> Option<PathBuf> {
+    let mut current: PathBuf = if app_path.is_absolute() {
+        app_path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(app_path)
+    };
+    // Resolve so the `.git` boundary check sees real ancestors.
+    current = current.canonicalize().unwrap_or(current);
+
+    loop {
+        let candidate = current.join(WORKSPACE_CONFIG_FILENAME);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        // Stop at repo root — don't escape the source tree.
+        if current.join(".git").exists() {
+            return None;
+        }
+        match current.parent() {
+            Some(parent) => current = parent.to_path_buf(),
+            None => return None,
+        }
+    }
+}
+
+/// Load and parse a workspace config file at the given path. Same parsing
+/// rules as `load_full_project_config` (TOML, version=1, unused-field warnings,
+/// at-most-one default environment), since `rise.workspace.toml` uses the same
+/// `ProjectBuildConfig` shape — it's defaults for any of the same fields.
+fn load_workspace_config_at(path: &Path) -> Result<ProjectBuildConfig> {
+    info!("Loading workspace config from {}", path.display());
+    let content = std::fs::read_to_string(path)?;
+    parse_project_config(&content, path)
+}
+
+/// Shared TOML parser used by both per-app and workspace loaders.
+fn parse_project_config(content: &str, source_path: &Path) -> Result<ProjectBuildConfig> {
+    let mut unused_fields = Vec::new();
+    let deserializer = toml::Deserializer::parse(content)
+        .map_err(|e| anyhow::Error::new(e).context("Failed to parse TOML"))?;
+    let config: ProjectBuildConfig = serde_ignored::deserialize(deserializer, |path| {
+        unused_fields.push(path.to_string());
+    })?;
+
+    for field in &unused_fields {
+        warn!(
+            "Unknown configuration field in {}: {}",
+            source_path.display(),
+            field
+        );
+    }
+
+    if let Some(version) = config.version {
+        if version != 1 {
+            anyhow::bail!(
+                "Unsupported {} version: {}. This CLI supports version 1.",
+                source_path.display(),
+                version
+            );
+        }
+    } else {
+        debug!(
+            "No version specified in {}, using latest",
+            source_path.display()
+        );
+    }
+
+    let default_envs: Vec<&str> = config
+        .environments
+        .iter()
+        .filter(|(_, env)| env.default)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if default_envs.len() > 1 {
+        anyhow::bail!(
+            "Multiple environments have default = true: {}. Only one is allowed.",
+            default_envs.join(", ")
+        );
+    }
+
+    Ok(config)
+}
+
+/// Merge a workspace config (defaults) with a per-app leaf config (overrides).
+/// Top-level `Option` fields take the leaf when present, otherwise the
+/// workspace. The `environments` map is unioned with leaf entries replacing
+/// workspace entries that share a key.
+fn merge_workspace_and_leaf(
+    workspace: Option<ProjectBuildConfig>,
+    leaf: Option<ProjectBuildConfig>,
+) -> Option<ProjectBuildConfig> {
+    match (workspace, leaf) {
+        (None, leaf) => leaf,
+        (Some(w), None) => Some(w),
+        (Some(w), Some(l)) => {
+            let mut environments = w.environments;
+            environments.extend(l.environments);
+            Some(ProjectBuildConfig {
+                version: l.version.or(w.version),
+                project: l.project.or(w.project),
+                build: l.build.or(w.build),
+                deploy: l.deploy.or(w.deploy),
+                registry: l.registry.or(w.registry),
+                environments,
+            })
+        }
+    }
+}
+
+/// Like `load_full_project_config`, but also walks up from `app_path` looking
+/// for a `rise.workspace.toml` and merges it as defaults. Use this for
+/// deploy/build/run paths so a source-repo-level config (e.g. shared
+/// `[registry] image_base`) is inherited by every app under it.
+///
+/// `rise project create` deliberately does NOT use this — it must only see the
+/// directory's own rise.toml when deciding whether to overwrite.
+pub fn load_full_project_config_with_workspace(
+    app_path: &str,
+) -> Result<Option<ProjectBuildConfig>> {
+    let leaf = load_full_project_config(app_path)?;
+    let workspace = match find_workspace_config(Path::new(app_path)) {
+        Some(path) => Some(load_workspace_config_at(&path)?),
+        None => None,
+    };
+    Ok(merge_workspace_and_leaf(workspace, leaf))
 }
 
 /// Write project configuration to rise.toml
@@ -230,12 +323,14 @@ FOO = "bar"
             }),
             build: None,
             deploy: None,
+            registry: None,
             environments: BTreeMap::from([(
                 "staging".to_string(),
                 EnvironmentConfig {
                     default: true,
                     env: BTreeMap::from([("STAGE_VAR".to_string(), "stage_val".to_string())]),
                     deploy: None,
+                    registry: None,
                 },
             )]),
         };
@@ -319,6 +414,235 @@ default = true
             err.contains("Multiple environments have default = true"),
             "unexpected error: {}",
             err
+        );
+    }
+
+    #[test]
+    fn test_workspace_provides_registry_when_leaf_omits_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Repo root marker + workspace config
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(
+            tmp.path().join(WORKSPACE_CONFIG_FILENAME),
+            r#"
+[registry]
+image_base = "jfrog.helsing-dev.ai/hdf-docker-playground/hs-hdf-rise-apps"
+"#,
+        )
+        .unwrap();
+        // App directory with its own rise.toml that omits [registry]
+        let app_dir = tmp.path().join("apps").join("compass");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("rise.toml"),
+            r#"
+[project]
+name = "compass"
+"#,
+        )
+        .unwrap();
+
+        let merged = load_full_project_config_with_workspace(app_dir.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            merged.registry.as_ref().unwrap().image_base,
+            "jfrog.helsing-dev.ai/hdf-docker-playground/hs-hdf-rise-apps"
+        );
+        assert_eq!(merged.project.unwrap().name, "compass");
+    }
+
+    #[test]
+    fn test_leaf_overrides_workspace_registry() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(
+            tmp.path().join(WORKSPACE_CONFIG_FILENAME),
+            r#"
+[registry]
+image_base = "workspace.example.com/base"
+"#,
+        )
+        .unwrap();
+        let app_dir = tmp.path().join("special");
+        std::fs::create_dir(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("rise.toml"),
+            r#"
+[project]
+name = "special"
+
+[registry]
+image_base = "leaf.example.com/override"
+"#,
+        )
+        .unwrap();
+
+        let merged = load_full_project_config_with_workspace(app_dir.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            merged.registry.unwrap().image_base,
+            "leaf.example.com/override",
+            "leaf must win over workspace when both set [registry]"
+        );
+    }
+
+    #[test]
+    fn test_workspace_lookup_stops_at_git_boundary() {
+        // Outer "fake home" with a stray workspace config — must NOT be picked up.
+        let outer = tempfile::tempdir().unwrap();
+        std::fs::write(
+            outer.path().join(WORKSPACE_CONFIG_FILENAME),
+            r#"
+[registry]
+image_base = "should.not.be.inherited/from/home"
+"#,
+        )
+        .unwrap();
+        // Inner "source repo" — .git marker scopes the search.
+        let repo = outer.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(repo.join(".git")).unwrap();
+        let app_dir = repo.join("apps").join("a");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("rise.toml"),
+            r#"
+[project]
+name = "a"
+"#,
+        )
+        .unwrap();
+
+        let merged = load_full_project_config_with_workspace(app_dir.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(
+            merged.registry.is_none(),
+            "workspace lookup escaped the repo via parent traversal"
+        );
+    }
+
+    #[test]
+    fn test_no_workspace_file_matches_load_full_project_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(
+            tmp.path().join("rise.toml"),
+            r#"
+[project]
+name = "solo"
+"#,
+        )
+        .unwrap();
+
+        let baseline = load_full_project_config(tmp.path().to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        let with_ws = load_full_project_config_with_workspace(tmp.path().to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            baseline.project.as_ref().unwrap().name,
+            with_ws.project.as_ref().unwrap().name
+        );
+        assert!(with_ws.registry.is_none());
+    }
+
+    #[test]
+    fn test_workspace_environments_merge_with_leaf_overriding() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(
+            tmp.path().join(WORKSPACE_CONFIG_FILENAME),
+            r#"
+[environments.staging.env]
+SHARED = "from-workspace"
+ONLY_WS = "ws-only"
+"#,
+        )
+        .unwrap();
+        let app_dir = tmp.path().join("app");
+        std::fs::create_dir(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("rise.toml"),
+            r#"
+[project]
+name = "app"
+
+[environments.staging.env]
+SHARED = "from-leaf"
+ONLY_LEAF = "leaf-only"
+
+[environments.production.env]
+APP_VAR = "leaf-prod"
+"#,
+        )
+        .unwrap();
+
+        let merged = load_full_project_config_with_workspace(app_dir.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        // The leaf's `staging` entry replaces workspace's `staging` wholesale —
+        // we union by environment key, not by env-var key. ONLY_WS is therefore
+        // not visible. This is documented behavior; deep-merging env vars is a
+        // future enhancement if a use case appears.
+        let staging = merged.environments.get("staging").unwrap();
+        assert_eq!(staging.env.get("SHARED").unwrap(), "from-leaf");
+        assert_eq!(staging.env.get("ONLY_LEAF").unwrap(), "leaf-only");
+        assert!(!staging.env.contains_key("ONLY_WS"));
+        // The `production` env exists only in the leaf — passes through.
+        let production = merged.environments.get("production").unwrap();
+        assert_eq!(production.env.get("APP_VAR").unwrap(), "leaf-prod");
+    }
+
+    #[test]
+    fn test_workspace_per_env_registry_passes_through_to_leaf() {
+        // Workspace declares production-only registry override; leaf only
+        // touches staging (the common rise-apps shape). The production
+        // [registry] from workspace must survive the env-map union.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(
+            tmp.path().join(WORKSPACE_CONFIG_FILENAME),
+            r#"
+[registry]
+image_base = "jfrog.example.com/playground"
+
+[environments.production.registry]
+image_base = "jfrog.example.com/snapshot"
+"#,
+        )
+        .unwrap();
+        let app_dir = tmp.path().join("app");
+        std::fs::create_dir(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("rise.toml"),
+            r#"
+[project]
+name = "app"
+
+[environments.staging]
+default = true
+"#,
+        )
+        .unwrap();
+
+        let merged = load_full_project_config_with_workspace(app_dir.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            merged.registry.as_ref().unwrap().image_base,
+            "jfrog.example.com/playground",
+            "top-level registry default flows through"
+        );
+        let production = merged.environments.get("production").unwrap();
+        assert_eq!(
+            production.registry.as_ref().unwrap().image_base,
+            "jfrog.example.com/snapshot",
+            "per-env registry override survives env-map union when leaf doesn't \
+             touch the same env"
         );
     }
 
