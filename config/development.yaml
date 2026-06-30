@@ -18,9 +18,17 @@ server:
 database:
   url: "${DATABASE_URL}"
 
+# Local AES-GCM is the lowest-friction encryption for new contributors.
+# Swap to aws-kms (commented below) if you're mirroring rise-dev/rise-prod
+# locally and have AWS+KMS creds available.
 encryption:
   type: "aes-gcm-256"
   key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" # Generate with: openssl rand -base64 32
+
+# encryption:
+#   type: "aws-kms"
+#   region: "${AWS_REGION:-us-east-1}"
+#   key_id: "${KMS_KEY_ID}"
 
 auth:
   issuer: "http://localhost:5556/dex"
@@ -38,38 +46,29 @@ auth:
       - "admin@example.com"
       - "dev@example.com"
 
+# Local-only OCI registry (no AWS deps) — lowest-friction default for new
+# contributors. Swap to the ECR block below if you're mirroring
+# rise-dev/rise-prod locally and have AWS creds available.
 registry:
   type: "oci-client-auth"
-  registry_url: "rise-registry:5000" # Internal URL for deployment controllers
+  registry_url: "rise-registry:5000"
   namespace: "rise-apps"
-  client_registry_url: "rise-registry:5000" # Client-facing URL for CLI push operations
+  client_registry_url: "rise-registry:5000"
 
-# JFrog Artifactory registry (via Vault):
+# Mirrors rise-dev/rise-prod and lets you exercise the client-controlled
+# JFrog push path (rise.workspace.toml with [registry] image_base) on top
+# of the same backend wiring used in prod. `strict_external_hosts` extends
+# the cross-project image validation to JFrog refs that source repos push to.
 # registry:
-#   type: "jfrog"
-#   registry_host: "rise-jfrog:8082"
-#   client_registry_url: "localhost:3082"
-#   docker_repo_key: "rise-docker-local"
-#   token_provider:
-#     type: "vault"
-#     vault_mount_path: "artifactory"
-#     vault_role: "rise"
-#     # scope_override: true       # default; requires the Rise Vault plugin fork with allowed_scopes
-#   # push_permissions: "r,w"     # default (ignored when scope_override=false)
-#   # pull_permissions: "r"       # default (ignored when scope_override=false)
-#   # push_token_ttl: 600         # push token TTL in seconds (default: 600)
-#   # pull_token_ttl: 86400       # pull token TTL in seconds (default: 86400 = 24h)
-
-# JFrog Artifactory registry (via Direct token):
-# registry:
-#   type: "jfrog"
-#   registry_host: "rise-jfrog:8082"
-#   client_registry_url: "localhost:3082"
-#   docker_repo_key: "rise-docker-local"
-#   token_provider:
-#     type: "direct"
-#     jfrog_url: "http://localhost:3082"
-#     admin_token: "${JFROG_ADMIN_TOKEN}"
+#   type: "ecr"
+#   region: "${AWS_REGION:-us-east-1}"
+#   account_id: "${AWS_ACCOUNT_ID}"
+#   repo_prefix: "${ECR_REPO_PREFIX:-rise/}"
+#   role_arn: "${ECR_CONTROLLER_ROLE_ARN}"
+#   push_role_arn: "${ECR_PUSH_ROLE_ARN}"
+#   auto_remove: false
+#   strict_external_hosts:
+#     - "jfrog.helsing-dev.ai"
 
 deployment_controller:
   type: "kubernetes"
@@ -83,6 +82,15 @@ deployment_controller:
   namespace_format: "rise-{project_name}"
   auth_backend_url: "${RISE_AUTH_BACKEND_URL:-http://host.minikube.internal:3000}" # URL for Nginx auth subrequests, must be reachable from ingress-nginx pods
   auth_signin_url: "http://rise.local:3000" # Domain for user-facing OAuth redirects, must be resolvable by users' browsers
+  # Externally-managed pull secret reference attached to every app pod (in
+  # addition to the controller-minted rise-registry-creds). Required when
+  # mirroring the rise-dev/rise-prod JFrog wiring locally; harmless to
+  # leave commented out for the default OCI-registry-only setup since
+  # nothing would pull from JFrog anyway.
+  # Locally, `mise run dev:jfrog-refresh` installs Emberstack Reflector +
+  # a source secret that auto-mirrors to all rise-* namespaces (faking
+  # what ESO's ClusterExternalSecret does in prod).
+  # image_pull_secret_name: "jfrog-helsing-dev-ai-user"
   ingress_annotations:
     nginx.ingress.kubernetes.io/ssl-redirect: "false"
   ingress_port: 8080 # `mise minikube:up` port-forwards ingress to this port

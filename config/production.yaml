@@ -34,6 +34,15 @@ registry:
   role_arn: "${ECR_CONTROLLER_ROLE_ARN}"
   push_role_arn: "${ECR_PUSH_ROLE_ARN}"
   auto_remove: false
+  # Hosts of external registries source repos push to (e.g. a shared JFrog
+  # instance opted into via `rise.toml [registry] image_base`). Applies the
+  # strict last-path-segment cross-project policy so project `evil` can't
+  # claim project `compass`'s image ref. Pair with
+  # `deployment_controller.image_pull_secret_name` below so the controller
+  # actually pulls from the host. See operator-registry-operations/shared-external-host
+  # in the engineering docs.
+  # strict_external_hosts:
+  #   - "jfrog.example.com"
 
 encryption:
   type: "aws-kms"
@@ -43,6 +52,15 @@ encryption:
 deployment_controller:
   type: "kubernetes"
   metacontroller_pod_namespace: "${RISE_METACONTROLLER_POD_NAMESPACE}"
+  # Externally-managed pull secret attached to every app pod alongside
+  # any controller-minted scoped creds. Typical use: an External Secrets
+  # Operator ClusterExternalSecret materializes a shared JFrog token into
+  # every namespace; this names that secret so kubelet can pull from
+  # JFrog refs your source repos push to via `rise.toml [registry]`.
+  # Set `registry.strict_external_hosts` (above) to the same host(s) so
+  # cross-project image-substitution protection is preserved — Rise emits
+  # a startup warning if this is set without strict_external_hosts.
+  # image_pull_secret_name: "jfrog-shared-pull-secret"
   production_ingress_url_template: "${RISE_PRODUCTION_INGRESS_URL_TEMPLATE:-{project_name}.apps.rise.dev}"
   staging_ingress_url_template: "${RISE_STAGING_INGRESS_URL_TEMPLATE:-{project_name}-{deployment_group}.preview.rise.dev}"
   environment_ingress_url_template: "${RISE_ENVIRONMENT_INGRESS_URL_TEMPLATE:-{project_name}-{environment}.preview.rise.dev}"

@@ -1,12 +1,8 @@
-[tool_alias]
-railpack = "github:railwayapp/railpack"
-buildkit = "github:moby/buildkit"
-
 [tools]
 minikube = "1.38.1"
 pack = "0.40.6"
-railpack = "0.15.1"
-buildkit = "0.28.0"
+"ubi:railwayapp/railpack" = "0.15.1"
+"ubi:moby/buildkit" = "0.28.0"
 "cargo:sqlx-cli" = "latest"
 "cargo:cargo-all-features" = "latest"
 helm = "latest"
@@ -401,4 +397,67 @@ sudo /usr/local/bin/k3s-uninstall.sh
 run = """
 ( sleep 2 && curl http://localhost:9229/token -d '{"sub": "test", "aud": "http://rise.local:3000"}' ) &
 npx @oidc.pub/cli dev issuer --url http://localhost:9229
+"""
+
+# Local-dev helper for the opt-in JFrog flow.
+#
+# In prod, an ESO ClusterExternalSecret materializes
+# `jfrog-helsing-dev-ai-user` into every namespace automatically. On local k3s
+# there's no ESO, so when the backend's
+# `deployment_controller.image_pull_secret_name` points at that name the
+# secret has to exist in each project's namespace before pods can pull from
+# JFrog.
+#
+# This task fakes ESO's behaviour with Emberstack `Reflector`:
+# - Installs the reflector helm chart (idempotent — `upgrade --install`).
+# - Mints a fresh JFrog token via Vault.
+# - Creates/updates a single annotated source secret in the `reflector`
+#   namespace. Reflector mirrors it into every existing and future namespace.
+#
+# Re-run whenever the JFrog token expires (~6h default Vault TTL) or after
+# `mise k3s:down && mise k3s:up`. Safe to run any time — idempotent.
+#
+# Usage: mise run dev:jfrog-refresh
+[tasks."dev:jfrog-refresh"]
+description = "Install Emberstack Reflector + mint a fresh JFrog pull secret that auto-mirrors to every namespace (faking what ESO does in prod). Run once per ~6h."
+run = """
+set -e
+
+JFROG_USER="${JFROG_USER:-$(vault token lookup -format=json 2>/dev/null | jq -r '.data.meta.email // (.data.display_name | sub("^oidc-global-entra-"; ""))')}"
+if [ -z "$JFROG_USER" ] || [ "$JFROG_USER" = "null" ]; then
+  echo "Failed to resolve JFrog user. Set JFROG_USER=<email> or run 'vault login -method=oidc -path=global/entra role=developer'."
+  exit 1
+fi
+
+JFROG_TOKEN=$(vault read -field=access_token global/artifactory/user_token/$JFROG_USER)
+if [ -z "$JFROG_TOKEN" ]; then
+  echo "Failed to mint JFrog token from Vault. Is your Vault session valid?"
+  exit 1
+fi
+
+# Install Reflector if it's not already running. helm upgrade --install is
+# idempotent, but skip the network round-trip if it's clearly already there.
+if ! kubectl -n reflector get deploy reflector >/dev/null 2>&1; then
+  echo "Installing Emberstack Reflector..."
+  helm repo add emberstack https://emberstack.github.io/helm-charts >/dev/null 2>&1 || true
+  helm repo update emberstack >/dev/null
+  helm upgrade --install reflector emberstack/reflector \\
+    -n reflector --create-namespace --wait --timeout=2m
+fi
+
+# Materialize the source secret with auto-mirror annotations. Reflector watches
+# this and re-syncs every mirror copy when the source changes — re-running this
+# task with a fresh token rotates every existing namespace's copy too.
+kubectl create namespace reflector --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+kubectl -n reflector create secret docker-registry jfrog-helsing-dev-ai-user \\
+  --docker-server=jfrog.helsing-dev.ai \\
+  --docker-username="$JFROG_USER" \\
+  --docker-password="$JFROG_TOKEN" --dry-run=client -o yaml \\
+  | kubectl annotate -f - --local --dry-run=client -o yaml \\
+      reflector.v1.k8s.emberstack.com/reflection-allowed=true \\
+      reflector.v1.k8s.emberstack.com/reflection-auto-enabled=true \\
+      reflector.v1.k8s.emberstack.com/reflection-auto-namespaces='rise-.*' \\
+  | kubectl apply -f -
+
+echo "✓ jfrog-helsing-dev-ai-user refreshed in reflector ns; Reflector will mirror to every rise-* namespace within ~10s."
 """

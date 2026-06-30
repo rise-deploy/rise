@@ -9,5 +9,7 @@ custom_domains = []
 [project.env]
 
 [build]
-backend = "pack"
-builder = "heroku/builder:24"
+backend = "railpack"
+
+# [registry]
+# image_base = "jfrog.helsing-dev.ai/hdf-docker-playground/hs-hdf-rise-apps"
