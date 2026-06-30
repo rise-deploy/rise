@@ -1,4 +1,3 @@
-use chrono::Utc;
 use tracing::error;
 
 use crate::db::deployments as db_deployments;
@@ -8,12 +7,7 @@ use crate::server::error::{ServerError, ServerErrorExt};
 use crate::server::extensions::InjectedEnvVarValue;
 use crate::server::state::AppState;
 
-/// Generate deployment ID in format YYYYMMDD-HHMMSS
-/// Note: Could have collisions if multiple deployments in same second
-/// Enhancement: Add milliseconds for uniqueness
-pub fn generate_deployment_id() -> String {
-    Utc::now().format("%Y%m%d-%H%M%S").to_string()
-}
+pub use crate::deployment_id::generate_deployment_id;
 
 /// Get the image tag for a deployment
 ///
@@ -37,6 +31,10 @@ pub async fn get_deployment_image_tag(
     // Pre-built images use the pinned digest
     if let Some(ref digest) = deployment.image_digest {
         return digest.clone();
+    }
+
+    if let Some(ref image_path) = deployment.image_path {
+        return image_path.clone();
     }
 
     // For rollback deployments, use the source deployment's deployment_id for the image tag

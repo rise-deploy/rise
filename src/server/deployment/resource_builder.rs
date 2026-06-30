@@ -516,27 +516,38 @@ impl ResourceBuilder {
         &self,
         name: &str,
         namespace: &str,
-        registry_host: &str,
-        credentials: &RegistryCredentials,
+        entries: &[(&str, &RegistryCredentials)],
     ) -> anyhow::Result<Secret> {
         use base64::Engine;
 
-        let auths_entry = match credentials.auth_method {
-            RegistryAuthMethod::LoginCredentials => {
-                let auth = base64::engine::general_purpose::STANDARD
-                    .encode(format!("{}:{}", credentials.username, credentials.password));
-                serde_json::json!({
-                    "username": credentials.username,
-                    "password": credentials.password,
-                    "auth": auth,
-                })
+        let mut auths = serde_json::Map::new();
+        for (registry_host, credentials) in entries {
+            // Empty credentials don't go into the dockerconfigjson — kubelet
+            // would either reject them outright (empty auth header) or attempt
+            // an anonymous pull regardless. Skipping them lets ambient cluster
+            // auth (e.g. node-level pull secrets) take over for that host.
+            if credentials.username.is_empty() && credentials.password.is_empty() {
+                continue;
             }
-            RegistryAuthMethod::RegistryToken => {
-                serde_json::json!({ "registrytoken": credentials.password })
-            }
-        };
 
-        let docker_config = serde_json::json!({ "auths": { registry_host: auths_entry } });
+            let auths_entry = match credentials.auth_method {
+                RegistryAuthMethod::LoginCredentials => {
+                    let auth = base64::engine::general_purpose::STANDARD
+                        .encode(format!("{}:{}", credentials.username, credentials.password));
+                    serde_json::json!({
+                        "username": credentials.username,
+                        "password": credentials.password,
+                        "auth": auth,
+                    })
+                }
+                RegistryAuthMethod::RegistryToken => {
+                    serde_json::json!({ "registrytoken": credentials.password })
+                }
+            };
+            auths.insert((*registry_host).to_string(), auths_entry);
+        }
+
+        let docker_config = serde_json::json!({ "auths": serde_json::Value::Object(auths) });
         let docker_config_bytes = docker_config.to_string().into_bytes();
 
         let mut data = BTreeMap::new();
@@ -985,23 +996,30 @@ impl ResourceBuilder {
                     spec: Some(PodSpec {
                         security_context: self.create_pod_security_context(),
                         image_pull_secrets: {
-                            // Use the explicitly-configured secret name if present.
-                            // Fall back to the default constant only when the registry
-                            // provider needs the controller to mint pull secrets.
-                            // requires_pull_secret() == false means the cluster handles
-                            // auth itself (e.g. node IAM), but an explicit
-                            // image_pull_secret_name should still always be honoured.
-                            let secret_name =
-                                self.image_pull_secret_name.as_deref().or_else(|| {
-                                    self.registry_provider
-                                        .requires_pull_secret()
-                                        .then_some(IMAGE_PULL_SECRET_NAME)
-                                });
-                            secret_name.map(|name| {
-                                vec![LocalObjectReference {
+                            // Pod's imagePullSecrets is a list. We add up to two:
+                            //
+                            // 1. The explicitly-configured `image_pull_secret_name`
+                            //    (typically an externally-managed Secret like an
+                            //    ESO ClusterExternalSecret), if set.
+                            // 2. The controller-minted IMAGE_PULL_SECRET_NAME
+                            //    when the provider needs it (`requires_pull_secret()`).
+                            //
+                            // Both can be present simultaneously — e.g. ECR provider
+                            // mints scoped-per-project ECR creds AND the operator
+                            // points at an ESO-managed JFrog secret. kubelet picks
+                            // the right one based on the image's host.
+                            let mut secrets: Vec<LocalObjectReference> = Vec::new();
+                            if let Some(name) = self.image_pull_secret_name.as_deref() {
+                                secrets.push(LocalObjectReference {
                                     name: name.to_string(),
-                                }]
-                            })
+                                });
+                            }
+                            if self.registry_provider.requires_pull_secret() {
+                                secrets.push(LocalObjectReference {
+                                    name: IMAGE_PULL_SECRET_NAME.to_string(),
+                                });
+                            }
+                            (!secrets.is_empty()).then_some(secrets)
                         },
                         containers: vec![Container {
                             name: "app".to_string(),
@@ -1338,9 +1356,10 @@ impl ResourceBuilder {
     // ── Image tag resolution ───────────────────────────────────────────
 
     /// Resolve the image reference for a deployment.
-    /// For pre-built images, uses the pinned digest.
-    /// For rollback deployments, uses the source deployment's tag.
-    /// For regular builds, constructs from registry config.
+    ///
+    /// Priority: `image_digest`, then `image_path`, then reconstruct via
+    /// `registry_provider.get_image_tag` (fallback for rows persisted before
+    /// `image_path` existed).
     pub fn resolve_image(
         &self,
         project: &Project,
@@ -1348,17 +1367,21 @@ impl ResourceBuilder {
         source_deployment_id: Option<&str>,
     ) -> String {
         if let Some(ref image_digest) = deployment.image_digest {
-            image_digest.clone()
-        } else {
-            let deployment_id_for_tag = source_deployment_id
-                .unwrap_or(&deployment.deployment_id)
-                .to_string();
-            self.registry_provider.get_image_tag(
-                &project.name,
-                &deployment_id_for_tag,
-                crate::server::registry::ImageTagType::Internal,
-            )
+            return image_digest.clone();
         }
+
+        if let Some(ref image_path) = deployment.image_path {
+            return image_path.clone();
+        }
+
+        let deployment_id_for_tag = source_deployment_id
+            .unwrap_or(&deployment.deployment_id)
+            .to_string();
+        self.registry_provider.get_image_tag(
+            &project.name,
+            &deployment_id_for_tag,
+            crate::server::registry::ImageTagType::Internal,
+        )
     }
 }
 
@@ -1480,6 +1503,7 @@ mod tests {
             controller_metadata: serde_json::Value::Null,
             image: None,
             image_digest: None,
+            image_path: None,
             rolled_back_from_deployment_id: None,
             http_port: 8080,
             needs_reconcile: false,
@@ -1711,6 +1735,24 @@ mod tests {
         let d = make_deployment(None, false);
         let secrets = &pod_spec_from_deployment(&d).image_pull_secrets;
         assert!(secrets.is_none());
+    }
+
+    /// Opt-in JFrog wiring on rise-dev: ECR provider still mints scoped
+    /// per-project ECR creds (controller-minted IMAGE_PULL_SECRET_NAME) AND
+    /// the operator references an externally-managed JFrog secret via
+    /// `image_pull_secret_name`. Pod must list both so kubelet can pull from
+    /// either registry depending on the image's host.
+    #[test]
+    fn image_pull_secrets_include_minted_alongside_explicit() {
+        let d = make_deployment(Some("eso-managed-primary"), true);
+        let names: Vec<&str> = pod_spec_from_deployment(&d)
+            .image_pull_secrets
+            .as_ref()
+            .expect("expected both explicit and minted references")
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["eso-managed-primary", IMAGE_PULL_SECRET_NAME]);
     }
 }
 

@@ -150,6 +150,10 @@ pub struct Deployment {
     pub controller_metadata: serde_json::Value,
     pub image: Option<String>,
     pub image_digest: Option<String>,
+    /// Internal-form image reference allocated at deploy creation. NULL for
+    /// pre-built deployments (`image_digest` covers the full ref) and for
+    /// legacy rows (controller falls back to `get_image_tag`).
+    pub image_path: Option<String>,
     pub rolled_back_from_deployment_id: Option<Uuid>,
     pub http_port: i32,
     pub needs_reconcile: bool,

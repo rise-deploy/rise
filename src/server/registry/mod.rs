@@ -85,4 +85,37 @@ pub trait RegistryProvider: Send + Sync {
     fn requires_pull_secret(&self) -> bool {
         true
     }
+
+    /// Validate that an `image_ref` supplied by a CLI caller is allowed to be
+    /// deployed under `project_name`. Defends against cross-project image
+    /// substitution: an attacker owning project `evil` must not be able to
+    /// claim a deployment using project `compass`'s image ref.
+    ///
+    /// Default implementation: when the image starts with this provider's
+    /// `registry_url()/`, the first path segment after the prefix must equal
+    /// `project_name`. External images (not under that prefix) are allowed.
+    /// Matches the historical ECR layout `<host>/<repo_prefix>/<project>:<tag>`.
+    ///
+    /// Stricter providers override this to enforce the invariant universally
+    /// (regardless of repo prefix layout) and to reject external images.
+    fn validate_image_for_project(&self, image_ref: &str, project_name: &str) -> Result<()> {
+        let registry_url = self.registry_url();
+        if registry_url.is_empty() {
+            return Ok(());
+        }
+        let prefix = format!("{}/", registry_url.trim_end_matches('/'));
+        let Some(image_path) = image_ref.strip_prefix(&prefix) else {
+            return Ok(());
+        };
+        let image_project = image_path.split([':', '/', '@']).next().unwrap_or("");
+        if image_project != project_name {
+            anyhow::bail!(
+                "Image belongs to a different project '{}' — \
+                 deployments can only use images from their own project '{}'",
+                image_project,
+                project_name
+            );
+        }
+        Ok(())
+    }
 }

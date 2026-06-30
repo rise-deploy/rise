@@ -87,6 +87,37 @@ fn parse_expiration(expires_in: &str) -> Result<DateTime<Utc>, String> {
     Ok(Utc::now() + duration)
 }
 
+/// Normalize a caller-supplied digest into a fully-qualified `image@sha256:...`
+/// reference. Accepts either:
+/// - a bare digest like `sha256:abc...` — appended onto `image_ref` (with any
+///   existing `@sha256:...` suffix on `image_ref` stripped first).
+/// - a fully-qualified `image@sha256:...` — returned as-is after validation.
+///
+/// Rejects anything that doesn't match the `sha256:[64-hex]` shape, since the
+/// digest is stored verbatim and used by the controller to pull.
+fn normalize_caller_digest(image_ref: &str, caller_digest: &str) -> anyhow::Result<String> {
+    let digest = if let Some((_image, digest)) = caller_digest.rsplit_once('@') {
+        digest
+    } else {
+        caller_digest
+    };
+
+    let Some(hash) = digest.strip_prefix("sha256:") else {
+        anyhow::bail!("expected 'sha256:<hex>' prefix");
+    };
+    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        anyhow::bail!("sha256 digest must be 64 hex chars");
+    }
+
+    // Strip any existing @sha256:... from the image ref so we don't end up with
+    // `image@sha256:a@sha256:b`.
+    let base = image_ref
+        .rsplit_once('@')
+        .map(|(b, _)| b)
+        .unwrap_or(image_ref);
+    Ok(format!("{base}@{digest}"))
+}
+
 /// Resolve image tag to digest by contacting OCI registry directly
 ///
 /// This function uses the OCI Distribution API to fetch the image manifest
@@ -111,27 +142,16 @@ async fn resolve_image_digest(
     image_ref: &str,
     project_name: &str,
 ) -> anyhow::Result<String> {
-    // Cross-project image validation: if the image is on the Rise registry,
-    // verify it belongs to this project (defense-in-depth).
-    // Use registry_url() (which includes namespace/repo_key) to correctly match
-    // Rise-managed images rather than just the hostname.
+    registry_provider.validate_image_for_project(image_ref, project_name)?;
+
+    // Whether the image is on this registry — used below to decide if we should
+    // attach project-scoped pull credentials when resolving the digest. The
+    // prefix check is a superset of validation (which has already passed); it
+    // distinguishes "external image, use anonymous auth" from "our registry,
+    // attach scoped creds".
     let registry_url = registry_provider.registry_url();
     let prefix = format!("{}/", registry_url.trim_end_matches('/'));
-    let is_rise_image = if let Some(image_path) = image_ref.strip_prefix(&prefix) {
-        // After stripping the registry URL prefix, the first path segment is the project name.
-        let image_project = image_path.split([':', '/', '@']).next().unwrap_or("");
-        if image_project != project_name {
-            anyhow::bail!(
-                "Image belongs to a different Rise project '{}' — \
-                 deployments can only use images from their own project '{}'",
-                image_project,
-                project_name
-            );
-        }
-        true
-    } else {
-        false
-    };
+    let is_rise_image = !registry_url.is_empty() && image_ref.starts_with(&prefix);
 
     // Only fetch scoped pull credentials for Rise-managed images.
     // External images use anonymous auth.
@@ -987,6 +1007,7 @@ pub async fn create_deployment(
                 status: DbDeploymentStatus::Pushed, // Start in Pushed state so controller picks it up
                 image: source_deployment.image.as_deref(), // Copy image from source if present
                 image_digest: source_deployment.image_digest.as_deref(), // Copy digest from source if present
+                image_path: source_deployment.image_path.as_deref(), // Rollback reuses the source's allocated path
                 rolled_back_from_deployment_id: Some(original_source_id), // Track original source for image tag calculation
                 deployment_group: &resolved_group, // Use requested group (may be different from source)
                 environment_id: resolved_environment.as_ref().map(|e| e.id),
@@ -1121,10 +1142,21 @@ pub async fn create_deployment(
             // and the controller uses get_image_tag() (the no-digest path) to pull from there.
             info!("Creating push-image deployment with image: {}", user_image);
 
+            // ClientFacing tag is what the CLI pushes to (potentially a
+            // proxy/host-external URL); Internal is what the controller pulls
+            // from (in-cluster service URL). They're the same for ECR/JFrog
+            // but differ for OCI-client-auth in dev. The CLI gets ClientFacing
+            // in the response; the controller resolves through `image_path`, so
+            // persist the Internal form.
             let image_tag = state.registry_provider.get_image_tag(
                 &payload.project,
                 &deployment_id,
                 ImageTagType::ClientFacing,
+            );
+            let internal_image_path = state.registry_provider.get_image_tag(
+                &payload.project,
+                &deployment_id,
+                ImageTagType::Internal,
             );
             let credentials = state
                 .registry_provider
@@ -1140,7 +1172,8 @@ pub async fn create_deployment(
                     created_by_id: user.id,
                     status: DbDeploymentStatus::Pending,
                     image: Some(user_image), // Store original user input for display
-                    image_digest: None, // No digest — controller will use internal registry tag
+                    image_digest: None, // No digest — controller will use image_path or internal registry tag
+                    image_path: Some(internal_image_path.as_str()), // Internal tag — the controller pulls from this
                     rolled_back_from_deployment_id: None,
                     deployment_group: &resolved_group,
                     environment_id: resolved_environment.as_ref().map(|e| e.id),
@@ -1206,21 +1239,40 @@ pub async fn create_deployment(
         // Path 1b: Direct pre-built image deployment (no push)
         info!("Creating deployment with pre-built image: {}", user_image);
 
-        // Resolve image to digest (the OCI client handles Docker Hub shorthand
-        // normalization like nginx → docker.io/library/nginx internally)
-        info!("Resolving image '{}' to digest...", user_image);
-        let image_digest = resolve_image_digest(
-            &state.oci_client,
-            &state.registry_provider,
-            user_image,
-            &project.name,
-        )
-        .await
-        .map_err(|e| {
-            ServerError::bad_request(format!("Failed to resolve image '{}': {}", user_image, e))
-        })?;
-
-        info!("Successfully resolved image to digest: {}", image_digest);
+        // Prefer a caller-supplied digest (client-controlled push flow) over
+        // resolving via the OCI client. The latter requires registry credentials
+        // the backend may not have for private registries (e.g. JFrog under the
+        // ambient-auth model where only the CLI has a token).
+        let image_digest = if let Some(caller_digest) = payload.image_digest.as_deref() {
+            info!("Trusting caller-supplied image digest: {}", caller_digest);
+            // The caller-supplied-digest path skips OCI resolution, but it
+            // MUST NOT skip cross-project ownership validation: an attacker
+            // owning project `evil` could otherwise POST `{image:
+            // "<host>/.../compass:tag", image_digest: <copied>}` and have the
+            // controller pull and run compass's image under evil's namespace.
+            // `resolve_image_digest` runs the same check on the other branch.
+            state
+                .registry_provider
+                .validate_image_for_project(user_image, &project.name)
+                .map_err(|e| ServerError::bad_request(e.to_string()))?;
+            normalize_caller_digest(user_image, caller_digest).map_err(|e| {
+                ServerError::bad_request(format!("Invalid image_digest '{caller_digest}': {e}"))
+            })?
+        } else {
+            info!("Resolving image '{}' to digest...", user_image);
+            let digest = resolve_image_digest(
+                &state.oci_client,
+                &state.registry_provider,
+                user_image,
+                &project.name,
+            )
+            .await
+            .map_err(|e| {
+                ServerError::bad_request(format!("Failed to resolve image '{}': {}", user_image, e))
+            })?;
+            info!("Successfully resolved image to digest: {}", digest);
+            digest
+        };
 
         // Create deployment record with image fields set and invoke extension hooks
         let deployment = create_deployment_with_hooks(
@@ -1232,6 +1284,7 @@ pub async fn create_deployment(
                 status: DbDeploymentStatus::Pushed,
                 image: Some(user_image),
                 image_digest: Some(&image_digest),
+                image_path: None, // Pre-built image — digest already covers the full ref
                 rolled_back_from_deployment_id: None,
                 deployment_group: &resolved_group,
                 environment_id: resolved_environment.as_ref().map(|e| e.id),
@@ -1316,11 +1369,19 @@ pub async fn create_deployment(
         }))
     } else {
         // Path 2: Build from source (current behavior)
-        // Get full image tag from provider for CLI client (uses client_registry_url if configured)
+        // ClientFacing tag is what the CLI pushes to (potentially a
+        // proxy/host-external URL); Internal is what the controller pulls
+        // from. The CLI receives ClientFacing in the response; the controller
+        // resolves through `image_path`, so persist the Internal form.
         let image_tag = state.registry_provider.get_image_tag(
             &payload.project,
             &deployment_id,
             ImageTagType::ClientFacing,
+        );
+        let internal_image_path = state.registry_provider.get_image_tag(
+            &payload.project,
+            &deployment_id,
+            ImageTagType::Internal,
         );
 
         // Get registry credentials scoped to this exact tag
@@ -1341,9 +1402,10 @@ pub async fn create_deployment(
                 created_by_id: user.id,
                 status: DbDeploymentStatus::Pending,
                 image: None,        // image - NULL for build-from-source
-                image_digest: None, // image_digest - NULL for build-from-source
-                rolled_back_from_deployment_id: None, // Not a rollback
-                deployment_group: &resolved_group, // deployment_group
+                image_digest: None, // populated server-side after CLI marks Pushed
+                image_path: Some(internal_image_path.as_str()), // Internal tag — the controller pulls from this
+                rolled_back_from_deployment_id: None,           // Not a rollback
+                deployment_group: &resolved_group,              // deployment_group
                 environment_id: resolved_environment.as_ref().map(|e| e.id),
                 expires_at,                            // expires_at
                 http_port: effective_http_port as i32, // http_port
@@ -2291,7 +2353,8 @@ pub async fn stream_deployment_logs(
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_env_override_is_protected, validate_env_override, validate_env_override_key,
+        normalize_caller_digest, normalize_env_override_is_protected, validate_env_override,
+        validate_env_override_key,
     };
     use crate::server::deployment::models::EnvOverride;
     use axum::http::StatusCode;
@@ -2300,6 +2363,41 @@ mod tests {
     fn env_override_key_validation_rejects_empty_keys() {
         assert!(!validate_env_override_key(""));
         assert!(validate_env_override_key("VALID_KEY_123"));
+    }
+
+    const DIGEST: &str = "sha256:e07ee1baac5fae8a25aa5ea0a55e94f4d3a18c8bf75a3e6fcd3eb6ca8aa67e6e";
+    const IMAGE: &str = "registry.example.com/some-repo/some-group/app:tag";
+
+    #[test]
+    fn normalize_caller_digest_accepts_bare_sha() {
+        let got = normalize_caller_digest(IMAGE, DIGEST).unwrap();
+        assert_eq!(got, format!("{IMAGE}@{DIGEST}"));
+    }
+
+    #[test]
+    fn normalize_caller_digest_accepts_fully_qualified_ref() {
+        let pinned = format!("{IMAGE}@{DIGEST}");
+        let got = normalize_caller_digest(IMAGE, &pinned).unwrap();
+        assert_eq!(got, pinned);
+    }
+
+    #[test]
+    fn normalize_caller_digest_strips_existing_digest_on_image_ref() {
+        let pinned_image = format!("{IMAGE}@sha256:{}", "a".repeat(64));
+        let got = normalize_caller_digest(&pinned_image, DIGEST).unwrap();
+        assert_eq!(got, format!("{IMAGE}@{DIGEST}"));
+    }
+
+    #[test]
+    fn normalize_caller_digest_rejects_missing_prefix() {
+        let err = normalize_caller_digest(IMAGE, "deadbeef").unwrap_err();
+        assert!(err.to_string().contains("sha256"));
+    }
+
+    #[test]
+    fn normalize_caller_digest_rejects_wrong_length() {
+        let err = normalize_caller_digest(IMAGE, "sha256:short").unwrap_err();
+        assert!(err.to_string().contains("64 hex"));
     }
 
     #[test]

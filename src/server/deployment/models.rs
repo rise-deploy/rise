@@ -224,6 +224,13 @@ pub struct CreateDeploymentRequest {
     pub project: String, // Project name
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>, // Optional pre-built image reference
+    /// Pinned digest for `image`. When set, the backend skips its own digest
+    /// resolution (which would require JFrog/registry credentials it may not
+    /// have) and trusts what the caller pushed. Used by the client-controlled
+    /// push flow when rise.toml has a `[registry]` block — the CLI captures the
+    /// digest from `docker push` and forwards it here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_digest: Option<String>,
     /// Deployment group. Defaults to the primary group of the target environment.
     #[serde(default)]
     pub group: Option<String>,

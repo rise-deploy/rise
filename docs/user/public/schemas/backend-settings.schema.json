@@ -296,7 +296,7 @@
             },
             "image_pull_secret_name": {
               "default": null,
-              "description": "Optional name of an existing imagePullSecret to use for deployments\n\nIf not specified:\n  - With a registry provider (e.g., ECR): The controller creates and manages the secret\n  - Without a registry provider: No image pull secret is used\n\nIf specified:\n  - The named secret must exist in each project namespace\n  - The controller will NOT create or manage the secret\n  - Useful for static registries where credentials are managed externally\n\nExample: \"my-registry-secret\"",
+              "description": "Optional name of an externally-managed `imagePullSecret` to add to\nevery deployed pod's `imagePullSecrets` list. **Additive** — the\ncontroller still mints its own pull secret (`IMAGE_PULL_SECRET_NAME`)\nwhen the configured registry provider's `requires_pull_secret()` is\ntrue, and both names are attached to the pod. The intent is to let\nan ESO-materialized secret (e.g. a cluster-wide JFrog token) coexist\nwith controller-minted scoped creds (e.g. ECR) so the kubelet can\npull either ref during an ECR→JFrog migration window.\n\nThe named secret must exist in each project namespace — Rise does\nnot create or manage it. Operators typically deploy it via External\nSecrets Operator's `ClusterExternalSecret`.\n\nPair with `registry.strict_external_hosts` (see operator docs) to\nkeep cross-project image-substitution protection intact for the\nshared external registry the named secret can pull from.\n\nExample: `\"jfrog-helsing-dev-ai-user\"`\n\n**Local-dev note:** in prod, ESO's `ClusterExternalSecret`\nmaterializes the named secret into every namespace automatically.\nLocal k3s doesn't have ESO; the included `mise run\ndev:jfrog-refresh` task installs Emberstack Reflector + an\nannotated source secret to fake the same UX (one cluster-wide\nrefresh per ~6h, no per-project step).",
               "type": [
                 "string",
                 "null"
@@ -1097,6 +1097,14 @@
                 "string",
                 "null"
               ]
+            },
+            "strict_external_hosts": {
+              "default": [],
+              "description": "Hostnames of external (non-ECR) registries to which the strict\ncross-project validation policy still applies. See\n`EcrConfig::strict_external_hosts` for the rationale and policy.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
             },
             "type": {
               "const": "ecr",

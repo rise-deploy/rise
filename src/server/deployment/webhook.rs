@@ -37,6 +37,7 @@ use crate::server::deployment::resource_builder::{
     IRRECOVERABLE_CONTAINER_REASONS, LABEL_DEPLOYMENT_ID,
 };
 use crate::server::deployment::state_machine;
+use crate::server::registry::models::RegistryCredentials;
 use crate::server::state::AppState;
 
 // ── Metacontroller webhook protocol types ──────────────────────────────
@@ -959,9 +960,17 @@ async fn compute_desired_children(
     children.push(serde_json::to_value(&ns)?);
 
     // 2. Image pull secret (if needed)
-    if resource_builder.image_pull_secret_name.is_none()
-        && resource_builder.registry_provider.requires_pull_secret()
-    {
+    //
+    // The controller mints `IMAGE_PULL_SECRET_NAME` whenever the registry
+    // provider requires per-project pull credentials (`requires_pull_secret()`).
+    // The mint is independent of `deployment_controller.image_pull_secret_name`
+    // — they serve different registries and pods reference both: the
+    // controller-minted secret authenticates pulls against the configured
+    // registry provider (e.g. ECR-scoped creds), while the named secret comes
+    // from somewhere external (ESO `ClusterExternalSecret` in prod) and
+    // authenticates pulls against a different host (e.g. JFrog).
+    let needs_mint = resource_builder.registry_provider.requires_pull_secret();
+    if needs_mint {
         if let Some(secret) =
             build_image_pull_secret(resource_builder, project, &namespace, observed).await?
         {
@@ -1264,18 +1273,23 @@ async fn build_image_pull_secret(
         }
     }
 
-    // Fetch fresh pull credentials (scoped to this project's repository)
-    let credentials = resource_builder
+    let primary_host = resource_builder
+        .registry_provider
+        .registry_host()
+        .to_string();
+
+    let primary_credentials = resource_builder
         .registry_provider
         .get_k8s_pull_credentials(&project.name)
         .await?;
-    let registry_host = resource_builder.registry_provider.registry_host();
+
+    let entries: Vec<(&str, &RegistryCredentials)> =
+        vec![(primary_host.as_str(), &primary_credentials)];
 
     let secret = resource_builder.create_dockerconfigjson_secret(
         IMAGE_PULL_SECRET_NAME,
         namespace,
-        registry_host,
-        &credentials,
+        &entries,
     )?;
 
     Ok(Some(secret))
@@ -1888,6 +1902,7 @@ mod tests {
             controller_metadata: serde_json::Value::Null,
             image: None,
             image_digest: None,
+            image_path: None,
             rolled_back_from_deployment_id: None,
             http_port: 8080,
             needs_reconcile: false,

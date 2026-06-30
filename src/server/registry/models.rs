@@ -59,6 +59,22 @@ pub struct EcrConfig {
     /// If false, repos are tagged as orphaned instead
     #[serde(default)]
     pub auto_remove: bool,
+    /// Hostnames of external (non-ECR) registries to which the strict
+    /// cross-project validation policy still applies: image must be on the
+    /// listed host AND the image-name path segment (last segment before `:` or
+    /// `@`) must equal the project name.
+    ///
+    /// The default `validate_image_for_project` impl on this provider lets
+    /// external images through unchecked (they're treated as third-party).
+    /// That's safe for refs like `nginx:latest`, but unsafe when source repos
+    /// push to a known registry the operator considers "ours" (e.g.
+    /// `jfrog.helsing-dev.ai`) — an attacker owning project `evil` could
+    /// otherwise claim project `compass`'s JFrog image.
+    ///
+    /// Add hosts here to extend the strict policy without flipping the
+    /// backend off the ECR provider. Defaults to empty.
+    #[serde(default)]
+    pub strict_external_hosts: Vec<String>,
 }
 
 #[cfg(feature = "backend")]

@@ -168,6 +168,7 @@ mod tests {
             controller_metadata: serde_json::Value::Null,
             image: None,
             image_digest: None,
+            image_path: None,
             rolled_back_from_deployment_id: None,
             http_port: 8080,
             needs_reconcile: false,
