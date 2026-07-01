@@ -44,12 +44,16 @@ pub fn load_full_project_config(app_path: &str) -> Result<Option<ProjectBuildCon
     }
 }
 
-/// Walk up from `app_path` looking for a `rise.workspace.toml`. Stops at the
-/// first `.git` directory encountered (so a stray rise.workspace.toml outside
-/// the source repo can never silently leak in) or at the filesystem root.
+/// Walk up from `app_path` looking for a `rise.workspace.toml`. The search
+/// requires a `.git` marker somewhere in the ancestor chain — the workspace
+/// file only counts when it lives at or above the repo root, and never above
+/// `.git`. That way a stray `rise.workspace.toml` in `$HOME` or `/` can never
+/// silently leak in, including on archive checkouts or CI clones that omit
+/// `.git`.
 ///
-/// `app_path`'s own directory is searched too — a workspace file colocated with
-/// `rise.toml` is unusual but not forbidden.
+/// Returns the first workspace file found within the walk (nearest-ancestor
+/// wins). `app_path`'s own directory is searched too — a workspace file
+/// colocated with `rise.toml` is unusual but not forbidden.
 fn find_workspace_config(app_path: &Path) -> Option<PathBuf> {
     let mut current: PathBuf = if app_path.is_absolute() {
         app_path.to_path_buf()
@@ -59,14 +63,16 @@ fn find_workspace_config(app_path: &Path) -> Option<PathBuf> {
     // Resolve so the `.git` boundary check sees real ancestors.
     current = current.canonicalize().unwrap_or(current);
 
+    let mut nearest_workspace: Option<PathBuf> = None;
     loop {
-        let candidate = current.join(WORKSPACE_CONFIG_FILENAME);
-        if candidate.is_file() {
-            return Some(candidate);
+        if nearest_workspace.is_none() {
+            let candidate = current.join(WORKSPACE_CONFIG_FILENAME);
+            if candidate.is_file() {
+                nearest_workspace = Some(candidate);
+            }
         }
-        // Stop at repo root — don't escape the source tree.
         if current.join(".git").exists() {
-            return None;
+            return nearest_workspace;
         }
         match current.parent() {
             Some(parent) => current = parent.to_path_buf(),
@@ -135,8 +141,10 @@ fn parse_project_config(content: &str, source_path: &Path) -> Result<ProjectBuil
 
 /// Merge a workspace config (defaults) with a per-app leaf config (overrides).
 /// Top-level `Option` fields take the leaf when present, otherwise the
-/// workspace. The `environments` map is unioned with leaf entries replacing
-/// workspace entries that share a key.
+/// workspace. Per-environment configs are deep-merged field-by-field so a
+/// leaf that only sets, say, `[environments.production.deploy]` doesn't
+/// wipe the workspace's `[environments.production.registry]` — production
+/// is exactly the environment where the registry override matters most.
 fn merge_workspace_and_leaf(
     workspace: Option<ProjectBuildConfig>,
     leaf: Option<ProjectBuildConfig>,
@@ -146,7 +154,16 @@ fn merge_workspace_and_leaf(
         (Some(w), None) => Some(w),
         (Some(w), Some(l)) => {
             let mut environments = w.environments;
-            environments.extend(l.environments);
+            for (name, leaf_env) in l.environments {
+                match environments.remove(&name) {
+                    Some(ws_env) => {
+                        environments.insert(name, merge_environment(ws_env, leaf_env));
+                    }
+                    None => {
+                        environments.insert(name, leaf_env);
+                    }
+                }
+            }
             Some(ProjectBuildConfig {
                 version: l.version.or(w.version),
                 project: l.project.or(w.project),
@@ -156,6 +173,23 @@ fn merge_workspace_and_leaf(
                 environments,
             })
         }
+    }
+}
+
+/// Merge a workspace's `EnvironmentConfig` with a leaf's for the same
+/// environment name. Leaf wins for scalars and env-var map entries with
+/// shared keys; workspace fields survive when the leaf doesn't touch them.
+fn merge_environment(
+    workspace: crate::rise_toml::EnvironmentConfig,
+    leaf: crate::rise_toml::EnvironmentConfig,
+) -> crate::rise_toml::EnvironmentConfig {
+    let mut env = workspace.env;
+    env.extend(leaf.env);
+    crate::rise_toml::EnvironmentConfig {
+        default: leaf.default || workspace.default,
+        env,
+        deploy: leaf.deploy.or(workspace.deploy),
+        registry: leaf.registry.or(workspace.registry),
     }
 }
 
@@ -584,17 +618,91 @@ APP_VAR = "leaf-prod"
         let merged = load_full_project_config_with_workspace(app_dir.to_str().unwrap())
             .unwrap()
             .unwrap();
-        // The leaf's `staging` entry replaces workspace's `staging` wholesale —
-        // we union by environment key, not by env-var key. ONLY_WS is therefore
-        // not visible. This is documented behavior; deep-merging env vars is a
-        // future enhancement if a use case appears.
+        // Deep-merged: leaf wins for SHARED, workspace's ONLY_WS survives.
         let staging = merged.environments.get("staging").unwrap();
         assert_eq!(staging.env.get("SHARED").unwrap(), "from-leaf");
         assert_eq!(staging.env.get("ONLY_LEAF").unwrap(), "leaf-only");
-        assert!(!staging.env.contains_key("ONLY_WS"));
+        assert_eq!(staging.env.get("ONLY_WS").unwrap(), "ws-only");
         // The `production` env exists only in the leaf — passes through.
         let production = merged.environments.get("production").unwrap();
         assert_eq!(production.env.get("APP_VAR").unwrap(), "leaf-prod");
+    }
+
+    #[test]
+    fn test_leaf_env_does_not_shadow_workspace_registry() {
+        // The core reason we deep-merge: a leaf touching production.env or
+        // production.deploy must not silently wipe the workspace's
+        // production.registry override (playground → snapshot for develop
+        // deploys is the whole point).
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(
+            tmp.path().join(WORKSPACE_CONFIG_FILENAME),
+            r#"
+[environments.production.registry]
+image_base = "jfrog.example.com/snapshot"
+"#,
+        )
+        .unwrap();
+        let app_dir = tmp.path().join("app");
+        std::fs::create_dir(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("rise.toml"),
+            r#"
+[project]
+name = "app"
+
+# Leaf touches production.env but must not wipe workspace's production.registry.
+[environments.production.env]
+APP_VAR = "prod-value"
+"#,
+        )
+        .unwrap();
+
+        let merged = load_full_project_config_with_workspace(app_dir.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        let production = merged.environments.get("production").unwrap();
+        assert_eq!(
+            production.registry.as_ref().unwrap().image_base,
+            "jfrog.example.com/snapshot",
+        );
+        assert_eq!(production.env.get("APP_VAR").unwrap(), "prod-value");
+    }
+
+    #[test]
+    fn test_workspace_lookup_requires_git_marker() {
+        // Without a `.git` in the ancestor chain the workspace file must
+        // NOT be honored — protects archive checkouts / CI clones without
+        // `.git` from silently inheriting a stray `rise.workspace.toml` in
+        // `$HOME` or `/`.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(WORKSPACE_CONFIG_FILENAME),
+            r#"
+[registry]
+image_base = "should.not.be.inherited/from/home"
+"#,
+        )
+        .unwrap();
+        let app_dir = tmp.path().join("app");
+        std::fs::create_dir(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("rise.toml"),
+            r#"
+[project]
+name = "app"
+"#,
+        )
+        .unwrap();
+
+        let merged = load_full_project_config_with_workspace(app_dir.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(
+            merged.registry.is_none(),
+            "workspace file without a .git ancestor must not leak in",
+        );
     }
 
     #[test]

@@ -94,11 +94,9 @@ macro_rules! trace_layer {
     };
 }
 
-/// Warn loudly when the operator wires a cluster-wide `image_pull_secret_name`
-/// (typically an ESO-managed JFrog token that can pull *any* repo on that host)
-/// without also listing the host in `registry.strict_external_hosts`. In that
-/// state the default `validate_image_for_project` lets project `evil` POST a
-/// digest for project `compass`'s JFrog image and the controller will pull it.
+/// Flag the misconfig where a cluster-wide `image_pull_secret_name` can pull
+/// any image on a shared external registry but the cross-project validation
+/// still falls through to third-party-allowed.
 fn warn_if_strict_external_hosts_missing(settings: &settings::Settings) {
     let pull_secret_set = matches!(
         &settings.deployment_controller,
@@ -117,11 +115,8 @@ fn warn_if_strict_external_hosts_missing(settings: &settings::Settings) {
     if pull_secret_set && strict_hosts_empty {
         tracing::warn!(
             "deployment_controller.image_pull_secret_name is set but \
-             registry.strict_external_hosts is empty. If the named secret can \
-             pull cross-project images on an external registry (e.g. JFrog), \
-             add that host to strict_external_hosts to keep \
-             validate_image_for_project from falling through to the permissive \
-             third-party-allowed default. See ECR provider docs."
+             registry.strict_external_hosts is empty — cross-project image \
+             substitution on the shared external registry is unchecked."
         );
     }
 }

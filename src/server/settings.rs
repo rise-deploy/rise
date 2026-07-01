@@ -674,31 +674,17 @@ pub enum DeploymentControllerSettings {
         #[serde(default = "default_node_selector")]
         node_selector: std::collections::HashMap<String, String>,
 
-        /// Optional name of an externally-managed `imagePullSecret` to add to
-        /// every deployed pod's `imagePullSecrets` list. **Additive** — the
-        /// controller still mints its own pull secret (`IMAGE_PULL_SECRET_NAME`)
-        /// when the configured registry provider's `requires_pull_secret()` is
-        /// true, and both names are attached to the pod. The intent is to let
-        /// an ESO-materialized secret (e.g. a cluster-wide JFrog token) coexist
-        /// with controller-minted scoped creds (e.g. ECR) so the kubelet can
-        /// pull either ref during an ECR→JFrog migration window.
+        /// Name of an externally-managed `imagePullSecret` added to every
+        /// deployed pod's `imagePullSecrets` list. **Additive** — the
+        /// controller still mints its own pull secret when the registry
+        /// provider requires one; both names are attached. Lets an
+        /// ESO-materialized cluster-wide secret coexist with controller-minted
+        /// scoped creds (e.g. a JFrog token alongside ECR).
         ///
-        /// The named secret must exist in each project namespace — Rise does
-        /// not create or manage it. Operators typically deploy it via External
-        /// Secrets Operator's `ClusterExternalSecret`.
-        ///
-        /// Pair with `registry.strict_external_hosts` (see operator docs) to
-        /// keep cross-project image-substitution protection intact for the
-        /// shared external registry the named secret can pull from.
-        ///
-        /// Example: `"jfrog-helsing-dev-ai-user"`
-        ///
-        /// **Local-dev note:** in prod, ESO's `ClusterExternalSecret`
-        /// materializes the named secret into every namespace automatically.
-        /// Local k3s doesn't have ESO; the included `mise run
-        /// dev:jfrog-refresh` task installs Emberstack Reflector + an
-        /// annotated source secret to fake the same UX (one cluster-wide
-        /// refresh per ~6h, no per-project step).
+        /// The named secret must already exist in each project namespace.
+        /// Pair with `registry.strict_external_hosts` — Rise warns at startup
+        /// if this is set without it, since a cluster-wide pull secret makes
+        /// cross-project image substitution possible without the strict policy.
         #[serde(default)]
         image_pull_secret_name: Option<String>,
 
