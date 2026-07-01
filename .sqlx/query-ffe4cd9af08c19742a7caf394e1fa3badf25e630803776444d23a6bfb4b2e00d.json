@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT d.id, d.deployment_id, p.name AS project_name\n        FROM deployments d\n        JOIN projects p ON p.id = d.project_id\n        WHERE d.image_path IS NULL AND d.image_digest IS NULL\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "deployment_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "project_name",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "ffe4cd9af08c19742a7caf394e1fa3badf25e630803776444d23a6bfb4b2e00d"
+}

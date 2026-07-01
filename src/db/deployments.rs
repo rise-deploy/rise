@@ -775,6 +775,50 @@ pub async fn mark_needs_reconcile(pool: &PgPool, id: Uuid) -> Result<()> {
     Ok(())
 }
 
+/// One row of deployment metadata needed to reconstruct an internal image
+/// reference for backfilling `image_path`. Kept narrow so the backfill query
+/// stays cheap even against a table with many rows.
+pub struct MissingImagePathRow {
+    pub id: Uuid,
+    pub deployment_id: String,
+    pub project_name: String,
+}
+
+/// Fetch deployments that predate the `image_path` column: build-from-source
+/// rows (no `image_digest`) where `image_path` is still NULL. Pre-built rows
+/// (which set `image_digest` to a self-describing digest ref) are skipped.
+pub async fn list_missing_image_paths(pool: &PgPool) -> Result<Vec<MissingImagePathRow>> {
+    let rows = sqlx::query_as!(
+        MissingImagePathRow,
+        r#"
+        SELECT d.id, d.deployment_id, p.name AS project_name
+        FROM deployments d
+        JOIN projects p ON p.id = d.project_id
+        WHERE d.image_path IS NULL AND d.image_digest IS NULL
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("Failed to list deployments with missing image_path")?;
+
+    Ok(rows)
+}
+
+/// Set the `image_path` for a deployment. Used only by the startup backfill —
+/// deploy creation writes `image_path` inline via `create`.
+pub async fn set_image_path(pool: &PgPool, id: Uuid, image_path: &str) -> Result<()> {
+    sqlx::query!(
+        "UPDATE deployments SET image_path = $2, updated_at = NOW() WHERE id = $1",
+        id,
+        image_path,
+    )
+    .execute(pool)
+    .await
+    .context("Failed to set image_path")?;
+
+    Ok(())
+}
+
 /// Clear the needs_reconcile flag for a deployment
 ///
 /// Called after successfully reconciling a deployment

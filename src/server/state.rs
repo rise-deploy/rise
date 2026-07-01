@@ -474,6 +474,19 @@ impl AppState {
             }
         };
 
+        // Backfill image_path for build-from-source deployments persisted
+        // before the column existed. Idempotent — no-op after the first run.
+        match crate::server::deployment::utils::backfill_missing_image_paths(
+            &db_pool,
+            &*registry_provider,
+        )
+        .await
+        {
+            Ok(0) => {}
+            Ok(n) => tracing::info!("Backfilled image_path for {n} legacy deployments"),
+            Err(e) => tracing::warn!("image_path backfill failed (non-fatal): {e:?}"),
+        }
+
         // Initialize OCI client for direct registry interaction
         let oci_client = Arc::new(
             crate::server::oci::OciClient::new().context("Failed to initialize OCI client")?,

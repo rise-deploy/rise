@@ -1,3 +1,5 @@
+use anyhow::Result;
+use sqlx::PgPool;
 use tracing::error;
 
 use crate::db::deployments as db_deployments;
@@ -7,6 +9,36 @@ use crate::server::error::{ServerError, ServerErrorExt};
 use crate::server::extensions::InjectedEnvVarValue;
 use crate::server::registry::{ImageTagType, RegistryProvider};
 use crate::server::state::AppState;
+
+/// One-shot backfill of `deployments.image_path` for build-from-source rows
+/// that predate the column. The value written matches what the pre-column
+/// fallback in `resolve_image` would have reconstructed at pull time, so
+/// pods keep pulling the same image after this runs — the point is only
+/// to make the reference explicit in the DB so `resolve_image` can trust
+/// `image_path` instead of falling back on the current `registry_url()`.
+///
+/// Runs from `AppState::new` after the registry provider is initialized and
+/// migrations have applied. Pre-built rows (which pin their own image via
+/// `image_digest`) are skipped.
+pub async fn backfill_missing_image_paths(
+    pool: &PgPool,
+    registry_provider: &dyn RegistryProvider,
+) -> Result<usize> {
+    let rows = db_deployments::list_missing_image_paths(pool).await?;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    tracing::info!("Backfilling image_path for {} deployments", rows.len());
+    for row in &rows {
+        let image_path = registry_provider.get_image_tag(
+            &row.project_name,
+            &row.deployment_id,
+            ImageTagType::Internal,
+        );
+        db_deployments::set_image_path(pool, row.id, &image_path).await?;
+    }
+    Ok(rows.len())
+}
 
 /// Resolve the image reference for a deployment. Single source of truth for
 /// both the HTTP-response case and the controller reconciler.
