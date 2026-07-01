@@ -1006,8 +1006,10 @@ struct ClientPushed {
 
 /// Build + push the project image to the registry configured in rise.toml's
 /// `[registry]` block. Returns `Ok(None)` when the client-controlled path
-/// doesn't apply: no rise.toml, no `[registry]`, `--image` was supplied, or
-/// this is a rollback (`--from-deployment`).
+/// doesn't apply: no rise.toml, no `[registry]`, `--image` was supplied,
+/// this is a rollback (`--from-deployment`), or `--push-image` was set (which
+/// runs a separate pull-and-push-to-Rise-registry flow further down and is
+/// mutually exclusive with source-repo-controlled push).
 ///
 /// Auth comes from whatever lives in `~/.docker/config.json` (or the podman
 /// equivalent) — typically a Vault-minted JFrog token. No `docker login` here.
@@ -1015,7 +1017,10 @@ fn client_controlled_push_if_configured(
     config: &Config,
     deploy_opts: &DeploymentOptions<'_>,
 ) -> Result<Option<ClientPushed>> {
-    if deploy_opts.image.is_some() || deploy_opts.from_deployment.is_some() {
+    if deploy_opts.image.is_some()
+        || deploy_opts.from_deployment.is_some()
+        || deploy_opts.push_image
+    {
         return Ok(None);
     }
     let Some(toml) = deploy_opts.toml_config.as_ref() else {

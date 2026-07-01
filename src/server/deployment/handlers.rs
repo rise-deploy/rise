@@ -870,20 +870,26 @@ pub async fn create_deployment(
     // Use the CLI-supplied deployment_id when present (client-controlled push
     // path — the CLI embedded it in the JFrog tag before pushing, so the DB
     // row must agree). Otherwise mint a fresh UUIDv7.
-    let deployment_id = if let Some(id) = payload.deployment_id.as_deref() {
-        uuid::Uuid::parse_str(id).map_err(|_| {
-            ServerError::bad_request(format!("deployment_id must be a valid UUID, got '{id}'"))
+    //
+    // Canonicalize via `Uuid::to_string()` — `parse_str` accepts uppercase,
+    // braced, and urn forms, but the value ends up in Kubernetes resource
+    // names (`{project}-{deployment_id}`) which must be RFC1123 lowercase.
+    // Canonicalizing also makes the uniqueness check byte-exact.
+    let deployment_id = if let Some(raw) = payload.deployment_id.as_deref() {
+        let parsed = uuid::Uuid::parse_str(raw).map_err(|_| {
+            ServerError::bad_request(format!("deployment_id must be a valid UUID, got '{raw}'"))
         })?;
-        if !db_deployments::find_by_deployment_id_unscoped(&state.db_pool, id, 1)
+        let canonical = parsed.to_string();
+        if !db_deployments::find_by_deployment_id_unscoped(&state.db_pool, &canonical, 1)
             .await
             .map_err(|e| ServerError::internal(format!("failed to check deployment_id: {e}")))?
             .is_empty()
         {
             return Err(ServerError::conflict(format!(
-                "deployment_id '{id}' already exists"
+                "deployment_id '{canonical}' already exists"
             )));
         }
-        id.to_string()
+        canonical
     } else {
         generate_deployment_id()
     };

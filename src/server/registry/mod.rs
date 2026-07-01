@@ -113,54 +113,76 @@ pub trait RegistryProvider: Send + Sync {
     /// 3. Otherwise — allowed unchecked (third-party images like
     ///    `nginx:latest` still work for the pre-built-image workflow).
     fn validate_image_for_project(&self, image_ref: &str, project_name: &str) -> Result<()> {
-        let registry_url = self.registry_url();
-        if !registry_url.is_empty() {
-            let prefix = format!("{}/", registry_url.trim_end_matches('/'));
-            if let Some(image_path) = image_ref.strip_prefix(&prefix) {
-                let image_project = image_path.split([':', '/', '@']).next().unwrap_or("");
-                if image_project != project_name {
-                    anyhow::bail!(
-                        "Image belongs to a different project '{}' — \
-                         deployments can only use images from their own project '{}'",
-                        image_project,
-                        project_name
-                    );
-                }
-                return Ok(());
-            }
-        }
-
-        let strict_hosts = self.strict_external_hosts();
-        if strict_hosts.is_empty() {
-            return Ok(());
-        }
-
-        // Parse via the OCI reference grammar so we don't have to hand-roll
-        // host/path/tag/digest splits — that's where bypass bugs (port
-        // suffixes, case variants, ambiguous `:` parsing for ported
-        // untagged refs) come from. Anything that doesn't parse as a
-        // valid reference can't be deployed at all.
+        // Parse once via the OCI reference grammar so both branches get
+        // spec-compliant host/repository extraction. Hand-rolling `strip_prefix`
+        // on the raw string opens port/case bypasses (`<host>:443/...`,
+        // `<HOST>/...`) — closed here by construction.
         let reference: oci_distribution::Reference = image_ref.parse().map_err(|e| {
             anyhow::anyhow!("Image '{image_ref}' is not a valid OCI reference: {e}")
         })?;
-        // `strict_hosts` are expected to be pre-normalized by the provider
-        // (see `EcrProvider::new`); we normalize the caller-supplied host
-        // once and byte-compare against each entry.
         let image_host = normalize_host(reference.registry());
-        if !strict_hosts.iter().any(|h| h == &image_host) {
+        let image_repository = reference.repository();
+
+        // Branch 1: image is on this provider's own registry.
+        let registry_url = self.registry_url();
+        if !registry_url.is_empty() {
+            let (primary_host, primary_path) = split_registry_url(registry_url);
+            if image_host == normalize_host(primary_host) {
+                let path_prefix = primary_path.trim_matches('/');
+                let rest = if path_prefix.is_empty() {
+                    image_repository
+                } else {
+                    // Image is on our host but outside our `repo_prefix` — not
+                    // a project-managed image; fall through to the external
+                    // branches so third-party layouts on the same host still
+                    // work (unchanged behavior).
+                    image_repository
+                        .strip_prefix(path_prefix)
+                        .and_then(|r| r.strip_prefix('/'))
+                        .unwrap_or_default()
+                };
+                if !rest.is_empty() {
+                    let first_segment = rest.split('/').next().unwrap_or("");
+                    if first_segment != project_name {
+                        anyhow::bail!(
+                            "Image belongs to a different project '{first_segment}' — \
+                             deployments can only use images from their own project '{project_name}'"
+                        );
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
+        // Branch 2: image is on a shared external registry the operator
+        // opted into strict policy for. Pre-normalized entries — see
+        // `EcrProvider::new`.
+        let strict_hosts = self.strict_external_hosts();
+        if strict_hosts.iter().any(|h| h == &image_host) {
+            let last_segment = image_repository.rsplit('/').next().unwrap_or("");
+            if last_segment != project_name {
+                anyhow::bail!(
+                    "Image '{image_ref}' on host '{}' is owned by a different \
+                     project (image name '{last_segment}' != project '{project_name}'). \
+                     Cross-project image deploys are not allowed for this host.",
+                    reference.registry(),
+                );
+            }
             return Ok(());
         }
 
-        let last_segment = reference.repository().rsplit('/').next().unwrap_or("");
-        if last_segment != project_name {
-            anyhow::bail!(
-                "Image '{image_ref}' on host '{}' is owned by a different \
-                 project (image name '{last_segment}' != project '{project_name}'). \
-                 Cross-project image deploys are not allowed for this host.",
-                reference.registry(),
-            );
-        }
+        // Branch 3: fully external image (e.g. `nginx:latest`) — allowed
+        // unchecked to keep the pre-built-image workflow working.
         Ok(())
+    }
+}
+
+/// Split a `registry_url()` (which for ECR is `<host>/<repo_prefix>`) into
+/// its host and path components.
+fn split_registry_url(url: &str) -> (&str, &str) {
+    match url.split_once('/') {
+        Some((host, path)) => (host, path),
+        None => (url, ""),
     }
 }
 
@@ -235,6 +257,47 @@ mod validate_image_tests {
             .validate_image_for_project(&format!("{ECR_URL}/compass:v1"), "evil")
             .unwrap_err();
         assert!(err.to_string().contains("'compass'"));
+    }
+
+    #[test]
+    fn primary_host_with_default_port_still_enforces_first_segment() {
+        // Previously `strip_prefix` on the raw ref let `<host>:443/rise/compass`
+        // slip past the branch-1 check because the prefix wouldn't match.
+        // After routing through the OCI parser, the canonicalized host
+        // matches and the first-segment rule fires.
+        let p = provider(ECR_URL, &[]);
+        let err = p
+            .validate_image_for_project(
+                "123456789012.dkr.ecr.eu-west-1.amazonaws.com:443/rise/compass:v1",
+                "evil",
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("'compass'"));
+    }
+
+    #[test]
+    fn primary_host_uppercase_still_enforces_first_segment() {
+        let p = provider(ECR_URL, &[]);
+        let err = p
+            .validate_image_for_project(
+                "123456789012.DKR.ECR.eu-west-1.amazonaws.com/rise/compass:v1",
+                "evil",
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("'compass'"));
+    }
+
+    #[test]
+    fn primary_host_outside_repo_prefix_falls_through() {
+        // Image on our host but outside our `repo_prefix` isn't Rise-managed —
+        // fall through to the external branches (unchecked, matches previous
+        // behavior for `<host>/some-other-path/foo:tag`).
+        let p = provider(ECR_URL, &[]);
+        p.validate_image_for_project(
+            "123456789012.dkr.ecr.eu-west-1.amazonaws.com/some-other-team/foo:v1",
+            "anything",
+        )
+        .unwrap();
     }
 
     #[test]
