@@ -1034,7 +1034,7 @@ fn client_controlled_push_if_configured(
         return Ok(None);
     };
 
-    let deployment_id = crate::deployment_id::generate_deployment_id();
+    let deployment_id = uuid::Uuid::now_v7().to_string();
     let image_tag = format!(
         "{}/{}:{}",
         registry.image_base.trim_end_matches('/'),

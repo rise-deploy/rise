@@ -8,8 +8,6 @@ use crate::server::extensions::InjectedEnvVarValue;
 use crate::server::registry::{ImageTagType, RegistryProvider};
 use crate::server::state::AppState;
 
-pub use crate::deployment_id::generate_deployment_id;
-
 /// Resolve the image reference for a deployment. Single source of truth for
 /// both the HTTP-response case and the controller reconciler.
 ///

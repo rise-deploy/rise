@@ -12,7 +12,7 @@ use tracing::{debug, error, info, warn};
 
 use super::models::{self, *};
 use super::state_machine;
-use super::utils::{create_deployment_with_hooks, generate_deployment_id};
+use super::utils::create_deployment_with_hooks;
 use crate::db::models::DeploymentStatus as DbDeploymentStatus;
 use crate::db::{deployments as db_deployments, projects, service_accounts, users};
 use crate::server::auth::context::AuthContext;
@@ -891,7 +891,7 @@ pub async fn create_deployment(
         }
         canonical
     } else {
-        generate_deployment_id()
+        uuid::Uuid::now_v7().to_string()
     };
     debug!("Deployment ID: {}", deployment_id);
 

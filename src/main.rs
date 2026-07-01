@@ -14,9 +14,6 @@ mod cli;
 #[cfg(any(feature = "cli", feature = "backend"))]
 mod rise_toml;
 
-#[cfg(any(feature = "cli", feature = "backend"))]
-mod deployment_id;
-
 #[cfg(feature = "backend")]
 mod db;
 #[cfg(feature = "backend")]
