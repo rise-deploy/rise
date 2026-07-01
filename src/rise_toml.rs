@@ -64,14 +64,6 @@ pub struct EnvironmentConfig {
     /// Environment-specific deployment resource overrides
     #[serde(default)]
     pub deploy: Option<DeployConfig>,
-
-    /// Environment-specific registry override. When set, takes precedence
-    /// over the top-level `[registry]` for deploys to this environment.
-    /// Lets a workspace pin a `playground` JFrog repo as the default for
-    /// MR/staging deploys and override to `snapshot`/`release` for the
-    /// production environment.
-    #[serde(default)]
-    pub registry: Option<RegistryConfig>,
 }
 
 /// Deployment resource configuration

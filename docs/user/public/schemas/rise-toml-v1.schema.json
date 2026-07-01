@@ -149,18 +149,6 @@
           "default": {},
           "description": "Plain-text environment variables scoped to this environment",
           "type": "object"
-        },
-        "registry": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RegistryConfig"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "description": "Environment-specific registry override. When set, takes precedence\nover the top-level `[registry]` for deploys to this environment.\nLets a workspace pin a `playground` JFrog repo as the default for\nMR/staging deploys and override to `snapshot`/`release` for the\nproduction environment."
         }
       },
       "type": "object"

@@ -1,6 +1,0 @@
-# Optional: opt every rise.toml under this repo into client-controlled
-# push. See docs/user/user-guide/client-push. Uncomment and set your
-# own image_base to activate.
-#
-# [registry]
-# image_base = "jfrog.example.com/team-playground/team-apps"

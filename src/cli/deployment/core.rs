@@ -1026,11 +1026,7 @@ fn client_controlled_push_if_configured(
     let Some(toml) = deploy_opts.toml_config.as_ref() else {
         return Ok(None);
     };
-    let env_registry = deploy_opts
-        .environment
-        .and_then(|name| toml.environments.get(name))
-        .and_then(|env| env.registry.as_ref());
-    let Some(registry) = env_registry.or(toml.registry.as_ref()) else {
+    let Some(registry) = toml.registry.as_ref() else {
         return Ok(None);
     };
 

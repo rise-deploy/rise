@@ -78,8 +78,8 @@ pub async fn run_locally(
         // Explicit project name takes precedence
         Some(name.to_string())
     } else {
-        // Try to load from rise.toml (merging any ancestor rise.workspace.toml)
-        match build::config::load_full_project_config_with_workspace(options.path) {
+        // Try to load from rise.toml
+        match build::config::load_full_project_config(options.path) {
             Ok(Some(config)) => {
                 if let Some(project_config) = config.project {
                     Some(project_config.name)

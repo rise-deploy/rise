@@ -31,43 +31,6 @@ When `[registry]` is present, `rise deploy`:
 
 Rise validates the image ref against the operator's policy (see [Cross-Project Validation](#cross-project-validation)) and creates the deployment with `image_digest` pinned — the kubelet pulls by digest, so the deployment is reproducible even if the tag is reused.
 
-## Workspace inheritance: `rise.workspace.toml`
-
-For source repos with many apps under one umbrella registry path, declare the `[registry]` once at the repo root:
-
-```
-my-repo/
-├── .git/
-├── rise.workspace.toml      # workspace defaults
-└── apps/
-    ├── frontend/rise.toml   # inherits [registry] from above
-    ├── api/rise.toml
-    └── worker/rise.toml
-```
-
-```toml
-# rise.workspace.toml
-[registry]
-image_base = "jfrog.example.com/my-team-playground/my-team-apps"
-```
-
-When `rise deploy` runs in any subdirectory, the CLI walks up looking for `rise.workspace.toml` (stops at the first `.git` boundary), and merges its `[registry]` (and other defaults) into the leaf's effective config. Leaf-level `[registry]` in `apps/<x>/rise.toml` overrides the workspace.
-
-## Per-environment override
-
-Often you want different image bases per environment — e.g. MR pipelines push to a playground repo (anyone can push) and `develop` pushes to a snapshot repo (write-token gated to the protected branch). Use `[environments.<name>.registry]`:
-
-```toml
-# rise.workspace.toml
-[registry]
-image_base = "jfrog.example.com/my-team-playground/my-team-apps"
-
-[environments.production.registry]
-image_base = "jfrog.example.com/my-team-snapshot/my-team-apps"
-```
-
-When `rise deploy --environment production` resolves to the `production` env, the CLI picks `[environments.production.registry]`. Other environments (including the workspace default for MR/staging deploys) use the top-level `[registry]`.
-
 ## Auth
 
 The CLI doesn't require any Rise-mediated auth for the push — your container CLI authenticates to the registry however it normally would. Common patterns:

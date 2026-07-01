@@ -63,7 +63,7 @@ fn resolve_project_name_with_config(
     let config = if let Some(cfg) = preloaded_config {
         Some(cfg)
     } else {
-        owned_config = build::config::load_full_project_config_with_workspace(path)?;
+        owned_config = build::config::load_full_project_config(path)?;
         owned_config.as_ref()
     };
 
@@ -1206,9 +1206,8 @@ async fn main() -> Result<()> {
             DeploymentCommands::Create { args } => {
                 // Load rise.toml once — reused for project name resolution,
                 // environment resolution, env var collection, and build config.
-                let toml_config =
-                    build::config::load_full_project_config_with_workspace(&args.path)
-                        .context("Failed to load rise.toml")?;
+                let toml_config = build::config::load_full_project_config(&args.path)
+                    .context("Failed to load rise.toml")?;
 
                 let project_name = resolve_project_name_with_config(
                     args.project.clone(),
@@ -1663,7 +1662,7 @@ async fn main() -> Result<()> {
                     path,
                     environment,
                 } => {
-                    let toml_config = build::config::load_full_project_config_with_workspace(path)?;
+                    let toml_config = build::config::load_full_project_config(path)?;
                     let project_name = resolve_project_name_with_config(
                         project.clone(),
                         path,
@@ -1818,7 +1817,7 @@ async fn main() -> Result<()> {
             let expose_port = expose.unwrap_or(*http_port);
 
             // Resolve environment from --environment flag or rise.toml default
-            let toml_config = build::config::load_full_project_config_with_workspace(path)?;
+            let toml_config = build::config::load_full_project_config(path)?;
             let resolved_env = resolve_environment(environment.clone(), toml_config.as_ref());
 
             cli::run::run_locally(
