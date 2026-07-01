@@ -74,7 +74,7 @@ pub struct EcrConfig {
     /// Add hosts here to extend the strict policy without flipping the
     /// backend off the ECR provider. Defaults to empty.
     #[serde(default)]
-    pub strict_external_hosts: Vec<String>,
+    pub external_registry_hosts: Vec<String>,
 }
 
 #[cfg(feature = "backend")]

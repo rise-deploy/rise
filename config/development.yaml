@@ -57,8 +57,7 @@ registry:
 
 # Mirrors rise-dev/rise-prod and lets you exercise the client-controlled
 # JFrog push path (rise.workspace.toml with [registry] image_base) on top
-# of the same backend wiring used in prod. `strict_external_hosts` extends
-# the cross-project image validation to JFrog refs that source repos push to.
+# of the same backend wiring used in prod.
 # registry:
 #   type: "ecr"
 #   region: "${AWS_REGION:-us-east-1}"
@@ -67,8 +66,11 @@ registry:
 #   role_arn: "${ECR_CONTROLLER_ROLE_ARN}"
 #   push_role_arn: "${ECR_PUSH_ROLE_ARN}"
 #   auto_remove: false
-#   strict_external_hosts:
-#     - "jfrog.helsing-dev.ai"
+#
+# Non-primary hosts source repos push to; backend enforces
+# project-scope validation on images from these hosts.
+# external_registry_hosts:
+#   - "jfrog.helsing-dev.ai"
 
 deployment_controller:
   type: "kubernetes"

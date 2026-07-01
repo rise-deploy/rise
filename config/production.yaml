@@ -34,15 +34,17 @@ registry:
   role_arn: "${ECR_CONTROLLER_ROLE_ARN}"
   push_role_arn: "${ECR_PUSH_ROLE_ARN}"
   auto_remove: false
-  # Hosts of external registries source repos push to (e.g. a shared JFrog
-  # instance opted into via `rise.toml [registry] image_base`). Applies the
-  # strict last-path-segment cross-project policy so project `evil` can't
-  # claim project `compass`'s image ref. Pair with
-  # `deployment_controller.external_pull_secret_name` below so the controller
-  # actually pulls from the host. See operator-registry-operations/shared-external-host
-  # in the engineering docs.
-  # strict_external_hosts:
-  #   - "jfrog.example.com"
+
+# Non-primary registries where source repos push their own images (via
+# `rise.toml [registry] image_base`). Backend enforces project-scope
+# validation on any image ref arriving from these hosts — last path
+# segment must equal the deploying project's name. Rise doesn't manage
+# these registries; this is purely a validation policy. Pair with
+# `deployment_controller.external_pull_secret_name` below so the controller
+# can actually pull from them; Rise emits a startup warning if one is set
+# without the other. See operator-registry-operations/shared-external-host.
+# external_registry_hosts:
+#   - "jfrog.example.com"
 
 encryption:
   type: "aws-kms"
@@ -57,9 +59,9 @@ deployment_controller:
   # Operator ClusterExternalSecret materializes a shared JFrog token into
   # every namespace; this names that secret so kubelet can pull from
   # JFrog refs your source repos push to via `rise.toml [registry]`.
-  # Set `registry.strict_external_hosts` (above) to the same host(s) so
+  # Set `registry.external_registry_hosts` (above) to the same host(s) so
   # cross-project image-substitution protection is preserved — Rise emits
-  # a startup warning if this is set without strict_external_hosts.
+  # a startup warning if this is set without external_registry_hosts.
   # external_pull_secret_name: "jfrog-shared-pull-secret"
   production_ingress_url_template: "${RISE_PRODUCTION_INGRESS_URL_TEMPLATE:-{project_name}.apps.rise.dev}"
   staging_ingress_url_template: "${RISE_STAGING_INGRESS_URL_TEMPLATE:-{project_name}-{deployment_group}.preview.rise.dev}"

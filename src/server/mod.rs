@@ -95,11 +95,10 @@ macro_rules! trace_layer {
 }
 
 /// Flag the misconfig where a cluster-wide `external_pull_secret_name` can pull
-/// any image on a shared external registry but the cross-project validation
-/// still falls through to third-party-allowed. Currently `strict_external_hosts`
-/// is only settable on the ECR provider; non-ECR primary registries hit this
-/// warning unconditionally when a pull secret is configured.
-fn warn_if_strict_external_hosts_missing(settings: &settings::Settings) {
+/// any image on a shared external registry but `external_registry_hosts` is
+/// empty — meaning the backend validates arriving images as third-party
+/// (allowed unchecked) rather than as ours-in-spirit (project-scope enforced).
+fn warn_if_external_registry_hosts_missing(settings: &settings::Settings) {
     let pull_secret_set = matches!(
         &settings.deployment_controller,
         Some(settings::DeploymentControllerSettings::Kubernetes {
@@ -110,15 +109,10 @@ fn warn_if_strict_external_hosts_missing(settings: &settings::Settings) {
     if !pull_secret_set {
         return;
     }
-    let strict_hosts_empty = settings
-        .registry
-        .as_ref()
-        .map(|r| r.strict_external_hosts.is_empty())
-        .unwrap_or(true);
-    if strict_hosts_empty {
+    if settings.external_registry_hosts.is_empty() {
         tracing::warn!(
             "deployment_controller.external_pull_secret_name is set but \
-             registry.strict_external_hosts is empty — cross-project image \
+             external_registry_hosts is empty — cross-project image \
              substitution on the shared external registry is unchecked."
         );
     }
@@ -128,7 +122,7 @@ fn warn_if_strict_external_hosts_missing(settings: &settings::Settings) {
 pub async fn run_server(settings: settings::Settings) -> Result<()> {
     let state = AppState::new(&settings).await?;
 
-    warn_if_strict_external_hosts_missing(&settings);
+    warn_if_external_registry_hosts_missing(&settings);
 
     // Construct ControllerState from AppState components for sharing with controllers
     let controller_state = ControllerState {
@@ -160,11 +154,7 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
 
     // Start ECR controller if ECR registry is configured (requires aws feature)
     #[cfg(feature = "backend")]
-    if let Some(settings::RegistrySettings {
-        provider: settings::RegistryProviderSettings::Ecr { .. },
-        ..
-    }) = &settings.registry
-    {
+    if let Some(settings::RegistrySettings::Ecr { .. }) = &settings.registry {
         info!("Starting ECR controller");
         let settings_clone = settings.clone();
         let controller_state_clone = controller_state.clone();
@@ -331,22 +321,18 @@ async fn run_ecr_controller_loop(
     settings: settings::Settings,
 ) -> Result<()> {
     use crate::server::registry::models::EcrConfig;
-    use crate::server::settings::{RegistryProviderSettings, RegistrySettings};
+    use crate::server::settings::RegistrySettings;
 
     // Extract ECR config from registry settings
     let ecr_config = match &settings.registry {
-        Some(RegistrySettings {
-            provider:
-                RegistryProviderSettings::Ecr {
-                    region,
-                    account_id,
-                    repo_prefix,
-                    push_role_arn,
-                    auto_remove,
-                    access_key_id,
-                    secret_access_key,
-                },
-            strict_external_hosts,
+        Some(RegistrySettings::Ecr {
+            region,
+            account_id,
+            repo_prefix,
+            push_role_arn,
+            auto_remove,
+            access_key_id,
+            secret_access_key,
         }) => EcrConfig {
             region: region.clone(),
             account_id: account_id.clone(),
@@ -355,7 +341,7 @@ async fn run_ecr_controller_loop(
             auto_remove: *auto_remove,
             access_key_id: access_key_id.clone(),
             secret_access_key: secret_access_key.clone(),
-            strict_external_hosts: strict_external_hosts.clone(),
+            external_registry_hosts: settings.external_registry_hosts.clone(),
         },
         _ => {
             anyhow::bail!("ECR controller requires ECR registry configuration");

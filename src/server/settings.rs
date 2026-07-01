@@ -16,6 +16,16 @@ pub struct Settings {
     pub encryption: Option<EncryptionSettings>,
     #[serde(default)]
     pub extensions: Option<ExtensionsSettings>,
+    /// Hostnames of external registries source repos push to (via
+    /// `rise.toml [registry] image_base`). Backend enforces
+    /// project-scope validation on images arriving from these hosts —
+    /// last path segment must equal the deploying project's name.
+    /// Rise doesn't push, pull, or otherwise manage anything here;
+    /// this is purely a validation policy. Empty list = no non-primary
+    /// hosts get strict validation (external images fall through to
+    /// the third-party-allowed default).
+    #[serde(default)]
+    pub external_registry_hosts: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, JsonSchema)]
@@ -682,7 +692,7 @@ pub enum DeploymentControllerSettings {
         ///
         /// The named secret must already exist in each project namespace
         /// (typically via ESO's `ClusterExternalSecret`). Pair with
-        /// `registry.strict_external_hosts` — Rise warns at startup if this
+        /// `registry.external_registry_hosts` — Rise warns at startup if this
         /// is set without it, since a cluster-wide pull secret makes
         /// cross-project image substitution possible without the strict policy.
         #[serde(default)]
@@ -756,26 +766,10 @@ pub enum DeploymentControllerSettings {
 }
 
 /// Registry provider configuration
-/// Registry configuration. Wraps the provider-specific block with
-/// registry-wide policy fields (`strict_external_hosts`) that shouldn't be
-/// scoped to any one provider.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct RegistrySettings {
-    #[serde(flatten)]
-    pub provider: RegistryProviderSettings,
-
-    /// Hostnames of external registries (i.e. not this backend's own
-    /// primary registry) to which the strict cross-project validation
-    /// policy applies. Registry-agnostic — a source repo pushing to
-    /// `jfrog.example.com/team/{project}` gets checked here regardless of
-    /// whether the backend runs against ECR, GitLab, or JFrog itself.
-    #[serde(default)]
-    pub strict_external_hosts: Vec<String>,
-}
-
+/// Registry configuration.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "kebab-case")]
-pub enum RegistryProviderSettings {
+pub enum RegistrySettings {
     Ecr {
         #[allow(dead_code)]
         region: String,

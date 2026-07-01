@@ -23,10 +23,10 @@ pub struct EcrProvider {
     registry_host: String,
     /// Cache for pull credentials (ECR tokens valid for 12 hours)
     cached_pull_creds: RwLock<Option<(String, String, Instant)>>,
-    /// `config.strict_external_hosts` pre-canonicalized (lowercased + port
+    /// `config.external_registry_hosts` pre-canonicalized (lowercased + port
     /// stripped) so the trait default validator can byte-compare without
     /// allocating per call.
-    normalized_strict_external_hosts: Vec<String>,
+    normalized_external_registry_hosts: Vec<String>,
 }
 
 impl EcrProvider {
@@ -64,8 +64,8 @@ impl EcrProvider {
         // repo_prefix is literal (e.g., "rise/" → "rise/hello")
         let registry_url = format!("{}/{}", registry_host, config.repo_prefix);
 
-        let normalized_strict_external_hosts = config
-            .strict_external_hosts
+        let normalized_external_registry_hosts = config
+            .external_registry_hosts
             .iter()
             .map(|h| crate::server::registry::normalize_host(h))
             .collect();
@@ -76,7 +76,7 @@ impl EcrProvider {
             registry_url,
             registry_host,
             cached_pull_creds: RwLock::new(None),
-            normalized_strict_external_hosts,
+            normalized_external_registry_hosts,
         })
     }
 
@@ -308,7 +308,7 @@ impl RegistryProvider for EcrProvider {
         format!("{}/{}:{}", self.registry_host, repo_name, tag)
     }
 
-    fn strict_external_hosts(&self) -> &[String] {
-        &self.normalized_strict_external_hosts
+    fn external_registry_hosts(&self) -> &[String] {
+        &self.normalized_external_registry_hosts
     }
 }

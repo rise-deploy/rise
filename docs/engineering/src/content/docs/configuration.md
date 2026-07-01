@@ -227,10 +227,10 @@ auto_remove = true
 
 # Optional: hosts of external (non-ECR) registries to apply the strict
 # last-path-segment cross-project policy to. See operator-registry-operations/shared-external-host.
-strict_external_hosts = ["jfrog.example.com"]
+external_registry_hosts = ["jfrog.example.com"]
 ```
 
-`strict_external_hosts` is the operator-side companion to source repos' [client-controlled push](../user-guide/client-push). It prevents project `evil` from claiming project `compass`'s image ref on a shared external registry. Without it, the default `validate_image_for_project` lets any non-ECR external image through. Pair with `deployment_controller.external_pull_secret_name` for the controller to actually pull from the external host. See [Shared External Registry](operator-registry-operations/shared-external-host) for the full rationale and rollout shape.
+`external_registry_hosts` is the operator-side companion to source repos' [client-controlled push](../user-guide/client-push). It prevents project `evil` from claiming project `compass`'s image ref on a shared external registry. Without it, the default `validate_image_for_project` lets any non-ECR external image through. Pair with `deployment_controller.external_pull_secret_name` for the controller to actually pull from the external host. See [Shared External Registry](operator-registry-operations/shared-external-host) for the full rationale and rollout shape.
 
 #### OCI Registry (Docker, Harbor, Quay)
 

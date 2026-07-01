@@ -125,13 +125,13 @@ To prevent project `evil` from claiming project `compass`'s JFrog image ref, the
 - Images under the configured backend registry prefix (`<registry_url>/...`) must have project name as the first path segment after the prefix.
 - Other external images are allowed (so `nginx:latest` etc. work for the pre-built-image flow).
 
-When the backend has `registry.strict_external_hosts: [jfrog.example.com]` set (operator-side config), images on those hosts get the **strict policy**: the last path segment before `:`/`@` must equal the project name. Source repos pushing to a shared external registry can't substitute each other's refs.
+When the backend has `registry.external_registry_hosts: [jfrog.example.com]` set (operator-side config), images on those hosts get the **strict policy**: the last path segment before `:`/`@` must equal the project name. Source repos pushing to a shared external registry can't substitute each other's refs.
 
 If your push lands on a strict host but the path doesn't end in `<project>`, the create-deployment API rejects the call with a clear error. Fix: re-tag with the correct project name segment (the CLI does this automatically when `[registry]` is used — `{image_base}/{project}:{deployment_id}`).
 
 ## Local Dev
 
-`rise deploy` against a personal backend works identically. If the backend is configured without `strict_external_hosts`, any image ref under the JFrog host is accepted; if `strict_external_hosts` is set, the same policy applies. See [Local Development](./local-development) for the personal-backend setup.
+`rise deploy` against a personal backend works identically. If the backend is configured without `external_registry_hosts`, any image ref under the JFrog host is accepted; if `external_registry_hosts` is set, the same policy applies. See [Local Development](./local-development) for the personal-backend setup.
 
 ## When NOT to use this
 

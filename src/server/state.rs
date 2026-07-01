@@ -16,7 +16,7 @@ use crate::server::registry::{
     providers::{EcrProvider, GitLabRegistryProvider, JfrogProvider},
 };
 use crate::server::settings::{
-    AuthSettings, EncryptionSettings, RegistryProviderSettings, ServerSettings, Settings,
+    AuthSettings, EncryptionSettings, RegistrySettings, ServerSettings, Settings,
 };
 use anyhow::{Context, Result};
 use sqlx::postgres::PgPoolOptions;
@@ -264,9 +264,9 @@ impl AppState {
 
         // Initialize registry provider (required for server operation)
         let registry_provider: Arc<dyn RegistryProvider> = match &settings.registry {
-            Some(registry_config) => match &registry_config.provider {
+            Some(registry_config) => match registry_config {
                 #[cfg(feature = "backend")]
-                RegistryProviderSettings::Ecr {
+                RegistrySettings::Ecr {
                     region,
                     account_id,
                     repo_prefix,
@@ -283,7 +283,7 @@ impl AppState {
                         auto_remove: *auto_remove,
                         access_key_id: access_key_id.clone(),
                         secret_access_key: secret_access_key.clone(),
-                        strict_external_hosts: registry_config.strict_external_hosts.clone(),
+                        external_registry_hosts: settings.external_registry_hosts.clone(),
                     };
                     let provider = EcrProvider::new(ecr_config)
                         .await
@@ -292,14 +292,14 @@ impl AppState {
                     Arc::new(provider)
                 }
                 #[cfg(not(feature = "backend"))]
-                RegistryProviderSettings::Ecr { account_id, .. } => {
+                RegistrySettings::Ecr { account_id, .. } => {
                     anyhow::bail!(
                         "AWS ECR registry is configured (account: {}) but the 'aws' feature is not enabled. \
                          Please rebuild with --features aws or use a pre-built binary with AWS support.",
                         account_id
                     )
                 }
-                RegistryProviderSettings::OciClientAuth {
+                RegistrySettings::OciClientAuth {
                     registry_url,
                     namespace,
                     client_registry_url,
@@ -318,7 +318,7 @@ impl AppState {
                     Arc::new(provider)
                 }
                 #[cfg(feature = "backend")]
-                RegistryProviderSettings::GitLab {
+                RegistrySettings::GitLab {
                     gitlab_url,
                     registry_url,
                     namespace,
@@ -342,14 +342,14 @@ impl AppState {
                     Arc::new(provider)
                 }
                 #[cfg(not(feature = "backend"))]
-                RegistryProviderSettings::GitLab { registry_url, .. } => {
+                RegistrySettings::GitLab { registry_url, .. } => {
                     anyhow::bail!(
                         "GitLab registry is configured ({}) but the 'backend' feature is not enabled.",
                         registry_url
                     )
                 }
                 #[cfg(feature = "backend")]
-                RegistryProviderSettings::Jfrog {
+                RegistrySettings::Jfrog {
                     registry_host,
                     client_registry_url,
                     docker_repo_key,
@@ -459,7 +459,7 @@ impl AppState {
                     Arc::new(provider)
                 }
                 #[cfg(not(feature = "backend"))]
-                RegistryProviderSettings::Jfrog { registry_host, .. } => {
+                RegistrySettings::Jfrog { registry_host, .. } => {
                     anyhow::bail!(
                         "JFrog registry is configured ({}) but the 'backend' feature is not enabled.",
                         registry_host
