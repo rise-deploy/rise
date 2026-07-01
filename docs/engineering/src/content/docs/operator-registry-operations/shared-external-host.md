@@ -30,25 +30,25 @@ The strict path enforces the invariant **regardless of repo prefix layout**: sou
 
 Earlier iterations of this feature shipped a separate `jfrog-static` registry provider, which forced a backend-wide cutover from ECR to JFrog. The current design keeps the backend on ECR (or whatever its primary provider is) and adds the strict policy as an additive operator setting. Source repos opt into the JFrog push path independently via [`rise.toml [registry]`](../../user-guide/client-push); the backend doesn't need to flip modes.
 
-## Pairing with `image_pull_secret_name`
+## Pairing with `external_pull_secret_name`
 
 `strict_external_hosts` only governs validation of the **incoming image ref**. To actually pull from the external registry, the operator also sets:
 
 ```yaml
 deployment_controller:
-  image_pull_secret_name: jfrog-shared-pull-secret
+  external_pull_secret_name: jfrog-shared-pull-secret
 ```
 
 The controller adds the named secret to every pod's `imagePullSecrets` alongside any registry-provider-minted scoped creds. Typically this secret is materialized cluster-wide by an [External Secrets Operator](https://external-secrets.io/) `ClusterExternalSecret`.
 
 ## Startup WARN — the misconfig signal
 
-Rise emits a warning at backend startup when `image_pull_secret_name` is set but `strict_external_hosts` is empty (or the primary registry provider doesn't yet support the field — currently ECR-only). Grep the backend logs for `strict_external_hosts is empty` or `does not support strict_external_hosts` to spot it.
+Rise emits a warning at backend startup when `external_pull_secret_name` is set but `strict_external_hosts` is empty (or the primary registry provider doesn't yet support the field — currently ECR-only). Grep the backend logs for `strict_external_hosts is empty` or `does not support strict_external_hosts` to spot it.
 
-The warn isn't fatal — `image_pull_secret_name` is a pre-existing field used for unrelated cases too (private mirrors that don't share with other projects), so the backend can't decide unilaterally. The operator is expected to read the warning and either add the relevant host to `strict_external_hosts` or confirm the pull secret's scope is project-safe.
+The warn isn't fatal — `external_pull_secret_name` is a pre-existing field used for unrelated cases too (private mirrors that don't share with other projects), so the backend can't decide unilaterally. The operator is expected to read the warning and either add the relevant host to `strict_external_hosts` or confirm the pull secret's scope is project-safe.
 
 ## Rollout shape
 
-1. Add `strict_external_hosts` and `image_pull_secret_name` to the backend config. Sync.
+1. Add `strict_external_hosts` and `external_pull_secret_name` to the backend config. Sync.
 2. The backend now accepts JFrog refs only when project name matches the last segment, and pods get the pull secret automatically.
 3. Source repos opt in to the JFrog push path at their own pace via [`rise.toml [registry]`](../../user-guide/client-push). No coordinated cutover.

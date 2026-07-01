@@ -53,7 +53,7 @@ The Kubernetes controller supports three modes for managing image pull secrets:
 deployment_controller:
   type: kubernetes
   # ... other settings ...
-  image_pull_secret_name: "my-registry-secret"
+  external_pull_secret_name: "my-registry-secret"
 ```
 
 - The controller will reference this secret name in all Deployments
@@ -65,7 +65,7 @@ deployment_controller:
   - Using a cluster-wide image pull secret that's pre-configured in all namespaces
 
 **3. No Image Pull Secret**
-- When no registry provider is configured and no `image_pull_secret_name` is set
+- When no registry provider is configured and no `external_pull_secret_name` is set
 - Deployments will not include any `imagePullSecrets` field
 - Only works with public container images or when using Kubernetes cluster defaults
 
@@ -81,7 +81,7 @@ registry:
 
 deployment_controller:
   type: kubernetes
-  # No image_pull_secret_name needed - automatically managed
+  # No external_pull_secret_name needed - automatically managed
 ```
 
 Using external secret:
@@ -94,7 +94,7 @@ registry:
 deployment_controller:
   type: kubernetes
   # ... other settings ...
-  image_pull_secret_name: "my-registry-secret"
+  external_pull_secret_name: "my-registry-secret"
 ```
 
 For external secrets, ensure the secret exists in each namespace:

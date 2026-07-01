@@ -90,7 +90,7 @@ deployment_controller:
   # Locally, `mise run dev:jfrog-refresh` installs Emberstack Reflector +
   # a source secret that auto-mirrors to all rise-* namespaces (faking
   # what ESO's ClusterExternalSecret does in prod).
-  # image_pull_secret_name: "jfrog-helsing-dev-ai-user"
+  # external_pull_secret_name: "jfrog-helsing-dev-ai-user"
   ingress_annotations:
     nginx.ingress.kubernetes.io/ssl-redirect: "false"
   ingress_port: 8080 # `mise minikube:up` port-forwards ingress to this port

@@ -94,7 +94,7 @@ macro_rules! trace_layer {
     };
 }
 
-/// Flag the misconfig where a cluster-wide `image_pull_secret_name` can pull
+/// Flag the misconfig where a cluster-wide `external_pull_secret_name` can pull
 /// any image on a shared external registry but the cross-project validation
 /// still falls through to third-party-allowed. Currently `strict_external_hosts`
 /// is only settable on the ECR provider; non-ECR primary registries hit this
@@ -103,33 +103,24 @@ fn warn_if_strict_external_hosts_missing(settings: &settings::Settings) {
     let pull_secret_set = matches!(
         &settings.deployment_controller,
         Some(settings::DeploymentControllerSettings::Kubernetes {
-            image_pull_secret_name: Some(_),
+            external_pull_secret_name: Some(_),
             ..
         })
     );
     if !pull_secret_set {
         return;
     }
-    match &settings.registry {
-        Some(settings::RegistrySettings::Ecr {
-            strict_external_hosts,
-            ..
-        }) if !strict_external_hosts.is_empty() => {}
-        Some(settings::RegistrySettings::Ecr { .. }) => {
-            tracing::warn!(
-                "deployment_controller.image_pull_secret_name is set but \
-                 registry.strict_external_hosts is empty — cross-project image \
-                 substitution on the shared external registry is unchecked."
-            );
-        }
-        _ => {
-            tracing::warn!(
-                "deployment_controller.image_pull_secret_name is set but the \
-                 configured registry provider does not support strict_external_hosts \
-                 (currently ECR-only). Cross-project image substitution on the \
-                 shared external registry is unchecked."
-            );
-        }
+    let strict_hosts_empty = settings
+        .registry
+        .as_ref()
+        .map(|r| r.strict_external_hosts.is_empty())
+        .unwrap_or(true);
+    if strict_hosts_empty {
+        tracing::warn!(
+            "deployment_controller.external_pull_secret_name is set but \
+             registry.strict_external_hosts is empty — cross-project image \
+             substitution on the shared external registry is unchecked."
+        );
     }
 }
 
@@ -169,7 +160,11 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
 
     // Start ECR controller if ECR registry is configured (requires aws feature)
     #[cfg(feature = "backend")]
-    if let Some(settings::RegistrySettings::Ecr { .. }) = &settings.registry {
+    if let Some(settings::RegistrySettings {
+        provider: settings::RegistryProviderSettings::Ecr { .. },
+        ..
+    }) = &settings.registry
+    {
         info!("Starting ECR controller");
         let settings_clone = settings.clone();
         let controller_state_clone = controller_state.clone();
@@ -336,18 +331,21 @@ async fn run_ecr_controller_loop(
     settings: settings::Settings,
 ) -> Result<()> {
     use crate::server::registry::models::EcrConfig;
-    use crate::server::settings::RegistrySettings;
+    use crate::server::settings::{RegistryProviderSettings, RegistrySettings};
 
     // Extract ECR config from registry settings
     let ecr_config = match &settings.registry {
-        Some(RegistrySettings::Ecr {
-            region,
-            account_id,
-            repo_prefix,
-            push_role_arn,
-            auto_remove,
-            access_key_id,
-            secret_access_key,
+        Some(RegistrySettings {
+            provider:
+                RegistryProviderSettings::Ecr {
+                    region,
+                    account_id,
+                    repo_prefix,
+                    push_role_arn,
+                    auto_remove,
+                    access_key_id,
+                    secret_access_key,
+                },
             strict_external_hosts,
         }) => EcrConfig {
             region: region.clone(),

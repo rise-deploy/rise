@@ -674,19 +674,19 @@ pub enum DeploymentControllerSettings {
         #[serde(default = "default_node_selector")]
         node_selector: std::collections::HashMap<String, String>,
 
-        /// Name of an externally-managed `imagePullSecret` added to every
-        /// deployed pod's `imagePullSecrets` list. **Additive** — the
-        /// controller still mints its own pull secret when the registry
-        /// provider requires one; both names are attached. Lets an
-        /// ESO-materialized cluster-wide secret coexist with controller-minted
-        /// scoped creds (e.g. a JFrog token alongside ECR).
+        /// Name of an externally-managed `imagePullSecret` (typically an
+        /// ESO-materialized JFrog token) attached to every deployed pod's
+        /// `imagePullSecrets` list. Additive — the controller still mints
+        /// its own scoped pull secret (`rise-registry-creds`, per project)
+        /// when the registry provider requires one; both names are attached.
         ///
-        /// The named secret must already exist in each project namespace.
-        /// Pair with `registry.strict_external_hosts` — Rise warns at startup
-        /// if this is set without it, since a cluster-wide pull secret makes
+        /// The named secret must already exist in each project namespace
+        /// (typically via ESO's `ClusterExternalSecret`). Pair with
+        /// `registry.strict_external_hosts` — Rise warns at startup if this
+        /// is set without it, since a cluster-wide pull secret makes
         /// cross-project image substitution possible without the strict policy.
         #[serde(default)]
-        image_pull_secret_name: Option<String>,
+        external_pull_secret_name: Option<String>,
 
         /// Access classes defining ingress authentication levels
         /// Key: access class identifier (e.g., "public", "private")
@@ -756,9 +756,26 @@ pub enum DeploymentControllerSettings {
 }
 
 /// Registry provider configuration
+/// Registry configuration. Wraps the provider-specific block with
+/// registry-wide policy fields (`strict_external_hosts`) that shouldn't be
+/// scoped to any one provider.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct RegistrySettings {
+    #[serde(flatten)]
+    pub provider: RegistryProviderSettings,
+
+    /// Hostnames of external registries (i.e. not this backend's own
+    /// primary registry) to which the strict cross-project validation
+    /// policy applies. Registry-agnostic — a source repo pushing to
+    /// `jfrog.example.com/team/{project}` gets checked here regardless of
+    /// whether the backend runs against ECR, GitLab, or JFrog itself.
+    #[serde(default)]
+    pub strict_external_hosts: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "kebab-case")]
-pub enum RegistrySettings {
+pub enum RegistryProviderSettings {
     Ecr {
         #[allow(dead_code)]
         region: String,
@@ -780,11 +797,6 @@ pub enum RegistrySettings {
         #[serde(default)]
         #[allow(dead_code)]
         secret_access_key: Option<String>,
-        /// Hostnames of external (non-ECR) registries to which the strict
-        /// cross-project validation policy still applies. See
-        /// `EcrConfig::strict_external_hosts` for the rationale and policy.
-        #[serde(default)]
-        strict_external_hosts: Vec<String>,
     },
     #[serde(rename = "oci-client-auth")]
     OciClientAuth {

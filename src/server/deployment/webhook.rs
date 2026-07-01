@@ -962,7 +962,7 @@ async fn compute_desired_children(
     //
     // The controller mints `IMAGE_PULL_SECRET_NAME` whenever the registry
     // provider requires per-project pull credentials (`requires_pull_secret()`).
-    // The mint is independent of `deployment_controller.image_pull_secret_name`
+    // The mint is independent of `deployment_controller.external_pull_secret_name`
     // — they serve different registries and pods reference both: the
     // controller-minted secret authenticates pulls against the configured
     // registry provider (e.g. ECR-scoped creds), while the named secret comes
@@ -1852,7 +1852,7 @@ mod tests {
             custom_domain_tls_mode: crate::server::settings::CustomDomainTlsMode::PerDomain,
             custom_domain_ingress_annotations: HashMap::new(),
             node_selector: HashMap::new(),
-            image_pull_secret_name: None,
+            external_pull_secret_name: None,
             access_classes: HashMap::new(),
             host_aliases: HashMap::new(),
             extra_service_token_audiences: HashMap::new(),

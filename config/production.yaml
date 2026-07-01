@@ -38,7 +38,7 @@ registry:
   # instance opted into via `rise.toml [registry] image_base`). Applies the
   # strict last-path-segment cross-project policy so project `evil` can't
   # claim project `compass`'s image ref. Pair with
-  # `deployment_controller.image_pull_secret_name` below so the controller
+  # `deployment_controller.external_pull_secret_name` below so the controller
   # actually pulls from the host. See operator-registry-operations/shared-external-host
   # in the engineering docs.
   # strict_external_hosts:
@@ -60,7 +60,7 @@ deployment_controller:
   # Set `registry.strict_external_hosts` (above) to the same host(s) so
   # cross-project image-substitution protection is preserved — Rise emits
   # a startup warning if this is set without strict_external_hosts.
-  # image_pull_secret_name: "jfrog-shared-pull-secret"
+  # external_pull_secret_name: "jfrog-shared-pull-secret"
   production_ingress_url_template: "${RISE_PRODUCTION_INGRESS_URL_TEMPLATE:-{project_name}.apps.rise.dev}"
   staging_ingress_url_template: "${RISE_STAGING_INGRESS_URL_TEMPLATE:-{project_name}-{deployment_group}.preview.rise.dev}"
   environment_ingress_url_template: "${RISE_ENVIRONMENT_INGRESS_URL_TEMPLATE:-{project_name}-{environment}.preview.rise.dev}"

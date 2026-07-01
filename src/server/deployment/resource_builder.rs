@@ -91,7 +91,7 @@ pub struct ResourceBuilder {
     pub custom_domain_tls_mode: crate::server::settings::CustomDomainTlsMode,
     pub custom_domain_ingress_annotations: std::collections::HashMap<String, String>,
     pub node_selector: std::collections::HashMap<String, String>,
-    pub image_pull_secret_name: Option<String>,
+    pub external_pull_secret_name: Option<String>,
     pub access_classes: std::collections::HashMap<String, crate::server::settings::AccessClass>,
     pub host_aliases: std::collections::HashMap<String, String>,
     pub extra_service_token_audiences: std::collections::HashMap<String, String>,
@@ -1000,7 +1000,7 @@ impl ResourceBuilder {
                         image_pull_secrets: {
                             // Pod's imagePullSecrets is a list. We add up to two:
                             //
-                            // 1. The explicitly-configured `image_pull_secret_name`
+                            // 1. The explicitly-configured `external_pull_secret_name`
                             //    (typically an externally-managed Secret like an
                             //    ESO ClusterExternalSecret), if set.
                             // 2. The controller-minted IMAGE_PULL_SECRET_NAME
@@ -1011,7 +1011,7 @@ impl ResourceBuilder {
                             // points at an ESO-managed JFrog secret. kubelet picks
                             // the right one based on the image's host.
                             let mut secrets: Vec<LocalObjectReference> = Vec::new();
-                            if let Some(name) = self.image_pull_secret_name.as_deref() {
+                            if let Some(name) = self.external_pull_secret_name.as_deref() {
                                 secrets.push(LocalObjectReference {
                                     name: name.to_string(),
                                 });
@@ -1445,7 +1445,7 @@ mod tests {
             custom_domain_tls_mode: crate::server::settings::CustomDomainTlsMode::PerDomain,
             custom_domain_ingress_annotations: std::collections::HashMap::new(),
             node_selector: std::collections::HashMap::new(),
-            image_pull_secret_name: None,
+            external_pull_secret_name: None,
             access_classes: std::collections::HashMap::new(),
             host_aliases: std::collections::HashMap::new(),
             extra_service_token_audiences: std::collections::HashMap::new(),
@@ -1657,14 +1657,14 @@ mod tests {
     }
 
     fn make_deployment(
-        image_pull_secret_name: Option<&str>,
+        external_pull_secret_name: Option<&str>,
         requires_pull_secret: bool,
     ) -> K8sDeployment {
         let mut builder = test_resource_builder();
         builder.registry_provider = Arc::new(TestRegistryProvider {
             requires_pull_secret,
         });
-        builder.image_pull_secret_name = image_pull_secret_name.map(str::to_string);
+        builder.external_pull_secret_name = external_pull_secret_name.map(str::to_string);
         builder.create_k8s_deployment(
             &test_project(),
             &test_deployment(),
@@ -1729,7 +1729,7 @@ mod tests {
     /// Opt-in JFrog wiring on rise-dev: ECR provider still mints scoped
     /// per-project ECR creds (controller-minted IMAGE_PULL_SECRET_NAME) AND
     /// the operator references an externally-managed JFrog secret via
-    /// `image_pull_secret_name`. Pod must list both so kubelet can pull from
+    /// `external_pull_secret_name`. Pod must list both so kubelet can pull from
     /// either registry depending on the image's host.
     #[test]
     fn image_pull_secrets_include_minted_alongside_explicit() {

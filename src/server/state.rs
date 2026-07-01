@@ -16,7 +16,7 @@ use crate::server::registry::{
     providers::{EcrProvider, GitLabRegistryProvider, JfrogProvider},
 };
 use crate::server::settings::{
-    AuthSettings, EncryptionSettings, RegistrySettings, ServerSettings, Settings,
+    AuthSettings, EncryptionSettings, RegistryProviderSettings, ServerSettings, Settings,
 };
 use anyhow::{Context, Result};
 use sqlx::postgres::PgPoolOptions;
@@ -264,9 +264,9 @@ impl AppState {
 
         // Initialize registry provider (required for server operation)
         let registry_provider: Arc<dyn RegistryProvider> = match &settings.registry {
-            Some(registry_config) => match registry_config {
+            Some(registry_config) => match &registry_config.provider {
                 #[cfg(feature = "backend")]
-                RegistrySettings::Ecr {
+                RegistryProviderSettings::Ecr {
                     region,
                     account_id,
                     repo_prefix,
@@ -274,7 +274,6 @@ impl AppState {
                     auto_remove,
                     access_key_id,
                     secret_access_key,
-                    strict_external_hosts,
                 } => {
                     let ecr_config = EcrConfig {
                         region: region.clone(),
@@ -284,7 +283,7 @@ impl AppState {
                         auto_remove: *auto_remove,
                         access_key_id: access_key_id.clone(),
                         secret_access_key: secret_access_key.clone(),
-                        strict_external_hosts: strict_external_hosts.clone(),
+                        strict_external_hosts: registry_config.strict_external_hosts.clone(),
                     };
                     let provider = EcrProvider::new(ecr_config)
                         .await
@@ -293,14 +292,14 @@ impl AppState {
                     Arc::new(provider)
                 }
                 #[cfg(not(feature = "backend"))]
-                RegistrySettings::Ecr { account_id, .. } => {
+                RegistryProviderSettings::Ecr { account_id, .. } => {
                     anyhow::bail!(
                         "AWS ECR registry is configured (account: {}) but the 'aws' feature is not enabled. \
                          Please rebuild with --features aws or use a pre-built binary with AWS support.",
                         account_id
                     )
                 }
-                RegistrySettings::OciClientAuth {
+                RegistryProviderSettings::OciClientAuth {
                     registry_url,
                     namespace,
                     client_registry_url,
@@ -319,7 +318,7 @@ impl AppState {
                     Arc::new(provider)
                 }
                 #[cfg(feature = "backend")]
-                RegistrySettings::GitLab {
+                RegistryProviderSettings::GitLab {
                     gitlab_url,
                     registry_url,
                     namespace,
@@ -343,14 +342,14 @@ impl AppState {
                     Arc::new(provider)
                 }
                 #[cfg(not(feature = "backend"))]
-                RegistrySettings::GitLab { registry_url, .. } => {
+                RegistryProviderSettings::GitLab { registry_url, .. } => {
                     anyhow::bail!(
                         "GitLab registry is configured ({}) but the 'backend' feature is not enabled.",
                         registry_url
                     )
                 }
                 #[cfg(feature = "backend")]
-                RegistrySettings::Jfrog {
+                RegistryProviderSettings::Jfrog {
                     registry_host,
                     client_registry_url,
                     docker_repo_key,
@@ -460,7 +459,7 @@ impl AppState {
                     Arc::new(provider)
                 }
                 #[cfg(not(feature = "backend"))]
-                RegistrySettings::Jfrog { registry_host, .. } => {
+                RegistryProviderSettings::Jfrog { registry_host, .. } => {
                     anyhow::bail!(
                         "JFrog registry is configured ({}) but the 'backend' feature is not enabled.",
                         registry_host
@@ -566,7 +565,7 @@ impl AppState {
                 custom_domain_tls_mode,
                 custom_domain_ingress_annotations,
                 node_selector,
-                image_pull_secret_name,
+                external_pull_secret_name,
                 access_classes,
                 host_aliases,
                 extra_service_token_audiences,
@@ -626,7 +625,7 @@ impl AppState {
                     custom_domain_tls_mode: custom_domain_tls_mode.clone(),
                     custom_domain_ingress_annotations: custom_domain_ingress_annotations.clone(),
                     node_selector: node_selector.clone(),
-                    image_pull_secret_name: image_pull_secret_name.clone(),
+                    external_pull_secret_name: external_pull_secret_name.clone(),
                     access_classes: filtered_access_classes,
                     host_aliases: host_aliases.clone(),
                     extra_service_token_audiences: extra_service_token_audiences.clone(),

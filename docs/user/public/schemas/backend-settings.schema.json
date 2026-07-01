@@ -267,6 +267,14 @@
                 "null"
               ]
             },
+            "external_pull_secret_name": {
+              "default": null,
+              "description": "Name of an externally-managed `imagePullSecret` (typically an\nESO-materialized JFrog token) attached to every deployed pod's\n`imagePullSecrets` list. Additive — the controller still mints\nits own scoped pull secret (`rise-registry-creds`, per project)\nwhen the registry provider requires one; both names are attached.\n\nThe named secret must already exist in each project namespace\n(typically via ESO's `ClusterExternalSecret`). Pair with\n`registry.strict_external_hosts` — Rise warns at startup if this\nis set without it, since a cluster-wide pull secret makes\ncross-project image substitution possible without the strict policy.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "extra_service_token_audiences": {
               "additionalProperties": {
                 "type": "string"
@@ -293,14 +301,6 @@
               "default": {},
               "description": "Host aliases to inject into pod specs (hostname -> IP address)\nMaps hostnames to IP addresses, injected as Kubernetes hostAliases.\nUseful for local development where pods need to resolve custom hostnames.\nExample: {\"rise.local\": \"192.168.49.1\"}",
               "type": "object"
-            },
-            "image_pull_secret_name": {
-              "default": null,
-              "description": "Name of an externally-managed `imagePullSecret` added to every\ndeployed pod's `imagePullSecrets` list. **Additive** — the\ncontroller still mints its own pull secret when the registry\nprovider requires one; both names are attached. Lets an\nESO-materialized cluster-wide secret coexist with controller-minted\nscoped creds (e.g. a JFrog token alongside ECR).\n\nThe named secret must already exist in each project namespace.\nPair with `registry.strict_external_hosts` — Rise warns at startup\nif this is set without it, since a cluster-wide pull secret makes\ncross-project image substitution possible without the strict policy.",
-              "type": [
-                "string",
-                "null"
-              ]
             },
             "ingress_annotations": {
               "additionalProperties": {
@@ -1060,7 +1060,7 @@
       "type": "string"
     },
     "RegistrySettings": {
-      "description": "Registry provider configuration",
+      "description": "Registry provider configuration\nRegistry configuration. Wraps the provider-specific block with\nregistry-wide policy fields (`strict_external_hosts`) that shouldn't be\nscoped to any one provider.",
       "oneOf": [
         {
           "properties": {
@@ -1097,14 +1097,6 @@
                 "string",
                 "null"
               ]
-            },
-            "strict_external_hosts": {
-              "default": [],
-              "description": "Hostnames of external (non-ECR) registries to which the strict\ncross-project validation policy still applies. See\n`EcrConfig::strict_external_hosts` for the rationale and policy.",
-              "items": {
-                "type": "string"
-              },
-              "type": "array"
             },
             "type": {
               "const": "ecr",
@@ -1263,7 +1255,18 @@
           ],
           "type": "object"
         }
-      ]
+      ],
+      "properties": {
+        "strict_external_hosts": {
+          "default": [],
+          "description": "Hostnames of external registries (i.e. not this backend's own\nprimary registry) to which the strict cross-project validation\npolicy applies. Registry-agnostic — a source repo pushing to\n`jfrog.example.com/team/{project}` gets checked here regardless of\nwhether the backend runs against ECR, GitLab, or JFrog itself.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
     },
     "ServerSettings": {
       "properties": {
