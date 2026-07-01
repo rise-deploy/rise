@@ -132,23 +132,43 @@ pub struct Config {
     pub backend_url: Option<String>,
     pub container_cli: Option<String>,
     pub managed_buildkit: Option<bool>,
+    #[serde(default, skip_serializing_if = "VaultConfig::is_empty")]
+    pub vault: VaultConfig,
+}
+
+/// Vault-related settings, grouped so the config file's JSON has a single
+/// `"vault"` object instead of four `vault_*` siblings on `Config`.
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+pub struct VaultConfig {
     /// Vault address (e.g. `https://vault.example.com:8200`). Persisted so
     /// `rise deploy` can auto-mint JFrog tokens without prompting per-invocation.
-    pub vault_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
     /// Vault OIDC auth mount path used by `rise vault login`. No default —
     /// operator-specific, must be set via `rise vault configure --auth-path`
     /// or `$RISE_VAULT_AUTH_PATH`.
-    pub vault_auth_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_path: Option<String>,
     /// Vault OIDC role passed as `role=...` to `vault login`. No default —
     /// operator-specific, must be set via `rise vault configure --auth-role`
     /// or `$RISE_VAULT_AUTH_ROLE`.
-    pub vault_auth_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_role: Option<String>,
     /// Vault KV/secret path that yields a JFrog access token. Supports the
     /// `{email}` placeholder, substituted with the authenticated user's email
-    /// at runtime. When set together with `vault_address`, `rise deploy`
-    /// auto-mints a fresh JFrog token via this path before each client-
-    /// controlled push.
-    pub vault_artifactory_token_path: Option<String>,
+    /// at runtime. When set together with `address`, `rise deploy` auto-mints
+    /// a fresh JFrog token via this path before each client-controlled push.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifactory_token_path: Option<String>,
+}
+
+impl VaultConfig {
+    fn is_empty(&self) -> bool {
+        self.address.is_none()
+            && self.auth_path.is_none()
+            && self.auth_role.is_none()
+            && self.artifactory_token_path.is_none()
+    }
 }
 
 impl Config {
@@ -316,7 +336,7 @@ impl Config {
 
     /// Persist the Vault address (idempotent).
     pub fn set_vault_address(&mut self, addr: String) -> Result<()> {
-        self.vault_address = Some(addr.trim_end_matches('/').to_string());
+        self.vault.address = Some(addr.trim_end_matches('/').to_string());
         self.save()
     }
 
@@ -328,12 +348,12 @@ impl Config {
         if let Ok(addr) = std::env::var("RISE_VAULT_ADDR") {
             return Some(addr.trim_end_matches('/').to_string());
         }
-        self.vault_address.clone()
+        self.vault.address.clone()
     }
 
     /// Persist the Vault OIDC auth path.
     pub fn set_vault_auth_path(&mut self, path: String) -> Result<()> {
-        self.vault_auth_path = Some(path);
+        self.vault.auth_path = Some(path);
         self.save()
     }
 
@@ -345,12 +365,12 @@ impl Config {
         if let Ok(path) = std::env::var("RISE_VAULT_AUTH_PATH") {
             return Some(path);
         }
-        self.vault_auth_path.clone()
+        self.vault.auth_path.clone()
     }
 
     /// Persist the Vault OIDC role.
     pub fn set_vault_auth_role(&mut self, role: String) -> Result<()> {
-        self.vault_auth_role = Some(role);
+        self.vault.auth_role = Some(role);
         self.save()
     }
 
@@ -361,12 +381,12 @@ impl Config {
         if let Ok(role) = std::env::var("RISE_VAULT_AUTH_ROLE") {
             return Some(role);
         }
-        self.vault_auth_role.clone()
+        self.vault.auth_role.clone()
     }
 
     /// Persist the Vault path used to mint JFrog tokens.
     pub fn set_vault_artifactory_token_path(&mut self, path: String) -> Result<()> {
-        self.vault_artifactory_token_path = Some(path);
+        self.vault.artifactory_token_path = Some(path);
         self.save()
     }
 
@@ -378,7 +398,7 @@ impl Config {
         if let Ok(p) = std::env::var("RISE_VAULT_ARTIFACTORY_TOKEN_PATH") {
             return Some(p);
         }
-        self.vault_artifactory_token_path.clone()
+        self.vault.artifactory_token_path.clone()
     }
 }
 
@@ -456,7 +476,7 @@ mod tests {
 
     #[test]
     fn test_vault_address_from_config() {
-        let c = config(|c| c.vault_address = Some("https://vault.example.com:8200".to_string()));
+        let c = config(|c| c.vault.address = Some("https://vault.example.com:8200".to_string()));
         assert_eq!(
             c.get_vault_address().as_deref(),
             Some("https://vault.example.com:8200"),
@@ -468,7 +488,7 @@ mod tests {
         // Avoid `set_vault_address` here — it persists to disk. Verify the
         // normalisation by mimicking what the setter does in-memory.
         let c = config(|c| {
-            c.vault_address = Some(
+            c.vault.address = Some(
                 "https://vault.example.com:8200/"
                     .trim_end_matches('/')
                     .to_string(),
@@ -487,7 +507,7 @@ mod tests {
 
     #[test]
     fn test_vault_auth_path_from_config() {
-        let c = config(|c| c.vault_auth_path = Some("custom/oidc".to_string()));
+        let c = config(|c| c.vault.auth_path = Some("custom/oidc".to_string()));
         assert_eq!(c.get_vault_auth_path(), Some("custom/oidc".to_string()));
     }
 
@@ -498,7 +518,7 @@ mod tests {
 
     #[test]
     fn test_vault_auth_role_from_config() {
-        let c = config(|c| c.vault_auth_role = Some("ops".to_string()));
+        let c = config(|c| c.vault.auth_role = Some("ops".to_string()));
         assert_eq!(c.get_vault_auth_role(), Some("ops".to_string()));
     }
 
@@ -512,7 +532,7 @@ mod tests {
     #[test]
     fn test_vault_artifactory_token_path_from_config() {
         let c = config(|c| {
-            c.vault_artifactory_token_path =
+            c.vault.artifactory_token_path =
                 Some("global/artifactory/user_token/{email}".to_string())
         });
         assert_eq!(

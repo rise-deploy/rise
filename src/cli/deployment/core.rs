@@ -1083,7 +1083,7 @@ fn client_controlled_push_if_configured(
 /// push host. No-op when Vault isn't configured — the caller falls back to
 /// ambient docker auth.
 ///
-/// Triggers when **both** `vault_address` and `vault_artifactory_token_path`
+/// Triggers when **both** `vault.address` and `vault.artifactory_token_path`
 /// are set in `~/.config/rise/config.json` (or via env). Either alone is
 /// treated as "not configured" — half-set is almost certainly a config error
 /// we'd rather surface as "skipped" than as a half-broken mint attempt.
