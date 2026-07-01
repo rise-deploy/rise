@@ -7,6 +7,7 @@
 //! here we have a human session, so reusing the CLI is the simpler choice.
 
 use anyhow::{anyhow, bail, Context, Result};
+use std::io::IsTerminal;
 use std::process::{Command, Stdio};
 
 const VAULT_BIN: &str = "vault";
@@ -17,6 +18,18 @@ pub fn ensure_session(addr: &str, auth_path: &str, auth_role: &str) -> Result<()
     if session_valid(addr)? {
         tracing::debug!("Vault session is valid, skipping login");
         return Ok(());
+    }
+
+    // The OIDC login flow opens a browser and waits interactively. Refuse to
+    // spawn it when there's no TTY — otherwise CI jobs hang until the runner
+    // times out. Operators running in CI should provision a token
+    // out-of-band (VAULT_TOKEN env or JWT auth) and skip Vault CLI login.
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "Vault session missing or expired, and no TTY is attached — refusing to spawn \
+             interactive `{VAULT_BIN} login -method=oidc`. In CI, set VAULT_TOKEN out-of-band \
+             (e.g. via GitLab ID token + `vault login -method=jwt`) before running rise deploy."
+        );
     }
 
     tracing::info!(
@@ -136,11 +149,16 @@ pub(crate) fn parse_identity(stdout: &[u8], auth_path: &str) -> Result<String> {
         .get("meta")
         .and_then(|m| m.get("email"))
         .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
     {
         return Ok(email.to_string());
     }
 
-    if let Some(display) = data.get("display_name").and_then(|v| v.as_str()) {
+    if let Some(display) = data
+        .get("display_name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
         let prefix = format!("oidc-{}-", auth_path.trim_matches('/').replace('/', "-"));
         if let Some(rest) = display.strip_prefix(&prefix) {
             if rest.contains('@') {

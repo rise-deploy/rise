@@ -867,9 +867,27 @@ pub async fn create_deployment(
         }
     }
 
-    // Generate deployment ID
-    let deployment_id = generate_deployment_id();
-    debug!("Generated deployment ID: {}", deployment_id);
+    // Use the CLI-supplied deployment_id when present (client-controlled push
+    // path — the CLI embedded it in the JFrog tag before pushing, so the DB
+    // row must agree). Otherwise mint a fresh UUIDv7.
+    let deployment_id = if let Some(id) = payload.deployment_id.as_deref() {
+        uuid::Uuid::parse_str(id).map_err(|_| {
+            ServerError::bad_request(format!("deployment_id must be a valid UUID, got '{id}'"))
+        })?;
+        if !db_deployments::find_by_deployment_id_unscoped(&state.db_pool, id, 1)
+            .await
+            .map_err(|e| ServerError::internal(format!("failed to check deployment_id: {e}")))?
+            .is_empty()
+        {
+            return Err(ServerError::conflict(format!(
+                "deployment_id '{id}' already exists"
+            )));
+        }
+        id.to_string()
+    } else {
+        generate_deployment_id()
+    };
+    debug!("Deployment ID: {}", deployment_id);
 
     // Resolve effective http_port:
     // 1. Explicit http_port from request (if provided)

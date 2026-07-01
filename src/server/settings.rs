@@ -784,7 +784,6 @@ pub enum RegistrySettings {
         /// cross-project validation policy still applies. See
         /// `EcrConfig::strict_external_hosts` for the rationale and policy.
         #[serde(default)]
-        #[allow(dead_code)]
         strict_external_hosts: Vec<String>,
     },
     #[serde(rename = "oci-client-auth")]

@@ -1,2 +1,2 @@
 [registry]
-image_base = "jfrog.helsing-dev.ai/hdf-docker-playground/hs-hdf-rise-apps"
+image_base = "jfrog.example.com/team-playground/team-apps"

@@ -43,17 +43,9 @@ The controller adds the named secret to every pod's `imagePullSecrets` alongside
 
 ## Startup WARN — the misconfig signal
 
-Rise emits a warning at backend startup when `image_pull_secret_name` is set but `strict_external_hosts` is empty:
+Rise emits a warning at backend startup when `image_pull_secret_name` is set but `strict_external_hosts` is empty (or the primary registry provider doesn't yet support the field — currently ECR-only). Grep the backend logs for `strict_external_hosts is empty` or `does not support strict_external_hosts` to spot it.
 
-```
-deployment_controller.image_pull_secret_name is set but
-registry.strict_external_hosts is empty. If the named secret can pull
-cross-project images on an external registry (e.g. JFrog), add that host
-to strict_external_hosts to keep validate_image_for_project from falling
-through to the permissive third-party-allowed default.
-```
-
-This catches the specific dangerous combination: a cluster-wide pull secret that can fetch any image on a shared external registry, with the validation rules still in their permissive default. The warn isn't fatal — `image_pull_secret_name` is a pre-existing field used for unrelated cases too (private mirrors that don't share with other projects), so the backend can't decide unilaterally. The operator is expected to read the warning and either add the relevant host to `strict_external_hosts` or confirm the pull secret's scope is project-safe.
+The warn isn't fatal — `image_pull_secret_name` is a pre-existing field used for unrelated cases too (private mirrors that don't share with other projects), so the backend can't decide unilaterally. The operator is expected to read the warning and either add the relevant host to `strict_external_hosts` or confirm the pull secret's scope is project-safe.
 
 ## Rollout shape
 

@@ -23,7 +23,7 @@ pub trait RegistryProvider: Send + Sync {
     ///
     /// # Arguments
     /// * `repository` - The repository name (e.g., "my-app")
-    /// * `tag` - The image tag (e.g., deployment ID like "20251215-204525").
+    /// * `tag` - The image tag (deployment ID, UUIDv7).
     ///           Providers that support tag-level scoping use this to mint
     ///           the narrowest possible credentials.
     ///
@@ -70,11 +70,11 @@ pub trait RegistryProvider: Send + Sync {
     ///
     /// # Arguments
     /// * `repository` - The repository/project name (e.g., "headscale")
-    /// * `tag` - The image tag (e.g., deployment ID like "20251215-204525")
+    /// * `tag` - The image tag (deployment ID, UUIDv7)
     /// * `tag_type` - Whether this is for client-facing or internal use
     ///
     /// # Returns
-    /// Full image reference for pushing (e.g., "localhost:5000/rise-apps/headscale:20251215-204525")
+    /// Full image reference for pushing (e.g., `localhost:5000/rise-apps/headscale:<uuidv7>`)
     fn get_image_tag(&self, repository: &str, tag: &str, tag_type: ImageTagType) -> String;
 
     /// Whether the Kubernetes controller should create and manage image pull secrets.
@@ -86,10 +86,10 @@ pub trait RegistryProvider: Send + Sync {
         true
     }
 
-    /// Hosts (without port) of external registries to which the strict
-    /// cross-project policy applies. Default empty — providers that want
-    /// the strict policy override this to return the operator-configured
-    /// list. See `validate_image_for_project` below.
+    /// Hosts of external registries to which the strict cross-project policy
+    /// applies. Entries MUST already be normalized via `normalize_host`
+    /// (lowercase, no port) — the trait default validator byte-compares
+    /// against them without re-normalizing per call. Default empty.
     fn strict_external_hosts(&self) -> &[String] {
         &[]
     }
@@ -143,8 +143,11 @@ pub trait RegistryProvider: Send + Sync {
         let reference: oci_distribution::Reference = image_ref.parse().map_err(|e| {
             anyhow::anyhow!("Image '{image_ref}' is not a valid OCI reference: {e}")
         })?;
+        // `strict_hosts` are expected to be pre-normalized by the provider
+        // (see `EcrProvider::new`); we normalize the caller-supplied host
+        // once and byte-compare against each entry.
         let image_host = normalize_host(reference.registry());
-        if !strict_hosts.iter().any(|h| normalize_host(h) == image_host) {
+        if !strict_hosts.iter().any(|h| h == &image_host) {
             return Ok(());
         }
 
@@ -167,7 +170,7 @@ pub trait RegistryProvider: Send + Sync {
 /// `jfrog.example.com:443`, and `jfrog.example.com:8443` all denote the
 /// same registry for trust purposes. Operators write hostnames, not
 /// host:port pairs, in `strict_external_hosts`.
-fn normalize_host(host: &str) -> String {
+pub(crate) fn normalize_host(host: &str) -> String {
     let lower = host.to_ascii_lowercase();
     match lower.rsplit_once(':') {
         Some((h, _)) => h.to_string(),
@@ -212,7 +215,7 @@ mod validate_image_tests {
     fn provider(registry_url: &str, strict: &[&str]) -> MockProvider {
         MockProvider {
             registry_url: registry_url.to_string(),
-            strict_external_hosts: strict.iter().map(|s| s.to_string()).collect(),
+            strict_external_hosts: strict.iter().map(|s| normalize_host(s)).collect(),
         }
     }
 

@@ -37,7 +37,6 @@ use crate::server::deployment::resource_builder::{
     IRRECOVERABLE_CONTAINER_REASONS, LABEL_DEPLOYMENT_ID,
 };
 use crate::server::deployment::state_machine;
-use crate::server::registry::models::RegistryCredentials;
 use crate::server::state::AppState;
 
 // ── Metacontroller webhook protocol types ──────────────────────────────
@@ -1283,13 +1282,11 @@ async fn build_image_pull_secret(
         .get_k8s_pull_credentials(&project.name)
         .await?;
 
-    let entries: Vec<(&str, &RegistryCredentials)> =
-        vec![(primary_host.as_str(), &primary_credentials)];
-
     let secret = resource_builder.create_dockerconfigjson_secret(
         IMAGE_PULL_SECRET_NAME,
         namespace,
-        &entries,
+        primary_host.as_str(),
+        &primary_credentials,
     )?;
 
     Ok(Some(secret))

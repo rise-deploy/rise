@@ -100,7 +100,7 @@ struct DeployArgs {
     /// Pre-built image to deploy (e.g., nginx:latest). Skips build if provided.
     #[arg(long, short)]
     image: Option<String>,
-    /// Create deployment from an existing deployment (e.g., '20240101-120000'). Skips build and reuses the image.
+    /// Create deployment from an existing deployment (UUIDv7, see `rise deployment list`). Skips build and reuses the image.
     #[arg(long)]
     from: Option<String>,
     /// When used with --from, copy environment variables from source deployment instead of using current project vars
@@ -513,7 +513,7 @@ enum DeploymentCommands {
         /// Path to rise.toml (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: String,
-        /// Deployment ID (YYYYMMDD-HHMMSS-XXXXXX format)
+        /// Deployment ID (UUIDv7, see `rise deployment list`)
         deployment_id: String,
         /// Follow log output (stream continuously)
         #[arg(short, long)]

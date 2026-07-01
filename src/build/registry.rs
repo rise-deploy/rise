@@ -93,10 +93,15 @@ pub(crate) fn inspect_push_digest(container_cli: &str, image_tag: &str) -> Resul
 }
 
 fn inspect_push_digest_via_buildx(container_cli: &str, image_tag: &str) -> Result<String> {
+    // `--raw` returns the raw manifest bytes; the digest is `sha256:` of
+    // those bytes. This is what the registry itself stores under the tag,
+    // and it's stable across docker/buildx CLI versions unlike the
+    // human-readable `Digest:` line in the default output.
     let output = Command::new(container_cli)
         .arg("buildx")
         .arg("imagetools")
         .arg("inspect")
+        .arg("--raw")
         .arg(image_tag)
         .output()
         .with_context(|| format!("Failed to execute {container_cli} buildx imagetools inspect"))?;
@@ -108,19 +113,12 @@ fn inspect_push_digest_via_buildx(container_cli: &str, image_tag: &str) -> Resul
         );
     }
 
-    // Parse the first top-level "Digest: sha256:..." line — this is the
-    // manifest list / image index digest, which is what `image_tag` resolves to.
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        if let Some(rest) = line.trim_start().strip_prefix("Digest:") {
-            let digest = rest.trim();
-            if digest.starts_with("sha256:") {
-                return Ok(digest.to_string());
-            }
-        }
-    }
-
-    bail!("Could not find Digest in buildx imagetools output:\n{stdout}");
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(&output.stdout);
+    let bytes = hasher.finalize();
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(format!("sha256:{hex}"))
 }
 
 /// Tag a container image

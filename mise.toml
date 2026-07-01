@@ -421,7 +421,7 @@ npx @oidc.pub/cli dev issuer --url http://localhost:9229
 [tasks."dev:jfrog-refresh"]
 description = "Install Emberstack Reflector + mint a fresh JFrog pull secret that auto-mirrors to every namespace (faking what ESO does in prod). Run once per ~6h."
 run = """
-set -e
+set -euo pipefail
 
 JFROG_USER="${JFROG_USER:-$(vault token lookup -format=json 2>/dev/null | jq -r '.data.meta.email // (.data.display_name | sub("^oidc-global-entra-"; ""))')}"
 if [ -z "$JFROG_USER" ] || [ "$JFROG_USER" = "null" ]; then
@@ -429,7 +429,7 @@ if [ -z "$JFROG_USER" ] || [ "$JFROG_USER" = "null" ]; then
   exit 1
 fi
 
-JFROG_TOKEN=$(vault read -field=access_token global/artifactory/user_token/$JFROG_USER)
+JFROG_TOKEN=$(vault read -field=access_token "global/artifactory/user_token/$JFROG_USER")
 if [ -z "$JFROG_TOKEN" ]; then
   echo "Failed to mint JFrog token from Vault. Is your Vault session valid?"
   exit 1

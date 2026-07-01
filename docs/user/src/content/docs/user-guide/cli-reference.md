@@ -21,7 +21,7 @@ The Rise CLI (`rise`) provides commands for managing projects, deployments, team
 | `rise team` | `t` | `create` (`c`), `list` (`ls`), `show` (`s`), `update` (`u`), `delete` (`rm`) | |
 | `rise service-account` | `sa` | `create` (`c`), `list` (`ls`), `show` (`s`), `delete` (`rm`) | [Service Accounts](../service-accounts) |
 | `rise extension` | `ext` | `create` (`c`), `update` (`u`), `patch` (`p`), `list` (`ls`), `show` (`s`), `delete` (`rm`) | [OAuth Extensions](../oauth) |
-| `rise vault` | | `configure`, `show`, `logout` | [Client-Controlled Push](../client-push#vault-minted-jfrog-token-laptop) |
+| `rise vault` | | `configure`, `login` | [Client-Controlled Push](../client-push#vault-minted-jfrog-token-laptop) |
 | `rise encrypt` | | | [OAuth Extensions](../oauth) |
 | `rise backend` | | `server`, `check-config`, `config-schema` | Operator commands (requires build with `--features backend`) |
 

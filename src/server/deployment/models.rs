@@ -231,6 +231,13 @@ pub struct CreateDeploymentRequest {
     /// digest from `docker push` and forwards it here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_digest: Option<String>,
+    /// Deployment ID minted by the client and embedded in the pushed image
+    /// tag (`{image_base}/{project}:{deployment_id}`). Sent by the
+    /// client-controlled push flow so the DB row and the JFrog tag agree on
+    /// which UUID names the deployment. When absent, the backend allocates
+    /// a fresh UUIDv7. Rejected as a 409 conflict if the id already exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_id: Option<String>,
     /// Deployment group. Defaults to the primary group of the target environment.
     #[serde(default)]
     pub group: Option<String>,

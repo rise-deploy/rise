@@ -5,77 +5,69 @@ use crate::db::env_vars as db_env_vars;
 use crate::db::models::{Deployment, Project};
 use crate::server::error::{ServerError, ServerErrorExt};
 use crate::server::extensions::InjectedEnvVarValue;
+use crate::server::registry::{ImageTagType, RegistryProvider};
 use crate::server::state::AppState;
 
 pub use crate::deployment_id::generate_deployment_id;
 
-/// Get the image tag for a deployment
+/// Resolve the image reference for a deployment. Single source of truth for
+/// both the HTTP-response case and the controller reconciler.
 ///
-/// This is the single source of truth for determining which image to use for a deployment.
-/// For pre-built images: returns the digest-pinned reference from image_digest field
-/// For build-from-source: constructs the full registry tag using registry configuration
-/// For rollback deployments: uses the source deployment's deployment_id for the tag
-///
-/// # Arguments
-/// * `state` - AppState containing registry provider configuration
-/// * `deployment` - The deployment record
-/// * `project` - The project record
-///
-/// # Returns
-/// The fully-qualified image tag to use for docker pull
+/// Priority: `image_digest` (pre-built) → `image_path` (Internal form set at
+/// deploy creation) → reconstruct via `registry_provider.get_image_tag`
+/// (legacy fallback for rows persisted before `image_path` existed).
+pub fn resolve_image(
+    project: &Project,
+    deployment: &Deployment,
+    source_deployment_id: Option<&str>,
+    registry_provider: &dyn RegistryProvider,
+) -> String {
+    if let Some(ref digest) = deployment.image_digest {
+        return digest.clone();
+    }
+    if let Some(ref image_path) = deployment.image_path {
+        return image_path.clone();
+    }
+    let id = source_deployment_id.unwrap_or(&deployment.deployment_id);
+    registry_provider.get_image_tag(&project.name, id, ImageTagType::Internal)
+}
+
+/// Async wrapper that resolves a rollback's source deployment_id (needs a DB
+/// lookup) and then delegates to `resolve_image`.
 pub async fn get_deployment_image_tag(
     state: &AppState,
     deployment: &Deployment,
     project: &Project,
 ) -> String {
-    // Pre-built images use the pinned digest
-    if let Some(ref digest) = deployment.image_digest {
-        return digest.clone();
-    }
-
-    if let Some(ref image_path) = deployment.image_path {
-        return image_path.clone();
-    }
-
-    // For rollback deployments, use the source deployment's deployment_id for the image tag
-    // This is because rollbacks don't build new images - they reuse the source deployment's image
-    let deployment_id_for_tag =
-        if let Some(source_deployment_id) = deployment.rolled_back_from_deployment_id {
-            // Fetch the source deployment to get its deployment_id
-            match db_deployments::find_by_id(&state.db_pool, source_deployment_id).await {
-                Ok(Some(source_deployment)) => source_deployment.deployment_id,
-                Ok(None) => {
-                    tracing::warn!(
-                        "Rollback deployment {} references non-existent source deployment {}",
-                        deployment.deployment_id,
-                        source_deployment_id
-                    );
-                    // Fallback to current deployment_id if source not found
-                    deployment.deployment_id.clone()
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to fetch source deployment {} for rollback {}: {}",
-                        source_deployment_id,
-                        deployment.deployment_id,
-                        e
-                    );
-                    // Fallback to current deployment_id on error
-                    deployment.deployment_id.clone()
-                }
+    let source_id = if let Some(source_deployment_id) = deployment.rolled_back_from_deployment_id {
+        match db_deployments::find_by_id(&state.db_pool, source_deployment_id).await {
+            Ok(Some(src)) => Some(src.deployment_id),
+            Ok(None) => {
+                tracing::warn!(
+                    "Rollback deployment {} references non-existent source deployment {}",
+                    deployment.deployment_id,
+                    source_deployment_id
+                );
+                None
             }
-        } else {
-            // Regular build-from-source deployment
-            deployment.deployment_id.clone()
-        };
-
-    // Build-from-source: construct from registry config using the appropriate deployment_id
-    let registry_url = state.registry_provider.registry_url();
-    format!(
-        "{}/{}:{}",
-        registry_url.trim_end_matches('/'),
-        project.name,
-        deployment_id_for_tag
+            Err(e) => {
+                tracing::error!(
+                    "Failed to fetch source deployment {} for rollback {}: {}",
+                    source_deployment_id,
+                    deployment.deployment_id,
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    resolve_image(
+        project,
+        deployment,
+        source_id.as_deref(),
+        &*state.registry_provider,
     )
 }
 

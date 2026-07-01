@@ -7,7 +7,7 @@
 -- before this column existed (controller falls back to reconstruction).
 
 ALTER TABLE deployments
-ADD COLUMN image_path TEXT NULL;
+ADD COLUMN IF NOT EXISTS image_path TEXT NULL;
 
 COMMENT ON COLUMN deployments.image_path IS
     'Internal-form registry image reference (e.g. "host/repo/path:tag") '

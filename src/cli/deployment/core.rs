@@ -582,6 +582,8 @@ pub async fn create_deployment(
         .or(deploy_opts.image);
     let client_supplied_digest: Option<&str> =
         client_pushed.as_ref().map(|p| p.image_digest.as_str());
+    let client_supplied_deployment_id: Option<&str> =
+        client_pushed.as_ref().map(|p| p.deployment_id.as_str());
 
     // Step 1: Create deployment and get deployment ID + credentials
     info!(
@@ -595,6 +597,7 @@ pub async fn create_deployment(
         deploy_opts.project_name,
         effective_image,
         client_supplied_digest,
+        client_supplied_deployment_id,
         deploy_opts.group,
         deploy_opts.environment,
         deploy_opts.expires_in,
@@ -990,6 +993,10 @@ fn detect_ci_pull_request_url() -> Option<String> {
 
 /// Outcome of a successful client-controlled build + push.
 struct ClientPushed {
+    /// Deployment ID minted client-side and embedded in `image_tag`. Sent to
+    /// the backend so the DB row and the JFrog tag agree on which UUID names
+    /// the deployment.
+    deployment_id: String,
     /// Tag-form image reference: `{image_base}/{project}:{deployment_id}`.
     image_tag: String,
     /// `sha256:...` digest captured from the local image after push. Forwarded
@@ -1061,6 +1068,7 @@ fn client_controlled_push_if_configured(
         })?;
 
     Ok(Some(ClientPushed {
+        deployment_id,
         image_tag,
         image_digest,
     }))
@@ -1143,6 +1151,7 @@ async fn call_create_deployment_api(
     project_name: &str,
     image: Option<&str>,
     image_digest: Option<&str>,
+    deployment_id: Option<&str>,
     group: Option<&str>,
     environment: Option<&str>,
     expires_in: Option<&str>,
@@ -1176,6 +1185,12 @@ async fn call_create_deployment_api(
     // Add caller-supplied digest if provided (client-controlled push flow)
     if let Some(digest) = image_digest {
         payload["image_digest"] = serde_json::json!(digest);
+    }
+
+    // Client-controlled push path: the CLI minted a UUID for the image tag,
+    // send it so the DB row uses the same one (backend enforces uniqueness).
+    if let Some(id) = deployment_id {
+        payload["deployment_id"] = serde_json::json!(id);
     }
 
     // Add group field if provided (defaults to "default" on backend)

@@ -516,20 +516,22 @@ impl ResourceBuilder {
         &self,
         name: &str,
         namespace: &str,
-        entries: &[(&str, &RegistryCredentials)],
+        registry_host: &str,
+        credentials: &RegistryCredentials,
     ) -> anyhow::Result<Secret> {
         use base64::Engine;
 
         let mut auths = serde_json::Map::new();
-        for (registry_host, credentials) in entries {
-            // Empty credentials don't go into the dockerconfigjson — kubelet
-            // would either reject them outright (empty auth header) or attempt
-            // an anonymous pull regardless. Skipping them lets ambient cluster
-            // auth (e.g. node-level pull secrets) take over for that host.
-            if credentials.username.is_empty() && credentials.password.is_empty() {
-                continue;
-            }
-
+        // Empty credentials don't go into the dockerconfigjson — kubelet
+        // would either reject them outright (empty auth header) or attempt
+        // an anonymous pull regardless. Skipping them lets ambient cluster
+        // auth (e.g. node-level pull secrets) take over for that host.
+        if credentials.username.is_empty() && credentials.password.is_empty() {
+            tracing::warn!(
+                registry_host,
+                "skipping registry host from pull secret: empty credentials",
+            );
+        } else {
             let auths_entry = match credentials.auth_method {
                 RegistryAuthMethod::LoginCredentials => {
                     let auth = base64::engine::general_purpose::STANDARD
@@ -544,7 +546,7 @@ impl ResourceBuilder {
                     serde_json::json!({ "registrytoken": credentials.password })
                 }
             };
-            auths.insert((*registry_host).to_string(), auths_entry);
+            auths.insert(registry_host.to_string(), auths_entry);
         }
 
         let docker_config = serde_json::json!({ "auths": serde_json::Value::Object(auths) });
@@ -1355,32 +1357,19 @@ impl ResourceBuilder {
 
     // ── Image tag resolution ───────────────────────────────────────────
 
-    /// Resolve the image reference for a deployment.
-    ///
-    /// Priority: `image_digest`, then `image_path`, then reconstruct via
-    /// `registry_provider.get_image_tag` (fallback for rows persisted before
-    /// `image_path` existed).
+    /// Thin wrapper around `utils::resolve_image` — kept as a method for the
+    /// existing webhook call site's ergonomics.
     pub fn resolve_image(
         &self,
         project: &Project,
         deployment: &Deployment,
         source_deployment_id: Option<&str>,
     ) -> String {
-        if let Some(ref image_digest) = deployment.image_digest {
-            return image_digest.clone();
-        }
-
-        if let Some(ref image_path) = deployment.image_path {
-            return image_path.clone();
-        }
-
-        let deployment_id_for_tag = source_deployment_id
-            .unwrap_or(&deployment.deployment_id)
-            .to_string();
-        self.registry_provider.get_image_tag(
-            &project.name,
-            &deployment_id_for_tag,
-            crate::server::registry::ImageTagType::Internal,
+        crate::server::deployment::utils::resolve_image(
+            project,
+            deployment,
+            source_deployment_id,
+            &*self.registry_provider,
         )
     }
 }

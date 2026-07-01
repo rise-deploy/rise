@@ -136,7 +136,64 @@ fn parse_project_config(content: &str, source_path: &Path) -> Result<ProjectBuil
         );
     }
 
+    validate_registry(config.registry.as_ref(), source_path)?;
+    for (env_name, env) in &config.environments {
+        if let Some(reg) = &env.registry {
+            validate_registry_config(
+                reg,
+                source_path,
+                &format!("[environments.{env_name}.registry]"),
+            )?;
+        }
+    }
+
     Ok(config)
+}
+
+fn validate_registry(
+    registry: Option<&crate::rise_toml::RegistryConfig>,
+    source_path: &Path,
+) -> Result<()> {
+    if let Some(reg) = registry {
+        validate_registry_config(reg, source_path, "[registry]")?;
+    }
+    Ok(())
+}
+
+/// Validate a `[registry]` (or `[environments.X.registry]`) block. Rejects
+/// obvious mistakes at load time so we don't blow up deep inside `docker
+/// push` with a garbled image ref.
+fn validate_registry_config(
+    reg: &crate::rise_toml::RegistryConfig,
+    source_path: &Path,
+    section: &str,
+) -> Result<()> {
+    let image_base = reg.image_base.trim();
+    if image_base.is_empty() {
+        anyhow::bail!(
+            "{} in {}: image_base must be a non-empty host/path prefix (e.g. \"jfrog.example.com/team/apps\")",
+            section,
+            source_path.display(),
+        );
+    }
+    if image_base != reg.image_base {
+        anyhow::bail!(
+            "{} in {}: image_base has leading/trailing whitespace",
+            section,
+            source_path.display(),
+        );
+    }
+    // Must contain at least one `/` separating host from path — a bare host
+    // with no path prefix isn't a valid push target for `{host}/{project}:{id}`.
+    if !image_base.contains('/') {
+        anyhow::bail!(
+            "{} in {}: image_base must contain a `/` between host and path prefix (got '{}')",
+            section,
+            source_path.display(),
+            image_base,
+        );
+    }
+    Ok(())
 }
 
 /// Merge a workspace config (defaults) with a per-app leaf config (overrides).

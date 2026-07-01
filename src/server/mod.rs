@@ -96,7 +96,9 @@ macro_rules! trace_layer {
 
 /// Flag the misconfig where a cluster-wide `image_pull_secret_name` can pull
 /// any image on a shared external registry but the cross-project validation
-/// still falls through to third-party-allowed.
+/// still falls through to third-party-allowed. Currently `strict_external_hosts`
+/// is only settable on the ECR provider; non-ECR primary registries hit this
+/// warning unconditionally when a pull secret is configured.
 fn warn_if_strict_external_hosts_missing(settings: &settings::Settings) {
     let pull_secret_set = matches!(
         &settings.deployment_controller,
@@ -105,19 +107,29 @@ fn warn_if_strict_external_hosts_missing(settings: &settings::Settings) {
             ..
         })
     );
-    let strict_hosts_empty = matches!(
-        &settings.registry,
+    if !pull_secret_set {
+        return;
+    }
+    match &settings.registry {
         Some(settings::RegistrySettings::Ecr {
             strict_external_hosts,
             ..
-        }) if strict_external_hosts.is_empty()
-    );
-    if pull_secret_set && strict_hosts_empty {
-        tracing::warn!(
-            "deployment_controller.image_pull_secret_name is set but \
-             registry.strict_external_hosts is empty — cross-project image \
-             substitution on the shared external registry is unchecked."
-        );
+        }) if !strict_external_hosts.is_empty() => {}
+        Some(settings::RegistrySettings::Ecr { .. }) => {
+            tracing::warn!(
+                "deployment_controller.image_pull_secret_name is set but \
+                 registry.strict_external_hosts is empty — cross-project image \
+                 substitution on the shared external registry is unchecked."
+            );
+        }
+        _ => {
+            tracing::warn!(
+                "deployment_controller.image_pull_secret_name is set but the \
+                 configured registry provider does not support strict_external_hosts \
+                 (currently ECR-only). Cross-project image substitution on the \
+                 shared external registry is unchecked."
+            );
+        }
     }
 }
 
