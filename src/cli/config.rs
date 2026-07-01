@@ -126,12 +126,6 @@ fn probe_runtime(command: &str) -> Option<ContainerRuntime> {
 // - Linux: Secret Service API / libsecret
 // - Windows: Credential Manager
 
-/// Default Vault OIDC mount path for `vault login -path=...`. Override per-laptop
-/// via `rise vault configure --auth-path ...` or `$RISE_VAULT_AUTH_PATH`.
-pub const DEFAULT_VAULT_AUTH_PATH: &str = "global/entra";
-/// Default Vault OIDC role passed as `role=<...>` to `vault login`.
-pub const DEFAULT_VAULT_AUTH_ROLE: &str = "developer";
-
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct Config {
     pub token: Option<String>,
@@ -141,11 +135,13 @@ pub struct Config {
     /// Vault address (e.g. `https://vault.example.com:8200`). Persisted so
     /// `rise deploy` can auto-mint JFrog tokens without prompting per-invocation.
     pub vault_address: Option<String>,
-    /// Vault OIDC auth mount path used by `rise vault login`. Defaults to
-    /// `DEFAULT_VAULT_AUTH_PATH` when unset.
+    /// Vault OIDC auth mount path used by `rise vault login`. No default —
+    /// operator-specific, must be set via `rise vault configure --auth-path`
+    /// or `$RISE_VAULT_AUTH_PATH`.
     pub vault_auth_path: Option<String>,
-    /// Vault OIDC role passed as `role=...` to `vault login`. Defaults to
-    /// `DEFAULT_VAULT_AUTH_ROLE` when unset.
+    /// Vault OIDC role passed as `role=...` to `vault login`. No default —
+    /// operator-specific, must be set via `rise vault configure --auth-role`
+    /// or `$RISE_VAULT_AUTH_ROLE`.
     pub vault_auth_role: Option<String>,
     /// Vault KV/secret path that yields a JFrog access token. Supports the
     /// `{email}` placeholder, substituted with the authenticated user's email
@@ -341,15 +337,15 @@ impl Config {
         self.save()
     }
 
-    /// Read the Vault OIDC auth path with env override + default fallback.
-    pub fn get_vault_auth_path(&self) -> String {
+    /// Read the Vault OIDC auth path. `$RISE_VAULT_AUTH_PATH` wins over the
+    /// persisted config. Returns `None` when nothing is set — the caller
+    /// should surface an actionable error pointing at `rise vault configure`.
+    pub fn get_vault_auth_path(&self) -> Option<String> {
         #[cfg(not(test))]
         if let Ok(path) = std::env::var("RISE_VAULT_AUTH_PATH") {
-            return path;
+            return Some(path);
         }
-        self.vault_auth_path
-            .clone()
-            .unwrap_or_else(|| DEFAULT_VAULT_AUTH_PATH.to_string())
+        self.vault_auth_path.clone()
     }
 
     /// Persist the Vault OIDC role.
@@ -358,15 +354,14 @@ impl Config {
         self.save()
     }
 
-    /// Read the Vault OIDC role with env override + default fallback.
-    pub fn get_vault_auth_role(&self) -> String {
+    /// Read the Vault OIDC role. Same semantics as `get_vault_auth_path` —
+    /// no default, `$RISE_VAULT_AUTH_ROLE` overrides.
+    pub fn get_vault_auth_role(&self) -> Option<String> {
         #[cfg(not(test))]
         if let Ok(role) = std::env::var("RISE_VAULT_AUTH_ROLE") {
-            return role;
+            return Some(role);
         }
-        self.vault_auth_role
-            .clone()
-            .unwrap_or_else(|| DEFAULT_VAULT_AUTH_ROLE.to_string())
+        self.vault_auth_role.clone()
     }
 
     /// Persist the Vault path used to mint JFrog tokens.
@@ -486,31 +481,25 @@ mod tests {
     }
 
     #[test]
-    fn test_vault_auth_path_defaults_when_unset() {
-        assert_eq!(
-            Config::default().get_vault_auth_path(),
-            DEFAULT_VAULT_AUTH_PATH,
-        );
+    fn test_vault_auth_path_none_when_unset() {
+        assert_eq!(Config::default().get_vault_auth_path(), None);
     }
 
     #[test]
-    fn test_vault_auth_path_from_config_overrides_default() {
+    fn test_vault_auth_path_from_config() {
         let c = config(|c| c.vault_auth_path = Some("custom/oidc".to_string()));
-        assert_eq!(c.get_vault_auth_path(), "custom/oidc");
+        assert_eq!(c.get_vault_auth_path(), Some("custom/oidc".to_string()));
     }
 
     #[test]
-    fn test_vault_auth_role_defaults_when_unset() {
-        assert_eq!(
-            Config::default().get_vault_auth_role(),
-            DEFAULT_VAULT_AUTH_ROLE,
-        );
+    fn test_vault_auth_role_none_when_unset() {
+        assert_eq!(Config::default().get_vault_auth_role(), None);
     }
 
     #[test]
-    fn test_vault_auth_role_from_config_overrides_default() {
+    fn test_vault_auth_role_from_config() {
         let c = config(|c| c.vault_auth_role = Some("ops".to_string()));
-        assert_eq!(c.get_vault_auth_role(), "ops");
+        assert_eq!(c.get_vault_auth_role(), Some("ops".to_string()));
     }
 
     #[test]

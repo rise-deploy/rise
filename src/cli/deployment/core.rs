@@ -1107,8 +1107,12 @@ fn ensure_jfrog_docker_login_if_configured(
         return Ok(());
     };
 
-    let auth_path = config.get_vault_auth_path();
-    let auth_role = config.get_vault_auth_role();
+    let auth_path = config.get_vault_auth_path().context(
+        "Vault auth path not configured — run `rise vault configure --auth-path <path>` (or set $RISE_VAULT_AUTH_PATH)",
+    )?;
+    let auth_role = config.get_vault_auth_role().context(
+        "Vault auth role not configured — run `rise vault configure --auth-role <role>` (or set $RISE_VAULT_AUTH_ROLE)",
+    )?;
 
     crate::vault::ensure_session(&addr, &auth_path, &auth_role)?;
     let email = crate::vault::identity(&addr, &auth_path)?;

@@ -79,10 +79,14 @@ One-off CLI config (writes `~/.config/rise/config.json`):
 ```bash
 rise vault configure \
   --address https://vault.example.com:8200 \
-  --auth-path your/oidc/path \
-  --auth-role developer \
-  --artifactory-token-path 'global/artifactory/user_token/{email}'
+  --auth-path <your-oidc-mount-path> \
+  --auth-role <your-oidc-role> \
+  --artifactory-token-path '<vault/kv/path/user_token/{email}>'
 ```
+
+All four flags are required — Rise ships no defaults for these (they're
+operator-specific). Ask your platform team what to put where, or check
+your organization's rise-deployment docs.
 
 Then `rise deploy` against any `[registry]` project:
 
@@ -108,7 +112,7 @@ job:
     DOCKER_AUTH_CONFIG:
       token: $VAULT_ID_TOKEN
       vault:
-        path: global/artifactory/user_token/publish-...
+        path: <vault/kv/path/publish-...>
         field: docker_auth_config
 ```
 

@@ -1870,8 +1870,12 @@ async fn main() -> Result<()> {
                 let addr = config.get_vault_address().context(
                     "Vault address not set — run `rise vault configure --address <url>` first",
                 )?;
-                let auth_path = config.get_vault_auth_path();
-                let auth_role = config.get_vault_auth_role();
+                let auth_path = config.get_vault_auth_path().context(
+                    "Vault auth path not set — run `rise vault configure --auth-path <path>` first",
+                )?;
+                let auth_role = config.get_vault_auth_role().context(
+                    "Vault auth role not set — run `rise vault configure --auth-role <role>` first",
+                )?;
                 cli::vault::ensure_session(&addr, &auth_path, &auth_role)?;
                 let email = cli::vault::identity(&addr, &auth_path)?;
                 println!("✓ Vault session active for {email}");
