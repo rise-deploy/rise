@@ -96,9 +96,13 @@ fn parse_project_config(content: &str, source_path: &Path) -> Result<ProjectBuil
     let mut unused_fields = Vec::new();
     let deserializer = toml::Deserializer::parse(content)
         .map_err(|e| anyhow::Error::new(e).context("Failed to parse TOML"))?;
-    let config: ProjectBuildConfig = serde_ignored::deserialize(deserializer, |path| {
+    let mut config: ProjectBuildConfig = serde_ignored::deserialize(deserializer, |path| {
         unused_fields.push(path.to_string());
     })?;
+
+    if let Some(reg) = config.registry.as_mut() {
+        reg.image_base = reg.image_base.trim().to_string();
+    }
 
     for field in &unused_fields {
         warn!(
@@ -168,17 +172,10 @@ fn validate_registry_config(
     source_path: &Path,
     section: &str,
 ) -> Result<()> {
-    let image_base = reg.image_base.trim();
+    let image_base = &reg.image_base;
     if image_base.is_empty() {
         anyhow::bail!(
             "{} in {}: image_base must be a non-empty host/path prefix (e.g. \"jfrog.example.com/team/apps\")",
-            section,
-            source_path.display(),
-        );
-    }
-    if image_base != reg.image_base {
-        anyhow::bail!(
-            "{} in {}: image_base has leading/trailing whitespace",
             section,
             source_path.display(),
         );
