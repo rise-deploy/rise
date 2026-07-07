@@ -284,6 +284,13 @@ pub fn render_traefik_labels(route: &TraefikRoute<'_>) -> HashMap<String, String
         format!("traefik.http.services.{r}.loadbalancer.server.port"),
         route.port.to_string(),
     );
+    // Bind the router to its own service explicitly. A container serving more
+    // than one route (multiple `[routes]` → the same container) defines several
+    // services, and Traefik refuses to auto-link a router when its container has
+    // multiple services ("cannot be linked automatically with multiple
+    // Services"). Naming the service the same as the router keeps this
+    // unambiguous.
+    labels.insert(format!("traefik.http.routers.{r}.service"), r.to_string());
     if let Some(certresolver) = route.certresolver {
         labels.insert(format!("traefik.http.routers.{r}.tls"), "true".to_string());
         labels.insert(
@@ -480,6 +487,30 @@ mod tests {
         assert!(!labels
             .keys()
             .any(|k| k.contains("forwardauth") || k.ends_with(".middlewares")));
+    }
+
+    #[test]
+    fn traefik_labels_bind_router_to_its_own_service() {
+        // Each router must explicitly name its service so a container serving
+        // more than one route (several services) doesn't hit Traefik's
+        // "cannot be linked automatically with multiple Services".
+        let labels = render_traefik_labels(&TraefikRoute {
+            router_name: "app-1",
+            hosts: &["app.rise.dev".to_string()],
+            path_prefix: Some("/api"),
+            port: 8080,
+            entrypoint: "web",
+            network: "rise_default",
+            certresolver: None,
+            forward_auth: None,
+        });
+        assert_eq!(
+            labels
+                .get("traefik.http.routers.app-1.service")
+                .map(String::as_str),
+            Some("app-1")
+        );
+        assert!(labels.contains_key("traefik.http.services.app-1.loadbalancer.server.port"));
     }
 
     #[test]

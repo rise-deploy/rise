@@ -794,9 +794,9 @@ impl Scenario for RouteAccessOverride {
         let app = b.sample_app();
 
         // Base access class = private (gated), with `/public` opened via
-        // `[routes].access`. Two containers with one route each keep each
-        // container to a single Traefik service (a container serving multiple
-        // routes can't be auto-linked to one of several services).
+        // `[routes].access`. Both routes target the same container — each router
+        // binds its own Traefik service, so a single container can serve
+        // multiple routes.
         expect_ok(
             b.rise_cli(
                 &[
@@ -818,11 +818,10 @@ impl Scenario for RouteAccessOverride {
             dir.join("rise.toml"),
             format!(
                 "[project]\nname = \"{project}\"\n\n\
-                 [containers.web]\nimage = \"{img}\"\nport = {port}\n\n\
-                 [containers.api]\nimage = \"{img}\"\nport = {port}\n\n\
+                 [containers.app]\nimage = \"{img}\"\nport = {port}\n\n\
                  [routes]\n\
-                 \"/\" = {{ container = \"web\" }}\n\
-                 \"/public\" = {{ container = \"api\", access = \"public\" }}\n",
+                 \"/\" = {{ container = \"app\" }}\n\
+                 \"/public\" = {{ container = \"app\", access = \"public\" }}\n",
                 img = app.image,
                 port = app.http_port
             ),
