@@ -37,7 +37,7 @@
       "type": "object"
     },
     "AccessRequirement": {
-      "description": "Access requirement level for ingress authentication.\n\nUsed both as the `access_requirement` of a server-configured access class\n(project-wide) and as the optional per-route `access` override in\n`.rise.toml`. The canonical spelling is PascalCase (matching the access-class\nsettings); lowercase spellings are accepted as aliases for convenience in\n`.rise.toml`.",
+      "description": "Access requirement level for ingress authentication.\n\nThis is the internal/wire representation: the `access_requirement` of a\nserver-configured access class, the per-route requirement carried on a\ndeployment's route side-data, and the `access` query param the reconciler\nstamps into the auth-url. Spelled PascalCase to match the access-class\nsettings. The `.rise.toml` surface uses [`RouteAccess`] instead, whose\n`public` reads more naturally on a route than `None`.",
       "oneOf": [
         {
           "const": "None",
