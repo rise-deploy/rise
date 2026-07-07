@@ -766,8 +766,8 @@ impl Scenario for PrivateIngressAuth {
 
 /// A private project whose `[routes].access` opens one path to the public and
 /// leaves another inheriting the gated project default. Exercises the per-route
-/// override end to end through the real ingress on both backends (nginx
-/// per-requirement-group Ingress split; Traefik per-router forwardAuth).
+/// override end to end through the real Traefik ingress (per-router forwardAuth:
+/// the `/public` router carries no auth, the `/` router does).
 struct RouteAccessOverride;
 
 impl Scenario for RouteAccessOverride {
@@ -775,10 +775,18 @@ impl Scenario for RouteAccessOverride {
         "route-access-override"
     }
 
-    fn applies_to(&self, _b: &dyn Backend) -> Applicability {
-        // Per-route access is enforced by proxy-native routing on both backends,
-        // so the loosen-one-path contract holds on each.
-        Applicability::Run
+    fn applies_to(&self, b: &dyn Backend) -> Applicability {
+        match b.kind() {
+            // Deploys `[routes]` from a generated project dir (same as
+            // `HealthRollingCutover`); the Minikube harness runs the CLI in a
+            // container without the host project dir mounted, so dir-based
+            // deploys are Docker-only. The nginx per-group Ingress split is
+            // covered by `resource_builder` unit tests.
+            BackendKind::Docker => Applicability::Run,
+            BackendKind::Minikube => {
+                Applicability::Skip("dir-based `[routes]` deploy is docker-only in the harness")
+            }
+        }
     }
 
     fn run(&self, b: &dyn Backend) -> Result<()> {
@@ -786,8 +794,9 @@ impl Scenario for RouteAccessOverride {
         let app = b.sample_app();
 
         // Base access class = private (gated), with `/public` opened via
-        // `[routes].access`. `[routes]` needs a `[containers]` block, so deploy
-        // from a generated project dir rather than `--image`.
+        // `[routes].access`. Two containers with one route each keep each
+        // container to a single Traefik service (a container serving multiple
+        // routes can't be auto-linked to one of several services).
         expect_ok(
             b.rise_cli(
                 &[
@@ -809,11 +818,13 @@ impl Scenario for RouteAccessOverride {
             dir.join("rise.toml"),
             format!(
                 "[project]\nname = \"{project}\"\n\n\
-                 [containers.app]\nimage = \"{}\"\nport = {}\n\n\
+                 [containers.web]\nimage = \"{img}\"\nport = {port}\n\n\
+                 [containers.api]\nimage = \"{img}\"\nport = {port}\n\n\
                  [routes]\n\
-                 \"/\" = {{ container = \"app\" }}\n\
-                 \"/public\" = {{ container = \"app\", access = \"public\" }}\n",
-                app.image, app.http_port
+                 \"/\" = {{ container = \"web\" }}\n\
+                 \"/public\" = {{ container = \"api\", access = \"public\" }}\n",
+                img = app.image,
+                port = app.http_port
             ),
         )
         .context("write route-access rise.toml")?;
