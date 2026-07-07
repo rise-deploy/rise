@@ -33,6 +33,59 @@ use rise_backend_core::DeploymentUrlBuilder;
 // consumers (e.g. the Docker reconciler) keep their import path.
 pub use rise_backend_core::IngressUrl;
 
+/// A resolved ingress route with the effective auth requirement for its path.
+///
+/// The webhook resolves each `RouteSpec` to `(path, service_name)` plus the
+/// route's effective requirement (`effective_access_requirement`: the per-route
+/// `access` override or the project default). The ingress builder partitions a
+/// deployment's routes by this requirement and emits one Ingress per group so
+/// nginx gates each path group independently.
+pub struct IngressRoute {
+    pub path: String,
+    pub service_name: String,
+    pub requirement: AccessRequirement,
+}
+
+/// Wire spelling of an access requirement for the `auth-url` `access` query
+/// param. Must match the PascalCase serde form the `ingress_auth` handler parses.
+fn access_requirement_param(requirement: &AccessRequirement) -> &'static str {
+    match requirement {
+        AccessRequirement::None => "None",
+        AccessRequirement::Authenticated => "Authenticated",
+        AccessRequirement::Member => "Member",
+    }
+}
+
+/// Short, DNS-safe suffix distinguishing per-requirement group ingresses when a
+/// deployment's routes span more than one effective requirement.
+fn requirement_ingress_suffix(requirement: &AccessRequirement) -> &'static str {
+    match requirement {
+        AccessRequirement::None => "public",
+        AccessRequirement::Authenticated => "auth",
+        AccessRequirement::Member => "member",
+    }
+}
+
+/// Partition a route table into per-effective-requirement groups in a fixed,
+/// deterministic order (`None`, `Authenticated`, `Member`). Empty groups are
+/// omitted. Every route's path belongs to exactly one group, so the resulting
+/// group ingresses have disjoint app paths on a shared host (nginx merges them).
+fn group_routes_by_requirement(
+    routes: &[IngressRoute],
+) -> Vec<(AccessRequirement, Vec<&IngressRoute>)> {
+    [
+        AccessRequirement::None,
+        AccessRequirement::Authenticated,
+        AccessRequirement::Member,
+    ]
+    .into_iter()
+    .filter_map(|req| {
+        let group: Vec<&IngressRoute> = routes.iter().filter(|r| r.requirement == req).collect();
+        (!group.is_empty()).then_some((req, group))
+    })
+    .collect()
+}
+
 // Re-export constants used by webhook and other consumers
 pub const LABEL_MANAGED_BY: &str = "app.kubernetes.io/managed-by";
 pub const LABEL_PROJECT: &str = "rise.dev/project";
@@ -1204,9 +1257,21 @@ impl ResourceBuilder {
 
     // ── Ingress ────────────────────────────────────────────────────────
 
+    /// Build the annotation set for one ingress serving routes at a single
+    /// effective access requirement.
+    ///
+    /// `requirement` is the effective requirement for *this* ingress's route
+    /// group (a route's per-route `access` override or the project default), not
+    /// necessarily the project's access-class requirement. The auth gate is
+    /// stamped only for non-`None` groups, and the requirement is baked into the
+    /// `auth-url` as `&access=<req>` so the shared `ingress_auth` handler enforces
+    /// exactly this group's requirement — it never re-matches the request path.
+    /// `ingress_class` and `custom_annotations` always come from the project's
+    /// access class (they are per-host and cannot vary per route).
     fn build_ingress_annotations(
         &self,
         project: &Project,
+        requirement: &AccessRequirement,
     ) -> anyhow::Result<BTreeMap<String, String>> {
         let mut annotations: BTreeMap<String, String> = self
             .ingress_annotations
@@ -1229,12 +1294,14 @@ impl ResourceBuilder {
                 )
             })?;
 
-        match access_class.access_requirement {
+        match requirement {
             AccessRequirement::None => {}
             AccessRequirement::Authenticated | AccessRequirement::Member => {
                 let auth_url = format!(
-                    "{}/api/v1/auth/ingress?project={}",
-                    self.auth_backend_url, project.name
+                    "{}/api/v1/auth/ingress?project={}&access={}",
+                    self.auth_backend_url,
+                    project.name,
+                    access_requirement_param(requirement),
                 );
 
                 let signin_url = if self.backend_address.is_some() {
@@ -1270,6 +1337,29 @@ impl ResourceBuilder {
         Ok(annotations)
     }
 
+    /// The project's access-class `access_requirement` — the default a route
+    /// inherits when it carries no per-route `access` override.
+    pub fn project_access_requirement(
+        &self,
+        project: &Project,
+    ) -> anyhow::Result<AccessRequirement> {
+        let access_class = self
+            .access_classes
+            .get(&project.access_class)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Access class '{}' not configured. Available: {}",
+                    project.access_class,
+                    self.access_classes
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+        Ok(access_class.access_requirement.clone())
+    }
+
     fn get_ingress_class_for_project(&self, project: &Project) -> anyhow::Result<&str> {
         let access_class = self
             .access_classes
@@ -1293,8 +1383,9 @@ impl ResourceBuilder {
     /// `routes` is the resolved `(path, service_name)` table — a single-container
     /// deployment is just `[("/", "<group>-app")]`. Paths are emitted
     /// longest-prefix-first (lexicographic tiebreaker) for deterministic output
-    /// and nginx longest-match semantics. The `/.rise` backend path is appended
-    /// last.
+    /// and nginx longest-match semantics. When `append_rise` is set the `/.rise`
+    /// backend path is appended last — the caller sets it on exactly one group
+    /// ingress so the shared-host merge keeps `/.rise` unique.
     ///
     /// `prefix` is the deployment's URL sub-path in sub-path mode (no wildcard
     /// cert), e.g. `/pr-123`; `None` in subdomain mode. In sub-path mode every
@@ -1312,6 +1403,7 @@ impl ResourceBuilder {
         &self,
         routes: &[(String, String)],
         prefix: Option<&str>,
+        append_rise: bool,
     ) -> Vec<HTTPIngressPath> {
         let mut sorted: Vec<(&str, &str)> = routes
             .iter()
@@ -1371,7 +1463,9 @@ impl ResourceBuilder {
             })
             .collect();
 
-        self.append_rise_backend_path(&mut paths);
+        if append_rise {
+            self.append_rise_backend_path(&mut paths);
+        }
         paths
     }
 
@@ -1412,15 +1506,17 @@ impl ResourceBuilder {
         inline_custom_domains: &[CustomDomain],
         environment_name: Option<&str>,
         all_environments: &[crate::db::models::Environment],
-        // Resolved `(path, service_name)` route table. A single-container
-        // deployment passes `[("/", "<group>-app")]`; a multi-container one
-        // passes its route table. An empty slice means a workers-only
-        // deployment (no routable container) — emit no ingress at all.
-        routes: &[(String, String)],
-    ) -> anyhow::Result<Option<Ingress>> {
+        // Resolved route table with per-route effective access requirement. A
+        // single-container deployment passes one route (`/` → `<group>-app`); a
+        // multi-container one passes its full table. An empty slice means a
+        // workers-only deployment (no routable container) — emit no ingress.
+        // Routes are partitioned by effective requirement into one Ingress per
+        // group so nginx gates each path group independently.
+        routes: &[IngressRoute],
+    ) -> anyhow::Result<Vec<Ingress>> {
         // Workers-only deployment (no routable container): emit no ingress.
         if routes.is_empty() {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         let mut hosts = self.primary_ingress_hosts(
             project,
@@ -1451,66 +1547,90 @@ impl ResourceBuilder {
                     host = %fallback.host,
                     "Skipping ingress: all candidate hosts collide with another env's URL"
                 );
-                return Ok(None);
+                return Ok(Vec::new());
             }
             hosts.push(fallback);
         }
-
-        let mut annotations = self.build_ingress_annotations(project)?;
-
-        // Annotations are per-ingress: if the DG host (first templated host) is
-        // path-based, apply the rewrite-target annotation. Mixed strategies on
-        // the same ingress are not supported by nginx-ingress today.
-        if let Some(ref path) = hosts[0].path_prefix {
-            annotations.insert(
-                "nginx.ingress.kubernetes.io/rewrite-target".to_string(),
-                "/$2".to_string(),
-            );
-            annotations.insert(
-                "nginx.ingress.kubernetes.io/x-forwarded-prefix".to_string(),
-                path.trim_end_matches('/').to_string(),
-            );
-        }
-
-        let rules: Vec<IngressRule> = hosts
-            .iter()
-            .map(|host| {
-                // Each host applies its own sub-path prefix (if any) to the
-                // route table. The per-ingress rewrite annotation above is keyed
-                // off the first host's prefix — mixed prefix/non-prefix hosts on
-                // one ingress are not supported by nginx-ingress.
-                let paths = self.build_ingress_paths(routes, host.path_prefix.as_deref());
-                IngressRule {
-                    host: Some(host.host.clone()),
-                    http: Some(HTTPIngressRuleValue { paths }),
-                }
-            })
-            .collect();
 
         let templated_hosts: Vec<String> = hosts
             .iter()
             .filter(|h| !inline_custom_domains.iter().any(|cd| cd.domain == h.host))
             .map(|h| h.host.clone())
             .collect();
-
         let tls = self.build_primary_tls_config(&templated_hosts, inline_custom_domains);
+        let ingress_class = self.get_ingress_class_for_project(project)?.to_string();
+        let base_name = Self::ingress_name(project, deployment);
 
-        Ok(Some(Ingress {
-            metadata: ObjectMeta {
-                name: Some(Self::ingress_name(project, deployment)),
-                namespace: Some(namespace.to_string()),
-                labels: Some(Self::common_labels(project, environment_name)),
-                annotations: Some(annotations),
+        // One Ingress per effective-requirement group. The `/.rise` backend path
+        // goes on exactly the first group so it stays unique across the
+        // shared-host merge; the group's name gets a requirement suffix only when
+        // more than one group exists (so the common single-group case keeps the
+        // stable, un-suffixed name and never churns on upgrade).
+        let groups = group_routes_by_requirement(routes);
+        let multi = groups.len() > 1;
+        let mut ingresses = Vec::with_capacity(groups.len());
+        for (idx, (requirement, group_routes)) in groups.into_iter().enumerate() {
+            let mut annotations = self.build_ingress_annotations(project, &requirement)?;
+
+            // Sub-path (path-based) hosts need the rewrite-target annotation; it
+            // is per-ingress and keyed off the first host's prefix, and every
+            // group ingress shares the same hosts so each replicates it.
+            if let Some(ref path) = hosts[0].path_prefix {
+                annotations.insert(
+                    "nginx.ingress.kubernetes.io/rewrite-target".to_string(),
+                    "/$2".to_string(),
+                );
+                annotations.insert(
+                    "nginx.ingress.kubernetes.io/x-forwarded-prefix".to_string(),
+                    path.trim_end_matches('/').to_string(),
+                );
+            }
+
+            let group_table: Vec<(String, String)> = group_routes
+                .iter()
+                .map(|r| (r.path.clone(), r.service_name.clone()))
+                .collect();
+            let append_rise = idx == 0;
+            let rules: Vec<IngressRule> = hosts
+                .iter()
+                .map(|host| {
+                    let paths = self.build_ingress_paths(
+                        &group_table,
+                        host.path_prefix.as_deref(),
+                        append_rise,
+                    );
+                    IngressRule {
+                        host: Some(host.host.clone()),
+                        http: Some(HTTPIngressRuleValue { paths }),
+                    }
+                })
+                .collect();
+
+            let name = if multi {
+                format!("{}-{}", base_name, requirement_ingress_suffix(&requirement))
+            } else {
+                base_name.clone()
+            };
+
+            ingresses.push(Ingress {
+                metadata: ObjectMeta {
+                    name: Some(name),
+                    namespace: Some(namespace.to_string()),
+                    labels: Some(Self::common_labels(project, environment_name)),
+                    annotations: Some(annotations),
+                    ..Default::default()
+                },
+                spec: Some(IngressSpec {
+                    ingress_class_name: Some(ingress_class.clone()),
+                    tls: tls.clone(),
+                    rules: Some(rules),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            },
-            spec: Some(IngressSpec {
-                ingress_class_name: Some(self.get_ingress_class_for_project(project)?.to_string()),
-                tls,
-                rules: Some(rules),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }))
+            });
+        }
+
+        Ok(ingresses)
     }
 
     pub fn create_custom_domain_ingress(
@@ -1520,44 +1640,69 @@ impl ResourceBuilder {
         namespace: &str,
         custom_domains: &[CustomDomain],
         environment_name: Option<&str>,
-        // Resolved `(path, service_name)` route table (same as `create_primary_ingress`).
-        // Custom domains are always served at the host root (no sub-path prefix).
-        routes: &[(String, String)],
-    ) -> anyhow::Result<Ingress> {
-        let mut annotations = self.build_ingress_annotations(project)?;
-
-        for (k, v) in &self.custom_domain_ingress_annotations {
-            annotations.insert(k.clone(), v.clone());
-        }
-
-        let mut rules = Vec::new();
-        for domain in custom_domains {
-            // Custom domains are full hostnames, never sub-paths → prefix None.
-            let paths = self.build_ingress_paths(routes, None);
-            rules.push(IngressRule {
-                host: Some(domain.domain.clone()),
-                http: Some(HTTPIngressRuleValue { paths }),
-            });
+        // Resolved route table (same as `create_primary_ingress`). Custom domains
+        // are always served at the host root (no sub-path prefix). Partitioned by
+        // effective requirement into one Ingress per group, like the primary.
+        routes: &[IngressRoute],
+    ) -> anyhow::Result<Vec<Ingress>> {
+        if custom_domains.is_empty() || routes.is_empty() {
+            return Ok(Vec::new());
         }
 
         let tls = self.build_custom_domain_tls_config(custom_domains);
+        let ingress_class = self.get_ingress_class_for_project(project)?.to_string();
+        let base_name = Self::custom_domain_ingress_name(project, deployment);
 
-        Ok(Ingress {
-            metadata: ObjectMeta {
-                name: Some(Self::custom_domain_ingress_name(project, deployment)),
-                namespace: Some(namespace.to_string()),
-                labels: Some(Self::common_labels(project, environment_name)),
-                annotations: Some(annotations),
+        let groups = group_routes_by_requirement(routes);
+        let multi = groups.len() > 1;
+        let mut ingresses = Vec::with_capacity(groups.len());
+        for (idx, (requirement, group_routes)) in groups.into_iter().enumerate() {
+            let mut annotations = self.build_ingress_annotations(project, &requirement)?;
+            for (k, v) in &self.custom_domain_ingress_annotations {
+                annotations.insert(k.clone(), v.clone());
+            }
+
+            let group_table: Vec<(String, String)> = group_routes
+                .iter()
+                .map(|r| (r.path.clone(), r.service_name.clone()))
+                .collect();
+            let append_rise = idx == 0;
+            let rules: Vec<IngressRule> = custom_domains
+                .iter()
+                .map(|domain| {
+                    let paths = self.build_ingress_paths(&group_table, None, append_rise);
+                    IngressRule {
+                        host: Some(domain.domain.clone()),
+                        http: Some(HTTPIngressRuleValue { paths }),
+                    }
+                })
+                .collect();
+
+            let name = if multi {
+                format!("{}-{}", base_name, requirement_ingress_suffix(&requirement))
+            } else {
+                base_name.clone()
+            };
+
+            ingresses.push(Ingress {
+                metadata: ObjectMeta {
+                    name: Some(name),
+                    namespace: Some(namespace.to_string()),
+                    labels: Some(Self::common_labels(project, environment_name)),
+                    annotations: Some(annotations),
+                    ..Default::default()
+                },
+                spec: Some(IngressSpec {
+                    ingress_class_name: Some(ingress_class.clone()),
+                    tls: tls.clone(),
+                    rules: Some(rules),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            },
-            spec: Some(IngressSpec {
-                ingress_class_name: Some(self.get_ingress_class_for_project(project)?.to_string()),
-                tls,
-                rules: Some(rules),
-                ..Default::default()
-            }),
-            ..Default::default()
-        })
+            });
+        }
+
+        Ok(ingresses)
     }
 
     fn build_primary_tls_config(
@@ -1723,6 +1868,14 @@ mod tests {
             },
             pod_security_enabled: true,
             health_probes: None,
+        }
+    }
+
+    fn iroute(path: &str, service_name: &str, requirement: AccessRequirement) -> IngressRoute {
+        IngressRoute {
+            path: path.to_string(),
+            service_name: service_name.to_string(),
+            requirement,
         }
     }
 
@@ -2444,7 +2597,7 @@ mod tests {
         let prod_env = test_environment("production", true, "default");
         let domains = vec![test_custom_domain("api.example.com", true)];
 
-        let ingress = builder
+        let ingresses = builder
             .create_primary_ingress(
                 &project,
                 &deployment,
@@ -2453,19 +2606,20 @@ mod tests {
                 &domains,
                 Some("production"),
                 &[],
-                &[("/".to_string(), "default-app".to_string())],
+                &[iroute("/", "default-app", AccessRequirement::None)],
             )
-            .expect("primary ingress")
-            .expect("ingress should be emitted");
+            .expect("primary ingress");
+        assert_eq!(ingresses.len(), 1, "single requirement group → one ingress");
+        let ingress = &ingresses[0];
 
-        let spec = ingress.spec.expect("spec");
-        let rules = spec.rules.expect("rules");
+        let spec = ingress.spec.as_ref().expect("spec");
+        let rules = spec.rules.as_ref().expect("rules");
         let hosts: Vec<String> = rules.iter().filter_map(|r| r.host.clone()).collect();
         assert!(hosts.contains(&"demo-default.preview.example.test".to_string()));
         assert!(hosts.contains(&"demo.example.test".to_string()));
         assert!(hosts.contains(&"api.example.com".to_string()));
 
-        let tls = spec.tls.expect("tls");
+        let tls = spec.tls.as_ref().expect("tls");
         // One entry for templated hosts (shared cert) + one per custom domain (PerDomain mode)
         assert!(tls
             .iter()
@@ -2510,14 +2664,100 @@ mod tests {
                 &[],
                 Some("staging"),
                 std::slice::from_ref(&staging_env),
-                &[("/".to_string(), "staging-app".to_string())],
+                &[iroute("/", "staging-app", AccessRequirement::None)],
             )
             .expect("call ok");
 
         assert!(
-            result.is_none(),
+            result.is_empty(),
             "expected no ingress when all candidate hosts collide"
         );
+    }
+
+    #[test]
+    fn create_primary_ingress_splits_routes_by_effective_requirement() {
+        let mut builder = test_resource_builder();
+        builder.access_classes.insert(
+            "default".to_string(),
+            crate::server::settings::AccessClass {
+                display_name: "Public".to_string(),
+                description: "Public".to_string(),
+                ingress_class: "nginx".to_string(),
+                access_requirement: AccessRequirement::None,
+                custom_annotations: std::collections::HashMap::new(),
+            },
+        );
+        let project = test_project();
+        let mut deployment = test_deployment();
+        deployment.deployment_group = "default".to_string();
+
+        // A public `/` and a member-gated `/admin` → two requirement groups.
+        let routes = vec![
+            iroute("/", "default-web", AccessRequirement::None),
+            iroute("/admin", "default-web", AccessRequirement::Member),
+        ];
+        let ingresses = builder
+            .create_primary_ingress(
+                &project,
+                &deployment,
+                "demo",
+                None,
+                &[],
+                Some("production"),
+                &[],
+                &routes,
+            )
+            .expect("ingresses");
+        assert_eq!(ingresses.len(), 2, "two requirement groups → two ingresses");
+
+        let name_of = |ing: &Ingress| ing.metadata.name.clone().unwrap();
+        let auth_url_of = |ing: &Ingress| {
+            ing.metadata
+                .annotations
+                .as_ref()
+                .unwrap()
+                .get("nginx.ingress.kubernetes.io/auth-url")
+                .cloned()
+        };
+        let paths_of = |ing: &Ingress| -> Vec<String> {
+            ing.spec
+                .as_ref()
+                .unwrap()
+                .rules
+                .as_ref()
+                .unwrap()
+                .iter()
+                .flat_map(|r| r.http.as_ref().unwrap().paths.iter())
+                .filter_map(|p| p.path.clone())
+                .collect()
+        };
+
+        let public = ingresses
+            .iter()
+            .find(|i| name_of(i).ends_with("-public"))
+            .expect("public group ingress");
+        let member = ingresses
+            .iter()
+            .find(|i| name_of(i).ends_with("-member"))
+            .expect("member group ingress");
+
+        // Public group is not gated; member group is gated with `&access=Member`.
+        assert!(
+            auth_url_of(public).is_none(),
+            "public group must carry no auth-url"
+        );
+        let member_auth = auth_url_of(member).expect("member group must be gated");
+        assert!(member_auth.contains("/api/v1/auth/ingress"));
+        assert!(
+            member_auth.contains("access=Member"),
+            "member auth-url must stamp the requirement, got: {member_auth}"
+        );
+
+        // Each path lives only in its own group; `/.rise` rides the first group.
+        assert!(paths_of(public).iter().any(|p| p == "/"));
+        assert!(!paths_of(public).iter().any(|p| p == "/admin"));
+        assert!(paths_of(member).iter().any(|p| p == "/admin"));
+        assert!(!paths_of(member).iter().any(|p| p == "/"));
     }
 
     #[test]
@@ -2663,7 +2903,7 @@ mod tests {
             ("/".to_string(), "default-frontend".to_string()),
             ("/api".to_string(), "default-api".to_string()),
         ];
-        let paths = builder.build_ingress_paths(&routes, None);
+        let paths = builder.build_ingress_paths(&routes, None, true);
         // `/api` (longer) is emitted before `/`.
         assert_eq!(paths[0].path.as_deref(), Some("/api"));
         assert_eq!(paths[0].path_type, "Prefix");
@@ -2685,7 +2925,7 @@ mod tests {
             ("/".to_string(), "default-frontend".to_string()),
             ("/api".to_string(), "default-api".to_string()),
         ];
-        let paths = builder.build_ingress_paths(&routes, Some("/pr-123"));
+        let paths = builder.build_ingress_paths(&routes, Some("/pr-123"), true);
         // Longest-first: `/api` before `/`.
         assert_eq!(
             paths[0].path.as_deref(),
@@ -2707,7 +2947,7 @@ mod tests {
         // matches literally (and can't inject regex structure).
         let builder = test_resource_builder();
         let routes = vec![("/a.b".to_string(), "default-svc".to_string())];
-        let paths = builder.build_ingress_paths(&routes, Some("/pr-1"));
+        let paths = builder.build_ingress_paths(&routes, Some("/pr-1"), true);
         assert_eq!(paths[0].path.as_deref(), Some(r"/pr-1(/)(a\.b(?:/|$).*)"));
     }
 }

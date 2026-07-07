@@ -4,6 +4,7 @@
 //! behavior that depends on filesystems, registries, databases, or controllers stays
 //! in the root crate.
 
+use crate::access::AccessRequirement;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
@@ -155,6 +156,15 @@ pub struct RouteConfig {
     /// Target container name (must exist in `[containers]` and have `port` set).
     /// The route's port is always the target container's `port`.
     pub container: String,
+
+    /// Per-route override of the ingress auth requirement. Overrides *only* the
+    /// `access_requirement` of the project's access class for this route's path
+    /// (the access class's `ingress_class` and `custom_annotations` are per-host
+    /// and always apply project-wide). When absent, the route inherits the
+    /// project's requirement. Lets a single route be opened (`None`) or tightened
+    /// (`Member`) relative to the rest of the project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<AccessRequirement>,
 }
 
 /// Name of the implicit container the backend synthesises for a single-container
@@ -184,6 +194,8 @@ pub struct ResolvedContainer {
 pub struct ResolvedRoute {
     pub path: String,
     pub container: String,
+    /// Per-route ingress auth requirement override (see [`RouteConfig::access`]).
+    pub access: Option<AccessRequirement>,
 }
 
 /// Outcome of `ProjectBuildConfig::resolve_containers()`.
@@ -230,6 +242,7 @@ impl ResolvedDeploy {
             routes: vec![ResolvedRoute {
                 path: "/".to_string(),
                 container: DEFAULT_CONTAINER_NAME.to_string(),
+                access: None,
             }],
         }
     }
@@ -315,6 +328,7 @@ impl ProjectBuildConfig {
                 vec![ResolvedRoute {
                     path: "/".to_string(),
                     container: routable[0].name.clone(),
+                    access: None,
                 }]
             } else {
                 Vec::new()
@@ -339,6 +353,7 @@ impl ProjectBuildConfig {
                 resolved.push(ResolvedRoute {
                     path: path.clone(),
                     container: route.container.clone(),
+                    access: route.access.clone(),
                 });
             }
             resolved
@@ -369,6 +384,7 @@ mod tests {
             "/".to_string(),
             RouteConfig {
                 container: "worker".to_string(),
+                access: None,
             },
         );
 
@@ -379,6 +395,54 @@ mod tests {
             err.contains("no port") && err.contains("worker") && err.contains("'/'"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn resolve_deploy_carries_per_route_access_and_defaults_to_none() {
+        let toml = r#"
+            [containers.web]
+            image = "web:latest"
+            port = 8080
+
+            [routes."/"]
+            container = "web"
+
+            [routes."/healthz"]
+            container = "web"
+            access = "none"
+
+            [routes."/admin"]
+            container = "web"
+            access = "Member"
+        "#;
+        let config: ProjectBuildConfig = toml::from_str(toml).unwrap();
+        let resolved = config.resolve_deploy().unwrap();
+        let by_path = |p: &str| {
+            resolved
+                .routes
+                .iter()
+                .find(|r| r.path == p)
+                .unwrap_or_else(|| panic!("route {p} missing"))
+                .access
+                .clone()
+        };
+        assert_eq!(by_path("/"), None, "no `access` → inherit (None option)");
+        assert_eq!(by_path("/healthz"), Some(AccessRequirement::None));
+        assert_eq!(by_path("/admin"), Some(AccessRequirement::Member));
+    }
+
+    #[test]
+    fn resolve_deploy_default_single_route_has_no_access_override() {
+        let toml = r#"
+            [containers.web]
+            image = "web:latest"
+            port = 8080
+        "#;
+        let config: ProjectBuildConfig = toml::from_str(toml).unwrap();
+        let resolved = config.resolve_deploy().unwrap();
+        assert_eq!(resolved.routes.len(), 1);
+        assert_eq!(resolved.routes[0].path, "/");
+        assert_eq!(resolved.routes[0].access, None);
     }
 
     #[test]

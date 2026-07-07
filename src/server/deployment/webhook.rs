@@ -1826,25 +1826,38 @@ async fn compute_desired_children(
             .map(|s| s.name.as_str())
             .collect();
         let service_name_base = ResourceBuilder::service_name(project, active_deployment);
-        let routes: Vec<(String, String)> = routes_by_deployment
-            .get(&active_deployment.id)
-            .map(|route_specs| {
-                route_specs
-                    .iter()
-                    .filter(|r| routable_names.contains(r.container.as_str()))
-                    .map(|r| {
-                        (
-                            r.path.clone(),
-                            format!("{}-{}", service_name_base, r.container),
+        // Each route's effective auth requirement is its per-route `access`
+        // override or the project's access-class default. The ingress builder
+        // partitions by this and gates each path group independently.
+        let project_requirement = resource_builder.project_access_requirement(project)?;
+        let routes: Vec<crate::server::deployment::resource_builder::IngressRoute> =
+            routes_by_deployment
+                .get(&active_deployment.id)
+                .map(|route_specs| {
+                    route_specs
+                        .iter()
+                        .filter(|r| routable_names.contains(r.container.as_str()))
+                        .map(
+                            |r| crate::server::deployment::resource_builder::IngressRoute {
+                                path: r.path.clone(),
+                                service_name: format!("{}-{}", service_name_base, r.container),
+                                requirement: rise_backend_core::effective_access_requirement(
+                                    r,
+                                    &project_requirement,
+                                ),
+                            },
                         )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+                        .collect()
+                })
+                .unwrap_or_default();
 
         // A workers-only deployment (no routable container) emits no ingress.
         if !routes.is_empty() {
-            if let Some(ingress) = resource_builder.create_primary_ingress(
+            // One or more Ingresses (one per effective-requirement group). An
+            // empty result means every candidate host collided with another env's
+            // URL — skip so nginx admission doesn't reject it (warning already
+            // logged); the deployment still runs.
+            for ingress in resource_builder.create_primary_ingress(
                 project,
                 active_deployment,
                 &namespace,
@@ -1856,23 +1869,19 @@ async fn compute_desired_children(
             )? {
                 children.push(serde_json::to_value(&ingress)?);
             }
-            // When `create_primary_ingress` returns `None`, every candidate host for
-            // this group collided with another env's URL (e.g. a deployment group
-            // named the same as an environment whose primary group is different).
-            // Skip the ingress so nginx admission doesn't reject it; the deployment
-            // still runs and a warning was logged in `create_primary_ingress`.
 
             // Sibling custom-domain ingress, only when carve-out annotations are set.
             if split_custom_domains && !domains_for_group.is_empty() {
-                let custom_ingress = resource_builder.create_custom_domain_ingress(
+                for custom_ingress in resource_builder.create_custom_domain_ingress(
                     project,
                     active_deployment,
                     &namespace,
                     &domains_for_group,
                     env_name.as_deref(),
                     &routes,
-                )?;
-                children.push(serde_json::to_value(&custom_ingress)?);
+                )? {
+                    children.push(serde_json::to_value(&custom_ingress)?);
+                }
             }
         }
 

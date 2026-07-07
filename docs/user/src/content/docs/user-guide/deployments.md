@@ -288,6 +288,26 @@ Notes:
 - Each container's `PORT` env var is set to **that container's own `port`** (e.g. `frontend` gets `PORT=8080`, `backend` gets `PORT=9090`) — not a single deployment-wide value. Containers without a `port` (workers) keep whatever deployment-wide `PORT` was set, if any.
 - When a deployment has two or more containers, each is also given a `RISE_CONTAINER_HOST__<NAME>` env var for every sibling that exposes a `port` (including a port-having container that isn't routed, such as a database) — pointing at that sibling's in-cluster Service. See [Environment Variables](../environment-variables#auto-injected-variables).
 
+#### Per-route access
+
+By default every route inherits the project's access class — the whole app is
+public, or the whole app is gated. A route may override **only the auth
+requirement** for its path with `access`, letting you open one path on an
+otherwise-private app or lock one path down on an otherwise-public one:
+
+```toml
+[routes]
+"/"        = { container = "frontend" }                    # inherits the project's access
+"/healthz" = { container = "frontend", access = "none" }   # always reachable, no login
+"/admin"   = { container = "backend",  access = "member" } # only project members
+```
+
+`access` accepts `none` (no authentication), `authenticated` (any signed-in
+user), or `member` (project owner/team member). Omit it to inherit the project
+default. Only the auth gate varies per route — the ingress class and any custom
+ingress annotations from the access class still apply to the whole app. This
+works identically on the Kubernetes and Docker backends.
+
 To run this project locally as a stack, use `rise compose up`; to run just one container, use `rise run --container <name>`. See [Local Development](../local-development#compose-stacks).
 
 ## CPU & Memory

@@ -16,6 +16,27 @@ use rise_backend_core::quantity::{
 };
 use rise_backend_core::AccessRequirement;
 
+/// Per-route forwardAuth outcome for a single Traefik router.
+enum RouteForwardAuth {
+    /// No auth requirement — emit the router with no forwardAuth middleware.
+    Open,
+    /// Auth required and wired — attach forwardAuth pointing at this address.
+    Gated(String),
+    /// Auth required but no `auth_backend_url` to wire it — withhold this router
+    /// (fail closed) rather than expose an unauthenticated public route.
+    Withheld,
+}
+
+/// Wire spelling of an access requirement for the forwardAuth `access` query
+/// param. Must match the PascalCase serde form the `ingress_auth` handler parses.
+fn access_requirement_param(requirement: &AccessRequirement) -> &'static str {
+    match requirement {
+        AccessRequirement::None => "None",
+        AccessRequirement::Authenticated => "Authenticated",
+        AccessRequirement::Member => "Member",
+    }
+}
+
 /// One ingress route attached to a routable container.
 #[derive(Debug, Clone)]
 pub struct DesiredRoute {
@@ -23,6 +44,10 @@ pub struct DesiredRoute {
     pub hosts: Vec<String>,
     /// Optional path prefix (`None` / `/` → host-only).
     pub path_prefix: Option<String>,
+    /// Per-route ingress auth requirement override (`.rise.toml` `[routes].access`).
+    /// `None` means the route inherits the project's access-class requirement; the
+    /// effective requirement decides this router's forwardAuth middleware.
+    pub access: Option<AccessRequirement>,
 }
 
 /// Fully-resolved description of a single container Rise wants running. Built by
@@ -647,28 +672,26 @@ fn render_traefik_labels_for(
             AccessRequirement::Member
         }
     };
-    let forward_auth_address: Option<String> = match requirement {
-        AccessRequirement::None => None,
-        AccessRequirement::Authenticated | AccessRequirement::Member => {
-            if cfg.auth_backend_url.is_empty() {
-                // No internal backend URL → we CANNOT wire forwardAuth. Startup
-                // (`init_docker_backend`) fails closed only for access classes
-                // that are CONFIGURED without an `auth_backend_url` (see
-                // `settings::docker_access_classes_missing_auth_backend_url`),
-                // but a project can still reach here carrying a stale/removed/
-                // renamed access-class string: the unknown-class branch above
-                // fails closed to `Member`, so an auth requirement now coincides
-                // with an empty `auth_backend_url`. We must NOT stamp a router
-                // with no forwardAuth (that would be an OPEN public route for a
-                // Member/Authenticated-only app); the route loop below withholds
-                // the router entirely when this is `None`.
-                None
-            } else {
-                Some(format!(
-                    "{}/api/v1/auth/ingress?project={}&signin_redirect=1",
-                    cfg.auth_backend_url.trim_end_matches('/'),
-                    urlencoding::encode(&desired.project)
-                ))
+    // Per-route effective requirement decides that router's forwardAuth. The
+    // address stamps `&access=<req>` so the shared `ingress_auth` handler enforces
+    // exactly this route group's requirement (never re-matching the request path).
+    // `signin_redirect=1` puts the handler in Traefik mode (302 to login on
+    // unauthenticated). A `None` route gets no middleware (open); an auth route on
+    // a project whose `auth_backend_url` is empty is withheld per-route below.
+    let route_forward_auth = |route_requirement: &AccessRequirement| -> RouteForwardAuth {
+        match route_requirement {
+            AccessRequirement::None => RouteForwardAuth::Open,
+            AccessRequirement::Authenticated | AccessRequirement::Member => {
+                if cfg.auth_backend_url.is_empty() {
+                    RouteForwardAuth::Withheld
+                } else {
+                    RouteForwardAuth::Gated(format!(
+                        "{}/api/v1/auth/ingress?project={}&access={}&signin_redirect=1",
+                        cfg.auth_backend_url.trim_end_matches('/'),
+                        urlencoding::encode(&desired.project),
+                        access_requirement_param(route_requirement),
+                    ))
+                }
             }
         }
     };
@@ -717,6 +740,25 @@ fn render_traefik_labels_for(
         if route.hosts.is_empty() {
             continue;
         }
+        // Effective requirement: the route's `access` override, else the
+        // project's (already failed-closed to Member on an unknown class).
+        let route_requirement = route.access.clone().unwrap_or_else(|| requirement.clone());
+        let forward_auth_address = match route_forward_auth(&route_requirement) {
+            RouteForwardAuth::Open => None,
+            RouteForwardAuth::Gated(address) => Some(address),
+            RouteForwardAuth::Withheld => {
+                // Auth required but no `auth_backend_url` to wire it: withhold
+                // this router (fail closed) instead of exposing an open route.
+                tracing::warn!(
+                    project = %desired.project,
+                    path = route.path_prefix.as_deref().unwrap_or("/"),
+                    "Withholding Traefik router for route: forwardAuth could not be \
+                     wired (auth_backend_url is empty) for an access requirement that \
+                     mandates authentication"
+                );
+                continue;
+            }
+        };
         let router_name = group_service_name(&base, idx, route_count);
         let traefik = labels::render_traefik_labels(&TraefikRoute {
             router_name: &router_name,
@@ -860,6 +902,7 @@ mod tests {
             routes: vec![DesiredRoute {
                 hosts: vec!["myapp.rise.dev".to_string()],
                 path_prefix: None,
+                access: None,
             }],
             routable: true,
             // `build_container` recomputes the route-hash from the rendered
@@ -1604,10 +1647,12 @@ mod tests {
             DesiredRoute {
                 hosts: vec!["myapp.rise.dev".to_string()],
                 path_prefix: Some("/".to_string()),
+                access: None,
             },
             DesiredRoute {
                 hosts: vec!["myapp.rise.dev".to_string()],
                 path_prefix: Some("/api/v1".to_string()),
+                access: None,
             },
         ];
         let built = build_container(&desired, &test_cfg());
@@ -1642,10 +1687,12 @@ mod tests {
             DesiredRoute {
                 hosts: vec!["myapp.rise.dev".to_string()],
                 path_prefix: Some("/".to_string()),
+                access: None,
             },
             DesiredRoute {
                 hosts: vec!["myapp.rise.dev".to_string()],
                 path_prefix: Some("/api/v1".to_string()),
+                access: None,
             },
         ];
         let built = build_container(&desired, &test_cfg());
@@ -1726,10 +1773,12 @@ mod tests {
             DesiredRoute {
                 hosts: vec!["myapp.rise.dev".to_string()],
                 path_prefix: Some("/".to_string()),
+                access: None,
             },
             DesiredRoute {
                 hosts: vec!["myapp.rise.dev".to_string()],
                 path_prefix: Some("/api/v1".to_string()),
+                access: None,
             },
         ];
         let built = build_container(&desired, &test_cfg());
@@ -1830,7 +1879,7 @@ mod tests {
                     "traefik.http.middlewares.{r}-auth.forwardauth.address"
                 ))
                 .map(String::as_str),
-            Some("http://rise:3000/api/v1/auth/ingress?project=myapp&signin_redirect=1")
+            Some("http://rise:3000/api/v1/auth/ingress?project=myapp&access=Member&signin_redirect=1")
         );
         assert_eq!(
             labels
@@ -1845,6 +1894,66 @@ mod tests {
                 .get(&format!("traefik.http.routers.{r}.middlewares"))
                 .map(String::as_str),
             Some(format!("{r}-auth@docker").as_str())
+        );
+    }
+
+    #[test]
+    fn per_route_access_overrides_forward_auth_independently() {
+        // A public project (access_class None) with two routes: `/` inherits
+        // public, `/admin` is tightened to Member. Only the `/admin` router gets
+        // forwardAuth, and its address stamps `&access=Member`.
+        let map = public_private_map();
+        let cfg = BuilderConfig {
+            auth_backend_url: "http://rise:3000",
+            access_classes: &map,
+            ..test_cfg()
+        };
+        let mut desired = single_container();
+        desired.access_class = "public".to_string();
+        desired.routes = vec![
+            DesiredRoute {
+                hosts: vec!["myapp.rise.dev".to_string()],
+                path_prefix: Some("/".to_string()),
+                access: None,
+            },
+            DesiredRoute {
+                hosts: vec!["myapp.rise.dev".to_string()],
+                path_prefix: Some("/admin".to_string()),
+                access: Some(AccessRequirement::Member),
+            },
+        ];
+        let built = build_container(&desired, &cfg);
+        let labels = built.config.labels.as_ref().unwrap();
+
+        // Routers are indexed longest-path-prefix first, so `/admin` (idx 0)
+        // precedes `/` (idx 1).
+        let base = group_service_base("myapp", "default", "app");
+        let member_router = group_service_name(&base, 0, 2);
+        let public_router = group_service_name(&base, 1, 2);
+
+        // `/` router: no forwardAuth middleware.
+        assert!(
+            labels
+                .get(&format!("traefik.http.routers.{public_router}.middlewares"))
+                .is_none(),
+            "public route must not be gated"
+        );
+        // `/admin` router: forwardAuth wired with `&access=Member`.
+        assert_eq!(
+            labels
+                .get(&format!(
+                    "traefik.http.middlewares.{member_router}-auth.forwardauth.address"
+                ))
+                .map(String::as_str),
+            Some(
+                "http://rise:3000/api/v1/auth/ingress?project=myapp&access=Member&signin_redirect=1"
+            )
+        );
+        assert_eq!(
+            labels
+                .get(&format!("traefik.http.routers.{member_router}.middlewares"))
+                .map(String::as_str),
+            Some(format!("{member_router}-auth@docker").as_str())
         );
     }
 
@@ -1980,7 +2089,7 @@ mod tests {
                     "traefik.http.middlewares.{r}-auth.forwardauth.address"
                 ))
                 .map(String::as_str),
-            Some("http://rise:3000/api/v1/auth/ingress?project=myapp&signin_redirect=1")
+            Some("http://rise:3000/api/v1/auth/ingress?project=myapp&access=Member&signin_redirect=1")
         );
     }
 
@@ -2007,7 +2116,7 @@ mod tests {
                     "traefik.http.middlewares.{r}-auth.forwardauth.address"
                 ))
                 .map(String::as_str),
-            Some("http://rise:3000/api/v1/auth/ingress?project=myapp&signin_redirect=1")
+            Some("http://rise:3000/api/v1/auth/ingress?project=myapp&access=Member&signin_redirect=1")
         );
         assert_eq!(
             labels

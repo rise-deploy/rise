@@ -271,6 +271,7 @@ mod tests {
         let routes = vec![RouteSpec {
             path: "/".to_string(),
             container: "api".to_string(),
+            access: None,
         }];
         validate_containers_and_routes(Some(&containers), &routes).unwrap();
     }
@@ -285,6 +286,7 @@ mod tests {
         let routes = vec![RouteSpec {
             path: "/.rise".to_string(),
             container: "api".to_string(),
+            access: None,
         }];
         let err = validate_containers_and_routes(Some(&containers), &routes).unwrap_err();
         assert!(err.message.contains("reserved") && err.message.contains("/.rise"));
@@ -317,6 +319,7 @@ mod tests {
             "/".to_string(),
             crate::project_config::RouteConfig {
                 container: "api".to_string(),
+                access: None,
             },
         );
         let err = validate_project_config(&config).unwrap_err();

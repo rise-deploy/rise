@@ -521,6 +521,7 @@ mod tests {
         let routes = vec![RouteSpec {
             path: "/".to_string(),
             container: "app".to_string(),
+            access: None,
         }];
         // A single-route container uses the bare base name — exactly what the
         // labels stamp (`group_service_names` over the matching DesiredContainer).
@@ -552,14 +553,17 @@ mod tests {
             RouteSpec {
                 path: "/".to_string(),
                 container: "api".to_string(),
+                access: None,
             },
             RouteSpec {
                 path: "/api/v1".to_string(),
                 container: "api".to_string(),
+                access: None,
             },
             RouteSpec {
                 path: "/".to_string(),
                 container: "other".to_string(),
+                access: None,
             },
         ];
         // Per-route services, longest path-prefix first (-0 = /api/v1, -1 = /),
@@ -593,6 +597,7 @@ mod tests {
                 .map(|p| DesiredRoute {
                     hosts: vec!["myapp.rise.dev".to_string()],
                     path_prefix: Some(p.to_string()),
+                    access: None,
                 })
                 .collect();
             d
@@ -613,6 +618,7 @@ mod tests {
                 .map(|p| RouteSpec {
                     path: p.to_string(),
                     container: container.to_string(),
+                    access: None,
                 })
                 .collect();
             (spec, routes)
@@ -670,6 +676,7 @@ mod tests {
         let routes = vec![RouteSpec {
             path: "/".to_string(),
             container: "app".to_string(),
+            access: None,
         }];
         // Same spec/routes that yield a service WITH a host — but with no host the
         // result is empty.

@@ -953,6 +953,7 @@ impl DockerReconciler {
                 .map(|r| DesiredRoute {
                     hosts: primary_hosts.clone(),
                     path_prefix: Some(r.path.clone()),
+                    access: r.access.clone(),
                 })
                 .collect();
 

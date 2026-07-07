@@ -11,7 +11,7 @@ publish = false
 default = []
 # Enables `schemars::JsonSchema` derives on the shared settings types so
 # `rise-deploy` can include them in the generated backend-config schema.
-schema = ["dep:schemars"]
+schema = ["dep:schemars", "rise-deployment-spec/schema"]
 
 [dependencies]
 anyhow = { workspace = true }

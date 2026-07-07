@@ -1,3 +1,4 @@
+use crate::access::AccessRequirement;
 use serde::{Deserialize, Serialize};
 
 /// A runtime environment variable override included in a deployment request.
@@ -68,6 +69,12 @@ pub struct ContainerSpec {
 pub struct RouteSpec {
     pub path: String,
     pub container: String,
+    /// Per-route ingress auth requirement override (see
+    /// `project_config::RouteConfig::access`). Additive and `#[serde(default)]`,
+    /// so existing `CONTAINER_SIDE_DATA_VERSION` side-data (which predates this
+    /// field) decodes with `access = None` — no version bump needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<AccessRequirement>,
 }
 
 #[cfg(test)]

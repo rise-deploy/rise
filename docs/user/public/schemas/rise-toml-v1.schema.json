@@ -1,5 +1,25 @@
 {
   "$defs": {
+    "AccessRequirement": {
+      "description": "Access requirement level for ingress authentication.\n\nUsed both as the `access_requirement` of a server-configured access class\n(project-wide) and as the optional per-route `access` override in\n`.rise.toml`. The canonical spelling is PascalCase (matching the access-class\nsettings); lowercase spellings are accepted as aliases for convenience in\n`.rise.toml`.",
+      "oneOf": [
+        {
+          "const": "None",
+          "description": "No authentication required - fully public access",
+          "type": "string"
+        },
+        {
+          "const": "Authenticated",
+          "description": "Must be authenticated, but no project membership required",
+          "type": "string"
+        },
+        {
+          "const": "Member",
+          "description": "Must be authenticated AND have project membership (owner or team member)",
+          "type": "string"
+        }
+      ]
+    },
     "BoolFalse": {
       "const": false,
       "type": "boolean"
@@ -332,6 +352,17 @@
     "RouteConfig": {
       "description": "One ingress path → container mapping.",
       "properties": {
+        "access": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AccessRequirement"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Per-route override of the ingress auth requirement. Overrides *only* the\n`access_requirement` of the project's access class for this route's path\n(the access class's `ingress_class` and `custom_annotations` are per-host\nand always apply project-wide). When absent, the route inherits the\nproject's requirement. Lets a single route be opened (`None`) or tightened\n(`Member`) relative to the rest of the project."
+        },
         "container": {
           "description": "Target container name (must exist in `[containers]` and have `port` set).\nThe route's port is always the target container's `port`.",
           "type": "string"

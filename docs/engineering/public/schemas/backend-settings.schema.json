@@ -37,7 +37,7 @@
       "type": "object"
     },
     "AccessRequirement": {
-      "description": "Access requirement level for project ingress.",
+      "description": "Access requirement level for ingress authentication.\n\nUsed both as the `access_requirement` of a server-configured access class\n(project-wide) and as the optional per-route `access` override in\n`.rise.toml`. The canonical spelling is PascalCase (matching the access-class\nsettings); lowercase spellings are accepted as aliases for convenience in\n`.rise.toml`.",
       "oneOf": [
         {
           "const": "None",
