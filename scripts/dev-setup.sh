@@ -9,6 +9,10 @@
 #                                          (base + *.rise.local ingress hosts
 #                                           enumerated from the current cluster)
 #   ./scripts/dev-setup.sh hosts-clear   # remove the managed /etc/hosts block
+#   ./scripts/dev-setup.sh hosts-watch   # background watcher: keep the managed
+#                                          /etc/hosts block synced to ingress
+#                                          changes (idempotent — won't double-spawn)
+#   ./scripts/dev-setup.sh hosts-watch-down # stop the /etc/hosts watcher
 #   ./scripts/dev-setup.sh docker        # only Docker insecure-registries
 #   ./scripts/dev-setup.sh docker-clear  # remove rise registries from daemon.json
 #   ./scripts/dev-setup.sh minikube      # bring up local minikube + helm install
@@ -39,6 +43,11 @@ REQUIRED_REGISTRIES='["rise-registry:5000","localhost:5000","127.0.0.1:5000","ri
 # between them is rewritten on each `hosts` run and removed on `hosts-clear`.
 HOSTS_BEGIN_MARKER='# >>> rise dev hosts (managed by scripts/dev-setup.sh) >>>'
 HOSTS_END_MARKER='# <<< rise dev hosts <<<'
+
+# Background /etc/hosts watcher bookkeeping. Machine-global (like /etc/hosts
+# itself) and kept out of the repo so worktrees don't accumulate stray files.
+HOSTS_WATCH_LOG="${TMPDIR:-/tmp}/rise-dev-hosts-watch.log"
+HOSTS_WATCH_PID="${TMPDIR:-/tmp}/rise-dev-hosts-watch.pid"
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m OK\033[0m %s\n' "$*"; }
@@ -117,17 +126,34 @@ setup_hosts() {
     echo "$HOSTS_END_MARKER"
   } >> "$tmp"
 
-  if ! cmp -s "$tmp" /etc/hosts; then
-    sudo cp "$tmp" /etc/hosts
+  if cmp -s "$tmp" /etc/hosts; then
+    ok "/etc/hosts already up to date"
+  elif apply_hosts_file "$tmp"; then
     if (( ${#ingress_hosts[@]} > 0 )); then
       ok "/etc/hosts updated (base + ${#ingress_hosts[@]} ingress host(s): ${ingress_hosts[*]})"
     else
       ok "/etc/hosts updated (base hosts only; no cluster reachable or no *.rise.local ingresses)"
     fi
-  else
-    ok "/etc/hosts already up to date"
   fi
   rm -f "$tmp"
+}
+
+# Privileged copy of the candidate hosts file (already known to differ from
+# /etc/hosts). Interactive callers may be prompted by sudo. The background
+# daemon (RISE_HOSTS_WATCH_DAEMON=1) stays non-interactive and degrades
+# gracefully when its sudo timestamp has lapsed (e.g. after the terminal that
+# primed it closed) — it logs and returns non-zero instead of blocking.
+apply_hosts_file() {
+  local tmp=$1
+  if [[ "${RISE_HOSTS_WATCH_DAEMON:-}" == "1" ]]; then
+    if sudo -n cp "$tmp" /etc/hosts 2>/dev/null; then
+      return 0
+    fi
+    warn "hosts-watch: sudo credentials lapsed; /etc/hosts not updated."
+    warn "hosts-watch: re-run 'mise setup hosts-watch' to re-prime sudo."
+    return 1
+  fi
+  sudo cp "$tmp" /etc/hosts
 }
 
 clear_hosts() {
@@ -204,6 +230,84 @@ check_hosts() {
     ' /etc/hosts || missing+=("$h")
   done
   (( ${#missing[@]} == 0 ))
+}
+
+# Is the current kubectl context pointing at a reachable cluster? Generalizes
+# the probe inlined in collect_ingress_rise_hosts. Used to gate the watcher
+# opt-in (the watcher is pointless without a cluster to enumerate).
+cluster_reachable() {
+  command -v kubectl >/dev/null 2>&1 || return 1
+  kubectl --request-timeout=3s get --raw /healthz >/dev/null 2>&1
+}
+
+# ---- /etc/hosts watcher (background) --------------------------------------
+
+# Source of truth for "is the watcher up?" is the unique internal daemon
+# command line (mirrors stop_ingress_port_forward / stop_loki_port_forward).
+# The PID file is only for friendly messaging.
+hosts_watch_running() {
+  pgrep -f 'dev-setup\.sh hosts-watch-run' >/dev/null 2>&1
+}
+
+# Spawn the background watcher (detached) unless one is already running. Primes
+# sudo on the current TTY first so the daemon starts with valid credentials.
+start_hosts_watch() {
+  require_cmd kubectl
+  if hosts_watch_running; then
+    ok "/etc/hosts watcher already running (PID: $(pgrep -f 'dev-setup\.sh hosts-watch-run' | head -1))"
+    return 0
+  fi
+  ensure_sudo
+  log "Starting /etc/hosts watcher (event-driven; logs: $HOSTS_WATCH_LOG)"
+  RISE_HOSTS_WATCH_DAEMON=1 nohup "$0" hosts-watch-run >"$HOSTS_WATCH_LOG" 2>&1 &
+  echo "$!" > "$HOSTS_WATCH_PID"
+  disown 2>/dev/null || true
+  sleep 1
+  if hosts_watch_running; then
+    ok "/etc/hosts watcher running (PID: $(cat "$HOSTS_WATCH_PID"))"
+  else
+    err "Watcher failed to start; see $HOSTS_WATCH_LOG"
+    return 1
+  fi
+}
+
+# The detached daemon body (internal subcommand `hosts-watch-run`). Keeps its
+# own sudo timestamp alive (tied to its own lifetime), reconciles /etc/hosts
+# once up front, then re-reconciles on each debounced ingress event. When the
+# watch stream ends (cluster restart, network blip, context change) it
+# reconciles once more and reconnects after a short backoff.
+hosts_watch_loop() {
+  require_cmd kubectl
+  local debounce=${RISE_HOSTS_WATCH_DEBOUNCE:-2}
+  # Keep sudo alive while we live. `$$` inside the subshell is this daemon's
+  # PID, so the keep-alive exits when the daemon is killed (same idiom as
+  # ensure_sudo). It also exits the moment creds lapse — the write path then
+  # degrades gracefully and logs.
+  ( while kill -0 "$$" 2>/dev/null && sudo -n true 2>/dev/null; do sleep 50; done ) &
+  log "hosts-watch: started (event-driven)"
+  setup_hosts || true
+  while true; do
+    kubectl get ingress --all-namespaces --watch-only -o name 2>/dev/null \
+      | while IFS= read -r _; do
+          sleep "$debounce"
+          setup_hosts || true
+        done
+    setup_hosts || true
+    sleep 5
+  done
+}
+
+stop_hosts_watch() {
+  local pids
+  pids=$(pgrep -f 'dev-setup\.sh hosts-watch-run' 2>/dev/null || true)
+  if [[ -n "$pids" ]]; then
+    log "Stopping /etc/hosts watcher: $pids"
+    kill $pids 2>/dev/null || true
+    ok "/etc/hosts watcher stopped"
+  else
+    ok "No /etc/hosts watcher running"
+  fi
+  rm -f "$HOSTS_WATCH_PID"
 }
 
 # ---- Docker insecure-registries -------------------------------------------
@@ -737,6 +841,7 @@ clear_docker() {
 
 cmd_down() {
   log "This will undo what 'mise setup' did:"
+  echo "    - stop the /etc/hosts watcher (if running)"
   echo "    - terminate any 'kubectl port-forward' for ingress-nginx (8080/8443)"
   echo "    - terminate any 'kubectl port-forward' for Loki (3100)"
   echo "    - delete the minikube cluster (if present)"
@@ -754,7 +859,9 @@ cmd_down() {
   fi
 
   # Reverse order of setup, so we don't pull /etc/hosts entries out from
-  # under a still-running cluster.
+  # under a still-running cluster. Stop the watcher first so it can't re-add
+  # ingress entries after clear_hosts wipes the managed block.
+  stop_hosts_watch
   stop_loki_port_forward
   stop_ingress_port_forward
   down_minikube
@@ -821,6 +928,20 @@ cmd_all() {
       exit 1
       ;;
   esac
+
+  # Offer to keep /etc/hosts auto-synced as ingress hosts come and go. Only
+  # meaningful with a reachable cluster; opt-in (default N).
+  if cluster_reachable; then
+    if hosts_watch_running; then
+      ok "/etc/hosts watcher already running"
+    else
+      local watch_ans
+      watch_ans=$(ask "Keep /etc/hosts auto-updated as ingress hosts come and go? Starts a background watcher. (y/N)" "N")
+      if [[ "$watch_ans" =~ ^[Yy]$ ]]; then
+        start_hosts_watch
+      fi
+    fi
+  fi
 }
 
 usage() {
@@ -831,23 +952,26 @@ usage() {
 main() {
   local cmd=${1:-all}
   case "$cmd" in
-    -h|--help|help) usage 0 ;;
-    hosts)         setup_hosts ;;
-    hosts-clear)   clear_hosts ;;
-    docker)        setup_docker ;;
-    docker-clear)  clear_docker ;;
-    minikube)      setup_minikube ;;
-    minikube-down) down_minikube ;;
-    k3s)           setup_k3s ;;
-    k3s-down)      down_k3s ;;
-    pf)            start_ingress_port_forward ;;
-    pf-down)       stop_ingress_port_forward ;;
-    loki-pf)       start_loki_port_forward ;;
-    loki-pf-down)  stop_loki_port_forward ;;
-    preflight)     cmd_preflight ;;
-    all)           cmd_all ;;
-    down)          cmd_down ;;
-    *)             err "Unknown command: $cmd"; usage 1 ;;
+    -h|--help|help)   usage 0 ;;
+    hosts)            setup_hosts ;;
+    hosts-clear)      clear_hosts ;;
+    hosts-watch)      start_hosts_watch ;;
+    hosts-watch-run)  hosts_watch_loop ;;   # internal: the detached daemon body
+    hosts-watch-down) stop_hosts_watch ;;
+    docker)           setup_docker ;;
+    docker-clear)     clear_docker ;;
+    minikube)         setup_minikube ;;
+    minikube-down)    down_minikube ;;
+    k3s)              setup_k3s ;;
+    k3s-down)         down_k3s ;;
+    pf)               start_ingress_port_forward ;;
+    pf-down)          stop_ingress_port_forward ;;
+    loki-pf)          start_loki_port_forward ;;
+    loki-pf-down)     stop_loki_port_forward ;;
+    preflight)        cmd_preflight ;;
+    all)              cmd_all ;;
+    down)             cmd_down ;;
+    *)                err "Unknown command: $cmd"; usage 1 ;;
   esac
 }
 
