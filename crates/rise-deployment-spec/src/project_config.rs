@@ -4,7 +4,7 @@
 //! behavior that depends on filesystems, registries, databases, or controllers stays
 //! in the root crate.
 
-use crate::access::AccessRequirement;
+use crate::access::{AccessRequirement, RouteAccess};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
@@ -157,14 +157,15 @@ pub struct RouteConfig {
     /// The route's port is always the target container's `port`.
     pub container: String,
 
-    /// Per-route override of the ingress auth requirement. Overrides *only* the
-    /// `access_requirement` of the project's access class for this route's path
-    /// (the access class's `ingress_class` and `custom_annotations` are per-host
-    /// and always apply project-wide). When absent, the route inherits the
-    /// project's requirement. Lets a single route be opened (`None`) or tightened
-    /// (`Member`) relative to the rest of the project.
+    /// Per-route override of the ingress auth requirement (`public` /
+    /// `authenticated` / `member`). Overrides *only* the access requirement for
+    /// this route's path — the project access class's `ingress_class` and
+    /// `custom_annotations` are per-host and always apply project-wide. When
+    /// absent, the route inherits the project's requirement. Lets a single route
+    /// be opened (`public`) or tightened (`member`) relative to the rest of the
+    /// project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub access: Option<AccessRequirement>,
+    pub access: Option<RouteAccess>,
 }
 
 /// Name of the implicit container the backend synthesises for a single-container
@@ -353,7 +354,7 @@ impl ProjectBuildConfig {
                 resolved.push(ResolvedRoute {
                     path: path.clone(),
                     container: route.container.clone(),
-                    access: route.access.clone(),
+                    access: route.access.map(AccessRequirement::from),
                 });
             }
             resolved
@@ -409,11 +410,11 @@ mod tests {
 
             [routes."/healthz"]
             container = "web"
-            access = "none"
+            access = "public"
 
             [routes."/admin"]
             container = "web"
-            access = "Member"
+            access = "member"
         "#;
         let config: ProjectBuildConfig = toml::from_str(toml).unwrap();
         let resolved = config.resolve_deploy().unwrap();
@@ -427,6 +428,7 @@ mod tests {
                 .clone()
         };
         assert_eq!(by_path("/"), None, "no `access` → inherit (None option)");
+        // `public` on the route maps to the internal `None` requirement.
         assert_eq!(by_path("/healthz"), Some(AccessRequirement::None));
         assert_eq!(by_path("/admin"), Some(AccessRequirement::Member));
     }

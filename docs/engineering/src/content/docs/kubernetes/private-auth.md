@@ -186,7 +186,7 @@ The application receives authenticated requests with these additional headers:
 ## Per-route access requirements
 
 A route can override **only the access requirement** for its path via
-`.rise.toml` `[routes].access` (`none` / `authenticated` / `member`), letting a
+`.rise.toml` `[routes].access` (`public` / `authenticated` / `member`), letting a
 single route be opened or tightened relative to the rest of the project. The
 access class's `ingress_class` and `custom_annotations` are per-host and always
 apply project-wide — they cannot vary per route.

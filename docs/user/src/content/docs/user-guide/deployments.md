@@ -297,12 +297,12 @@ otherwise-private app or lock one path down on an otherwise-public one:
 
 ```toml
 [routes]
-"/"        = { container = "frontend" }                    # inherits the project's access
-"/healthz" = { container = "frontend", access = "none" }   # always reachable, no login
-"/admin"   = { container = "backend",  access = "member" } # only project members
+"/"        = { container = "frontend" }                     # inherits the project's access
+"/healthz" = { container = "frontend", access = "public" }  # always reachable, no login
+"/admin"   = { container = "backend",  access = "member" }  # only project members
 ```
 
-`access` accepts `none` (no authentication), `authenticated` (any signed-in
+`access` accepts `public` (no authentication), `authenticated` (any signed-in
 user), or `member` (project owner/team member). Omit it to inherit the project
 default. Only the auth gate varies per route — the ingress class and any custom
 ingress annotations from the access class still apply to the whole app. This
