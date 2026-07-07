@@ -297,9 +297,10 @@ otherwise-private app or lock one path down on an otherwise-public one:
 
 ```toml
 [routes]
-"/"        = { container = "frontend" }                     # inherits the project's access
-"/healthz" = { container = "frontend", access = "public" }  # always reachable, no login
-"/admin"   = { container = "backend",  access = "member" }  # only project members
+"/"        = { container = "frontend" }                            # inherits the project's access
+"/healthz" = { container = "frontend", access = "public" }        # always reachable, no login
+"/account" = { container = "frontend", access = "authenticated" } # any signed-in user
+"/admin"   = { container = "backend",  access = "member" }        # only project members
 ```
 
 `access` accepts `public` (no authentication), `authenticated` (any signed-in

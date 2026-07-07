@@ -31,6 +31,7 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
         Box::new(PublicDeploy),
         Box::new(SaTokenExchange),
         Box::new(PrivateIngressAuth),
+        Box::new(RouteAccessOverride),
         Box::new(HealthRollingCutover),
         Box::new(LokiLogRetention),
         Box::new(HelmIdempotency),
@@ -757,6 +758,124 @@ impl Scenario for PrivateIngressAuth {
                 authed.body
             );
         }
+        Ok(())
+    }
+}
+
+// ---- per-route access override ---------------------------------------------
+
+/// A private project whose `[routes].access` opens one path to the public and
+/// leaves another inheriting the gated project default. Exercises the per-route
+/// override end to end through the real ingress on both backends (nginx
+/// per-requirement-group Ingress split; Traefik per-router forwardAuth).
+struct RouteAccessOverride;
+
+impl Scenario for RouteAccessOverride {
+    fn id(&self) -> &'static str {
+        "route-access-override"
+    }
+
+    fn applies_to(&self, _b: &dyn Backend) -> Applicability {
+        // Per-route access is enforced by proxy-native routing on both backends,
+        // so the loosen-one-path contract holds on each.
+        Applicability::Run
+    }
+
+    fn run(&self, b: &dyn Backend) -> Result<()> {
+        let project = unique("e2e-routeacc");
+        let app = b.sample_app();
+
+        // Base access class = private (gated), with `/public` opened via
+        // `[routes].access`. `[routes]` needs a `[containers]` block, so deploy
+        // from a generated project dir rather than `--image`.
+        expect_ok(
+            b.rise_cli(
+                &[
+                    "project",
+                    "create",
+                    &project,
+                    "--access-class",
+                    "private",
+                    "--no-rise-toml",
+                ],
+                None,
+            )?,
+            "project create",
+        )?;
+
+        let dir = std::env::temp_dir().join(unique("rise-routeacc"));
+        std::fs::create_dir_all(&dir).context("create route-access project dir")?;
+        std::fs::write(
+            dir.join("rise.toml"),
+            format!(
+                "[project]\nname = \"{project}\"\n\n\
+                 [containers.app]\nimage = \"{}\"\nport = {}\n\n\
+                 [routes]\n\
+                 \"/\" = {{ container = \"app\" }}\n\
+                 \"/public\" = {{ container = \"app\", access = \"public\" }}\n",
+                app.image, app.http_port
+            ),
+        )
+        .context("write route-access rise.toml")?;
+        let dir = dir.to_string_lossy().to_string();
+
+        expect_ok(
+            b.rise_cli(&["deploy", &dir, "--project", &project], None)?,
+            "deploy",
+        )?;
+        b.wait_healthy(&project)?;
+
+        // The opened route is reachable with no session (poll through warmup).
+        let mut public_status = 0;
+        for _ in 0..45 {
+            match b.ingress_get(&project, "/public", false, None) {
+                Ok(r) if r.status == 200 => {
+                    public_status = 200;
+                    break;
+                }
+                Ok(r) => public_status = r.status,
+                Err(_) => {}
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        anyhow::ensure!(
+            public_status == 200,
+            "expected 200 for the `access = \"public\"` route without a session, got {public_status}"
+        );
+
+        // The inherited route stays gated: unauthenticated → 302 to signin.
+        let mut root_status = 0;
+        let mut location = None;
+        for _ in 0..45 {
+            match b.ingress_get(&project, "/", false, None) {
+                Ok(r) if r.status == 302 => {
+                    root_status = 302;
+                    location = r.location;
+                    break;
+                }
+                Ok(r) => root_status = r.status,
+                Err(_) => {}
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        anyhow::ensure!(
+            root_status == 302,
+            "expected 302 for the inherited (private) route without a session, got {root_status}"
+        );
+        let location = location.context("302 had no Location header")?;
+        anyhow::ensure!(
+            location.contains("/.rise/auth/signin"),
+            "inherited route did not redirect to signin: {location}"
+        );
+
+        // …and it still lets an authenticated request through.
+        let cookie = format!("rise_jwt={}", b.ci_bearer());
+        let authed = b.ingress_get(&project, "/", false, Some(&cookie))?;
+        anyhow::ensure!(
+            authed.status == 200,
+            "expected 200 for an authed request to the gated route, got {}",
+            authed.status
+        );
         Ok(())
     }
 }

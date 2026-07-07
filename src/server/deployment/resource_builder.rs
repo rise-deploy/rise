@@ -1556,6 +1556,15 @@ impl ResourceBuilder {
         // shared-host merge; the group's name gets a requirement suffix only when
         // more than one group exists (so the common single-group case keeps the
         // stable, un-suffixed name and never churns on upgrade).
+        //
+        // Auth-gate correctness in sub-path mode (regex locations) relies on
+        // ingress-nginx merging all same-host paths into one server block ordered
+        // by path length — so the longer, more-specific gated regex outranks a
+        // shorter group's public catch-all whether the two live in one Ingress or
+        // are split across group Ingresses. This is the same ordering the existing
+        // multi-container routing depends on to send `/api` and `/` to different
+        // containers; the split preserves it. The `RouteAccessOverride` e2e
+        // scenario exercises this against a real ingress on both backends.
         let groups = group_routes_by_requirement(routes);
         let multi = groups.len() > 1;
         let mut ingresses = Vec::with_capacity(groups.len());
@@ -1596,8 +1605,18 @@ impl ResourceBuilder {
                 })
                 .collect();
 
+            // Single-group deployments keep the stable, un-suffixed name (no
+            // upgrade churn). Multi-group deployments append `-acc-<req>`; the
+            // `-acc-` infix keeps the split-ingress names clear of the bare
+            // `{base}` a single-group deployment would use (the same collision
+            // class that already exists for two groups whose names escape to the
+            // same string — see `escaped_group_name`).
             let name = if multi {
-                format!("{}-{}", base_name, requirement_ingress_suffix(&requirement))
+                format!(
+                    "{}-acc-{}",
+                    base_name,
+                    requirement_ingress_suffix(&requirement)
+                )
             } else {
                 base_name.clone()
             };
@@ -1668,8 +1687,18 @@ impl ResourceBuilder {
                 })
                 .collect();
 
+            // Single-group deployments keep the stable, un-suffixed name (no
+            // upgrade churn). Multi-group deployments append `-acc-<req>`; the
+            // `-acc-` infix keeps the split-ingress names clear of the bare
+            // `{base}` a single-group deployment would use (the same collision
+            // class that already exists for two groups whose names escape to the
+            // same string — see `escaped_group_name`).
             let name = if multi {
-                format!("{}-{}", base_name, requirement_ingress_suffix(&requirement))
+                format!(
+                    "{}-acc-{}",
+                    base_name,
+                    requirement_ingress_suffix(&requirement)
+                )
             } else {
                 base_name.clone()
             };
@@ -2724,11 +2753,11 @@ mod tests {
 
         let public = ingresses
             .iter()
-            .find(|i| name_of(i).ends_with("-public"))
+            .find(|i| name_of(i).ends_with("-acc-public"))
             .expect("public group ingress");
         let member = ingresses
             .iter()
-            .find(|i| name_of(i).ends_with("-member"))
+            .find(|i| name_of(i).ends_with("-acc-member"))
             .expect("member group ingress");
 
         // Public group is not gated; member group is gated with `&access=Member`.
