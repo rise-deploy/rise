@@ -27,16 +27,6 @@ enum RouteForwardAuth {
     Withheld,
 }
 
-/// Wire spelling of an access requirement for the forwardAuth `access` query
-/// param. Must match the PascalCase serde form the `ingress_auth` handler parses.
-fn access_requirement_param(requirement: &AccessRequirement) -> &'static str {
-    match requirement {
-        AccessRequirement::None => "None",
-        AccessRequirement::Authenticated => "Authenticated",
-        AccessRequirement::Member => "Member",
-    }
-}
-
 /// One ingress route attached to a routable container.
 #[derive(Debug, Clone)]
 pub struct DesiredRoute {
@@ -689,7 +679,7 @@ fn render_traefik_labels_for(
                         "{}/api/v1/auth/ingress?project={}&access={}&signin_redirect=1",
                         cfg.auth_backend_url.trim_end_matches('/'),
                         urlencoding::encode(&desired.project),
-                        access_requirement_param(route_requirement),
+                        route_requirement.as_query_param(),
                     ))
                 }
             }
@@ -712,6 +702,30 @@ fn render_traefik_labels_for(
             "Withholding Traefik router(s): forwardAuth could not be wired \
              (auth_backend_url is empty) for an access requirement that mandates \
              authentication — refusing to expose an unauthenticated public route"
+        );
+        return out;
+    }
+
+    // FAIL CLOSED per route: if ANY route's effective requirement needs auth but
+    // forwardAuth can't be wired (empty `auth_backend_url`), withhold the WHOLE
+    // container. A per-route `access` override can introduce an auth requirement
+    // the container-level `router_withheld` guard (which only sees the access
+    // class) does not catch; dropping just that route's router would leave a
+    // broader sibling (e.g. `/`) serving the gated path unauthenticated.
+    let any_route_withheld = desired.routes.iter().any(|route| {
+        let route_requirement = route.access.clone().unwrap_or_else(|| requirement.clone());
+        matches!(
+            route_forward_auth(&route_requirement),
+            RouteForwardAuth::Withheld
+        )
+    });
+    if any_route_withheld {
+        tracing::warn!(
+            project = %desired.project,
+            access_class = %desired.access_class,
+            "Withholding Traefik router(s): a route requires authentication but \
+             forwardAuth could not be wired (auth_backend_url is empty) — refusing \
+             to leave a sibling route serving the gated path unauthenticated"
         );
         return out;
     }
@@ -746,18 +760,9 @@ fn render_traefik_labels_for(
         let forward_auth_address = match route_forward_auth(&route_requirement) {
             RouteForwardAuth::Open => None,
             RouteForwardAuth::Gated(address) => Some(address),
-            RouteForwardAuth::Withheld => {
-                // Auth required but no `auth_backend_url` to wire it: withhold
-                // this router (fail closed) instead of exposing an open route.
-                tracing::warn!(
-                    project = %desired.project,
-                    path = route.path_prefix.as_deref().unwrap_or("/"),
-                    "Withholding Traefik router for route: forwardAuth could not be \
-                     wired (auth_backend_url is empty) for an access requirement that \
-                     mandates authentication"
-                );
-                continue;
-            }
+            // Unreachable: the pre-loop scan above withholds the whole container
+            // if any route is Withheld. Fail closed defensively regardless.
+            RouteForwardAuth::Withheld => continue,
         };
         let router_name = group_service_name(&base, idx, route_count);
         let traefik = labels::render_traefik_labels(&TraefikRoute {
@@ -1954,6 +1959,43 @@ mod tests {
                 .get(&format!("traefik.http.routers.{member_router}.middlewares"))
                 .map(String::as_str),
             Some(format!("{member_router}-auth@docker").as_str())
+        );
+    }
+
+    #[test]
+    fn per_route_tighten_without_backend_url_withholds_whole_container() {
+        // FAIL CLOSED: a public project (empty auth_backend_url is valid — no
+        // access class needs auth) with a Member-tightened `/admin` route cannot
+        // wire forwardAuth for `/admin`. Dropping only that router would leave the
+        // `/` router serving `/admin/x` unauthenticated, so the WHOLE container
+        // must be withheld — zero Traefik labels.
+        let mut map = HashMap::new();
+        map.insert("public".to_string(), AccessRequirement::None);
+        let cfg = BuilderConfig {
+            auth_backend_url: "",
+            access_classes: &map,
+            ..test_cfg()
+        };
+        let mut desired = single_container();
+        desired.access_class = "public".to_string();
+        desired.routes = vec![
+            DesiredRoute {
+                hosts: vec!["myapp.rise.dev".to_string()],
+                path_prefix: Some("/".to_string()),
+                access: None,
+            },
+            DesiredRoute {
+                hosts: vec!["myapp.rise.dev".to_string()],
+                path_prefix: Some("/admin".to_string()),
+                access: Some(AccessRequirement::Member),
+            },
+        ];
+        let built = build_container(&desired, &cfg);
+        let labels = built.config.labels.as_ref().unwrap();
+        assert!(
+            !labels.keys().any(|k| k.starts_with("traefik.")),
+            "a route that can't be gated must withhold the whole container, \
+             not just its own router"
         );
     }
 

@@ -1826,33 +1826,42 @@ async fn compute_desired_children(
             .map(|s| s.name.as_str())
             .collect();
         let service_name_base = ResourceBuilder::service_name(project, active_deployment);
-        // Each route's effective auth requirement is its per-route `access`
-        // override or the project's access-class default. The ingress builder
-        // partitions by this and gates each path group independently.
-        let project_requirement = resource_builder.project_access_requirement(project)?;
-        let routes: Vec<crate::server::deployment::resource_builder::IngressRoute> =
+        // Routable route specs: those targeting a container that exposes a port.
+        let routable_specs: Vec<&crate::server::deployment::models::RouteSpec> =
             routes_by_deployment
                 .get(&active_deployment.id)
                 .map(|route_specs| {
                     route_specs
                         .iter()
                         .filter(|r| routable_names.contains(r.container.as_str()))
-                        .map(
-                            |r| crate::server::deployment::resource_builder::IngressRoute {
-                                path: r.path.clone(),
-                                service_name: format!("{}-{}", service_name_base, r.container),
-                                requirement: rise_backend_core::effective_access_requirement(
-                                    r,
-                                    &project_requirement,
-                                ),
-                            },
-                        )
                         .collect()
                 })
                 .unwrap_or_default();
 
-        // A workers-only deployment (no routable container) emits no ingress.
-        if !routes.is_empty() {
+        // A workers-only deployment (no routable container) emits no ingress —
+        // and must not require the project's access class to resolve (resolving
+        // it here would fail reconcile for a workers-only group with a
+        // missing/misconfigured access class that never needed one).
+        if !routable_specs.is_empty() {
+            // Each route's effective auth requirement is its per-route `access`
+            // override or the project's access-class default. The ingress builder
+            // partitions by this and gates each path group independently.
+            let project_requirement = resource_builder.project_access_requirement(project)?;
+            let routes: Vec<crate::server::deployment::resource_builder::IngressRoute> =
+                routable_specs
+                    .iter()
+                    .map(
+                        |r| crate::server::deployment::resource_builder::IngressRoute {
+                            path: r.path.clone(),
+                            service_name: format!("{}-{}", service_name_base, r.container),
+                            requirement: rise_backend_core::effective_access_requirement(
+                                r,
+                                &project_requirement,
+                            ),
+                        },
+                    )
+                    .collect();
+
             // One or more Ingresses (one per effective-requirement group). An
             // empty result means every candidate host collided with another env's
             // URL — skip so nginx admission doesn't reject it (warning already

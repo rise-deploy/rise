@@ -23,6 +23,20 @@ pub enum AccessRequirement {
     Member,
 }
 
+impl AccessRequirement {
+    /// Wire spelling for the `auth-url` / forwardAuth `access` query param the
+    /// reconcilers stamp and the `ingress_auth` handler parses. MUST equal the
+    /// serde (PascalCase) representation — the test below locks that. Kept here,
+    /// next to the enum, so both backends share one source and can't drift.
+    pub fn as_query_param(&self) -> &'static str {
+        match self {
+            AccessRequirement::None => "None",
+            AccessRequirement::Authenticated => "Authenticated",
+            AccessRequirement::Member => "Member",
+        }
+    }
+}
+
 /// Per-route access spelling used in `.rise.toml` `[routes].access`.
 ///
 /// A route's auth requirement reads more naturally as `public` than the
@@ -66,6 +80,19 @@ mod tests {
             serde_json::to_string(&AccessRequirement::Member).unwrap(),
             "\"Member\""
         );
+    }
+
+    #[test]
+    fn as_query_param_matches_serde_form() {
+        // The `&access=` stamp must be byte-identical to what the handler parses.
+        for req in [
+            AccessRequirement::None,
+            AccessRequirement::Authenticated,
+            AccessRequirement::Member,
+        ] {
+            let serde_form = serde_json::to_string(&req).unwrap();
+            assert_eq!(format!("\"{}\"", req.as_query_param()), serde_form);
+        }
     }
 
     #[test]

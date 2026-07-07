@@ -46,16 +46,6 @@ pub struct IngressRoute {
     pub requirement: AccessRequirement,
 }
 
-/// Wire spelling of an access requirement for the `auth-url` `access` query
-/// param. Must match the PascalCase serde form the `ingress_auth` handler parses.
-fn access_requirement_param(requirement: &AccessRequirement) -> &'static str {
-    match requirement {
-        AccessRequirement::None => "None",
-        AccessRequirement::Authenticated => "Authenticated",
-        AccessRequirement::Member => "Member",
-    }
-}
-
 /// Short, DNS-safe suffix distinguishing per-requirement group ingresses when a
 /// deployment's routes span more than one effective requirement.
 fn requirement_ingress_suffix(requirement: &AccessRequirement) -> &'static str {
@@ -1301,7 +1291,7 @@ impl ResourceBuilder {
                     "{}/api/v1/auth/ingress?project={}&access={}",
                     self.auth_backend_url,
                     project.name,
-                    access_requirement_param(requirement),
+                    requirement.as_query_param(),
                 );
 
                 let signin_url = if self.backend_address.is_some() {
