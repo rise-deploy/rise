@@ -1838,15 +1838,14 @@ async fn compute_desired_children(
                 })
                 .unwrap_or_default();
 
-        // A workers-only deployment (no routable container) emits no ingress —
-        // and must not require the project's access class to resolve (resolving
-        // it here would fail reconcile for a workers-only group with a
-        // missing/misconfigured access class that never needed one).
+        // A workers-only deployment (no routable container) emits no ingress. The
+        // builder resolves the project's access class itself (after host
+        // selection), so a workers-only group — or a group whose hosts all
+        // collide — never forces a missing/misconfigured access class to resolve.
         if !routable_specs.is_empty() {
-            // Each route's effective auth requirement is its per-route `access`
-            // override or the project's access-class default. The ingress builder
-            // partitions by this and gates each path group independently.
-            let project_requirement = resource_builder.project_access_requirement(project)?;
+            // Carry each route's per-route `access` override; the builder resolves
+            // the effective requirement (override, else the project default) and
+            // partitions by it, gating each path group independently.
             let routes: Vec<crate::server::deployment::resource_builder::IngressRoute> =
                 routable_specs
                     .iter()
@@ -1854,10 +1853,7 @@ async fn compute_desired_children(
                         |r| crate::server::deployment::resource_builder::IngressRoute {
                             path: r.path.clone(),
                             service_name: format!("{}-{}", service_name_base, r.container),
-                            requirement: rise_backend_core::effective_access_requirement(
-                                r,
-                                &project_requirement,
-                            ),
+                            access_override: r.access.clone(),
                         },
                     )
                     .collect();

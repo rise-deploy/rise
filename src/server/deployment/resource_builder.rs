@@ -33,17 +33,19 @@ use rise_backend_core::DeploymentUrlBuilder;
 // consumers (e.g. the Docker reconciler) keep their import path.
 pub use rise_backend_core::IngressUrl;
 
-/// A resolved ingress route with the effective auth requirement for its path.
+/// A resolved ingress route: `(path, service_name)` plus its per-route auth
+/// override (`.rise.toml` `[routes].access`, `None` = inherit the project).
 ///
-/// The webhook resolves each `RouteSpec` to `(path, service_name)` plus the
-/// route's effective requirement (`effective_access_requirement`: the per-route
-/// `access` override or the project default). The ingress builder partitions a
-/// deployment's routes by this requirement and emits one Ingress per group so
-/// nginx gates each path group independently.
+/// The webhook builds these straight from the route specs; the ingress builder
+/// resolves the *effective* requirement (override, else the project default)
+/// itself — and only after it has confirmed a viable host, so a skipped ingress
+/// (all hosts collide) never forces the project's access class to resolve. It
+/// then partitions the routes by effective requirement and emits one Ingress per
+/// group so nginx gates each path group independently.
 pub struct IngressRoute {
     pub path: String,
     pub service_name: String,
-    pub requirement: AccessRequirement,
+    pub access_override: Option<AccessRequirement>,
 }
 
 /// Short, DNS-safe suffix distinguishing per-requirement group ingresses when a
@@ -57,12 +59,15 @@ fn requirement_ingress_suffix(requirement: &AccessRequirement) -> &'static str {
 }
 
 /// Partition a route table into per-effective-requirement groups in a fixed,
-/// deterministic order (`None`, `Authenticated`, `Member`). Empty groups are
-/// omitted. Every route's path belongs to exactly one group, so the resulting
-/// group ingresses have disjoint app paths on a shared host (nginx merges them).
-fn group_routes_by_requirement(
-    routes: &[IngressRoute],
-) -> Vec<(AccessRequirement, Vec<&IngressRoute>)> {
+/// deterministic order (`None`, `Authenticated`, `Member`). Each route's
+/// effective requirement is its override, else `project_requirement`. Empty
+/// groups are omitted. Every route's path belongs to exactly one group, so the
+/// resulting group ingresses have disjoint app paths on a shared host (nginx
+/// merges them).
+fn group_routes_by_requirement<'a>(
+    routes: &'a [IngressRoute],
+    project_requirement: &AccessRequirement,
+) -> Vec<(AccessRequirement, Vec<&'a IngressRoute>)> {
     [
         AccessRequirement::None,
         AccessRequirement::Authenticated,
@@ -70,7 +75,15 @@ fn group_routes_by_requirement(
     ]
     .into_iter()
     .filter_map(|req| {
-        let group: Vec<&IngressRoute> = routes.iter().filter(|r| r.requirement == req).collect();
+        let group: Vec<&IngressRoute> = routes
+            .iter()
+            .filter(|r| {
+                rise_backend_core::effective_access_requirement(
+                    r.access_override.as_ref(),
+                    project_requirement,
+                ) == req
+            })
+            .collect();
         (!group.is_empty()).then_some((req, group))
     })
     .collect()
@@ -1548,7 +1561,11 @@ impl ResourceBuilder {
             .map(|h| h.host.clone())
             .collect();
         let tls = self.build_primary_tls_config(&templated_hosts, inline_custom_domains);
+        // Resolve the access class only now — past the host-collision skip above,
+        // so a group whose hosts all collide never forces a (possibly
+        // misconfigured) access class to resolve for an ingress we won't emit.
         let ingress_class = self.get_ingress_class_for_project(project)?.to_string();
+        let project_requirement = self.project_access_requirement(project)?;
         let base_name = Self::ingress_name(project, deployment);
 
         // One Ingress per effective-requirement group. The `/.rise` backend path
@@ -1565,7 +1582,7 @@ impl ResourceBuilder {
         // multi-container routing depends on to send `/api` and `/` to different
         // containers; the split preserves it. The `RouteAccessOverride` e2e
         // scenario exercises this against a real ingress on both backends.
-        let groups = group_routes_by_requirement(routes);
+        let groups = group_routes_by_requirement(routes, &project_requirement);
         let multi = groups.len() > 1;
         let mut ingresses = Vec::with_capacity(groups.len());
         for (idx, (requirement, group_routes)) in groups.into_iter().enumerate() {
@@ -1660,9 +1677,10 @@ impl ResourceBuilder {
 
         let tls = self.build_custom_domain_tls_config(custom_domains);
         let ingress_class = self.get_ingress_class_for_project(project)?.to_string();
+        let project_requirement = self.project_access_requirement(project)?;
         let base_name = Self::custom_domain_ingress_name(project, deployment);
 
-        let groups = group_routes_by_requirement(routes);
+        let groups = group_routes_by_requirement(routes, &project_requirement);
         let multi = groups.len() > 1;
         let mut ingresses = Vec::with_capacity(groups.len());
         for (idx, (requirement, group_routes)) in groups.into_iter().enumerate() {
@@ -1890,11 +1908,15 @@ mod tests {
         }
     }
 
-    fn iroute(path: &str, service_name: &str, requirement: AccessRequirement) -> IngressRoute {
+    fn iroute(
+        path: &str,
+        service_name: &str,
+        access_override: Option<AccessRequirement>,
+    ) -> IngressRoute {
         IngressRoute {
             path: path.to_string(),
             service_name: service_name.to_string(),
-            requirement,
+            access_override,
         }
     }
 
@@ -2625,7 +2647,7 @@ mod tests {
                 &domains,
                 Some("production"),
                 &[],
-                &[iroute("/", "default-app", AccessRequirement::None)],
+                &[iroute("/", "default-app", None)],
             )
             .expect("primary ingress");
         assert_eq!(ingresses.len(), 1, "single requirement group → one ingress");
@@ -2683,7 +2705,7 @@ mod tests {
                 &[],
                 Some("staging"),
                 std::slice::from_ref(&staging_env),
-                &[iroute("/", "staging-app", AccessRequirement::None)],
+                &[iroute("/", "staging-app", None)],
             )
             .expect("call ok");
 
@@ -2712,8 +2734,10 @@ mod tests {
 
         // A public `/` and a member-gated `/admin` → two requirement groups.
         let routes = vec![
-            iroute("/", "default-web", AccessRequirement::None),
-            iroute("/admin", "default-web", AccessRequirement::Member),
+            // Project access class is None (public): `/` inherits (→ public),
+            // `/admin` is tightened to Member.
+            iroute("/", "default-web", None),
+            iroute("/admin", "default-web", Some(AccessRequirement::Member)),
         ];
         let ingresses = builder
             .create_primary_ingress(

@@ -21,17 +21,16 @@ use crate::AccessRequirement;
 /// Effective ingress auth requirement for a single route.
 ///
 /// A route inherits the project's access-class requirement unless it carries a
-/// per-route [`RouteSpec::access`] override (`.rise.toml` `[routes].access`).
-/// This is the single home for the loosen/tighten rule so both the Kubernetes
-/// and Docker reconcilers gate identically. `access` is a closed enum validated
-/// at config load, so there is no fail-open "unknown value" path.
+/// per-route override (`.rise.toml` `[routes].access`). This is the single home
+/// for the loosen/tighten rule so both the Kubernetes and Docker reconcilers gate
+/// identically. The override is a closed enum validated at config load, so there
+/// is no fail-open "unknown value" path.
 pub fn effective_access_requirement(
-    route: &RouteSpec,
+    route_override: Option<&AccessRequirement>,
     project_requirement: &AccessRequirement,
 ) -> AccessRequirement {
-    route
-        .access
-        .clone()
+    route_override
+        .cloned()
         .unwrap_or_else(|| project_requirement.clone())
 }
 
@@ -205,26 +204,25 @@ mod tests {
 
     #[test]
     fn effective_access_requirement_prefers_route_override() {
-        let mut route = RouteSpec {
-            path: "/".to_string(),
-            container: "app".to_string(),
-            access: None,
-        };
         // No override → inherit the project's requirement.
         assert_eq!(
-            effective_access_requirement(&route, &AccessRequirement::Member),
+            effective_access_requirement(None, &AccessRequirement::Member),
             AccessRequirement::Member
         );
         // Override can loosen …
-        route.access = Some(AccessRequirement::None);
         assert_eq!(
-            effective_access_requirement(&route, &AccessRequirement::Member),
+            effective_access_requirement(
+                Some(&AccessRequirement::None),
+                &AccessRequirement::Member
+            ),
             AccessRequirement::None
         );
         // … or tighten.
-        route.access = Some(AccessRequirement::Member);
         assert_eq!(
-            effective_access_requirement(&route, &AccessRequirement::None),
+            effective_access_requirement(
+                Some(&AccessRequirement::Member),
+                &AccessRequirement::None
+            ),
             AccessRequirement::Member
         );
     }
