@@ -812,11 +812,16 @@ impl Scenario for RouteAccessOverride {
         std::fs::write(
             std::path::Path::new(&dir).join("rise.toml"),
             format!(
+                // `/` is opened to the public; `/gated` inherits the project's
+                // private access. Only `/` is asserted for 200 — every sample app
+                // serves its root, but not arbitrary sub-paths. `/gated` is only
+                // asserted for the auth gate (302/redirect happens before the app
+                // is reached, so the app need not serve that path).
                 "[project]\nname = \"{project}\"\n\n\
                  [containers.app]\nimage = \"{img}\"\nport = {port}\n\n\
                  [routes]\n\
-                 \"/\" = {{ container = \"app\" }}\n\
-                 \"/public\" = {{ container = \"app\", access = \"public\" }}\n",
+                 \"/\" = {{ container = \"app\", access = \"public\" }}\n\
+                 \"/gated\" = {{ container = \"app\" }}\n",
                 img = app.image,
                 port = app.http_port
             ),
@@ -829,10 +834,10 @@ impl Scenario for RouteAccessOverride {
         )?;
         b.wait_healthy(&project)?;
 
-        // The opened route is reachable with no session (poll through warmup).
+        // The opened route (`/`) is reachable with no session (poll warmup).
         let mut public_status = 0;
         for _ in 0..45 {
-            match b.ingress_get(&project, "/public", false, None) {
+            match b.ingress_get(&project, "/", false, None) {
                 Ok(r) if r.status == 200 => {
                     public_status = 200;
                     break;
@@ -847,24 +852,26 @@ impl Scenario for RouteAccessOverride {
             "expected 200 for the `access = \"public\"` route without a session, got {public_status}"
         );
 
-        // The inherited route stays gated: unauthenticated → 302 to signin.
-        let mut root_status = 0;
+        // The inherited route (`/gated`) stays gated: unauthenticated → 302 to
+        // signin. The redirect happens at the ingress before the app is reached,
+        // so the app need not serve `/gated`.
+        let mut gated_status = 0;
         let mut location = None;
         for _ in 0..45 {
-            match b.ingress_get(&project, "/", false, None) {
+            match b.ingress_get(&project, "/gated", false, None) {
                 Ok(r) if r.status == 302 => {
-                    root_status = 302;
+                    gated_status = 302;
                     location = r.location;
                     break;
                 }
-                Ok(r) => root_status = r.status,
+                Ok(r) => gated_status = r.status,
                 Err(_) => {}
             }
             std::thread::sleep(std::time::Duration::from_secs(2));
         }
         anyhow::ensure!(
-            root_status == 302,
-            "expected 302 for the inherited (private) route without a session, got {root_status}"
+            gated_status == 302,
+            "expected 302 for the inherited (private) route without a session, got {gated_status}"
         );
         let location = location.context("302 had no Location header")?;
         anyhow::ensure!(
@@ -872,13 +879,14 @@ impl Scenario for RouteAccessOverride {
             "inherited route did not redirect to signin: {location}"
         );
 
-        // …and it still lets an authenticated request through.
+        // …and an authenticated request passes the gate (no signin redirect). The
+        // app may 404 `/gated` (not every sample app serves it) — the point is the
+        // gate let the request through instead of answering 302.
         let cookie = format!("rise_jwt={}", b.ci_bearer());
-        let authed = b.ingress_get(&project, "/", false, Some(&cookie))?;
+        let authed = b.ingress_get(&project, "/gated", false, Some(&cookie))?;
         anyhow::ensure!(
-            authed.status == 200,
-            "expected 200 for an authed request to the gated route, got {}",
-            authed.status
+            authed.status != 302,
+            "expected the gate to admit an authed request to /gated, but got a 302 redirect"
         );
         Ok(())
     }
