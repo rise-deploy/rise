@@ -181,6 +181,10 @@ impl Backend for DockerBackend {
         BackendKind::Docker
     }
 
+    fn cli_visible_path(&self, rel: &str) -> String {
+        self.repo_root.join(rel).to_string_lossy().into_owned()
+    }
+
     fn bring_up(&mut self) -> Result<()> {
         // Fresh volumes (a clean DB exercises org/controller-class bootstrap).
         report::step("docker compose down -v (clean slate)", || {

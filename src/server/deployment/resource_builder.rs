@@ -1302,8 +1302,8 @@ impl ResourceBuilder {
             AccessRequirement::Authenticated | AccessRequirement::Member => {
                 let auth_url = format!(
                     "{}/api/v1/auth/ingress?project={}&access={}",
-                    self.auth_backend_url,
-                    project.name,
+                    self.auth_backend_url.trim_end_matches('/'),
+                    urlencoding::encode(&project.name),
                     requirement.as_query_param(),
                 );
 

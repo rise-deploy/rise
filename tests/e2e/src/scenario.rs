@@ -766,8 +766,8 @@ impl Scenario for PrivateIngressAuth {
 
 /// A private project whose `[routes].access` opens one path to the public and
 /// leaves another inheriting the gated project default. Exercises the per-route
-/// override end to end through the real Traefik ingress (per-router forwardAuth:
-/// the `/public` router carries no auth, the `/` router does).
+/// override end to end through the real ingress on both backends (nginx
+/// per-requirement-group Ingress split; Traefik per-router forwardAuth).
 struct RouteAccessOverride;
 
 impl Scenario for RouteAccessOverride {
@@ -775,18 +775,10 @@ impl Scenario for RouteAccessOverride {
         "route-access-override"
     }
 
-    fn applies_to(&self, b: &dyn Backend) -> Applicability {
-        match b.kind() {
-            // Deploys `[routes]` from a generated project dir (same as
-            // `HealthRollingCutover`); the Minikube harness runs the CLI in a
-            // container without the host project dir mounted, so dir-based
-            // deploys are Docker-only. The nginx per-group Ingress split is
-            // covered by `resource_builder` unit tests.
-            BackendKind::Docker => Applicability::Run,
-            BackendKind::Minikube => {
-                Applicability::Skip("dir-based `[routes]` deploy is docker-only in the harness")
-            }
-        }
+    fn applies_to(&self, _b: &dyn Backend) -> Applicability {
+        // Per-route access is enforced by proxy-native routing on both backends,
+        // so the loosen-one-path contract holds on each.
+        Applicability::Run
     }
 
     fn run(&self, b: &dyn Backend) -> Result<()> {
@@ -812,10 +804,13 @@ impl Scenario for RouteAccessOverride {
             "project create",
         )?;
 
-        let dir = std::env::temp_dir().join(unique("rise-routeacc"));
+        // Write the generated project under the repo root so the CLI can read it
+        // on both backends — the Minikube harness runs the CLI in a container
+        // that mounts the repo root, not `/tmp`. `target/` is gitignored.
+        let dir = b.cli_visible_path(&format!("target/e2e-scratch/{}", unique("routeacc")));
         std::fs::create_dir_all(&dir).context("create route-access project dir")?;
         std::fs::write(
-            dir.join("rise.toml"),
+            std::path::Path::new(&dir).join("rise.toml"),
             format!(
                 "[project]\nname = \"{project}\"\n\n\
                  [containers.app]\nimage = \"{img}\"\nport = {port}\n\n\
@@ -827,7 +822,6 @@ impl Scenario for RouteAccessOverride {
             ),
         )
         .context("write route-access rise.toml")?;
-        let dir = dir.to_string_lossy().to_string();
 
         expect_ok(
             b.rise_cli(&["deploy", &dir, "--project", &project], None)?,
