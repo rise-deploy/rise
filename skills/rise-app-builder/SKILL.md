@@ -14,7 +14,7 @@ Your knowledge of Rise CLI flags, rise.toml fields, or extension specs may be ou
 
 ## Online Guides
 
-Full worked examples live at **`https://rise.dev/docs/guides/`**:
+Full worked examples live at **`https://rise-deploy.github.io/rise/user/guides/`**:
 
 | Guide | URL slug | Covers |
 |-------|----------|--------|
@@ -22,7 +22,7 @@ Full worked examples live at **`https://rise.dev/docs/guides/`**:
 | Authenticating end-users | `authenticating-end-users` | Generic OAuth extension, broker pattern, PKCE, token exchange |
 | Choosing a build backend | `choosing-a-build-backend` | Docker vs Railpack vs Pack, auto-detection, when to use each |
 
-Point agents to `https://rise.dev/docs/guides/<slug>` for full depth.
+Point agents to `https://rise-deploy.github.io/rise/user/guides/<slug>.md` for full depth.
 
 ## Routing Decision Tree
 
@@ -30,15 +30,15 @@ Point agents to `https://rise.dev/docs/guides/<slug>` for full depth.
 User intent
 ├─ "deploy from GitHub Actions / CI", "preview environments", "service account"
 │  → Set up SA + OIDC federation + preview deploys
-│  → Online guide: https://rise.dev/docs/guides/deploying-from-ci
+│  → Online guide: https://rise-deploy.github.io/rise/user/guides/deploying-from-ci.md
 │
 ├─ "login for my app", "OAuth", "Google/GitHub/Snowflake login", "redirect URI"
 │  → Use the Generic OAuth extension (broker pattern)
-│  → Online guide: https://rise.dev/docs/guides/authenticating-end-users
+│  → Online guide: https://rise-deploy.github.io/rise/user/guides/authenticating-end-users.md
 │
 ├─ "Dockerfile vs buildpacks", "how to build my image", "railpack"
 │  → Choose build backend; default is Railpack
-│  → Online guide: https://rise.dev/docs/guides/choosing-a-build-backend
+│  → Online guide: https://rise-deploy.github.io/rise/user/guides/choosing-a-build-backend.md
 │  → See "Build Backend Choice" below
 │
 ├─ "multiple containers", "worker + web", "routes"
@@ -50,15 +50,15 @@ User intent
 │
 ├─ "private app", "who can access", "access class"
 │  → Set --access-class (public / private) on project create/update
-│  → Docs: https://rise.dev/docs/user-guide/environments
+│  → Docs: https://rise-deploy.github.io/rise/user/user-guide/environments.md
 │
 ├─ "staging / preview env", "environments"
 │  → rise environment create <name> --group <group> [--production] [--color <c>]
-│  → Docs: https://rise.dev/docs/user-guide/environments
+│  → Docs: https://rise-deploy.github.io/rise/user/user-guide/environments.md
 │
 ├─ "workload identity", "AWS role for my app"
 │  → Configure [identity.audiences] in rise.toml
-│  → Docs: https://rise.dev/docs/user-guide/workload-identity-tokens
+│  → Docs: https://rise-deploy.github.io/rise/user/user-guide/workload-identity-tokens.md
 │
 └─ "configure rise.toml", "how do I set up my project config"
    → Load: reference/rise-toml-reference.md

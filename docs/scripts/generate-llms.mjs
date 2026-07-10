@@ -24,10 +24,24 @@ import { fileURLToPath } from 'node:url';
 /** docs/ directory (one level up from docs/scripts/). */
 const DOCS_ROOT = fileURLToPath(new URL('../', import.meta.url));
 
+function docsBaseUrl(envName, fallback) {
+  return (process.env[envName] || fallback).replace(/\/+$/, '');
+}
+
 /** The two Starlight sites. `baseUrl` is the public URL prefix for every link. */
 const SITES = [
-  { name: 'user', dir: 'user', title: 'Rise User Docs', baseUrl: 'https://rise.dev/docs' },
-  { name: 'engineering', dir: 'engineering', title: 'Rise Operator Docs', baseUrl: 'https://rise.dev/operator-docs' },
+  {
+    name: 'user',
+    dir: 'user',
+    title: 'Rise User Docs',
+    baseUrl: docsBaseUrl('RISE_USER_DOCS_URL', 'https://rise-deploy.github.io/rise/user'),
+  },
+  {
+    name: 'engineering',
+    dir: 'engineering',
+    title: 'Rise Operator Docs',
+    baseUrl: docsBaseUrl('RISE_OPERATOR_DOCS_URL', 'https://rise-deploy.github.io/rise/operator'),
+  },
 ];
 
 // --- Small helpers --------------------------------------------------------

@@ -2,7 +2,7 @@
 
 Field reference for `rise.toml` (also `.rise.toml`). Verified against `src/rise_toml.rs`.
 
-A [JSON Schema](https://rise.dev/docs/schemas/rise-toml-v1.schema.json) is available for editor validation. Add this as the first line for Taplo support:
+A [JSON Schema](https://rise-deploy.github.io/rise/user/schemas/rise-toml-v1.schema.json) is available for editor validation. Add this as the first line for Taplo support:
 
 ```toml
 #:schema https://rise.dev/api/v1/schema/rise-toml/v1
