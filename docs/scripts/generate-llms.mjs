@@ -362,11 +362,11 @@ async function main() {
     for (const p of all) {
       const destRel = p.isRootIndex ? 'index.md' : `${p.urlSlug}.md`;
       const dest = join(publicDir, destRel);
-      // Don't clobber hand-maintained public assets: our generated files always
-      // begin with an H1 (`# Title`); anything else is left untouched.
+      // Don't clobber hand-maintained public assets: generated files begin with
+      // the exact page title as their H1; anything else is left untouched.
       if (existsSync(dest)) {
-        const head = (await readFile(dest, 'utf8')).slice(0, 2);
-        if (head !== '# ') {
+        const firstLine = (await readFile(dest, 'utf8')).split(/\r?\n/, 1)[0];
+        if (firstLine !== `# ${p.title}`) {
           console.warn(`    skip per-page (existing public asset): ${relative(DOCS_ROOT, dest)}`);
           skipped++; continue;
         }

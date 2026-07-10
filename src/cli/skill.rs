@@ -50,6 +50,19 @@ fn validate_skill_name(name: &str) -> Result<()> {
     }
 }
 
+fn validate_install_destination(path: &Path, name: &str) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && path.join("SKILL.md").is_file() => Ok(()),
+        Ok(_) => bail!(
+            "Refusing to replace '{}': {} is not an installed skill directory.",
+            name,
+            path.display(),
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("Failed to inspect {}", path.display())),
+    }
+}
+
 fn github_commit_url(git_ref: &str) -> Result<reqwest::Url> {
     let mut url = reqwest::Url::parse(&format!(
         "https://api.github.com/repos/{}/{}/commits/",
@@ -113,6 +126,8 @@ pub async fn install_command(
         Some(t) => t,
         None => default_target()?,
     };
+    let dest_root = target.join(&name);
+    validate_install_destination(&dest_root, &name)?;
 
     let http = reqwest::Client::builder()
         .user_agent(concat!("rise/", env!("CARGO_PKG_VERSION")))
@@ -201,7 +216,7 @@ pub async fn install_command(
         git_ref,
         REPO_OWNER,
         REPO_NAME,
-        target.join(&name).display(),
+        dest_root.display(),
     );
 
     // 3. Fetch every file before touching the installed version.
@@ -225,7 +240,6 @@ pub async fn install_command(
     // 4. Build the new version beside the live directory, then swap it in.
     std::fs::create_dir_all(&target)
         .with_context(|| format!("Failed to create skills directory {}", target.display()))?;
-    let dest_root = target.join(&name);
     let staging_root = staging_path(&target, &name, "installing")?;
     let backup_root = staging_path(&target, &name, "previous")?;
     std::fs::create_dir(&staging_root).with_context(|| {
@@ -269,9 +283,19 @@ pub async fn install_command(
         if backup_root.exists() {
             let _ = std::fs::rename(&backup_root, &dest_root);
         }
-        return Err(error).with_context(|| {
-            format!("Failed to activate installed skill {}", dest_root.display())
-        });
+        let cleanup_error = std::fs::remove_dir_all(&staging_root).err();
+        let activation_error = Err(error)
+            .with_context(|| format!("Failed to activate installed skill {}", dest_root.display()));
+        return match cleanup_error {
+            Some(cleanup_error) => activation_error.with_context(|| {
+                format!(
+                    "Also failed to remove staging directory {}: {}",
+                    staging_root.display(),
+                    cleanup_error,
+                )
+            }),
+            None => activation_error,
+        };
     }
     if backup_root.exists() {
         if let Err(error) = std::fs::remove_dir_all(&backup_root) {
@@ -381,6 +405,30 @@ mod tests {
             url.as_str(),
             "https://api.github.com/repos/rise-deploy/rise/commits/feature%2Fskill%20install"
         );
+    }
+
+    #[test]
+    fn install_refuses_non_skill_destinations() {
+        let target = tempfile::tempdir().unwrap();
+        let destination = target.path().join("not-a-skill");
+        std::fs::create_dir(&destination).unwrap();
+
+        let error = validate_install_destination(&destination, "not-a-skill").unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("not an installed skill directory"));
+        assert!(destination.exists());
+    }
+
+    #[test]
+    fn install_accepts_existing_skill_destinations() {
+        let target = tempfile::tempdir().unwrap();
+        let destination = target.path().join("rise-app-builder");
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(destination.join("SKILL.md"), "# Skill").unwrap();
+
+        validate_install_destination(&destination, "rise-app-builder").unwrap();
     }
 
     #[test]
