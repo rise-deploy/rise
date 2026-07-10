@@ -4,7 +4,7 @@ title: "ADR-0001: Unified Permission Model"
 
 ## Status
 
-**Accepted** (implementation not started). Date: 2026-07-10.
+**Proposed** (under review). Date: 2026-07-10.
 
 Scope: the generic resource API (`/api/v1/resources/...`) and
 ServiceAccount/Controller token issuance (`POST /api/v1/auth/token`). It does
@@ -21,40 +21,33 @@ membership in the `auth.operator_users` config allowlist, with no finer
 granularity. The typed APIs (projects, teams, deployments, …) each carry their
 own per-endpoint ownership and membership checks, with `auth.admin_users`
 bypassing them wholesale. Controllers authenticate separately and are
-authorized for status/finalizer writes through a hardcoded
-`allowed_status_controller_ids` list. ServiceAccounts get tokens through
+authorized for status/finalizer writes through each `ResourceDefinition`'s
+`allowed_status_controller_ids` allowlist. ServiceAccounts get tokens through
 trust-policy-gated token exchange. Five subject populations, five ways of
 deciding "may this caller do this."
 
-The planned successor for the resource API's operator-only gate was PR A2
-(ROADMAP.md, "Org-scoped RBAC on the generic resource API"): a per-org
-Member/Admin role (`OrganizationRole`) sourced from membership rows, plus a
-per-resource single-subject `metadata.ownerRef = { kind, name }` whose grant
-inherits down the parent chain as a union — a descendant's own `ownerRef`
-could extend the access set but never restrict it. A2 was specced but never
-shipped; the shipped resource API has no `ownerRef` and no `OrganizationRole`.
+Almost none of this surface is load-bearing yet. The generic resource API's
+only production use today is seeding the default `Organization` resource from
+config, and controller authentication is entirely unused. This design
+therefore carries no backwards-compatibility constraints on the resource-store
+API or on controller authentication: where the model below conflicts with the
+current surface, the surface changes — breaking changes are acceptable and
+preferred over compatibility shims that would bake in tech debt before there
+is anything to be compatible with.
 
-The requirements outgrew that design before it was built. Multi-tenancy needs
-three distinguishable tiers — platform operator, org admins, org users — with
-per-org *asymmetric* restrictions: the operator must be able to impose a
-ceiling on one specific org (a compliance-restricted customer), and an org
-must be able to impose a tighter ceiling on itself, with both enforced
-simultaneously. Org admins must be able to delegate access further, but never
-beyond their own boundaries. And the model should be *one* runtime-configurable
-mechanism covering Users, Teams, ServiceAccounts, Controllers, and Operators
-alike — not five code paths that happen to agree. A two-value role enum plus a
-single-subject owner pointer with union-only, never-subtractive inheritance
-cannot express any of the ceiling, delegation-bounding, or exclusion
-requirements.
+The requirements come from the multi-tenancy split: three distinguishable
+tiers — platform operator, org admins, org users — with per-org *asymmetric*
+restrictions. The operator must be able to impose a ceiling on one specific
+org (a compliance-restricted customer), and an org must be able to impose a
+tighter ceiling on itself, with both enforced simultaneously. Org admins must
+be able to delegate access further, but never beyond their own boundaries. And
+it should be *one* runtime-configurable mechanism covering Users, Teams,
+ServiceAccounts, Controllers, and Operators alike — not five code paths that
+happen to agree.
 
 The design below was converged through multiple independent adversarial-review
 rounds; its wording is deliberate, particularly around the security-sensitive
 edges (label-write gating, token minting, operator bootstrap).
-
-This ADR supersedes the A2 `ownerRef`/`OrganizationRole` scheme **as a
-design**. Since A2 never shipped, there is no data migration from it — only
-the spec and roadmap direction change. A2's scope is to be re-planned against
-this model.
 
 ## Decision
 
@@ -263,7 +256,7 @@ Unlike the ceiling intersection (which is live, re-checked on every request), th
 
 ### 6. Ownership and attribution
 
-Ownership is not a bespoke field or a bespoke code path — the dedicated single-subject `ownerRef` field planned in the A2 design (never shipped) is superseded in favor of expressing ownership entirely through §3/§4's primitives.
+Ownership is not a bespoke field or a bespoke code path — it is expressed entirely through §3/§4's primitives. (A dedicated single-subject `ownerRef` field was considered and rejected — see Alternatives considered.)
 
 #### 6.1 — Attribution is one governed label
 
@@ -427,14 +420,14 @@ Max token TTL is governed by the same four-layer stack (§5), composed via `min(
   "why can this subject do this?") is only practical once the implementation
   builds a policy explain/simulator; that is additional, eventual work the
   model assumes.
-- The A2 roadmap items (and everything sequenced on A2's ownerRef/
-  OrganizationRole shape) must be re-planned against this model.
+- The resource-API RBAC items in `ROADMAP.md` (and everything sequenced on
+  them) are to be planned against this model.
 
 ## Alternatives considered
 
 - **Pure-additive, union-only permission sets (Kubernetes Role/RoleBinding-style), no Deny.** Cannot express subtraction from a wildcard — "everything except `delete` on `Environment`" has no faithful positive encoding against an open-ended, runtime-extensible set of resource kinds. Rejected; §3's Deny-capable evaluator, combined via union-then-evaluate in §4 step 3, is adopted specifically to make this expressible — including letting a narrower binding's Role genuinely subtract from what a broader one grants (§4's worked trace), not merely add to it.
 - **Folding ownership into a wildcard `Allow * *` statement**, rather than a distinct owner Role. Would silently over-grant: an owner would automatically gain `mintToken` and `updateFinalizers` alongside ordinary access, defeating the deliberate verb separation in §2. Rejected in favor of the named `resource-owner` Role with the explicit verb list pinned down in §6.2 (`get`/`list`/`update`/`delete` only).
-- **Keeping A2's planned `ownerRef` as a separate field/mechanism alongside the new ceiling/Role model**, rather than superseding it. Two independent inheritance and authorization mechanisms doing near-identical jobs complicates reasoning about why a subject has access to something, and `ownerRef`'s union-across-the-whole-ancestor-chain semantics would have meant a descendant could never fully exclude an ancestor's owner. Rejected; §6 subsumes ownership into the same Role/RoleBinding/label primitives as everything else — and unlike `ownerRef`, an ordinary Deny-bearing binding at a narrower scope genuinely can exclude a broader ancestor's grant (§4), so the exclusion capability `ownerRef` lacked is available for every kind of grant, not just reintroduced for ownership specifically.
+- **A dedicated single-subject `ownerRef` field as a separate ownership mechanism alongside the ceiling/Role model**, inherited down the ancestor chain as a union. Two independent inheritance and authorization mechanisms doing near-identical jobs complicates reasoning about why a subject has access to something, and union-across-the-whole-ancestor-chain semantics would mean a descendant could never fully exclude an ancestor's owner. Rejected; §6 subsumes ownership into the same Role/RoleBinding/label primitives as everything else — and unlike `ownerRef`, an ordinary Deny-bearing binding at a narrower scope genuinely can exclude a broader ancestor's grant (§4), so the exclusion capability `ownerRef` lacked is available for every kind of grant, not just reintroduced for ownership specifically.
 - **Labels driving RBAC directly, with no write-gate on the label itself.** Ordinary `update` access on a resource would let any editor silently redirect which subject holds a derived Role — an ungated escalation path. Rejected in favor of §6.6's binding-triggered Layer 4 gate, which in turn is one instance of §5's general rule that *every* write changing effective access — including RoleBinding and Role edits, not only labels — passes through the same check.
 - **A dedicated bespoke verb per protected field** (e.g. `setTeamLabel`), rather than a generic mechanism. Every newly-sensitive field would need a new verb and new engine code. Rejected in favor of §6.6, where protection is a consequence of a `LabelSelector` binding's existence, not a hardcoded field name — and generalized further in §5 so the same reasoning covers Role/RoleBinding writes, not only labels.
 - **Gating label writes on "does not drop access to zero"** rather than the standard subset check. Defends availability only — it never checks *who* gains access, only that the total doesn't hit zero — so it would still permit an unauthorized party to redirect access to themselves. Rejected in favor of the genuine subset comparison in §6.6.
@@ -453,13 +446,12 @@ Max token TTL is governed by the same four-layer stack (§5), composed via `min(
 - **Operator status as a hardcoded bypass branch in the evaluator**, checked before Role/binding resolution rather than expressed as data. Makes operator access the one thing the model's own explain/audit tooling can't account for, and duplicates logic the ordinary evaluator already has (union bindings, evaluate Allow/Deny). Rejected in favor of `system:operators` (§1): a reserved subject, resolved via the same live config-allowlist check as today, granted access through one seeded, immutable binding — operators run the same algorithm as everyone else, with only ceiling intersection (step 4) still skipped, and only for that one reserved subject.
 - **Treating the seeded `system:operators` binding as immutable data only, with no evaluator-level guarantee behind it.** Immutability through the ordinary write path (§5) protects only against mutation via this model's own API — not a bad migration, a restore from an old backup, or direct database access losing the row entirely. That residual risk is unacceptable for the one subject with no recovery authority above it. Rejected in favor of a hardcoded, evaluator-guaranteed grant for `system:operators` specifically, mirrored as a healable data row for audit/tooling parity — matching how Kubernetes redundantly hardcodes `system:masters` alongside its ordinary, self-healing `cluster-admin` ClusterRoleBinding, rather than relying on either mechanism alone.
 - **Making the `system:operators` binding fully virtual too, with no stored row at all** (matching how membership itself is virtual). Would remove operator access from the same explain/audit tooling that inspects everyone else's — exactly the gap `system:operators` was introduced to close by replacing a hardcoded bypass branch in the first place (above). Rejected; the binding stays data, mirrored and healable — only the evaluator's guarantee of its *effect* is hardcoded, not its existence as an inspectable object.
-- **Making the seeded `system-admin` Role and its binding platform-owned (operator-editable) rather than immutable.** Would let an operator edit or delete their own bootstrap grant through the ordinary write path — trivially passing the subset check, since they hold everything — with no higher authority left to recover from it, unlike every other documented risk in this spec. Rejected in favor of a third, **seeded** Role-ownership tier (§5) that no write path can modify, editable by no one.
+- **Making the seeded `system-admin` Role and its binding platform-owned (operator-editable) rather than immutable.** Would let an operator edit or delete their own bootstrap grant through the ordinary write path — trivially passing the subset check, since they hold everything — with no higher authority left to recover from it, unlike every other documented risk in this ADR. Rejected in favor of a third, **seeded** Role-ownership tier (§5) that no write path can modify, editable by no one.
 - **Allowing a static Subject to pair with a value-less `LabelSelector`.** Would grant a fixed subject access to any resource carrying *any* value for that label key, regardless of what it actually says — access disconnected from the value the selector nominally matches on. Rejected; value-less selectors are reserved for dynamic (templated) subjects, where the matched value is actually used (§4).
 
 ## References
 
 - `ROADMAP.md`, Workstream 1 ("Multi-Tenancy & Generic Resource API") — owns
-  live status for the affected items, in particular PR A2 (org-scoped RBAC),
-  whose scope is to be re-planned against this ADR.
+  live status for the resource-API RBAC items this model informs.
 - [Generic Resource API](/operator-docs/generic-resource-api/) — the shipped,
   operator-only surface this model will govern.

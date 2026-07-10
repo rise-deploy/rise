@@ -136,11 +136,11 @@ rest of Rise.
   new `src/server/resources/authz.rs`. **Blocker removed:** API-surface flip
   for B2/B3/B4. **Open in design:** `auth.admin_users` vs `auth.operator_users`
   overlap (see "Open questions" below — must resolve during this PR's design
-  phase, not as a separate PR). **Design superseded:** the target end-state
-  permission model has since been decided in
-  [ADR-0001](docs/engineering/src/content/docs/adr/0001-unified-permission-model.md);
-  the `ownerRef`/`OrganizationRole` design described above is superseded as
-  the end-state, and A2's scope is to be re-planned against the ADR.
+  phase, not as a separate PR). **Target model:**
+  [ADR-0001](docs/engineering/src/content/docs/adr/0001-unified-permission-model.md)
+  (under review) proposes the unified permission model for this surface; the
+  `ownerRef`/`OrganizationRole` design described above will be revisited
+  against it once the ADR is accepted.
 
 - [ ] **PR A3 — Pagination + label/field selectors on `list`.** Add
   `metadata.labels BTreeMap<String, String>` to the resource envelope plus a
@@ -327,10 +327,10 @@ Decide before coding the indicated PR.
   operator docs, (c) merge into a single role.
 - **A2 RBAC model.** Does `ownerRef` carry a user/team *name* or *uid*?
   Cross-Org references must be illegal — enforce at validation time.
-  *Resolved by
-  [ADR-0001](docs/engineering/src/content/docs/adr/0001-unified-permission-model.md):*
-  `ownerRef` does not exist in the target model — ownership is a governed
-  label (`rise.dev/owner`) plus a dynamic RoleBinding.
+  *Addressed by
+  [ADR-0001](docs/engineering/src/content/docs/adr/0001-unified-permission-model.md)
+  (under review):* `ownerRef` does not exist in the proposed model — ownership
+  is a governed label (`rise.dev/owner`) plus a dynamic RoleBinding.
 - **A3 labels storage.** Labels in `metadata.labels` JSONB with a GIN index,
   or a separate `resource_labels` table for selector performance? JSONB is
   simpler; measure before adding the extra table.

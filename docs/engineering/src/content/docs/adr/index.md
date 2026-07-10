@@ -1,5 +1,7 @@
 ---
 title: "Architecture Decision Records"
+sidebar:
+  order: 0
 ---
 
 ADRs record point-in-time architectural decisions: the context they were made
@@ -18,7 +20,8 @@ re-propose later. Routine implementation choices don't need one.
 
 One file per decision in this directory, named `NNNN-short-title.md` with a
 monotonically increasing number. Sections: **Status**, **Context**,
-**Decision**, **Consequences**, **Alternatives considered**.
+**Decision**, **Consequences**, **Alternatives considered**, plus an optional
+**References**.
 
 Statuses: **Proposed**, **Accepted**, **Superseded by ADR-NNNN**. A superseded
 ADR is never edited to say something else — it gets a status pointer to its
@@ -28,4 +31,4 @@ successor.
 
 | ADR | Status | Summary |
 |---|---|---|
-| [ADR-0001](/operator-docs/adr/0001-unified-permission-model/) — Unified Permission Model | Accepted | One Role/RoleBinding/ceiling model for all subject kinds (Users, Teams, ServiceAccounts, Controllers, Operators), replacing the planned A2 ownerRef/OrganizationRole design. |
+| [ADR-0001](/operator-docs/adr/0001-unified-permission-model/) — Unified Permission Model | Proposed | One Role/RoleBinding/ceiling model for all subject kinds (Users, Teams, ServiceAccounts, Controllers, Operators) on the generic resource API and token issuance. |
