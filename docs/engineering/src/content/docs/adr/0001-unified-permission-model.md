@@ -517,6 +517,66 @@ This deliberately gives the reference *snapshot* semantics, not §6.1's live sem
 - **Encoding product defaults (e.g. the default `RuntimeClass`) in `OrganizationPolicy`.** Would accrete product-specific settings onto the RBAC core's ceiling document. Rejected; the core stays agnostic — defaults live on the product resources themselves as labels, and the override cascade is `effectiveLabels` (§6.1, §9).
 - **Live `use` re-evaluation at reconcile time**, instead of materializing the resolved class onto the Deployment at creation. Leaves the check with no well-defined subject (a reconciler acts for nobody in particular) and turns a grant revocation into retroactive breakage of running workloads. Rejected; the effective class is materialized at deployment creation and `use`-checked against the deployer (§9), matching Kubernetes' DefaultStorageClass admission behavior — revocation applies from the next deployment.
 
+## Appendix: acceptance scenarios (normative)
+
+These scenarios pin the semantics an implementation must satisfy; several
+encode findings from the adversarial-review rounds this design went through
+(Context) — they are regression tests against reintroducing found-and-fixed
+bugs, not illustrative examples. The conformance test suite is expected to
+cover every scenario here. Each entry is tagged with the section whose rule
+it pins.
+
+### Evaluation & subjects (§1, §4)
+
+1. **Union of applicable bindings.** Given `team:platform` holds a scope binding at `Environment/acme-corp/env-prod` (`{Allow: * on Deployment}`), and `Deployment/acme-corp/env-prod/foo` carries `rise.dev/owner: platform`, when a team member requests `delete` on `foo`, then both bindings collect, their Roles union, and the request is allowed (§4 worked trace).
+2. **Deny wins across bindings.** Given the same subject additionally holds an env-scoped binding whose Role is `{Deny: delete on Environment}`, when they request `delete` on the Environment itself, then it is denied despite the broader Allow (Deny-wins union; §3, §4).
+3. **Deny is scope-blind.** Given a Deny-bearing binding at `Organization/acme-corp` and an Allow at a narrower scope beneath it, when the denied verb is requested below, then it is denied — there is no "more specific wins" between ordinary bindings (§3, §4; Decision primer).
+4. **Default deny.** Given no binding applicable to subject `S` on resource `r`, when `S` requests any verb, then the combined policy is empty, no Allow can match, and the request is denied — no implicit grant (§4 step 3).
+5. **Membership expansion is live.** Given a user whose only access to `r` flows through a `team:platform` binding, when they are removed from the team, then their very next request is denied — membership is resolved live, per request (§1).
+6. **Operator lifecycle.** Given an email added to the operator allowlist, then the next request expands to `system:operators` and draws on `system-admin`; removed, the next request falls back to the user's own grants. Ceiling intersection (§4 step 4) is skipped only for `system:operators`; every other subject, org-admins included, is fully subject to it (§1, §5).
+7. **Literal and template never collide.** Given a static `Subject: team:platform` binding and a dynamic `Subject: team:${ref.name}` binding whose template resolves to `platform` on some resource, then wildcard replacement compares authored Subject text only — neither replaces the other (§1).
+8. **Wildcard replacement is per-org.** Given the seeded `Scope: "*"` ownership binding and an org-scoped override binding for the same `(Subject-template, LabelSelector-key)` pair at `Organization/acme-corp`, when evaluating a resource in `acme-corp`, then the override replaces the seeded binding outright; every other org keeps the default (§1, §6.5).
+9. **Value-narrowed replacement is per-resource.** Given a wildcard binding on `{key: rise.dev/owner}` and an override on `{key: rise.dev/owner, value: "legacy"}`, then only resources whose label equals `legacy` collect the override (and drop the wildcard); resources carrying any other value stay governed by the wildcard binding, undiminished (§1).
+10. **Org-native Scope validation.** Given a static binding for an org-native subject (`acme-corp/team:platform`) supplying `Scope: Organization/other-org`, when written, then it is rejected — a supplied Scope must match the subject's own org (§1).
+11. **Static subject, value-less selector.** Given a binding pairing a literal `Subject: team:platform` with `LabelSelector: {key: rise.dev/owner}` and no `value`, when written, then it is rejected at write time (§4).
+
+### Ceilings & Layer 4 (§5)
+
+12. **Ceilings clip live.** Given a subject whose raw grant includes `delete` on `Deployment`, when the operator writes a Layer 2 ceiling denying it for that org, then the subject's next request is denied with no binding rewritten; relaxing the ceiling re-allows the next request (§5).
+13. **Layer 3 is uniform.** Given an org's own declared ceiling denies a verb, when one of that org's own admins requests it, then it is denied — no subject-kind or seniority exemption; only `system:operators` sits above the stack (§5, §1).
+14. **Granter subset, positive.** Given an org-admin effectively holding verb-set `X`, when they bind a Role granting `X` to a team in their org, then the write is allowed (Layer 4; §5).
+15. **Granter subset, negative (Role edit).** Given Bob holds only `update` on kind `Role`, when he appends `{Allow: mintToken on *}` to `resource-owner`, then the write is rejected — the newly-implied grant is not `⊆` his own effective permissions, however many subjects are bound to the Role (Layer 4; §5).
+16. **Role ownership.** Given org B's admin editing an org-owned Role of org A, then the write is rejected (Role ownership; §5). Given anyone — an operator via the ordinary write path included — editing the seeded `system-admin` Role or its `system:operators` binding, then the write is rejected (seeded tier; §1, §5).
+17. **Granter check is write-time only.** Given a granter's own permissions shrink after they authored a binding, then the grants they already made are unaffected — contrast scenario 12: only the live ceiling layers claw back (§5).
+18. **Cross-org Scope move.** Given a RoleBinding's `Scope` edited to move it from org A into org B, then the write is validated against both orgs — equivalent to a delete at the old scope plus a create at the new one (Layer 4; §5).
+
+### Ownership & labels (§6)
+
+19. **Nearest wins, no union.** Given `Project/secret-app` carries `rise.dev/owner: platform` and its child Environment carries `rise.dev/owner: devops`, then the child's `effectiveLabels` resolve to `devops` only, and `team:platform` holds no owner-derived access on the child absent another binding (§6.1).
+20. **Escalation blocked, oracle avoided.** Given an editor holding `update` but no claim to `resource-owner`, when they relabel `rise.dev/owner` to their own team, then the write is rejected by the subset check — and rejected *before* referential-integrity validation runs, so they never learn whether the named team exists (§6.6, §6.7).
+21. **Legitimate transfer.** Given the current owner — or an org-admin, whose access is label-independent — relabels `rise.dev/owner` to another team, then the write passes the subset check; a typo'd team name is rejected with a fuzzy-match suggestion (§6.6, §6.7).
+22. **Creation exception is narrow.** Given a subject holding only `create`, when they set `rise.dev/owner` to a team they belong to within the creation request, then it is allowed; naming a team they don't belong to falls back to the general rule and is rejected. A restore or upsert targeting an existing (even soft-deleted) identity is not creation — the general rule governs (§6.6).
+23. **Ungated keys stay ungated.** Given a label key no applicable binding's `LabelSelector` references, when it is written, then only ordinary `update` permission is required — no Layer 4 gate (§6.6 step 2).
+24. **`org-admin` is never label-derived.** Given a binding granting the `org-admin` Role via a `LabelSelector`, when written, then it is rejected structurally — `org-admin` may only ever be granted via a `Scope`-targeted binding (§6.7).
+
+### Token issuance (§7)
+
+25. **Both gates required.** Given a caller whose credentials satisfy a target ServiceAccount's trust policy but who holds no `mintToken` grant on it, then the mint is rejected; given the grant but no trust-policy match, authentication fails before the grant is ever consulted (§7).
+26. **Elevation is intended; `minted_by` is audit-only.** Given a caller holding *only* `mintToken` on an SA, then the minted token wields the SA's full, broader live-resolved grant; it carries `minted_by: <caller>`, attached to audit logging on every request the token makes, and never influencing authorization (§7).
+27. **One hop.** Given any token carrying `minted_by`, when presented as the calling identity for a further token exchange, then it is rejected — regardless of what `mintToken` grants it would otherwise satisfy (§7).
+28. **No self-issuer trust.** Given a trust policy naming Rise's own issuer/audience as an accepted source, when written, then it is rejected at trust-policy write time (§7).
+29. **Revocation asymmetry.** Given outstanding tokens for SA `A`: narrowing `A`'s own Role narrows every outstanding token immediately (live resolution); revoking the caller's `mintToken` grant on `A` stops new mints but leaves already-issued tokens valid to TTL (§7).
+30. **TTL and scope bounds.** Given an SA-specific max TTL exceeding the resolved `min()` ceiling, when written, then it is rejected at write time — never silently clamped (and the writer must hold an equal-or-greater TTL entitlement). A `requested_scope` may only narrow the target's live-resolved grant, never widen it (§7, §5).
+
+### Kind naming, references, platform resources (§8, §9)
+
+31. **One kind token.** Given the kind `Deployment`: `kinds:` in Role statements, `Scope` paths, and resource URLs all accept exactly that token; no plural form exists anywhere and `ResourceDefinition` declares none (§8).
+32. **`get`/`use` independence.** Given a subject with `get` but not `use` on a `RuntimeClass`, then reading it succeeds but a write referencing it at `spec.runtimeClass` is rejected; given `use` but not `get`, selection by name succeeds while reads are denied (§2, §9).
+33. **Cross-org isolation without disclosure.** Given `RuntimeClass/gpu-b` is granted only to `org:acme-corp`, when another org's subject writes `spec.runtimeClass: gpu-b`, then it is rejected without disclosing whether `gpu-b` exists (`use` check precedes existence disclosure); that org's admin also cannot author a binding at `RuntimeClass/gpu-b` — root-scope binding authorship and the Layer 4 subset check both block it (§9).
+34. **Org default is use-checked.** Given an org-admin setting `runtimeclass.rise.dev/default` on their Organization: naming a class the org holds `use` on is allowed; naming an ungranted class is rejected — the default label key is itself a declared reference (§9).
+35. **Materialization semantics.** Given an SA in `acme-corp` (covered by an `org:acme-corp` `use` binding) creating a deployment, then the effective class resolves via the nearest-wins cascade, is stamped onto the Deployment, and is `use`-checked against the SA — allowed. Given the grant is later revoked, the running deployment is unaffected; the org's next deploy or rollback fails the check (§9, §6.1).
+36. **`system:authenticated` reach.** Given the binding `Subject: system:authenticated, Scope: RuntimeClass/standard`, then any authenticated subject, of any kind, in any org, may select `standard` (§9, §1).
+
 ## References
 
 - `ROADMAP.md`, Workstream 1 ("Multi-Tenancy & Generic Resource API") — owns

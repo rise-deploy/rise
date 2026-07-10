@@ -20,7 +20,7 @@ re-propose later. Routine implementation choices don't need one.
 One file per decision in this directory, named `NNNN-short-title.md` with a
 monotonically increasing number. Sections: **Status**, **Context**,
 **Decision**, **Consequences**, **Alternatives considered**, plus an optional
-**References**.
+**References** and appendices where they earn their keep.
 
 Statuses: **Proposed**, **Accepted**, **In Progress** (implementation
 underway), **Implemented**, **Superseded by ADR-NNNN**. A superseded ADR is
