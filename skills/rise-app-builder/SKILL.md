@@ -136,10 +136,6 @@ Then reference `$ENCRYPTED` in the `--spec` JSON.
 | `--secret-env KEY=VALUE` / `rise env set --secret` | ✅ | ✅ |
 | `--protected-env KEY=VALUE` | ✅ | ❌ |
 
-### 9. cargo fmt / clippy (Rise repo only)
-
-If the user is working **on the Rise codebase itself** (not deploying their app), run `cargo fmt --all` and `cargo clippy` before any commit.
-
 ## Condensed Patterns
 
 ### Build Backend Choice
