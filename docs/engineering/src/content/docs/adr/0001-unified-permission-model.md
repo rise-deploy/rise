@@ -98,7 +98,10 @@ first place does not reach back and affect a token already issued (§7).
 Ownership works through this same mechanism, not a separate one. A resource
 can carry a label — `rise.dev/owner: platform` — naming the team or person it
 belongs to. The platform ships one built-in rule: whoever that label names
-automatically gets an owner-level Role on the resource. Nothing about that
+automatically gets an owner-level Role on the resource. That rule is the
+entirety of what "ownership" is — the engine itself has no ownership concept;
+remove or replace the rule and the word means nothing, or means whatever the
+replacement says. Nothing about that
 rule is hardcoded to any specific label key — it's ordinary Role/binding data,
 and any organization can replace it with their own version using the exact
 same tools they'd use for any other grant. Because relabeling a resource can
@@ -266,7 +269,7 @@ Unlike the ceiling intersection (which is live, re-checked on every request), th
 
 ### 6. Ownership and attribution
 
-Ownership is not a bespoke field or a bespoke code path — it is expressed entirely through §3/§4's primitives. (A dedicated single-subject `ownerRef` field was considered and rejected — see Alternatives considered.)
+There is no ownership primitive in this model. Nothing in §1–§5 knows what an "owner" is: the evaluator sees subjects, bindings, labels, and ceilings — nothing more. "Ownership" exists only as the *effect* of one binding (§6.2) that happens to grant owner-like permissions to whoever a label names. Remove that binding and the concept vanishes from the platform without touching the engine; override it (§6.5) and ownership *means something else* in that org. The label is likewise just a convenient, inspectable targeting mechanism: `rise.dev/owner` carries no authorization semantics of its own — no label key does — a key becomes access-relevant exactly when, and only for as long as, some binding's `LabelSelector` references it (§6.6 step 2). What this section defines is therefore not an ownership *feature* but a shipped default *convention*: a reserved key, one seeded dynamic binding, and the write-gating that any access-driving label automatically inherits. (A dedicated single-subject `ownerRef` field — a true ownership primitive — was considered and rejected; see Alternatives considered.)
 
 #### 6.1 — Attribution is one governed label
 
@@ -589,6 +592,10 @@ it pins.
 37. **Scope containment.** Given an org-parented `RoleBinding` under `acme-corp` whose `Scope` names `Organization/other-org`, a root-scoped instance, or `"*"`, when written, then it is rejected — an org binding's `Scope` must lie within its parent org's subtree; a root-parented `PlatformRoleBinding` carries any of those Scopes freely (§4).
 38. **Reference direction.** Given an org `RoleBinding` referencing `PlatformRole/resource-owner`, then it is valid (platform Roles bind org-locally); given a `PlatformRoleBinding` referencing an org `Role`, when written, then it is rejected — org-authored policy never escapes its org through a platform-wide binding (§4).
 39. **No shadowing.** Given `acme-corp` creates a `Role` named `resource-owner`, then every existing and future reference to `PlatformRole/resource-owner` is unaffected — references are kind-qualified, never resolved by bare-name fallback (§4).
+
+### Ownership is emergent, not primitive (§6)
+
+40. **No binding, no ownership.** Given a deployment (or an org, via a §6.5 override binding a Role granting nothing) where no binding's `LabelSelector` references `rise.dev/owner`, then the label confers no access whatsoever, and writing it requires only ordinary `update` — the gate of §6.6 step 2 no longer triggers, because labels carry no authorization semantics of their own; "ownership" is entirely the effect of the seeded binding (§6, §6.6).
 
 ## References
 
