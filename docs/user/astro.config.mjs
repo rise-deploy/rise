@@ -29,6 +29,14 @@ export default defineConfig({
           ],
         },
         {
+          label: 'Guides',
+          items: [
+            { label: 'Deploying from CI', slug: 'guides/deploying-from-ci' },
+            { label: 'Authenticating End Users', slug: 'guides/authenticating-end-users' },
+            { label: 'Choosing a Build Backend', slug: 'guides/choosing-a-build-backend' },
+          ],
+        },
+        {
           label: 'Deploy Applications',
           items: [
             { label: 'Deployments', slug: 'user-guide/deployments' },

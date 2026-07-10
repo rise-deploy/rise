@@ -260,6 +260,9 @@ enum Commands {
     /// Workload identity token commands (run inside a Rise deployment)
     #[command(subcommand)]
     Identity(IdentityCommands),
+    /// Install and manage Rise skills for AI assistants (Crush, Claude Code)
+    #[command(subcommand)]
+    Skill(SkillCommands),
     /// Team management commands
     #[command(subcommand)]
     #[command(visible_alias = "t")]
@@ -281,6 +284,36 @@ enum IdentityCommands {
         /// (default 900). Omitting this field uses the server maximum.
         #[arg(long)]
         ttl_seconds: Option<u64>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SkillCommands {
+    /// Install or update a Rise skill from GitHub into your AI assistant's skills directory
+    Install {
+        /// Skill name (defaults to the bundled 'rise-app-builder' skill)
+        name: Option<String>,
+        /// Git ref to fetch from (branch, tag, or sha). Defaults to 'develop'
+        #[arg(long)]
+        git_ref: Option<String>,
+        /// Directory to install into. Defaults to ~/.claude/skills
+        #[arg(long)]
+        target: Option<std::path::PathBuf>,
+    },
+    /// List installed skills
+    List {
+        /// Directory to inspect. Defaults to ~/.claude/skills
+        #[arg(long)]
+        target: Option<std::path::PathBuf>,
+    },
+    /// Remove an installed skill
+    #[command(visible_alias = "rm")]
+    Uninstall {
+        /// Skill name to remove
+        name: String,
+        /// Directory to remove from. Defaults to ~/.claude/skills
+        #[arg(long)]
+        target: Option<std::path::PathBuf>,
     },
 }
 
@@ -1589,6 +1622,26 @@ async fn main() -> Result<()> {
                     *ttl_seconds,
                 )
                 .await?;
+            }
+        },
+        Commands::Skill(skill_cmd) => match skill_cmd {
+            SkillCommands::Install {
+                name,
+                git_ref,
+                target,
+            } => {
+                cli::skill::install_command(
+                    name.as_ref().cloned(),
+                    git_ref.as_ref().cloned(),
+                    target.as_ref().cloned(),
+                )
+                .await?;
+            }
+            SkillCommands::List { target } => {
+                cli::skill::list_command(target.clone())?;
+            }
+            SkillCommands::Uninstall { name, target } => {
+                cli::skill::uninstall_command(name.clone(), target.clone())?;
             }
         },
         Commands::Environment(env_cmd) => {
