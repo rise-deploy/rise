@@ -4,8 +4,12 @@ Single source of truth for in-flight architectural workstreams in Rise.
 Forward-looking PRs and shipped milestones live here together; check items
 off as they merge.
 
-New roadmap files should not be created — add new workstreams as top-level
-sections here.
+New roadmap files should not be created. Architectural decisions — and,
+via their Status field, their implementation progress — are recorded as
+[ADRs](docs/engineering/src/content/docs/adr/index.md); prefer starting new
+architectural work as an ADR. This file is being wound down gradually: it
+keeps covering the workstreams already tracked here, but should not grow new
+sections.
 
 Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
 

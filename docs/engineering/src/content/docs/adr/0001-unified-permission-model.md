@@ -57,7 +57,8 @@ every resource is decided the same way, by the same evaluator, regardless of
 what kind of subject it is.
 
 Resources live in a tree — an Organization contains Projects, which contain
-Environments, which contain Deployments, and so on (e.g. `acme-corp/env-prod`).
+Environments, which contain Deployments, and so on (e.g. an Environment
+`env-prod` under the org `acme-corp`).
 Access is granted by binding a **Role** (a named bundle of permissions — "can
 update Deployments, can read Environments," built from `verbs` like
 `get`/`update`/`delete`) to a subject, placed at some point in that tree. A
@@ -105,7 +106,7 @@ silently redirect who holds that owner-level Role, writing such a label goes
 through the identical check as writing a binding directly: you can only
 redirect access you already hold.
 
-The numbered sections below (§1–§8) are the concrete design this
+The numbered sections below (§1–§10) are the concrete design this
 plain-language model compiles down to.
 
 ### 1. Subjects
@@ -128,6 +129,8 @@ An operator's request runs through the *same* evaluation algorithm as anyone els
 
 **Membership never replaces a caller's own identity.** When `niklas@example.net`, listed in the operator allowlist, makes a request, his subject is `user:niklas` — exactly what it would be if he weren't an operator at all. What differs is **membership expansion** (§4 step 1): evaluating a subject `S`'s own request considers not only bindings that target `S` directly, but also any binding targeting a group `S` currently belongs to, checked live on every request. Team membership and `system:operators` allowlist membership are both instances of this one rule, no separate code path per group kind. Since the only binding targeting `system:operators` grants `system-admin`, niklas's combined policy for that request includes `Allow: * on *`, unioned with whatever he separately holds as `user:niklas`. Remove his email from the allowlist, and his very next request no longer draws on it — nothing to revoke, no propagation delay, the same live-recheck property as everything else in this model (§5). This is also what makes the default ownership binding (§6.2) actually reach a human in the first place: it targets a resolved Team, and a member of that Team benefits from it only through this same expansion.
 
+**Group subjects.** Two reserved group forms exist beyond Team: `system:authenticated` — every authenticated subject, of any kind — and `org:<name>` — every subject belonging to that organization: its org-native subjects (Teams, ServiceAccounts) and its user members alike. Both resolve through the same membership expansion as Teams and `system:operators`; there is no separate code path per group kind. ServiceAccount inclusion in `org:<name>` is deliberate and load-bearing: grants addressed to a whole organization (e.g. `use` on a platform-provided resource, §9) must reach the org's CI identities, or every machine-driven flow fails exactly where a human's would succeed.
+
 **The binding is data; the membership is not — deliberately.** `system:operators`'s grant (the binding above) is a stored row, same table as every other binding. Whether a given identity is currently *in* `system:operators` is never stored anywhere in this model — it's synthesized at evaluation time from the config allowlist, which lives outside the resource store entirely. This is forced by the same bootstrap problem the Operator concept exists to solve: if membership were itself an ordinary RBAC record, granting the first one would require an already-privileged actor to write it, and nothing could ever create that first record. The config allowlist is the one piece of trust in this model that has to originate from outside the system Rise itself governs.
 
 The binding has no equivalent forcing problem — it's never granted by anyone at runtime, only seeded once at bootstrap — so it can safely be data, with one refinement. Being immutable through the ordinary write path (§5's **seeded** Role-ownership tier: no write path can ever modify it, not even an operator) only protects against mutation through this model's own API — it says nothing about a bad migration, a restore from an old backup, or direct database access losing the row entirely, outside any write path this model governs. That residual risk is unacceptable for the one subject with no recovery authority above it, so `system:operators` resolving to `system-admin = { Allow: * on * }` is a fact the evaluator **guarantees unconditionally** — the same hardcoded way step 4 is already skipped for it, above — not something solely read from, and therefore losable with, a table row. The row is still materialized alongside that guarantee, purely so the same explain/audit tooling that inspects everyone else's access can inspect this one too without a special case; if it's ever found missing or altered outside the write path, that's healed by re-materializing it, not a live authorization dependency.
@@ -144,6 +147,7 @@ This mirrors how Kubernetes actually handles `system:masters`: a hardcoded super
 
 - **`updateStatus`** and **`updateFinalizers`**, splitting what was one coarse subresource verb. Finalizers gate deletion and are more sensitive than routine status updates; a controller can be granted one without the other.
 - **`mintToken`** — applies to a ServiceAccount or Controller identity *as a resource in its own right*, not to whatever that identity subsequently acts on. See §7.
+- **`use`** — the right to *reference* a resource from another resource's fields, distinct from reading or editing it. Checked at write time of the *referencing* resource, against its writer, wherever a `ResourceDefinition` declares a reference (§9). Granting `get` without `use` makes a catalog browsable but not selectable; `use` without `get` allows selection by name without exposing the referenced object's contents. (Precedent: the Kubernetes `use` verb on PodSecurityPolicies.)
 
 ### 3. Roles and the Allow/Deny evaluator
 
@@ -168,18 +172,20 @@ A **RoleBinding** attaches a Role to a subject, at a `Scope`, optionally narrowe
 
 ```
 Subject:        <literal subject, e.g. team:platform>  |  <subject template, e.g. team:${ref.name}>
-Scope:          <tree path, e.g. acme-corp/env-prod>  |  "*"     # always present (defaults to "*")
+Scope:          <path, e.g. Environment/acme-corp/env-prod>  |  "*"   # always present (defaults to "*")
 LabelSelector?: { key: <label key>, value?: <fixed value> }      # optional narrowing filter
 Role:           <Role name>
 ```
 
 `Scope` is always present (it defaults to `"*"`, the whole tree, if omitted) and establishes where the binding is placed — it applies to the named node and everything beneath it. `LabelSelector`, when present, doesn't replace `Scope` as a separate targeting mode — it narrows the grant to only the resources *within* that scope whose `effectiveLabels` (§6.1) match. A binding with no `LabelSelector` grants over its entire scoped subtree; a binding with one grants only over the subset of that subtree carrying the matching label.
 
+A `Scope` path is written exactly like a resource URL with the `{group}/{version}` prefix dropped (§8): the target's **kind** first, then its ancestor names root-first, then its own name — `Environment/acme-corp/env-prod` is the Environment `env-prod` under org `acme-corp`; `Organization/acme-corp` is the org itself; `RuntimeClass/standard` is a root-scoped instance (§9). Ancestor kinds are derived from the leaf kind's declared parent chain, the same resolution the URL grammar already performs — one path grammar, not two. (A distinct separator between the kind and the path was considered for visual clarity and rejected to keep `Scope` byte-identical to the URL form — see Alternatives considered.)
+
 **Static** targeting — a fixed subject:
 
 ```
 Subject: team:platform
-Scope:   acme-corp/env-prod
+Scope:   Environment/acme-corp/env-prod
 Role:    deployment-editor
 ```
 
@@ -210,15 +216,15 @@ Evaluating a dynamic binding against a resource is two independent steps: resolv
 3. Union the surviving bindings' Role policies into one combined policy; evaluate `(verb, kind)` against it (Allow-with-Deny-wins, §3) to get `S`'s raw grant on `r`. If no binding survives step 2, the combined policy is empty, no `Allow` statement can match, and the result is **denied** — there is no implicit grant.
 4. Intersect the raw grant against the resolved ceiling for `r`'s organization (§5) — this check runs on every request, live.
 
-A **worked trace**: `team:platform` requests `delete` on `acme-corp/env-prod/deployment:foo`, which carries `rise.dev/owner: platform`.
+A **worked trace**: `team:platform` requests `delete` on `Deployment/acme-corp/env-prod/foo`, which carries `rise.dev/owner: platform`.
 
-- Step 1 collects two bindings: (a) a scope binding at `acme-corp/env-prod` granting `deployment-editor` = `{Allow: * on Deployment}`; (b) the seeded dynamic ownership binding (§6.2), which resolves to `team:platform` via the `rise.dev/owner` label and grants `resource-owner`.
+- Step 1 collects two bindings: (a) a scope binding at `Environment/acme-corp/env-prod` granting `deployment-editor` = `{Allow: * on Deployment}`; (b) the seeded dynamic ownership binding (§6.2), which resolves to `team:platform` via the `rise.dev/owner` label and grants `resource-owner`.
 - Step 2: no wildcard/specific collision between these two.
 - Step 3: union = `{Allow: * on Deployment} ∪ resource-owner's statements`; no `Deny` present → `delete` is in the raw grant.
 - Step 4: `acme-corp` has no Layer 2/3 ceiling narrower than the default → the raw grant passes through unchanged.
 - **Result: allowed.**
 
-Now suppose the org has separately authored, at `acme-corp/env-prod` specifically, a binding for `team:platform` with Role `{Deny: delete on Environment}` (the org's own "nobody deletes an Environment here" rule, §5). That binding's Role statement is unioned into the same combined policy in step 3 for any *Environment*-kind resource under that scope — for the Environment itself, `Deny` wins and `delete` is denied, even though the broader `deployment-editor` binding would otherwise have allowed it. This is the narrower-binding-subtracts-from-a-broader-one behavior the opening primer describes: it only takes effect where a binding's Role actually carries a matching `Deny`, not merely by virtue of being placed at a narrower scope.
+Now suppose the org has separately authored, at `Environment/acme-corp/env-prod` specifically, a binding for `team:platform` with Role `{Deny: delete on Environment}` (the org's own "nobody deletes an Environment here" rule, §5). That binding's Role statement is unioned into the same combined policy in step 3 for any *Environment*-kind resource under that scope — for the Environment itself, `Deny` wins and `delete` is denied, even though the broader `deployment-editor` binding would otherwise have allowed it. This is the narrower-binding-subtracts-from-a-broader-one behavior the opening primer describes: it only takes effect where a binding's Role actually carries a matching `Deny`, not merely by virtue of being placed at a narrower scope.
 
 ### 5. Ceilings — the four-layer, most-restrictive-wins stack
 
@@ -238,7 +244,7 @@ Applied uniformly across every subject kind, with no asymmetry by *kind* — the
 
 Both are the identical mechanism, chosen once at deployment time by whoever authors the Role, not two different architectures — and the same lever widens `resource-owner` if a deployment wants owners themselves to touch their own resources' bookkeeping. Layers 1–2 stay available as a hard backstop regardless of what any org-owned Role or §6.5 override later grants: a SaaS operator can Deny these verbs at the instance ceiling so the restriction holds even if some org tries to route around its own `org-admin` definition.
 
-Its own definition, like any Role, is edit-gated by Layer 4 (below) — but because it's a platform-shipped Role rather than an org-authored one (see the Role-ownership rule below), only an operator may edit its statement list; an org-admin holding it cannot widen it for themselves. `org-admin` is a reserved Role name, recognized specially by the platform the same way `rise.dev/owner` is a reserved label key — every organization is provisioned with exactly one `org-admin`-Role binding, `Scope`-targeted to that org, at org-creation time (§8); Layer 3's write authority and §6.7's structural constraint both key off that reserved name directly, not off any separate "is this an admin" flag.
+Its own definition, like any Role, is edit-gated by Layer 4 (below) — but because it's a platform-shipped Role rather than an org-authored one (see the Role-ownership rule below), only an operator may edit its statement list; an org-admin holding it cannot widen it for themselves. `org-admin` is a reserved Role name, recognized specially by the platform the same way `rise.dev/owner` is a reserved label key — every organization is provisioned with exactly one `org-admin`-Role binding, `Scope`-targeted to that org, at org-creation time (§10); Layer 3's write authority and §6.7's structural constraint both key off that reserved name directly, not off any separate "is this an admin" flag.
 
 **Roles are owned, and only their owner may edit them — in one of three tiers.** A Role is **seeded** (baked in at platform bootstrap, immutable — no write path can ever modify it, not even an operator; today only `system-admin`, §1, which needs this because there is no authority above an operator left to recover a self-inflicted lockout), **platform-owned** (authored by an operator, usable and bindable by any org, e.g. `resource-owner`, `org-admin` — ordinarily editable, just operator-only, since an operator botching one of these stays recoverable by another operator), or **org-owned** (authored by one org's admins, usable only within bindings scoped to that org). Only an operator may edit a platform-owned Role; only that org's admins may edit an org-owned Role; nobody may edit a seeded one. This closes a case the write-time subset check alone doesn't: without ownership, a Role referenced by bindings across multiple orgs with different ceilings would have no single well-defined "which org's ceiling applies" answer when its body is edited. With ownership fixed, editing an org-owned Role is checked against that one org's ceiling and the editor's own permissions in it (§5's general Layer 4 rule); editing a platform-owned Role requires being an operator, who is still, as for any subject, held to holding what they hand out.
 
@@ -250,7 +256,7 @@ Unlike the ceiling intersection (which is live, re-checked on every request), th
 
 **A concrete Role-write example.** Bob holds only `update` on kind `Role` — a narrow grant for maintaining Role definitions — and holds no other binding. Bob edits the `resource-owner` Role, appending `{Allow: mintToken on *}`. Because Role edits go through the same Layer 4 gate as everything else, this write is checked against Bob's own effective permissions: Bob does not himself hold `mintToken` on anything, so the newly-implied grant is not `⊆` his effective permissions, and the write is **rejected** — even though hundreds of subjects are bound to `resource-owner` via the platform-wide default (§6.2) and would otherwise all have been silently escalated by one edit.
 
-**Layer 2's home.** Layer 2 lives in an ordinary resource, `OrganizationPolicy` — one per Organization, created alongside its `org-admin` binding at org-creation bootstrap (§8) — rather than a bespoke subresource on `Organization` itself. This needs no envelope-level machinery: an org's admins are granted ordinary `get`/`list` on it (a denial is diagnosable, not opaque, without ever needing write access), and by default nobody holds `create`/`update`/`delete` on it except `system:operators` (§1) — an ordinary consequence of no binding granting those verbs to anyone else, not a hardcoded rule. A self-hosted operator who wants their own org-admins to write it directly can grant that like any other verb; a SaaS operator leaves the default in place and, per the `org-admin` definition above, denies it explicitly so the restriction survives even a broad `Allow: * on *` elsewhere in that Role. Layer 3 lives in `Organization.spec`, writable by an org's admins through their ordinary grant on the Organization resource — no bespoke home needed for it either.
+**Layer 2's home.** Layer 2 lives in an ordinary resource, `OrganizationPolicy` — one per Organization, created alongside its `org-admin` binding at org-creation bootstrap (§10) — rather than a bespoke subresource on `Organization` itself. This needs no envelope-level machinery: an org's admins are granted ordinary `get`/`list` on it (a denial is diagnosable, not opaque, without ever needing write access), and by default nobody holds `create`/`update`/`delete` on it except `system:operators` (§1) — an ordinary consequence of no binding granting those verbs to anyone else, not a hardcoded rule. A self-hosted operator who wants their own org-admins to write it directly can grant that like any other verb; a SaaS operator leaves the default in place and, per the `org-admin` definition above, denies it explicitly so the restriction survives even a broad `Allow: * on *` elsewhere in that Role. Layer 3 lives in `Organization.spec`, writable by an org's admins through their ordinary grant on the Organization resource — no bespoke home needed for it either.
 
 **Live, uncached ceiling enforcement.** All four layers' ceiling comparison is resolved fresh on every request. Tightening a ceiling takes effect immediately for every subject currently relying on it, with nothing to rewrite — this is also what makes "revoke the role" exactly as effective as "revoke the token" (§7).
 
@@ -322,7 +328,7 @@ The seeded ownership binding is ordinary `Scope: "*"` data. §1's wildcard-repla
 Subject:       team:${ref.name}
 LabelSelector: { key: rise.dev/owner }
 Role:          project-viewer     # ownership implies read-only here
-Scope:         acme-corp
+Scope:         Organization/acme-corp
 ```
 
 The override write still passes the ordinary Layer 4 gate (§5) — no override-specific mechanism.
@@ -370,13 +376,57 @@ A token-exchange request may ask for **less** than the target identity's full ef
 
 Max token TTL is governed by the same four-layer stack (§5), composed via `min()`: an SA-specific setting, bounded by the org's own declared TTL ceiling, bounded by the operator's per-org imposed ceiling, bounded by the instance-wide default. Setting an SA-specific TTL that exceeds the resolved ceiling is **rejected at write time**, consistent with how Layer 4 treats permission-set grants (§5) — it is never silently accepted and clamped later; a write that would be meaningless once capped is refused up front rather than stored as a misleading value. As with permission-set grants, the writer must also currently hold an equal-or-greater TTL entitlement themselves — the numeric case of the same writer-subset check.
 
-### 8. Explicitly out of scope
+### 8. One canonical kind token — no plural forms
+
+A kind has exactly one name: the `kind` itself (`Deployment`, `RuntimeClass`). Role statements (`kinds:`), `Scope` paths (§4), reference declarations (§9), and the resource API's URL grammar all use that same token — the URL grammar becomes `{group}/{version}/{Kind}/{ancestor}…/{name}`, and `ResourceDefinition` no longer declares a plural at all. Kubernetes maintains a parallel plural vocabulary for REST-style collection URLs, at the cost of every RBAC rule (`resources: ["deployments"]`) naming things differently from every manifest (`kind: Deployment`), with a lookup command (`kubectl api-resources`) existing largely to map between the two. A naming scheme that needs a lookup table is a tax, and collection-URL aesthetics don't pay for it. This changes the shipped URL grammar, which is sanctioned: the surface carries no compatibility constraints (Context).
+
+### 9. References to platform-provided resources
+
+Some resources exist to be *referenced* rather than contained: a platform-level `RuntimeClass` (root-scoped, operator-managed) describes how project deployments are reconciled, and organizations select one rather than own one. Some classes are for every org; others are provisioned for one specific customer. The interesting permission is not CRUD on the class — that stays operator-only by ordinary default-deny — but who may *select* it.
+
+**Reference declarations.** A `ResourceDefinition` may declare that a field (or label key) of its kind references another kind:
+
+```
+references:
+  - at:   spec.runtimeClass          # a field path or a label key
+    kind: RuntimeClass
+    verb: use
+```
+
+Declared once at kind registration, as data — the same family as `ResourceDefinition`-declared subresource verbs (Alternatives considered), never per-field engine code. Any write that sets or changes a declared reference additionally requires the writer to hold `use` (§2) on the *referenced instance*, evaluated by the ordinary algorithm (§4). An unchanged value on a later write is not re-checked (same rule as §6.6 step 1), and the check runs before existence disclosure (same ordering as §6.6/§6.7): a writer without `use` cannot probe whether a class exists.
+
+**Availability is instance-targeted bindings.** A root-scoped instance is a node in the tree, so §4's `Scope` targets it with nothing new:
+
+```
+# everyone may use the standard class
+Subject: system:authenticated
+Scope:   RuntimeClass/standard
+Role:    rc-user = { Allow: use on RuntimeClass }
+
+# gpu-b is provisioned for acme-corp only
+Subject: org:acme-corp
+Scope:   RuntimeClass/gpu-b
+Role:    rc-user
+```
+
+Multiple orgs → one binding each: explicit and auditable. "Org A cannot select org B's class" is not a rule anyone writes — it is the *absence of a grant*: org A's subjects hold no `use` binding on `gpu-b`, default-deny (§4 step 3) rejects the write without confirming the class exists, and org A cannot self-serve the grant — authoring a binding scoped at `RuntimeClass/gpu-b` requires binding-write access at root scope (operator territory), and Layer 4's subset check independently blocks handing out `use` they don't hold.
+
+**Defaults are product data, not permission data.** `OrganizationPolicy` stays purely a ceiling document (§5); nothing product-specific accretes onto the RBAC core resources. The global default is a label on the class itself — `runtimeclass.rise.dev/is-default: "true"`, operator-writable because the class is operator-owned (the same pattern as Kubernetes' `storageclass.kubernetes.io/is-default-class`). Org- and Project-level overrides are a label on the Organization or Project (`runtimeclass.rise.dev/default: gpu-b`), and the override cascade — Deployment-explicit → Project → Organization → global — is `effectiveLabels`' nearest-wins walk (§6.1), with no new inheritance machinery. The default label key is itself covered by a reference declaration, so an org-admin setting their org's default is `use`-checked like anyone else — an org cannot default itself onto a class it was never granted.
+
+**Materialization at deployment creation.** When a deployment is created, the effective class is resolved once and written onto the Deployment as its own concrete value; that materializing write is a reference write, `use`-checked against **the deployer** — the User or ServiceAccount driving the deployment. This is why `org:<name>` includes ServiceAccounts (§1): CI-driven deploys must pass exactly where a human's would. The reconciler then reads only the materialized field and never evaluates `use` at all — every `use` check in the system has a well-defined, present subject. (Precedent: Kubernetes' DefaultStorageClass admission stamps the default `storageClassName` onto a PVC at create time.)
+
+This deliberately gives the reference *snapshot* semantics, not §6.1's live semantics: the never-store rule exists for access-driving labels, where staleness is a security bug, whereas here the recorded value is the *output* of a decision made at a specific moment by a specific subject, and reproducibility is the point. The org's default label remains live as an *input* to the next deployment. Revoking an org's `use` grant therefore stops the *next* deployment, never a running one — consistent with Layer 4 grants being write-time everywhere else (§5), and the right availability call: a revoked class ages out at the org's next deploy or rollback (which creates a new deployment and re-resolves against current grants).
+
+**Boundary.** Org-admins cannot sub-delegate or per-instance-restrict `use` of platform-provided resources inside their org — those grants live at root scope. Their levers are the org default label and a kind-level Layer 3 ceiling denial (`Deny: use on RuntimeClass`); per-instance, org-side restriction would need resource admission policies, which are out of scope (§10).
+
+### 10. Explicitly out of scope
 
 - Org-registrable Controllers/ResourceDefinitions — falls out for free once registration is just another ceiling-governed verb, not designed now.
 - Migrating today's typed-table-backed APIs (`Project`, `Team`, `Deployment`, …) onto this model — happens automatically as a consequence of their separate, already-planned migration onto the generic resource store.
 - Ingress-level authentication for a deployed application's own end users — a different problem domain entirely.
 - How a brand-new organization's first `org-admin` binding is created (the org-creation bootstrap) — necessarily an operator action, the same way the very first Role/RoleBinding on the whole instance must be, but the org-creation workflow itself is not designed here.
 - A pluggable subject-kind registry letting organizations define groups with custom membership semantics (§6.4) — organization-specific *naming* of a grouping concept is supported today by pairing an existing kind with an organization-chosen label key; genuinely custom membership resolution is not, and would need a larger extension to the closed subject-kind list.
+- Resource admission policies — org- or operator-authored rules constraining what may be written below a given scope (e.g. required labels, or per-instance restriction of which platform resources an org's own subjects may reference, §9). A future mechanism; nothing here forecloses it.
 
 ## Consequences
 
@@ -396,6 +446,10 @@ Max token TTL is governed by the same four-layer stack (§5), composed via `min(
   request, so tightening a ceiling or narrowing an identity's Role takes
   effect immediately — including for every outstanding token of that identity
   (§5, §7).
+- Reference authorization — who may *select* a platform-provided resource
+  like a `RuntimeClass` — reuses the same evaluator, bindings, default-deny,
+  and existence-masking as everything else; making a class available to an
+  org is one auditable binding (§9).
 
 **Negative / accepted risks.**
 
@@ -420,6 +474,14 @@ Max token TTL is governed by the same four-layer stack (§5), composed via `min(
   "why can this subject do this?") is only practical once the implementation
   builds a policy explain/simulator; that is additional, eventual work the
   model assumes.
+- `use` revocation takes effect at the next deployment — references are
+  materialized and checked at write time, so running workloads are never
+  retroactively broken, which also means a revoked class lingers until the
+  org's next deploy or rollback (§9).
+- Org-admins cannot per-instance restrict or sub-delegate `use` of
+  platform-provided resources inside their org; their levers are the org
+  default label and a kind-level Layer 3 denial, until admission policies
+  exist (§9, §10).
 - The resource-API RBAC items in `ROADMAP.md` (and everything sequenced on
   them) are to be planned against this model.
 
@@ -433,7 +495,7 @@ Max token TTL is governed by the same four-layer stack (§5), composed via `min(
 - **Gating label writes on "does not drop access to zero"** rather than the standard subset check. Defends availability only — it never checks *who* gains access, only that the total doesn't hit zero — so it would still permit an unauthorized party to redirect access to themselves. Rejected in favor of the genuine subset comparison in §6.6.
 - **Exempting machine identities (Controller, ServiceAccount) from an org's own declared ceiling**, to avoid an org accidentally stranding its own controller. Rejected — an exemption would require every ceiling check to first determine whether the binding being evaluated targets a machine or human subject, adding a second evaluation path everywhere ceilings apply for a narrow footgun-avoidance benefit; ceilings apply uniformly instead, with no asymmetry by subject kind, and the resulting footgun is accepted as-is (§1, §5).
 - **A ceiling-tightening (or wildcard-replacement) dry-run/impact-preview warning.** Would require simulating the write's effect across every subject with a live binding under the tightened rule before committing it — expensive and stateful in a way the rest of the write path deliberately isn't, and it doesn't integrate cleanly into a generic REST write path. Deferred; the footgun is accepted, not solved, for now (§1, §5).
-- **An open, pluggable subject-kind registry**, to let organizations define arbitrary group types (e.g. "squad") with their own membership resolution. Subject kind carries real infrastructure (membership resolution, org-native-vs-agnostic encoding, `mintToken` semantics) not worth making pluggable. Rejected; §6.4 shows organization-specific *naming* of a grouping concept is expressible by pairing an existing kind (Team) with an organization-chosen label key — genuinely custom membership resolution is a separate, larger ask this does not address, and remains out of scope (§8).
+- **An open, pluggable subject-kind registry**, to let organizations define arbitrary group types (e.g. "squad") with their own membership resolution. Subject kind carries real infrastructure (membership resolution, org-native-vs-agnostic encoding, `mintToken` semantics) not worth making pluggable. Rejected; §6.4 shows organization-specific *naming* of a grouping concept is expressible by pairing an existing kind (Team) with an organization-chosen label key — genuinely custom membership resolution is a separate, larger ask this does not address, and remains out of scope (§10).
 - **Clamping a minted token's scope to the calling subject's own permissions.** Forecloses a legitimate privilege-elevation pattern — a low-privilege, long-lived caller minting a token for a higher-privilege, short-lived ServiceAccount, the same shape as AWS STS `AssumeRole`. Rejected; §7 gates *who may mint*, not what the minted token may then do.
 - **A single global namespace for Role names, with no ownership.** Any org editing any Role by name would make cross-org ceiling attribution ambiguous the moment a Role is bound in more than one org — whose ceiling governs an edit? Rejected in favor of Role ownership (§5): a Role is platform-owned (operator-editable, any org may bind it) or org-owned (editable, and bindable, only within one org) — editing a Role always has exactly one unambiguous ceiling to check against.
 - **Unbounded `mintToken` chaining** (letting a minted token itself be used to mint a further token). Lets a caller holding `mintToken` on one identity reach arbitrarily far through a chain of that identity's own `mintToken` grants, with no single grant reflecting the actual resulting reach. Rejected in favor of the one-hop bound in §7 — only directly-authenticated callers may mint.
@@ -448,6 +510,12 @@ Max token TTL is governed by the same four-layer stack (§5), composed via `min(
 - **Making the `system:operators` binding fully virtual too, with no stored row at all** (matching how membership itself is virtual). Would remove operator access from the same explain/audit tooling that inspects everyone else's — exactly the gap `system:operators` was introduced to close by replacing a hardcoded bypass branch in the first place (above). Rejected; the binding stays data, mirrored and healable — only the evaluator's guarantee of its *effect* is hardcoded, not its existence as an inspectable object.
 - **Making the seeded `system-admin` Role and its binding platform-owned (operator-editable) rather than immutable.** Would let an operator edit or delete their own bootstrap grant through the ordinary write path — trivially passing the subset check, since they hold everything — with no higher authority left to recover from it, unlike every other documented risk in this ADR. Rejected in favor of a third, **seeded** Role-ownership tier (§5) that no write path can modify, editable by no one.
 - **Allowing a static Subject to pair with a value-less `LabelSelector`.** Would grant a fixed subject access to any resource carrying *any* value for that label key, regardless of what it actually says — access disconnected from the value the selector nominally matches on. Rejected; value-less selectors are reserved for dynamic (templated) subjects, where the matched value is actually used (§4).
+- **Kubernetes-style plural resource names** (a `plural` declared per kind, used in collection URLs and grants). Creates a permanent dual vocabulary — rules and URLs naming `deployments` while every object says `kind: Deployment` — with a lookup step (`kubectl api-resources`) as the ongoing price of collection-URL aesthetics. Rejected; the `kind` token is the single canonical name everywhere (§8) and `ResourceDefinition` declares no plural.
+- **A distinct separator between the kind and the path in `Scope`** (e.g. a `RuntimeClass:gpu-b`-style form), for visual clarity. Rejected to keep `Scope` byte-identical to the URL path form (§4, §8) — one grammar to learn, one parser to trust.
+- **`get` as the reference gate** ("if you can read it, you can select it"), instead of a distinct `use` verb. Couples two independent decisions: a catalog may be browsable without being selectable (visible-but-gated offerings), and selectable without being readable (a class's internals — node selectors, cost plumbing — are not the selector's business). Rejected in favor of `use` (§2, §9), mirroring the Kubernetes `use` verb on PodSecurityPolicies.
+- **An `allowedOrgs` list on the referenced resource's spec** as the availability mechanism. Moves an authorization decision out of the one system built to answer authorization questions, needs its own evaluation and audit path, and caps out at org granularity. Rejected; availability is ordinary instance-targeted `use` bindings (§9), which also express team- or ServiceAccount-narrow grants with no extra machinery.
+- **Encoding product defaults (e.g. the default `RuntimeClass`) in `OrganizationPolicy`.** Would accrete product-specific settings onto the RBAC core's ceiling document. Rejected; the core stays agnostic — defaults live on the product resources themselves as labels, and the override cascade is `effectiveLabels` (§6.1, §9).
+- **Live `use` re-evaluation at reconcile time**, instead of materializing the resolved class onto the Deployment at creation. Leaves the check with no well-defined subject (a reconciler acts for nobody in particular) and turns a grant revocation into retroactive breakage of running workloads. Rejected; the effective class is materialized at deployment creation and `use`-checked against the deployer (§9), matching Kubernetes' DefaultStorageClass admission behavior — revocation applies from the next deployment.
 
 ## References
 

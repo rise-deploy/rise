@@ -4,11 +4,10 @@ sidebar:
   order: 0
 ---
 
-ADRs record point-in-time architectural decisions: the context they were made
-in, the alternatives that were rejected, and the consequences accepted. They
-complement `ROADMAP.md`, which owns live workstream status and phase rationale
-— an ADR records *why a decision was made*; the roadmap tracks *where the work
-stands*.
+ADRs record architectural decisions: the context they were made in, the
+alternatives that were rejected, and the consequences accepted. An ADR's
+**Status** field tracks the decision through its whole lifecycle, from
+proposal to implementation.
 
 ## When to write one
 
@@ -23,8 +22,9 @@ monotonically increasing number. Sections: **Status**, **Context**,
 **Decision**, **Consequences**, **Alternatives considered**, plus an optional
 **References**.
 
-Statuses: **Proposed**, **Accepted**, **Superseded by ADR-NNNN**. A superseded
-ADR is never edited to say something else — it gets a status pointer to its
+Statuses: **Proposed**, **Accepted**, **In Progress** (implementation
+underway), **Implemented**, **Superseded by ADR-NNNN**. A superseded ADR is
+never edited to say something else — it gets a status pointer to its
 successor.
 
 ## Index
