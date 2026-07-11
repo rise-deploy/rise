@@ -31,5 +31,4 @@ successor.
 
 | ADR | Status | Summary |
 |---|---|---|
-| [ADR-0001](/operator-docs/adr/0001-unified-permission-model/) — Unified Permission Model | Proposed | One Role/RoleBinding/ceiling model for all subject kinds (Users, Teams, ServiceAccounts, Controllers, Operators) on the generic resource API and token issuance. |
-| [ADR-0002](/operator-docs/adr/0002-authorization-code-structure/) — Authorization Code Structure | Proposed | Crate layering that realizes ADR-0001: a pure, DB-free policy/engine core generic over `ResourceStore` + `MembershipResolver`, with Rise wiring and store SQLX kept out of it. |
+| [ADR-0001](/operator-docs/adr/0001-unified-permission-model/) — Unified Permission Model | Proposed | One Role/RoleBinding/ceiling model for all subject kinds (Users, Teams, ServiceAccounts, Controllers, Operators) on the generic resource API and token issuance, plus the crate structure that realizes it. |

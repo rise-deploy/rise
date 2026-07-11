@@ -592,6 +592,37 @@ This deliberately gives the reference *snapshot* semantics, not §6.1's live sem
 - **Using the presence of the `act`/attribution claim as the one-hop gate**, rather than a separate token-class marker. Coupling the security gate to an audit claim means a later change to *when* `act` is emitted (e.g. omitting it for some first-party mint) would silently reopen chaining. Rejected in favor of an unconditional `token_class` marker stamped on every exchange-minted token, decoupled from `act` (§7).
 - **Allowing org bindings to target arbitrary subjects (a cross-org grant).** Would let an org author a binding whose grant reaches a foreign org's subjects, or an org-agnostic Controller, with no membership relationship to the granting org. Rejected in favor of the recipient boundary's org-membership intersection (§1) — an org binding's grant reaches only live members of its own org — with deliberate cross-org sharing deferred to a future first-class primitive (§10).
 
+## Implementation structure
+
+*Where the code lives, not what the model is. This realizes the sections above; it is a design intent, not a normative rule.*
+
+The evaluation logic is security-critical, and the value of a small, auditable core is highest exactly there. The carve-up's goal is that the decision logic — union, Deny-wins, the subset check, wildcard replacement, ceiling intersection, the label-write gate — can be read, fuzzed, and tested **without a database and without any Rise product concept**. What a `Deployment` is, what `rise.dev/` means, and how rows reach Postgres must never leak into it. One fact drives most of the structure: the RBAC objects — `Role`, `RoleBinding`, `PlatformRole`, `PlatformRoleBinding`, `OrganizationPolicy`, `InstancePolicy` — are all **resources** in the generic store (§3, §5), so reading a subject's bindings or an org's ceiling is an ordinary `ResourceStore` read, not a bespoke authorization data path.
+
+Three layers, separating security decisions, fact-retrieval, and product meaning:
+
+- **Layer 0 — pure policy algebra** (new crate, e.g. `rise-authz-policy`; ~zero deps). The Allow/Deny evaluator, ceiling composition (pointwise `∩`, `min()`), the Deny-aware subset check and the intensional `(Scope, LabelSelector)` domain lattice, wildcard replacement with Deny-preservation, `${ref.name}` substitution — all pure functions over its **own** small `Verb`/`Kind`/`Statement`/`Policy` types, no store, no I/O, no reserved-key constants. Carries the pure-logic acceptance scenarios as unit tests.
+- **Layer 1 — the evaluation engine** (new crate, e.g. `rise-authz`). The §4 algorithm, membership expansion, `effectiveLabels` diffing (§6.6), the recipient-boundary intersection, and `list` filtering. Depends on `rise-authz-policy`, on `rise-resource-api`'s envelope types, and on two traits it evaluates against — `ResourceStore` (facts from the tree) and a small new `MembershipResolver` (which it defines). No SQLX, no Axum, no token signing; testable end-to-end against in-memory fake stores.
+- **Layer 2 — Rise wiring** (`rise-deploy`). The `MembershipResolver` implementation, the seed data (reserved label keys; the `system-admin`/`resource-owner`/`org-admin` contents and deployment variants; the seeded bindings), the operator allowlist source, the authz choke point (`src/server/resources/authz.rs`, replacing today's `require_operator`), the HTTP handlers, and the `list` metadata-vs-full projection and 403-vs-masked-empty mapping.
+
+**The facts come from the store crate, not scattered in `rise-deploy`.** The tree/binding/ceiling reads are the *existing* `ResourceStore` trait, grown with generic hierarchy/label operations implemented in `rise-resource-store`'s Postgres store: ancestor chain, the K-inheriting subtree (`WITH RECURSIVE` over `parent_uid`), `effectiveLabels` resolution, and list-by-kind-under-scope — product-agnostic operations over a labeled hierarchical store. This matches the repo's SQLX split (`rise-resource-store` owns resource-store SQLX; `rise_deploy::db` owns typed-table SQLX). The one product-specific seam is **`MembershipResolver`**: team membership (`team_members`), org membership (Team ties, §1), and operator status (config allowlist) are the Rise-specific inputs, and Teams are still typed-table-backed — so the engine defines the trait and `rise-deploy` implements it over `rise_deploy::db` + config. When the typed tables migrate onto the generic store, most of this dissolves back into `ResourceStore` reads; the operator allowlist stays config-sourced regardless.
+
+**Prerequisite refactor:** the `ResourceStore` trait currently lives in `rise-resource-store`, which carries `sqlx`. Move the trait (and its Row/Params model types) down into the dep-light `rise-resource-api`, leaving only `PgStore` + `sqlx` in `rise-resource-store`, so the engine compiles against the trait without transitively pulling a database driver. Two further splits fall along existing seams: token issuance (§7) — the *authorization* half (`mintToken` verb check, the one-hop `token_class` rule) is engine logic, the *issuance* half (signing, `act`/`token_class` claims, TTL, trust-policy match) is `rise-backend-auth`; and `list` (§4) — per-item filtering is engine, the metadata-vs-full projection is a `rise-resource-api`/server serialization concern. `effectiveLabels` as a plain read is a store op; the §6.6 before/after *simulation with a hypothetical value* is engine logic over store-provided ancestor labels, keeping the store free of authorization semantics.
+
+```
+rise-authz-policy   (pure algebra; own Verb/Kind/Statement types; ~zero deps)
+        ▲
+rise-authz (engine) ──► rise-resource-api  (envelope types + the ResourceStore
+   defines MembershipResolver              & MembershipResolver traits, no sqlx)
+        ▲                        ▲
+        │                        │ impl
+rise-deploy ──► rise-resource-store (PgStore: ancestors, K-inheriting subtree,
+  impl MembershipResolver         effectiveLabels, list-by-kind — the sqlx home)
+  over team/org tables + config;
+  seed data; authz.rs choke point; HTTP; list projection; token wiring
+```
+
+The payoff: the pure algebra and engine are testable with fakes and no Postgres, so the acceptance suite partitions three ways — pure-logic → Layer 0 unit tests; tree/membership → Layer 1 with fake stores; wiring (masking, `list` projection, token endpoint) → server integration — and the most security-sensitive code has the fewest dependencies. Two structure choices are left revisitable: whether Layers 0 and 1 are one crate (modules `policy`/`engine`) or two — leaning **one with a hard internal boundary**, split when the pure layer earns it (as `rise-backend-docker` was extracted only once its seam matured, #377) — and whether Layer 0 reuses `rise-resource-api`'s verb/kind types or defines its **own** (leaning own, for a standalone, portable policy library at the cost of a thin mapping layer). Leaving the `ResourceStore` trait in the sqlx-bearing crate and letting the engine take the transitive database dependency was considered and rejected — it bloats the security core's dependency graph and undercuts fake-testability.
+
 ## Appendix: acceptance scenarios (normative)
 
 These scenarios pin the semantics an implementation must satisfy; several
@@ -697,6 +728,5 @@ tagged with the section whose rule it pins.
   live status for the resource-API RBAC items this model informs.
 - [Generic Resource API](/operator-docs/generic-resource-api/) — the shipped,
   operator-only surface this model will govern.
-- [ADR-0002](/operator-docs/adr/0002-authorization-code-structure/) — the crate
-  structure that realizes this model (pure policy/engine core, store and Rise
-  wiring kept out of it).
+- `crates/rise-resource-api`, `crates/rise-resource-store` — the envelope types
+  and the `ResourceStore` trait/impl the Implementation structure builds on.
