@@ -697,3 +697,6 @@ tagged with the section whose rule it pins.
   live status for the resource-API RBAC items this model informs.
 - [Generic Resource API](/operator-docs/generic-resource-api/) — the shipped,
   operator-only surface this model will govern.
+- [ADR-0002](/operator-docs/adr/0002-authorization-code-structure/) — the crate
+  structure that realizes this model (pure policy/engine core, store and Rise
+  wiring kept out of it).
