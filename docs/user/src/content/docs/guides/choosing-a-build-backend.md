@@ -3,8 +3,6 @@ title: "Choosing a Build Backend"
 description: "Decide between Railpack, Docker, and Pack (buildpacks) for building container images in Rise."
 ---
 
-import { Aside } from '@astrojs/starlight/components';
-
 ## When to use this
 
 You're deploying an app to Rise and need to pick a build backend — or you've hit a limitation with the default and want to know when to switch. This guide covers auto-detection rules, the decision matrix, and configuration for each backend.

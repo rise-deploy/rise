@@ -31,6 +31,7 @@ export default defineConfig({
         {
           label: 'Guides',
           items: [
+            { label: 'Using Rise with AI Agents', slug: 'guides/ai-app-builder' },
             { label: 'Deploying from CI', slug: 'guides/deploying-from-ci' },
             { label: 'Authenticating End Users', slug: 'guides/authenticating-end-users' },
             { label: 'Choosing a Build Backend', slug: 'guides/choosing-a-build-backend' },

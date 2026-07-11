@@ -3,8 +3,6 @@ title: "Deploying from CI"
 description: "Set up Service Accounts and CI pipelines for automatic deploys, including preview environments."
 ---
 
-import { Aside } from '@astrojs/starlight/components';
-
 ## When to use this
 
 You want your CI pipeline (GitHub Actions, GitLab CI, etc.) to push deployments to Rise automatically — without storing a long-lived token. This guide covers inbound OIDC federation via Service Accounts, the recommended exchange flow, and the preview-environments pattern.
@@ -52,12 +50,12 @@ rise sa create -p my-app \
   --claim ref=refs/heads/main
 ```
 
-<Aside type="note" title="Verified requirements">
+:::note[Verified requirements]
 - `--issuer` for GitHub Actions is `https://token.actions.githubusercontent.com`.
 - The `aud` claim is **mandatory** (validated both client-side and server-side).
 - At least **one additional claim** beyond `aud` is required.
 - Claims support glob wildcards (`*`). For example, `--claim ref=refs/heads/*` matches any branch.
-</Aside>
+:::
 
 ### 2. Note the SA identity email
 

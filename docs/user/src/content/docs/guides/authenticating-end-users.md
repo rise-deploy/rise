@@ -3,8 +3,6 @@ title: "Authenticating End Users"
 description: "Add user login to a Rise app using the Generic OAuth extension, the rise_jwt cookie, or a DIY approach."
 ---
 
-import { Aside } from '@astrojs/starlight/components';
-
 ## When to use this
 
 Your deployed app needs to authenticate end users, but you're unsure whether to use Rise's built-in identity (the `rise_jwt` cookie), the Generic OAuth extension (broker for third-party providers), or implement OAuth yourself. This guide helps you choose and set up the right approach.
@@ -71,7 +69,7 @@ rise extension create oauth-google -p my-app \
   }'
 ```
 
-<Aside type="note" title="Verified spec fields">
+:::note[Verified spec fields]
 Required fields (validated in `src/server/extensions/providers/oauth/provider.rs`):
 - `provider_name` — display name
 - `client_id` — upstream OAuth client ID
@@ -82,7 +80,7 @@ Required fields (validated in `src/server/extensions/providers/oauth/provider.rs
 Optional fields:
 - `authorization_endpoint` — only needed for non-OIDC providers (auto-discovered for OIDC-compliant providers like Google, Auth0, Dex)
 - `token_endpoint` — same: only for non-OIDC providers (e.g., GitHub, Snowflake)
-</Aside>
+:::
 
 For a **non-OIDC provider** like GitHub, specify endpoints manually:
 
