@@ -6,6 +6,14 @@ const docsBasePath = import.meta.env.BASE_URL.replace(/\/$/, '');
 
 <pre><code data-rise-agent-prompt data-docs-base={docsBasePath}>{buildAgentPrompt(docsBasePath)}</code></pre>
 
+<style>
+	pre,
+	code {
+		white-space: pre-wrap;
+		overflow-wrap: anywhere;
+	}
+</style>
+
 <script>
 	import { buildAgentPrompt } from '../../../scripts/agent-prompt.mjs';
 
