@@ -63,6 +63,54 @@ fn validate_install_destination(path: &Path, name: &str) -> Result<()> {
     }
 }
 
+fn path_exists(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("Failed to inspect {}", path.display())),
+    }
+}
+
+fn backup_path(target: &Path, name: &str) -> PathBuf {
+    target.join(format!(".{name}.previous"))
+}
+
+fn is_internal_entry(name: &str) -> bool {
+    name.starts_with('.') && (name.ends_with(".previous") || name.contains(".installing-"))
+}
+
+fn recover_interrupted_install(dest: &Path, backup: &Path, name: &str) -> Result<()> {
+    let dest_exists = path_exists(dest)?;
+    let backup_exists = path_exists(backup)?;
+
+    match (dest_exists, backup_exists) {
+        (false, true) => {
+            validate_install_destination(backup, name)?;
+            std::fs::rename(backup, dest).with_context(|| {
+                format!(
+                    "Failed to restore interrupted skill update from {} to {}",
+                    backup.display(),
+                    dest.display(),
+                )
+            })?;
+            println!("Restored interrupted skill update for '{}'.", name);
+        }
+        (true, true) => {
+            validate_install_destination(dest, name)?;
+            validate_install_destination(backup, name)?;
+            std::fs::remove_dir_all(backup).with_context(|| {
+                format!(
+                    "Failed to clean previous skill version {} before updating",
+                    backup.display(),
+                )
+            })?;
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
 fn github_commit_url(git_ref: &str) -> Result<reqwest::Url> {
     let mut url = reqwest::Url::parse(&format!(
         "https://api.github.com/repos/{}/{}/commits/",
@@ -126,7 +174,11 @@ pub async fn install_command(
         Some(t) => t,
         None => default_target()?,
     };
+    std::fs::create_dir_all(&target)
+        .with_context(|| format!("Failed to create skills directory {}", target.display()))?;
     let dest_root = target.join(&name);
+    let backup_root = backup_path(&target, &name);
+    recover_interrupted_install(&dest_root, &backup_root, &name)?;
     validate_install_destination(&dest_root, &name)?;
 
     let http = reqwest::Client::builder()
@@ -238,10 +290,7 @@ pub async fn install_command(
     }
 
     // 4. Build the new version beside the live directory, then swap it in.
-    std::fs::create_dir_all(&target)
-        .with_context(|| format!("Failed to create skills directory {}", target.display()))?;
     let staging_root = staging_path(&target, &name, "installing")?;
-    let backup_root = staging_path(&target, &name, "previous")?;
     std::fs::create_dir(&staging_root).with_context(|| {
         format!(
             "Failed to create staging directory {}",
@@ -281,7 +330,16 @@ pub async fn install_command(
     }
     if let Err(error) = std::fs::rename(&staging_root, &dest_root) {
         if backup_root.exists() {
-            let _ = std::fs::rename(&backup_root, &dest_root);
+            if let Err(restore_error) = std::fs::rename(&backup_root, &dest_root) {
+                let _ = std::fs::remove_dir_all(&staging_root);
+                bail!(
+                    "Failed to activate installed skill {}: {}. The previous version remains at {} because restoring it also failed: {}",
+                    dest_root.display(),
+                    error,
+                    backup_root.display(),
+                    restore_error,
+                );
+            }
         }
         let cleanup_error = std::fs::remove_dir_all(&staging_root).err();
         let activation_error = Err(error)
@@ -333,6 +391,13 @@ pub fn list_command(target: Option<PathBuf>) -> Result<()> {
     {
         let entry = entry?;
         let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_internal_entry)
+        {
+            continue;
+        }
         if path.is_dir() && path.join("SKILL.md").exists() {
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 found.push((name.to_string(), path));
@@ -429,6 +494,44 @@ mod tests {
         std::fs::write(destination.join("SKILL.md"), "# Skill").unwrap();
 
         validate_install_destination(&destination, "rise-app-builder").unwrap();
+    }
+
+    #[test]
+    fn recovers_previous_version_after_interrupted_install() {
+        let target = tempfile::tempdir().unwrap();
+        let destination = target.path().join("rise-app-builder");
+        let backup = backup_path(target.path(), "rise-app-builder");
+        std::fs::create_dir(&backup).unwrap();
+        std::fs::write(backup.join("SKILL.md"), "# Previous").unwrap();
+
+        recover_interrupted_install(&destination, &backup, "rise-app-builder").unwrap();
+
+        assert!(destination.join("SKILL.md").is_file());
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn cleans_stale_backup_after_successful_activation() {
+        let target = tempfile::tempdir().unwrap();
+        let destination = target.path().join("rise-app-builder");
+        let backup = backup_path(target.path(), "rise-app-builder");
+        for path in [&destination, &backup] {
+            std::fs::create_dir(path).unwrap();
+            std::fs::write(path.join("SKILL.md"), "# Skill").unwrap();
+        }
+
+        recover_interrupted_install(&destination, &backup, "rise-app-builder").unwrap();
+
+        assert!(destination.join("SKILL.md").is_file());
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn recognizes_only_internal_transaction_entries() {
+        assert!(is_internal_entry(".rise-app-builder.previous"));
+        assert!(is_internal_entry(".rise-app-builder.installing-123-456"));
+        assert!(!is_internal_entry("rise-app-builder"));
+        assert!(!is_internal_entry(".custom-skill"));
     }
 
     #[test]

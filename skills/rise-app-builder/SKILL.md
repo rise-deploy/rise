@@ -133,8 +133,8 @@ Then reference `$ENCRYPTED` in the `--spec` JSON.
 | Flag / option | Encrypted at rest | Retrievable via API |
 |---------------|:-:|:-:|
 | `-e KEY=VALUE` (plain env) | | n/a |
-| `--secret-env KEY=VALUE` / `rise env set --secret` | ✅ | ✅ |
-| `--protected-env KEY=VALUE` | ✅ | ❌ |
+| `--secret-env KEY=VALUE` / `rise env set --secret --protected=false` | ✅ | ✅ |
+| `--protected-env KEY=VALUE` / `rise env set --secret` | ✅ | ❌ |
 
 ## Condensed Patterns
 

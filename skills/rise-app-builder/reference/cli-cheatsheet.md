@@ -120,7 +120,7 @@ Build and run a container locally for development.
 | `--context <path>` | Build context directory (docker/podman only) |
 | `--build-context name=path` | Named build context for multi-stage builds (repeatable) |
 | `--no-cache` | Disable build cache |
-| `--platform <arch>` | Target platform (default: `linux/amd64`) |
+| `--platform <arch>` | Target platform override. Resolution order: CLI, `RISE_PLATFORM`, rise.toml, backend hint, host architecture. |
 | `--separate-push` | Build locally first, then push separately (for long CI builds) |
 
 ## Environments (`rise environment` / `rise envs`)

@@ -49,7 +49,7 @@ LOG_LEVEL = "info"
 | `args` | `[String]` | Build-time args (`KEY=VALUE` or `KEY` to read from shell). Alias: `env` |
 | `container_cli` | `String` | Container CLI: `docker` or `podman` |
 | `managed_buildkit` | `bool` | Enable managed BuildKit daemon (auto-enables when `SSL_CERT_FILE` is set) |
-| `platform` | `String` | Target platform (default: `linux/amd64`) |
+| `platform` | `String` | Target platform override. Without it, Rise uses the backend hint or host architecture. |
 | `no_cache` | `bool` | Disable build cache |
 
 ```toml
