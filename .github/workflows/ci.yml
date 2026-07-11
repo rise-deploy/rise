@@ -726,6 +726,12 @@ jobs:
         working-directory: docs
         run: npm ci
 
+      - name: Generate LLM documentation
+        env:
+          RISE_USER_DOCS_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/user
+          RISE_OPERATOR_DOCS_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/operator
+        run: node docs/scripts/generate-llms.mjs
+
       - name: Build user docs
         working-directory: docs/user
         env:
@@ -885,6 +891,12 @@ jobs:
       - name: Install docs dependencies
         working-directory: docs
         run: npm ci
+
+      - name: Generate LLM documentation preview
+        env:
+          RISE_USER_DOCS_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/preview/pr-${{ github.event.pull_request.number }}/user
+          RISE_OPERATOR_DOCS_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/preview/pr-${{ github.event.pull_request.number }}/operator
+        run: node docs/scripts/generate-llms.mjs
 
       - name: Build user docs preview
         working-directory: docs/user
