@@ -4,6 +4,7 @@ description: "Install or remotely load the Rise App Builder skill so AI agents f
 ---
 
 import SkillLinks from '../../../components/SkillLinks.astro';
+import AgentPrompt from '../../../components/AgentPrompt.astro';
 
 ## When to use this
 
@@ -27,6 +28,8 @@ An agent does not need the skill installed locally. Point it to the hosted files
 
 The user documentation `llms.txt` also lists these files under **AI Skills**, so an agent starting from the documentation root can discover them automatically.
 
-:::tip[Recommended prompt]
-Read the Rise user documentation `llms.txt` and the linked Rise App Builder skill before changing this application. Follow the skill's routing decisions and core invariants, and use its references instead of guessing CLI flags or `rise.toml` fields.
-:::
+## Recommended prompt
+
+This prompt automatically uses the documentation URL of the page you are viewing, including PR previews:
+
+<AgentPrompt />

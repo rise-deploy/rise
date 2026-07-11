@@ -18,6 +18,7 @@ import { readdir, readFile, writeFile, mkdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, relative, basename, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { buildAgentPrompt } from './agent-prompt.mjs';
 
 // --- Configuration --------------------------------------------------------
 
@@ -352,10 +353,15 @@ function skillLinksMarkdown(site) {
   ].join('\n');
 }
 
+function agentPromptMarkdown(site) {
+  return `\`\`\`text\n${buildAgentPrompt(site.baseUrl)}\n\`\`\``;
+}
+
 function rawPageBody(page, site) {
   return page.body
     .replace(/^import\s+.*?;\s*$/gm, '')
     .replace('<SkillLinks />', skillLinksMarkdown(site))
+    .replace('<AgentPrompt />', agentPromptMarkdown(site))
     .replace(/^\n+/, '');
 }
 
