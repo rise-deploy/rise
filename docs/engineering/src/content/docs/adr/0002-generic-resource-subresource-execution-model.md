@@ -82,17 +82,31 @@ route and validate the registered subresource
 → complete the audit record
 ```
 
-The handler is never passed a JWT or raw `sub`, never decides whether the
-caller holds the primary subresource permission, and never chooses an
-authorization verb from request data. It receives a typed context containing
-the authenticated principal, already-resolved parent identity and object,
-resource definition, canonical subresource, request deadline/cancellation, and
-an audit correlation identifier.
+With the single exception of token exchange (below), the handler is never
+passed a JWT or raw `sub`; no handler decides whether the caller holds the
+primary subresource permission, and none chooses an authorization verb from
+request data. It receives a typed context containing the authenticated
+principal, already-resolved parent identity and object, resource definition,
+canonical subresource, request deadline/cancellation, and an audit correlation
+identifier.
+
+**Token exchange is the one credential-handling exception.** For the `token`
+strategy the pipeline authenticates the *minting caller*, but the principal the
+`(create, kind, token)` check authorizes is the *source* identity the handler
+resolves by validating an external source credential against the target's trust
+policies (ADR-0001 §7). That validation and source-principal resolution run
+inside the handler — the sole handler that accepts an external workload JWT — so
+for this strategy the authorize step applies to a handler-resolved principal
+rather than one fixed before invocation. Every other handler receives only an
+already-authenticated Rise principal and validates no credential.
 
 Some handlers may need additional authorization decisions on resources they
 reference. Those go back through the same authorization service as explicit
 secondary checks; a handler cannot manufacture an `Allowed` result or accept a
-caller-supplied subject. Whether any initial handler needs this remains open.
+caller-supplied subject. Unlike the pipeline-enforced primary check — a failure
+there means the handler is never invoked — a secondary decision is returned *to*
+the handler, which is trusted to honor it; how secondary checks are constrained
+is an open question below. Whether any initial handler needs this remains open.
 
 Parent lookup, scope and label resolution, denial/existence masking, and
 tombstone behavior inherit ADR-0001 and the generic resource API contract. A
@@ -107,7 +121,7 @@ handler an unrestricted raw HTTP response:
 |---|---|---|
 | Protected stored-field mutation | `status`, `finalizers` | Updated parent resource |
 | Virtual resource projection | `scale` | Typed projection, optionally mapped back into the parent |
-| Generated finite response | `token` | Typed non-persisted response with explicit sensitivity metadata |
+| Generated finite response | `token` | Typed non-persisted response with registration-declared sensitivity metadata |
 | Server stream | `logs` | Content type plus cancellable, backpressured byte stream |
 | Upgraded or duplex connection | possible `exec` | Audited connection/session handle |
 | Reverse proxy | possible `proxy` | Constrained upstream exchange |
@@ -134,8 +148,10 @@ A kind may register an optional typed validator for legal status or finalizer
 transitions. It does not reimplement routing, authorization, patch/apply field
 filtering, resource-version checks, or storage.
 
-The handling of server-side apply field ownership across these strategies must
-be specified and tested before this ADR becomes **Proposed**.
+The *mechanism* by which apply managed-fields/field-manager bookkeeping tracks
+the split — the *outcome*, that a caller acquires no ownership of fields a
+strategy protects, is fixed in ADR-0001 §2 — must be specified and tested before
+this ADR becomes **Proposed**.
 
 ### 5. Generated and virtual responses do not imply stored resources
 
@@ -195,9 +211,24 @@ Each shipped product subresource may require its own smaller ADR or API design.
 - What is the exact `ResourceDefinition.subresources` schema?
 - What are the Rust registration, request-context, and result interfaces?
 - Are handler registrations static at process startup, and how are collisions
-  diagnosed across crates?
-- Which verbs and media types do the initial `status`, `finalizers`, and
-  `token` strategies expose?
+  diagnosed across crates? (The answer is load-bearing for the
+  code-backed-registry guarantee that registration is not a plugin ABI — a
+  runtime-mutable registry would weaken it.)
+- Which request/response media types do the initial `status`, `finalizers`, and
+  `token` strategies expose? (Their RBAC verbs are fixed in ADR-0001 §2 —
+  `token` create-only, `status`/`finalizers` their defined read/update.)
+- How does token exchange's in-handler source-credential validation and
+  source-principal resolution map onto the shared authenticate→authorize→invoke
+  order, given the authorizing principal is handler-resolved?
+- How are secondary authorization checks constrained and enforced — a bar on a
+  request-derived target/verb, a guarantee the handler honors a `Deny`, and
+  whether secondary decisions are audited?
+- Beyond audit exclusion (§6 already withholds every response payload), what
+  does the registration-declared sensitivity flag drive — transport, caching,
+  error-path redaction?
+- Are authorization denials and probing attempts audited, and is every start
+  record guaranteed a matching completion record on abnormal termination (crash,
+  panic, a hung finite handler)?
 - How do apply field managers and managed fields behave on protected fields?
 - Does UID addressing admit every registered subresource identically to named
   addressing?
@@ -206,6 +237,10 @@ Each shipped product subresource may require its own smaller ADR or API design.
   discovery document or a new endpoint?
 - Should upgraded connections and reverse proxying use this seam or a narrower
   follow-up abstraction?
+- Should `/token` extend to the `User` kind — self-service personal tokens,
+  operator-delegated minting on behalf of a user, and the OAuth flow's
+  assertion→token leg — and how does that unify with SSO login without
+  RBAC-gating authentication? (Policy side and hazards deferred in ADR-0001 §10.)
 
 ## Consequences if adopted
 

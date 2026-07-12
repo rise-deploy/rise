@@ -603,6 +603,22 @@ This deliberately gives the reference *snapshot* semantics, not §6.1's live sem
   authorization tuple and the shared registration seam, but their handler
   interfaces, transport semantics, and response types are drafted in
   [ADR-0002](../0002-generic-resource-subresource-execution-model/) (§3).
+- Extending the `token` subresource to the `User` kind — user self-service
+  personal tokens, operator-delegated minting on behalf of a user, and unifying
+  the OAuth-flow assertion→token exchange leg onto the same RFC 8693 endpoint.
+  Deferred with two hazards to design first: because `User` is root-scoped,
+  `(create, User, token)` is grantable only by a `PlatformRoleBinding` (§4
+  containment) — operator-only, so an org-admin structurally cannot grant it,
+  and delegated minting would otherwise hand out a target user's *cross-org*
+  reach unless the minted token is clamped to the minter's own scope authority;
+  and self-service minting needs a binding primitive for a grant on the `User`
+  whose identity equals the subject, which the label-value `${ref.name}`
+  templating (§6.4) does not express. This deferral does **not** affect SSO
+  login, which is authentication — a User's own external credential mapped to a
+  live `UserIdentity` (§7), gated by that trust mapping, never by an RBAC
+  `(create, User, token)` grant. Any future unification onto `token` must keep
+  that self-authentication leg trust-policy-gated, not RBAC-gated, to avoid a
+  login bootstrap paradox.
 
 ## Consequences
 
