@@ -67,6 +67,31 @@ const MAX_REPLICAS: u32 = 50;
 /// healthy.
 const PER_PROJECT_MIN_VALIDITY: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Route-aware adapter shared by desired-state and readiness reconciliation.
+/// Keeping this selection in one place prevents either path from accidentally
+/// falling back to the project access class and ignoring per-route overrides.
+fn routes_withheld_for_container(
+    access_class: &str,
+    access_classes: &HashMap<String, rise_backend_core::AccessRequirement>,
+    auth_backend_url: &str,
+    container_name: &str,
+    route_specs: &[rise_deployment_spec::request_spec::RouteSpec],
+    has_routable_host: bool,
+) -> bool {
+    if !has_routable_host {
+        return false;
+    }
+    container_builder::routes_withheld(
+        access_class,
+        access_classes,
+        auth_backend_url,
+        route_specs
+            .iter()
+            .filter(|route| route.container == container_name)
+            .map(|route| route.access.as_ref()),
+    )
+}
+
 /// Owned controller configuration the reconciler carries.
 #[derive(Clone)]
 pub struct ReconcilerConfig {
@@ -841,28 +866,6 @@ impl DockerReconciler {
             self.url_builder
                 .resolve_image(project, deployment, source_deployment_id.as_deref());
 
-        // Every infra-bearing deployment is routable: both the old active and the
-        // new Deploying deployment join the ONE group-scoped Traefik service and
-        // carry its health-check labels immediately; Traefik's per-server health
-        // check drains the old servers as the new ones come UP, so there is no
-        // cutover gap. Routing the new deployment from the start (rather than
-        // gating on `is_active`) also avoids the g1→g2 route-hash churn that a
-        // later `is_active` flip would otherwise cause.
-        //
-        // The sole exception: a container whose Traefik router would be WITHHELD
-        // (auth required but no `auth_backend_url` to wire forwardAuth — a
-        // misconfiguration that fails closed in the builder) is treated as NOT
-        // routable here, so the cutover/readiness path doesn't mark a never-routed
-        // container as in-rotation (ready-when-running) and silently report the
-        // deploy Healthy. Keeping routability consistent with router emission
-        // makes such a deploy surface as not-Healthy instead. Same predicate the
-        // builder uses.
-        let routable = !container_builder::router_withheld(
-            &project.access_class,
-            &self.config.access_classes,
-            &self.config.auth_backend_url,
-        );
-
         // Cross-container service discovery: expose each routable sibling's
         // address as `RISE_CONTAINER_HOST__<NAME>=<host>:<port>`, mirroring the
         // K8s convention (`ResourceBuilder::auto_container_host_env_vars`) so a
@@ -956,6 +959,21 @@ impl DockerReconciler {
                     access: r.access.clone(),
                 })
                 .collect();
+            // Every infra-bearing deployment normally joins the group-scoped
+            // Traefik service immediately. The exception is a container with an
+            // unknown access class, or an auth-required effective route without
+            // a forwardAuth backend: its routers fail closed, so desired
+            // routability must be false as well. Include per-route overrides here
+            // so this agrees with label rendering for a public project that
+            // tightens only one route.
+            let routable = !routes_withheld_for_container(
+                &project.access_class,
+                &self.config.access_classes,
+                &self.config.auth_backend_url,
+                &spec.name,
+                &route_specs,
+                !primary_hosts.is_empty(),
+            );
 
             // Base container (replica 0). All replicas are clones of this with
             // only their `replica` index differing — same image/env/routes, so
@@ -1916,20 +1934,19 @@ impl DockerReconciler {
         let primary_hosts = self
             .primary_hosts_for_deployment(project, deployment)
             .await?;
-        // A router-withheld project (auth-required access class but no
-        // `auth_backend_url` to wire forwardAuth — a builder misconfiguration that
-        // fails closed) gets NO Traefik router, so Traefik will never route to its
-        // app containers. Such a port-ed container must therefore never be marked
-        // Ready: otherwise a ready-when-running container would go Healthy and
-        // supersede a working deployment while serving no traffic. Deployment-level
-        // (depends only on the project's access class), so resolve it once. Workers
-        // (no port) need no router and are unaffected.
-        let router_withheld = container_builder::router_withheld(
-            &project.access_class,
-            &self.config.access_classes,
-            &self.config.auth_backend_url,
-        );
         for spec in &container_specs {
+            // A withheld router must never be marked Ready: otherwise a
+            // ready-when-running container could supersede a working deployment
+            // while serving no traffic. Resolve this per container because a
+            // route-level override can introduce the auth requirement.
+            let router_withheld = routes_withheld_for_container(
+                &project.access_class,
+                &self.config.access_classes,
+                &self.config.auth_backend_url,
+                &spec.name,
+                &route_specs,
+                !primary_hosts.is_empty(),
+            );
             let replica_count = clamp_replicas(spec.replicas);
             // The readiness signal that drives the Deploying→Healthy supersede
             // (and Healthy→Unhealthy) is whether the container's server is
@@ -2644,6 +2661,57 @@ mod tests {
             MAX_REPLICAS,
             "above max → clamped to MAX_REPLICAS"
         );
+    }
+
+    #[test]
+    fn route_override_withholding_is_container_scoped() {
+        use rise_backend_core::AccessRequirement;
+        use rise_deployment_spec::request_spec::RouteSpec;
+
+        let classes = HashMap::from([("public".to_string(), AccessRequirement::None)]);
+        let routes = vec![
+            RouteSpec {
+                path: "/".to_string(),
+                container: "web".to_string(),
+                access: None,
+            },
+            RouteSpec {
+                path: "/admin".to_string(),
+                container: "web".to_string(),
+                access: Some(AccessRequirement::Member),
+            },
+            RouteSpec {
+                path: "/metrics".to_string(),
+                container: "metrics".to_string(),
+                access: Some(AccessRequirement::None),
+            },
+        ];
+
+        assert!(routes_withheld_for_container(
+            "public", &classes, "", "web", &routes, true
+        ));
+        assert!(!routes_withheld_for_container(
+            "public", &classes, "", "metrics", &routes, true
+        ));
+        assert!(routes_withheld_for_container(
+            "removed-class",
+            &classes,
+            "http://rise:3000",
+            "metrics",
+            &routes,
+            true
+        ));
+        assert!(!routes_withheld_for_container(
+            "public",
+            &classes,
+            "http://rise:3000",
+            "web",
+            &routes,
+            true
+        ));
+        assert!(!routes_withheld_for_container(
+            "public", &classes, "", "web", &routes, false
+        ));
     }
 
     #[test]

@@ -812,16 +812,15 @@ impl Scenario for RouteAccessOverride {
         std::fs::write(
             std::path::Path::new(&dir).join("rise.toml"),
             format!(
-                // `/` is opened to the public; `/gated` inherits the project's
-                // private access. Only `/` is asserted for 200 — every sample app
-                // serves its root, but not arbitrary sub-paths. `/gated` is only
-                // asserted for the auth gate (302/redirect happens before the app
-                // is reached, so the app need not serve that path).
+                // `/` inherits the project's private access; `/public` is opened.
+                // Keeping the public route narrower than the catch-all lets the
+                // scenario prove segment-bounded matching: `/publicity` must still
+                // select the private `/` route rather than the public `/public`.
                 "[project]\nname = \"{project}\"\n\n\
                  [containers.app]\nimage = \"{img}\"\nport = {port}\n\n\
                  [routes]\n\
-                 \"/\" = {{ container = \"app\", access = \"public\" }}\n\
-                 \"/gated\" = {{ container = \"app\" }}\n",
+                 \"/\" = {{ container = \"app\" }}\n\
+                 \"/public\" = {{ container = \"app\", access = \"public\" }}\n",
                 img = app.image,
                 port = app.http_port
             ),
@@ -834,59 +833,51 @@ impl Scenario for RouteAccessOverride {
         )?;
         b.wait_healthy(&project)?;
 
-        // The opened route (`/`) is reachable with no session (poll warmup).
-        let mut public_status = 0;
-        for _ in 0..45 {
-            match b.ingress_get(&project, "/", false, None) {
-                Ok(r) if r.status == 200 => {
-                    public_status = 200;
-                    break;
-                }
-                Ok(r) => public_status = r.status,
-                Err(_) => {}
-            }
-            std::thread::sleep(std::time::Duration::from_secs(2));
-        }
-        anyhow::ensure!(
-            public_status == 200,
-            "expected 200 for the `access = \"public\"` route without a session, got {public_status}"
-        );
-
-        // The inherited route (`/gated`) stays gated: unauthenticated → 302 to
-        // signin. The redirect happens at the ingress before the app is reached,
-        // so the app need not serve `/gated`.
-        let mut gated_status = 0;
+        // A neighboring path must NOT be captured by the public `/public`
+        // route. Polling for its private-route redirect also ensures the ingress
+        // configuration is live before checking the exact public path.
+        let mut boundary_status = 0;
         let mut location = None;
         for _ in 0..45 {
-            match b.ingress_get(&project, "/gated", false, None) {
+            match b.ingress_get(&project, "/publicity", false, None) {
                 Ok(r) if r.status == 302 => {
-                    gated_status = 302;
+                    boundary_status = 302;
                     location = r.location;
                     break;
                 }
-                Ok(r) => gated_status = r.status,
+                Ok(r) => boundary_status = r.status,
                 Err(_) => {}
             }
             std::thread::sleep(std::time::Duration::from_secs(2));
         }
         anyhow::ensure!(
-            gated_status == 302,
-            "expected 302 for the inherited (private) route without a session, got {gated_status}"
+            boundary_status == 302,
+            "expected neighboring /publicity to inherit private access and redirect, got {boundary_status}"
         );
         let location = location.context("302 had no Location header")?;
         anyhow::ensure!(
             location.contains("/.rise/auth/signin"),
-            "inherited route did not redirect to signin: {location}"
+            "neighboring private path did not redirect to signin: {location}"
         );
 
-        // …and an authenticated request passes the gate (no signin redirect). The
-        // app may 404 `/gated` (not every sample app serves it) — the point is the
-        // gate let the request through instead of answering 302.
-        let cookie = format!("rise_jwt={}", b.ci_bearer());
-        let authed = b.ingress_get(&project, "/gated", false, Some(&cookie))?;
+        // The exact public route must bypass the gate. The sample app may return
+        // 404 for `/public`; the contract under test is that the ingress forwards
+        // it instead of producing an auth response.
+        let public = b.ingress_get(&project, "/public", false, None)?;
         anyhow::ensure!(
-            authed.status != 302,
-            "expected the gate to admit an authed request to /gated, but got a 302 redirect"
+            !matches!(public.status, 302 | 401 | 403),
+            "expected the exact `access = \"public\"` route to bypass auth, got {}",
+            public.status
+        );
+
+        // An authenticated request to the inherited root route passes the gate
+        // and reaches the sample app's known-good `/` path.
+        let cookie = format!("rise_jwt={}", b.ci_bearer());
+        let authed = b.ingress_get(&project, "/", false, Some(&cookie))?;
+        anyhow::ensure!(
+            authed.status == 200,
+            "expected the gate to admit an authed request to /, got {}",
+            authed.status
         );
         Ok(())
     }

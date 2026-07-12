@@ -65,6 +65,32 @@ pub fn validate_route_path(path: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
+/// Canonical form used by both ingress backends for Prefix semantics. A
+/// trailing slash is ignored (`/admin` and `/admin/` match the same requests);
+/// all-slash inputs canonicalize to the root route.
+fn canonical_route_path(path: &str) -> &str {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/"
+    } else {
+        trimmed
+    }
+}
+
+fn reject_equivalent_route_path(
+    seen: &mut HashMap<String, String>,
+    path: &str,
+    prefix: &str,
+) -> Result<(), ValidationError> {
+    let canonical = canonical_route_path(path);
+    if let Some(existing) = seen.insert(canonical.to_string(), path.to_string()) {
+        return Err(ValidationError::new(format!(
+            "{prefix} route paths '{existing}' and '{path}' are equivalent after ignoring trailing slashes"
+        )));
+    }
+    Ok(())
+}
+
 pub fn validate_containers_and_routes(
     containers: Option<&[ContainerSpec]>,
     routes: &[RouteSpec],
@@ -125,8 +151,10 @@ pub fn validate_containers_and_routes(
     let container_by_name: HashMap<&str, &ContainerSpec> =
         containers.iter().map(|c| (c.name.as_str(), c)).collect();
 
+    let mut seen_route_paths = HashMap::with_capacity(routes.len());
     for route in routes {
         validate_route_path(&route.path)?;
+        reject_equivalent_route_path(&mut seen_route_paths, &route.path, "Duplicate")?;
         let target = container_by_name
             .get(route.container.as_str())
             .ok_or_else(|| {
@@ -202,8 +230,10 @@ pub fn validate_project_config(
         }
     }
 
+    let mut seen_route_paths = HashMap::with_capacity(config.routes.len());
     for (path, route) in &config.routes {
         validate_project_route_path(path)?;
+        reject_equivalent_route_path(&mut seen_route_paths, path, "[routes]")?;
         let target = config.containers.get(&route.container).ok_or_else(|| {
             ValidationError::new(format!(
                 "[routes] '{}' targets unknown container '{}'",
@@ -313,6 +343,40 @@ mod tests {
     }
 
     #[test]
+    fn validation_rejects_routes_equivalent_after_trailing_slash_normalization() {
+        let containers = vec![cspec("api", Some("nginx"), Some(8080))];
+        let routes = vec![
+            RouteSpec {
+                path: "/admin".to_string(),
+                container: "api".to_string(),
+                access: Some(crate::access::AccessRequirement::Member),
+            },
+            RouteSpec {
+                path: "/admin/".to_string(),
+                container: "api".to_string(),
+                access: Some(crate::access::AccessRequirement::None),
+            },
+        ];
+        let err = validate_containers_and_routes(Some(&containers), &routes).unwrap_err();
+        assert!(err.message.contains("equivalent"), "got: {}", err.message);
+
+        let root_aliases = vec![
+            RouteSpec {
+                path: "/".to_string(),
+                container: "api".to_string(),
+                access: None,
+            },
+            RouteSpec {
+                path: "//".to_string(),
+                container: "api".to_string(),
+                access: None,
+            },
+        ];
+        let err = validate_containers_and_routes(Some(&containers), &root_aliases).unwrap_err();
+        assert!(err.message.contains("equivalent"), "got: {}", err.message);
+    }
+
+    #[test]
     fn project_config_validation_preserves_messages() {
         let mut config = crate::project_config::ProjectBuildConfig::default();
         config.routes.insert(
@@ -335,5 +399,30 @@ mod tests {
         );
         let err = validate_project_config(&config).unwrap_err();
         assert!(err.message.contains("Invalid container name"));
+    }
+
+    #[test]
+    fn project_config_rejects_equivalent_route_keys() {
+        let mut config = crate::project_config::ProjectBuildConfig::default();
+        config.containers.insert(
+            "api".to_string(),
+            crate::project_config::ContainerConfig {
+                image: Some("nginx".to_string()),
+                port: Some(8080),
+                ..Default::default()
+            },
+        );
+        for path in ["/admin", "/admin/"] {
+            config.routes.insert(
+                path.to_string(),
+                crate::project_config::RouteConfig {
+                    container: "api".to_string(),
+                    access: None,
+                },
+            );
+        }
+
+        let err = validate_project_config(&config).unwrap_err();
+        assert!(err.message.contains("equivalent"), "got: {}", err.message);
     }
 }

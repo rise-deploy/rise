@@ -75,9 +75,9 @@ pub struct DesiredContainer {
     /// active and the new Deploying deployment both join the one group-scoped
     /// Traefik service, and Traefik's per-server health check drains the old
     /// servers as the new ones come up. `false` only when the router would be
-    /// withheld (auth required but no `auth_backend_url` to wire forwardAuth, a
-    /// misconfiguration that fails closed), so the readiness path doesn't report
-    /// a never-routed container as Healthy.
+    /// withheld (unknown access class, or auth required without an
+    /// `auth_backend_url`), so the readiness path doesn't report a never-routed
+    /// container as Healthy.
     pub routable: bool,
     /// Recreate-signature hash: sha256 of the fully-rendered Traefik label set
     /// for this container PLUS whether its app port is published to a loopback
@@ -593,27 +593,36 @@ pub fn group_service_names(desired: &DesiredContainer) -> Vec<String> {
         .collect()
 }
 
-/// Whether the Traefik router must be WITHHELD for a container with this access
-/// class — i.e. the class resolves to an auth requirement (Authenticated/Member,
-/// INCLUDING the fail-closed unknown-class→Member case) but no forwardAuth can be
-/// wired because `auth_backend_url` is empty. Stamping a router then would expose
-/// the app as an open public route, so the router is withheld (the app is not
-/// routed). The authoritative definition of the withhold condition: both the
-/// label renderer (which omits the router) AND the reconciler (which must then
-/// treat the container as NOT routable, so a misconfigured deploy surfaces as
-/// not-Healthy instead of silently Healthy-but-unrouted) consult this.
-pub(crate) fn router_withheld(
+/// Whether all Traefik routers must be withheld for a container because its
+/// access class is unknown, or at least one effective route needs forwardAuth
+/// but no backend URL is configured. Dropping only the gated router would let a
+/// broader public sibling serve that path, so the whole container fails closed.
+///
+/// This is the authoritative predicate for label rendering, desired routability,
+/// and readiness. Route overrides are included so all three paths agree when a
+/// public project tightens only one route.
+pub(crate) fn routes_withheld<'a>(
     access_class: &str,
     access_classes: &HashMap<String, AccessRequirement>,
     auth_backend_url: &str,
+    route_overrides: impl IntoIterator<Item = Option<&'a AccessRequirement>>,
 ) -> bool {
-    // Unknown/removed class fails closed to the most restrictive requirement.
-    let requirement = access_classes
-        .get(access_class)
-        .cloned()
-        .unwrap_or(AccessRequirement::Member);
-    let auth_required = !matches!(requirement, AccessRequirement::None);
-    auth_required && auth_backend_url.is_empty()
+    let mut route_overrides = route_overrides.into_iter().peekable();
+    // A removed/renamed class is a control-plane configuration error. Route
+    // overrides must never weaken that failure into public access: Kubernetes
+    // emits no ingress for the same state, so Docker withholds every router too.
+    let Some(project_requirement) = access_classes.get(access_class) else {
+        return route_overrides.peek().is_some();
+    };
+    if !auth_backend_url.trim().is_empty() {
+        return false;
+    }
+    route_overrides.any(|route_override| {
+        !matches!(
+            rise_backend_core::effective_access_requirement(route_override, project_requirement),
+            AccessRequirement::None
+        )
+    })
 }
 
 /// Render the full Traefik label map for a desired container.
@@ -624,8 +633,9 @@ pub(crate) fn router_withheld(
 /// shared `Host(...)` rule and join the one group-scoped Traefik service, and
 /// Traefik's per-server health check drains the old servers as the new ones come
 /// up (the rolling overlap). `routable` is `false` only when the router is
-/// withheld (auth required but no `auth_backend_url` to wire forwardAuth), so a
-/// misconfigured deployment never advertises an unauthenticated router.
+/// withheld (unknown access class, or auth required without an
+/// `auth_backend_url`), so a misconfigured deployment never advertises an
+/// unauthenticated router.
 fn render_traefik_labels_for(
     desired: &DesiredContainer,
     cfg: &BuilderConfig<'_>,
@@ -644,22 +654,18 @@ fn render_traefik_labels_for(
     //
     // FAIL CLOSED on an unknown access class: a project referencing a
     // missing/removed class must NOT silently become public (mirroring the K8s
-    // path, which errors on an unknown class — see
-    // `ResourceBuilder::build_ingress_annotations`). The builder's signature
-    // can't propagate an error (it feeds the create spec and a precomputed
-    // route hash), so we treat an unknown class as the most restrictive
-    // requirement (`Member`) rather than defaulting to public `None`. The app
-    // is then routed only behind forwardAuth — never as an open public route.
+    // path, which errors on an unknown class). Route overrides cannot weaken a
+    // missing class, so suppress every router rather than inventing a default.
     let requirement = match cfg.access_classes.get(&desired.access_class) {
         Some(req) => req.clone(),
         None => {
             tracing::error!(
                 project = %desired.project,
                 access_class = %desired.access_class,
-                "Access class not configured — failing closed (treating as Member, \
-                 routing only behind forwardAuth) to avoid a silent public route"
+                "Access class not configured — withholding all Traefik routers \
+                 to avoid a silent public route"
             );
-            AccessRequirement::Member
+            return out;
         }
     };
     // Per-route effective requirement decides that router's forwardAuth. The
@@ -672,12 +678,12 @@ fn render_traefik_labels_for(
         match route_requirement {
             AccessRequirement::None => RouteForwardAuth::Open,
             AccessRequirement::Authenticated | AccessRequirement::Member => {
-                if cfg.auth_backend_url.is_empty() {
+                if cfg.auth_backend_url.trim().is_empty() {
                     RouteForwardAuth::Withheld
                 } else {
                     RouteForwardAuth::Gated(format!(
                         "{}/api/v1/auth/ingress?project={}&access={}&signin_redirect=1",
-                        cfg.auth_backend_url.trim_end_matches('/'),
+                        cfg.auth_backend_url.trim().trim_end_matches('/'),
                         urlencoding::encode(&desired.project),
                         route_requirement.as_query_param(),
                     ))
@@ -686,46 +692,24 @@ fn render_traefik_labels_for(
         }
     };
 
-    // FAIL CLOSED: auth is required (Authenticated/Member) but no forwardAuth
-    // address could be built (empty `auth_backend_url`). Stamping a router with
-    // no middleware would expose the app as an OPEN public route — exactly what
-    // the access class forbids. K8s exposes nothing in this case, so for parity
-    // we withhold ALL routers for this container: the app is simply not routed.
-    if router_withheld(
+    // FAIL CLOSED: an unknown access class or an auth-required route without a
+    // forwardAuth address must expose nothing. Stamping a router in either state
+    // could turn a control-plane error into public access.
+    if routes_withheld(
         &desired.access_class,
         cfg.access_classes,
         cfg.auth_backend_url,
+        desired
+            .routes
+            .iter()
+            .filter(|route| !route.hosts.is_empty())
+            .map(|route| route.access.as_ref()),
     ) {
         tracing::warn!(
             project = %desired.project,
             access_class = %desired.access_class,
-            "Withholding Traefik router(s): forwardAuth could not be wired \
-             (auth_backend_url is empty) for an access requirement that mandates \
-             authentication — refusing to expose an unauthenticated public route"
-        );
-        return out;
-    }
-
-    // FAIL CLOSED per route: if ANY route's effective requirement needs auth but
-    // forwardAuth can't be wired (empty `auth_backend_url`), withhold the WHOLE
-    // container. A per-route `access` override can introduce an auth requirement
-    // the container-level `router_withheld` guard (which only sees the access
-    // class) does not catch; dropping just that route's router would leave a
-    // broader sibling (e.g. `/`) serving the gated path unauthenticated.
-    let any_route_withheld = desired.routes.iter().any(|route| {
-        let route_requirement = route.access.clone().unwrap_or_else(|| requirement.clone());
-        matches!(
-            route_forward_auth(&route_requirement),
-            RouteForwardAuth::Withheld
-        )
-    });
-    if any_route_withheld {
-        tracing::warn!(
-            project = %desired.project,
-            access_class = %desired.access_class,
-            "Withholding Traefik router(s): a route requires authentication but \
-             forwardAuth could not be wired (auth_backend_url is empty) — refusing \
-             to leave a sibling route serving the gated path unauthenticated"
+            "Withholding Traefik router(s): access class is unknown or forwardAuth \
+             could not be wired — refusing to expose an unauthenticated public route"
         );
         return out;
     }
@@ -1670,7 +1654,7 @@ mod tests {
             labels
                 .get(&format!("traefik.http.routers.{r0}.rule"))
                 .map(String::as_str),
-            Some("Host(`myapp.rise.dev`) && PathPrefix(`/api/v1`)")
+            Some("Host(`myapp.rise.dev`) && (Path(`/api/v1`) || PathPrefix(`/api/v1/`))")
         );
         assert_eq!(
             labels
@@ -1869,7 +1853,8 @@ mod tests {
     fn private_access_class_stamps_forward_auth_labels() {
         let map = public_private_map();
         let cfg = BuilderConfig {
-            auth_backend_url: "http://rise:3000",
+            // Config values are trimmed before constructing the middleware URL.
+            auth_backend_url: "  http://rise:3000/  ",
             access_classes: &map,
             ..test_cfg()
         };
@@ -1935,6 +1920,14 @@ mod tests {
         let base = group_service_base("myapp", "default", "app");
         let member_router = group_service_name(&base, 0, 2);
         let public_router = group_service_name(&base, 1, 2);
+
+        assert_eq!(
+            labels
+                .get(&format!("traefik.http.routers.{member_router}.rule"))
+                .map(String::as_str),
+            Some("Host(`myapp.rise.dev`) && (Path(`/admin`) || PathPrefix(`/admin/`))"),
+            "the gated route must not capture a neighboring path such as /administrator"
+        );
 
         // `/` router: no forwardAuth middleware.
         assert!(
@@ -2037,24 +2030,63 @@ mod tests {
     }
 
     #[test]
-    fn router_withheld_predicate_matches_render_and_reconciler_contract() {
+    fn routes_withheld_predicate_matches_render_and_reconciler_contract() {
         use rise_backend_core::AccessRequirement;
         let mut classes: HashMap<String, AccessRequirement> = HashMap::new();
         classes.insert("public".into(), AccessRequirement::None);
         classes.insert("members".into(), AccessRequirement::Member);
         // None requirement → never withheld, even with an empty backend URL.
-        assert!(!router_withheld("public", &classes, ""));
+        assert!(!routes_withheld("public", &classes, "", [None]));
         // Auth-required + empty URL → withheld (can't wire forwardAuth).
-        assert!(router_withheld("members", &classes, ""));
+        assert!(routes_withheld("members", &classes, "", [None]));
         // Auth-required + configured URL → routed behind forwardAuth, not withheld.
-        assert!(!router_withheld("members", &classes, "http://rise:3000"));
-        // Unknown/removed class fails closed to Member → withheld when URL empty,
-        // routed (behind forwardAuth) when a URL is configured.
-        assert!(router_withheld("stale-removed", &classes, ""));
-        assert!(!router_withheld(
+        assert!(!routes_withheld(
+            "members",
+            &classes,
+            "http://rise:3000",
+            [None]
+        ));
+        // A public project tightened on one route must also fail closed.
+        assert!(routes_withheld(
+            "public",
+            &classes,
+            "",
+            [None, Some(&AccessRequirement::Member)]
+        ));
+        assert!(routes_withheld(
+            "public",
+            &classes,
+            "   ",
+            [Some(&AccessRequirement::Member)]
+        ));
+        // Conversely, all-public overrides need no auth backend.
+        assert!(!routes_withheld(
+            "members",
+            &classes,
+            "",
+            [Some(&AccessRequirement::None)]
+        ));
+        // No effective routes means no router can fail open.
+        assert!(!routes_withheld(
+            "members",
+            &classes,
+            "",
+            std::iter::empty()
+        ));
+        // Unknown/removed classes always withhold effective routes, regardless
+        // of backend URL or a route-level public override.
+        assert!(routes_withheld("stale-removed", &classes, "", [None]));
+        assert!(routes_withheld(
             "stale-removed",
             &classes,
-            "http://rise:3000"
+            "http://rise:3000",
+            [None]
+        ));
+        assert!(routes_withheld(
+            "stale-removed",
+            &classes,
+            "http://rise:3000",
+            [Some(&AccessRequirement::None)]
         ));
     }
 
@@ -2137,9 +2169,8 @@ mod tests {
 
     #[test]
     fn unknown_access_class_fails_closed_not_public() {
-        // A project whose access_class is absent from the map must NOT be served
-        // as an open public route. We fail closed: the route is stamped behind
-        // forwardAuth (most-restrictive) rather than defaulting to None/public.
+        // A project whose access_class is absent from the map must emit no
+        // router, even if a route explicitly asks to be public.
         let map = public_private_map(); // does not contain "ghost"
         let cfg = BuilderConfig {
             auth_backend_url: "http://rise:3000",
@@ -2148,23 +2179,12 @@ mod tests {
         };
         let mut desired = single_container();
         desired.access_class = "ghost".to_string();
+        desired.routes[0].access = Some(AccessRequirement::None);
         let built = build_container(&desired, &cfg);
         let labels = built.config.labels.as_ref().unwrap();
-        let r = group_service_base("myapp", "default", "app");
-        // forwardAuth middleware IS stamped (route is protected, not open).
-        assert_eq!(
-            labels
-                .get(&format!(
-                    "traefik.http.middlewares.{r}-auth.forwardauth.address"
-                ))
-                .map(String::as_str),
-            Some("http://rise:3000/api/v1/auth/ingress?project=myapp&access=Member&signin_redirect=1")
-        );
-        assert_eq!(
-            labels
-                .get(&format!("traefik.http.routers.{r}.middlewares"))
-                .map(String::as_str),
-            Some(format!("{r}-auth@docker").as_str())
+        assert!(
+            !labels.keys().any(|key| key.starts_with("traefik.")),
+            "unknown access class must suppress every router before applying public overrides"
         );
     }
 

@@ -92,6 +92,17 @@ pub fn resolve_runtime_containers(
             })?,
             None => Vec::new(),
         };
+        // Re-validate persisted side-data before either backend turns it into
+        // routing resources. Request-time validation is authoritative, but this
+        // fail-closed check also protects upgrades and manually-corrupted rows
+        // from equivalent route paths carrying conflicting access requirements.
+        rise_deployment_spec::validation::validate_containers_and_routes(Some(&specs), &routes)
+            .with_context(|| {
+                format!(
+                    "deployment {} ({}) contains invalid persisted container/route side-data",
+                    deployment.id, deployment.deployment_id
+                )
+            })?;
         return Ok((specs, routes));
     }
 
