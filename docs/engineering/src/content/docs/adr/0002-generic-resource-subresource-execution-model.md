@@ -90,14 +90,17 @@ principal, already-resolved parent identity and object, resource definition,
 canonical subresource, request deadline/cancellation, and an audit correlation
 identifier.
 
-**Token exchange is the one credential-handling exception.** For the `token`
-strategy the pipeline authenticates the *minting caller*, but the principal the
-`(create, kind, token)` check authorizes is the *source* identity the handler
-resolves by validating an external source credential against the target's trust
-policies (ADR-0001 §7). That validation and source-principal resolution run
-inside the handler — the sole handler that accepts an external workload JWT — so
-for this strategy the authorize step applies to a handler-resolved principal
-rather than one fixed before invocation. Every other handler receives only an
+**Token exchange is the one credential-handling exception.** The `token`
+strategy has two caller modes. When the caller is already a Rise-authenticated
+principal — for example a User session minting for a target it holds
+`(create, kind, token)` on — the pipeline authenticates it normally and the
+handler only issues. When the caller instead presents an *external* source-issuer
+credential (a ServiceAccount or Controller JWT), the handler itself — the sole
+handler that accepts an external workload JWT — validates that credential and
+matches it by issuer to a source `ServiceAccount`/`Controller` trust policy to
+resolve the *source* identity; the `(create, kind, token)` check is then
+authorized against that handler-resolved source, not against a principal fixed
+before invocation (ADR-0001 §7). Every other handler receives only an
 already-authenticated Rise principal and validates no credential.
 
 Some handlers may need additional authorization decisions on resources they
@@ -148,10 +151,10 @@ A kind may register an optional typed validator for legal status or finalizer
 transitions. It does not reimplement routing, authorization, patch/apply field
 filtering, resource-version checks, or storage.
 
-The *mechanism* by which apply managed-fields/field-manager bookkeeping tracks
-the split — the *outcome*, that a caller acquires no ownership of fields a
-strategy protects, is fixed in ADR-0001 §2 — must be specified and tested before
-this ADR becomes **Proposed**.
+How apply managed-fields/field-manager bookkeeping tracks the split must be
+specified and tested before this ADR becomes **Proposed**. (The *outcome* — that
+a caller acquires no ownership of strategy-protected fields — is already fixed in
+ADR-0001 §2.)
 
 ### 5. Generated and virtual responses do not imply stored resources
 

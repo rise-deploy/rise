@@ -520,11 +520,11 @@ Authentication — proving which known Rise identity a credential represents, an
 | Plane | Role | Played by |
 |---|---|---|
 | User login (interactive) | OAuth Authorization Server | the upstream OAuth/OIDC IdP (Dex by default) |
-| User login (interactive) | OAuth Relying Party | Rise |
-| Token issuance | Security Token Service (RFC 8693) | Rise |
+| User login (interactive) | OAuth Relying Party (mints the app session) | Rise |
+| Token issuance | Security Token Service (RFC 8693 `/token` exchange) | Rise |
 | Access control (RBAC) | Policy Decision Point + Enforcement Point | Rise |
 
-Rise is the sole authority on the access-control plane — the Policy Decision Point this whole model describes — and its own token issuer (a Security Token Service, for workload exchange and sessions). But for *interactive* user login it is a relying party, not the authorization server; that role stays with the configured upstream IdP. "Authorization Server" (an OAuth login/consent role) and "authorization" (an access-control decision) are different concerns on different planes, and this model governs only the latter. This is why unifying the OAuth login flow onto `/token` (§10) means sharing the *issuance core*, not making Rise an authorization server: interactive login stays a relying-party flow, while `/token` serves only the non-interactive RFC 8693 exchange.
+Rise is the sole authority on the access-control plane — the Policy Decision Point this whole model describes — and its own token issuer: a Security Token Service for the RFC 8693 `/token` exchange. For *interactive* user login it is a relying party, not the authorization server — that role stays with the configured upstream IdP — and the app session a login establishes is minted by that relying-party flow, a distinct artifact from an RFC 8693 exchange token that merely shares the same signing core. "Authorization Server" (an OAuth login/consent role) and "authorization" (an access-control decision) are different concerns on different planes, and this model governs only the latter. This is why unifying the OAuth login flow onto `/token` (§10) means sharing the *issuance core*, not making Rise an authorization server: interactive login stays a relying-party flow, while `/token` serves only the non-interactive RFC 8693 exchange.
 
 For readability, this section calls `(create, ServiceAccount|Controller,
 token)` a **token-create permission**. That is prose shorthand, never a new
@@ -632,9 +632,10 @@ This deliberately gives the reference *snapshot* semantics, not §6.1's live sem
   templating (§6.4) does not express. This deferral does **not** affect SSO
   login, which is authentication — a User's own external credential mapped to a
   live `UserIdentity` (§7), gated by that trust mapping, never by an RBAC
-  `(create, User, token)` grant. Any future unification onto `token` must keep
-  that self-authentication leg trust-policy-gated, not RBAC-gated, to avoid a
-  login bootstrap paradox.
+  `(create, User, token)` grant. (Machine `/token` exchange differs: it stays
+  grant-gated even for an identity assuming itself — scenario 25.) Any future
+  unification onto `token` must keep that self-authentication leg
+  trust-policy-gated, not RBAC-gated, to avoid a login bootstrap paradox.
 
 ## Consequences
 
