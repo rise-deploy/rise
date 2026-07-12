@@ -238,9 +238,11 @@ Each shipped product subresource may require its own smaller ADR or API design.
 - Should upgraded connections and reverse proxying use this seam or a narrower
   follow-up abstraction?
 - Should `/token` extend to the `User` kind — self-service personal tokens,
-  operator-delegated minting on behalf of a user, and the OAuth flow's
-  assertion→token leg — and how does that unify with SSO login without
-  RBAC-gating authentication? (Policy side and hazards deferred in ADR-0001 §10.)
+  operator-delegated minting on behalf of a user, and non-interactive
+  external-assertion→token exchange (RFC 8693) — sharing one issuance core with
+  the OAuth login callback rather than routing interactive login through the
+  endpoint, and without RBAC-gating self-authentication? (Policy side and
+  hazards deferred in ADR-0001 §10.)
 
 ## Consequences if adopted
 

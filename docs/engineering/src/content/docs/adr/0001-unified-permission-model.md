@@ -604,9 +604,13 @@ This deliberately gives the reference *snapshot* semantics, not §6.1's live sem
   interfaces, transport semantics, and response types are drafted in
   [ADR-0002](../0002-generic-resource-subresource-execution-model/) (§3).
 - Extending the `token` subresource to the `User` kind — user self-service
-  personal tokens, operator-delegated minting on behalf of a user, and unifying
-  the OAuth-flow assertion→token exchange leg onto the same RFC 8693 endpoint.
-  Deferred with two hazards to design first: because `User` is root-scoped,
+  personal tokens, operator-delegated minting on behalf of a user, and exposing
+  non-interactive external-assertion→Rise-token exchange (RFC 8693) for users
+  through it. The interactive browser login flow stays separate: Rise remains an
+  OAuth relying party (Dex is the authorization server), and the token-issuance
+  logic is shared as one issuance core (`rise-backend-auth`) that both the login
+  callback and `/token` call, rather than routing interactive login through the
+  `/token` endpoint. Deferred with two hazards to design first: because `User` is root-scoped,
   `(create, User, token)` is grantable only by a `PlatformRoleBinding` (§4
   containment) — operator-only, so an org-admin structurally cannot grant it,
   and delegated minting would otherwise hand out a target user's *cross-org*
