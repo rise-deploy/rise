@@ -8,7 +8,7 @@ title: "ADR-0002: Generic Resource Subresource Execution Model"
 
 This is an exploratory design, not yet a proposed decision. It may change
 substantially before promotion to **Proposed**. ADR-0001 fixes the authorization
-shape `(verb, kind, subresource?)` and the initial `status`, `finalizers`, and
+shape `(verb, ResourceKind, subresource?)` and the initial `status`, `finalizers`, and
 `token` semantics; this draft explores how authorized subresources execute.
 
 ## Context
@@ -36,7 +36,7 @@ these shapes without becoming an untyped escape hatch around RBAC.
 
 ## Draft decision
 
-### 1. A subresource is registered against a parent kind
+### 1. A subresource is registered against a qualified ResourceKind
 
 A `ResourceDefinition` may declare named subresources. Each declaration names
 a platform-known handler strategy and the operations that strategy exposes:
@@ -57,7 +57,7 @@ The exact serialized schema remains open. The intended invariants are not:
 - the handler identifier must exist in the process's code-backed registry;
 - declared verbs must be a subset of that handler's supported verbs;
 - duplicate names and ambiguous registrations are rejected;
-- an undeclared `(kind, subresource)` route does not exist;
+- an undeclared `(ResourceKind, subresource)` route does not exist;
 - registration never grants access — RBAC is evaluated separately per request.
 
 This is not a plugin ABI. A `ResourceDefinition` selects from handlers already
@@ -73,35 +73,39 @@ The generic resource API owns this sequence:
 
 ```text
 route and validate the registered subresource
-→ authenticate to a typed Rise principal
-→ resolve the parent resource and authorization context
-→ authorize (verb, kind, subresource) through ADR-0001
+→ perform mode-specific authentication to a typed outcome
+→ resolve the parent, or reuse the target resolved during workload exchange
+→ authorize (verb, ResourceKind, subresource) through ADR-0001 when required
 → apply concurrency, admission, and request-limit policy
 → invoke the registered handler
 → map its typed result to HTTP
 → complete the audit record
 ```
 
-With the single exception of token exchange (below), the handler is never
-passed a JWT or raw `sub`; no handler decides whether the caller holds the
-primary subresource permission, and none chooses an authorization verb from
-request data. It receives a typed context containing the authenticated
-principal, already-resolved parent identity and object, resource definition,
-canonical subresource, request deadline/cancellation, and an audit correlation
-identifier.
+The handler is never passed an unvalidated JWT or raw `sub`; no handler decides
+whether the caller holds the primary subresource permission, and none chooses an
+authorization verb from request data. It receives a typed context containing an
+authentication outcome, already-resolved parent identity and object, resource
+definition, canonical subresource, request deadline/cancellation, and an audit
+correlation identifier.
 
-**Token exchange is the one credential-handling exception.** The `token`
-strategy has two caller modes. When the caller is already a Rise-authenticated
-principal — for example a User session minting for a target it holds
-`(create, kind, token)` on — the pipeline authenticates it normally and the
-handler only issues. When the caller instead presents an *external* source-issuer
-credential (a ServiceAccount or Controller JWT), the handler itself — the sole
-handler that accepts an external workload JWT — validates that credential and
-matches it by issuer to a source `ServiceAccount`/`Controller` trust policy to
-resolve the *source* identity; the `(create, kind, token)` check is then
-authorized against that handler-resolved source, not against a principal fixed
-before invocation (ADR-0001 §7). Every other handler receives only an
-already-authenticated Rise principal and validates no credential.
+**The `token` strategy has two pre-handler authentication outcomes.** A
+Rise-issued bearer yields `Delegated(AuthenticatedPrincipal)` and follows the
+ordinary primary `(create, ResourceKind, token)` authorization step. An external
+assertion yields `WorkloadExchange(TargetPrincipal)` only after a token-specific
+authentication adapter validates it against trust-policy children of the URL's
+target identity; this outcome skips primary RBAC because it is authentication
+into that same identity, not delegated assumption. The two modes are disjoint,
+and the issuance handler receives only the typed outcome — never the raw
+assertion. Every other strategy accepts only
+`Delegated(AuthenticatedPrincipal)` and follows the normal authorize step
+(ADR-0001 §7). After routing has selected a registered ServiceAccount or
+Controller `token` strategy, workload exchange resolves the target as part of
+authentication and maps nonexistent, deleted, disabled, UID-resolved wrong-kind,
+and nonmatching targets to the same coarse authentication failure; the handler
+sees none of those details. A kind that does not register `token` has no route
+and returns route-not-found during the first pipeline step, before any
+authentication masking applies.
 
 Some handlers may need additional authorization decisions on resources they
 reference. Those go back through the same authorization service as explicit
@@ -159,8 +163,9 @@ ADR-0001 §2.)
 ### 5. Generated and virtual responses do not imply stored resources
 
 `POST <ServiceAccount-or-Controller>/token` is dispatched as a generated
-finite response. It may return a credential after trust-policy and one-hop
-checks, but it creates no Token row and exposes no `get token` operation.
+finite response. It may return a UID-bound, authorization-capped credential
+after workload token exchange or delegated RBAC, but it creates
+no Token row and exposes no `get token` operation.
 
 A future `/scale` may return a versioned scale representation projected from a
 Deployment and map an authorized update back to a declared parent field. Its
@@ -205,7 +210,12 @@ The following are explicitly not decided here:
 - Deployment replica/container selection;
 - proxy target selection and permitted protocols;
 - terminal resize and attach/exec protocols;
-- backend-specific availability and fallback behavior.
+- backend-specific availability and fallback behavior;
+- whether ADR-0001's constrained Project ServiceAccount lifecycle operation is
+  a Project subresource, another typed product route, or a separate compound
+  command interface. Its fixed policy bundle, fresh-name, atomicity, and
+  cleanup invariants are already normative there; only its API/execution shape
+  remains open.
 
 Each shipped product subresource may require its own smaller ADR or API design.
 
@@ -220,9 +230,9 @@ Each shipped product subresource may require its own smaller ADR or API design.
 - Which request/response media types do the initial `status`, `finalizers`, and
   `token` strategies expose? (Their RBAC verbs are fixed in ADR-0001 §2 —
   `token` create-only, `status`/`finalizers` their defined read/update.)
-- How does token exchange's in-handler source-credential validation and
-  source-principal resolution map onto the shared authenticate→authorize→invoke
-  order, given the authorizing principal is handler-resolved?
+- What is the exact typed representation of the disjoint
+  `Delegated(AuthenticatedPrincipal)` and `WorkloadExchange(TargetPrincipal)` outcomes,
+  and where are raw external assertions consumed so they cannot reach handlers?
 - How are secondary authorization checks constrained and enforced — a bar on a
   request-derived target/verb, a guarantee the handler honors a `Deny`, and
   whether secondary decisions are audited?
@@ -240,6 +250,9 @@ Each shipped product subresource may require its own smaller ADR or API design.
   discovery document or a new endpoint?
 - Should upgraded connections and reverse proxying use this seam or a narrower
   follow-up abstraction?
+- What route and typed execution shape should implement ADR-0001's constrained
+  Project ServiceAccount lifecycle without exposing generic ServiceAccount or
+  Role/RoleBinding creation authority to the caller?
 - Should `/token` extend to the `User` kind — self-service personal tokens,
   operator-delegated minting on behalf of a user, and non-interactive
   external-assertion→token exchange (RFC 8693) — sharing one issuance core with
