@@ -28,6 +28,7 @@ pub(crate) fn desired(container: &str, image: &str, hash: &str) -> DesiredContai
         routes: vec![DesiredRoute {
             hosts: vec!["myapp.rise.dev".to_string()],
             path_prefix: None,
+            access: None,
         }],
         routable: true,
         // Fixed sentinel route-hash for diff tests; the reconciler computes

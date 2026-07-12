@@ -633,6 +633,10 @@ impl Backend for MinikubeBackend {
         BackendKind::Minikube
     }
 
+    fn cli_visible_path(&self, rel: &str) -> String {
+        self.repo_path(rel)
+    }
+
     fn bring_up(&mut self) -> Result<()> {
         let jfrog = self.registry_mode == RegistryMode::JfrogVault;
 

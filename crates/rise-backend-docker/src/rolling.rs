@@ -165,11 +165,11 @@ pub(crate) fn service_names_for_spec(
 /// loop in `reconcile_health` so the `serverStatus` selection is unit-testable
 /// without a daemon. Inputs:
 ///
-/// - `router_withheld`: the project's Traefik router is withheld (auth-required
-///   access class but no `auth_backend_url` to wire forwardAuth). Traefik then
-///   never routes to the container, so it can never be Ready — fails closed
-///   regardless of the other inputs, so a misconfigured deploy surfaces as
-///   not-Healthy instead of superseding a working one while serving no traffic.
+/// - `router_withheld`: the project's Traefik router is withheld (unknown access
+///   class, or auth required without an `auth_backend_url`). Traefik then never
+///   routes to the container, so it can never be Ready — fails closed regardless
+///   of the other inputs, so a misconfigured deploy surfaces as not-Healthy
+///   instead of superseding a working one while serving no traffic.
 /// - `has_health_path`: the container has an effective health path;
 /// - `running`: the live container is `running` on the daemon;
 /// - `api_available`: a Traefik API client is configured AND its serverStatus
@@ -195,8 +195,7 @@ pub(crate) fn replica_ready(
 ) -> ReadyVerdict {
     if router_withheld {
         return ReadyVerdict::NotReady(
-            "router withheld (access class requires authentication but no auth_backend_url is \
-             configured)"
+            "router withheld (access class is unknown or required authentication cannot be wired)"
                 .to_string(),
         );
     }
@@ -521,6 +520,7 @@ mod tests {
         let routes = vec![RouteSpec {
             path: "/".to_string(),
             container: "app".to_string(),
+            access: None,
         }];
         // A single-route container uses the bare base name — exactly what the
         // labels stamp (`group_service_names` over the matching DesiredContainer).
@@ -552,14 +552,17 @@ mod tests {
             RouteSpec {
                 path: "/".to_string(),
                 container: "api".to_string(),
+                access: None,
             },
             RouteSpec {
                 path: "/api/v1".to_string(),
                 container: "api".to_string(),
+                access: None,
             },
             RouteSpec {
                 path: "/".to_string(),
                 container: "other".to_string(),
+                access: None,
             },
         ];
         // Per-route services, longest path-prefix first (-0 = /api/v1, -1 = /),
@@ -593,6 +596,7 @@ mod tests {
                 .map(|p| DesiredRoute {
                     hosts: vec!["myapp.rise.dev".to_string()],
                     path_prefix: Some(p.to_string()),
+                    access: None,
                 })
                 .collect();
             d
@@ -613,6 +617,7 @@ mod tests {
                 .map(|p| RouteSpec {
                     path: p.to_string(),
                     container: container.to_string(),
+                    access: None,
                 })
                 .collect();
             (spec, routes)
@@ -670,6 +675,7 @@ mod tests {
         let routes = vec![RouteSpec {
             path: "/".to_string(),
             container: "app".to_string(),
+            access: None,
         }];
         // Same spec/routes that yield a service WITH a host — but with no host the
         // result is empty.
@@ -733,9 +739,9 @@ mod tests {
 
     #[test]
     fn replica_ready_router_withheld_is_never_ready() {
-        // A withheld Traefik router (auth-required access class but no
-        // auth_backend_url) means Traefik never routes to the container, so it is
-        // never Ready — regardless of run-state, health check, or serverStatus.
+        // A withheld Traefik router (unknown access class or unavailable auth
+        // backend) means Traefik never routes to the container, so it is never
+        // Ready — regardless of run-state, health check, or serverStatus.
         // Without this a ready-when-running container would go Healthy and
         // supersede a working deployment while serving no traffic.
         for (has_health_path, running, api_available, server_up) in [

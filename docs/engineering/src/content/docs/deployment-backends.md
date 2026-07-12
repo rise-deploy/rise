@@ -47,6 +47,7 @@ Legend: ✅ supported · ⚠️ partial / with caveats · ❌ not supported (see
 | Custom domains | project custom domain | ✅ | ✅ | Registration emits the route + auth wiring. |
 | TLS termination | custom domain / ingress | ✅ | ✅ | cert-manager (K8s) vs. Traefik ACME / Let's Encrypt HTTP-01 (Docker). |
 | Access classes (`None` / `Authenticated` / `Member`) | `access_requirement` | ✅ | ✅ | nginx `auth-url` (K8s) vs. Traefik forwardAuth (Docker). |
+| Per-route access requirement | `[routes].access` | ✅ | ✅ | A route can loosen (`public`) or tighten (`member`) the project's requirement. Enforced by proxy-native routing — one Ingress per requirement group sharing the host (K8s) vs. per-router forwardAuth (Docker) — plus a server-stamped `&access=<req>` the shared `ingress_auth` handler enforces. Only the auth gate varies per route; `ingress_class` and `custom_annotations` stay per-project (a per-host limitation). |
 | `/.rise` auth endpoints on the app host | implicit | ✅ | ✅ | High-priority route to the backend on both. |
 | Multi-container deployments | `[containers]` | ✅ | ✅ | Separate Deployments (K8s) vs. one container per spec (Docker). |
 | Cross-container service discovery | `RISE_CONTAINER_HOST__*` | ✅ | ✅ | Service DNS (K8s) vs. container-name DNS on `rise_default` (Docker). |
