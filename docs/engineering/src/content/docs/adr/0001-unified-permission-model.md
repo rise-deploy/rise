@@ -516,7 +516,7 @@ Referential-integrity validation (§6.7) runs only *after* this gate passes — 
 Authentication — proving which known Rise identity a credential represents, and whether that caller may assume another identity at all (issuer/JWKS/claims trust-policy match) — remains a distinct concern from authorization; trust-policy matching is never folded into the RBAC model. The boundary between them is nevertheless normative: the authorization engine accepts only an `AuthenticatedPrincipal` carrying an already-parsed canonical `SubjectId`, never a JWT, a raw `sub` claim, or a caller-supplied subject string.
 
 For readability, this section calls `(create, ServiceAccount|Controller,
-token)` a **token-create permission**. That is prose shorthand, never a sixth
+token)` a **token-create permission**. That is prose shorthand, never a new
 verb in the policy schema.
 
 **Only known Rise principals reach authorization.** Every authentication adapter first validates the credential's signature, issuer, intended audience, expiry/not-before, and credential type, then maps it to an existing, active Rise identity. User SSO performs an exact lookup of a live `UserIdentity.spec.(issuer, subject)` pair and resolves that resource's User parent; matching email alone never maps or links an account. A syntactically plausible `sub` is lookup input, not identity proof. The only subject kinds that may be request principals are User, ServiceAccount, and Controller. Team, `org:<name>`, `system:authenticated`, and `system:operators` are derived membership targets only and are rejected as token principals; operator status is derived from a successfully authenticated User plus the live allowlist. After lookup, the adapter constructs `AuthenticatedPrincipal { subject: SubjectId, provenance, token_class, actor }`; only that typed value crosses into authorization. An unknown, deleted/disabled, malformed, or non-principal subject fails authentication even if the surrounding token is otherwise validly signed.
@@ -602,7 +602,7 @@ This deliberately gives the reference *snapshot* semantics, not §6.1's live sem
   contracts (`logs`, `proxy`, `scale`, and similar). This ADR fixes their
   authorization tuple and the shared registration seam, but their handler
   interfaces, transport semantics, and response types are drafted in
-  [ADR-0002](../0002-generic-resource-subresource-execution-model/) (§2).
+  [ADR-0002](../0002-generic-resource-subresource-execution-model/) (§3).
 
 ## Consequences
 

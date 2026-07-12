@@ -34,5 +34,5 @@ open questions but is not yet ready for review as a proposed architecture.
 
 | ADR | Status | Summary |
 |---|---|---|
-| [ADR-0001](./0001-unified-permission-model/) — Unified Permission Model | Proposed | One Role/RoleBinding/ceiling model for all subject kinds (Users, Teams, ServiceAccounts, Controllers, Operators) on the generic resource API and token issuance, plus the crate structure that realizes it. |
+| [ADR-0001](./0001-unified-permission-model/) — Unified Permission Model | Proposed | One Role/RoleBinding model for all subject kinds (Users, Teams, ServiceAccounts, Controllers, Operators) on the generic resource API and token issuance, plus the crate structure that realizes it. |
 | [ADR-0002](./0002-generic-resource-subresource-execution-model/) — Generic Resource Subresource Execution Model | Draft | A typed registration and execution seam for stored, virtual, generated, streaming, and possible connection-oriented subresources. |
