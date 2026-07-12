@@ -22,13 +22,17 @@ monotonically increasing number. Sections: **Status**, **Context**,
 **Decision**, **Consequences**, **Alternatives considered**, plus an optional
 **References** and appendices where they earn their keep.
 
-Statuses: **Proposed**, **Accepted**, **In Progress** (implementation
+Statuses: **Draft**, **Proposed**, **Accepted**, **In Progress** (implementation
 underway), **Implemented**, **Superseded by ADR-NNNN**. A superseded ADR is
 never edited to say something else — it gets a status pointer to its
 successor.
+
+**Draft** is pre-decision working material: it records a design direction and
+open questions but is not yet ready for review as a proposed architecture.
 
 ## Index
 
 | ADR | Status | Summary |
 |---|---|---|
-| [ADR-0001](/operator-docs/adr/0001-unified-permission-model/) — Unified Permission Model | Proposed | One Role/RoleBinding/ceiling model for all subject kinds (Users, Teams, ServiceAccounts, Controllers, Operators) on the generic resource API and token issuance, plus the crate structure that realizes it. |
+| [ADR-0001](./0001-unified-permission-model/) — Unified Permission Model | Proposed | One Role/RoleBinding/ceiling model for all subject kinds (Users, Teams, ServiceAccounts, Controllers, Operators) on the generic resource API and token issuance, plus the crate structure that realizes it. |
+| [ADR-0002](./0002-generic-resource-subresource-execution-model/) — Generic Resource Subresource Execution Model | Draft | A typed registration and execution seam for stored, virtual, generated, streaming, and possible connection-oriented subresources. |
