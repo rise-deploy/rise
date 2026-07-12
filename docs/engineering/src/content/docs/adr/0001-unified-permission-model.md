@@ -515,6 +515,17 @@ Referential-integrity validation (§6.7) runs only *after* this gate passes — 
 
 Authentication — proving which known Rise identity a credential represents, and whether that caller may assume another identity at all (issuer/JWKS/claims trust-policy match) — remains a distinct concern from authorization; trust-policy matching is never folded into the RBAC model. The boundary between them is nevertheless normative: the authorization engine accepts only an `AuthenticatedPrincipal` carrying an already-parsed canonical `SubjectId`, never a JWT, a raw `sub` claim, or a caller-supplied subject string.
 
+**Rise's roles across the two planes.** Two distinct planes each use the word "authorization," and keeping them apart is load-bearing for the boundary above and for the deferred `/token`-on-`User` direction (§10):
+
+| Plane | Role | Played by |
+|---|---|---|
+| User login (interactive) | OAuth Authorization Server | the upstream OAuth/OIDC IdP (Dex by default) |
+| User login (interactive) | OAuth Relying Party | Rise |
+| Token issuance | Security Token Service (RFC 8693) | Rise |
+| Access control (RBAC) | Policy Decision Point + Enforcement Point | Rise |
+
+Rise is the sole authority on the access-control plane — the Policy Decision Point this whole model describes — and its own token issuer (a Security Token Service, for workload exchange and sessions). But for *interactive* user login it is a relying party, not the authorization server; that role stays with the configured upstream IdP. "Authorization Server" (an OAuth login/consent role) and "authorization" (an access-control decision) are different concerns on different planes, and this model governs only the latter. This is why unifying the OAuth login flow onto `/token` (§10) means sharing the *issuance core*, not making Rise an authorization server: interactive login stays a relying-party flow, while `/token` serves only the non-interactive RFC 8693 exchange.
+
 For readability, this section calls `(create, ServiceAccount|Controller,
 token)` a **token-create permission**. That is prose shorthand, never a new
 verb in the policy schema.
@@ -607,7 +618,8 @@ This deliberately gives the reference *snapshot* semantics, not §6.1's live sem
   personal tokens, operator-delegated minting on behalf of a user, and exposing
   non-interactive external-assertion→Rise-token exchange (RFC 8693) for users
   through it. The interactive browser login flow stays separate: Rise remains an
-  OAuth relying party (Dex is the authorization server), and the token-issuance
+  OAuth relying party (the upstream OAuth IdP is the authorization server), and
+  the token-issuance
   logic is shared as one issuance core (`rise-backend-auth`) that both the login
   callback and `/token` call, rather than routing interactive login through the
   `/token` endpoint. Deferred with two hazards to design first: because `User` is root-scoped,
