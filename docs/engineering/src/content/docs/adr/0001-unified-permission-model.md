@@ -273,7 +273,7 @@ This ADR standardizes that shared authorization and handler seam, plus
 the concrete `status`, `finalizers`, and `token` strategies. Streaming,
 connection, proxy, and virtual-projection contracts needed by possible future
 `logs`, `proxy`, or `scale` subresources are explored in
-[ADR-0002](../0002-generic-resource-subresource-execution-model/). Adding one
+[ADR-0002](./0002-generic-resource-subresource-execution-model.md). Adding one
 later does not change the RBAC algebra: it registers a handler and is authorized
 by the same `(verb, ResourceKind, subresource)` tuple.
 
@@ -912,7 +912,7 @@ resource admission policy, which is out of scope (§10).
   contracts (`logs`, `proxy`, `scale`, and similar). This ADR fixes their
   authorization tuple and the shared registration seam, but their handler
   interfaces, transport semantics, and response types are drafted in
-  [ADR-0002](../0002-generic-resource-subresource-execution-model/) (§3).
+  [ADR-0002](./0002-generic-resource-subresource-execution-model.md) (§3).
 - Extending the `token` subresource to the `User` kind — user self-service
   personal tokens, operator-delegated minting on behalf of a user, and exposing
   non-interactive external-assertion→Rise-token exchange (RFC 8693) for users
@@ -1391,7 +1391,7 @@ tagged `§9 deferred` or `product-operation deferred`.
 - `ROADMAP.md` §§1–4 — owns live delivery status for the unified RBAC,
   authentication, subresource, and typed-object migration work this model
   informs.
-- [Generic Resource API](../../generic-resource-api/) — the shipped,
+- [Generic Resource API](../generic-resource-api.md) — the shipped,
   operator-only surface this model will govern.
 - `crates/rise-resource-api`, `crates/rise-resource-store` — the envelope types
   and the `ResourceStore` trait/impl the Implementation structure builds on.

@@ -299,5 +299,5 @@ use case exists limits that risk.
 
 ## References
 
-- [ADR-0001: Unified Permission Model](../0001-unified-permission-model/)
-- [Generic Resource API](../../generic-resource-api/)
+- [ADR-0001: Unified Permission Model](./0001-unified-permission-model.md)
+- [Generic Resource API](../generic-resource-api.md)
