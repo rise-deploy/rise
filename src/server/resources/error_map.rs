@@ -1,9 +1,9 @@
-//! Convert `rise_resource_store::StoreError` into the server's `ServerError`.
+//! Convert `rise_resource_api::StoreError` into the server's `ServerError`.
 //!
 //! Kept out of the store crate so the store stays free of HTTP-specific
 //! dependencies. All HTTP handler code converts via this module.
 
-use rise_resource_store::StoreError;
+use rise_resource_api::StoreError;
 
 use crate::server::error::ServerError;
 
@@ -33,9 +33,10 @@ pub fn store_error_to_server_error(err: StoreError) -> ServerError {
             ServerError::bad_request("path resolution requires at least one segment")
         }
         StoreError::Validation(msg) => ServerError::bad_request(msg),
-        StoreError::Database(db) => {
-            ServerError::internal_anyhow(db.into(), "resource store database error")
-        }
+        StoreError::Backend { source } => ServerError::internal_anyhow(
+            anyhow::Error::from_boxed(source),
+            "resource store backend error",
+        ),
     }
 }
 
@@ -95,5 +96,14 @@ mod tests {
             got: "Widget".into(),
         });
         assert_eq!(err.status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn maps_opaque_backend_errors_to_internal_server_error() {
+        let err = store_error_to_server_error(StoreError::backend(std::io::Error::other(
+            "database unavailable",
+        )));
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.message, "resource store backend error");
     }
 }

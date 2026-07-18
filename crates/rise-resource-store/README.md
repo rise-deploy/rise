@@ -1,5 +1,19 @@
 # rise-resource-store
 
+PostgreSQL implementation of Rise's generic resource persistence boundary.
+
+The storage-neutral contract lives in `rise-resource-api`: consumers should
+import `ResourceStore`, `ResourceRow`, `StoreError`, request parameters,
+validators, and shared constants from that crate. This crate intentionally
+exports only PostgreSQL/migration/registry concerns and concrete validators:
+`PgResourceStore`, `run_migrations`, `BuiltInRegistry`,
+`OrganizationValidator`, `ResourceDefinitionValidator`, and
+`JsonSchemaValidator`.
+
+Keeping SQLX and JSON Schema compilation behind the implementation boundary
+lets authorization and controller code use fake `ResourceStore`
+implementations without pulling in PostgreSQL.
+
 Backend-only DB layer for generic resource storage. Implements the `ResourceStore` trait
 backed by PostgreSQL.
 

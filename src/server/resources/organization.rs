@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use rise_resource_store::{DeleteOutcome, ResourceStore, StoreError};
+use rise_resource_api::{DeleteOutcome, ResourceStore, StoreError};
 use sqlx::PgPool;
 use uuid::Uuid;
 

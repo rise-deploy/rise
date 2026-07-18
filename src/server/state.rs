@@ -67,7 +67,7 @@ pub struct AppState {
     /// (later) by internal controllers wanting to reconcile against Rise state
     /// without a network round-trip.
     #[cfg(feature = "backend")]
-    pub resource_store: Arc<dyn rise_resource_store::ResourceStore>,
+    pub resource_store: Arc<dyn rise_resource_api::ResourceStore>,
     /// Resource UID of the default Organization. Populated by the bootstrap
     /// pass at startup; typed APIs use this to stamp newly created
     /// users/teams/projects with the configured default Organization.
@@ -341,7 +341,7 @@ async fn init_docker_backend(
     settings: &crate::server::settings::DeploymentControllerSettings,
     registry_provider: Arc<dyn RegistryProvider>,
     encryption_provider: Option<Arc<dyn EncryptionProvider>>,
-    resource_store: Arc<dyn rise_resource_store::ResourceStore>,
+    resource_store: Arc<dyn rise_resource_api::ResourceStore>,
     jwt_signer: Arc<RiseTokenSigner>,
     db_pool: PgPool,
     store: Arc<dyn rise_backend_core::DeploymentStore>,
@@ -604,7 +604,7 @@ impl AppState {
         // store is cheap to construct (it caches compiled JSON schemas lazily),
         // so we instantiate it once and clone the Arc into every handler.
         #[cfg(feature = "backend")]
-        let resource_store: Arc<dyn rise_resource_store::ResourceStore> =
+        let resource_store: Arc<dyn rise_resource_api::ResourceStore> =
             Arc::new(rise_resource_store::PgResourceStore::new(db_pool.clone()));
 
         // Run default-Organization bootstrap. Must complete before

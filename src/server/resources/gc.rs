@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use rise_resource_store::{DeleteOutcome, ResourceRow, ResourceStore, StoreError};
+use rise_resource_api::{DeleteOutcome, ResourceRow, ResourceStore, StoreError};
 use sqlx::PgPool;
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
@@ -432,11 +432,11 @@ fn stuck_for_secs(row: &ResourceRow, now: DateTime<Utc>) -> u64 {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use rise_resource_api::{API_VERSION_V1ALPHA1, ORGANIZATION_KIND, RESOURCE_DEFINITION_KIND};
-    use rise_resource_store::{
-        CollectionInfo, CreateResourceParams, PathSegment, PgResourceStore, StoreError,
-        UpdateResourceParams,
+    use rise_resource_api::{
+        CollectionInfo, CreateResourceParams, PathSegment, StoreError, UpdateResourceParams,
     };
+    use rise_resource_api::{API_VERSION_V1ALPHA1, ORGANIZATION_KIND, RESOURCE_DEFINITION_KIND};
+    use rise_resource_store::PgResourceStore;
     use serde_json::json;
     use std::collections::BTreeMap;
 

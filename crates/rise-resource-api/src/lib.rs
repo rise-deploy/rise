@@ -4,6 +4,24 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+mod resource_kind;
+mod resource_row;
+mod scope;
+mod store;
+mod subject_id;
+mod subject_ref;
+
+pub use resource_kind::ResourceKind;
+pub use resource_row::ResourceRow;
+pub use scope::Scope;
+pub use store::{
+    CollectionInfo, CreateResourceParams, DeleteOutcome, NoOpValidator, PathSegment, ResourceStore,
+    SpecValidator, StoreError, UpdateResourceParams, CASCADE_DELETION_FINALIZER,
+    MAX_PARENT_CHAIN_DEPTH, SYSTEM_FINALIZER_PREFIX,
+};
+pub use subject_id::SubjectId;
+pub use subject_ref::SubjectRef;
+
 pub const API_VERSION_V1ALPHA1: &str = "rise.dev/v1alpha1";
 
 pub const ORGANIZATION_KIND: &str = "Organization";
@@ -170,7 +188,8 @@ pub struct ValidationError {
 }
 
 impl ValidationError {
-    fn new(message: impl Into<String>) -> Self {
+    /// Construct a validation error from a concrete validator.
+    pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }
