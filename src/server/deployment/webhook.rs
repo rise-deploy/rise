@@ -408,7 +408,7 @@ pub struct CachedOrganizationView {
 /// memoising a transient "not found" (`try_get_with` only retains
 /// successful loads).
 async fn load_org_view(
-    store: std::sync::Arc<dyn rise_resource_store::ResourceStore>,
+    store: std::sync::Arc<dyn rise_resource_api::ResourceStore>,
     uid: uuid::Uuid,
 ) -> anyhow::Result<CachedOrganizationView> {
     let row = store

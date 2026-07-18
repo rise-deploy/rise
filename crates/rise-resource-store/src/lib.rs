@@ -1,25 +1,13 @@
 pub mod builtin;
-pub mod error;
-pub mod models;
 pub mod pg_store;
-pub mod store;
 pub mod validation;
 
 mod discriminator;
+mod models;
 
 pub use builtin::{BuiltInRegistration, BuiltInRegistry};
-pub use error::StoreError;
-pub use models::ResourceRow;
 pub use pg_store::PgResourceStore;
-pub use store::{
-    CollectionInfo, CreateResourceParams, DeleteOutcome, PathSegment, ResourceStore,
-    UpdateResourceParams, CASCADE_DELETION_FINALIZER, MAX_PARENT_CHAIN_DEPTH,
-    SYSTEM_FINALIZER_PREFIX,
-};
-pub use validation::{
-    JsonSchemaValidator, NoOpValidator, OrganizationValidator, ResourceDefinitionValidator,
-    SpecValidator,
-};
+pub use validation::{JsonSchemaValidator, OrganizationValidator, ResourceDefinitionValidator};
 
 /// Run resource-store migrations in their own Postgres schema (`resource_store`),
 /// keeping both the application tables and the `_sqlx_migrations` tracking table

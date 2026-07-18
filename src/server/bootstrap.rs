@@ -24,10 +24,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
-use rise_resource_api::{OrganizationSpec, API_VERSION_V1ALPHA1, ORGANIZATION_KIND};
-use rise_resource_store::{
-    CreateResourceParams, OrganizationValidator, ResourceRow, ResourceStore, UpdateResourceParams,
+use rise_resource_api::{
+    CreateResourceParams, OrganizationSpec, ResourceRow, ResourceStore, UpdateResourceParams,
+    API_VERSION_V1ALPHA1, ORGANIZATION_KIND,
 };
+use rise_resource_store::OrganizationValidator;
 use sqlx::PgPool;
 use tracing::info;
 

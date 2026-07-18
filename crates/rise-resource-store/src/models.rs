@@ -1,13 +1,11 @@
 use chrono::{DateTime, Utc};
-use rise_resource_api::{Resource, ResourceMetadata};
-use serde::de::DeserializeOwned;
-use std::collections::BTreeMap;
+use rise_resource_api::ResourceRow;
 use uuid::Uuid;
 
-use crate::error::StoreError;
-
+/// SQLX-only representation of a `resources` row. The public contract uses the
+/// storage-neutral `rise_resource_api::ResourceRow` and never depends on SQLX.
 #[derive(Debug, Clone, sqlx::FromRow)]
-pub struct ResourceRow {
+pub(crate) struct PgResourceRow {
     pub uid: Uuid,
     pub api_version: String,
     pub kind: String,
@@ -24,34 +22,69 @@ pub struct ResourceRow {
     pub updated_at: DateTime<Utc>,
 }
 
-impl ResourceRow {
-    pub fn to_resource<TSpec, TStatus>(&self) -> Result<Resource<TSpec, TStatus>, StoreError>
-    where
-        TSpec: Default + DeserializeOwned,
-        TStatus: Default + DeserializeOwned,
-    {
-        let spec: TSpec = serde_json::from_value(self.spec.clone())
-            .map_err(|e| StoreError::Validation(format!("invalid spec: {e}")))?;
-        let status: TStatus = serde_json::from_value(self.status.clone())
-            .map_err(|e| StoreError::Validation(format!("invalid status: {e}")))?;
+impl From<PgResourceRow> for ResourceRow {
+    fn from(row: PgResourceRow) -> Self {
+        Self {
+            uid: row.uid,
+            api_version: row.api_version,
+            kind: row.kind,
+            parent_uid: row.parent_uid,
+            name: row.name,
+            discriminator: row.discriminator,
+            metadata: row.metadata,
+            spec: row.spec,
+            status: row.status,
+            revision: row.revision,
+            finalizers: row.finalizers,
+            deletion_timestamp: row.deletion_timestamp,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }
+}
 
-        let annotations: BTreeMap<String, String> =
-            serde_json::from_value(self.metadata.clone()).unwrap_or_default();
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
 
-        Ok(Resource {
-            api_version: self.api_version.clone(),
-            kind: self.kind.clone(),
-            metadata: ResourceMetadata {
-                name: self.name.clone(),
-                uid: Some(self.uid),
-                revision: Some(self.revision),
-                discriminator: Some(self.discriminator.clone()),
-                annotations,
-                finalizers: self.finalizers.clone(),
-                deletion_timestamp: self.deletion_timestamp,
-            },
-            spec,
-            status,
-        })
+    #[test]
+    fn pg_row_conversion_maps_every_field() {
+        let created_at = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let updated_at = Utc.timestamp_opt(1_700_000_100, 0).unwrap();
+        let deletion_timestamp = Some(Utc.timestamp_opt(1_700_000_200, 0).unwrap());
+        let uid = Uuid::from_u128(42);
+        let db = PgResourceRow {
+            uid,
+            api_version: "example.dev/v1".into(),
+            kind: "Widget".into(),
+            parent_uid: Some(Uuid::from_u128(7)),
+            name: "widget-a".into(),
+            discriminator: "abc123de".into(),
+            metadata: serde_json::json!({"owner": "team-a"}),
+            spec: serde_json::json!({"size": 3}),
+            status: serde_json::json!({"ready": true}),
+            revision: 9,
+            finalizers: vec!["example.dev/cleanup".into()],
+            deletion_timestamp,
+            created_at,
+            updated_at,
+        };
+
+        let api: ResourceRow = db.into();
+        assert_eq!(api.uid, uid);
+        assert_eq!(api.api_version, "example.dev/v1");
+        assert_eq!(api.kind, "Widget");
+        assert_eq!(api.parent_uid, Some(Uuid::from_u128(7)));
+        assert_eq!(api.name, "widget-a");
+        assert_eq!(api.discriminator, "abc123de");
+        assert_eq!(api.metadata, serde_json::json!({"owner": "team-a"}));
+        assert_eq!(api.spec, serde_json::json!({"size": 3}));
+        assert_eq!(api.status, serde_json::json!({"ready": true}));
+        assert_eq!(api.revision, 9);
+        assert_eq!(api.finalizers, vec!["example.dev/cleanup"]);
+        assert_eq!(api.deletion_timestamp, deletion_timestamp);
+        assert_eq!(api.created_at, created_at);
+        assert_eq!(api.updated_at, updated_at);
     }
 }

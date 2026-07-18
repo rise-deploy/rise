@@ -4188,7 +4188,6 @@ dependencies = [
  "rise-backend-core",
  "rise-deployment-spec",
  "rise-resource-api",
- "rise-resource-store",
  "rise-runtime-sync",
  "serde",
  "serde_json",
@@ -4290,10 +4289,14 @@ dependencies = [
 name = "rise-resource-api"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
+ "jsonschema",
  "schemars 1.2.1",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
  "uuid",
 ]
 
@@ -4301,18 +4304,14 @@ dependencies = [
 name = "rise-resource-store"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "chrono",
  "jsonschema",
  "rand 0.10.2",
  "rise-resource-api",
- "serde",
  "serde_json",
  "sqlx",
- "thiserror 2.0.18",
  "tokio",
- "tracing",
  "uuid",
 ]
 

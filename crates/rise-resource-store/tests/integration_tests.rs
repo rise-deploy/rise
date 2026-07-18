@@ -1,8 +1,9 @@
-use rise_resource_api::{API_VERSION_V1ALPHA1, ORGANIZATION_KIND, RESOURCE_DEFINITION_KIND};
-use rise_resource_store::{
-    CreateResourceParams, DeleteOutcome, PathSegment, PgResourceStore, ResourceStore, StoreError,
-    UpdateResourceParams, CASCADE_DELETION_FINALIZER,
+use rise_resource_api::{
+    CreateResourceParams, DeleteOutcome, PathSegment, ResourceRow, ResourceStore, StoreError,
+    UpdateResourceParams, API_VERSION_V1ALPHA1, CASCADE_DELETION_FINALIZER, ORGANIZATION_KIND,
+    RESOURCE_DEFINITION_KIND,
 };
+use rise_resource_store::PgResourceStore;
 use serde_json::json;
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -1864,7 +1865,7 @@ async fn update_resource_definition_invalidates_schema_cache(
         .validate_spec(&json!({"color": "blue"}))
         .unwrap_err();
     assert!(
-        matches!(err, StoreError::Validation(_)),
+        err.to_string().contains("spec validation failed"),
         "expected refreshed schema to reject old shape, got {err:?}"
     );
     refreshed_info
@@ -1929,7 +1930,7 @@ async fn update_rejects_resource_definition(pool: sqlx::PgPool) -> sqlx::Result<
 // Cascade deletion
 // ---------------------------------------------------------------------------------------------
 
-async fn create_org(store: &PgResourceStore, name: &str) -> rise_resource_store::ResourceRow {
+async fn create_org(store: &PgResourceStore, name: &str) -> ResourceRow {
     store
         .create(CreateResourceParams {
             api_version: API_VERSION_V1ALPHA1.to_string(),
@@ -1986,7 +1987,7 @@ async fn create_child(
     kind: &str,
     name: &str,
     finalizers: Vec<String>,
-) -> rise_resource_store::ResourceRow {
+) -> ResourceRow {
     // Ensure the ResourceDefinition exists so that the FOR SHARE lock in `create` can find it.
     register_example_widget_rd(store).await;
     store

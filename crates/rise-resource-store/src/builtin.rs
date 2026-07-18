@@ -19,12 +19,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use rise_resource_api::{
-    ResourceParentRef, API_VERSION_V1ALPHA1, ORGANIZATION_COLLECTION, ORGANIZATION_KIND,
-    RESOURCE_DEFINITION_COLLECTION, RESOURCE_DEFINITION_KIND,
+    CollectionInfo, ResourceParentRef, SpecValidator, API_VERSION_V1ALPHA1,
+    ORGANIZATION_COLLECTION, ORGANIZATION_KIND, RESOURCE_DEFINITION_COLLECTION,
+    RESOURCE_DEFINITION_KIND,
 };
 
-use crate::store::CollectionInfo;
-use crate::validation::{OrganizationValidator, ResourceDefinitionValidator, SpecValidator};
+use crate::validation::{OrganizationValidator, ResourceDefinitionValidator};
 
 /// Static description of one built-in resource kind.
 ///

@@ -15,10 +15,12 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use rise_resource_api::{CreateResourceRequest, UpdateResourceRequest};
-use rise_resource_store::{
-    CollectionInfo, CreateResourceParams, DeleteOutcome, PathSegment, ResourceRow, ResourceStore,
-    UpdateResourceParams,
+#[cfg(test)]
+use rise_resource_api::NoOpValidator;
+use rise_resource_api::{
+    CollectionInfo, CreateResourceParams, CreateResourceRequest, DeleteOutcome, PathSegment,
+    ResourceRow, ResourceStore, UpdateResourceParams, UpdateResourceRequest,
+    MAX_PARENT_CHAIN_DEPTH,
 };
 use serde::Deserialize;
 use uuid::Uuid;
@@ -72,6 +74,28 @@ impl ResourceApiCtx {
     fn is_operator(&self, email: &str) -> bool {
         crate::server::auth::admin::is_operator_user(&self.operator_users, email)
     }
+}
+
+fn response_resource(
+    row: &ResourceRow,
+    response_api_version: &str,
+) -> Result<rise_resource_api::Resource, ServerError> {
+    let converted = if response_api_version == row.api_version {
+        row_to_resource(row)
+    } else {
+        row_to_resource_with_api_version(row, response_api_version)
+    };
+    converted.map_err(|error| {
+        ServerError::internal_anyhow(
+            anyhow::Error::new(error),
+            "stored resource could not be converted to an API response",
+        )
+        .with_context("resource_uid", row.uid.to_string())
+        .with_context("resource_kind", row.kind.clone())
+        .with_context("resource_name", row.name.clone())
+        .with_context("stored_api_version", row.api_version.clone())
+        .with_context("response_api_version", response_api_version.to_owned())
+    })
 }
 
 // -----------------------------------------------------------------------------
@@ -230,12 +254,11 @@ async fn resolve_parent_chain(
     let mut chain: Vec<CollectionInfo> = Vec::new();
     let mut current = leaf.parent.clone();
     while let Some(parent_ref) = current {
-        if chain.len() >= rise_resource_store::MAX_PARENT_CHAIN_DEPTH {
+        if chain.len() >= MAX_PARENT_CHAIN_DEPTH {
             return Err(ServerError::internal(format!(
                 "ResourceDefinition parent chain for kind '{}' exceeds the maximum depth \
                  of {}; the parent graph may contain a cycle",
-                leaf.kind,
-                rise_resource_store::MAX_PARENT_CHAIN_DEPTH,
+                leaf.kind, MAX_PARENT_CHAIN_DEPTH,
             )));
         }
         let group = api_group(&parent_ref.api_version);
@@ -563,8 +586,10 @@ async fn dispatch_get_inner(
                 count = rows.len(),
                 "resource.pending_deletion_listed"
             );
-            let items: Vec<rise_resource_api::Resource> =
-                rows.iter().map(row_to_resource).collect();
+            let items = rows
+                .iter()
+                .map(|row| response_resource(row, &row.api_version))
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(Json(serde_json::json!({ "items": items })).into_response())
         }
         ResolvedPath::List {
@@ -588,18 +613,14 @@ async fn dispatch_get_inner(
                 kind: resolved.info.kind,
                 items: rows
                     .iter()
-                    .map(|row| row_to_resource_with_api_version(row, &resolved.info.api_version))
-                    .collect(),
+                    .map(|row| response_resource(row, &resolved.info.api_version))
+                    .collect::<Result<Vec<_>, _>>()?,
             })
             .into_response())
         }
         ResolvedPath::Item { resolved, leaf } => {
             let row = resolve_leaf(&ctx.store, &resolved, &leaf).await?;
-            Ok(Json(row_to_resource_with_api_version(
-                &row,
-                &resolved.info.api_version,
-            ))
-            .into_response())
+            Ok(Json(response_resource(&row, &resolved.info.api_version)?).into_response())
         }
         ResolvedPath::Subresource { .. } => Err(ServerError::new(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -901,10 +922,7 @@ async fn create_resource(
     );
     Ok((
         StatusCode::CREATED,
-        Json(row_to_resource_with_api_version(
-            &row,
-            &resolved.info.api_version,
-        )),
+        Json(response_resource(&row, &resolved.info.api_version)?),
     ))
 }
 
@@ -988,10 +1006,10 @@ async fn update_resource(
         revision = updated.revision,
         "resource.updated"
     );
-    Ok(Json(row_to_resource_with_api_version(
+    Ok(Json(response_resource(
         &updated,
         &resolved.info.api_version,
-    )))
+    )?))
 }
 
 async fn delete_resource(
@@ -1052,15 +1070,18 @@ async fn delete_resource(
             Json(serde_json::json!({"deleted": true, "uid": row.uid})),
         )
             .into_response()),
-        DeleteOutcome::MarkedForDeletion(marked) => Ok((
-            StatusCode::ACCEPTED,
-            Json(serde_json::json!({
-                "deleted": false,
-                "markedForDeletion": true,
-                "resource": row_to_resource_with_api_version(&marked, response_api_version),
-            })),
-        )
-            .into_response()),
+        DeleteOutcome::MarkedForDeletion(marked) => {
+            let resource = response_resource(&marked, response_api_version)?;
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "deleted": false,
+                    "markedForDeletion": true,
+                    "resource": resource,
+                })),
+            )
+                .into_response())
+        }
     }
 }
 
@@ -1085,10 +1106,7 @@ async fn apply_controller_status(
         name = %row.name,
         "resource.controller_status_updated"
     );
-    Ok(Json(row_to_resource_with_api_version(
-        &updated,
-        response_api_version,
-    )))
+    Ok(Json(response_resource(&updated, response_api_version)?))
 }
 
 async fn apply_controller_finalizers(
@@ -1112,10 +1130,7 @@ async fn apply_controller_finalizers(
         name = %row.name,
         "resource.controller_finalizers_updated"
     );
-    Ok(Json(row_to_resource_with_api_version(
-        &updated,
-        response_api_version,
-    )))
+    Ok(Json(response_resource(&updated, response_api_version)?))
 }
 
 async fn apply_operator_status(
@@ -1139,10 +1154,7 @@ async fn apply_operator_status(
         name = %row.name,
         "resource.operator_status_updated"
     );
-    Ok(Json(row_to_resource_with_api_version(
-        &updated,
-        response_api_version,
-    )))
+    Ok(Json(response_resource(&updated, response_api_version)?))
 }
 
 async fn apply_operator_finalizers(
@@ -1166,10 +1178,7 @@ async fn apply_operator_finalizers(
         name = %row.name,
         "resource.operator_finalizers_updated"
     );
-    Ok(Json(row_to_resource_with_api_version(
-        &updated,
-        response_api_version,
-    )))
+    Ok(Json(response_resource(&updated, response_api_version)?))
 }
 
 #[cfg(test)]
@@ -1185,7 +1194,7 @@ mod tests {
             declared_api_versions: vec!["rise.dev/v1alpha1".into()],
             kind: "Organization".into(),
             parent: None,
-            spec_validator: std::sync::Arc::new(rise_resource_store::NoOpValidator),
+            spec_validator: std::sync::Arc::new(NoOpValidator),
             allowed_status_controller_ids: vec![],
         };
 
@@ -1207,7 +1216,7 @@ mod tests {
             declared_api_versions: vec!["example.dev/v1".into()],
             kind: "Widget".into(),
             parent: None,
-            spec_validator: std::sync::Arc::new(rise_resource_store::NoOpValidator),
+            spec_validator: std::sync::Arc::new(NoOpValidator),
             allowed_status_controller_ids: allowed,
         }
     }
@@ -1242,6 +1251,39 @@ mod tests {
         // No slash — the whole string is the group.
         assert_eq!(api_group("plaingroup"), "plaingroup");
         assert_eq!(api_group(""), "");
+    }
+
+    #[test]
+    fn malformed_stored_row_maps_to_contextual_internal_error() {
+        let now = chrono::Utc::now();
+        let row = ResourceRow {
+            uid: Uuid::new_v4(),
+            api_version: "example.dev/v1".into(),
+            kind: "Widget".into(),
+            parent_uid: None,
+            name: "widget-a".into(),
+            discriminator: "abcd1234".into(),
+            metadata: serde_json::json!({"invalid": 42}),
+            spec: serde_json::json!({}),
+            status: serde_json::json!({}),
+            revision: 1,
+            finalizers: vec![],
+            deletion_timestamp: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let error = response_resource(&row, "example.dev/v1").unwrap_err();
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(error.source.is_some());
+        assert!(error
+            .context
+            .iter()
+            .any(|(key, value)| *key == "resource_uid" && value == &row.uid.to_string()));
+        assert!(error
+            .context
+            .iter()
+            .any(|(key, value)| *key == "response_api_version" && value == "example.dev/v1"));
     }
 }
 

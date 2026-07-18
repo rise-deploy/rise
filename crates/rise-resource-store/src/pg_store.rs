@@ -3,23 +3,18 @@ use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
 use rise_resource_api::{
-    validate_controller_id, validate_resource_name, ResourceDefinitionSpec, API_VERSION_V1ALPHA1,
-    ORGANIZATION_KIND, RESOURCE_DEFINITION_KIND,
+    validate_controller_id, validate_resource_name, CollectionInfo, CreateResourceParams,
+    DeleteOutcome, NoOpValidator, PathSegment, ResourceDefinitionSpec, ResourceRow, ResourceStore,
+    SpecValidator, StoreError, UpdateResourceParams, API_VERSION_V1ALPHA1,
+    CASCADE_DELETION_FINALIZER, MAX_PARENT_CHAIN_DEPTH, ORGANIZATION_KIND,
+    RESOURCE_DEFINITION_KIND, SYSTEM_FINALIZER_PREFIX,
 };
 use sqlx::{PgPool, Row};
 
 use crate::builtin::BuiltInRegistry;
 use crate::discriminator;
-use crate::error::StoreError;
-use crate::models::ResourceRow;
-use crate::store::{
-    CollectionInfo, CreateResourceParams, DeleteOutcome, PathSegment, ResourceStore,
-    UpdateResourceParams, CASCADE_DELETION_FINALIZER, MAX_PARENT_CHAIN_DEPTH,
-    SYSTEM_FINALIZER_PREFIX,
-};
-use crate::validation::{
-    JsonSchemaValidator, NoOpValidator, ResourceDefinitionValidator, SpecValidator,
-};
+use crate::models::PgResourceRow;
+use crate::validation::{JsonSchemaValidator, ResourceDefinitionValidator};
 
 pub struct PgResourceStore {
     pool: PgPool,
@@ -116,9 +111,10 @@ impl PgResourceStore {
 
             sqlx::query("SAVEPOINT sp_discriminator_retry")
                 .execute(&mut *conn)
-                .await?;
+                .await
+                .map_err(StoreError::backend)?;
 
-            let result = sqlx::query_as::<_, ResourceRow>(
+            let result = sqlx::query_as::<_, PgResourceRow>(
                 r#"
                 INSERT INTO resource_store.resources
                     (api_version, kind, parent_uid, name, discriminator, metadata, spec, finalizers)
@@ -141,26 +137,32 @@ impl PgResourceStore {
                 Ok(row) => {
                     sqlx::query("RELEASE SAVEPOINT sp_discriminator_retry")
                         .execute(&mut *conn)
-                        .await?;
-                    return Ok(row);
+                        .await
+                        .map_err(StoreError::backend)?;
+                    return Ok(row.into());
                 }
                 Err(ref e) if Self::is_name_conflict(e) => {
                     sqlx::query("ROLLBACK TO SAVEPOINT sp_discriminator_retry")
                         .execute(&mut *conn)
-                        .await?;
+                        .await
+                        .map_err(StoreError::backend)?;
                     return Err(StoreError::NameConflict);
                 }
                 Err(ref e) if Self::is_discriminator_conflict(e) => {
                     sqlx::query("ROLLBACK TO SAVEPOINT sp_discriminator_retry")
                         .execute(&mut *conn)
-                        .await?;
+                        .await
+                        .map_err(StoreError::backend)?;
                     continue;
                 }
                 Err(e) => {
                     sqlx::query("ROLLBACK TO SAVEPOINT sp_discriminator_retry")
                         .execute(&mut *conn)
-                        .await?;
-                    return Err(Self::rd_uniqueness_conflict(&e).unwrap_or(StoreError::Database(e)));
+                        .await
+                        .map_err(StoreError::backend)?;
+                    return Err(
+                        Self::rd_uniqueness_conflict(&e).unwrap_or_else(|| StoreError::backend(e))
+                    );
                 }
             }
         }
@@ -170,7 +172,7 @@ impl PgResourceStore {
 
     async fn ensure_resource_definition_has_no_instances(
         &self,
-        row: &ResourceRow,
+        row: &PgResourceRow,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     ) -> Result<(), StoreError> {
         let spec: ResourceDefinitionSpec =
@@ -190,7 +192,8 @@ impl PgResourceStore {
         sqlx::query("SELECT uid FROM resource_store.resources WHERE uid = $1 FOR UPDATE")
             .bind(row.uid)
             .execute(&mut **tx)
-            .await?;
+            .await
+            .map_err(StoreError::backend)?;
 
         let instance_count: i64 = sqlx::query_scalar(
             r#"
@@ -203,7 +206,8 @@ impl PgResourceStore {
         .bind(&spec.kind)
         .bind(&api_versions)
         .fetch_one(&mut **tx)
-        .await?;
+        .await
+        .map_err(StoreError::backend)?;
 
         if instance_count > 0 {
             return Err(StoreError::Validation(format!(
@@ -252,7 +256,8 @@ impl PgResourceStore {
         .bind(kind)
         .bind(serde_json::json!([{ "name": version, "storage": true }]))
         .fetch_optional(&mut **tx)
-        .await?;
+        .await
+        .map_err(StoreError::backend)?;
 
         if required && row.is_none() {
             return Err(StoreError::Validation(format!(
@@ -332,14 +337,15 @@ impl PgResourceStore {
         .bind(group)
         .bind(kind)
         .fetch_optional(&mut *conn)
-        .await?;
+        .await
+        .map_err(StoreError::backend)?;
 
         let Some(row) = row else {
             return Ok(None);
         };
 
         let spec: ResourceDefinitionSpec = serde_json::from_value(
-            row.try_get("spec").map_err(StoreError::Database)?,
+            row.try_get("spec").map_err(StoreError::backend)?,
         )
         .map_err(|e| {
             StoreError::Validation(format!(
@@ -399,7 +405,7 @@ impl ResourceStore for PgResourceStore {
 
         let metadata = serde_json::to_value(&params.annotations).unwrap_or_default();
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
         if params.kind != RESOURCE_DEFINITION_KIND {
             let is_builtin =
                 params.api_version == API_VERSION_V1ALPHA1 && params.kind == ORGANIZATION_KIND;
@@ -415,18 +421,19 @@ impl ResourceStore for PgResourceStore {
             .await?;
         }
         let row = Self::insert_resource_row_with_retry(&mut tx, &params, metadata).await?;
-        tx.commit().await?;
+        tx.commit().await.map_err(StoreError::backend)?;
         Ok(row)
     }
 
     async fn get(&self, uid: Uuid) -> Result<Option<ResourceRow>, StoreError> {
-        let row = sqlx::query_as::<_, ResourceRow>(
+        let row = sqlx::query_as::<_, PgResourceRow>(
             "SELECT * FROM resource_store.resources WHERE uid = $1",
         )
         .bind(uid)
         .fetch_optional(&self.pool)
-        .await?;
-        Ok(row)
+        .await
+        .map_err(StoreError::backend)?;
+        Ok(row.map(Into::into))
     }
 
     async fn get_by_name(
@@ -442,16 +449,17 @@ impl ResourceStore for PgResourceStore {
         // which declared version it is stored at.
         let row =
             match parent_uid {
-                None => sqlx::query_as::<_, ResourceRow>(
+                None => sqlx::query_as::<_, PgResourceRow>(
                     "SELECT * FROM resource_store.resources WHERE split_part(api_version, '/', 1) = split_part($1, '/', 1) AND kind = $2 AND name = $3 AND parent_uid IS NULL",
                 )
                 .bind(api_version)
                 .bind(kind)
                 .bind(name)
                 .fetch_optional(&self.pool)
-                .await?,
+                .await
+                .map_err(StoreError::backend)?,
                 Some(pid) => {
-                    sqlx::query_as::<_, ResourceRow>(
+                    sqlx::query_as::<_, PgResourceRow>(
                         "SELECT * FROM resource_store.resources WHERE split_part(api_version, '/', 1) = split_part($1, '/', 1) AND kind = $2 AND name = $3 AND parent_uid = $4",
                     )
                     .bind(api_version)
@@ -459,10 +467,11 @@ impl ResourceStore for PgResourceStore {
                     .bind(name)
                     .bind(pid)
                     .fetch_optional(&self.pool)
-                    .await?
+                    .await
+                    .map_err(StoreError::backend)?
                 }
             };
-        Ok(row)
+        Ok(row.map(Into::into))
     }
 
     async fn list(
@@ -475,25 +484,27 @@ impl ResourceStore for PgResourceStore {
         // every declared version of the kind (see `get_by_name`).
         let rows =
             match parent_uid {
-                None => sqlx::query_as::<_, ResourceRow>(
+                None => sqlx::query_as::<_, PgResourceRow>(
                     "SELECT * FROM resource_store.resources WHERE split_part(api_version, '/', 1) = split_part($1, '/', 1) AND kind = $2 AND parent_uid IS NULL ORDER BY name",
                 )
                 .bind(api_version)
                 .bind(kind)
                 .fetch_all(&self.pool)
-                .await?,
+                .await
+                .map_err(StoreError::backend)?,
                 Some(pid) => {
-                    sqlx::query_as::<_, ResourceRow>(
+                    sqlx::query_as::<_, PgResourceRow>(
                         "SELECT * FROM resource_store.resources WHERE split_part(api_version, '/', 1) = split_part($1, '/', 1) AND kind = $2 AND parent_uid = $3 ORDER BY name",
                     )
                     .bind(api_version)
                     .bind(kind)
                     .bind(pid)
                     .fetch_all(&self.pool)
-                    .await?
+                    .await
+                    .map_err(StoreError::backend)?
                 }
             };
-        Ok(rows)
+        Ok(rows.into_iter().map(Into::into).collect())
     }
 
     async fn list_versions(
@@ -504,25 +515,27 @@ impl ResourceStore for PgResourceStore {
     ) -> Result<Vec<ResourceRow>, StoreError> {
         let rows =
             match parent_uid {
-                None => sqlx::query_as::<_, ResourceRow>(
+                None => sqlx::query_as::<_, PgResourceRow>(
                     "SELECT * FROM resource_store.resources WHERE api_version = ANY($1) AND kind = $2 AND parent_uid IS NULL ORDER BY name",
                 )
                 .bind(api_versions)
                 .bind(kind)
                 .fetch_all(&self.pool)
-                .await?,
+                .await
+                .map_err(StoreError::backend)?,
                 Some(pid) => {
-                    sqlx::query_as::<_, ResourceRow>(
+                    sqlx::query_as::<_, PgResourceRow>(
                         "SELECT * FROM resource_store.resources WHERE api_version = ANY($1) AND kind = $2 AND parent_uid = $3 ORDER BY name",
                     )
                     .bind(api_versions)
                     .bind(kind)
                     .bind(pid)
                     .fetch_all(&self.pool)
-                    .await?
+                    .await
+                    .map_err(StoreError::backend)?
                 }
             };
-        Ok(rows)
+        Ok(rows.into_iter().map(Into::into).collect())
     }
 
     async fn update(
@@ -536,7 +549,8 @@ impl ResourceStore for PgResourceStore {
             sqlx::query_as("SELECT api_version, kind FROM resource_store.resources WHERE uid = $1")
                 .bind(uid)
                 .fetch_optional(&self.pool)
-                .await?;
+                .await
+                .map_err(StoreError::backend)?;
         let Some((current_api_version, kind)) = current_identity else {
             return Err(StoreError::NotFound);
         };
@@ -556,7 +570,7 @@ impl ResourceStore for PgResourceStore {
         // Include the expected revision in the WHERE clause so the update is atomic:
         // a concurrent write that already incremented the revision will cause zero rows
         // to be affected, which we detect and map to RevisionConflict.
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
         // Always acquire the FOR SHARE lock on the matching ResourceDefinition for
         // non-builtin external kinds, regardless of whether a validator was provided.
         // Without the lock, a concurrent hard-delete of the ResourceDefinition can
@@ -586,7 +600,7 @@ impl ResourceStore for PgResourceStore {
             .await?;
         }
 
-        let updated = sqlx::query_as::<_, ResourceRow>(
+        let updated = sqlx::query_as::<_, PgResourceRow>(
             r#"
             UPDATE resource_store.resources
             SET api_version = COALESCE($1, api_version),
@@ -614,12 +628,12 @@ impl ResourceStore for PgResourceStore {
             // already exists. Surface the partial unique-index violation as NameConflict (409)
             // instead of leaking an internal Database error (500).
             Err(ref e) if Self::is_name_conflict(e) => return Err(StoreError::NameConflict),
-            Err(e) => return Err(StoreError::Database(e)),
+            Err(e) => return Err(StoreError::backend(e)),
         };
 
         if let Some(row) = updated {
-            tx.commit().await?;
-            return Ok(row);
+            tx.commit().await.map_err(StoreError::backend)?;
+            return Ok(row.into());
         }
 
         // Zero rows affected — revision mismatch (NotFound already handled above)
@@ -637,7 +651,8 @@ impl ResourceStore for PgResourceStore {
             sqlx::query_scalar("SELECT kind FROM resource_store.resources WHERE uid = $1")
                 .bind(uid)
                 .fetch_optional(&self.pool)
-                .await?;
+                .await
+                .map_err(StoreError::backend)?;
         let Some(kind) = kind else {
             return Err(StoreError::NotFound);
         };
@@ -647,7 +662,7 @@ impl ResourceStore for PgResourceStore {
             ));
         }
 
-        let updated = sqlx::query_as::<_, ResourceRow>(
+        let updated = sqlx::query_as::<_, PgResourceRow>(
             r#"
             UPDATE resource_store.resources
             SET name       = $1,
@@ -663,24 +678,25 @@ impl ResourceStore for PgResourceStore {
         .await;
 
         match updated {
-            Ok(Some(row)) => Ok(row),
+            Ok(Some(row)) => Ok(row.into()),
             Ok(None) => Err(StoreError::NotFound),
             Err(ref e) if Self::is_name_conflict(e) => Err(StoreError::NameConflict),
-            Err(e) => Err(StoreError::Database(e)),
+            Err(e) => Err(StoreError::backend(e)),
         }
     }
 
     async fn delete(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
 
         // Lock the row inside the transaction so a concurrent update_controller_finalizers()
         // can't add a finalizer between our read and the hard-delete branch below.
-        let row = sqlx::query_as::<_, ResourceRow>(
+        let row = sqlx::query_as::<_, PgResourceRow>(
             "SELECT * FROM resource_store.resources WHERE uid = $1 FOR UPDATE",
         )
         .bind(uid)
         .fetch_optional(&mut *tx)
-        .await?
+        .await
+        .map_err(StoreError::backend)?
         .ok_or(StoreError::NotFound)?;
 
         let child_count: i64 = sqlx::query_scalar(
@@ -688,7 +704,8 @@ impl ResourceStore for PgResourceStore {
         )
         .bind(uid)
         .fetch_one(&mut *tx)
-        .await?;
+        .await
+        .map_err(StoreError::backend)?;
 
         if child_count > 0 {
             // Stamp immediate children that aren't already marked. A future GC sweep
@@ -704,10 +721,11 @@ impl ResourceStore for PgResourceStore {
             )
             .bind(uid)
             .execute(&mut *tx)
-            .await?;
+            .await
+            .map_err(StoreError::backend)?;
 
             // Stamp the parent and attach the cascade finalizer (idempotent).
-            let marked = sqlx::query_as::<_, ResourceRow>(
+            let marked = sqlx::query_as::<_, PgResourceRow>(
                 r#"
                 UPDATE resource_store.resources
                 SET deletion_timestamp = COALESCE(deletion_timestamp, NOW()),
@@ -723,9 +741,10 @@ impl ResourceStore for PgResourceStore {
             .bind(uid)
             .bind(CASCADE_DELETION_FINALIZER)
             .fetch_one(&mut *tx)
-            .await?;
-            tx.commit().await?;
-            return Ok(DeleteOutcome::MarkedForDeletion(Box::new(marked)));
+            .await
+            .map_err(StoreError::backend)?;
+            tx.commit().await.map_err(StoreError::backend)?;
+            return Ok(DeleteOutcome::MarkedForDeletion(Box::new(marked.into())));
         }
 
         // No (remaining) children. For ResourceDefinitions, reject deletion when live instances
@@ -738,7 +757,7 @@ impl ResourceStore for PgResourceStore {
 
         // Mark if finalizers, else hard-delete.
         if !row.finalizers.is_empty() {
-            let marked = sqlx::query_as::<_, ResourceRow>(
+            let marked = sqlx::query_as::<_, PgResourceRow>(
                 r#"
                 UPDATE resource_store.resources
                 SET deletion_timestamp = COALESCE(deletion_timestamp, NOW()),
@@ -749,35 +768,38 @@ impl ResourceStore for PgResourceStore {
             )
             .bind(uid)
             .fetch_one(&mut *tx)
-            .await?;
-            tx.commit().await?;
-            return Ok(DeleteOutcome::MarkedForDeletion(Box::new(marked)));
+            .await
+            .map_err(StoreError::backend)?;
+            tx.commit().await.map_err(StoreError::backend)?;
+            return Ok(DeleteOutcome::MarkedForDeletion(Box::new(marked.into())));
         }
         // Deleting the `resources` row also removes it from the
         // `resource_definitions` view.
         sqlx::query("DELETE FROM resource_store.resources WHERE uid = $1")
             .bind(uid)
             .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
+            .await
+            .map_err(StoreError::backend)?;
+        tx.commit().await.map_err(StoreError::backend)?;
 
         Ok(DeleteOutcome::Deleted)
     }
 
     async fn try_collect(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
 
-        let row = sqlx::query_as::<_, ResourceRow>(
+        let row = sqlx::query_as::<_, PgResourceRow>(
             "SELECT * FROM resource_store.resources WHERE uid = $1 FOR UPDATE",
         )
         .bind(uid)
         .fetch_optional(&mut *tx)
-        .await?
+        .await
+        .map_err(StoreError::backend)?
         .ok_or(StoreError::NotFound)?;
 
         // Not tombstoned: nothing to collect, return current state.
         if row.deletion_timestamp.is_none() {
-            return Ok(DeleteOutcome::MarkedForDeletion(Box::new(row)));
+            return Ok(DeleteOutcome::MarkedForDeletion(Box::new(row.into())));
         }
 
         let child_count: i64 = sqlx::query_scalar(
@@ -785,7 +807,8 @@ impl ResourceStore for PgResourceStore {
         )
         .bind(uid)
         .fetch_one(&mut *tx)
-        .await?;
+        .await
+        .map_err(StoreError::backend)?;
 
         if child_count > 0 {
             // Fan out: stamp any unmarked children. Ensure the cascade finalizer is present
@@ -801,9 +824,10 @@ impl ResourceStore for PgResourceStore {
             )
             .bind(uid)
             .execute(&mut *tx)
-            .await?;
+            .await
+            .map_err(StoreError::backend)?;
 
-            let row = sqlx::query_as::<_, ResourceRow>(
+            let row = sqlx::query_as::<_, PgResourceRow>(
                 r#"
                 UPDATE resource_store.resources
                 SET finalizers = CASE
@@ -821,14 +845,15 @@ impl ResourceStore for PgResourceStore {
             .bind(uid)
             .bind(CASCADE_DELETION_FINALIZER)
             .fetch_one(&mut *tx)
-            .await?;
-            tx.commit().await?;
-            return Ok(DeleteOutcome::MarkedForDeletion(Box::new(row)));
+            .await
+            .map_err(StoreError::backend)?;
+            tx.commit().await.map_err(StoreError::backend)?;
+            return Ok(DeleteOutcome::MarkedForDeletion(Box::new(row.into())));
         }
 
         // No children. Drop the cascade finalizer if present. Only bump revision when the
         // finalizer was actually removed so idempotent re-calls don't churn the version.
-        let row = sqlx::query_as::<_, ResourceRow>(
+        let row = sqlx::query_as::<_, PgResourceRow>(
             r#"
             UPDATE resource_store.resources
             SET finalizers = array_remove(finalizers, $2),
@@ -843,11 +868,12 @@ impl ResourceStore for PgResourceStore {
         .bind(uid)
         .bind(CASCADE_DELETION_FINALIZER)
         .fetch_one(&mut *tx)
-        .await?;
+        .await
+        .map_err(StoreError::backend)?;
 
         if !row.finalizers.is_empty() {
-            tx.commit().await?;
-            return Ok(DeleteOutcome::MarkedForDeletion(Box::new(row)));
+            tx.commit().await.map_err(StoreError::backend)?;
+            return Ok(DeleteOutcome::MarkedForDeletion(Box::new(row.into())));
         }
 
         // Clear: hard-delete.
@@ -860,14 +886,15 @@ impl ResourceStore for PgResourceStore {
         sqlx::query("DELETE FROM resource_store.resources WHERE uid = $1")
             .bind(uid)
             .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
+            .await
+            .map_err(StoreError::backend)?;
+        tx.commit().await.map_err(StoreError::backend)?;
 
         Ok(DeleteOutcome::Deleted)
     }
 
     async fn list_pending_collection(&self, limit: i64) -> Result<Vec<ResourceRow>, StoreError> {
-        let rows = sqlx::query_as::<_, ResourceRow>(
+        let rows = sqlx::query_as::<_, PgResourceRow>(
             r#"
             SELECT * FROM resource_store.resources
             WHERE deletion_timestamp IS NOT NULL
@@ -877,8 +904,9 @@ impl ResourceStore for PgResourceStore {
         )
         .bind(limit)
         .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
+        .await
+        .map_err(StoreError::backend)?;
+        Ok(rows.into_iter().map(Into::into).collect())
     }
 
     async fn resolve_path(&self, segments: &[PathSegment]) -> Result<Vec<ResourceRow>, StoreError> {
@@ -886,7 +914,7 @@ impl ResourceStore for PgResourceStore {
             return Err(StoreError::EmptyPath);
         }
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
         let mut chain: Vec<ResourceRow> = Vec::with_capacity(segments.len());
         let mut current_parent: Option<Uuid> = None;
 
@@ -897,16 +925,17 @@ impl ResourceStore for PgResourceStore {
                     kind,
                     name,
                 } => {
-                    let row: Option<ResourceRow> = match current_parent {
-                        None => sqlx::query_as::<_, ResourceRow>(
+                    let row: Option<PgResourceRow> = match current_parent {
+                        None => sqlx::query_as::<_, PgResourceRow>(
                             "SELECT * FROM resource_store.resources WHERE api_version = ANY($1) AND kind = $2 AND name = $3 AND parent_uid IS NULL",
                         )
                         .bind(api_versions)
                         .bind(kind)
                         .bind(name)
                         .fetch_optional(&mut *tx)
-                        .await?,
-                        Some(pid) => sqlx::query_as::<_, ResourceRow>(
+                        .await
+                        .map_err(StoreError::backend)?,
+                        Some(pid) => sqlx::query_as::<_, PgResourceRow>(
                             "SELECT * FROM resource_store.resources WHERE api_version = ANY($1) AND kind = $2 AND name = $3 AND parent_uid = $4",
                         )
                         .bind(api_versions)
@@ -914,7 +943,8 @@ impl ResourceStore for PgResourceStore {
                         .bind(name)
                         .bind(pid)
                         .fetch_optional(&mut *tx)
-                        .await?,
+                        .await
+                        .map_err(StoreError::backend)?,
                     };
                     match row {
                         Some(r) => r,
@@ -927,12 +957,13 @@ impl ResourceStore for PgResourceStore {
                     kind,
                     uid,
                 } => {
-                    let row: ResourceRow = match sqlx::query_as::<_, ResourceRow>(
+                    let row: PgResourceRow = match sqlx::query_as::<_, PgResourceRow>(
                         "SELECT * FROM resource_store.resources WHERE uid = $1",
                     )
                     .bind(uid)
                     .fetch_optional(&mut *tx)
-                    .await?
+                    .await
+                    .map_err(StoreError::backend)?
                     {
                         Some(r) => r,
                         None if idx + 1 == segments.len() => return Err(StoreError::NotFound),
@@ -953,10 +984,10 @@ impl ResourceStore for PgResourceStore {
             };
 
             current_parent = Some(row.uid);
-            chain.push(row);
+            chain.push(row.into());
         }
 
-        tx.commit().await?;
+        tx.commit().await.map_err(StoreError::backend)?;
         Ok(chain)
     }
 
@@ -968,7 +999,7 @@ impl ResourceStore for PgResourceStore {
     ) -> Result<ResourceRow, StoreError> {
         validate_controller_id(controller_id).map_err(|e| StoreError::Validation(e.to_string()))?;
 
-        let row = sqlx::query_as::<_, ResourceRow>(
+        let row = sqlx::query_as::<_, PgResourceRow>(
             r#"
             UPDATE resource_store.resources
             SET status = status || jsonb_build_object(
@@ -986,10 +1017,11 @@ impl ResourceStore for PgResourceStore {
         .bind(controller_id)
         .bind(status_value)
         .fetch_optional(&self.pool)
-        .await?
+        .await
+        .map_err(StoreError::backend)?
         .ok_or(StoreError::NotFound)?;
 
-        Ok(row)
+        Ok(row.into())
     }
 
     async fn update_controller_finalizers(
@@ -1015,14 +1047,15 @@ impl ResourceStore for PgResourceStore {
 
         // Use SELECT FOR UPDATE inside a transaction to serialise concurrent finalizer
         // mutations from different controllers on the same resource, preventing lost updates.
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
 
-        let current = sqlx::query_as::<_, ResourceRow>(
+        let current = sqlx::query_as::<_, PgResourceRow>(
             "SELECT * FROM resource_store.resources WHERE uid = $1 FOR UPDATE",
         )
         .bind(uid)
         .fetch_optional(&mut *tx)
-        .await?
+        .await
+        .map_err(StoreError::backend)?
         .ok_or(StoreError::NotFound)?;
 
         let remove_set: std::collections::HashSet<&str> =
@@ -1038,7 +1071,7 @@ impl ResourceStore for PgResourceStore {
             }
         }
 
-        let row = sqlx::query_as::<_, ResourceRow>(
+        let row = sqlx::query_as::<_, PgResourceRow>(
             r#"
             UPDATE resource_store.resources
             SET finalizers = $1, revision = revision + 1, updated_at = NOW()
@@ -1049,11 +1082,12 @@ impl ResourceStore for PgResourceStore {
         .bind(&new_finalizers)
         .bind(uid)
         .fetch_one(&mut *tx)
-        .await?;
+        .await
+        .map_err(StoreError::backend)?;
 
-        tx.commit().await?;
+        tx.commit().await.map_err(StoreError::backend)?;
 
-        Ok(row)
+        Ok(row.into())
     }
 
     async fn operator_update_status(
@@ -1065,7 +1099,7 @@ impl ResourceStore for PgResourceStore {
         // Store under `status.controllers.operator:<operator>` — same nested
         // structure as update_controller_status but with the operator key.
         let operator_key = format!("operator:{operator}");
-        let row = sqlx::query_as::<_, ResourceRow>(
+        let row = sqlx::query_as::<_, PgResourceRow>(
             r#"
             UPDATE resource_store.resources
             SET status = status || jsonb_build_object(
@@ -1083,10 +1117,11 @@ impl ResourceStore for PgResourceStore {
         .bind(&operator_key)
         .bind(status_value)
         .fetch_optional(&self.pool)
-        .await?
+        .await
+        .map_err(StoreError::backend)?
         .ok_or(StoreError::NotFound)?;
 
-        Ok(row)
+        Ok(row.into())
     }
 
     async fn operator_update_finalizers(
@@ -1106,14 +1141,15 @@ impl ResourceStore for PgResourceStore {
 
         let _ = operator; // operator identity is recorded in the audit log by the handler
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
 
-        let current = sqlx::query_as::<_, ResourceRow>(
+        let current = sqlx::query_as::<_, PgResourceRow>(
             "SELECT * FROM resource_store.resources WHERE uid = $1 FOR UPDATE",
         )
         .bind(uid)
         .fetch_optional(&mut *tx)
-        .await?
+        .await
+        .map_err(StoreError::backend)?
         .ok_or(StoreError::NotFound)?;
 
         let remove_set: std::collections::HashSet<&str> =
@@ -1129,7 +1165,7 @@ impl ResourceStore for PgResourceStore {
             }
         }
 
-        let row = sqlx::query_as::<_, ResourceRow>(
+        let row = sqlx::query_as::<_, PgResourceRow>(
             r#"
             UPDATE resource_store.resources
             SET finalizers = $1, revision = revision + 1, updated_at = NOW()
@@ -1140,11 +1176,12 @@ impl ResourceStore for PgResourceStore {
         .bind(&new_finalizers)
         .bind(uid)
         .fetch_one(&mut *tx)
-        .await?;
+        .await
+        .map_err(StoreError::backend)?;
 
-        tx.commit().await?;
+        tx.commit().await.map_err(StoreError::backend)?;
 
-        Ok(row)
+        Ok(row.into())
     }
 
     async fn resolve_collection(
@@ -1167,19 +1204,19 @@ impl ResourceStore for PgResourceStore {
         )
         .bind(collection)
         .fetch_optional(&self.pool)
-        .await?;
+        .await
+        .map_err(StoreError::backend)?;
 
         let Some(row) = row else {
             return Ok(None);
         };
 
         let versions: Vec<rise_resource_api::ResourceDefinitionVersion> =
-            serde_json::from_value(row.try_get("versions").map_err(StoreError::Database)?)
-                .map_err(|e| {
-                    StoreError::Validation(format!("invalid versions in ResourceDefinition: {e}"))
-                })?;
+            serde_json::from_value(row.try_get("versions").map_err(StoreError::backend)?).map_err(
+                |e| StoreError::Validation(format!("invalid versions in ResourceDefinition: {e}")),
+            )?;
 
-        let group_name: String = row.try_get("group_name").map_err(StoreError::Database)?;
+        let group_name: String = row.try_get("group_name").map_err(StoreError::backend)?;
         // Mirror resolve_collection_by_kind's fallback: if the storage version is not served,
         // pick any served version (resolve_collection_version rejects non-served versions).
         let storage = versions.iter().find(|v| v.storage);
@@ -1239,14 +1276,15 @@ impl ResourceStore for PgResourceStore {
         .bind(group)
         .bind(collection)
         .fetch_optional(&self.pool)
-        .await?;
+        .await
+        .map_err(StoreError::backend)?;
 
         let Some(row) = row else {
             return Ok(None);
         };
 
         let spec: ResourceDefinitionSpec = serde_json::from_value(
-            row.try_get("spec").map_err(StoreError::Database)?,
+            row.try_get("spec").map_err(StoreError::backend)?,
         )
         .map_err(|e| StoreError::Validation(format!("invalid ResourceDefinition spec: {e}")))?;
 
@@ -1288,9 +1326,9 @@ impl ResourceStore for PgResourceStore {
 
         let allowed: Vec<String> = row
             .try_get("allowed_status_controller_ids")
-            .map_err(StoreError::Database)?;
+            .map_err(StoreError::backend)?;
 
-        let kind: String = row.try_get("kind").map_err(StoreError::Database)?;
+        let kind: String = row.try_get("kind").map_err(StoreError::backend)?;
 
         // Use the cached validator, or compile one and store it in the cache. A schema that
         // fails to compile is a hard error: silently falling back to NoOpValidator would let
@@ -1350,18 +1388,18 @@ impl ResourceStore for PgResourceStore {
         .bind(group)
         .bind(kind)
         .fetch_optional(&self.pool)
-        .await?;
+        .await
+        .map_err(StoreError::backend)?;
 
         let Some(row) = row else {
             return Ok(None);
         };
 
-        let plural: String = row.try_get("plural").map_err(StoreError::Database)?;
+        let plural: String = row.try_get("plural").map_err(StoreError::backend)?;
         let versions: Vec<rise_resource_api::ResourceDefinitionVersion> =
-            serde_json::from_value(row.try_get("versions").map_err(StoreError::Database)?)
-                .map_err(|e| {
-                    StoreError::Validation(format!("invalid versions in ResourceDefinition: {e}"))
-                })?;
+            serde_json::from_value(row.try_get("versions").map_err(StoreError::backend)?).map_err(
+                |e| StoreError::Validation(format!("invalid versions in ResourceDefinition: {e}")),
+            )?;
 
         // Ancestors are not version-addressed: resolve at the storage version,
         // falling back to any served version when the storage version is not
@@ -1409,7 +1447,7 @@ impl ResourceStore for PgResourceStore {
         // fail only when that version is first used.
         Self::validate_version_schemas(&spec, &format!("'{}'", params.name))?;
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
 
         // Acquire a transaction-scoped advisory lock before the cycle check so that two
         // concurrent registrations cannot both pass the check before either commits.
@@ -1418,7 +1456,8 @@ impl ResourceStore for PgResourceStore {
             "SELECT pg_advisory_xact_lock(hashtext('resource_definitions_parent_cycle')::bigint)",
         )
         .execute(&mut *tx)
-        .await?;
+        .await
+        .map_err(StoreError::backend)?;
 
         // Reject a parent chain that would cycle back to this kind. The advisory lock above
         // serialises concurrent registrations; reads go through `tx` so they see the same
@@ -1434,7 +1473,7 @@ impl ResourceStore for PgResourceStore {
         // second row to write.
         let resource_row = Self::insert_resource_row_with_retry(&mut tx, &params, metadata).await?;
 
-        tx.commit().await?;
+        tx.commit().await.map_err(StoreError::backend)?;
 
         self.invalidate_schema_cache(&spec.group, &spec.plural);
 
@@ -1455,15 +1494,16 @@ impl ResourceStore for PgResourceStore {
         // Validate every declared JSON schema compiles. Symmetric with register.
         Self::validate_version_schemas(&new_spec, "")?;
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
 
         // Lock the row and fetch current state
-        let current = sqlx::query_as::<_, ResourceRow>(
+        let current = sqlx::query_as::<_, PgResourceRow>(
             "SELECT * FROM resource_store.resources WHERE uid = $1 FOR UPDATE",
         )
         .bind(uid)
         .fetch_optional(&mut *tx)
-        .await?
+        .await
+        .map_err(StoreError::backend)?
         .ok_or(StoreError::NotFound)?;
 
         if current.kind != RESOURCE_DEFINITION_KIND {
@@ -1508,7 +1548,8 @@ impl ResourceStore for PgResourceStore {
             sqlx::query("SELECT uid FROM resource_store.resources WHERE uid = $1 FOR UPDATE")
                 .bind(uid)
                 .execute(&mut *tx)
-                .await?;
+                .await
+                .map_err(StoreError::backend)?;
 
             let instance_count: i64 = sqlx::query_scalar(
                 r#"
@@ -1521,7 +1562,8 @@ impl ResourceStore for PgResourceStore {
             .bind(&new_spec.kind)
             .bind(&removed_api_versions)
             .fetch_one(&mut *tx)
-            .await?;
+            .await
+            .map_err(StoreError::backend)?;
 
             if instance_count > 0 {
                 return Err(StoreError::Validation(format!(
@@ -1535,7 +1577,7 @@ impl ResourceStore for PgResourceStore {
         let metadata = serde_json::to_value(&params.annotations).unwrap_or_default();
 
         // Update the resources row with optimistic concurrency
-        let updated = sqlx::query_as::<_, ResourceRow>(
+        let updated = sqlx::query_as::<_, PgResourceRow>(
             r#"
             UPDATE resource_store.resources
             SET api_version = COALESCE($1, api_version),
@@ -1562,7 +1604,7 @@ impl ResourceStore for PgResourceStore {
             // Defensively map a name-uniqueness violation (e.g. an api_version change that
             // collides on (group, kind, name)) to NameConflict rather than a raw DB error.
             Err(ref e) if Self::is_name_conflict(e) => return Err(StoreError::NameConflict),
-            Err(e) => return Err(StoreError::Database(e)),
+            Err(e) => return Err(StoreError::backend(e)),
         };
 
         let row = match updated {
@@ -1578,14 +1620,26 @@ impl ResourceStore for PgResourceStore {
         // The mutable fields (versions, allowed_status_controller_ids) live in
         // `spec`, which the `resources` UPDATE above already wrote — the
         // `resource_definitions` view reflects it with no separate sync.
-        tx.commit().await?;
+        tx.commit().await.map_err(StoreError::backend)?;
 
         self.invalidate_schema_cache(&new_spec.group, &new_spec.plural);
 
-        Ok(row)
+        Ok(row.into())
     }
 }
 
 fn is_controller_finalizer(finalizer: &str, controller_id: &str) -> bool {
     finalizer == controller_id || finalizer.starts_with(&format!("{controller_id}/"))
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+
+    fn assert_resource_store<T: ResourceStore>() {}
+
+    #[test]
+    fn pg_resource_store_implements_api_contract() {
+        assert_resource_store::<PgResourceStore>();
+    }
 }

@@ -18,7 +18,6 @@ rise-backend-auth = { path = "../rise-backend-auth" }
 rise-backend-core = { path = "../rise-backend-core" }
 rise-deployment-spec = { path = "../rise-deployment-spec" }
 rise-resource-api = { path = "../rise-resource-api" }
-rise-resource-store = { path = "../rise-resource-store" }
 rise-runtime-sync = { path = "../rise-runtime-sync" }
 serde = { workspace = true }
 serde_json = { workspace = true }
