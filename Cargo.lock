@@ -4243,7 +4243,7 @@ dependencies = [
  "rise-backend-docker",
  "rise-deployment-spec",
  "rise-resource-api",
- "rise-resource-store",
+ "rise-resource-store-postgres",
  "rise-runtime-sync",
  "rsa",
  "rustls",
@@ -4301,7 +4301,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rise-resource-store"
+name = "rise-resource-store-postgres"
 version = "0.1.0"
 dependencies = [
  "async-trait",

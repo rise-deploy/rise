@@ -1301,7 +1301,7 @@ mod tests {
 mod dispatch_tests {
     use super::*;
     use rise_resource_api::RESOURCE_DEFINITION_KIND;
-    use rise_resource_store::PgResourceStore;
+    use rise_resource_store_postgres::PgResourceStore;
     use serde_json::{json, Value};
 
     const OPERATOR: &str = "operator@example.com";
@@ -1311,7 +1311,7 @@ mod dispatch_tests {
     /// store schema is layered on top of the root migrations `#[sqlx::test]`
     /// already ran.
     async fn ctx(pool: sqlx::PgPool) -> ResourceApiCtx {
-        rise_resource_store::run_migrations(&pool)
+        rise_resource_store_postgres::run_migrations(&pool)
             .await
             .expect("resource store migrations");
         ResourceApiCtx {
@@ -2095,7 +2095,9 @@ mod dispatch_tests {
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
                 spec: org_spec,
-                validator: Some(Arc::new(rise_resource_store::OrganizationValidator)),
+                validator: Some(Arc::new(
+                    rise_resource_store_postgres::OrganizationValidator,
+                )),
             })
             .await
             .expect("create organization");
@@ -2200,7 +2202,9 @@ mod dispatch_tests {
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
                 spec: org_spec,
-                validator: Some(Arc::new(rise_resource_store::OrganizationValidator)),
+                validator: Some(Arc::new(
+                    rise_resource_store_postgres::OrganizationValidator,
+                )),
             })
             .await
             .expect("create organization");

@@ -1,4 +1,4 @@
-# rise-resource-store
+# rise-resource-store-postgres
 
 PostgreSQL implementation of Rise's generic resource persistence boundary.
 

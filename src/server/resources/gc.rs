@@ -436,7 +436,7 @@ mod tests {
         CollectionInfo, CreateResourceParams, PathSegment, StoreError, UpdateResourceParams,
     };
     use rise_resource_api::{API_VERSION_V1ALPHA1, ORGANIZATION_KIND, RESOURCE_DEFINITION_KIND};
-    use rise_resource_store::PgResourceStore;
+    use rise_resource_store_postgres::PgResourceStore;
     use serde_json::json;
     use std::collections::BTreeMap;
 
@@ -502,7 +502,7 @@ mod tests {
     /// `GlobalSchedule`, which write to `runtime_sync.leader_leases` /
     /// `runtime_sync.leader_schedules`.
     async fn store_for(pool: PgPool) -> Arc<dyn ResourceStore> {
-        rise_resource_store::run_migrations(&pool)
+        rise_resource_store_postgres::run_migrations(&pool)
             .await
             .expect("resource store migrations");
         rise_runtime_sync::run_migrations(&pool)

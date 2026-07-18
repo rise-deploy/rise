@@ -1133,7 +1133,7 @@ jobs:
         id: auth
 
       - name: Strip path-only workspace deps from Cargo.toml
-        # `rise-resource-api`/`rise-resource-store` are path-only workspace
+        # `rise-resource-api`/`rise-resource-store-postgres` are path-only workspace
         # crates and aren't published. Cargo refuses to publish a manifest
         # with path-only deps, so strip them and their `dep:` references
         # before invoking `cargo publish`. Other backend deps come from

@@ -1,7 +1,7 @@
 //! Default-Organization bootstrap.
 //!
 //! Runs after both the root migrations (`./migrations/`) and the
-//! `rise-resource-store` migrations have applied. The bootstrap pass:
+//! `rise-resource-store-postgres` migrations have applied. The bootstrap pass:
 //!
 //! 1. Acquires a single Postgres advisory lock (so concurrent replicas don't
 //!    race), the only mutator of the default-Organization linkage state.
@@ -28,7 +28,7 @@ use rise_resource_api::{
     CreateResourceParams, OrganizationSpec, ResourceRow, ResourceStore, UpdateResourceParams,
     API_VERSION_V1ALPHA1, ORGANIZATION_KIND,
 };
-use rise_resource_store::OrganizationValidator;
+use rise_resource_store_postgres::OrganizationValidator;
 use sqlx::PgPool;
 use tracing::info;
 
@@ -595,11 +595,12 @@ mod tests {
     async fn bootstrap_is_idempotent(pool: sqlx::PgPool) {
         // Layer the resource-store schema on top of the root migrations that
         // `#[sqlx::test]` already ran.
-        rise_resource_store::run_migrations(&pool)
+        rise_resource_store_postgres::run_migrations(&pool)
             .await
             .expect("resource store migrations");
-        let store: Arc<dyn ResourceStore> =
-            Arc::new(rise_resource_store::PgResourceStore::new(pool.clone()));
+        let store: Arc<dyn ResourceStore> = Arc::new(
+            rise_resource_store_postgres::PgResourceStore::new(pool.clone()),
+        );
 
         let settings = test_settings();
 
@@ -683,11 +684,12 @@ mod tests {
     /// every typed-row linkage remains valid.
     #[sqlx::test]
     async fn bootstrap_renames_existing_default_organization(pool: sqlx::PgPool) {
-        rise_resource_store::run_migrations(&pool)
+        rise_resource_store_postgres::run_migrations(&pool)
             .await
             .expect("resource store migrations");
-        let store: Arc<dyn ResourceStore> =
-            Arc::new(rise_resource_store::PgResourceStore::new(pool.clone()));
+        let store: Arc<dyn ResourceStore> = Arc::new(
+            rise_resource_store_postgres::PgResourceStore::new(pool.clone()),
+        );
 
         // First boot mints the Org under the configured name.
         let first = run(&pool, &store, &test_settings_with_org_name("default"))
@@ -726,11 +728,12 @@ mod tests {
     /// existing set rather than overwriting them.
     #[sqlx::test]
     async fn bootstrap_rename_preserves_non_default_annotations(pool: sqlx::PgPool) {
-        rise_resource_store::run_migrations(&pool)
+        rise_resource_store_postgres::run_migrations(&pool)
             .await
             .expect("resource store migrations");
-        let store: Arc<dyn ResourceStore> =
-            Arc::new(rise_resource_store::PgResourceStore::new(pool.clone()));
+        let store: Arc<dyn ResourceStore> = Arc::new(
+            rise_resource_store_postgres::PgResourceStore::new(pool.clone()),
+        );
 
         // First boot mints the Org under the configured name.
         let first = run(&pool, &store, &test_settings_with_org_name("default"))
@@ -793,11 +796,12 @@ mod tests {
     /// default and refuses to start.
     #[sqlx::test]
     async fn bootstrap_bails_on_multiple_existing_orgs_with_no_name_match(pool: sqlx::PgPool) {
-        rise_resource_store::run_migrations(&pool)
+        rise_resource_store_postgres::run_migrations(&pool)
             .await
             .expect("resource store migrations");
-        let store: Arc<dyn ResourceStore> =
-            Arc::new(rise_resource_store::PgResourceStore::new(pool.clone()));
+        let store: Arc<dyn ResourceStore> = Arc::new(
+            rise_resource_store_postgres::PgResourceStore::new(pool.clone()),
+        );
 
         // Mint the first Org via bootstrap.
         run(&pool, &store, &test_settings_with_org_name("default"))

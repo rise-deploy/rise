@@ -28,9 +28,9 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
 
 ### Unified identity and RBAC
 
-- [~] Move the dep-light `ResourceStore` contract and canonical `SubjectId`,
+- [x] Move the dep-light `ResourceStore` contract and canonical `SubjectId`,
   dynamic-label `SubjectRef`, group-qualified `ResourceKind`, and `Scope` types into `rise-resource-api`;
-  keep SQLX and Postgres adapters in `rise-resource-store`.
+  keep SQLX and Postgres adapters in `rise-resource-store-postgres`.
 - [ ] Implement policy types and validation for `Role`, `RoleBinding`,
   `PlatformRole`, and `PlatformRoleBinding`: structured `roleRef`, one
   subject per binding, normalized PascalCase `subjectMembership: Any |
