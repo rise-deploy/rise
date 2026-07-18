@@ -1,6 +1,7 @@
 [workspace]
 members = [
     ".",
+    "crates/rise-authz",
     "crates/rise-backend-auth",
     "crates/rise-backend-core",
     "crates/rise-backend-docker",

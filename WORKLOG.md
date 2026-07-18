@@ -29,10 +29,10 @@ scope and avoiding dead-end compatibility layers.
    PostgreSQL adapters in `rise-resource-store-postgres`. Cover parsing,
    canonicalization, rejection behavior, serialization, and
    store-implementation compatibility.
-2. **In progress — name the PostgreSQL adapter boundary explicitly.** Rename the
+2. **Merged in PR #417 — name the PostgreSQL adapter boundary explicitly.** Rename the
    concrete adapter crate to `rise-resource-store-postgres` without changing
    behavior or adding compatibility aliases.
-3. **Planned — policy resources and pure policy algebra.** Add the Role/binding
+3. **In progress — policy resources and pure policy algebra.** Add the Role/binding
    schemas, validation, Allow/Deny tuple evaluation, wildcard replacement, and
    subset checks with database-free conformance coverage.
 4. **Planned — identity resources and storage projections.** Register the
@@ -113,8 +113,8 @@ scope and avoiding dead-end compatibility layers.
 
 ## Increment 2 — explicit PostgreSQL adapter crate name
 
-- State: implementation, local verification, and independent review complete;
-  ready for draft-PR review.
+- State: merged in PR #417 at commit
+  `1eabe9cc12c32fefbc71d7ed54ffddcfa2448caa`.
 - Branch: `refactor/resource-store-postgres`.
 - Acceptance criteria:
   - Rename the package and directory to `rise-resource-store-postgres` and
@@ -154,4 +154,59 @@ scope and avoiding dead-end compatibility layers.
     migration. Because SQLX hashes the full migration text, the edits would
     have caused version-mismatch startup failures on upgraded databases; the
     historical migration was restored byte-for-byte.
-- PR: #417, open as a draft for review.
+- PR: #417, merged.
+
+## Increment 3 — policy resource contracts and pure policy algebra
+
+- State: implementation, local verification, and independent review complete;
+  ready for draft PR review.
+- Branch: `feat/adr0001-policy-algebra`.
+- Acceptance criteria:
+  - `rise-resource-api` owns the closed serialized contracts for `Role`,
+    `RoleBinding`, `PlatformRole`, and `PlatformRoleBinding`, reusing its
+    canonical `ResourceKind`, `Scope`, `SubjectId`, and `SubjectRef` types.
+  - A new `rise-authz` crate owns a hard, database-free `policy` module for
+    authorization tuple matching, Deny-wins evaluation, placement-provenance
+    preservation, wildcard replacement, subject substitution, and
+    scope/selector subset checks.
+  - Policy syntax rejects unqualified kinds, empty pattern lists, unknown
+    fields and enum values, plural subjects, invalid templates, invalid
+    static/dynamic selector combinations, and explicit null defaults.
+  - Omitted `PlatformRoleBinding.subjectMembership` normalizes to `Any` in the
+    typed contract; binding scope normalization remains an explicit contextual
+    operation because its default depends on placement, parent, and subject.
+  - Database-free conformance tests cover the applicable portions of ADR-0001
+    scenarios 1, 2, 4-6, 11, 15, 20, 31, 32, 49, 50, and 57.
+  - Focused tests plus the relevant workspace format, lint, and test gates pass.
+- Decisions:
+  - Use one `rise-authz` crate with a hard `policy` module rather than splitting
+    Tier 0 and Tier 1 before the engine seam exists; the pure module remains
+    extractable later.
+  - Reuse API-owned canonical types instead of creating a second kind/scope/
+    subject vocabulary and a security-sensitive mapping layer.
+  - Do not register writable policy built-ins in this increment. The current
+    `SpecValidator` is deliberately pure and pre-transactional, cannot rewrite
+    the JSON that the store persists, and cannot atomically validate scope,
+    subject, or role references. Registration lands with a transaction-scoped
+    normalization/admission seam.
+  - Preserve binding placement on statement contributions, but perform live
+    operator/admin classification and Deny-tier filtering in Tier 1 alongside
+    membership expansion; these are not ordinary statement algebra.
+- Verification:
+  - Focused `rise-resource-api` and `rise-authz` tests pass with the lockfile in
+    offline mode, including policy contract and algebra regression coverage.
+  - `mise run lint` passes, including all-features checks, strict Clippy,
+    formatting, SQLX metadata checks, generated resource schemas, Helm lint,
+    and the existing auth/core tests.
+  - The full all-features workspace test suite passes serially with offline
+    SQLX metadata, including all 56 PostgreSQL-backed integration tests.
+  - The Docker planner stage builds successfully with the new crate included.
+- Review:
+  - Independent reviews covered the public API and normalization boundary,
+    policy-domain/subset semantics, migration and integration safety, and the
+    final pinned diff.
+  - Confirmed findings fixed before publication include domain widening on an
+    unchanged policy, grant creation by deleting Deny statements, ordinary use
+    of `system:operators`, construction of unchecked normalized values, and
+    fail-open handling of concrete-scope ancestry.
+- PR: #418, draft.

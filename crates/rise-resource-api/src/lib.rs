@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+mod policy;
 mod resource_kind;
 mod resource_row;
 mod scope;
@@ -11,6 +12,13 @@ mod store;
 mod subject_id;
 mod subject_ref;
 
+pub use policy::{
+    BindingSubject, Effect, KindMatcher, LabelKey, LabelSelector,
+    LocallyNormalizedPlatformRoleBindingSpec, LocallyNormalizedRoleBindingSpec,
+    PlatformRoleBindingSpec, PlatformRoleRef, PlatformRoleRefKind, PolicyStatement,
+    ResourceKindPattern, RoleBindingSpec, RoleRef, RoleRefKind, RoleSpec, SubjectMembership,
+    SubresourceMatcher, SubresourceName, Verb, VerbMatcher,
+};
 pub use resource_kind::ResourceKind;
 pub use resource_row::ResourceRow;
 pub use scope::Scope;
@@ -30,9 +38,25 @@ pub const ORGANIZATION_COLLECTION: &str = "organizations";
 pub const RESOURCE_DEFINITION_KIND: &str = "ResourceDefinition";
 pub const RESOURCE_DEFINITION_COLLECTION: &str = "resourcedefinitions";
 
+// Policy resources are reserved here before store registration so a custom
+// ResourceDefinition cannot claim a collection that the built-in admission
+// path will own in a later increment.
+pub const ROLE_KIND: &str = "Role";
+pub const ROLE_COLLECTION: &str = "roles";
+pub const ROLE_BINDING_KIND: &str = "RoleBinding";
+pub const ROLE_BINDING_COLLECTION: &str = "rolebindings";
+pub const PLATFORM_ROLE_KIND: &str = "PlatformRole";
+pub const PLATFORM_ROLE_COLLECTION: &str = "platformroles";
+pub const PLATFORM_ROLE_BINDING_KIND: &str = "PlatformRoleBinding";
+pub const PLATFORM_ROLE_BINDING_COLLECTION: &str = "platformrolebindings";
+
 pub const RESERVED_COLLECTION_NAMES: &[&str] = &[
     ORGANIZATION_COLLECTION,
     RESOURCE_DEFINITION_COLLECTION,
+    ROLE_COLLECTION,
+    ROLE_BINDING_COLLECTION,
+    PLATFORM_ROLE_COLLECTION,
+    PLATFORM_ROLE_BINDING_COLLECTION,
     "projects",
     "users",
     "teams",

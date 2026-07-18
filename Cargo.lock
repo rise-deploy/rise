@@ -4139,6 +4139,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rise-authz"
+version = "0.1.0"
+dependencies = [
+ "rise-resource-api",
+ "serde_json",
+]
+
+[[package]]
 name = "rise-backend-auth"
 version = "0.1.0"
 dependencies = [

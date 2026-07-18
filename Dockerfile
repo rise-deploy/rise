@@ -18,6 +18,7 @@ FROM chef AS planner
 
 # Copy workspace project files
 COPY Cargo.toml Cargo.lock ./
+COPY crates/rise-authz/Cargo.toml ./crates/rise-authz/Cargo.toml
 COPY crates/rise-resource-api/Cargo.toml ./crates/rise-resource-api/Cargo.toml
 COPY crates/rise-resource-store-postgres/Cargo.toml ./crates/rise-resource-store-postgres/Cargo.toml
 COPY crates/rise-backend-auth/Cargo.toml ./crates/rise-backend-auth/Cargo.toml
@@ -29,6 +30,8 @@ COPY crates/rise-runtime-sync/Cargo.toml ./crates/rise-runtime-sync/Cargo.toml
 # Create dummy sources for cargo to be happy
 RUN mkdir -p src && \
     echo "fn main() {}" > src/main.rs && \
+    mkdir -p crates/rise-authz/src && \
+    echo "" > crates/rise-authz/src/lib.rs && \
     mkdir -p crates/rise-resource-api/src && \
     echo "" > crates/rise-resource-api/src/lib.rs && \
     mkdir -p crates/rise-resource-store-postgres/src && \
