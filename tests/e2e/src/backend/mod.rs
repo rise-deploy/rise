@@ -54,6 +54,14 @@ pub trait Backend {
         self.rise_cli(args, auth)
     }
 
+    /// Absolute path to `rel` under the repo root, as the CLI sees it. Both
+    /// backends run the CLI with the repo root as cwd — the Minikube harness runs
+    /// it in a container that bind-mounts the repo root at the same path — so a
+    /// path under the repo root is readable by the CLI on either backend, unlike
+    /// `/tmp` (which the Minikube CLI container does not mount). Use this for
+    /// dir-based deploys (a generated `rise.toml`) that must run on both backends.
+    fn cli_visible_path(&self, rel: &str) -> String;
+
     /// GET an app path through this backend's ingress. `Ok(None)` means app-HTTP
     /// reach isn't wired for this backend yet — a *declared* gap the scenario
     /// logs, never silent drift.

@@ -389,6 +389,7 @@ mod tests {
         let routes = vec![RouteSpec {
             path: "/".to_string(),
             container: "app".to_string(),
+            access: None,
         }];
         assert!(validate_containers_and_routes(None, &routes).is_err());
     }
@@ -408,6 +409,7 @@ mod tests {
         let routes = vec![RouteSpec {
             path: "/".to_string(),
             container: "api".to_string(),
+            access: None,
         }];
         validate_containers_and_routes(Some(&containers), &routes).unwrap();
     }
@@ -489,6 +491,7 @@ mod tests {
         let routes = vec![RouteSpec {
             path: "/".to_string(),
             container: "ghost".to_string(),
+            access: None,
         }];
         let err = validate_containers_and_routes(Some(&containers), &routes).unwrap_err();
         assert!(
@@ -504,6 +507,7 @@ mod tests {
         let routes = vec![RouteSpec {
             path: "/".to_string(),
             container: "worker".to_string(),
+            access: None,
         }];
         let err = validate_containers_and_routes(Some(&containers), &routes).unwrap_err();
         assert!(err.message.contains("no port"), "got: {}", err.message);
@@ -515,6 +519,7 @@ mod tests {
         let routes = vec![RouteSpec {
             path: "api".to_string(),
             container: "api".to_string(),
+            access: None,
         }];
         let err = validate_containers_and_routes(Some(&containers), &routes).unwrap_err();
         assert!(
@@ -531,6 +536,7 @@ mod tests {
             let routes = vec![RouteSpec {
                 path: reserved.to_string(),
                 container: "api".to_string(),
+                access: None,
             }];
             let err = validate_containers_and_routes(Some(&containers), &routes).unwrap_err();
             assert!(
@@ -547,6 +553,7 @@ mod tests {
         let routes = vec![RouteSpec {
             path: "/api".to_string(),
             container: "api".to_string(),
+            access: None,
         }];
         validate_containers_and_routes(Some(&containers), &routes).unwrap();
     }
@@ -558,6 +565,7 @@ mod tests {
             let routes = vec![RouteSpec {
                 path: bad.to_string(),
                 container: "api".to_string(),
+                access: None,
             }];
             let err = validate_containers_and_routes(Some(&containers), &routes).unwrap_err();
             assert!(
@@ -684,6 +692,7 @@ mod tests {
         let routes = vec![RouteSpec {
             path: "/api".to_string(),
             container: "api".to_string(),
+            access: None,
         }];
         let routes_decoded: Vec<RouteSpec> =
             decode_side_data(&encode_side_data(&routes).unwrap()).unwrap();

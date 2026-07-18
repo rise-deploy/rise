@@ -183,6 +183,33 @@ The application receives authenticated requests with these additional headers:
 - `X-Auth-Request-Email`: User's email address
 - `X-Auth-Request-User`: User's ID
 
+## Per-route access requirements
+
+A route can override **only the access requirement** for its path via
+`.rise.toml` `[routes].access` (`public` / `authenticated` / `member`), letting a
+single route be opened or tightened relative to the rest of the project. The
+access class's `ingress_class` and `custom_annotations` are per-host and always
+apply project-wide — they cannot vary per route.
+
+Because nginx auth annotations are per-Ingress (not per-path), the requirement is
+enforced by **how the controller routes**, not by re-matching the request path in
+the handler (which would be unsafe — nginx forwards the *raw* request URI while it
+routes on the *normalized* path, so a handler-side match could be bypassed with
+`/public/../private`). Instead the controller partitions a deployment's routes by
+their effective requirement and emits **one Ingress per group** on the shared
+host: the `None` group carries no auth annotations, and each gated group's
+`auth-url` is stamped with `&access=<requirement>`. The `ingress_auth` handler
+reads `access` from its **own** query string (never from the request path) and
+enforces exactly that requirement — so the path group nginx actually routed to
+determines the gate. The `/.rise/*` backend paths ride a single group and stay
+allowlisted. The same model applies to the Docker/Traefik backend, where
+forwardAuth is attached per-router with the same `&access=` stamp.
+
+Because the gate is decided by the proxy's own routing (each path group has its
+own Ingress/router and its own stamped `auth-url`), the handler performs **no**
+route lookup or path matching — it trusts only the `access` param it was called
+with, which is control-plane input the client cannot influence.
+
 ## Troubleshooting
 
 **Infinite redirect loop**:

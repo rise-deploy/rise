@@ -865,10 +865,12 @@ mod tests {
                 ResolvedRoute {
                     path: "/".to_string(),
                     container: "web".to_string(),
+                    access: None,
                 },
                 ResolvedRoute {
                     path: "/api".to_string(),
                     container: "api".to_string(),
+                    access: None,
                 },
             ],
         };

@@ -112,6 +112,7 @@ fn build_multi_container_payload(
         .map(|r| RouteSpec {
             path: r.path.clone(),
             container: r.container.clone(),
+            access: r.access.clone(),
         })
         .collect();
 
@@ -2826,6 +2827,7 @@ mod tests {
             "/api".to_string(),
             RouteConfig {
                 container: "api".to_string(),
+                access: None,
             },
         );
 

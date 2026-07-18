@@ -198,6 +198,10 @@ description = "Install documentation dependencies (shared workspace)."
 dir = "docs"
 run = "npm install"
 
+[tasks."docs:llms"]
+description = "Generate llms.txt, llms-full.txt, and per-page .md files for both doc sites (for LLM consumption)."
+run = "node docs/scripts/generate-llms.mjs"
+
 [tasks."docs:serve"]
 description = "Serve bundled user documentation with live reload on port 3001."
 depends = ["docs:install"]
@@ -206,7 +210,7 @@ run = "npm run dev"
 
 [tasks."docs:build"]
 description = "Build the bundled user documentation."
-depends = ["docs:install"]
+depends = ["docs:install", "docs:llms"]
 dir = "docs/user"
 run = "npm run build"
 
@@ -218,7 +222,7 @@ run = "npm run dev"
 
 [tasks."docs:engineering:build"]
 description = "Build the engineering documentation."
-depends = ["docs:install"]
+depends = ["docs:install", "docs:llms"]
 dir = "docs/engineering"
 run = "npm run build"
 

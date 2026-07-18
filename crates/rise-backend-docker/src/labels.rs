@@ -210,11 +210,13 @@ pub struct TraefikRoute<'a> {
     pub forward_auth: Option<ForwardAuth<'a>>,
 }
 
-/// Build a Traefik `Host(...)` (+ optional `PathPrefix(...)`) rule string.
+/// Build a Traefik `Host(...)` (+ optional segment-bounded path-prefix) rule.
 ///
-/// Multiple hosts are OR-ed: ``Host(`a`) || Host(`b`)``. When `path_prefix` is
-/// set the whole host alternation is grouped and AND-ed with the prefix:
-/// ``(Host(`a`) || Host(`b`)) && PathPrefix(`/p`)``.
+/// Multiple hosts are OR-ed: ``Host(`a`) || Host(`b`)``. A non-root route
+/// matches the path itself and descendants on a slash boundary — `/api` and
+/// `/api/...`, but not `/apiculture`. This mirrors Kubernetes `Prefix` path
+/// semantics and prevents a less-restrictive route from widening its access
+/// policy to neighboring paths.
 pub fn build_rule(hosts: &[String], path_prefix: Option<&str>) -> String {
     let host_rule = hosts
         .iter()
@@ -223,10 +225,22 @@ pub fn build_rule(hosts: &[String], path_prefix: Option<&str>) -> String {
         .join(" || ");
     match path_prefix {
         Some(prefix) if !prefix.is_empty() && prefix != "/" => {
-            if hosts.len() > 1 {
-                format!("({host_rule}) && PathPrefix(`{prefix}`)")
+            // Kubernetes Prefix semantics ignore a trailing slash, so normalize
+            // `/api/` to `/api`. Preserve all-slash inputs such as `//` instead
+            // of collapsing them to an empty base and accidentally widening the
+            // rule to host-wide `PathPrefix(`/`)`.
+            let trimmed = prefix.trim_end_matches('/');
+            let segment = if trimmed.is_empty() { prefix } else { trimmed };
+            let descendant_prefix = if trimmed.is_empty() {
+                segment.to_string()
             } else {
-                format!("{host_rule} && PathPrefix(`{prefix}`)")
+                format!("{segment}/")
+            };
+            let path_rule = format!("(Path(`{segment}`) || PathPrefix(`{descendant_prefix}`))");
+            if hosts.len() > 1 {
+                format!("({host_rule}) && {path_rule}")
+            } else {
+                format!("{host_rule} && {path_rule}")
             }
         }
         _ => host_rule,
@@ -284,6 +298,13 @@ pub fn render_traefik_labels(route: &TraefikRoute<'_>) -> HashMap<String, String
         format!("traefik.http.services.{r}.loadbalancer.server.port"),
         route.port.to_string(),
     );
+    // Bind the router to its own service explicitly. A container serving more
+    // than one route (multiple `[routes]` → the same container) defines several
+    // services, and Traefik refuses to auto-link a router when its container has
+    // multiple services ("cannot be linked automatically with multiple
+    // Services"). Naming the service the same as the router keeps this
+    // unambiguous.
+    labels.insert(format!("traefik.http.routers.{r}.service"), r.to_string());
     if let Some(certresolver) = route.certresolver {
         labels.insert(format!("traefik.http.routers.{r}.tls"), "true".to_string());
         labels.insert(
@@ -363,7 +384,7 @@ mod tests {
     fn build_rule_with_path_prefix() {
         assert_eq!(
             build_rule(&["a.rise.dev".to_string()], Some("/api")),
-            "Host(`a.rise.dev`) && PathPrefix(`/api`)"
+            "Host(`a.rise.dev`) && (Path(`/api`) || PathPrefix(`/api/`))"
         );
         // Multi-host gets grouped before AND-ing the prefix.
         assert_eq!(
@@ -371,7 +392,26 @@ mod tests {
                 &["a.rise.dev".to_string(), "b.rise.dev".to_string()],
                 Some("/api")
             ),
-            "(Host(`a.rise.dev`) || Host(`b.rise.dev`)) && PathPrefix(`/api`)"
+            "(Host(`a.rise.dev`) || Host(`b.rise.dev`)) && (Path(`/api`) || PathPrefix(`/api/`))"
+        );
+    }
+
+    #[test]
+    fn build_rule_path_prefix_is_segment_bounded() {
+        let rule = build_rule(&["a.rise.dev".to_string()], Some("/health/"));
+        assert_eq!(
+            rule,
+            "Host(`a.rise.dev`) && (Path(`/health`) || PathPrefix(`/health/`))"
+        );
+        assert!(rule.contains("Path(`/health`)"));
+        assert!(!rule.contains("PathPrefix(`/health`)"));
+    }
+
+    #[test]
+    fn build_rule_preserves_trailing_slashes_without_widening_to_root() {
+        assert_eq!(
+            build_rule(&["a.rise.dev".to_string()], Some("//")),
+            "Host(`a.rise.dev`) && (Path(`//`) || PathPrefix(`//`))"
         );
     }
 
@@ -480,6 +520,30 @@ mod tests {
         assert!(!labels
             .keys()
             .any(|k| k.contains("forwardauth") || k.ends_with(".middlewares")));
+    }
+
+    #[test]
+    fn traefik_labels_bind_router_to_its_own_service() {
+        // Each router must explicitly name its service so a container serving
+        // more than one route (several services) doesn't hit Traefik's
+        // "cannot be linked automatically with multiple Services".
+        let labels = render_traefik_labels(&TraefikRoute {
+            router_name: "app-1",
+            hosts: &["app.rise.dev".to_string()],
+            path_prefix: Some("/api"),
+            port: 8080,
+            entrypoint: "web",
+            network: "rise_default",
+            certresolver: None,
+            forward_auth: None,
+        });
+        assert_eq!(
+            labels
+                .get("traefik.http.routers.app-1.service")
+                .map(String::as_str),
+            Some("app-1")
+        );
+        assert!(labels.contains_key("traefik.http.services.app-1.loadbalancer.server.port"));
     }
 
     #[test]

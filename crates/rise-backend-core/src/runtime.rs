@@ -16,6 +16,23 @@ use rise_deployment_spec::side_data::decode_side_data;
 
 use crate::models::{Deployment, DeploymentEnvVar, DeploymentStatus};
 use crate::providers::EncryptionProvider;
+use crate::AccessRequirement;
+
+/// Effective ingress auth requirement for a single route.
+///
+/// A route inherits the project's access-class requirement unless it carries a
+/// per-route override (`.rise.toml` `[routes].access`). This is the single home
+/// for the loosen/tighten rule so both the Kubernetes and Docker reconcilers gate
+/// identically. The override is a closed enum validated at config load, so there
+/// is no fail-open "unknown value" path.
+pub fn effective_access_requirement(
+    route_override: Option<&AccessRequirement>,
+    project_requirement: &AccessRequirement,
+) -> AccessRequirement {
+    route_override
+        .cloned()
+        .unwrap_or_else(|| project_requirement.clone())
+}
 
 /// Duration a deployment can be in Deploying state before timing out.
 pub const DEPLOYING_TIMEOUT_MINUTES: i64 = 5;
@@ -75,6 +92,17 @@ pub fn resolve_runtime_containers(
             })?,
             None => Vec::new(),
         };
+        // Re-validate persisted side-data before either backend turns it into
+        // routing resources. Request-time validation is authoritative, but this
+        // fail-closed check also protects upgrades and manually-corrupted rows
+        // from equivalent route paths carrying conflicting access requirements.
+        rise_deployment_spec::validation::validate_containers_and_routes(Some(&specs), &routes)
+            .with_context(|| {
+                format!(
+                    "deployment {} ({}) contains invalid persisted container/route side-data",
+                    deployment.id, deployment.deployment_id
+                )
+            })?;
         return Ok((specs, routes));
     }
 
@@ -108,6 +136,7 @@ pub fn resolve_runtime_containers(
         .map(|route| RouteSpec {
             path: route.path,
             container: route.container,
+            access: route.access,
         })
         .collect();
     Ok((specs, routes))
@@ -183,6 +212,31 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Utc;
     use uuid::Uuid;
+
+    #[test]
+    fn effective_access_requirement_prefers_route_override() {
+        // No override → inherit the project's requirement.
+        assert_eq!(
+            effective_access_requirement(None, &AccessRequirement::Member),
+            AccessRequirement::Member
+        );
+        // Override can loosen …
+        assert_eq!(
+            effective_access_requirement(
+                Some(&AccessRequirement::None),
+                &AccessRequirement::Member
+            ),
+            AccessRequirement::None
+        );
+        // … or tighten.
+        assert_eq!(
+            effective_access_requirement(
+                Some(&AccessRequirement::Member),
+                &AccessRequirement::None
+            ),
+            AccessRequirement::Member
+        );
+    }
 
     /// Identity-passthrough provider: `decrypt` returns the ciphertext verbatim
     /// so tests can assert which values were routed through decryption.
