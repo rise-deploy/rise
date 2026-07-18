@@ -154,4 +154,4 @@ scope and avoiding dead-end compatibility layers.
     migration. Because SQLX hashes the full migration text, the edits would
     have caused version-mismatch startup failures on upgraded databases; the
     historical migration was restored byte-for-byte.
-- PR: pending.
+- PR: #417, open as a draft for review.
