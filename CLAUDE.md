@@ -188,8 +188,13 @@ Keep it current as work merges:
   for every in-flight architectural workstream (multi-tenancy + generic
   resource API, authentication & token exchange, future workstreams). The
   Project owns *live status*. Don't duplicate rationale into the board, and
-  don't create new `<TOPIC>_PLAN.md` / `<TOPIC>_ROADMAP.md` files — add new
-  workstreams as sections in `ROADMAP.md`.
+  don't create new `<TOPIC>_PLAN.md` / `<TOPIC>_ROADMAP.md` files.
+  Architectural decisions are recorded as ADRs under
+  `docs/engineering/src/content/docs/adr/` — an ADR records the decision, its
+  rationale, and (via its Status field) implementation progress. Prefer an
+  ADR over a new `ROADMAP.md` section for new architectural work; `ROADMAP.md`
+  is being wound down gradually and keeps covering only the workstreams
+  already tracked in it.
 
 ## Guidelines
 
