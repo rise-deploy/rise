@@ -591,7 +591,7 @@ impl AppState {
         Self::run_migrations(&db_pool).await?;
 
         // Run resource-store migrations immediately after root migrations
-        rise_resource_store::run_migrations(&db_pool)
+        rise_resource_store_postgres::run_migrations(&db_pool)
             .await
             .context("Failed to run resource store migrations")?;
 
@@ -604,8 +604,9 @@ impl AppState {
         // store is cheap to construct (it caches compiled JSON schemas lazily),
         // so we instantiate it once and clone the Arc into every handler.
         #[cfg(feature = "backend")]
-        let resource_store: Arc<dyn rise_resource_api::ResourceStore> =
-            Arc::new(rise_resource_store::PgResourceStore::new(db_pool.clone()));
+        let resource_store: Arc<dyn rise_resource_api::ResourceStore> = Arc::new(
+            rise_resource_store_postgres::PgResourceStore::new(db_pool.clone()),
+        );
 
         // Run default-Organization bootstrap. Must complete before
         // controllers begin processing typed projects, so we await it before

@@ -19,7 +19,7 @@ FROM chef AS planner
 # Copy workspace project files
 COPY Cargo.toml Cargo.lock ./
 COPY crates/rise-resource-api/Cargo.toml ./crates/rise-resource-api/Cargo.toml
-COPY crates/rise-resource-store/Cargo.toml ./crates/rise-resource-store/Cargo.toml
+COPY crates/rise-resource-store-postgres/Cargo.toml ./crates/rise-resource-store-postgres/Cargo.toml
 COPY crates/rise-backend-auth/Cargo.toml ./crates/rise-backend-auth/Cargo.toml
 COPY crates/rise-backend-core/Cargo.toml ./crates/rise-backend-core/Cargo.toml
 COPY crates/rise-backend-docker/Cargo.toml ./crates/rise-backend-docker/Cargo.toml
@@ -31,8 +31,8 @@ RUN mkdir -p src && \
     echo "fn main() {}" > src/main.rs && \
     mkdir -p crates/rise-resource-api/src && \
     echo "" > crates/rise-resource-api/src/lib.rs && \
-    mkdir -p crates/rise-resource-store/src && \
-    echo "" > crates/rise-resource-store/src/lib.rs && \
+    mkdir -p crates/rise-resource-store-postgres/src && \
+    echo "" > crates/rise-resource-store-postgres/src/lib.rs && \
     mkdir -p crates/rise-backend-auth/src && \
     echo "" > crates/rise-backend-auth/src/lib.rs && \
     mkdir -p crates/rise-backend-core/src && \

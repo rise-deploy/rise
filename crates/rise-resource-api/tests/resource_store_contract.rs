@@ -133,7 +133,7 @@ impl ResourceStore for FakeStore {
 #[tokio::test]
 async fn separate_consumer_can_implement_and_type_erase_the_api_store_contract() {
     // This is a compile/object-safety/dependency-boundary proof: this Rust
-    // integration-test consumer imports no rise-resource-store or SQLX. It is
+    // integration-test consumer imports no rise-resource-store-postgres or SQLX. It is
     // intentionally not a behavioral conformance suite for store backends.
     let store: Arc<dyn ResourceStore> = Arc::new(FakeStore);
     assert!(store.get(Uuid::nil()).await.unwrap().is_none());

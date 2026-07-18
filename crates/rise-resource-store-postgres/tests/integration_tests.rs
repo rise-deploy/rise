@@ -3,7 +3,7 @@ use rise_resource_api::{
     UpdateResourceParams, API_VERSION_V1ALPHA1, CASCADE_DELETION_FINALIZER, ORGANIZATION_KIND,
     RESOURCE_DEFINITION_KIND,
 };
-use rise_resource_store::PgResourceStore;
+use rise_resource_store_postgres::PgResourceStore;
 use serde_json::json;
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -1301,7 +1301,7 @@ async fn create_rejects_invalid_name(pool: sqlx::PgPool) -> sqlx::Result<()> {
 
 #[sqlx::test]
 async fn create_invokes_spec_validator(pool: sqlx::PgPool) -> sqlx::Result<()> {
-    use rise_resource_store::OrganizationValidator;
+    use rise_resource_store_postgres::OrganizationValidator;
     use std::sync::Arc;
 
     let store = PgResourceStore::new(pool);

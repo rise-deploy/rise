@@ -6,7 +6,7 @@ members = [
     "crates/rise-backend-docker",
     "crates/rise-deployment-spec",
     "crates/rise-resource-api",
-    "crates/rise-resource-store",
+    "crates/rise-resource-store-postgres",
     "crates/rise-runtime-sync",
 ]
 # The rise-e2e harness is its own standalone workspace (tests/e2e/Cargo.toml) so
@@ -81,7 +81,7 @@ backend = [
     "dep:rise-backend-core", # strip-on-publish
     "dep:rise-backend-docker", # strip-on-publish
     "dep:rise-resource-api", # strip-on-publish
-    "dep:rise-resource-store", # strip-on-publish
+    "dep:rise-resource-store-postgres", # strip-on-publish
     "dep:rise-runtime-sync", # strip-on-publish
     "dep:config",
     "dep:openssl",
@@ -132,7 +132,7 @@ rise-backend-auth = { path = "crates/rise-backend-auth", optional = true }
 rise-backend-core = { path = "crates/rise-backend-core", optional = true }
 rise-backend-docker = { path = "crates/rise-backend-docker", optional = true }
 rise-resource-api = { path = "crates/rise-resource-api", optional = true }
-rise-resource-store = { path = "crates/rise-resource-store", optional = true }
+rise-resource-store-postgres = { path = "crates/rise-resource-store-postgres", optional = true }
 rise-runtime-sync = { path = "crates/rise-runtime-sync", optional = true }
 # --- END BACKEND ---
 
