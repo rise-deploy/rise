@@ -47,8 +47,8 @@ pub(crate) fn validate_new_resource_definition_identity(
     }
     if is_reserved_resource_kind(&spec.group, &spec.kind) {
         return Err(ValidationError::new(format!(
-            "group/kind '{}/{}' is reserved for a built-in resource",
-            spec.group, spec.kind
+            "API group '{}' is reserved for built-in resources",
+            spec.group
         )));
     }
 
@@ -161,13 +161,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_reserved_builtin_group_kind_with_an_unreserved_plural() {
-        for kind in ["User", "UserIdentity", "Role", "PlatformRoleBinding"] {
+    fn rejects_every_kind_in_the_reserved_builtin_group() {
+        for kind in [
+            "User",
+            "UserIdentity",
+            "Role",
+            "PlatformRoleBinding",
+            "FutureBuiltIn",
+        ] {
             let spec: ResourceDefinitionSpec =
                 serde_json::from_value(resource_definition("rise.dev", kind, "customresources"))
                     .unwrap();
             let error = validate_new_resource_definition_identity(&spec).unwrap_err();
-            assert!(error.to_string().contains("reserved for a built-in"));
+            assert!(error
+                .to_string()
+                .contains("API group 'rise.dev' is reserved"));
         }
     }
 

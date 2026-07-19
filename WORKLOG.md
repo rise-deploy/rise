@@ -230,14 +230,15 @@ scope and avoiding dead-end compatibility layers.
     query, fragment, or trailing slash; external subjects remain opaque and
     case-sensitive. Both are bounded so the future composite B-tree key has a
     safe index-entry budget.
-  - Group membership uses a kind-qualified, UID-bound User reference, and
-    workload trust policies require public issuer and claim constraints,
-    including a non-empty audience constraint.
+  - Group membership is an empty marker named for the canonical User. Optional
+    UID-bound lifecycle owner references are deferred to the generic resource
+    GC follow-up; workload trust policies require public issuer and claim
+    constraints, including a non-empty audience constraint.
   - The eight built-in collection definitions are reserved with their ADR-fixed
     root, Organization-owned, or fixed-parent placement, but are not registered
     as writable runtime resources in this increment.
-  - Custom ResourceDefinitions cannot claim either a reserved collection or a
-    reserved `rise.dev` built-in `(group, kind)` under another plural.
+  - Custom ResourceDefinitions cannot claim either a reserved collection or
+    any kind in the platform-reserved `rise.dev` API group.
   - Serde and JSON Schema tests cover valid shapes, defaults, closed-object
     rejection, invalid references, and malformed trust constraints.
   - Focused tests plus the relevant workspace format, lint, schema, and test
@@ -253,10 +254,10 @@ scope and avoiding dead-end compatibility layers.
     security data cannot be persisted between preparatory releases.
   - Issuer parsing uses one validated API-owned type for UserIdentity and both
     trust-policy kinds. It permits HTTP for development and service-network
-    issuers, canonicalizes URL spelling and trailing slashes, and caps the raw
-    ASCII URI at 1,024 bytes so Serde and JSON Schema enforce the same indexed
-    representation budget. External subjects are nonblank, otherwise opaque,
-    and capped at 255 Unicode scalar values.
+    issuers, rejects noncanonical URL aliases with the required spelling in the
+    error, and caps the canonical ASCII URI at 1,024 bytes so Serde and JSON
+    Schema enforce the same indexed representation budget. External subjects
+    are nonblank, otherwise opaque, and capped at 255 Unicode scalar values.
   - `IDENTITY_KIND_DEFINITIONS` is the placement source that activation must
     consume, rather than copying an independent identity registry table.
   - This increment blocks new ResourceDefinition conflicts. Activation must
@@ -285,7 +286,7 @@ scope and avoiding dead-end compatibility layers.
     activation scope, and upgrade compatibility.
   - Confirmed findings fixed before publication include unchecked public
     strings, invalid defaults/aliases, unbounded future index keys, issuer URL
-    repair and overlong-alias inputs, reserved `(group, kind)` bypasses, generic
+    aliases and overlong inputs, reserved API-group bypasses, generic
     ResourceDefinition creation bypassing admission, and updates to legacy
     definitions becoming frozen by newly introduced reservations.
   - Activation remains deliberately deferred: the runtime registry and lookup

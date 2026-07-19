@@ -4,10 +4,9 @@ use regex::Regex;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
-use uuid::Uuid;
 
 use crate::{
-    ResourceKind, ValidationError, API_VERSION_V1ALPHA1, CONTROLLER_COLLECTION, CONTROLLER_KIND,
+    ValidationError, API_VERSION_V1ALPHA1, CONTROLLER_COLLECTION, CONTROLLER_KIND,
     CONTROLLER_TRUST_POLICY_COLLECTION, CONTROLLER_TRUST_POLICY_KIND, GROUP_COLLECTION, GROUP_KIND,
     GROUP_MEMBERSHIP_COLLECTION, GROUP_MEMBERSHIP_KIND, ORGANIZATION_KIND,
     SERVICE_ACCOUNT_COLLECTION, SERVICE_ACCOUNT_KIND, SERVICE_ACCOUNT_TRUST_POLICY_COLLECTION,
@@ -143,7 +142,7 @@ impl Default for UserSpec {
     }
 }
 
-/// Maximum accepted raw ASCII issuer length; canonicalization can only shorten it.
+/// Maximum accepted canonical ASCII issuer length.
 pub const MAX_ISSUER_BYTES: usize = 1024;
 
 /// Maximum number of Unicode scalar values retained in an external subject.
@@ -206,12 +205,17 @@ impl Issuer {
             ));
         }
 
-        // The existing authentication matcher treats trailing slashes as
-        // aliases. Persist one spelling so the future exact unique index does
-        // not admit equivalent `(issuer, subject)` pairs.
+        // Reject aliases instead of silently changing an authentication
+        // identifier. `url::Url` normalizes host case, default ports, and dot
+        // segments; Rise additionally chooses the spelling without a trailing
+        // slash as canonical.
         let canonical = parsed.as_str().trim_end_matches('/').to_owned();
-        debug_assert!(canonical.len() <= MAX_ISSUER_BYTES);
-        Ok(Self(canonical))
+        if canonical != value {
+            return Err(ValidationError::new(format!(
+                "issuer URL must be in its canonical form \"{canonical}\""
+            )));
+        }
+        Ok(Self(value.to_owned()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -244,13 +248,13 @@ impl JsonSchema for Issuer {
     }
 
     fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
-        // JSON Schema can validate the accepted raw URL shape but cannot
-        // express `url::Url` canonicalization. Transaction-owned admission
-        // must persist the typed, reserialized value.
+        // JSON Schema can validate the accepted URL shape but cannot express
+        // `url::Url`'s exact canonical spelling. Typed admission performs that
+        // final equality check.
         schemars::json_schema!({
             "type": "string",
             "minLength": 1,
-            "maxLength": 1024,
+            "maxLength": MAX_ISSUER_BYTES,
             "pattern": ISSUER_PATTERN
         })
     }
@@ -305,10 +309,12 @@ impl JsonSchema for ExternalSubject {
     }
 
     fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        // Require at least one non-whitespace character while preserving all
+        // surrounding whitespace: an external subject is opaque, not trimmed.
         schemars::json_schema!({
             "type": "string",
             "minLength": 1,
-            "maxLength": 255,
+            "maxLength": MAX_EXTERNAL_SUBJECT_CHARS,
             "pattern": ".*\\S.*"
         })
     }
@@ -339,97 +345,13 @@ pub struct GroupSpec {}
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ServiceAccountSpec {}
 
-/// A UID-bound, version-independent reference to a User resource.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UserReference {
-    kind: ResourceKind,
-    uid: Uuid,
-}
-
-impl UserReference {
-    pub fn new(uid: Uuid) -> Result<Self, ValidationError> {
-        if uid.is_nil() {
-            return Err(ValidationError::new("a User reference UID must not be nil"));
-        }
-        Ok(Self {
-            kind: ResourceKind::new("rise.dev", USER_KIND)
-                .expect("the built-in User ResourceKind is valid"),
-            uid,
-        })
-    }
-
-    pub fn kind(&self) -> &ResourceKind {
-        &self.kind
-    }
-
-    pub fn uid(&self) -> Uuid {
-        self.uid
-    }
-}
-
-impl<'de> Deserialize<'de> for UserReference {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase", deny_unknown_fields)]
-        struct Repr {
-            kind: ResourceKind,
-            uid: String,
-        }
-
-        let Repr { kind, uid } = Repr::deserialize(deserializer)?;
-        if kind.group() != "rise.dev" || kind.kind() != USER_KIND {
-            return Err(serde::de::Error::custom(
-                "userRef.kind must be 'rise.dev/User'",
-            ));
-        }
-        let parsed_uid = Uuid::parse_str(&uid).map_err(serde::de::Error::custom)?;
-        if parsed_uid.hyphenated().to_string() != uid {
-            return Err(serde::de::Error::custom(
-                "userRef.uid must be a canonical lowercase hyphenated UUID",
-            ));
-        }
-        if parsed_uid.is_nil() {
-            return Err(serde::de::Error::custom(
-                "userRef.uid must not be a nil UUID",
-            ));
-        }
-        Ok(Self {
-            kind,
-            uid: parsed_uid,
-        })
-    }
-}
-
-impl JsonSchema for UserReference {
-    fn schema_name() -> std::borrow::Cow<'static, str> {
-        "UserReference".into()
-    }
-
-    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
-        schemars::json_schema!({
-            "type": "object",
-            "properties": {
-                "kind": { "const": "rise.dev/User" },
-                "uid": {
-                    "type": "string",
-                    "format": "uuid",
-                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-                    "not": { "const": "00000000-0000-0000-0000-000000000000" }
-                }
-            },
-            "required": ["kind", "uid"],
-            "additionalProperties": false
-        })
-    }
-}
-
-/// One boolean membership edge from the parent Group to a User.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// One name-bound boolean membership marker under the parent Group.
+///
+/// Admission requires the resource name to equal an existing User's canonical
+/// name. Optional lifecycle ownership belongs in generic resource metadata.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct GroupMembershipSpec {
-    pub user_ref: UserReference,
-}
+pub struct GroupMembershipSpec {}
 
 /// Required string-valued JWT claim constraints for a workload trust policy.
 ///

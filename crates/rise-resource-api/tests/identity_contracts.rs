@@ -1,8 +1,8 @@
 use jsonschema::validator_for;
 use rise_resource_api::{
     ControllerSpec, ControllerTrustPolicySpec, ExternalSubject, GroupMembershipSpec, GroupSpec,
-    Issuer, ServiceAccountSpec, ServiceAccountTrustPolicySpec, UserIdentitySpec, UserReference,
-    UserSpec, API_VERSION_V1ALPHA1, CONTROLLER_KIND, CONTROLLER_TRUST_POLICY_KIND, GROUP_KIND,
+    Issuer, ServiceAccountSpec, ServiceAccountTrustPolicySpec, UserIdentitySpec, UserSpec,
+    API_GROUP, API_VERSION_V1ALPHA1, CONTROLLER_KIND, CONTROLLER_TRUST_POLICY_KIND, GROUP_KIND,
     GROUP_MEMBERSHIP_KIND, IDENTITY_KIND_DEFINITIONS, MAX_EXTERNAL_SUBJECT_CHARS, MAX_ISSUER_BYTES,
     ORGANIZATION_KIND, SERVICE_ACCOUNT_KIND, SERVICE_ACCOUNT_TRUST_POLICY_KIND, USER_IDENTITY_KIND,
     USER_KIND,
@@ -10,7 +10,6 @@ use rise_resource_api::{
 use schemars::{schema_for, JsonSchema};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
-use uuid::Uuid;
 
 fn schema_accepts<T: JsonSchema>(value: Value) -> bool {
     let schema = serde_json::to_value(schema_for!(T)).unwrap();
@@ -85,9 +84,9 @@ fn user_profile_is_optional_non_authoritative_and_closed() {
 }
 
 #[test]
-fn external_identity_fields_are_required_and_locally_normalized() {
+fn external_identity_fields_are_required_and_canonical() {
     let identity: UserIdentitySpec = serde_json::from_value(json!({
-        "issuer": "https://issuer.example/",
+        "issuer": "https://issuer.example",
         "subject": " subject with spaces "
     }))
     .unwrap();
@@ -109,11 +108,30 @@ fn external_identity_fields_are_required_and_locally_normalized() {
     ] {
         assert_rejected::<UserIdentitySpec>(invalid);
     }
+
+    assert!(serde_json::from_value::<UserIdentitySpec>(json!({
+        "issuer": "https://issuer.example/",
+        "subject": "subject"
+    }))
+    .is_err());
 }
 
 #[test]
-fn issuers_are_urls_and_normalize_to_one_index_key() {
-    for (raw, canonical) in [
+fn issuers_are_canonical_urls() {
+    for canonical in [
+        "https://issuer.example",
+        "http://rise-dex:5556/dex",
+        "https://127.0.0.1:8443",
+    ] {
+        let issuer = Issuer::new(canonical).unwrap();
+        assert_eq!(issuer.as_str(), canonical);
+        assert_eq!(serde_json::to_value(&issuer).unwrap(), json!(canonical));
+        assert!(schema_accepts::<Issuer>(json!(canonical)));
+    }
+
+    // These parse to one of the canonical URLs above, but authentication
+    // identifiers are exact strings and must not be silently repaired.
+    for (noncanonical, canonical) in [
         (
             "https://ISSUER.example:443/a/../tenant///",
             "https://issuer.example/tenant",
@@ -121,10 +139,11 @@ fn issuers_are_urls_and_normalize_to_one_index_key() {
         ("http://rise-dex:5556/dex/", "http://rise-dex:5556/dex"),
         ("https://127.0.0.1:8443/", "https://127.0.0.1:8443"),
     ] {
-        let issuer = Issuer::new(raw).unwrap();
-        assert_eq!(issuer.as_str(), canonical);
-        assert_eq!(serde_json::to_value(&issuer).unwrap(), json!(canonical));
-        assert!(schema_accepts::<Issuer>(json!(raw)));
+        let error = Issuer::new(noncanonical).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("issuer URL must be in its canonical form \"{canonical}\"")
+        );
     }
 
     for invalid in [
@@ -186,37 +205,12 @@ fn external_subject_is_opaque_nonblank_and_bounded() {
 }
 
 #[test]
-fn membership_reference_is_qualified_and_uid_bound_to_user() {
-    let uid = Uuid::new_v4();
-    let membership: GroupMembershipSpec = serde_json::from_value(json!({
-        "userRef": {
-            "kind": "rise.dev/User",
-            "uid": uid
-        }
-    }))
-    .unwrap();
-    assert_eq!(membership.user_ref.kind().as_ref(), "rise.dev/User");
-    assert_eq!(membership.user_ref.uid(), uid);
-    assert_eq!(UserReference::new(uid).unwrap(), membership.user_ref);
-    assert!(UserReference::new(Uuid::nil()).is_err());
-    assert!(schema_accepts::<GroupMembershipSpec>(json!({
-        "userRef": {
-            "kind": "rise.dev/User",
-            "uid": uid
-        }
-    })));
+fn membership_is_an_empty_name_bound_marker() {
+    let membership: GroupMembershipSpec = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(membership, GroupMembershipSpec::default());
+    assert!(schema_accepts::<GroupMembershipSpec>(json!({})));
 
-    for invalid in [
-        json!({}),
-        json!({"userRef": null}),
-        json!({"userRef":{"kind":"User","uid":uid}}),
-        json!({"userRef":{"kind":"example.dev/User","uid":uid}}),
-        json!({"userRef":{"kind":"rise.dev/Group","uid":uid}}),
-        json!({"userRef":{"kind":"rise.dev/User","uid":"not-a-uuid"}}),
-        json!({"userRef":{"kind":"rise.dev/User","uid":"00000000-0000-0000-0000-000000000000"}}),
-        json!({"userRef":{"kind":"rise.dev/User","uid":uid,"name":"alice"}}),
-        json!({"userRef":{"kind":"rise.dev/User","uid":uid},"role":"admin"}),
-    ] {
+    for invalid in [json!({"userRef": null}), json!({"role": "admin"})] {
         assert_rejected::<GroupMembershipSpec>(invalid);
     }
 }
@@ -247,6 +241,19 @@ fn workload_trust_policies_use_closed_string_claim_constraints() {
     ));
     assert!(schema_accepts::<ServiceAccountTrustPolicySpec>(
         valid_trust_policy()
+    ));
+
+    let audience_only = json!({
+        "issuer": "https://issuer.example",
+        "claims": {"aud": "rise"}
+    });
+    assert!(serde_json::from_value::<ControllerTrustPolicySpec>(audience_only.clone()).is_ok());
+    assert!(serde_json::from_value::<ServiceAccountTrustPolicySpec>(audience_only.clone()).is_ok());
+    assert!(schema_accepts::<ControllerTrustPolicySpec>(
+        audience_only.clone()
+    ));
+    assert!(schema_accepts::<ServiceAccountTrustPolicySpec>(
+        audience_only
     ));
 
     for invalid in [
@@ -327,9 +334,15 @@ fn identity_collections_are_reserved_before_runtime_registration() {
         ));
     }
 
-    for kind in [USER_KIND, USER_IDENTITY_KIND, "Role", "PlatformRoleBinding"] {
+    for kind in [
+        USER_KIND,
+        USER_IDENTITY_KIND,
+        "Role",
+        "PlatformRoleBinding",
+        "FutureBuiltIn",
+    ] {
         assert!(rise_resource_api::is_reserved_resource_kind(
-            "rise.dev", kind
+            API_GROUP, kind
         ));
         assert!(!rise_resource_api::is_reserved_resource_kind(
             "other.example",

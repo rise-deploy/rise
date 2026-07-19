@@ -144,6 +144,19 @@ async fn separate_consumer_can_implement_and_type_erase_the_api_store_contract()
 }
 
 #[test]
+fn create_params_have_empty_optional_defaults() {
+    let params = CreateResourceParams::default();
+    assert!(params.api_version.is_empty());
+    assert!(params.kind.is_empty());
+    assert!(params.name.is_empty());
+    assert!(params.parent_uid.is_none());
+    assert!(params.annotations.is_empty());
+    assert!(params.finalizers.is_empty());
+    assert_eq!(params.spec, serde_json::json!({}));
+    assert!(params.validator.is_none());
+}
+
+#[test]
 fn validation_and_backend_errors_keep_expected_display_and_source() {
     let validation = StoreError::from(ValidationError::new("bad policy syntax"));
     assert_eq!(

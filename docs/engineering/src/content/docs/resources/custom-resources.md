@@ -15,7 +15,7 @@ The store treats both the same way at the row level — same `resources` table, 
 | Spec validation | Rust struct deserialization + a typed validator | JSON Schema declared in the `ResourceDefinition` |
 | Resolution order | Tried first | Tried second |
 
-A `ResourceDefinition`'s plural collection name cannot collide with a built-in or a reserved name (`organizations`, `projects`, `users`, `teams`, `environments`, `deployments`, `serviceaccounts`, `resourcedefinitions`). Reserved names that are not yet built-in are reserved for future built-ins so external controllers cannot squat on them.
+A `ResourceDefinition`'s plural collection name cannot collide with a built-in or a reserved name (`organizations`, `projects`, `users`, `teams`, `environments`, `deployments`, `serviceaccounts`, `resourcedefinitions`). Reserved names that are not yet built-in are reserved for future built-ins so external controllers cannot squat on them. The entire `rise.dev` API group is likewise reserved for current and future platform-owned kinds; external definitions must use another DNS subdomain as their group.
 
 ## Registering a ResourceDefinition
 

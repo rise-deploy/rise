@@ -16,7 +16,7 @@ mod subject_ref;
 pub use identity::{
     ControllerSpec, ControllerTrustPolicySpec, ExternalSubject, GroupMembershipSpec, GroupSpec,
     IdentityKindDefinition, IdentityKindParent, Issuer, ServiceAccountSpec,
-    ServiceAccountTrustPolicySpec, TrustPolicyClaims, UserIdentitySpec, UserReference, UserSpec,
+    ServiceAccountTrustPolicySpec, TrustPolicyClaims, UserIdentitySpec, UserSpec,
     IDENTITY_KIND_DEFINITIONS, MAX_EXTERNAL_SUBJECT_CHARS, MAX_ISSUER_BYTES,
 };
 pub use policy::{
@@ -37,6 +37,8 @@ pub use store::{
 pub use subject_id::SubjectId;
 pub use subject_ref::SubjectRef;
 
+/// API group reserved for Rise-owned built-in resources.
+pub const API_GROUP: &str = "rise.dev";
 pub const API_VERSION_V1ALPHA1: &str = "rise.dev/v1alpha1";
 
 pub const ORGANIZATION_KIND: &str = "Organization";
@@ -283,23 +285,9 @@ pub fn is_reserved_collection_name(value: &str) -> bool {
         .any(|reserved| reserved.eq_ignore_ascii_case(value))
 }
 
-/// Whether a custom ResourceDefinition would claim a Rise built-in API identity.
-pub fn is_reserved_resource_kind(group: &str, kind: &str) -> bool {
-    if group != "rise.dev" {
-        return false;
-    }
-
-    matches!(
-        kind,
-        ORGANIZATION_KIND
-            | RESOURCE_DEFINITION_KIND
-            | ROLE_KIND
-            | ROLE_BINDING_KIND
-            | PLATFORM_ROLE_KIND
-            | PLATFORM_ROLE_BINDING_KIND
-    ) || IDENTITY_KIND_DEFINITIONS
-        .iter()
-        .any(|definition| definition.kind == kind)
+/// Whether a custom ResourceDefinition would claim Rise's reserved API group.
+pub fn is_reserved_resource_kind(group: &str, _kind: &str) -> bool {
+    group == API_GROUP
 }
 
 pub fn validate_resource_group(value: &str) -> Result<(), ValidationError> {

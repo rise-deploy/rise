@@ -46,9 +46,6 @@ async fn generic_create_rejects_resource_definitions(pool: sqlx::PgPool) -> sqlx
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "users.rise.dev".to_string(),
-            parent_uid: None,
-            annotations: BTreeMap::new(),
-            finalizers: vec![],
             spec: json!({
                 "group": "rise.dev",
                 "kind": "User",
@@ -56,7 +53,7 @@ async fn generic_create_rejects_resource_definitions(pool: sqlx::PgPool) -> sqlx
                 "versions": [{"name": "v1", "served": true, "storage": true}],
                 "allowedStatusControllerIds": []
             }),
-            validator: None,
+            ..Default::default()
         })
         .await
         .unwrap_err();
