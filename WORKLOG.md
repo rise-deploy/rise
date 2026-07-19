@@ -296,7 +296,7 @@ scope and avoiding dead-end compatibility layers.
 
 ## Increment 5 — generic lifecycle owner references
 
-- State: implementation in progress; not yet published.
+- State: published as draft PR #420; awaiting review.
 - Branch: `feat/resource-owner-references`.
 - Acceptance criteria:
   - The generic create, update, response, row, and store contracts carry optional
@@ -336,3 +336,4 @@ scope and avoiding dead-end compatibility layers.
     PostgreSQL-backed resource-store integration tests.
   - SQLX metadata verification, generated resource-schema consistency, and
     Helm lint pass.
+- PR: #420, draft.
