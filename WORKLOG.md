@@ -32,22 +32,26 @@ scope and avoiding dead-end compatibility layers.
 2. **Merged in PR #417 — name the PostgreSQL adapter boundary explicitly.** Rename the
    concrete adapter crate to `rise-resource-store-postgres` without changing
    behavior or adding compatibility aliases.
-3. **In progress — policy resources and pure policy algebra.** Add the Role/binding
-   schemas, validation, Allow/Deny tuple evaluation, wildcard replacement, and
-   subset checks with database-free conformance coverage.
-4. **Planned — identity resources and storage projections.** Register the
-   built-in identity kinds and add the ADR-required uniqueness and reverse-lookup
-   indexes with migration/integration coverage.
-5. **Planned — live authorization engine.** Add membership expansion, org-admin
+3. **Merged in PR #418 — policy resources and pure policy algebra.** Add the
+   Role/binding schemas, validation, Allow/Deny tuple evaluation, wildcard
+   replacement, and subset checks with database-free conformance coverage.
+4. **In progress — identity resource contracts.** Add the closed identity,
+   membership, and workload-trust schemas plus reserved built-in collection
+   definitions, without making the resources writable yet.
+5. **Planned — transaction-scoped resource activation and storage projections.**
+   Add the mutation/admission seam, activate policy and identity built-ins with
+   their structural invariants, and add the ADR-required uniqueness and
+   reverse-lookup indexes with migration/integration coverage.
+6. **Planned — live authorization engine.** Add membership expansion, org-admin
    classification, effective labels, tier filtering, per-item list filtering,
    request-local snapshots, and explain/audit foundations.
-6. **Planned — mutation grant gate and seeded policy.** Add serializable
+7. **Planned — mutation grant gate and seeded policy.** Add serializable
    authorization-changing writes, label-subtree deltas, bootstrap policy, and
    the centralized generic-resource authorization choke point.
-7. **Planned — identity authentication and token convergence.** Add live
+8. **Planned — identity authentication and token convergence.** Add live
    User/UserIdentity resolution, operator selection/JIT, target-bound workload
    exchange, delegated `/token`, UID checks, caps, and actor-chain handling.
-8. **Planned — full conformance and finalization.** Close every applicable
+9. **Planned — full conformance and finalization.** Close every applicable
    ADR-0001 acceptance scenario, update documentation/status, and audit the
    implementation requirement by requirement.
 
@@ -158,8 +162,8 @@ scope and avoiding dead-end compatibility layers.
 
 ## Increment 3 — policy resource contracts and pure policy algebra
 
-- State: implementation, local verification, and independent review complete;
-  ready for draft PR review.
+- State: merged in PR #418 at commit
+  `86c7b9a900204a11f32ea733826ff637f9569737`.
 - Branch: `feat/adr0001-policy-algebra`.
 - Acceptance criteria:
   - `rise-resource-api` owns the closed serialized contracts for `Role`,
@@ -209,4 +213,82 @@ scope and avoiding dead-end compatibility layers.
     unchanged policy, grant creation by deleting Deny statements, ordinary use
     of `system:operators`, construction of unchecked normalized values, and
     fail-open handling of concrete-scope ancestry.
-- PR: #418, draft.
+- PR: #418, merged.
+
+## Increment 4 — identity resource contracts
+
+- State: implementation, verification, and review complete; ready for draft PR.
+- Branch: `feat/adr0001-identity-contracts`.
+- Acceptance criteria:
+  - `rise-resource-api` owns closed serialized contracts for `User`,
+    `UserIdentity`, `Controller`, `ControllerTrustPolicy`, `Group`,
+    `GroupMembership`, `ServiceAccount`, and `ServiceAccountTrustPolicy`.
+  - User and UserIdentity `active` fields default to `true` when omitted and
+    reject explicit `null`; User profile fields remain optional and
+    non-authoritative.
+  - External issuers are canonical absolute HTTP(S) URLs without credentials,
+    query, fragment, or trailing slash; external subjects remain opaque and
+    case-sensitive. Both are bounded so the future composite B-tree key has a
+    safe index-entry budget.
+  - Group membership uses a kind-qualified, UID-bound User reference, and
+    workload trust policies require public issuer and claim constraints,
+    including a non-empty audience constraint.
+  - The eight built-in collection definitions are reserved with their ADR-fixed
+    root, Organization-owned, or fixed-parent placement, but are not registered
+    as writable runtime resources in this increment.
+  - Custom ResourceDefinitions cannot claim either a reserved collection or a
+    reserved `rise.dev` built-in `(group, kind)` under another plural.
+  - Serde and JSON Schema tests cover valid shapes, defaults, closed-object
+    rejection, invalid references, and malformed trust constraints.
+  - Focused tests plus the relevant workspace format, lint, schema, and test
+    gates pass.
+- Decisions:
+  - Split contracts from activation after independent review of the current
+    store boundary. `SpecValidator` is pure and pre-transactional, while these
+    resources require atomic normalization, parent/reference checks,
+    immutability and delete guards before persistence.
+  - Do not add PostgreSQL indexes, identity lookup adapters, runtime registry
+    entries, authentication behavior, or compatibility aliases in this
+    increment. They land with the transaction-owned admission seam so invalid
+    security data cannot be persisted between preparatory releases.
+  - Issuer parsing uses one validated API-owned type for UserIdentity and both
+    trust-policy kinds. It permits HTTP for development and service-network
+    issuers, canonicalizes URL spelling and trailing slashes, and caps the raw
+    ASCII URI at 1,024 bytes so Serde and JSON Schema enforce the same indexed
+    representation budget. External subjects are nonblank, otherwise opaque,
+    and capped at 255 Unicode scalar values.
+  - `IDENTITY_KIND_DEFINITIONS` is the placement source that activation must
+    consume, rather than copying an independent identity registry table.
+  - This increment blocks new ResourceDefinition conflicts. Activation must
+    also fail closed after scanning for conflicting definitions persisted before
+    these reservations existed; doing that scan before any routing change would
+    break upgrades without removing a current conflict.
+  - `ResourceDefinition` remains a globally reserved structural kind: the store
+    projection and dedicated lifecycle discriminate on that kind, so admitting
+    an ordinary custom resource with the same name in another group would create
+    data that cannot follow the generic lifecycle safely.
+  - Activation must convert trust constraints into `rise-backend-auth` matcher
+    inputs with cross-crate conformance tests, keeping resource-shape validation
+    and runtime claim matching from drifting.
+- Verification:
+  - `cargo fmt --all` and `git diff --check` pass.
+  - `mise run lint` passes, including all-feature checks, strict Clippy, SQLX
+    metadata, generated resource-schema consistency, Helm lint, and the auth
+    and backend-core suites.
+  - The serial all-features workspace suite passes with offline SQLX metadata,
+    including all 59 PostgreSQL-backed integration tests.
+  - Focused API contract tests cover all eight identity shapes, URL/schema
+    parity, defaults, bounds, references, placement, and reservations.
+- Review:
+  - Maximum-effort adversarial review covered API construction boundaries,
+    Serde/schema parity, PostgreSQL index budgets, reservation semantics,
+    activation scope, and upgrade compatibility.
+  - Confirmed findings fixed before publication include unchecked public
+    strings, invalid defaults/aliases, unbounded future index keys, issuer URL
+    repair and overlong-alias inputs, reserved `(group, kind)` bypasses, generic
+    ResourceDefinition creation bypassing admission, and updates to legacy
+    definitions becoming frozen by newly introduced reservations.
+  - Activation remains deliberately deferred: the runtime registry and lookup
+    adapters are unchanged, and the next increment must audit pre-existing
+    conflicts transactionally before enabling identity routes.
+- PR: pending.

@@ -38,11 +38,14 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
   invalid), canonical scopes, pure Allow/Deny tuple evaluation, placement
   provenance, wildcard replacement, and Deny-aware subset checks. Activate
   these resources only through transaction-scoped normalization/admission.
-- [ ] Add built-in identity resources: root `User` and `Controller`;
-  Organization-owned `Group` and `ServiceAccount`; and fixed-parent
+- [~] Add closed contracts for the built-in identity resources: root `User`
+  and `Controller`; Organization-owned `Group` and `ServiceAccount`; and
+  fixed-parent
   `UserIdentity`, `GroupMembership`, `ControllerTrustPolicy`, and
   `ServiceAccountTrustPolicy`. User and UserIdentity carry platform-managed
   `active` state, defaulting true; shipped policy does not allow self-editing.
+  Reserve their collection definitions now, but activate them only through the
+  transaction-scoped normalization/admission seam.
 - [ ] Add partial Postgres indexes for unique external User mappings,
   target-parent workload trust lookup, and unique/reverse membership edges.
   These remain internal storage projections and do not change the generic

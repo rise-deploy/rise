@@ -1,8 +1,8 @@
 use rise_resource_api::{
-    is_reserved_collection_name, validate_collection_name, validate_controller_id,
-    validate_resource_group, validate_resource_kind, validate_resource_version, OrganizationSpec,
-    OrganizationStatus, ResourceDefinitionSpec, ResourceDefinitionStatus, SpecValidator,
-    ValidationError,
+    is_reserved_collection_name, is_reserved_resource_kind, validate_collection_name,
+    validate_controller_id, validate_resource_group, validate_resource_kind,
+    validate_resource_version, OrganizationSpec, OrganizationStatus, ResourceDefinitionSpec,
+    ResourceDefinitionStatus, SpecValidator, ValidationError, RESOURCE_DEFINITION_KIND,
 };
 
 pub struct OrganizationValidator;
@@ -28,6 +28,33 @@ impl SpecValidator for OrganizationValidator {
 
 pub struct ResourceDefinitionValidator;
 
+pub(crate) fn validate_new_resource_definition_identity(
+    spec: &ResourceDefinitionSpec,
+) -> Result<(), ValidationError> {
+    // `ResourceDefinition` is the store's structural discriminator: its rows feed a projection
+    // view and use a dedicated create/update/delete lifecycle. It therefore cannot be reused as
+    // an ordinary custom kind in another API group.
+    if spec.kind == RESOURCE_DEFINITION_KIND {
+        return Err(ValidationError::new(format!(
+            "kind '{RESOURCE_DEFINITION_KIND}' is reserved for the resource-definition system"
+        )));
+    }
+    if is_reserved_collection_name(&spec.plural) {
+        return Err(ValidationError::new(format!(
+            "plural '{}' is a reserved collection name",
+            spec.plural
+        )));
+    }
+    if is_reserved_resource_kind(&spec.group, &spec.kind) {
+        return Err(ValidationError::new(format!(
+            "group/kind '{}/{}' is reserved for a built-in resource",
+            spec.group, spec.kind
+        )));
+    }
+
+    Ok(())
+}
+
 impl SpecValidator for ResourceDefinitionValidator {
     fn validate_spec(&self, spec: &serde_json::Value) -> Result<(), ValidationError> {
         let parsed: ResourceDefinitionSpec = serde_json::from_value(spec.clone())
@@ -36,13 +63,6 @@ impl SpecValidator for ResourceDefinitionValidator {
         validate_resource_group(&parsed.group)?;
         validate_resource_kind(&parsed.kind)?;
         validate_collection_name(&parsed.plural)?;
-
-        if is_reserved_collection_name(&parsed.plural) {
-            return Err(ValidationError::new(format!(
-                "plural '{}' is a reserved collection name",
-                parsed.plural
-            )));
-        }
 
         // A ResourceDefinition is root-scoped when it declares no `parent`;
         // otherwise the parent reference must be well-formed.
@@ -122,5 +142,52 @@ impl SpecValidator for JsonSchemaValidator {
 
     fn validate_status(&self, _status: &serde_json::Value) -> Result<(), ValidationError> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn resource_definition(group: &str, kind: &str, plural: &str) -> serde_json::Value {
+        json!({
+            "group": group,
+            "kind": kind,
+            "plural": plural,
+            "versions": [{"name":"v1", "served":true, "storage":true}],
+            "allowedStatusControllerIds": []
+        })
+    }
+
+    #[test]
+    fn rejects_reserved_builtin_group_kind_with_an_unreserved_plural() {
+        for kind in ["User", "UserIdentity", "Role", "PlatformRoleBinding"] {
+            let spec: ResourceDefinitionSpec =
+                serde_json::from_value(resource_definition("rise.dev", kind, "customresources"))
+                    .unwrap();
+            let error = validate_new_resource_definition_identity(&spec).unwrap_err();
+            assert!(error.to_string().contains("reserved for a built-in"));
+        }
+    }
+
+    #[test]
+    fn allows_the_same_kind_name_in_another_group() {
+        let spec =
+            serde_json::from_value(resource_definition("other.example", "User", "customusers"))
+                .unwrap();
+        validate_new_resource_definition_identity(&spec).unwrap();
+    }
+
+    #[test]
+    fn rejects_resource_definition_as_a_custom_kind_in_any_group() {
+        let spec = serde_json::from_value(resource_definition(
+            "other.example",
+            RESOURCE_DEFINITION_KIND,
+            "customdefinitions",
+        ))
+        .unwrap();
+        let error = validate_new_resource_definition_identity(&spec).unwrap_err();
+        assert!(error.to_string().contains("resource-definition system"));
     }
 }

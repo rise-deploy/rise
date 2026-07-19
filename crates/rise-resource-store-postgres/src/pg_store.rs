@@ -14,7 +14,9 @@ use sqlx::{PgPool, Row};
 use crate::builtin::BuiltInRegistry;
 use crate::discriminator;
 use crate::models::PgResourceRow;
-use crate::validation::{JsonSchemaValidator, ResourceDefinitionValidator};
+use crate::validation::{
+    validate_new_resource_definition_identity, JsonSchemaValidator, ResourceDefinitionValidator,
+};
 
 pub struct PgResourceStore {
     pool: PgPool,
@@ -397,6 +399,13 @@ impl PgResourceStore {
 #[async_trait::async_trait]
 impl ResourceStore for PgResourceStore {
     async fn create(&self, params: CreateResourceParams) -> Result<ResourceRow, StoreError> {
+        if params.kind == RESOURCE_DEFINITION_KIND {
+            return Err(StoreError::Validation(
+                "ResourceDefinitions must be created through register_resource_definition"
+                    .to_string(),
+            ));
+        }
+
         validate_resource_name(&params.name).map_err(|e| StoreError::Validation(e.to_string()))?;
 
         if let Some(v) = &params.validator {
@@ -406,20 +415,18 @@ impl ResourceStore for PgResourceStore {
         let metadata = serde_json::to_value(&params.annotations).unwrap_or_default();
 
         let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
-        if params.kind != RESOURCE_DEFINITION_KIND {
-            let is_builtin =
-                params.api_version == API_VERSION_V1ALPHA1 && params.kind == ORGANIZATION_KIND;
-            // Always require the lock (and therefore verify the RD exists) unless this is a
-            // builtin kind. Without a lock, a concurrent RD hard-deletion could race with the
-            // insert, and callers with validator=None would bypass the RD existence check.
-            Self::lock_matching_definition_for_write(
-                &mut tx,
-                &params.api_version,
-                &params.kind,
-                !is_builtin,
-            )
-            .await?;
-        }
+        let is_builtin =
+            params.api_version == API_VERSION_V1ALPHA1 && params.kind == ORGANIZATION_KIND;
+        // Always require the lock (and therefore verify the RD exists) unless this is a
+        // builtin kind. Without a lock, a concurrent RD hard-deletion could race with the
+        // insert, and callers with validator=None would bypass the RD existence check.
+        Self::lock_matching_definition_for_write(
+            &mut tx,
+            &params.api_version,
+            &params.kind,
+            !is_builtin,
+        )
+        .await?;
         let row = Self::insert_resource_row_with_retry(&mut tx, &params, metadata).await?;
         tx.commit().await.map_err(StoreError::backend)?;
         Ok(row)
@@ -1430,6 +1437,12 @@ impl ResourceStore for PgResourceStore {
         // Parse once; safe to unwrap because validate_spec succeeded above
         let spec: ResourceDefinitionSpec = serde_json::from_value(params.spec.clone())
             .expect("spec parseable: ResourceDefinitionValidator.validate_spec succeeded");
+
+        // Reservations apply to new definitions only. Existing installations may contain a
+        // definition whose identity became reserved in a later release; keep allowing updates
+        // that leave those immutable identity fields unchanged until built-in activation audits
+        // and resolves such conflicts explicitly.
+        validate_new_resource_definition_identity(&spec)?;
 
         // ResourceDefinition names follow the {plural}.{group} convention. Identity fields are
         // immutable post-creation, so an inconsistent name becomes permanent — reject upfront.
