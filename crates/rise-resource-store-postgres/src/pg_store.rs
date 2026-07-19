@@ -374,7 +374,7 @@ impl PgResourceStore {
         for dependent in dependents {
             let (reason, relationship, block_owner_deletion) = match dependent.relationship {
                 CascadeRelationship::StructuralParent => {
-                    ("parent_deleted", "structuralParent", true)
+                    ("parent_deleted", "structuralChild", true)
                 }
                 CascadeRelationship::OwnerReference {
                     block_owner_deletion,
