@@ -99,6 +99,21 @@ pub struct CreateResourceParams {
     pub validator: Option<Arc<dyn SpecValidator>>,
 }
 
+impl Default for CreateResourceParams {
+    fn default() -> Self {
+        Self {
+            api_version: String::new(),
+            kind: String::new(),
+            name: String::new(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: Vec::new(),
+            spec: serde_json::Value::Object(serde_json::Map::new()),
+            validator: None,
+        }
+    }
+}
+
 pub struct UpdateResourceParams {
     /// New canonical storage API version when migrating a row.
     ///

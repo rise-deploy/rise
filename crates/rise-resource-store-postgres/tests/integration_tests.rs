@@ -38,6 +38,33 @@ async fn create_and_get_resource(pool: sqlx::PgPool) -> sqlx::Result<()> {
 }
 
 #[sqlx::test]
+async fn generic_create_rejects_resource_definitions(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+
+    let error = store
+        .create(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: RESOURCE_DEFINITION_KIND.to_string(),
+            name: "users.rise.dev".to_string(),
+            spec: json!({
+                "group": "rise.dev",
+                "kind": "User",
+                "plural": "users",
+                "versions": [{"name": "v1", "served": true, "storage": true}],
+                "allowedStatusControllerIds": []
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, StoreError::Validation(message) if
+        message.contains("register_resource_definition")));
+
+    Ok(())
+}
+
+#[sqlx::test]
 async fn list_resources(pool: sqlx::PgPool) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
 
@@ -963,6 +990,91 @@ async fn register_resource_definition_rejects_reserved_plural(
         .unwrap_err();
 
     assert!(matches!(err, StoreError::Validation(_)));
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn register_rejects_resource_definition_as_a_custom_kind(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+
+    let error = store
+        .register_resource_definition(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: RESOURCE_DEFINITION_KIND.to_string(),
+            name: "customdefinitions.other.example".to_string(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers: vec![],
+            spec: json!({
+                "group": "other.example",
+                "kind": "ResourceDefinition",
+                "plural": "customdefinitions",
+                "versions": [{"name": "v1", "served": true, "storage": true}],
+                "allowedStatusControllerIds": []
+            }),
+            validator: None,
+        })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, StoreError::Validation(message) if
+        message.contains("resource-definition system")));
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn update_allows_an_unchanged_legacy_reserved_definition(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    // Model a definition created before `rise.dev/User` and `users` were reserved. Upgrading must
+    // not freeze unrelated schema updates while identity activation remains deferred.
+    let uid: Uuid = sqlx::query_scalar(
+        r#"
+        INSERT INTO resource_store.resources
+            (api_version, kind, name, discriminator, spec)
+        VALUES
+            ('rise.dev/v1alpha1', 'ResourceDefinition', 'users.rise.dev', 'legacy00', $1)
+        RETURNING uid
+        "#,
+    )
+    .bind(json!({
+        "group": "rise.dev",
+        "kind": "User",
+        "plural": "users",
+        "versions": [{"name": "v1", "served": true, "storage": true}],
+        "allowedStatusControllerIds": []
+    }))
+    .fetch_one(&pool)
+    .await?;
+
+    let store = PgResourceStore::new(pool);
+    let updated = store
+        .update_resource_definition(
+            uid,
+            UpdateResourceParams {
+                api_version: None,
+                revision: 1,
+                annotations: BTreeMap::new(),
+                finalizers: vec![],
+                spec: json!({
+                    "group": "rise.dev",
+                    "kind": "User",
+                    "plural": "users",
+                    "versions": [{"name": "v1", "served": true, "storage": true}],
+                    "allowedStatusControllerIds": ["schema-controller"]
+                }),
+                validator: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(updated.revision, 2);
+    assert_eq!(updated.spec["kind"], "User");
 
     Ok(())
 }

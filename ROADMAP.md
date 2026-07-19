@@ -38,20 +38,32 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
   invalid), canonical scopes, pure Allow/Deny tuple evaluation, placement
   provenance, wildcard replacement, and Deny-aware subset checks. Activate
   these resources only through transaction-scoped normalization/admission.
-- [ ] Add built-in identity resources: root `User` and `Controller`;
-  Organization-owned `Group` and `ServiceAccount`; and fixed-parent
+- [~] Add closed contracts for the built-in identity resources: root `User`
+  and `Controller`; Organization-owned `Group` and `ServiceAccount`; and
+  fixed-parent
   `UserIdentity`, `GroupMembership`, `ControllerTrustPolicy`, and
   `ServiceAccountTrustPolicy`. User and UserIdentity carry platform-managed
   `active` state, defaulting true; shipped policy does not allow self-editing.
+  GroupMembership is an empty marker named for its User.
+  Reserve their collection definitions now, but activate them only through the
+  transaction-scoped normalization/admission seam.
+- [ ] Add optional, UID-authoritative `metadata.ownerReferences` to the generic
+  resource envelope and implement transactional reverse lookup, cycle-safe,
+  finalizer-respecting dependent garbage collection. GroupMembership may name
+  its User as lifecycle owner; backend-managed memberships normally do so,
+  while operator-managed markers may intentionally remain unowned. Land this
+  before GroupMembership runtime activation.
 - [ ] Add partial Postgres indexes for unique external User mappings,
-  target-parent workload trust lookup, and unique/reverse membership edges.
+  target-parent workload trust lookup, and reverse name-based membership edges.
   These remain internal storage projections and do not change the generic
   resource API shape.
 - [ ] Implement live membership expansion, per-item list filtering/projection,
   effective-label resolution, typed `SubjectRef` values for dynamic ownership,
   tiered platform/org Deny filtering, admin/operator classification, platform
   ceilings, and the centralized authorization choke point replacing
-  `require_operator`.
+  `require_operator`. Once Controller writes use that path, remove
+  `ResourceDefinition.allowedStatusControllerIds` and authorize `status` and
+  `finalizers` exclusively through RBAC.
 - [ ] Add Role/policy audit and explain diagnostics for semantically inert
   configuration: no-op recipient or membership constraints, owners with no
   current grant, selectors matching nothing, stale references, and shadowed
@@ -176,8 +188,8 @@ and secret handling remain kind-specific prerequisites.
 - [ ] Migrate extension kinds to external `ResourceDefinition` resources;
   secret-bearing extensions wait for encrypted fields.
 - [ ] Migrate `Project` (Organization child) and `Environment` (Project
-  child) as built-ins. Ownership is `rise.dev/owner` plus policy, never
-  `ownerRef`.
+  child) as built-ins. Authorization ownership is `rise.dev/owner` plus policy;
+  lifecycle `metadata.ownerReferences` never grant access.
 - [ ] Migrate `User`, `UserIdentity`, `Group`, and `GroupMembership`, mapping
   the existing Rise Team concept to `Group` while preserving stable generated
   User names and exact SSO mappings.

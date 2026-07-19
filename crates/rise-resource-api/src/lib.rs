@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+mod identity;
 mod policy;
 mod resource_kind;
 mod resource_row;
@@ -12,6 +13,12 @@ mod store;
 mod subject_id;
 mod subject_ref;
 
+pub use identity::{
+    ControllerSpec, ControllerTrustPolicySpec, ExternalSubject, GroupMembershipSpec, GroupSpec,
+    IdentityKindDefinition, IdentityKindParent, Issuer, ServiceAccountSpec,
+    ServiceAccountTrustPolicySpec, TrustPolicyClaims, UserIdentitySpec, UserSpec,
+    IDENTITY_KIND_DEFINITIONS, MAX_EXTERNAL_SUBJECT_CHARS, MAX_ISSUER_BYTES,
+};
 pub use policy::{
     BindingSubject, Effect, KindMatcher, LabelKey, LabelSelector,
     LocallyNormalizedPlatformRoleBindingSpec, LocallyNormalizedRoleBindingSpec,
@@ -30,6 +37,8 @@ pub use store::{
 pub use subject_id::SubjectId;
 pub use subject_ref::SubjectRef;
 
+/// API group reserved for Rise-owned built-in resources.
+pub const API_GROUP: &str = "rise.dev";
 pub const API_VERSION_V1ALPHA1: &str = "rise.dev/v1alpha1";
 
 pub const ORGANIZATION_KIND: &str = "Organization";
@@ -50,6 +59,25 @@ pub const PLATFORM_ROLE_COLLECTION: &str = "platformroles";
 pub const PLATFORM_ROLE_BINDING_KIND: &str = "PlatformRoleBinding";
 pub const PLATFORM_ROLE_BINDING_COLLECTION: &str = "platformrolebindings";
 
+// Identity resources are reserved before runtime registration so custom
+// ResourceDefinitions cannot claim the API identities that admission will own.
+pub const USER_KIND: &str = "User";
+pub const USER_COLLECTION: &str = "users";
+pub const USER_IDENTITY_KIND: &str = "UserIdentity";
+pub const USER_IDENTITY_COLLECTION: &str = "useridentities";
+pub const CONTROLLER_KIND: &str = "Controller";
+pub const CONTROLLER_COLLECTION: &str = "controllers";
+pub const CONTROLLER_TRUST_POLICY_KIND: &str = "ControllerTrustPolicy";
+pub const CONTROLLER_TRUST_POLICY_COLLECTION: &str = "controllertrustpolicies";
+pub const GROUP_KIND: &str = "Group";
+pub const GROUP_COLLECTION: &str = "groups";
+pub const GROUP_MEMBERSHIP_KIND: &str = "GroupMembership";
+pub const GROUP_MEMBERSHIP_COLLECTION: &str = "groupmemberships";
+pub const SERVICE_ACCOUNT_KIND: &str = "ServiceAccount";
+pub const SERVICE_ACCOUNT_COLLECTION: &str = "serviceaccounts";
+pub const SERVICE_ACCOUNT_TRUST_POLICY_KIND: &str = "ServiceAccountTrustPolicy";
+pub const SERVICE_ACCOUNT_TRUST_POLICY_COLLECTION: &str = "serviceaccounttrustpolicies";
+
 pub const RESERVED_COLLECTION_NAMES: &[&str] = &[
     ORGANIZATION_COLLECTION,
     RESOURCE_DEFINITION_COLLECTION,
@@ -57,12 +85,18 @@ pub const RESERVED_COLLECTION_NAMES: &[&str] = &[
     ROLE_BINDING_COLLECTION,
     PLATFORM_ROLE_COLLECTION,
     PLATFORM_ROLE_BINDING_COLLECTION,
+    USER_COLLECTION,
+    USER_IDENTITY_COLLECTION,
+    CONTROLLER_COLLECTION,
+    CONTROLLER_TRUST_POLICY_COLLECTION,
+    GROUP_COLLECTION,
+    GROUP_MEMBERSHIP_COLLECTION,
+    SERVICE_ACCOUNT_COLLECTION,
+    SERVICE_ACCOUNT_TRUST_POLICY_COLLECTION,
     "projects",
-    "users",
     "teams",
     "environments",
     "deployments",
-    "serviceaccounts",
 ];
 
 pub type JsonObject = BTreeMap<String, serde_json::Value>;
@@ -249,6 +283,11 @@ pub fn is_reserved_collection_name(value: &str) -> bool {
     RESERVED_COLLECTION_NAMES
         .iter()
         .any(|reserved| reserved.eq_ignore_ascii_case(value))
+}
+
+/// Whether a custom ResourceDefinition would claim Rise's reserved API group.
+pub fn is_reserved_resource_kind(group: &str, _kind: &str) -> bool {
+    group == API_GROUP
 }
 
 pub fn validate_resource_group(value: &str) -> Result<(), ValidationError> {
