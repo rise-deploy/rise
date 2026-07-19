@@ -520,6 +520,7 @@ mod tests {
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: json!({"displayName": name}),
                 validator: None,
             })
@@ -538,6 +539,7 @@ mod tests {
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![CONTROLLER_FINALIZER.to_string()],
+                owner_references: vec![],
                 spec: json!({"displayName": name}),
                 validator: None,
             })
@@ -554,6 +556,7 @@ mod tests {
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: json!({
                     "group": "example.dev",
                     "kind": "Widget",
@@ -582,6 +585,7 @@ mod tests {
                 parent_uid: Some(parent),
                 annotations: BTreeMap::new(),
                 finalizers,
+                owner_references: vec![],
                 spec: json!({}),
                 validator: None,
             })
@@ -893,6 +897,7 @@ mod tests {
             status: json!({}),
             revision: 1,
             finalizers: vec![],
+            owner_references: vec![],
             deletion_timestamp: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),

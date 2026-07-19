@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
-use crate::{Resource, ResourceKind, ResourceMetadata, ValidationError};
+use crate::{OwnerReference, Resource, ResourceKind, ResourceMetadata, ValidationError};
 
 /// Storage-neutral row returned by [`crate::ResourceStore`].
 #[derive(Debug, Clone, PartialEq)]
@@ -20,6 +20,7 @@ pub struct ResourceRow {
     pub status: serde_json::Value,
     pub revision: i64,
     pub finalizers: Vec<String>,
+    pub owner_references: Vec<OwnerReference>,
     pub deletion_timestamp: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -59,6 +60,7 @@ impl ResourceRow {
                 discriminator: Some(self.discriminator.clone()),
                 annotations,
                 finalizers: self.finalizers.clone(),
+                owner_references: self.owner_references.clone(),
                 deletion_timestamp: self.deletion_timestamp,
             },
             spec,

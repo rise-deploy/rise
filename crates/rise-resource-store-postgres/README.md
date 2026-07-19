@@ -40,6 +40,11 @@ identity fields (group, kind, plural, versions, allowed status controller IDs) o
 `ResourceDefinition` rows out of their `spec`. Being a view it cannot drift from the
 backing row; identity uniqueness is enforced by partial unique indexes on `resources`.
 
+Lifecycle owner references are stored once, in the resource row's
+`owner_references` JSONB array. A `jsonb_path_ops` GIN index supports reverse
+UID containment queries for garbage collection. No separate edge table is
+maintained.
+
 ## Deletion model
 
 Inspired by Kubernetes finalizers, but adapted to a hierarchical store with a hard FK.
@@ -47,11 +52,11 @@ Inspired by Kubernetes finalizers, but adapted to a hierarchical store with a ha
 ### Lifecycle
 
 1. `delete(uid)` marks the row (`deletion_timestamp = NOW()`) and stamps its immediate
-   children.
+   structural children and direct owner-reference dependents.
 2. Controllers observe `deletion_timestamp`, do their teardown work, and clear their own
    finalizers via `update_controller_finalizers`.
 3. A GC worker iterates `list_pending_collection()` and calls `try_collect(uid)` on each
-   tombstoned row. When the row has no children and no remaining finalizers, `try_collect`
+   tombstoned row. When the row has no dependents and no remaining finalizers, `try_collect`
    hard-deletes it.
 
 ### Visibility contract
@@ -62,12 +67,12 @@ and resolution paths all need to observe in-progress teardown.
 
 ### Cascade
 
-Deletion always cascades. `delete` stamps `deletion_timestamp` on the parent and its
-**immediate children**, and attaches the store-managed finalizer
-`system.rise.dev/cascade-deletion` to the parent (if children exist). Subsequent GC sweeps
-via `try_collect` fan out down the tree as each level drains. The parent stays observable
-until the entire subtree has been collected; because the `parent_uid` FK forbids deleting a
-referenced row, collection is necessarily bottom-up.
+Deletion always cascades. `delete` stamps `deletion_timestamp` on the owner and
+its **immediate structural children and owner-reference dependents**, and
+attaches the store-managed finalizer `system.rise.dev/cascade-deletion` when
+dependents exist. Subsequent GC sweeps via `try_collect` fan out down the
+lifecycle DAG as each level drains. The owner stays observable until every
+dependent has been collected.
 
 There is no detach/orphan operation — a non-root resource can never become parentless.
 

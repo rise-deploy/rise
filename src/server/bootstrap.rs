@@ -215,6 +215,7 @@ async fn upsert_default_organization(
                 parent_uid: None,
                 annotations: desired_annotations,
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: spec_value,
                 validator: Some(Arc::new(OrganizationValidator)),
             })
@@ -279,6 +280,7 @@ async fn upsert_default_organization(
                 revision: row.revision,
                 annotations: merged_annotations,
                 finalizers: row.finalizers.clone(),
+                owner_references: row.owner_references.clone(),
                 spec: spec_value,
                 validator: Some(Arc::new(OrganizationValidator)),
             },
@@ -758,6 +760,7 @@ mod tests {
                     revision: row.revision,
                     annotations,
                     finalizers: row.finalizers.clone(),
+                    owner_references: row.owner_references.clone(),
                     spec: row.spec.clone(),
                     validator: Some(Arc::new(OrganizationValidator)),
                 },
@@ -817,6 +820,7 @@ mod tests {
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: serde_json::json!({"displayName": "Other"}),
                 validator: Some(Arc::new(OrganizationValidator)),
             })

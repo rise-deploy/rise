@@ -75,7 +75,13 @@ Authorization: Bearer <operator-jwt>
   "metadata": {
     "name": "my-widget",
     "annotations": {"team": "platform"},
-    "finalizers": []
+    "finalizers": [],
+    "ownerReferences": [{
+      "apiVersion": "rise.dev/v1alpha1",
+      "kind": "Organization",
+      "name": "acme",
+      "uid": "6e999cac-9c0b-4a94-a844-546ce8d508fb"
+    }]
   },
   "spec": {"color": "blue"}
 }
@@ -84,6 +90,9 @@ Authorization: Bearer <operator-jwt>
 - The body's `apiVersion` must be a *served* version of the collection.
 - The body's `kind` must match the collection's kind.
 - `metadata.name` is the resource's name within its scope.
+- `metadata.ownerReferences` is optional lifecycle metadata. Every entry must
+  identify the same live resource by API group/kind, name, and UID. References
+  do not change the resource URL or grant authorization.
 - Server-controlled fields (`uid`, `revision`, `discriminator`, `deletionTimestamp`) are rejected on create.
 - `status` is rejected on create.
 - Response: `201 Created` with the created resource (envelope projected to the URL's served version).
@@ -102,7 +111,8 @@ Authorization: Bearer <operator-jwt>
     "name": "my-widget",
     "revision": 7,
     "annotations": {"team": "platform"},
-    "finalizers": ["controller.example.com/cleanup"]
+    "finalizers": ["controller.example.com/cleanup"],
+    "ownerReferences": []
   },
   "spec": {"color": "red"}
 }
@@ -111,6 +121,8 @@ Authorization: Bearer <operator-jwt>
 - `metadata.revision` is required; omitting it is `400`.
 - A revision mismatch is `409 Conflict`.
 - `metadata.name` must equal the URL name (or the stored row's name when addressed by UID) — resources cannot be renamed.
+- `metadata.ownerReferences` replaces the complete owner-reference set. Omitting
+  it is equivalent to an empty set.
 - `status` is rejected on update (use the `status` subresource).
 - Reads (GET/LIST) work for any *served* version. Writes (POST/PUT) must use the *storage* version — a write targeting a served non-storage version is rejected with `422 Unprocessable Entity` (version conversion is not yet implemented).
 
@@ -147,7 +159,8 @@ DELETE /api/v1/resources/rise.dev/v1alpha1/organizations/acme
 Authorization: Bearer <operator-jwt>
 ```
 
-`DELETE` always cascades to the subtree (see [Storage Model](./storage)). Two response shapes:
+`DELETE` always cascades through structural children and owner-reference
+dependents (see [Storage Model](./storage)). Two response shapes:
 
 - `200 OK` with `{"deleted": true, "uid": "..."}` — row had no finalizers and no children, hard-deleted in place.
 - `202 Accepted` with `{"deleted": false, "markedForDeletion": true, "resource": ...}` — row tombstoned, cascade in progress. The returned envelope carries the row at its post-stamp state (`metadata.deletionTimestamp` set, `metadata.finalizers` may include `system.rise.dev/cascade-deletion`).

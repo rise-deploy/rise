@@ -1,5 +1,37 @@
 {
   "$defs": {
+    "OwnerReference": {
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*/[a-z0-9]+$",
+          "type": "string"
+        },
+        "kind": {
+          "pattern": "^[A-Z][A-Za-z0-9]*$",
+          "type": "string"
+        },
+        "name": {
+          "maxLength": 253,
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$",
+          "type": "string"
+        },
+        "uid": {
+          "format": "uuid",
+          "not": {
+            "const": "00000000-0000-0000-0000-000000000000"
+          },
+          "type": "string"
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "name",
+        "uid"
+      ],
+      "type": "object"
+    },
     "ResourceDefinitionSpec": {
       "properties": {
         "allowedStatusControllerIds": {
@@ -104,6 +136,12 @@
         },
         "name": {
           "type": "string"
+        },
+        "ownerReferences": {
+          "items": {
+            "$ref": "#/$defs/OwnerReference"
+          },
+          "type": "array"
         },
         "revision": {
           "format": "int64",

@@ -217,7 +217,7 @@ scope and avoiding dead-end compatibility layers.
 
 ## Increment 4 — identity resource contracts
 
-- State: published as draft PR #419; awaiting CI and review.
+- State: merged in PR #419 at commit `a20c32c`.
 - Branch: `feat/adr0001-identity-contracts`.
 - Acceptance criteria:
   - `rise-resource-api` owns closed serialized contracts for `User`,
@@ -292,4 +292,47 @@ scope and avoiding dead-end compatibility layers.
   - Activation remains deliberately deferred: the runtime registry and lookup
     adapters are unchanged, and the next increment must audit pre-existing
     conflicts transactionally before enabling identity routes.
-- PR: #419, draft.
+- PR: #419, merged.
+
+## Increment 5 — generic lifecycle owner references
+
+- State: implementation in progress; not yet published.
+- Branch: `feat/resource-owner-references`.
+- Acceptance criteria:
+  - The generic create, update, response, row, and store contracts carry optional
+    typed `metadata.ownerReferences` without activating identity resources.
+  - References are UID-authoritative and admitted only when API group/kind,
+    canonical name, and UID identify the same live resource; duplicate owner
+    UIDs and lifecycle cycles are rejected.
+  - Cycle detection treats structural parent edges and owner-reference edges as
+    one DAG and is serialized for edge-creating writes.
+  - Owner deletion stamps direct owner-reference dependents, respects their
+    finalizers, and keeps the owner observable until every dependent drains.
+  - `resources.owner_references` is the only persisted representation. A GIN
+    containment index supplies reverse UID lookup; there is no edge table,
+    trigger projection, or application dual-write to keep synchronized.
+  - GroupMembership's optional matching-User owner rule remains deferred to
+    transaction-scoped identity admission and runtime activation.
+- Decisions:
+  - Keep lifecycle ownership separate from structural parentage and from
+    authorization. It does not change URLs, subject expansion, policy matching,
+    or grants.
+  - Multiple owners are supported generically. Deletion of any owner starts
+    dependent collection, while removing owner references explicitly leaves the
+    resource independent.
+  - Store-level renames refresh inbound owner-reference name descriptors and
+    dependent revisions atomically; the lifecycle binding remains the UID.
+  - Serialize edge-creating/replacing writes with rename and collection so row
+    locks follow one order. Empty ordinary writes and edge removal cannot create
+    cycles and retain the existing concurrent fast path.
+- Verification:
+  - API contract tests pass, including Serde/JSON Schema parity and support for
+    ResourceDefinition DNS-subdomain names.
+  - Focused PostgreSQL tests pass for persistence, replacement, indexed
+    cascading, finalizer blocking, stale identity and duplicate rejection, and
+    mixed structural/owner-reference cycles.
+  - The all-features workspace check and strict Clippy pass.
+  - The serial all-features workspace suite passes, including all 63
+    PostgreSQL-backed resource-store integration tests.
+  - SQLX metadata verification, generated resource-schema consistency, and
+    Helm lint pass.

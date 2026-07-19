@@ -5,13 +5,14 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
-use crate::{ResourceParentRef, ResourceRow, ValidationError};
+use crate::{OwnerReference, ResourceParentRef, ResourceRow, ValidationError};
 
 /// Reserved finalizer prefix for store-managed finalizers. Controllers cannot
 /// add or remove finalizers in this namespace.
 pub const SYSTEM_FINALIZER_PREFIX: &str = "system.rise.dev/";
-/// Finalizer added to a parent resource when it is deleted while it still has
-/// children. The store removes it once the subtree has drained.
+/// Finalizer added to a resource while it still has structural or
+/// owner-reference dependents. The store removes it once the lifecycle DAG
+/// below that resource has drained.
 pub const CASCADE_DELETION_FINALIZER: &str = "system.rise.dev/cascade-deletion";
 /// Maximum `ResourceDefinition` parent-chain depth. Registration rejects a
 /// longer or cyclic chain, and path resolution caps its walk at this bound.
@@ -95,6 +96,7 @@ pub struct CreateResourceParams {
     pub parent_uid: Option<Uuid>,
     pub annotations: BTreeMap<String, String>,
     pub finalizers: Vec<String>,
+    pub owner_references: Vec<OwnerReference>,
     pub spec: serde_json::Value,
     pub validator: Option<Arc<dyn SpecValidator>>,
 }
@@ -108,6 +110,7 @@ impl Default for CreateResourceParams {
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: Vec::new(),
+            owner_references: Vec::new(),
             spec: serde_json::Value::Object(serde_json::Map::new()),
             validator: None,
         }
@@ -123,6 +126,7 @@ pub struct UpdateResourceParams {
     pub revision: i64,
     pub annotations: BTreeMap<String, String>,
     pub finalizers: Vec<String>,
+    pub owner_references: Vec<OwnerReference>,
     pub spec: serde_json::Value,
     pub validator: Option<Arc<dyn SpecValidator>>,
 }
@@ -212,24 +216,28 @@ pub trait ResourceStore: Send + Sync {
         params: UpdateResourceParams,
     ) -> Result<ResourceRow, StoreError>;
     /// Rename a resource, bumping `revision` and `updated_at` while preserving
-    /// UID, discriminator, spec, metadata, finalizers, parent, and API version.
+    /// UID, discriminator, spec, metadata, finalizers, owner references,
+    /// parent, and API version. Inbound owner-reference name descriptors are
+    /// refreshed atomically while their UID binding remains unchanged.
     /// Same-scope collisions return [`StoreError::NameConflict`].
     ///
-    /// Tombstoned rows remain renamable for bootstrap use; callers provide
-    /// their own lock. ResourceDefinitions cannot be renamed because their
-    /// names are structural and a rename would desynchronize projection data.
+    /// Tombstoned rows remain renamable for bootstrap use. Implementations
+    /// serialize the row and inbound-reference rewrite. ResourceDefinitions
+    /// cannot be renamed because their names are structural and a rename would
+    /// desynchronize projection data.
     async fn rename(&self, uid: Uuid, new_name: &str) -> Result<ResourceRow, StoreError>;
-    /// Delete or tombstone a resource while cascading through its subtree.
+    /// Delete or tombstone a resource while cascading through its lifecycle DAG.
     ///
-    /// The store stamps the resource and immediate children, adds
-    /// [`CASCADE_DELETION_FINALIZER`] when children exist, and hard-deletes only
-    /// once the subtree and all finalizers have drained. A childless resource
-    /// without finalizers is deleted immediately.
+    /// The store stamps the resource, immediate structural children, and direct
+    /// owner-reference dependents; adds [`CASCADE_DELETION_FINALIZER`] when
+    /// dependents exist; and hard-deletes only once the dependent graph and all
+    /// finalizers have drained. A resource without dependents or finalizers is
+    /// deleted immediately.
     async fn delete(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError>;
     /// Idempotent garbage-collection sweep for one resource.
     ///
     /// A live row is returned unchanged as `MarkedForDeletion`. A tombstoned
-    /// row with children fans deletion out and retains the cascade finalizer.
+    /// row with dependents fans deletion out and retains the cascade finalizer.
     /// A tombstoned leaf loses the cascade finalizer and is hard-deleted only
     /// when no other finalizers remain.
     async fn try_collect(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError>;

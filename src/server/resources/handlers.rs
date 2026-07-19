@@ -891,6 +891,7 @@ async fn create_resource(
         parent_uid,
         annotations,
         finalizers: body.metadata.finalizers,
+        owner_references: body.metadata.owner_references,
         spec,
         validator: Some(resolved.info.spec_validator.clone()),
     };
@@ -980,6 +981,7 @@ async fn update_resource(
         revision: body.metadata.revision,
         annotations,
         finalizers: body.metadata.finalizers,
+        owner_references: body.metadata.owner_references,
         spec,
         validator: Some(resolved.info.spec_validator.clone()),
     };
@@ -1268,6 +1270,7 @@ mod tests {
             status: serde_json::json!({}),
             revision: 1,
             finalizers: vec![],
+            owner_references: vec![],
             deletion_timestamp: None,
             created_at: now,
             updated_at: now,
@@ -1385,6 +1388,7 @@ mod dispatch_tests {
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec,
                 validator: None,
             })
@@ -1413,6 +1417,7 @@ mod dispatch_tests {
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec,
                 validator: None,
             })
@@ -1439,6 +1444,7 @@ mod dispatch_tests {
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec,
                 validator: None,
             })
@@ -1871,6 +1877,7 @@ mod dispatch_tests {
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: serde_json::json!({"size": "large"}),
                 validator: None,
             })
@@ -2094,6 +2101,7 @@ mod dispatch_tests {
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: org_spec,
                 validator: Some(Arc::new(
                     rise_resource_store_postgres::OrganizationValidator,
@@ -2201,6 +2209,7 @@ mod dispatch_tests {
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: org_spec,
                 validator: Some(Arc::new(
                     rise_resource_store_postgres::OrganizationValidator,
@@ -2400,6 +2409,7 @@ mod dispatch_tests {
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec,
                 validator: None,
             })
@@ -2417,6 +2427,7 @@ mod dispatch_tests {
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: serde_json::json!({"size": "large"}),
                 validator: None,
             })

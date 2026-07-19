@@ -17,11 +17,12 @@ Every resource row carries these fields:
 | `parent_uid` | UUID NULL | Parent row's `uid`. NULL means root-scoped. |
 | `name` | TEXT | User-chosen name. Scope-unique. |
 | `discriminator` | VARCHAR(8) | System-generated. Scope-unique. |
-| `metadata` | JSONB | Annotations, finalizers, deletion timestamp. |
+| `metadata` | JSONB | Resource annotations. |
 | `spec` | JSONB | Caller-controlled desired state. |
 | `status` | JSONB | Controller-owned observed state (`status.controllers[<id>]`). |
 | `revision` | BIGINT | Monotonic version counter. Increments on every write. |
 | `finalizers` | TEXT[] | Cleanup tokens that block hard-delete. |
+| `owner_references` | JSONB | Optional UID-authoritative lifecycle owners. |
 | `deletion_timestamp` | TIMESTAMPTZ NULL | Tombstone marker. |
 | `created_at`, `updated_at` | TIMESTAMPTZ | Standard audit timestamps. |
 
@@ -30,6 +31,7 @@ The store enforces these invariants at the database level:
 - `discriminator` matches `^[a-z0-9][a-z0-9-]{6}[a-z0-9]$` (8 lowercase DNS-safe chars, no leading or trailing hyphen).
 - `name` matches a DNS-label (`my-app`) or DNS-subdomain (`widgets.example.dev`) format, max 253 chars.
 - `metadata`, `spec`, `status` must each be a JSON object.
+- `owner_references` must be a JSON array.
 
 And these uniqueness invariants:
 
@@ -74,13 +76,45 @@ Each ResourceDefinition declares exactly one `parent` (or none, for root-scoped 
 
 The store caps parent-chain depth (and the `resolve_path` ancestor walk) at `MAX_PARENT_CHAIN_DEPTH = 32`. Registration also rejects cyclic parent graphs.
 
+## Owner references
+
+`metadata.ownerReferences` adds lifecycle edges without changing structural
+parentage or URL scope. Each typed reference carries `apiVersion`, `kind`,
+`name`, and `uid`; a write succeeds only when those fields identify the same
+live row. The UID is authoritative after admission, so deleting and recreating
+the same name cannot transfer lifecycle ownership.
+
+The `resources.owner_references` JSONB column is the sole persisted source of
+truth. A `jsonb_path_ops` GIN index accelerates reverse `@>` containment lookup
+when the collector needs all resources that reference an owner UID. There is no
+edge table, trigger-maintained projection, or application dual-write to drift
+from the resource envelope.
+
+`ResourceStore::rename`—currently used only by bootstrap to reconcile the
+default Organization with its configured name—rewrites the matching `name`
+descriptor in inbound references and bumps those dependent revisions in the
+same transaction. Normal HTTP updates cannot rename resources, and
+ResourceDefinitions cannot be renamed. This keeps references inspectable
+without changing their UID binding.
+
+Edge-creating owner-reference mutations, rename, and collection take a
+transaction-scoped graph lock so graph checks and row locks have one ordering.
+Admission locks referenced owners, rejects duplicate UIDs and tombstoned or
+mismatched owners, and runs a recursive cycle check over both structural
+`parent_uid` edges and owner-reference edges. Multiple owners are allowed;
+deletion of any one owner starts deletion of the dependent. Owner references are
+lifecycle-only and confer no authorization.
+
 ## Lifecycle: create
 
 The create path validates the spec (via the typed validator for built-ins, JSON Schema for external custom resources), generates a discriminator, and inserts the row at `revision = 1`. Same-level name and discriminator conflicts surface as `409 Conflict`.
 
 ## Lifecycle: update
 
-`PUT` replaces the resource's user-controlled fields (`spec`, plus `metadata.annotations` and `metadata.finalizers`) under optimistic concurrency on `revision`. The body's `metadata.name` must equal the stored name — resources cannot be renamed.
+`PUT` replaces the resource's user-controlled fields (`spec`, plus
+`metadata.annotations`, `metadata.finalizers`, and
+`metadata.ownerReferences`) under optimistic concurrency on `revision`. The
+body's `metadata.name` must equal the stored name — resources cannot be renamed.
 
 `api_version` may be changed to a different declared version of the same group via the store's `UpdateResourceParams.api_version`; the HTTP API translates a served request version to the collection's storage version before calling the store.
 
@@ -88,14 +122,21 @@ Identity fields (`uid`, `discriminator`, `deletionTimestamp`) cannot be modified
 
 ## Lifecycle: delete (cascade + finalizers)
 
-`DELETE` always cascades to the subtree. Behavior depends on the row's state:
+`DELETE` always cascades through both structural children and owner-reference
+dependents. Behavior depends on the row's state:
 
 | Row state | Outcome |
 |---|---|
-| No finalizers, no children | Hard-deleted in one transaction. Returns `200 OK`. |
-| Has finalizers and/or children | Tombstoned (`deletion_timestamp` set). Returns `202 Accepted`. |
+| No finalizers, no dependents | Hard-deleted in one transaction. Returns `200 OK`. |
+| Has finalizers and/or dependents | Tombstoned (`deletion_timestamp` set). Returns `202 Accepted`. |
 
-When children exist at delete time, the store stamps `deletion_timestamp` on **immediate children only** in the same transaction and attaches the system finalizer `system.rise.dev/cascade-deletion` to the parent. A background garbage collector (see below) drains the subtree bottom-up by repeatedly calling `try_collect` on tombstoned rows — each call stamps the next layer of children, and eventually hard-deletes a row when all its finalizers and children are gone.
+When dependents exist at delete time, the store stamps `deletion_timestamp` on
+immediate structural children and direct owner-reference dependents in the same
+transaction, then attaches the system finalizer
+`system.rise.dev/cascade-deletion` to the owner. A background garbage collector
+(see below) drains the lifecycle DAG bottom-up by repeatedly calling
+`try_collect` on tombstoned rows. Each call stamps the next layer and eventually
+hard-deletes a row when all its finalizers and dependents are gone.
 
 `ON DELETE CASCADE` is deliberately not used. That would bypass child finalizers; the cascade-stamping + GC sweep is the substitute.
 

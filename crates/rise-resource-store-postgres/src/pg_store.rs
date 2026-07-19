@@ -4,9 +4,9 @@ use uuid::Uuid;
 
 use rise_resource_api::{
     validate_controller_id, validate_resource_name, CollectionInfo, CreateResourceParams,
-    DeleteOutcome, NoOpValidator, PathSegment, ResourceDefinitionSpec, ResourceRow, ResourceStore,
-    SpecValidator, StoreError, UpdateResourceParams, API_VERSION_V1ALPHA1,
-    CASCADE_DELETION_FINALIZER, MAX_PARENT_CHAIN_DEPTH, ORGANIZATION_KIND,
+    DeleteOutcome, NoOpValidator, OwnerReference, PathSegment, ResourceDefinitionSpec,
+    ResourceKind, ResourceRow, ResourceStore, SpecValidator, StoreError, UpdateResourceParams,
+    API_VERSION_V1ALPHA1, CASCADE_DELETION_FINALIZER, MAX_PARENT_CHAIN_DEPTH, ORGANIZATION_KIND,
     RESOURCE_DEFINITION_KIND, SYSTEM_FINALIZER_PREFIX,
 };
 use sqlx::{PgPool, Row};
@@ -86,6 +86,144 @@ impl PgResourceStore {
         }
     }
 
+    fn canonical_owner_references(
+        references: &[OwnerReference],
+    ) -> Result<Vec<OwnerReference>, StoreError> {
+        let mut references = references.to_vec();
+        references.sort_by_key(OwnerReference::uid);
+        for pair in references.windows(2) {
+            if pair[0].uid() == pair[1].uid() {
+                return Err(StoreError::Validation(format!(
+                    "duplicate owner reference UID '{}'",
+                    pair[0].uid()
+                )));
+            }
+        }
+        Ok(references)
+    }
+
+    async fn lock_owner_reference_graph(conn: &mut sqlx::PgConnection) -> Result<(), StoreError> {
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtext('resource_owner_reference_cycle')::bigint)",
+        )
+        .execute(conn)
+        .await
+        .map_err(StoreError::backend)?;
+        Ok(())
+    }
+
+    async fn validate_owner_references(
+        conn: &mut sqlx::PgConnection,
+        dependent_uid: Uuid,
+        references: &[OwnerReference],
+    ) -> Result<Vec<OwnerReference>, StoreError> {
+        let references = Self::canonical_owner_references(references)?;
+        if references.is_empty() {
+            // Removing edges cannot create a cycle. Skipping the global graph
+            // lock also keeps the overwhelmingly common unowned write path
+            // fully concurrent.
+            return Ok(references);
+        }
+
+        // Serialize cycle checks and edge replacement. Resource owner graphs
+        // are expected to be small and mutations rare; one transaction lock
+        // closes races where concurrent individually-acyclic writes would form
+        // a cycle together.
+        Self::lock_owner_reference_graph(conn).await?;
+
+        let owner_uids: Vec<Uuid> = references.iter().map(OwnerReference::uid).collect();
+        if !owner_uids.is_empty() {
+            let owners = sqlx::query_as::<
+                _,
+                (
+                    Uuid,
+                    String,
+                    String,
+                    String,
+                    Option<chrono::DateTime<chrono::Utc>>,
+                ),
+            >(
+                r#"
+                SELECT uid, api_version, kind, name, deletion_timestamp
+                FROM resource_store.resources
+                WHERE uid = ANY($1)
+                ORDER BY uid
+                FOR UPDATE
+                "#,
+            )
+            .bind(&owner_uids)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(StoreError::backend)?;
+
+            let owners_by_uid: HashMap<_, _> =
+                owners.into_iter().map(|owner| (owner.0, owner)).collect();
+            for reference in &references {
+                let Some((_, api_version, kind, name, deletion_timestamp)) =
+                    owners_by_uid.get(&reference.uid())
+                else {
+                    return Err(StoreError::Validation(format!(
+                        "owner reference UID '{}' does not identify a live resource",
+                        reference.uid()
+                    )));
+                };
+                if deletion_timestamp.is_some() {
+                    return Err(StoreError::Validation(format!(
+                        "owner reference UID '{}' is pending deletion",
+                        reference.uid()
+                    )));
+                }
+                let stored_kind = ResourceKind::from_api_route(api_version, kind)?;
+                if stored_kind != reference.resource_kind()? || name != reference.name() {
+                    return Err(StoreError::Validation(format!(
+                        "owner reference UID '{}' does not match {}/{} named '{}'",
+                        reference.uid(),
+                        reference.api_version(),
+                        reference.kind(),
+                        reference.name()
+                    )));
+                }
+            }
+
+            let creates_cycle: bool = sqlx::query_scalar(
+                r#"
+                WITH RECURSIVE reachable(uid) AS (
+                    SELECT $1::uuid
+                    UNION
+                    SELECT edge.dependent_uid
+                    FROM reachable current
+                    JOIN (
+                        SELECT uid AS dependent_uid, parent_uid AS owner_uid
+                        FROM resource_store.resources
+                        WHERE parent_uid IS NOT NULL
+                        UNION ALL
+                        SELECT resource.uid AS dependent_uid,
+                               (reference->>'uid')::uuid AS owner_uid
+                        FROM resource_store.resources resource
+                        CROSS JOIN LATERAL
+                            jsonb_array_elements(resource.owner_references) reference
+                    ) edge ON edge.owner_uid = current.uid
+                )
+                SELECT EXISTS(
+                    SELECT 1 FROM reachable WHERE uid = ANY($2)
+                )
+                "#,
+            )
+            .bind(dependent_uid)
+            .bind(&owner_uids)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(StoreError::backend)?;
+            if creates_cycle {
+                return Err(StoreError::Validation(
+                    "owner references would create a lifecycle cycle".into(),
+                ));
+            }
+        }
+
+        Ok(references)
+    }
+
     /// Project this store's built-in registry into a `CollectionInfo` for
     /// `collection`. Returns `None` when `collection` is not a registered
     /// built-in; the caller falls through to the `resource_definitions`
@@ -108,6 +246,7 @@ impl PgResourceStore {
         params: &CreateResourceParams,
         metadata: serde_json::Value,
     ) -> Result<ResourceRow, StoreError> {
+        let owner_references = Self::canonical_owner_references(&params.owner_references)?;
         for _ in 0..10 {
             let discriminator = discriminator::generate();
 
@@ -119,8 +258,9 @@ impl PgResourceStore {
             let result = sqlx::query_as::<_, PgResourceRow>(
                 r#"
                 INSERT INTO resource_store.resources
-                    (api_version, kind, parent_uid, name, discriminator, metadata, spec, finalizers)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    (api_version, kind, parent_uid, name, discriminator, metadata, spec,
+                     finalizers, owner_references)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 RETURNING *
                 "#,
             )
@@ -132,6 +272,7 @@ impl PgResourceStore {
             .bind(metadata.clone())
             .bind(&params.spec)
             .bind(&params.finalizers)
+            .bind(serde_json::to_value(&owner_references).unwrap_or_default())
             .fetch_one(&mut *conn)
             .await;
 
@@ -415,6 +556,9 @@ impl ResourceStore for PgResourceStore {
         let metadata = serde_json::to_value(&params.annotations).unwrap_or_default();
 
         let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
+        if !params.owner_references.is_empty() {
+            Self::lock_owner_reference_graph(&mut tx).await?;
+        }
         let is_builtin =
             params.api_version == API_VERSION_V1ALPHA1 && params.kind == ORGANIZATION_KIND;
         // Always require the lock (and therefore verify the RD exists) unless this is a
@@ -428,7 +572,11 @@ impl ResourceStore for PgResourceStore {
         )
         .await?;
         let row = Self::insert_resource_row_with_retry(&mut tx, &params, metadata).await?;
+        let owner_references =
+            Self::validate_owner_references(&mut tx, row.uid, &params.owner_references).await?;
         tx.commit().await.map_err(StoreError::backend)?;
+        let mut row = row;
+        row.owner_references = owner_references;
         Ok(row)
     }
 
@@ -578,6 +726,9 @@ impl ResourceStore for PgResourceStore {
         // a concurrent write that already incremented the revision will cause zero rows
         // to be affected, which we detect and map to RevisionConflict.
         let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
+        if !params.owner_references.is_empty() {
+            Self::lock_owner_reference_graph(&mut tx).await?;
+        }
         // Always acquire the FOR SHARE lock on the matching ResourceDefinition for
         // non-builtin external kinds, regardless of whether a validator was provided.
         // Without the lock, a concurrent hard-delete of the ResourceDefinition can
@@ -607,6 +758,9 @@ impl ResourceStore for PgResourceStore {
             .await?;
         }
 
+        let owner_references =
+            Self::validate_owner_references(&mut tx, uid, &params.owner_references).await?;
+
         let updated = sqlx::query_as::<_, PgResourceRow>(
             r#"
             UPDATE resource_store.resources
@@ -614,6 +768,7 @@ impl ResourceStore for PgResourceStore {
                 metadata   = $2,
                 spec       = $3,
                 finalizers = $4,
+                owner_references = $7,
                 revision   = revision + 1,
                 updated_at = NOW()
             WHERE uid = $5 AND revision = $6
@@ -626,6 +781,7 @@ impl ResourceStore for PgResourceStore {
         .bind(&params.finalizers)
         .bind(uid)
         .bind(params.revision)
+        .bind(serde_json::to_value(&owner_references).unwrap_or_default())
         .fetch_optional(&mut *tx)
         .await;
 
@@ -652,14 +808,18 @@ impl ResourceStore for PgResourceStore {
     }
 
     async fn rename(&self, uid: Uuid, new_name: &str) -> Result<ResourceRow, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
+        Self::lock_owner_reference_graph(&mut tx).await?;
+
         // Refuse to rename ResourceDefinitions: their name is structural
         // (`{plural}.{group}`) and the projection table would desync.
-        let kind: Option<String> =
-            sqlx::query_scalar("SELECT kind FROM resource_store.resources WHERE uid = $1")
-                .bind(uid)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(StoreError::backend)?;
+        let kind: Option<String> = sqlx::query_scalar(
+            "SELECT kind FROM resource_store.resources WHERE uid = $1 FOR UPDATE",
+        )
+        .bind(uid)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(StoreError::backend)?;
         let Some(kind) = kind else {
             return Err(StoreError::NotFound);
         };
@@ -681,19 +841,57 @@ impl ResourceStore for PgResourceStore {
         )
         .bind(new_name)
         .bind(uid)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await;
 
-        match updated {
-            Ok(Some(row)) => Ok(row.into()),
-            Ok(None) => Err(StoreError::NotFound),
-            Err(ref e) if Self::is_name_conflict(e) => Err(StoreError::NameConflict),
-            Err(e) => Err(StoreError::backend(e)),
-        }
+        let updated = match updated {
+            Ok(Some(row)) => row,
+            Ok(None) => return Err(StoreError::NotFound),
+            Err(ref error) if Self::is_name_conflict(error) => {
+                return Err(StoreError::NameConflict)
+            }
+            Err(error) => return Err(StoreError::backend(error)),
+        };
+
+        // UID remains authoritative, but keep the inspectable name descriptor
+        // canonical when ResourceStore::rename is used (currently by default
+        // Organization bootstrap). The same transaction prevents a successful
+        // rename from leaving dependent envelopes stale.
+        sqlx::query(
+            r#"
+            UPDATE resource_store.resources AS dependent
+            SET owner_references = (
+                    SELECT jsonb_agg(
+                        CASE
+                            WHEN reference->>'uid' = $1::text
+                            THEN jsonb_set(reference, '{name}', to_jsonb($2::text))
+                            ELSE reference
+                        END
+                        ORDER BY ordinal
+                    )
+                    FROM jsonb_array_elements(dependent.owner_references)
+                         WITH ORDINALITY AS refs(reference, ordinal)
+                ),
+                revision = revision + 1,
+                updated_at = NOW()
+            WHERE owner_references @> jsonb_build_array(
+                jsonb_build_object('uid', $1::text)
+            )
+            "#,
+        )
+        .bind(uid)
+        .bind(new_name)
+        .execute(&mut *tx)
+        .await
+        .map_err(StoreError::backend)?;
+
+        tx.commit().await.map_err(StoreError::backend)?;
+        Ok(updated.into())
     }
 
     async fn delete(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError> {
         let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
+        Self::lock_owner_reference_graph(&mut tx).await?;
 
         // Lock the row inside the transaction so a concurrent update_controller_finalizers()
         // can't add a finalizer between our read and the hard-delete branch below.
@@ -706,24 +904,45 @@ impl ResourceStore for PgResourceStore {
         .map_err(StoreError::backend)?
         .ok_or(StoreError::NotFound)?;
 
-        let child_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM resource_store.resources WHERE parent_uid = $1",
+        let dependent_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM (
+                SELECT uid AS dependent_uid
+                FROM resource_store.resources
+                WHERE parent_uid = $1
+                UNION
+                SELECT uid
+                FROM resource_store.resources
+                WHERE owner_references @> jsonb_build_array(
+                    jsonb_build_object('uid', $1::text)
+                )
+            ) dependents
+            "#,
         )
         .bind(uid)
         .fetch_one(&mut *tx)
         .await
         .map_err(StoreError::backend)?;
 
-        if child_count > 0 {
-            // Stamp immediate children that aren't already marked. A future GC sweep
-            // (try_collect) drives the fan-out down the remaining levels. Bump
-            // revision on each affected child so concurrent updates see the change.
+        if dependent_count > 0 {
+            // Stamp immediate structural children and owner-reference dependents
+            // that aren't already marked. A future GC sweep drives fan-out down
+            // the remaining lifecycle graph.
             sqlx::query(
                 r#"
                 UPDATE resource_store.resources
                 SET deletion_timestamp = NOW(),
                     revision = revision + 1
-                WHERE parent_uid = $1 AND deletion_timestamp IS NULL
+                WHERE uid IN (
+                    SELECT uid FROM resource_store.resources WHERE parent_uid = $1
+                    UNION
+                    SELECT uid
+                    FROM resource_store.resources
+                    WHERE owner_references @> jsonb_build_array(
+                        jsonb_build_object('uid', $1::text)
+                    )
+                )
+                  AND deletion_timestamp IS NULL
                 "#,
             )
             .bind(uid)
@@ -794,6 +1013,7 @@ impl ResourceStore for PgResourceStore {
 
     async fn try_collect(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError> {
         let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
+        Self::lock_owner_reference_graph(&mut tx).await?;
 
         let row = sqlx::query_as::<_, PgResourceRow>(
             "SELECT * FROM resource_store.resources WHERE uid = $1 FOR UPDATE",
@@ -809,24 +1029,44 @@ impl ResourceStore for PgResourceStore {
             return Ok(DeleteOutcome::MarkedForDeletion(Box::new(row.into())));
         }
 
-        let child_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM resource_store.resources WHERE parent_uid = $1",
+        let dependent_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM (
+                SELECT uid AS dependent_uid
+                FROM resource_store.resources
+                WHERE parent_uid = $1
+                UNION
+                SELECT uid
+                FROM resource_store.resources
+                WHERE owner_references @> jsonb_build_array(
+                    jsonb_build_object('uid', $1::text)
+                )
+            ) dependents
+            "#,
         )
         .bind(uid)
         .fetch_one(&mut *tx)
         .await
         .map_err(StoreError::backend)?;
 
-        if child_count > 0 {
-            // Fan out: stamp any unmarked children. Ensure the cascade finalizer is present
-            // (in case the row was tombstoned by some other path that didn't add it). Bump
-            // revision on every row we mutate so observers see the change.
+        if dependent_count > 0 {
+            // Fan out through both structural and owner-reference edges. Ensure
+            // the cascade finalizer is present and bump every mutated dependent.
             sqlx::query(
                 r#"
                 UPDATE resource_store.resources
                 SET deletion_timestamp = NOW(),
                     revision = revision + 1
-                WHERE parent_uid = $1 AND deletion_timestamp IS NULL
+                WHERE uid IN (
+                    SELECT uid FROM resource_store.resources WHERE parent_uid = $1
+                    UNION
+                    SELECT uid
+                    FROM resource_store.resources
+                    WHERE owner_references @> jsonb_build_array(
+                        jsonb_build_object('uid', $1::text)
+                    )
+                )
+                  AND deletion_timestamp IS NULL
                 "#,
             )
             .bind(uid)
@@ -1461,6 +1701,9 @@ impl ResourceStore for PgResourceStore {
         Self::validate_version_schemas(&spec, &format!("'{}'", params.name))?;
 
         let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
+        if !params.owner_references.is_empty() {
+            Self::lock_owner_reference_graph(&mut tx).await?;
+        }
 
         // Acquire a transaction-scoped advisory lock before the cycle check so that two
         // concurrent registrations cannot both pass the check before either commits.
@@ -1485,11 +1728,16 @@ impl ResourceStore for PgResourceStore {
         // error. The `resource_definitions` projection is a view, so there is no
         // second row to write.
         let resource_row = Self::insert_resource_row_with_retry(&mut tx, &params, metadata).await?;
+        let owner_references =
+            Self::validate_owner_references(&mut tx, resource_row.uid, &params.owner_references)
+                .await?;
 
         tx.commit().await.map_err(StoreError::backend)?;
 
         self.invalidate_schema_cache(&spec.group, &spec.plural);
 
+        let mut resource_row = resource_row;
+        resource_row.owner_references = owner_references;
         Ok(resource_row)
     }
 
@@ -1508,6 +1756,9 @@ impl ResourceStore for PgResourceStore {
         Self::validate_version_schemas(&new_spec, "")?;
 
         let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
+        if !params.owner_references.is_empty() {
+            Self::lock_owner_reference_graph(&mut tx).await?;
+        }
 
         // Lock the row and fetch current state
         let current = sqlx::query_as::<_, PgResourceRow>(
@@ -1588,6 +1839,8 @@ impl ResourceStore for PgResourceStore {
         }
 
         let metadata = serde_json::to_value(&params.annotations).unwrap_or_default();
+        let owner_references =
+            Self::validate_owner_references(&mut tx, uid, &params.owner_references).await?;
 
         // Update the resources row with optimistic concurrency
         let updated = sqlx::query_as::<_, PgResourceRow>(
@@ -1597,6 +1850,7 @@ impl ResourceStore for PgResourceStore {
                 metadata   = $2,
                 spec       = $3,
                 finalizers = $4,
+                owner_references = $7,
                 revision   = revision + 1,
                 updated_at = NOW()
             WHERE uid = $5 AND revision = $6
@@ -1609,6 +1863,7 @@ impl ResourceStore for PgResourceStore {
         .bind(&params.finalizers)
         .bind(uid)
         .bind(params.revision)
+        .bind(serde_json::to_value(&owner_references).unwrap_or_default())
         .fetch_optional(&mut *tx)
         .await;
 

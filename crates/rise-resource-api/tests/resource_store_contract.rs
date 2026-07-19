@@ -152,6 +152,7 @@ fn create_params_have_empty_optional_defaults() {
     assert!(params.parent_uid.is_none());
     assert!(params.annotations.is_empty());
     assert!(params.finalizers.is_empty());
+    assert!(params.owner_references.is_empty());
     assert_eq!(params.spec, serde_json::json!({}));
     assert!(params.validator.is_none());
 }
@@ -187,6 +188,7 @@ fn row(
         status,
         revision: 1,
         finalizers: vec![],
+        owner_references: vec![],
         deletion_timestamp: None,
         created_at: now,
         updated_at: now,
