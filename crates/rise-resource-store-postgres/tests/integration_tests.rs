@@ -2163,14 +2163,6 @@ async fn owner_references_are_persisted_and_replaceable(pool: sqlx::PgPool) -> s
         vec![owner_reference(&owner)]
     );
 
-    let renamed_owner = store.rename(owner.uid, "renamed-owner").await.unwrap();
-    let fetched = store.get(dependent.uid).await.unwrap().unwrap();
-    assert_eq!(
-        fetched.owner_references,
-        vec![owner_reference(&renamed_owner)]
-    );
-    assert_eq!(fetched.revision, dependent.revision + 1);
-
     let updated = store
         .update(
             dependent.uid,
@@ -2189,7 +2181,7 @@ async fn owner_references_are_persisted_and_replaceable(pool: sqlx::PgPool) -> s
     assert!(updated.owner_references.is_empty());
 
     assert!(matches!(
-        store.delete(renamed_owner.uid).await.unwrap(),
+        store.delete(owner.uid).await.unwrap(),
         DeleteOutcome::Deleted
     ));
     assert!(store.get(dependent.uid).await.unwrap().is_some());
@@ -2741,134 +2733,5 @@ async fn resolve_path_empty_returns_error(pool: sqlx::PgPool) -> sqlx::Result<()
     let store = PgResourceStore::new(pool);
     let err = store.resolve_path(&[]).await.unwrap_err();
     assert!(matches!(err, StoreError::EmptyPath));
-    Ok(())
-}
-
-#[sqlx::test]
-async fn rename_preserves_uid_and_bumps_revision(pool: sqlx::PgPool) -> sqlx::Result<()> {
-    let store = PgResourceStore::new(pool);
-
-    let row = store
-        .create(CreateResourceParams {
-            api_version: API_VERSION_V1ALPHA1.to_string(),
-            kind: ORGANIZATION_KIND.to_string(),
-            name: "before".to_string(),
-            parent_uid: None,
-            annotations: BTreeMap::new(),
-            finalizers: vec![],
-            owner_references: vec![],
-            spec: json!({"displayName": "Before"}),
-            validator: None,
-        })
-        .await
-        .unwrap();
-    let original_uid = row.uid;
-    let original_discriminator = row.discriminator.clone();
-    let original_spec = row.spec.clone();
-
-    let renamed = store.rename(row.uid, "after").await.unwrap();
-    assert_eq!(renamed.uid, original_uid, "UID must be preserved");
-    assert_eq!(
-        renamed.discriminator, original_discriminator,
-        "discriminator must be preserved"
-    );
-    assert_eq!(renamed.name, "after");
-    assert_eq!(renamed.revision, row.revision + 1, "revision must bump");
-    assert_eq!(renamed.spec, original_spec, "spec must be untouched");
-
-    // get_by_name follows the rename.
-    assert!(store
-        .get_by_name(API_VERSION_V1ALPHA1, ORGANIZATION_KIND, "before", None)
-        .await
-        .unwrap()
-        .is_none());
-    let by_name = store
-        .get_by_name(API_VERSION_V1ALPHA1, ORGANIZATION_KIND, "after", None)
-        .await
-        .unwrap()
-        .expect("renamed row resolves under the new name");
-    assert_eq!(by_name.uid, original_uid);
-
-    Ok(())
-}
-
-#[sqlx::test]
-async fn rename_to_existing_name_yields_name_conflict(pool: sqlx::PgPool) -> sqlx::Result<()> {
-    let store = PgResourceStore::new(pool);
-
-    for name in ["a", "b"] {
-        store
-            .create(CreateResourceParams {
-                api_version: API_VERSION_V1ALPHA1.to_string(),
-                kind: ORGANIZATION_KIND.to_string(),
-                name: name.to_string(),
-                parent_uid: None,
-                annotations: BTreeMap::new(),
-                finalizers: vec![],
-                owner_references: vec![],
-                spec: json!({"displayName": name}),
-                validator: None,
-            })
-            .await
-            .unwrap();
-    }
-
-    let a = store
-        .get_by_name(API_VERSION_V1ALPHA1, ORGANIZATION_KIND, "a", None)
-        .await
-        .unwrap()
-        .unwrap();
-
-    let err = store.rename(a.uid, "b").await.unwrap_err();
-    assert!(
-        matches!(err, StoreError::NameConflict),
-        "expected NameConflict, got {err:?}"
-    );
-
-    Ok(())
-}
-
-#[sqlx::test]
-async fn rename_resource_definition_is_rejected(pool: sqlx::PgPool) -> sqlx::Result<()> {
-    let store = PgResourceStore::new(pool);
-
-    let rd = store
-        .register_resource_definition(CreateResourceParams {
-            api_version: API_VERSION_V1ALPHA1.to_string(),
-            kind: RESOURCE_DEFINITION_KIND.to_string(),
-            name: "widgets.example.dev".to_string(),
-            parent_uid: None,
-            annotations: BTreeMap::new(),
-            finalizers: vec![],
-            owner_references: vec![],
-            spec: json!({
-                "group": "example.dev",
-                "kind": "Widget",
-                "plural": "widgets",
-                "versions": [{"name": "v1", "served": true, "storage": true}],
-                "allowedStatusControllerIds": []
-            }),
-            validator: None,
-        })
-        .await
-        .unwrap();
-
-    let err = store
-        .rename(rd.uid, "renamed.example.dev")
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(err, StoreError::Validation(_)),
-        "expected Validation, got {err:?}"
-    );
-
-    Ok(())
-}
-
-#[sqlx::test]
-async fn rename_unknown_uid_yields_not_found(pool: sqlx::PgPool) -> sqlx::Result<()> {
-    let store = PgResourceStore::new(pool);
-    let err = store.rename(Uuid::new_v4(), "x").await.unwrap_err();
-    assert!(matches!(err, StoreError::NotFound), "got {err:?}");
     Ok(())
 }

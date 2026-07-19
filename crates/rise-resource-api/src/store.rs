@@ -215,17 +215,6 @@ pub trait ResourceStore: Send + Sync {
         uid: Uuid,
         params: UpdateResourceParams,
     ) -> Result<ResourceRow, StoreError>;
-    /// Rename a resource, bumping `revision` and `updated_at` while preserving
-    /// UID, discriminator, spec, metadata, finalizers, owner references,
-    /// parent, and API version. Inbound owner-reference name descriptors are
-    /// refreshed atomically while their UID binding remains unchanged.
-    /// Same-scope collisions return [`StoreError::NameConflict`].
-    ///
-    /// Tombstoned rows remain renamable for bootstrap use. Implementations
-    /// serialize the row and inbound-reference rewrite. ResourceDefinitions
-    /// cannot be renamed because their names are structural and a rename would
-    /// desynchronize projection data.
-    async fn rename(&self, uid: Uuid, new_name: &str) -> Result<ResourceRow, StoreError>;
     /// Delete or tombstone a resource while cascading through its lifecycle DAG.
     ///
     /// The store stamps the resource, immediate structural children, and direct

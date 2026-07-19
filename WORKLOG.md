@@ -320,19 +320,21 @@ scope and avoiding dead-end compatibility layers.
   - Multiple owners are supported generically. Deletion of any owner starts
     dependent collection, while removing owner references explicitly leaves the
     resource independent.
-  - Store-level renames refresh inbound owner-reference name descriptors and
-    dependent revisions atomically; the lifecycle binding remains the UID.
-  - Serialize edge-creating/replacing writes with rename and collection so row
-    locks follow one order. Empty ordinary writes and edge removal cannot create
-    cycles and retain the existing concurrent fast path.
+  - Resource names are immutable. Bootstrap creates the configured default
+    Organization only when none exist and fails startup when existing names do
+    not match, rather than exposing a generic rename operation.
+  - Serialize edge-creating/replacing writes with collection so row locks follow
+    one order. Empty ordinary writes and edge removal cannot create cycles and
+    retain the existing concurrent fast path.
 - Verification:
   - API contract tests pass, including Serde/JSON Schema parity and support for
     ResourceDefinition DNS-subdomain names.
   - Focused PostgreSQL tests pass for persistence, replacement, indexed
-    cascading, finalizer blocking, stale identity and duplicate rejection, and
-    mixed structural/owner-reference cycles.
+    cascading, finalizer blocking, stale identity and duplicate rejection,
+    mixed structural/owner-reference cycles, and fail-closed default
+    Organization bootstrap matching.
   - The all-features workspace check and strict Clippy pass.
-  - The serial all-features workspace suite passes, including all 63
+  - The serial all-features workspace suite passes, including all 59
     PostgreSQL-backed resource-store integration tests.
   - SQLX metadata verification, generated resource-schema consistency, and
     Helm lint pass.

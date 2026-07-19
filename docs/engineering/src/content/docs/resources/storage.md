@@ -90,20 +90,14 @@ when the collector needs all resources that reference an owner UID. There is no
 edge table, trigger-maintained projection, or application dual-write to drift
 from the resource envelope.
 
-`ResourceStore::rename`—currently used only by bootstrap to reconcile the
-default Organization with its configured name—rewrites the matching `name`
-descriptor in inbound references and bumps those dependent revisions in the
-same transaction. Normal HTTP updates cannot rename resources, and
-ResourceDefinitions cannot be renamed. This keeps references inspectable
-without changing their UID binding.
-
-Edge-creating owner-reference mutations, rename, and collection take a
+Edge-creating owner-reference mutations and collection take a
 transaction-scoped graph lock so graph checks and row locks have one ordering.
 Admission locks referenced owners, rejects duplicate UIDs and tombstoned or
 mismatched owners, and runs a recursive cycle check over both structural
-`parent_uid` edges and owner-reference edges. Multiple owners are allowed;
-deletion of any one owner starts deletion of the dependent. Owner references are
-lifecycle-only and confer no authorization.
+`parent_uid` edges and owner-reference edges. Resource names are immutable, so
+the inspectable name descriptor cannot drift after admission. Multiple owners
+are allowed; deletion of any one owner starts deletion of the dependent. Owner
+references are lifecycle-only and confer no authorization.
 
 ## Lifecycle: create
 
@@ -175,5 +169,10 @@ Organizations carry an optional annotation `kubernetes.rise.dev/namespace-prefix
 - When absent, the controller falls back to `org-{metadata.discriminator}-` (e.g. `org-a1b2c3d4-myapp`), which is collision-safe by construction.
 
 The bootstrap path also populates `spec.deploymentControllerClass` on the default Organization from the Kubernetes controller's configured `controller_class_name`. The Kubernetes controller only reconciles projects whose Organization carries a matching `deploymentControllerClass`; an unmatched or unset value means the org's projects are ignored, leaving room for alternate deployment backends per organization.
+
+Bootstrap creates the configured default Organization only when no
+Organizations exist. Otherwise an exact `default_organization.name` match is
+required; a nonmatching existing Organization makes backend startup fail.
+Bootstrap never renames an Organization or creates a second candidate default.
 
 Deleting an Organization that still has typed children (teams or projects linked via `organization_resource_uid`) is blocked at the application layer. Those rows are not children in the generic `resources` table, so the generic same-parent child check does not cover them — the guard must be explicit at the bootstrap/HTTP layer until typed APIs migrate onto the generic store.

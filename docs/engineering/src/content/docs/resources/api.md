@@ -35,7 +35,7 @@ The leaf identifier may be given as `uid:{uuid}` instead of a name. A UID is glo
 
 UID addressing skips the ancestor-chain resolution entirely — it works even if an ancestor's `ResourceDefinition` has been removed. This is the intended disaster-recovery path: if a RD is deleted while instances still exist, named addressing fails, but operators and controllers can still reach the orphaned rows by UID.
 
-When a UID-prefixed identifier is used in a PUT URL, the body's `metadata.name` is not validated against the URL — but it still must match the stored resource name (resources cannot be renamed via PUT).
+When a UID-prefixed identifier is used in a PUT URL, the body's `metadata.name` is not validated against the URL — but it still must match the stored resource name. Resource names are immutable.
 
 ## Auth tiers
 
@@ -120,7 +120,7 @@ Authorization: Bearer <operator-jwt>
 
 - `metadata.revision` is required; omitting it is `400`.
 - A revision mismatch is `409 Conflict`.
-- `metadata.name` must equal the URL name (or the stored row's name when addressed by UID) — resources cannot be renamed.
+- `metadata.name` must equal the URL name (or the stored row's name when addressed by UID); resource names are immutable.
 - `metadata.ownerReferences` replaces the complete owner-reference set. Omitting
   it is equivalent to an empty set.
 - `status` is rejected on update (use the `status` subresource).

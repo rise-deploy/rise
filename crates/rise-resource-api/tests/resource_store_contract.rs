@@ -45,9 +45,6 @@ impl ResourceStore for FakeStore {
     async fn update(&self, _: Uuid, _: UpdateResourceParams) -> Result<ResourceRow, StoreError> {
         Err(StoreError::NotFound)
     }
-    async fn rename(&self, _: Uuid, _: &str) -> Result<ResourceRow, StoreError> {
-        Err(StoreError::NotFound)
-    }
     async fn delete(&self, _: Uuid) -> Result<DeleteOutcome, StoreError> {
         Err(StoreError::NotFound)
     }
