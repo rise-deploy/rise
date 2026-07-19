@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 
 mod identity;
+mod owner_reference;
 mod policy;
 mod resource_kind;
 mod resource_row;
@@ -19,6 +20,7 @@ pub use identity::{
     ServiceAccountTrustPolicySpec, TrustPolicyClaims, UserIdentitySpec, UserSpec,
     IDENTITY_KIND_DEFINITIONS, MAX_EXTERNAL_SUBJECT_CHARS, MAX_ISSUER_BYTES,
 };
+pub use owner_reference::OwnerReference;
 pub use policy::{
     BindingSubject, Effect, KindMatcher, LabelKey, LabelSelector,
     LocallyNormalizedPlatformRoleBindingSpec, LocallyNormalizedRoleBindingSpec,
@@ -30,7 +32,8 @@ pub use resource_kind::ResourceKind;
 pub use resource_row::ResourceRow;
 pub use scope::Scope;
 pub use store::{
-    CollectionInfo, CreateResourceParams, DeleteOutcome, NoOpValidator, PathSegment, ResourceStore,
+    CollectionInfo, CreateResourceParams, DeleteOutcome, DeletionBlocker,
+    DeletionBlockerRelationship, DeletionBlockerReport, NoOpValidator, PathSegment, ResourceStore,
     SpecValidator, StoreError, UpdateResourceParams, CASCADE_DELETION_FINALIZER,
     MAX_PARENT_CHAIN_DEPTH, SYSTEM_FINALIZER_PREFIX,
 };
@@ -127,6 +130,8 @@ pub struct ResourceMetadata {
     pub annotations: BTreeMap<String, String>,
     #[serde(default)]
     pub finalizers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_references: Vec<OwnerReference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deletion_timestamp: Option<DateTime<Utc>>,
 }
@@ -152,6 +157,8 @@ pub struct CreateResourceMetadata {
     pub annotations: BTreeMap<String, String>,
     #[serde(default)]
     pub finalizers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_references: Vec<OwnerReference>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -173,6 +180,8 @@ pub struct UpdateResourceMetadata {
     pub annotations: BTreeMap<String, String>,
     #[serde(default)]
     pub finalizers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_references: Vec<OwnerReference>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
@@ -264,6 +273,15 @@ impl std::error::Error for ValidationError {}
 
 pub fn validate_resource_name(value: &str) -> Result<(), ValidationError> {
     validate_dns_label(value, 63, "resource name")
+}
+
+/// Validate a resource name carried in a reference.
+///
+/// Most resources use a single DNS label, while `ResourceDefinition` names
+/// use `{plural}.{group}`. References can target either, so they accept the
+/// DNS-subdomain form shared by every persisted resource identity.
+pub fn validate_resource_reference_name(value: &str) -> Result<(), ValidationError> {
+    validate_dns_subdomain(value, "resource reference name")
 }
 
 pub fn validate_discriminator(value: &str) -> Result<(), ValidationError> {

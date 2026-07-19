@@ -1,11 +1,13 @@
 use rise_resource_api::{
-    CreateResourceParams, DeleteOutcome, PathSegment, ResourceRow, ResourceStore, StoreError,
-    UpdateResourceParams, API_VERSION_V1ALPHA1, CASCADE_DELETION_FINALIZER, ORGANIZATION_KIND,
-    RESOURCE_DEFINITION_KIND,
+    CreateResourceParams, DeleteOutcome, OwnerReference, PathSegment, ResourceRow, ResourceStore,
+    StoreError, UpdateResourceParams, API_VERSION_V1ALPHA1, CASCADE_DELETION_FINALIZER,
+    ORGANIZATION_KIND, RESOURCE_DEFINITION_KIND,
 };
 use rise_resource_store_postgres::PgResourceStore;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
 use uuid::Uuid;
 
 #[sqlx::test]
@@ -19,6 +21,7 @@ async fn create_and_get_resource(pool: sqlx::PgPool) -> sqlx::Result<()> {
         parent_uid: None,
         annotations: BTreeMap::new(),
         finalizers: vec![],
+        owner_references: vec![],
         spec: json!({"displayName": "My Org"}),
         validator: None,
     };
@@ -77,6 +80,7 @@ async fn list_resources(pool: sqlx::PgPool) -> sqlx::Result<()> {
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: json!({"displayName": name}),
                 validator: None,
             })
@@ -114,6 +118,7 @@ async fn same_kind_name_is_isolated_by_api_version(pool: sqlx::PgPool) -> sqlx::
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: json!({
                     "group": group,
                     "kind": "Widget",
@@ -135,6 +140,7 @@ async fn same_kind_name_is_isolated_by_api_version(pool: sqlx::PgPool) -> sqlx::
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: json!({}),
             validator: None,
         })
@@ -149,6 +155,7 @@ async fn same_kind_name_is_isolated_by_api_version(pool: sqlx::PgPool) -> sqlx::
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: json!({}),
             validator: None,
         })
@@ -184,6 +191,7 @@ async fn update_resource_increments_revision(pool: sqlx::PgPool) -> sqlx::Result
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: json!({"displayName": "My Org"}),
             validator: None,
         })
@@ -200,6 +208,7 @@ async fn update_resource_increments_revision(pool: sqlx::PgPool) -> sqlx::Result
                 revision: 1,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: json!({"displayName": "Updated Org"}),
                 validator: None,
             },
@@ -225,6 +234,7 @@ async fn update_rejects_wrong_revision(pool: sqlx::PgPool) -> sqlx::Result<()> {
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: json!({"displayName": "My Org"}),
             validator: None,
         })
@@ -239,6 +249,7 @@ async fn update_rejects_wrong_revision(pool: sqlx::PgPool) -> sqlx::Result<()> {
                 revision: 99, // wrong
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: json!({"displayName": "Updated"}),
                 validator: None,
             },
@@ -268,6 +279,7 @@ async fn duplicate_name_returns_conflict(pool: sqlx::PgPool) -> sqlx::Result<()>
         parent_uid: None,
         annotations: BTreeMap::new(),
         finalizers: vec![],
+        owner_references: vec![],
         spec: json!({"displayName": "Org"}),
         validator: None,
     };
@@ -293,6 +305,7 @@ async fn duplicate_name_returns_conflict_for_rd_backed_kind(
         parent_uid: None,
         annotations: BTreeMap::new(),
         finalizers: vec![],
+        owner_references: vec![],
         spec: json!({}),
         validator: None,
     };
@@ -320,6 +333,7 @@ async fn create_rejects_non_storage_version_at_root(pool: sqlx::PgPool) -> sqlx:
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: json!({}),
             validator: None,
         })
@@ -347,6 +361,7 @@ async fn create_rejects_non_storage_version_in_child_scope(pool: sqlx::PgPool) -
             parent_uid: Some(parent.uid),
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: json!({}),
             validator: None,
         })
@@ -379,6 +394,7 @@ async fn update_api_version_collision_returns_name_conflict(
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: json!({
                     "group": group,
                     "kind": "Widget",
@@ -401,6 +417,7 @@ async fn update_api_version_collision_returns_name_conflict(
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: json!({}),
             validator: None,
         })
@@ -414,6 +431,7 @@ async fn update_api_version_collision_returns_name_conflict(
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: json!({}),
             validator: None,
         })
@@ -430,6 +448,7 @@ async fn update_api_version_collision_returns_name_conflict(
                 revision: moving.revision,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: json!({}),
                 validator: None,
             },
@@ -457,6 +476,7 @@ async fn update_rejects_non_storage_version(pool: sqlx::PgPool) -> sqlx::Result<
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: json!({}),
             validator: None,
         })
@@ -473,6 +493,7 @@ async fn update_rejects_non_storage_version(pool: sqlx::PgPool) -> sqlx::Result<
                 revision: widget.revision,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: json!({}),
                 validator: None,
             },
@@ -499,6 +520,7 @@ async fn delete_without_finalizers_removes_row(pool: sqlx::PgPool) -> sqlx::Resu
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: json!({"displayName": "Delete Me"}),
             validator: None,
         })
@@ -524,6 +546,7 @@ async fn delete_with_finalizers_marks_deletion_timestamp(pool: sqlx::PgPool) -> 
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec!["controller.example.com/cleanup".to_string()],
+            owner_references: vec![],
             spec: json!({"displayName": "Org"}),
             validator: None,
         })
@@ -555,6 +578,7 @@ async fn finalizer_flow_completes_deletion(pool: sqlx::PgPool) -> sqlx::Result<(
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![finalizer.to_string()],
+            owner_references: vec![],
             spec: json!({"displayName": "Org"}),
             validator: None,
         })
@@ -591,6 +615,7 @@ async fn controller_status_update_merges_key(pool: sqlx::PgPool) -> sqlx::Result
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: json!({"displayName": "Org"}),
             validator: None,
         })
@@ -638,6 +663,7 @@ async fn controller_finalizers_enforces_ownership(pool: sqlx::PgPool) -> sqlx::R
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: json!({"displayName": "Org"}),
             validator: None,
         })
@@ -731,6 +757,7 @@ async fn resolve_collection_by_kind_resolves_builtins_and_rds(
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: json!({
                 "group": "example.dev",
                 "kind": "Widget",
@@ -769,6 +796,7 @@ async fn resolve_collection_by_kind_resolves_builtins_and_rds(
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: json!({
                 "group": "example.dev",
                 "kind": "Gauge",
@@ -814,6 +842,7 @@ async fn register_resource_definition(pool: sqlx::PgPool) -> sqlx::Result<()> {
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec,
             validator: None,
         })
@@ -852,13 +881,14 @@ async fn delete_resource_definition_rejects_existing_instances(
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec,
             validator: None,
         })
         .await
         .unwrap();
 
-    store
+    let instance = store
         .create(CreateResourceParams {
             api_version: "example.dev/v1".to_string(),
             kind: "Widget".to_string(),
@@ -866,6 +896,7 @@ async fn delete_resource_definition_rejects_existing_instances(
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![owner_reference(&definition).with_block_owner_deletion(true)],
             spec: json!({}),
             validator: None,
         })
@@ -878,6 +909,13 @@ async fn delete_resource_definition_rejects_existing_instances(
         "expected validation error, got {err:?}"
     );
     assert!(store.resolve_collection("widgets").await.unwrap().is_some());
+    assert!(store
+        .get(instance.uid)
+        .await
+        .unwrap()
+        .unwrap()
+        .deletion_timestamp
+        .is_none());
 
     Ok(())
 }
@@ -907,6 +945,7 @@ async fn delete_resource_definition_rejects_instances_in_any_served_version(
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: spec_v1_storage,
             validator: None,
         })
@@ -921,6 +960,7 @@ async fn delete_resource_definition_rejects_instances_in_any_served_version(
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: json!({}),
             validator: None,
         })
@@ -948,6 +988,7 @@ async fn delete_resource_definition_rejects_instances_in_any_served_version(
                 revision: definition.revision,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: spec_v2_storage,
                 validator: None,
             },
@@ -983,6 +1024,7 @@ async fn register_resource_definition_rejects_reserved_plural(
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec,
             validator: None,
         })
@@ -1008,6 +1050,7 @@ async fn register_rejects_resource_definition_as_a_custom_kind(
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: json!({
                 "group": "other.example",
                 "kind": "ResourceDefinition",
@@ -1060,6 +1103,7 @@ async fn update_allows_an_unchanged_legacy_reserved_definition(
                 revision: 1,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: json!({
                     "group": "rise.dev",
                     "kind": "User",
@@ -1103,6 +1147,7 @@ async fn register_resource_definition_rejects_zero_served_versions(
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec,
             validator: None,
         })
@@ -1139,6 +1184,7 @@ async fn register_resource_definition_root_and_parent_validation(
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: root,
             validator: None,
         })
@@ -1162,6 +1208,7 @@ async fn register_resource_definition_root_and_parent_validation(
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: bad_parent,
             validator: None,
         })
@@ -1198,6 +1245,7 @@ async fn register_resource_definition_rejects_parent_cycles(
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec,
             validator: None,
         }
@@ -1259,6 +1307,7 @@ async fn register_resource_definition_rejects_duplicate_identity(
         parent_uid: None,
         annotations: BTreeMap::new(),
         finalizers: vec![],
+        owner_references: vec![],
         spec: json!({
             "group": group,
             "kind": kind,
@@ -1311,6 +1360,7 @@ async fn get_by_name(pool: sqlx::PgPool) -> sqlx::Result<()> {
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: json!({"displayName": "Lookup Org"}),
             validator: None,
         })
@@ -1347,6 +1397,7 @@ async fn get_by_name_and_list_span_all_versions_of_a_group(pool: sqlx::PgPool) -
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: json!({}),
             validator: None,
         })
@@ -1397,6 +1448,7 @@ async fn create_rejects_invalid_name(pool: sqlx::PgPool) -> sqlx::Result<()> {
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: json!({"displayName": "Bad"}),
             validator: None,
         })
@@ -1427,6 +1479,7 @@ async fn create_invokes_spec_validator(pool: sqlx::PgPool) -> sqlx::Result<()> {
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: json!({"displayName": "   "}),
             validator: Some(Arc::new(OrganizationValidator)),
         })
@@ -1453,6 +1506,7 @@ async fn delete_already_marked_resource_is_idempotent(pool: sqlx::PgPool) -> sql
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec!["controller.example.com/cleanup".to_string()],
+            owner_references: vec![],
             spec: json!({"displayName": "Org"}),
             validator: None,
         })
@@ -1499,6 +1553,7 @@ async fn update_resource_definition_updates_projection(pool: sqlx::PgPool) -> sq
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: spec_v1,
             validator: None,
         })
@@ -1525,6 +1580,7 @@ async fn update_resource_definition_updates_projection(pool: sqlx::PgPool) -> sq
                 revision: row.revision,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: spec_v2,
                 validator: None,
             },
@@ -1563,6 +1619,7 @@ async fn added_version_serves_existing_instances_without_rewriting(
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: spec_v1,
             validator: None,
         })
@@ -1577,6 +1634,7 @@ async fn added_version_serves_existing_instances_without_rewriting(
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: json!({}),
             validator: None,
         })
@@ -1602,6 +1660,7 @@ async fn added_version_serves_existing_instances_without_rewriting(
                 revision: rd.revision,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: spec_v2,
                 validator: None,
             },
@@ -1650,6 +1709,7 @@ async fn update_resource_definition_rejects_identity_change(
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec,
             validator: None,
         })
@@ -1673,6 +1733,7 @@ async fn update_resource_definition_rejects_identity_change(
                 revision: row.revision,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: changed_group_spec,
                 validator: None,
             },
@@ -1713,6 +1774,7 @@ async fn update_resource_definition_rejects_removing_version_with_instances(
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec,
             validator: None,
         })
@@ -1728,6 +1790,7 @@ async fn update_resource_definition_rejects_removing_version_with_instances(
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: json!({}),
             validator: None,
         })
@@ -1751,6 +1814,7 @@ async fn update_resource_definition_rejects_removing_version_with_instances(
                 revision: rd.revision,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: drop_v1,
                 validator: None,
             },
@@ -1779,6 +1843,7 @@ async fn update_resource_definition_rejects_removing_version_with_instances(
                 revision: rd.revision,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: drop_v2,
                 validator: None,
             },
@@ -1810,6 +1875,7 @@ async fn update_resource_definition_rejects_parent_change(pool: sqlx::PgPool) ->
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec,
             validator: None,
         })
@@ -1833,6 +1899,7 @@ async fn update_resource_definition_rejects_parent_change(pool: sqlx::PgPool) ->
                 revision: row.revision,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: changed_parent_spec,
                 validator: None,
             },
@@ -1873,6 +1940,7 @@ async fn register_resource_definition_rejects_invalid_non_storage_schema(
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec,
             validator: None,
         })
@@ -1918,6 +1986,7 @@ async fn update_resource_definition_invalidates_schema_cache(
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: spec_v1,
             validator: None,
         })
@@ -1959,6 +2028,7 @@ async fn update_resource_definition_invalidates_schema_cache(
                 revision: row.revision,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: spec_v2,
                 validator: None,
             },
@@ -2008,6 +2078,7 @@ async fn update_rejects_resource_definition(pool: sqlx::PgPool) -> sqlx::Result<
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: spec.clone(),
             validator: None,
         })
@@ -2023,6 +2094,7 @@ async fn update_rejects_resource_definition(pool: sqlx::PgPool) -> sqlx::Result<
                 revision: row.revision,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec,
                 validator: None,
             },
@@ -2051,11 +2123,492 @@ async fn create_org(store: &PgResourceStore, name: &str) -> ResourceRow {
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: json!({"displayName": name}),
             validator: None,
         })
         .await
         .unwrap()
+}
+
+fn owner_reference(row: &ResourceRow) -> OwnerReference {
+    OwnerReference::new(&row.api_version, &row.kind, &row.name, row.uid).unwrap()
+}
+
+async fn create_owned_widget(
+    store: &PgResourceStore,
+    name: &str,
+    owner_references: Vec<OwnerReference>,
+    finalizers: Vec<String>,
+) -> ResourceRow {
+    register_example_widget_rd(store).await;
+    store
+        .create(CreateResourceParams {
+            api_version: "example.dev/v1".to_string(),
+            kind: "Widget".to_string(),
+            name: name.to_string(),
+            parent_uid: None,
+            annotations: BTreeMap::new(),
+            finalizers,
+            owner_references,
+            spec: json!({}),
+            validator: None,
+        })
+        .await
+        .unwrap()
+}
+
+#[sqlx::test]
+async fn owner_references_are_persisted_and_replaceable(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let owner = create_owned_widget(&store, "owner", vec![], vec![]).await;
+    let dependent =
+        create_owned_widget(&store, "dependent", vec![owner_reference(&owner)], vec![]).await;
+
+    let fetched = store.get(dependent.uid).await.unwrap().unwrap();
+    assert_eq!(fetched.owner_references, vec![owner_reference(&owner)]);
+    let resource: rise_resource_api::Resource = fetched.to_resource().unwrap();
+    assert_eq!(
+        resource.metadata.owner_references,
+        vec![owner_reference(&owner)]
+    );
+
+    let updated = store
+        .update(
+            dependent.uid,
+            UpdateResourceParams {
+                api_version: None,
+                revision: fetched.revision,
+                annotations: BTreeMap::new(),
+                finalizers: vec![],
+                owner_references: vec![],
+                spec: fetched.spec,
+                validator: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(updated.owner_references.is_empty());
+
+    assert!(matches!(
+        store.delete(owner.uid).await.unwrap(),
+        DeleteOutcome::Deleted
+    ));
+    assert!(store.get(dependent.uid).await.unwrap().is_some());
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn nonblocking_owner_deletion_cascades_without_waiting_for_dependent_finalizers(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let owner = create_org(&store, "owner").await;
+    let cleanup_finalizer = "controller.example.com/cleanup".to_string();
+    let dependent = create_owned_widget(
+        &store,
+        "dependent",
+        vec![owner_reference(&owner)],
+        vec![cleanup_finalizer.clone()],
+    )
+    .await;
+
+    assert!(matches!(
+        store.delete(owner.uid).await.unwrap(),
+        DeleteOutcome::Deleted
+    ));
+    assert!(store.get(owner.uid).await.unwrap().is_none());
+    assert!(store
+        .get(dependent.uid)
+        .await
+        .unwrap()
+        .unwrap()
+        .deletion_timestamp
+        .is_some());
+    assert!(store
+        .list_deletion_blockers(dependent.uid)
+        .await
+        .unwrap()
+        .blockers
+        .is_empty());
+
+    store
+        .update_controller_finalizers(
+            dependent.uid,
+            "controller.example.com",
+            &[],
+            &[cleanup_finalizer],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.try_collect(dependent.uid).await.unwrap(),
+        DeleteOutcome::Deleted
+    ));
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn blocking_owner_reference_waits_for_dependent_finalizers(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let owner = create_org(&store, "blocking-owner").await;
+    let cleanup_finalizer = "controller.example.com/cleanup".to_string();
+    let blocking_reference = owner_reference(&owner).with_block_owner_deletion(true);
+    let dependent = create_owned_widget(
+        &store,
+        "blocking-dependent",
+        vec![blocking_reference],
+        vec![cleanup_finalizer.clone()],
+    )
+    .await;
+    let nonblocking_dependent = create_owned_widget(
+        &store,
+        "nonblocking-dependent",
+        vec![owner_reference(&owner)],
+        vec!["controller.example.com/nonblocking-cleanup".to_string()],
+    )
+    .await;
+
+    let blockers = store
+        .list_deletion_blockers(owner.uid)
+        .await
+        .unwrap()
+        .blockers;
+    assert_eq!(blockers.len(), 1);
+    assert_eq!(
+        blockers[0].relationship,
+        rise_resource_api::DeletionBlockerRelationship::OwnerReference
+    );
+    assert_eq!(blockers[0].uid, dependent.uid);
+
+    let marked_owner = match store.delete(owner.uid).await.unwrap() {
+        DeleteOutcome::MarkedForDeletion(row) => row,
+        DeleteOutcome::Deleted => panic!("blocking dependent must retain its owner"),
+    };
+    assert!(marked_owner
+        .finalizers
+        .contains(&CASCADE_DELETION_FINALIZER.to_string()));
+    assert!(store
+        .get(dependent.uid)
+        .await
+        .unwrap()
+        .unwrap()
+        .deletion_timestamp
+        .is_some());
+    assert!(store
+        .get(nonblocking_dependent.uid)
+        .await
+        .unwrap()
+        .unwrap()
+        .deletion_timestamp
+        .is_some());
+
+    store
+        .update_controller_finalizers(
+            dependent.uid,
+            "controller.example.com",
+            &[],
+            &[cleanup_finalizer],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.try_collect(dependent.uid).await.unwrap(),
+        DeleteOutcome::Deleted
+    ));
+    assert!(matches!(
+        store.try_collect(owner.uid).await.unwrap(),
+        DeleteOutcome::Deleted
+    ));
+    assert!(
+        store
+            .get(nonblocking_dependent.uid)
+            .await
+            .unwrap()
+            .is_some(),
+        "a non-blocking dependent must not retain its owner"
+    );
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn owner_references_reject_stale_identity_and_duplicates(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    register_example_widget_rd(&store).await;
+    let owner = create_org(&store, "owner").await;
+    let wrong_name =
+        OwnerReference::new(&owner.api_version, &owner.kind, "different-name", owner.uid).unwrap();
+
+    let error = store
+        .create(CreateResourceParams {
+            api_version: "example.dev/v1".to_string(),
+            kind: "Widget".to_string(),
+            name: "dependent".to_string(),
+            owner_references: vec![wrong_name],
+            spec: json!({}),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(error, StoreError::Validation(message) if message.contains("does not match")));
+
+    let reference = owner_reference(&owner);
+    let error = store
+        .create(CreateResourceParams {
+            api_version: "example.dev/v1".to_string(),
+            kind: "Widget".to_string(),
+            name: "duplicate-dependent".to_string(),
+            owner_references: vec![reference.clone(), reference],
+            spec: json!({}),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, StoreError::Validation(message) if message.contains("duplicate owner reference"))
+    );
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn owner_references_reject_protected_dependent_kinds(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let owner = create_org(&store, "owner").await;
+    let reference = owner_reference(&owner);
+
+    let create_error = store
+        .create(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: ORGANIZATION_KIND.to_string(),
+            name: "dependent-org".to_string(),
+            owner_references: vec![reference.clone()],
+            spec: json!({"displayName": "Dependent"}),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(create_error, StoreError::Validation(message) if message.contains("not supported on Organization"))
+    );
+
+    let organization = create_org(&store, "dependent-org").await;
+    let update_error = store
+        .update(
+            organization.uid,
+            UpdateResourceParams {
+                api_version: None,
+                revision: organization.revision,
+                annotations: BTreeMap::new(),
+                finalizers: organization.finalizers,
+                owner_references: vec![reference.clone()],
+                spec: organization.spec,
+                validator: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(update_error, StoreError::Validation(message) if message.contains("not supported on Organization"))
+    );
+
+    let rd_spec = json!({
+        "group": "blocked.example.dev",
+        "kind": "Blocked",
+        "plural": "blockeds",
+        "versions": [{"name": "v1", "served": true, "storage": true}],
+        "allowedStatusControllerIds": []
+    });
+    let register_error = store
+        .register_resource_definition(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: RESOURCE_DEFINITION_KIND.to_string(),
+            name: "blockeds.blocked.example.dev".to_string(),
+            owner_references: vec![reference.clone()],
+            spec: rd_spec,
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(register_error, StoreError::Validation(message) if message.contains("not supported on ResourceDefinition"))
+    );
+
+    register_example_widget_rd(&store).await;
+    let definition = store
+        .get_by_name(
+            API_VERSION_V1ALPHA1,
+            RESOURCE_DEFINITION_KIND,
+            "widgets.example.dev",
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let update_rd_error = store
+        .update_resource_definition(
+            definition.uid,
+            UpdateResourceParams {
+                api_version: None,
+                revision: definition.revision,
+                annotations: BTreeMap::new(),
+                finalizers: definition.finalizers,
+                owner_references: vec![reference.clone()],
+                spec: definition.spec,
+                validator: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(update_rd_error, StoreError::Validation(message) if message.contains("not supported on ResourceDefinition"))
+    );
+
+    store
+        .register_resource_definition(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: RESOURCE_DEFINITION_KIND.to_string(),
+            name: "custom-organizations.custom.example.dev".to_string(),
+            spec: json!({
+                "group": "custom.example.dev",
+                "kind": "Organization",
+                "plural": "custom-organizations",
+                "versions": [{"name": "v1", "served": true, "storage": true}],
+                "allowedStatusControllerIds": []
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let custom_organization = store
+        .create(CreateResourceParams {
+            api_version: "custom.example.dev/v1".to_string(),
+            kind: ORGANIZATION_KIND.to_string(),
+            name: "dependent-custom-org".to_string(),
+            owner_references: vec![reference],
+            spec: json!({}),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(custom_organization.owner_references.len(), 1);
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn owner_reference_add_racing_owner_delete_fails_closed(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = Arc::new(PgResourceStore::new(pool.clone()));
+    let owner = create_org(&store, "race-owner").await;
+    let dependent = create_owned_widget(&store, "race-dependent", vec![], vec![]).await;
+
+    // Hold edge admission at the graph lock. Deletion must not queue behind
+    // this global lock; its owner-row lock is the synchronization boundary.
+    let mut graph_guard = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('resource_owner_reference_cycle')::bigint)")
+        .execute(&mut *graph_guard)
+        .await?;
+
+    let writer_store = Arc::clone(&store);
+    let owner_ref = owner_reference(&owner);
+    let writer = tokio::spawn(async move {
+        writer_store
+            .update(
+                dependent.uid,
+                UpdateResourceParams {
+                    api_version: None,
+                    revision: dependent.revision,
+                    annotations: BTreeMap::new(),
+                    finalizers: dependent.finalizers,
+                    owner_references: vec![owner_ref],
+                    spec: dependent.spec,
+                    validator: None,
+                },
+            )
+            .await
+    });
+    tokio::task::yield_now().await;
+
+    let deletion = tokio::time::timeout(Duration::from_secs(2), store.delete(owner.uid))
+        .await
+        .expect("owner deletion must not wait for the graph-wide admission lock")
+        .unwrap();
+    assert!(matches!(deletion, DeleteOutcome::Deleted));
+
+    graph_guard.commit().await?;
+    let writer_error = writer.await.unwrap().unwrap_err();
+    assert!(
+        matches!(writer_error, StoreError::Validation(message) if message.contains("does not identify a live resource"))
+    );
+    assert!(store
+        .get(dependent.uid)
+        .await
+        .unwrap()
+        .unwrap()
+        .owner_references
+        .is_empty());
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn owner_references_reject_lifecycle_cycles(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let owner = create_owned_widget(&store, "owner", vec![], vec![]).await;
+    let dependent =
+        create_owned_widget(&store, "dependent", vec![owner_reference(&owner)], vec![]).await;
+
+    let error = store
+        .update(
+            owner.uid,
+            UpdateResourceParams {
+                api_version: None,
+                revision: owner.revision,
+                annotations: BTreeMap::new(),
+                finalizers: vec![],
+                owner_references: vec![owner_reference(&dependent)],
+                spec: owner.spec.clone(),
+                validator: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, StoreError::Validation(message) if message.contains("lifecycle cycle"))
+    );
+
+    let structural_child =
+        create_child(&store, owner.uid, "Widget", "structural-child", vec![]).await;
+    let current_owner = store.get(owner.uid).await.unwrap().unwrap();
+    let error = store
+        .update(
+            owner.uid,
+            UpdateResourceParams {
+                api_version: None,
+                revision: current_owner.revision,
+                annotations: BTreeMap::new(),
+                finalizers: vec![],
+                owner_references: vec![owner_reference(&structural_child)],
+                spec: current_owner.spec,
+                validator: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, StoreError::Validation(message) if message.contains("lifecycle cycle"))
+    );
+
+    Ok(())
 }
 
 /// Register the `example.dev/Widget` ResourceDefinition with versions `v1` (storage) and `v2`
@@ -2074,6 +2627,7 @@ async fn register_example_widget_rd(store: &PgResourceStore) {
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
+            owner_references: vec![],
             spec: json!({
                 "group": "example.dev",
                 "kind": "Widget",
@@ -2110,6 +2664,7 @@ async fn create_child(
             parent_uid: Some(parent),
             annotations: BTreeMap::new(),
             finalizers,
+            owner_references: vec![],
             spec: json!({}),
             validator: None,
         })
@@ -2123,6 +2678,15 @@ async fn cascade_delete_stamps_immediate_children(pool: sqlx::PgPool) -> sqlx::R
     let parent = create_org(&store, "cascade-org").await;
     let c1 = create_child(&store, parent.uid, "Widget", "w1", vec![]).await;
     let c2 = create_child(&store, parent.uid, "Widget", "w2", vec![]).await;
+
+    let blockers = store
+        .list_deletion_blockers(parent.uid)
+        .await
+        .unwrap()
+        .blockers;
+    assert_eq!(blockers.len(), 2);
+    assert!(blockers.iter().all(|blocker| blocker.relationship
+        == rise_resource_api::DeletionBlockerRelationship::StructuralChild));
 
     let outcome = store.delete(parent.uid).await.unwrap();
     let marked = match outcome {
@@ -2453,131 +3017,5 @@ async fn resolve_path_empty_returns_error(pool: sqlx::PgPool) -> sqlx::Result<()
     let store = PgResourceStore::new(pool);
     let err = store.resolve_path(&[]).await.unwrap_err();
     assert!(matches!(err, StoreError::EmptyPath));
-    Ok(())
-}
-
-#[sqlx::test]
-async fn rename_preserves_uid_and_bumps_revision(pool: sqlx::PgPool) -> sqlx::Result<()> {
-    let store = PgResourceStore::new(pool);
-
-    let row = store
-        .create(CreateResourceParams {
-            api_version: API_VERSION_V1ALPHA1.to_string(),
-            kind: ORGANIZATION_KIND.to_string(),
-            name: "before".to_string(),
-            parent_uid: None,
-            annotations: BTreeMap::new(),
-            finalizers: vec![],
-            spec: json!({"displayName": "Before"}),
-            validator: None,
-        })
-        .await
-        .unwrap();
-    let original_uid = row.uid;
-    let original_discriminator = row.discriminator.clone();
-    let original_spec = row.spec.clone();
-
-    let renamed = store.rename(row.uid, "after").await.unwrap();
-    assert_eq!(renamed.uid, original_uid, "UID must be preserved");
-    assert_eq!(
-        renamed.discriminator, original_discriminator,
-        "discriminator must be preserved"
-    );
-    assert_eq!(renamed.name, "after");
-    assert_eq!(renamed.revision, row.revision + 1, "revision must bump");
-    assert_eq!(renamed.spec, original_spec, "spec must be untouched");
-
-    // get_by_name follows the rename.
-    assert!(store
-        .get_by_name(API_VERSION_V1ALPHA1, ORGANIZATION_KIND, "before", None)
-        .await
-        .unwrap()
-        .is_none());
-    let by_name = store
-        .get_by_name(API_VERSION_V1ALPHA1, ORGANIZATION_KIND, "after", None)
-        .await
-        .unwrap()
-        .expect("renamed row resolves under the new name");
-    assert_eq!(by_name.uid, original_uid);
-
-    Ok(())
-}
-
-#[sqlx::test]
-async fn rename_to_existing_name_yields_name_conflict(pool: sqlx::PgPool) -> sqlx::Result<()> {
-    let store = PgResourceStore::new(pool);
-
-    for name in ["a", "b"] {
-        store
-            .create(CreateResourceParams {
-                api_version: API_VERSION_V1ALPHA1.to_string(),
-                kind: ORGANIZATION_KIND.to_string(),
-                name: name.to_string(),
-                parent_uid: None,
-                annotations: BTreeMap::new(),
-                finalizers: vec![],
-                spec: json!({"displayName": name}),
-                validator: None,
-            })
-            .await
-            .unwrap();
-    }
-
-    let a = store
-        .get_by_name(API_VERSION_V1ALPHA1, ORGANIZATION_KIND, "a", None)
-        .await
-        .unwrap()
-        .unwrap();
-
-    let err = store.rename(a.uid, "b").await.unwrap_err();
-    assert!(
-        matches!(err, StoreError::NameConflict),
-        "expected NameConflict, got {err:?}"
-    );
-
-    Ok(())
-}
-
-#[sqlx::test]
-async fn rename_resource_definition_is_rejected(pool: sqlx::PgPool) -> sqlx::Result<()> {
-    let store = PgResourceStore::new(pool);
-
-    let rd = store
-        .register_resource_definition(CreateResourceParams {
-            api_version: API_VERSION_V1ALPHA1.to_string(),
-            kind: RESOURCE_DEFINITION_KIND.to_string(),
-            name: "widgets.example.dev".to_string(),
-            parent_uid: None,
-            annotations: BTreeMap::new(),
-            finalizers: vec![],
-            spec: json!({
-                "group": "example.dev",
-                "kind": "Widget",
-                "plural": "widgets",
-                "versions": [{"name": "v1", "served": true, "storage": true}],
-                "allowedStatusControllerIds": []
-            }),
-            validator: None,
-        })
-        .await
-        .unwrap();
-
-    let err = store
-        .rename(rd.uid, "renamed.example.dev")
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(err, StoreError::Validation(_)),
-        "expected Validation, got {err:?}"
-    );
-
-    Ok(())
-}
-
-#[sqlx::test]
-async fn rename_unknown_uid_yields_not_found(pool: sqlx::PgPool) -> sqlx::Result<()> {
-    let store = PgResourceStore::new(pool);
-    let err = store.rename(Uuid::new_v4(), "x").await.unwrap_err();
-    assert!(matches!(err, StoreError::NotFound), "got {err:?}");
     Ok(())
 }

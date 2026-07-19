@@ -77,6 +77,7 @@ mod tests {
             status,
             revision: 3,
             finalizers: vec!["controller.example.com/cleanup".into()],
+            owner_references: vec![],
             deletion_timestamp: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),

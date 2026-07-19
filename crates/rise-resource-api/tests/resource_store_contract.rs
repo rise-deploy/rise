@@ -45,9 +45,6 @@ impl ResourceStore for FakeStore {
     async fn update(&self, _: Uuid, _: UpdateResourceParams) -> Result<ResourceRow, StoreError> {
         Err(StoreError::NotFound)
     }
-    async fn rename(&self, _: Uuid, _: &str) -> Result<ResourceRow, StoreError> {
-        Err(StoreError::NotFound)
-    }
     async fn delete(&self, _: Uuid) -> Result<DeleteOutcome, StoreError> {
         Err(StoreError::NotFound)
     }
@@ -56,6 +53,13 @@ impl ResourceStore for FakeStore {
     }
     async fn list_pending_collection(&self, _: i64) -> Result<Vec<ResourceRow>, StoreError> {
         Ok(vec![])
+    }
+
+    async fn list_deletion_blockers(
+        &self,
+        _: Uuid,
+    ) -> Result<rise_resource_api::DeletionBlockerReport, StoreError> {
+        Err(StoreError::NotFound)
     }
     async fn resolve_path(&self, segments: &[PathSegment]) -> Result<Vec<ResourceRow>, StoreError> {
         if segments.is_empty() {
@@ -152,6 +156,7 @@ fn create_params_have_empty_optional_defaults() {
     assert!(params.parent_uid.is_none());
     assert!(params.annotations.is_empty());
     assert!(params.finalizers.is_empty());
+    assert!(params.owner_references.is_empty());
     assert_eq!(params.spec, serde_json::json!({}));
     assert!(params.validator.is_none());
 }
@@ -187,6 +192,7 @@ fn row(
         status,
         revision: 1,
         finalizers: vec![],
+        owner_references: vec![],
         deletion_timestamp: None,
         created_at: now,
         updated_at: now,

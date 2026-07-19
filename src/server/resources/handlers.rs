@@ -20,9 +20,9 @@ use rise_resource_api::NoOpValidator;
 use rise_resource_api::{
     CollectionInfo, CreateResourceParams, CreateResourceRequest, DeleteOutcome, PathSegment,
     ResourceRow, ResourceStore, UpdateResourceParams, UpdateResourceRequest,
-    MAX_PARENT_CHAIN_DEPTH,
+    CASCADE_DELETION_FINALIZER, MAX_PARENT_CHAIN_DEPTH,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::error_map::store_error_to_server_error;
@@ -345,6 +345,28 @@ pub struct PendingDeletionQuery {
     pub limit: Option<i64>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeletionBlockersResponse {
+    resource_uid: Uuid,
+    cascade_finalizer_present: bool,
+    blockers: Vec<DeletionBlockerResponse>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeletionBlockerResponse {
+    relationship: &'static str,
+    api_version: String,
+    kind: String,
+    name: String,
+    uid: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    block_owner_deletion: Option<bool>,
+    deletion_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+    finalizers: Vec<String>,
+}
+
 // -----------------------------------------------------------------------------
 // Store-aware path classification
 // -----------------------------------------------------------------------------
@@ -497,9 +519,9 @@ async fn classify_path(
         2 => {
             let subresource = Subresource::from_keyword(&segments[depth + 1]).ok_or_else(|| {
                 ServerError::bad_request(format!(
-                    "expected a subresource keyword (status, finalizers) after \
-                     the item name, got '{}'",
-                    segments[depth + 1]
+                    "expected a subresource keyword ({}) after the item name, got '{}'",
+                    Subresource::KEYWORDS,
+                    segments[depth + 1],
                 ))
             })?;
             Ok(ResolvedPath::Subresource {
@@ -622,9 +644,65 @@ async fn dispatch_get_inner(
             let row = resolve_leaf(&ctx.store, &resolved, &leaf).await?;
             Ok(Json(response_resource(&row, &resolved.info.api_version)?).into_response())
         }
+        ResolvedPath::Subresource {
+            resolved,
+            leaf,
+            subresource: Subresource::DeletionBlockers,
+        } => {
+            let row = resolve_leaf(&ctx.store, &resolved, &leaf).await?;
+            let report = ctx
+                .store
+                .list_deletion_blockers(row.uid)
+                .await
+                .map_err(store_error_to_server_error)?;
+            let row = report.resource;
+            let blockers = report
+                .blockers
+                .into_iter()
+                .map(|blocker| {
+                    let (relationship, block_owner_deletion) = match blocker.relationship {
+                        rise_resource_api::DeletionBlockerRelationship::StructuralChild => {
+                            ("structuralChild", None)
+                        }
+                        rise_resource_api::DeletionBlockerRelationship::OwnerReference => {
+                            ("ownerReference", Some(true))
+                        }
+                    };
+                    DeletionBlockerResponse {
+                        relationship,
+                        api_version: blocker.api_version,
+                        kind: blocker.kind,
+                        name: blocker.name,
+                        uid: blocker.uid,
+                        block_owner_deletion,
+                        deletion_timestamp: blocker.deletion_timestamp,
+                        finalizers: blocker.finalizers,
+                    }
+                })
+                .collect::<Vec<_>>();
+            tracing::info!(
+                target: "rise::audit",
+                actor = %user.email,
+                uid = %row.uid,
+                api_version = %row.api_version,
+                kind = %row.kind,
+                name = %row.name,
+                blocker_count = blockers.len(),
+                "resource.deletion_blockers_listed"
+            );
+            Ok(Json(DeletionBlockersResponse {
+                resource_uid: row.uid,
+                cascade_finalizer_present: row
+                    .finalizers
+                    .iter()
+                    .any(|finalizer| finalizer == CASCADE_DELETION_FINALIZER),
+                blockers,
+            })
+            .into_response())
+        }
         ResolvedPath::Subresource { .. } => Err(ServerError::new(
             StatusCode::METHOD_NOT_ALLOWED,
-            "GET is not supported for subresource paths",
+            "GET is only supported for the deletion-blockers subresource",
         )),
     }
 }
@@ -762,6 +840,10 @@ async fn dispatch_put_inner(
                             .await?;
                             Ok(resp.into_response())
                         }
+                        Subresource::DeletionBlockers => Err(ServerError::new(
+                            StatusCode::METHOD_NOT_ALLOWED,
+                            "deletion-blockers is a read-only subresource",
+                        )),
                     }
                 }
                 AnyAuth::User(_) => {
@@ -798,6 +880,10 @@ async fn dispatch_put_inner(
                             .await?;
                             Ok(resp.into_response())
                         }
+                        Subresource::DeletionBlockers => Err(ServerError::new(
+                            StatusCode::METHOD_NOT_ALLOWED,
+                            "deletion-blockers is a read-only subresource",
+                        )),
                     }
                 }
             }
@@ -891,6 +977,7 @@ async fn create_resource(
         parent_uid,
         annotations,
         finalizers: body.metadata.finalizers,
+        owner_references: body.metadata.owner_references,
         spec,
         validator: Some(resolved.info.spec_validator.clone()),
     };
@@ -980,6 +1067,7 @@ async fn update_resource(
         revision: body.metadata.revision,
         annotations,
         finalizers: body.metadata.finalizers,
+        owner_references: body.metadata.owner_references,
         spec,
         validator: Some(resolved.info.spec_validator.clone()),
     };
@@ -1268,6 +1356,7 @@ mod tests {
             status: serde_json::json!({}),
             revision: 1,
             finalizers: vec![],
+            owner_references: vec![],
             deletion_timestamp: None,
             created_at: now,
             updated_at: now,
@@ -1385,6 +1474,7 @@ mod dispatch_tests {
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec,
                 validator: None,
             })
@@ -1413,6 +1503,7 @@ mod dispatch_tests {
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec,
                 validator: None,
             })
@@ -1439,6 +1530,7 @@ mod dispatch_tests {
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec,
                 validator: None,
             })
@@ -1871,6 +1963,7 @@ mod dispatch_tests {
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: serde_json::json!({"size": "large"}),
                 validator: None,
             })
@@ -2094,6 +2187,7 @@ mod dispatch_tests {
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: org_spec,
                 validator: Some(Arc::new(
                     rise_resource_store_postgres::OrganizationValidator,
@@ -2201,6 +2295,7 @@ mod dispatch_tests {
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: org_spec,
                 validator: Some(Arc::new(
                     rise_resource_store_postgres::OrganizationValidator,
@@ -2371,6 +2466,79 @@ mod dispatch_tests {
         assert_eq!(err.status, StatusCode::FORBIDDEN);
     }
 
+    #[sqlx::test]
+    async fn deletion_blockers_reports_blocking_relationships(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx, &[]).await;
+        let owner = ctx
+            .store
+            .create(CreateResourceParams {
+                api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
+                kind: rise_resource_api::ORGANIZATION_KIND.to_string(),
+                name: "blocker-owner".to_string(),
+                spec: json!({"displayName": "Blocker Owner"}),
+                ..Default::default()
+            })
+            .await
+            .expect("create owner");
+        let blocking_reference = rise_resource_api::OwnerReference::new(
+            &owner.api_version,
+            &owner.kind,
+            &owner.name,
+            owner.uid,
+        )
+        .expect("owner reference")
+        .with_block_owner_deletion(true);
+        let dependent = ctx
+            .store
+            .create(CreateResourceParams {
+                api_version: "example.dev/v1".to_string(),
+                kind: "Widget".to_string(),
+                name: "blocker-dependent".to_string(),
+                owner_references: vec![blocking_reference],
+                finalizers: vec!["controller.example.com/cleanup".to_string()],
+                spec: json!({}),
+                ..Default::default()
+            })
+            .await
+            .expect("create dependent");
+
+        ctx.store.delete(owner.uid).await.expect("delete owner");
+
+        let resp = dispatch_get_inner(
+            &ctx,
+            "rise.dev/v1alpha1/organizations/blocker-owner/deletion-blockers".to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("list deletion blockers");
+        let (status, body) = read(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["resourceUid"], owner.uid.to_string());
+        assert_eq!(body["cascadeFinalizerPresent"], true);
+        let blockers = body["blockers"].as_array().expect("blockers array");
+        assert_eq!(blockers.len(), 1);
+        assert_eq!(blockers[0]["relationship"], "ownerReference");
+        assert_eq!(blockers[0]["uid"], dependent.uid.to_string());
+        assert_eq!(blockers[0]["blockOwnerDeletion"], true);
+        assert!(blockers[0]["deletionTimestamp"].is_string());
+        assert_eq!(
+            blockers[0]["finalizers"],
+            json!(["controller.example.com/cleanup"])
+        );
+
+        let err = dispatch_get_inner(
+            &ctx,
+            "rise.dev/v1alpha1/organizations/blocker-owner/deletion-blockers".to_string(),
+            auth(PLAIN_USER),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect_err("non-operator must be rejected");
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+    }
+
     // -------------------------------------------------------------------------
     // Version-independent lookup
     // -------------------------------------------------------------------------
@@ -2400,6 +2568,7 @@ mod dispatch_tests {
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec,
                 validator: None,
             })
@@ -2417,6 +2586,7 @@ mod dispatch_tests {
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: serde_json::json!({"size": "large"}),
                 validator: None,
             })

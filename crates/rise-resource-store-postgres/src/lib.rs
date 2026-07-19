@@ -34,3 +34,16 @@ pub async fn run_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::migrate::Mi
 
     sqlx::migrate!("./migrations").run(&mut conn).await
 }
+
+#[cfg(test)]
+mod migration_tests {
+    #[test]
+    fn concurrent_index_migration_is_non_transactional() {
+        let migrator = sqlx::migrate!("./migrations");
+        let migration = migrator
+            .iter()
+            .find(|migration| migration.version == 20260719000001)
+            .expect("owner-reference index migration exists");
+        assert!(migration.no_tx);
+    }
+}

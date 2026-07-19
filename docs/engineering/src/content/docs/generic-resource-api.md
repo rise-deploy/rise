@@ -14,8 +14,10 @@ A resource path names the **leaf** collection as `{group}/{version}/{plural}`, f
 | `{group}/{version}/{plural}/{ancestor}…/{name}` (`D+1`) | GET, PUT, DELETE | Get / update / delete an item |
 | `{group}/{version}/{plural}/{ancestor}…/{name}/status` (`D+2`) | PUT | Controller status update |
 | `{group}/{version}/{plural}/{ancestor}…/{name}/finalizers` (`D+2`) | PUT | Controller finalizer update |
+| `{group}/{version}/{plural}/{ancestor}…/{name}/deletion-blockers` (`D+2`) | GET | Deletion-blocker diagnostics |
 | `{group}/{version}/{plural}/uid:{uuid}` | GET, PUT, DELETE | Get / update / delete an item by UID |
 | `{group}/{version}/{plural}/uid:{uuid}/{sub}` | PUT | `status` / `finalizers` on an item by UID |
+| `{group}/{version}/{plural}/uid:{uuid}/deletion-blockers` | GET | Deletion-blocker diagnostics by UID |
 | `pending-deletion` | GET | List resources tombstoned and awaiting garbage collection |
 
 The `{ancestor}` segments are bare resource *names*, ordered root-most first; the ancestor *types* are derived from the leaf's `ResourceDefinition` parent chain, never supplied in the URL. `pending-deletion` is only valid as the sole path segment, so a resource may be named `pending-deletion`.
@@ -75,9 +77,20 @@ Reads (GET/LIST) work for any served version. Writes (POST/PUT) must use the sto
 
 ## Deletion
 
-`DELETE` always cascades: the resource and its entire subtree are removed. The resource is tombstoned, its subtree drains as finalizers clear, and rows are collected bottom-up.
+`DELETE` cascades through structural children and UID-bound
+`metadata.ownerReferences`. Every direct dependent is tombstoned; structural
+children and owner references with `blockOwnerDeletion: true` retain the owner
+through `system.rise.dev/cascade-deletion`, while non-blocking cross-tree
+dependents may continue draining after the owner disappears. Rows are collected
+as their controller finalizers clear.
 
 `GET /api/v1/resources/pending-deletion` lists resources that are tombstoned and still draining — useful for spotting a deletion stuck on a finalizer. Accepts a `limit` query parameter (1–1000, default 100).
+
+`GET .../{name-or-uid}/deletion-blockers` is an operator-only, consistent
+snapshot of the concrete structural and opted-in cross-tree dependents retaining
+that resource, including their deletion timestamps and finalizers. Newly
+tombstoned dependents also produce best-effort structured
+`resource.deletion_cascaded` logs on the `rise::audit` target.
 
 Tombstoned resources (those pending cascade deletion) also appear in normal list responses — `GET` collection endpoints return them alongside live resources. They are identifiable by the presence of `metadata.deletionTimestamp`. This differs from kubectl's default behavior, which hides terminating resources; the resource API surfaces them explicitly so consumers can react to in-progress deletions. Use `pending-deletion` for an operator-level view of all tombstoned resources across the entire system.
 

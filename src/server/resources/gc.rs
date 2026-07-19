@@ -1,19 +1,22 @@
 //! Background garbage-collection worker for the generic resource store.
 //!
-//! `store.delete()` always cascades by stamping `deletion_timestamp` on the
-//! target and its *immediate* children, then attaching the
-//! `system.rise.dev/cascade-deletion` system finalizer to the target when
-//! children exist. Nothing in the request path drains the resulting subtree —
+//! `store.delete()` cascades by stamping `deletion_timestamp` on every immediate
+//! structural child and owner-reference dependent. The
+//! `system.rise.dev/cascade-deletion` finalizer retains the target only while a
+//! structural child or an owner reference with `blockOwnerDeletion: true`
+//! remains. Non-blocking cross-tree dependents continue draining after their
+//! owner disappears. Nothing in the request path drains the resulting graph —
 //! that is this worker's job.
 //!
 //! On each tick the leader fetches a batch of tombstoned rows oldest-first
 //! (`list_pending_collection`) and calls `try_collect` on each. The store
 //! handles per-row mechanics:
-//!   - children remain → stamps the next layer and keeps the cascade finalizer
+//!   - lifecycle dependents remain → stamps the next layer and keeps the
+//!     cascade finalizer only for blocking edges
 //!   - all finalizers (controller + cascade) clear → hard-deletes the row
 //!
-//! Controllers progressively shed their own finalizers from the bottom of the
-//! tree; successive sweeps eventually drain each subtree.
+//! Controllers progressively shed their own finalizers from lifecycle leaves;
+//! successive sweeps eventually drain the graph.
 //!
 //! Robustness properties worth knowing:
 //!   - **Forward-progress guard**: within a single sweep we track which UIDs
@@ -520,6 +523,7 @@ mod tests {
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: json!({"displayName": name}),
                 validator: None,
             })
@@ -538,6 +542,7 @@ mod tests {
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![CONTROLLER_FINALIZER.to_string()],
+                owner_references: vec![],
                 spec: json!({"displayName": name}),
                 validator: None,
             })
@@ -554,6 +559,7 @@ mod tests {
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: json!({
                     "group": "example.dev",
                     "kind": "Widget",
@@ -582,6 +588,7 @@ mod tests {
                 parent_uid: Some(parent),
                 annotations: BTreeMap::new(),
                 finalizers,
+                owner_references: vec![],
                 spec: json!({}),
                 validator: None,
             })
@@ -893,6 +900,7 @@ mod tests {
             status: json!({}),
             revision: 1,
             finalizers: vec![],
+            owner_references: vec![],
             deletion_timestamp: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -956,10 +964,6 @@ mod tests {
             self.inner.update(uid, params).await
         }
 
-        async fn rename(&self, uid: Uuid, new_name: &str) -> Result<ResourceRow, StoreError> {
-            self.inner.rename(uid, new_name).await
-        }
-
         async fn delete(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError> {
             self.inner.delete(uid).await
         }
@@ -976,6 +980,13 @@ mod tests {
             limit: i64,
         ) -> Result<Vec<ResourceRow>, StoreError> {
             self.inner.list_pending_collection(limit).await
+        }
+
+        async fn list_deletion_blockers(
+            &self,
+            uid: Uuid,
+        ) -> Result<rise_resource_api::DeletionBlockerReport, StoreError> {
+            self.inner.list_deletion_blockers(uid).await
         }
 
         async fn resolve_path(
@@ -1132,10 +1143,6 @@ mod tests {
             self.inner.update(uid, params).await
         }
 
-        async fn rename(&self, uid: Uuid, new_name: &str) -> Result<ResourceRow, StoreError> {
-            self.inner.rename(uid, new_name).await
-        }
-
         async fn delete(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError> {
             self.inner.delete(uid).await
         }
@@ -1149,6 +1156,13 @@ mod tests {
             limit: i64,
         ) -> Result<Vec<ResourceRow>, StoreError> {
             self.inner.list_pending_collection(limit).await
+        }
+
+        async fn list_deletion_blockers(
+            &self,
+            uid: Uuid,
+        ) -> Result<rise_resource_api::DeletionBlockerReport, StoreError> {
+            self.inner.list_deletion_blockers(uid).await
         }
 
         async fn resolve_path(

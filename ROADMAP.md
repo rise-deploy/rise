@@ -47,7 +47,7 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
   GroupMembership is an empty marker named for its User.
   Reserve their collection definitions now, but activate them only through the
   transaction-scoped normalization/admission seam.
-- [ ] Add optional, UID-authoritative `metadata.ownerReferences` to the generic
+- [~] Add optional, UID-authoritative `metadata.ownerReferences` to the generic
   resource envelope and implement transactional reverse lookup, cycle-safe,
   finalizer-respecting dependent garbage collection. GroupMembership may name
   its User as lifecycle owner; backend-managed memberships normally do so,

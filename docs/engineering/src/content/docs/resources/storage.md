@@ -17,11 +17,12 @@ Every resource row carries these fields:
 | `parent_uid` | UUID NULL | Parent row's `uid`. NULL means root-scoped. |
 | `name` | TEXT | User-chosen name. Scope-unique. |
 | `discriminator` | VARCHAR(8) | System-generated. Scope-unique. |
-| `metadata` | JSONB | Annotations, finalizers, deletion timestamp. |
+| `metadata` | JSONB | Resource annotations. |
 | `spec` | JSONB | Caller-controlled desired state. |
 | `status` | JSONB | Controller-owned observed state (`status.controllers[<id>]`). |
 | `revision` | BIGINT | Monotonic version counter. Increments on every write. |
 | `finalizers` | TEXT[] | Cleanup tokens that block hard-delete. |
+| `owner_references` | JSONB | Optional UID-authoritative lifecycle owners. |
 | `deletion_timestamp` | TIMESTAMPTZ NULL | Tombstone marker. |
 | `created_at`, `updated_at` | TIMESTAMPTZ | Standard audit timestamps. |
 
@@ -30,6 +31,7 @@ The store enforces these invariants at the database level:
 - `discriminator` matches `^[a-z0-9][a-z0-9-]{6}[a-z0-9]$` (8 lowercase DNS-safe chars, no leading or trailing hyphen).
 - `name` matches a DNS-label (`my-app`) or DNS-subdomain (`widgets.example.dev`) format, max 253 chars.
 - `metadata`, `spec`, `status` must each be a JSON object.
+- `owner_references` must be a JSON array.
 
 And these uniqueness invariants:
 
@@ -74,13 +76,44 @@ Each ResourceDefinition declares exactly one `parent` (or none, for root-scoped 
 
 The store caps parent-chain depth (and the `resolve_path` ancestor walk) at `MAX_PARENT_CHAIN_DEPTH = 32`. Registration also rejects cyclic parent graphs.
 
+## Owner references
+
+`metadata.ownerReferences` adds lifecycle edges without changing structural
+parentage or URL scope. Each typed reference carries `apiVersion`, `kind`,
+`name`, `uid`, and optional `blockOwnerDeletion` (default `false`); a write
+succeeds only when the identity fields identify the same live row. The UID is
+authoritative after admission, so deleting and recreating the same name cannot
+transfer lifecycle ownership.
+
+The `resources.owner_references` JSONB column is the sole persisted source of
+truth. A `jsonb_path_ops` GIN index accelerates reverse `@>` containment lookup
+when the collector needs all resources that reference an owner UID. There is no
+edge table, trigger-maintained projection, or application dual-write to drift
+from the resource envelope.
+
+Edge-creating owner-reference mutations take a transaction-scoped graph lock so
+graph checks and row locks have one ordering. Deletion and collection instead
+lock the owner row; reference writers lock every referenced owner, which closes
+the add-reference-versus-delete race without serializing unrelated cascades.
+Admission locks referenced owners, rejects duplicate UIDs and tombstoned or
+mismatched owners, and runs a recursive cycle check over both structural
+`parent_uid` edges and owner-reference edges. Resource names are immutable, so
+the inspectable name descriptor cannot drift after admission. Multiple owners
+are allowed; deletion of any one owner starts deletion of the dependent. A
+reference with `blockOwnerDeletion: true` additionally keeps that owner visible
+until the dependent is collected. Owner references are lifecycle-only and
+confer no authorization.
+
 ## Lifecycle: create
 
 The create path validates the spec (via the typed validator for built-ins, JSON Schema for external custom resources), generates a discriminator, and inserts the row at `revision = 1`. Same-level name and discriminator conflicts surface as `409 Conflict`.
 
 ## Lifecycle: update
 
-`PUT` replaces the resource's user-controlled fields (`spec`, plus `metadata.annotations` and `metadata.finalizers`) under optimistic concurrency on `revision`. The body's `metadata.name` must equal the stored name — resources cannot be renamed.
+`PUT` replaces the resource's user-controlled fields (`spec`, plus
+`metadata.annotations`, `metadata.finalizers`, and
+`metadata.ownerReferences`) under optimistic concurrency on `revision`. The
+body's `metadata.name` must equal the stored name — resources cannot be renamed.
 
 `api_version` may be changed to a different declared version of the same group via the store's `UpdateResourceParams.api_version`; the HTTP API translates a served request version to the collection's storage version before calling the store.
 
@@ -88,14 +121,41 @@ Identity fields (`uid`, `discriminator`, `deletionTimestamp`) cannot be modified
 
 ## Lifecycle: delete (cascade + finalizers)
 
-`DELETE` always cascades to the subtree. Behavior depends on the row's state:
+`DELETE` always cascades through both structural children and owner-reference
+dependents. Behavior depends on the row's state:
 
 | Row state | Outcome |
 |---|---|
-| No finalizers, no children | Hard-deleted in one transaction. Returns `200 OK`. |
-| Has finalizers and/or children | Tombstoned (`deletion_timestamp` set). Returns `202 Accepted`. |
+| No finalizers or blocking dependents | Hard-deleted in one transaction after immediate dependents are tombstoned. Returns `200 OK`. |
+| Has finalizers and/or blocking dependents | Tombstoned (`deletion_timestamp` set). Returns `202 Accepted`. |
 
-When children exist at delete time, the store stamps `deletion_timestamp` on **immediate children only** in the same transaction and attaches the system finalizer `system.rise.dev/cascade-deletion` to the parent. A background garbage collector (see below) drains the subtree bottom-up by repeatedly calling `try_collect` on tombstoned rows — each call stamps the next layer of children, and eventually hard-deletes a row when all its finalizers and children are gone.
+When dependents exist at delete time, the store stamps `deletion_timestamp` on
+immediate structural children and every direct owner-reference dependent in the
+same transaction. Structural children are inherently blocking. Cross-tree
+dependents block only when their matching reference has
+`blockOwnerDeletion: true`. While either kind of blocker remains, the store
+attaches `system.rise.dev/cascade-deletion` to the owner. Non-blocking
+owner-reference dependents continue draining after the owner disappears. A
+background garbage collector (see below) repeatedly calls `try_collect` to
+drive the lifecycle DAG.
+
+After each successful transaction, the store best-effort emits one structured
+`resource.deletion_cascaded` log on the `rise::audit` target for every dependent
+whose deletion timestamp was newly stamped. The record includes the immediate
+owner and dependent identities, `parent_deleted` or `owner_deleted` reason,
+relationship type, and blocking flag. Repeated GC sweeps do not emit duplicates
+for an already tombstoned dependent. These logs are emitted after commit, so a
+process exit in that narrow window can lose a record; durable delivery would
+require a transactional outbox or Event resource in a later increment.
+
+A built-in `Organization` or `ResourceDefinition` cannot currently be the
+dependent side of an owner reference: writes that put `owner_references` on
+either kind are rejected. Owner-driven deletion tombstones dependents directly
+through the generic collector, which would bypass the additional deletion
+safety checks for legacy Organization-owned records and resources that still
+use a ResourceDefinition. Both kinds can still be owners, and a custom
+`Organization` kind in another API group is unaffected. This restriction can
+be removed once those guards move into the transaction-scoped lifecycle layer.
 
 `ON DELETE CASCADE` is deliberately not used. That would bypass child finalizers; the cascade-stamping + GC sweep is the substitute.
 
@@ -103,7 +163,7 @@ When children exist at delete time, the store stamps `deletion_timestamp` on **i
 
 Finalizers are caller-managed cleanup tokens. While *any* finalizer is on a row, the row cannot be hard-deleted. Controllers add their own finalizer when they take ownership of an external resource, do their cleanup on observing a deletion timestamp, then remove the finalizer to unblock the hard-delete.
 
-The `system.rise.dev/*` prefix is reserved for store-internal finalizers (currently `system.rise.dev/cascade-deletion`). Controllers cannot add or remove these via `update_controller_finalizers` regardless of `controller_id`. Operators can override stuck cascade finalizers via the operator-finalizer endpoint, but the same reserved-prefix guard still applies — the operator path is for breaking deadlocks on controller-owned finalizers, not for forcing through cascade state.
+The `system.rise.dev/*` prefix is reserved for store-internal finalizers (currently `system.rise.dev/cascade-deletion`). Controllers and operators cannot add or remove these through finalizer subresources. The operator path can break deadlocks on controller-owned finalizers, but cannot force through a lifecycle blocker; the deletion-blockers subresource identifies the resources that must drain.
 
 ### Tombstones are visible
 
@@ -116,14 +176,15 @@ A leader-elected background worker (`ResourceGcController`) periodically polls `
 Per-row, `try_collect` is idempotent and does:
 
 - Non-tombstoned row → no-op (returns `MarkedForDeletion(row)`); the GC worker logs and moves on.
-- Tombstoned with children → stamps any still-unstamped children, ensures the cascade finalizer is set, returns `MarkedForDeletion`.
-- Tombstoned with no children → removes `system.rise.dev/cascade-deletion` if present; if no other finalizers remain, hard-deletes and returns `Deleted`; otherwise returns `MarkedForDeletion` (waiting on a controller finalizer).
+- Tombstoned with blocking dependents → stamps every still-live immediate dependent, ensures the cascade finalizer is set, and returns `MarkedForDeletion`.
+- Tombstoned without blocking dependents → stamps every still-live non-blocking owner-reference dependent, removes `system.rise.dev/cascade-deletion` if present, then hard-deletes when no other finalizer remains.
 
 The sweep has a forward-progress guard so stuck rows (controllers whose finalizer never clears) cannot starve newer tombstones within one tick. Consecutive sweep failures back off exponentially up to 60s.
 
-Two operational endpoints help diagnose stuck deletions:
+Three operational views help diagnose deletion behavior:
 
 - `GET /api/v1/resources/pending-deletion?limit=N` — list tombstoned rows oldest first (1 ≤ N ≤ 1000, default 100). Operator-only.
+- Per-resource `GET .../{name-or-uid}/deletion-blockers` — list current structural and opted-in owner-reference blockers with their finalizers. Operator-only and computed directly from canonical rows.
 - Per-row `GET` returns the row with `metadata.deletionTimestamp` and the current `metadata.finalizers`, so you can see which finalizer is holding cleanup.
 
 ## Organization namespace prefix
@@ -134,5 +195,10 @@ Organizations carry an optional annotation `kubernetes.rise.dev/namespace-prefix
 - When absent, the controller falls back to `org-{metadata.discriminator}-` (e.g. `org-a1b2c3d4-myapp`), which is collision-safe by construction.
 
 The bootstrap path also populates `spec.deploymentControllerClass` on the default Organization from the Kubernetes controller's configured `controller_class_name`. The Kubernetes controller only reconciles projects whose Organization carries a matching `deploymentControllerClass`; an unmatched or unset value means the org's projects are ignored, leaving room for alternate deployment backends per organization.
+
+Bootstrap creates the configured default Organization only when no
+Organizations exist. Otherwise an exact `default_organization.name` match is
+required; a nonmatching existing Organization makes backend startup fail.
+Bootstrap never renames an Organization or creates a second candidate default.
 
 Deleting an Organization that still has typed children (teams or projects linked via `organization_resource_uid`) is blocked at the application layer. Those rows are not children in the generic `resources` table, so the generic same-parent child check does not cover them — the guard must be explicit at the bootstrap/HTTP layer until typed APIs migrate onto the generic store.

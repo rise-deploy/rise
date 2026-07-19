@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use rise_resource_api::ResourceRow;
+use rise_resource_api::{OwnerReference, ResourceRow};
 use uuid::Uuid;
 
 /// SQLX-only representation of a `resources` row. The public contract uses the
@@ -17,6 +17,7 @@ pub(crate) struct PgResourceRow {
     pub status: serde_json::Value,
     pub revision: i64,
     pub finalizers: Vec<String>,
+    pub owner_references: sqlx::types::Json<Vec<OwnerReference>>,
     pub deletion_timestamp: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -36,6 +37,7 @@ impl From<PgResourceRow> for ResourceRow {
             status: row.status,
             revision: row.revision,
             finalizers: row.finalizers,
+            owner_references: row.owner_references.0,
             deletion_timestamp: row.deletion_timestamp,
             created_at: row.created_at,
             updated_at: row.updated_at,
@@ -66,6 +68,7 @@ mod tests {
             status: serde_json::json!({"ready": true}),
             revision: 9,
             finalizers: vec!["example.dev/cleanup".into()],
+            owner_references: sqlx::types::Json(vec![]),
             deletion_timestamp,
             created_at,
             updated_at,
@@ -83,6 +86,7 @@ mod tests {
         assert_eq!(api.status, serde_json::json!({"ready": true}));
         assert_eq!(api.revision, 9);
         assert_eq!(api.finalizers, vec!["example.dev/cleanup"]);
+        assert!(api.owner_references.is_empty());
         assert_eq!(api.deletion_timestamp, deletion_timestamp);
         assert_eq!(api.created_at, created_at);
         assert_eq!(api.updated_at, updated_at);
