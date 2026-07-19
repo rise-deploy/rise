@@ -217,7 +217,7 @@ scope and avoiding dead-end compatibility layers.
 
 ## Increment 4 — identity resource contracts
 
-- State: implementation, verification, and review complete; ready for draft PR.
+- State: published as draft PR #419; awaiting CI and review.
 - Branch: `feat/adr0001-identity-contracts`.
 - Acceptance criteria:
   - `rise-resource-api` owns closed serialized contracts for `User`,
@@ -291,4 +291,4 @@ scope and avoiding dead-end compatibility layers.
   - Activation remains deliberately deferred: the runtime registry and lookup
     adapters are unchanged, and the next increment must audit pre-existing
     conflicts transactionally before enabling identity routes.
-- PR: pending.
+- PR: #419, draft.
