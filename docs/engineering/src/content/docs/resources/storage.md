@@ -148,10 +148,14 @@ for an already tombstoned dependent. These logs are emitted after commit, so a
 process exit in that narrow window can lose a record; durable delivery would
 require a transactional outbox or Event resource in a later increment.
 
-`Organization` and `ResourceDefinition` cannot currently carry owner references
-because their deletion admission includes kind-specific checks outside the
-generic collector. They can still be owners. This restriction can be removed
-once those guards move into the transaction-scoped lifecycle layer.
+A built-in `Organization` or `ResourceDefinition` cannot currently be the
+dependent side of an owner reference: writes that put `owner_references` on
+either kind are rejected. Owner-driven deletion tombstones dependents directly
+through the generic collector, which would bypass the additional deletion
+safety checks for legacy Organization-owned records and resources that still
+use a ResourceDefinition. Both kinds can still be owners, and a custom
+`Organization` kind in another API group is unaffected. This restriction can
+be removed once those guards move into the transaction-scoped lifecycle layer.
 
 `ON DELETE CASCADE` is deliberately not used. That would bypass child finalizers; the cascade-stamping + GC sweep is the substitute.
 

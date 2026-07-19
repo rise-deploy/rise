@@ -45,9 +45,14 @@ Lifecycle owner references are stored once, in the resource row's
 UID containment queries for garbage collection. No separate edge table is
 maintained.
 
-`Organization` and `ResourceDefinition` are temporarily rejected as
-owner-reference dependents because their deletion admission still includes
-kind-specific checks outside this generic store. Both remain valid owners.
+A built-in `Organization` or `ResourceDefinition` cannot currently be the
+dependent side of an owner reference: writes that put `owner_references` on
+either kind are rejected. Owner-driven deletion tombstones dependents directly
+through the generic collector, which would bypass the additional deletion
+safety checks for legacy Organization-owned records and resources that still
+use a ResourceDefinition. Both kinds remain valid owners, and a custom
+`Organization` kind in another API group is unaffected. The restriction can be
+removed once those guards move into the transaction-scoped lifecycle layer.
 
 ## Deletion model
 

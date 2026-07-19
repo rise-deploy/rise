@@ -99,9 +99,14 @@ Authorization: Bearer <operator-jwt>
   always starts dependent deletion. Optional `blockOwnerDeletion` defaults to
   `false`; when `true`, that dependent also keeps the owner visible until the
   dependent is collected.
-- `Organization` and `ResourceDefinition` cannot currently carry owner
-  references because their deletion paths have additional admission guards;
-  they may still be referenced as owners.
+- A built-in `Organization` or `ResourceDefinition` cannot currently be the
+  dependent side of an owner reference: requests that put
+  `metadata.ownerReferences` on either kind are rejected. Owner-driven deletion
+  tombstones dependents through the generic garbage collector, which would
+  bypass the additional deletion safety checks for legacy Organization-owned
+  records and resources that still use a ResourceDefinition. Both kinds may
+  still be referenced as owners. A custom `Organization` kind in another API
+  group is unaffected.
 - Server-controlled fields (`uid`, `revision`, `discriminator`, `deletionTimestamp`) are rejected on create.
 - `status` is rejected on create.
 - Response: `201 Created` with the created resource (envelope projected to the URL's served version).
