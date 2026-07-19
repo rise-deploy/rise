@@ -21,8 +21,10 @@ A path always names the **leaf** collection first as `{group}/{version}/{plural}
 | `{group}/{version}/{plural}/{ancestor}…/{name}` (`D+1`) | GET, PUT, DELETE | Get / update / delete an item |
 | `{group}/{version}/{plural}/{ancestor}…/{name}/status` (`D+2`) | PUT | Status subresource update |
 | `{group}/{version}/{plural}/{ancestor}…/{name}/finalizers` (`D+2`) | PUT | Finalizer subresource update |
+| `{group}/{version}/{plural}/{ancestor}…/{name}/deletion-blockers` (`D+2`) | GET | Deletion-blocker diagnostics |
 | `{group}/{version}/{plural}/uid:{uuid}` | GET, PUT, DELETE | Item by UID |
 | `{group}/{version}/{plural}/uid:{uuid}/{sub}` | PUT | `status` or `finalizers` by UID |
+| `{group}/{version}/{plural}/uid:{uuid}/deletion-blockers` | GET | Deletion-blocker diagnostics by UID |
 | `pending-deletion` | GET | List tombstoned resources awaiting GC |
 
 Ancestor segments are bare resource *names*; the ancestor *kinds* are derived from the leaf's `ResourceDefinition` parent chain and never appear in the URL. `pending-deletion` is only valid as the sole path segment, so a resource may be named `pending-deletion` without ambiguity.
@@ -50,7 +52,7 @@ Operators have unrestricted access to subresources. When an operator writes fina
 
 `auth.admin_users` are admins within the default Organization for typed APIs only; they do **not** receive Operator and cannot access the generic API unless also listed in `auth.operator_users`.
 
-All write operations are audit-logged on the `rise::audit` target. Events: `resource.created`, `resource.updated`, `resource.deleted`, `resource.controller_status_updated`, `resource.controller_finalizers_updated`, `resource.operator_status_updated`, `resource.operator_finalizers_updated`, `resource.pending_deletion_listed`.
+Resource lifecycle operations are audit-logged on the `rise::audit` target. Records include `resource.created`, `resource.updated`, `resource.deleted`, `resource.deletion_cascaded`, `resource.controller_status_updated`, `resource.controller_finalizers_updated`, `resource.operator_status_updated`, `resource.operator_finalizers_updated`, `resource.pending_deletion_listed`, and `resource.deletion_blockers_listed`. Cascade records are best-effort after commit; durable delivery would require a transactional outbox or Event resource.
 
 ### Controller authorization
 
@@ -80,7 +82,8 @@ Authorization: Bearer <operator-jwt>
       "apiVersion": "rise.dev/v1alpha1",
       "kind": "Organization",
       "name": "acme",
-      "uid": "6e999cac-9c0b-4a94-a844-546ce8d508fb"
+      "uid": "6e999cac-9c0b-4a94-a844-546ce8d508fb",
+      "blockOwnerDeletion": false
     }]
   },
   "spec": {"color": "blue"}
@@ -92,7 +95,13 @@ Authorization: Bearer <operator-jwt>
 - `metadata.name` is the resource's name within its scope.
 - `metadata.ownerReferences` is optional lifecycle metadata. Every entry must
   identify the same live resource by API group/kind, name, and UID. References
-  do not change the resource URL or grant authorization.
+  do not change the resource URL or grant authorization. Deleting an owner
+  always starts dependent deletion. Optional `blockOwnerDeletion` defaults to
+  `false`; when `true`, that dependent also keeps the owner visible until the
+  dependent is collected.
+- `Organization` and `ResourceDefinition` cannot currently carry owner
+  references because their deletion paths have additional admission guards;
+  they may still be referenced as owners.
 - Server-controlled fields (`uid`, `revision`, `discriminator`, `deletionTimestamp`) are rejected on create.
 - `status` is rejected on create.
 - Response: `201 Created` with the created resource (envelope projected to the URL's served version).
@@ -162,7 +171,7 @@ Authorization: Bearer <operator-jwt>
 `DELETE` always cascades through structural children and owner-reference
 dependents (see [Storage Model](./storage)). Two response shapes:
 
-- `200 OK` with `{"deleted": true, "uid": "..."}` — row had no finalizers and no children, hard-deleted in place.
+- `200 OK` with `{"deleted": true, "uid": "..."}` — row had no finalizers or blocking dependents, hard-deleted in place. Non-blocking owner-reference dependents have already been tombstoned and continue draining asynchronously.
 - `202 Accepted` with `{"deleted": false, "markedForDeletion": true, "resource": ...}` — row tombstoned, cascade in progress. The returned envelope carries the row at its post-stamp state (`metadata.deletionTimestamp` set, `metadata.finalizers` may include `system.rise.dev/cascade-deletion`).
 
 ### Pending-deletion listing
@@ -173,6 +182,22 @@ Authorization: Bearer <operator-jwt>
 ```
 
 Returns tombstoned rows oldest-first, up to `limit` (1–1000, default 100). Useful for spotting deletions stuck on a finalizer.
+
+### Deletion-blockers subresource
+
+```http
+GET /api/v1/resources/rise.dev/v1alpha1/organizations/acme/deletion-blockers
+Authorization: Bearer <operator-jwt>
+```
+
+Returns the concrete resources currently preventing the addressed resource
+from being collected. Structural children are always blockers;
+owner-reference dependents appear only when their matching reference carries
+`blockOwnerDeletion: true`. Each item identifies the relationship and resource,
+including its deletion timestamp and finalizers. The response also reports
+whether `system.rise.dev/cascade-deletion` is currently present. This
+operator-only subresource is computed from the canonical resource rows and
+does not maintain a separate blocker table.
 
 ## Status codes
 

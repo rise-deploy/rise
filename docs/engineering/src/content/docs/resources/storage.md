@@ -80,9 +80,10 @@ The store caps parent-chain depth (and the `resolve_path` ancestor walk) at `MAX
 
 `metadata.ownerReferences` adds lifecycle edges without changing structural
 parentage or URL scope. Each typed reference carries `apiVersion`, `kind`,
-`name`, and `uid`; a write succeeds only when those fields identify the same
-live row. The UID is authoritative after admission, so deleting and recreating
-the same name cannot transfer lifecycle ownership.
+`name`, `uid`, and optional `blockOwnerDeletion` (default `false`); a write
+succeeds only when the identity fields identify the same live row. The UID is
+authoritative after admission, so deleting and recreating the same name cannot
+transfer lifecycle ownership.
 
 The `resources.owner_references` JSONB column is the sole persisted source of
 truth. A `jsonb_path_ops` GIN index accelerates reverse `@>` containment lookup
@@ -90,14 +91,18 @@ when the collector needs all resources that reference an owner UID. There is no
 edge table, trigger-maintained projection, or application dual-write to drift
 from the resource envelope.
 
-Edge-creating owner-reference mutations and collection take a
-transaction-scoped graph lock so graph checks and row locks have one ordering.
+Edge-creating owner-reference mutations take a transaction-scoped graph lock so
+graph checks and row locks have one ordering. Deletion and collection instead
+lock the owner row; reference writers lock every referenced owner, which closes
+the add-reference-versus-delete race without serializing unrelated cascades.
 Admission locks referenced owners, rejects duplicate UIDs and tombstoned or
 mismatched owners, and runs a recursive cycle check over both structural
 `parent_uid` edges and owner-reference edges. Resource names are immutable, so
 the inspectable name descriptor cannot drift after admission. Multiple owners
-are allowed; deletion of any one owner starts deletion of the dependent. Owner
-references are lifecycle-only and confer no authorization.
+are allowed; deletion of any one owner starts deletion of the dependent. A
+reference with `blockOwnerDeletion: true` additionally keeps that owner visible
+until the dependent is collected. Owner references are lifecycle-only and
+confer no authorization.
 
 ## Lifecycle: create
 
@@ -121,16 +126,32 @@ dependents. Behavior depends on the row's state:
 
 | Row state | Outcome |
 |---|---|
-| No finalizers, no dependents | Hard-deleted in one transaction. Returns `200 OK`. |
-| Has finalizers and/or dependents | Tombstoned (`deletion_timestamp` set). Returns `202 Accepted`. |
+| No finalizers or blocking dependents | Hard-deleted in one transaction after immediate dependents are tombstoned. Returns `200 OK`. |
+| Has finalizers and/or blocking dependents | Tombstoned (`deletion_timestamp` set). Returns `202 Accepted`. |
 
 When dependents exist at delete time, the store stamps `deletion_timestamp` on
-immediate structural children and direct owner-reference dependents in the same
-transaction, then attaches the system finalizer
-`system.rise.dev/cascade-deletion` to the owner. A background garbage collector
-(see below) drains the lifecycle DAG bottom-up by repeatedly calling
-`try_collect` on tombstoned rows. Each call stamps the next layer and eventually
-hard-deletes a row when all its finalizers and dependents are gone.
+immediate structural children and every direct owner-reference dependent in the
+same transaction. Structural children are inherently blocking. Cross-tree
+dependents block only when their matching reference has
+`blockOwnerDeletion: true`. While either kind of blocker remains, the store
+attaches `system.rise.dev/cascade-deletion` to the owner. Non-blocking
+owner-reference dependents continue draining after the owner disappears. A
+background garbage collector (see below) repeatedly calls `try_collect` to
+drive the lifecycle DAG.
+
+After each successful transaction, the store best-effort emits one structured
+`resource.deletion_cascaded` log on the `rise::audit` target for every dependent
+whose deletion timestamp was newly stamped. The record includes the immediate
+owner and dependent identities, `parent_deleted` or `owner_deleted` reason,
+relationship type, and blocking flag. Repeated GC sweeps do not emit duplicates
+for an already tombstoned dependent. These logs are emitted after commit, so a
+process exit in that narrow window can lose a record; durable delivery would
+require a transactional outbox or Event resource in a later increment.
+
+`Organization` and `ResourceDefinition` cannot currently carry owner references
+because their deletion admission includes kind-specific checks outside the
+generic collector. They can still be owners. This restriction can be removed
+once those guards move into the transaction-scoped lifecycle layer.
 
 `ON DELETE CASCADE` is deliberately not used. That would bypass child finalizers; the cascade-stamping + GC sweep is the substitute.
 
@@ -138,7 +159,7 @@ hard-deletes a row when all its finalizers and dependents are gone.
 
 Finalizers are caller-managed cleanup tokens. While *any* finalizer is on a row, the row cannot be hard-deleted. Controllers add their own finalizer when they take ownership of an external resource, do their cleanup on observing a deletion timestamp, then remove the finalizer to unblock the hard-delete.
 
-The `system.rise.dev/*` prefix is reserved for store-internal finalizers (currently `system.rise.dev/cascade-deletion`). Controllers cannot add or remove these via `update_controller_finalizers` regardless of `controller_id`. Operators can override stuck cascade finalizers via the operator-finalizer endpoint, but the same reserved-prefix guard still applies — the operator path is for breaking deadlocks on controller-owned finalizers, not for forcing through cascade state.
+The `system.rise.dev/*` prefix is reserved for store-internal finalizers (currently `system.rise.dev/cascade-deletion`). Controllers and operators cannot add or remove these through finalizer subresources. The operator path can break deadlocks on controller-owned finalizers, but cannot force through a lifecycle blocker; the deletion-blockers subresource identifies the resources that must drain.
 
 ### Tombstones are visible
 
@@ -151,14 +172,15 @@ A leader-elected background worker (`ResourceGcController`) periodically polls `
 Per-row, `try_collect` is idempotent and does:
 
 - Non-tombstoned row → no-op (returns `MarkedForDeletion(row)`); the GC worker logs and moves on.
-- Tombstoned with children → stamps any still-unstamped children, ensures the cascade finalizer is set, returns `MarkedForDeletion`.
-- Tombstoned with no children → removes `system.rise.dev/cascade-deletion` if present; if no other finalizers remain, hard-deletes and returns `Deleted`; otherwise returns `MarkedForDeletion` (waiting on a controller finalizer).
+- Tombstoned with blocking dependents → stamps every still-live immediate dependent, ensures the cascade finalizer is set, and returns `MarkedForDeletion`.
+- Tombstoned without blocking dependents → stamps every still-live non-blocking owner-reference dependent, removes `system.rise.dev/cascade-deletion` if present, then hard-deletes when no other finalizer remains.
 
 The sweep has a forward-progress guard so stuck rows (controllers whose finalizer never clears) cannot starve newer tombstones within one tick. Consecutive sweep failures back off exponentially up to 60s.
 
-Two operational endpoints help diagnose stuck deletions:
+Three operational views help diagnose deletion behavior:
 
 - `GET /api/v1/resources/pending-deletion?limit=N` — list tombstoned rows oldest first (1 ≤ N ≤ 1000, default 100). Operator-only.
+- Per-resource `GET .../{name-or-uid}/deletion-blockers` — list current structural and opted-in owner-reference blockers with their finalizers. Operator-only and computed directly from canonical rows.
 - Per-row `GET` returns the row with `metadata.deletionTimestamp` and the current `metadata.finalizers`, so you can see which finalizer is holding cleanup.
 
 ## Organization namespace prefix

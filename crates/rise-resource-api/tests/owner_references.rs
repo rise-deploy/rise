@@ -17,6 +17,8 @@ where
 #[test]
 fn owner_reference_is_closed_typed_and_uid_bound() {
     let uid = Uuid::new_v4();
+    let label = "a".repeat(63);
+    let overlong_api_group = format!("{label}.{label}.{label}.{label}/v1");
     let reference: OwnerReference = serde_json::from_value(json!({
         "apiVersion": "rise.dev/v1alpha1",
         "kind": "User",
@@ -28,7 +30,18 @@ fn owner_reference_is_closed_typed_and_uid_bound() {
     assert_eq!(reference.kind(), "User");
     assert_eq!(reference.name(), "u-alice");
     assert_eq!(reference.uid(), uid);
+    assert!(!reference.block_owner_deletion());
     assert_eq!(reference.resource_kind().unwrap().as_ref(), "rise.dev/User");
+
+    let blocking: OwnerReference = serde_json::from_value(json!({
+        "apiVersion": "rise.dev/v1alpha1",
+        "kind": "User",
+        "name": "u-alice",
+        "uid": uid,
+        "blockOwnerDeletion": true
+    }))
+    .unwrap();
+    assert!(blocking.block_owner_deletion());
 
     for invalid in [
         json!({"kind":"User","name":"u-alice","uid":uid}),
@@ -37,6 +50,7 @@ fn owner_reference_is_closed_typed_and_uid_bound() {
         json!({"apiVersion":"rise.dev/v1alpha1","kind":"User","name":"Alice","uid":uid}),
         json!({"apiVersion":"rise..dev/v1alpha1","kind":"User","name":"u-alice","uid":uid}),
         json!({"apiVersion":"rise.dev/v1alpha1","kind":"User","name":"bad..name","uid":uid}),
+        json!({"apiVersion":overlong_api_group,"kind":"User","name":"u-alice","uid":uid}),
         json!({"apiVersion":"rise.dev/v1alpha1","kind":"User","name":"u-alice","uid":"00000000-0000-0000-0000-000000000000"}),
         json!({"apiVersion":"rise.dev/v1alpha1","kind":"User","name":"u-alice","uid":uid,"controller":true}),
     ] {

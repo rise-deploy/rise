@@ -4,9 +4,10 @@ use uuid::Uuid;
 
 use rise_resource_api::{
     validate_controller_id, validate_resource_name, CollectionInfo, CreateResourceParams,
-    DeleteOutcome, NoOpValidator, OwnerReference, PathSegment, ResourceDefinitionSpec,
-    ResourceKind, ResourceRow, ResourceStore, SpecValidator, StoreError, UpdateResourceParams,
-    API_VERSION_V1ALPHA1, CASCADE_DELETION_FINALIZER, MAX_PARENT_CHAIN_DEPTH, ORGANIZATION_KIND,
+    DeleteOutcome, DeletionBlocker, DeletionBlockerRelationship, DeletionBlockerReport,
+    NoOpValidator, OwnerReference, PathSegment, ResourceDefinitionSpec, ResourceKind, ResourceRow,
+    ResourceStore, SpecValidator, StoreError, UpdateResourceParams, API_VERSION_V1ALPHA1,
+    CASCADE_DELETION_FINALIZER, MAX_PARENT_CHAIN_DEPTH, ORGANIZATION_KIND,
     RESOURCE_DEFINITION_KIND, SYSTEM_FINALIZER_PREFIX,
 };
 use sqlx::{PgPool, Row};
@@ -27,6 +28,41 @@ pub struct PgResourceStore {
     /// `resource_definitions` row, so resolution for them goes through this
     /// registry rather than the database. See [`crate::builtin`].
     builtins: Arc<BuiltInRegistry>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CascadeRelationship {
+    StructuralParent,
+    OwnerReference { block_owner_deletion: bool },
+}
+
+#[derive(Debug)]
+struct TombstonedDependent {
+    relationship: CascadeRelationship,
+    uid: Uuid,
+    api_version: String,
+    kind: String,
+    name: String,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct TombstonedDependentRow {
+    uid: Uuid,
+    api_version: String,
+    kind: String,
+    name: String,
+    block_owner_deletion: bool,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct PgDeletionBlocker {
+    structural: bool,
+    api_version: String,
+    kind: String,
+    name: String,
+    uid: Uuid,
+    deletion_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+    finalizers: Vec<String>,
 }
 
 impl PgResourceStore {
@@ -102,6 +138,25 @@ impl PgResourceStore {
         Ok(references)
     }
 
+    /// These kinds still have deletion admission outside the generic store.
+    /// Letting them become cross-tree dependents would allow owner-driven GC to
+    /// bypass those guards.
+    fn ensure_owner_references_supported(
+        dependent_api_version: &str,
+        dependent_kind: &str,
+        references: &[OwnerReference],
+    ) -> Result<(), StoreError> {
+        let has_external_deletion_admission = dependent_kind == RESOURCE_DEFINITION_KIND
+            || (dependent_api_version == API_VERSION_V1ALPHA1
+                && dependent_kind == ORGANIZATION_KIND);
+        if !references.is_empty() && has_external_deletion_admission {
+            return Err(StoreError::Validation(format!(
+                "owner references are not supported on {dependent_kind} resources"
+            )));
+        }
+        Ok(())
+    }
+
     async fn lock_owner_reference_graph(conn: &mut sqlx::PgConnection) -> Result<(), StoreError> {
         sqlx::query(
             "SELECT pg_advisory_xact_lock(hashtext('resource_owner_reference_cycle')::bigint)",
@@ -125,11 +180,9 @@ impl PgResourceStore {
             return Ok(references);
         }
 
-        // Serialize cycle checks and edge replacement. Resource owner graphs
-        // are expected to be small and mutations rare; one transaction lock
-        // closes races where concurrent individually-acyclic writes would form
-        // a cycle together.
-        Self::lock_owner_reference_graph(conn).await?;
+        // The caller holds the owner-reference graph lock before any other
+        // resource locks. That ordering closes races where concurrent,
+        // individually acyclic writes would form a cycle together.
 
         let owner_uids: Vec<Uuid> = references.iter().map(OwnerReference::uid).collect();
         if !owner_uids.is_empty() {
@@ -190,19 +243,13 @@ impl PgResourceStore {
                 WITH RECURSIVE reachable(uid) AS (
                     SELECT $1::uuid
                     UNION
-                    SELECT edge.dependent_uid
+                    SELECT dependent.uid
                     FROM reachable current
-                    JOIN (
-                        SELECT uid AS dependent_uid, parent_uid AS owner_uid
-                        FROM resource_store.resources
-                        WHERE parent_uid IS NOT NULL
-                        UNION ALL
-                        SELECT resource.uid AS dependent_uid,
-                               (reference->>'uid')::uuid AS owner_uid
-                        FROM resource_store.resources resource
-                        CROSS JOIN LATERAL
-                            jsonb_array_elements(resource.owner_references) reference
-                    ) edge ON edge.owner_uid = current.uid
+                    JOIN resource_store.resources dependent
+                      ON dependent.parent_uid = current.uid
+                      OR dependent.owner_references @> jsonb_build_array(
+                          jsonb_build_object('uid', current.uid::text)
+                      )
                 )
                 SELECT EXISTS(
                     SELECT 1 FROM reachable WHERE uid = ANY($2)
@@ -222,6 +269,134 @@ impl PgResourceStore {
         }
 
         Ok(references)
+    }
+
+    /// Tombstone every immediate lifecycle dependent that has not already
+    /// entered deletion. Structural children are updated first, so a resource
+    /// that is both a structural child and an owner-reference dependent emits
+    /// one event with the structural relationship.
+    async fn tombstone_immediate_dependents(
+        conn: &mut sqlx::PgConnection,
+        owner_uid: Uuid,
+    ) -> Result<Vec<TombstonedDependent>, StoreError> {
+        let structural = sqlx::query_as::<_, TombstonedDependentRow>(
+            r#"
+            UPDATE resource_store.resources
+            SET deletion_timestamp = NOW(),
+                revision = revision + 1
+            WHERE parent_uid = $1
+              AND deletion_timestamp IS NULL
+            RETURNING uid, api_version, kind, name,
+                      true AS block_owner_deletion
+            "#,
+        )
+        .bind(owner_uid)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(StoreError::backend)?;
+
+        let referenced = sqlx::query_as::<_, TombstonedDependentRow>(
+            r#"
+            UPDATE resource_store.resources
+            SET deletion_timestamp = NOW(),
+                revision = revision + 1
+            WHERE owner_references @> jsonb_build_array(
+                    jsonb_build_object('uid', $1::text)
+                )
+              AND deletion_timestamp IS NULL
+            RETURNING uid, api_version, kind, name,
+                      owner_references @> jsonb_build_array(
+                          jsonb_build_object(
+                              'uid', $1::text,
+                              'blockOwnerDeletion', true
+                          )
+                      ) AS block_owner_deletion
+            "#,
+        )
+        .bind(owner_uid)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(StoreError::backend)?;
+
+        let mut tombstoned = Vec::with_capacity(structural.len() + referenced.len());
+        tombstoned.extend(structural.into_iter().map(|row| TombstonedDependent {
+            relationship: CascadeRelationship::StructuralParent,
+            uid: row.uid,
+            api_version: row.api_version,
+            kind: row.kind,
+            name: row.name,
+        }));
+        tombstoned.extend(referenced.into_iter().map(|row| TombstonedDependent {
+            relationship: CascadeRelationship::OwnerReference {
+                block_owner_deletion: row.block_owner_deletion,
+            },
+            uid: row.uid,
+            api_version: row.api_version,
+            kind: row.kind,
+            name: row.name,
+        }));
+        Ok(tombstoned)
+    }
+
+    /// Structural children always block collection. Cross-tree dependents only
+    /// block when the matching owner reference opts into foreground behavior.
+    async fn has_blocking_dependents(
+        conn: &mut sqlx::PgConnection,
+        owner_uid: Uuid,
+    ) -> Result<bool, StoreError> {
+        sqlx::query_scalar(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                FROM resource_store.resources
+                WHERE parent_uid = $1
+            ) OR EXISTS(
+                SELECT 1
+                FROM resource_store.resources
+                WHERE owner_references @> jsonb_build_array(
+                    jsonb_build_object(
+                        'uid', $1::text,
+                        'blockOwnerDeletion', true
+                    )
+                )
+            )
+            "#,
+        )
+        .bind(owner_uid)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(StoreError::backend)
+    }
+
+    /// Best-effort emit one structured lifecycle log after the transaction that
+    /// first tombstoned each dependent has committed.
+    fn log_tombstoned_dependents(owner: &PgResourceRow, dependents: Vec<TombstonedDependent>) {
+        for dependent in dependents {
+            let (reason, relationship, block_owner_deletion) = match dependent.relationship {
+                CascadeRelationship::StructuralParent => {
+                    ("parent_deleted", "structuralParent", true)
+                }
+                CascadeRelationship::OwnerReference {
+                    block_owner_deletion,
+                } => ("owner_deleted", "ownerReference", block_owner_deletion),
+            };
+            tracing::info!(
+                target: "rise::audit",
+                actor = "resource-store",
+                reason,
+                relationship,
+                owner_uid = %owner.uid,
+                owner_api_version = %owner.api_version,
+                owner_kind = %owner.kind,
+                owner_name = %owner.name,
+                dependent_uid = %dependent.uid,
+                dependent_api_version = %dependent.api_version,
+                dependent_kind = %dependent.kind,
+                dependent_name = %dependent.name,
+                block_owner_deletion,
+                "resource.deletion_cascaded"
+            );
+        }
     }
 
     /// Project this store's built-in registry into a `CollectionInfo` for
@@ -548,6 +723,11 @@ impl ResourceStore for PgResourceStore {
         }
 
         validate_resource_name(&params.name).map_err(|e| StoreError::Validation(e.to_string()))?;
+        Self::ensure_owner_references_supported(
+            &params.api_version,
+            &params.kind,
+            &params.owner_references,
+        )?;
 
         if let Some(v) = &params.validator {
             v.validate_spec(&params.spec)?;
@@ -715,6 +895,11 @@ impl ResourceStore for PgResourceStore {
                     .to_string(),
             ));
         }
+        Self::ensure_owner_references_supported(
+            &current_api_version,
+            &kind,
+            &params.owner_references,
+        )?;
 
         if let Some(v) = &params.validator {
             v.validate_spec(&params.spec)?;
@@ -809,7 +994,6 @@ impl ResourceStore for PgResourceStore {
 
     async fn delete(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError> {
         let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
-        Self::lock_owner_reference_graph(&mut tx).await?;
 
         // Lock the row inside the transaction so a concurrent update_controller_finalizers()
         // can't add a finalizer between our read and the hard-delete branch below.
@@ -822,53 +1006,19 @@ impl ResourceStore for PgResourceStore {
         .map_err(StoreError::backend)?
         .ok_or(StoreError::NotFound)?;
 
-        let dependent_count: i64 = sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*) FROM (
-                SELECT uid AS dependent_uid
-                FROM resource_store.resources
-                WHERE parent_uid = $1
-                UNION
-                SELECT uid
-                FROM resource_store.resources
-                WHERE owner_references @> jsonb_build_array(
-                    jsonb_build_object('uid', $1::text)
-                )
-            ) dependents
-            "#,
-        )
-        .bind(uid)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(StoreError::backend)?;
+        // ResourceDefinition deletion admission must run before any dependent
+        // is tombstoned or an early blocking-dependent branch can commit.
+        if row.kind == RESOURCE_DEFINITION_KIND {
+            self.ensure_resource_definition_has_no_instances(&row, &mut tx)
+                .await?;
+        }
 
-        if dependent_count > 0 {
-            // Stamp immediate structural children and owner-reference dependents
-            // that aren't already marked. A future GC sweep drives fan-out down
-            // the remaining lifecycle graph.
-            sqlx::query(
-                r#"
-                UPDATE resource_store.resources
-                SET deletion_timestamp = NOW(),
-                    revision = revision + 1
-                WHERE uid IN (
-                    SELECT uid FROM resource_store.resources WHERE parent_uid = $1
-                    UNION
-                    SELECT uid
-                    FROM resource_store.resources
-                    WHERE owner_references @> jsonb_build_array(
-                        jsonb_build_object('uid', $1::text)
-                    )
-                )
-                  AND deletion_timestamp IS NULL
-                "#,
-            )
-            .bind(uid)
-            .execute(&mut *tx)
-            .await
-            .map_err(StoreError::backend)?;
+        let tombstoned = Self::tombstone_immediate_dependents(&mut tx, uid).await?;
+        let has_blocking_dependents = Self::has_blocking_dependents(&mut tx, uid).await?;
 
-            // Stamp the parent and attach the cascade finalizer (idempotent).
+        if has_blocking_dependents {
+            // Structural children and explicitly blocking owner references keep
+            // the owner visible until the collector drains them.
             let marked = sqlx::query_as::<_, PgResourceRow>(
                 r#"
                 UPDATE resource_store.resources
@@ -888,15 +1038,8 @@ impl ResourceStore for PgResourceStore {
             .await
             .map_err(StoreError::backend)?;
             tx.commit().await.map_err(StoreError::backend)?;
+            Self::log_tombstoned_dependents(&row, tombstoned);
             return Ok(DeleteOutcome::MarkedForDeletion(Box::new(marked.into())));
-        }
-
-        // No (remaining) children. For ResourceDefinitions, reject deletion when live instances
-        // exist — check before tombstoning (finalizer path) or hard-deleting so the caller gets
-        // an immediate error rather than a silent tombstone that try_collect would later reject.
-        if row.kind == RESOURCE_DEFINITION_KIND {
-            self.ensure_resource_definition_has_no_instances(&row, &mut tx)
-                .await?;
         }
 
         // Mark if finalizers, else hard-delete.
@@ -915,6 +1058,7 @@ impl ResourceStore for PgResourceStore {
             .await
             .map_err(StoreError::backend)?;
             tx.commit().await.map_err(StoreError::backend)?;
+            Self::log_tombstoned_dependents(&row, tombstoned);
             return Ok(DeleteOutcome::MarkedForDeletion(Box::new(marked.into())));
         }
         // Deleting the `resources` row also removes it from the
@@ -925,13 +1069,13 @@ impl ResourceStore for PgResourceStore {
             .await
             .map_err(StoreError::backend)?;
         tx.commit().await.map_err(StoreError::backend)?;
+        Self::log_tombstoned_dependents(&row, tombstoned);
 
         Ok(DeleteOutcome::Deleted)
     }
 
     async fn try_collect(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError> {
         let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
-        Self::lock_owner_reference_graph(&mut tx).await?;
 
         let row = sqlx::query_as::<_, PgResourceRow>(
             "SELECT * FROM resource_store.resources WHERE uid = $1 FOR UPDATE",
@@ -947,51 +1091,12 @@ impl ResourceStore for PgResourceStore {
             return Ok(DeleteOutcome::MarkedForDeletion(Box::new(row.into())));
         }
 
-        let dependent_count: i64 = sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*) FROM (
-                SELECT uid AS dependent_uid
-                FROM resource_store.resources
-                WHERE parent_uid = $1
-                UNION
-                SELECT uid
-                FROM resource_store.resources
-                WHERE owner_references @> jsonb_build_array(
-                    jsonb_build_object('uid', $1::text)
-                )
-            ) dependents
-            "#,
-        )
-        .bind(uid)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(StoreError::backend)?;
+        let tombstoned = Self::tombstone_immediate_dependents(&mut tx, uid).await?;
+        let has_blocking_dependents = Self::has_blocking_dependents(&mut tx, uid).await?;
 
-        if dependent_count > 0 {
-            // Fan out through both structural and owner-reference edges. Ensure
-            // the cascade finalizer is present and bump every mutated dependent.
-            sqlx::query(
-                r#"
-                UPDATE resource_store.resources
-                SET deletion_timestamp = NOW(),
-                    revision = revision + 1
-                WHERE uid IN (
-                    SELECT uid FROM resource_store.resources WHERE parent_uid = $1
-                    UNION
-                    SELECT uid
-                    FROM resource_store.resources
-                    WHERE owner_references @> jsonb_build_array(
-                        jsonb_build_object('uid', $1::text)
-                    )
-                )
-                  AND deletion_timestamp IS NULL
-                "#,
-            )
-            .bind(uid)
-            .execute(&mut *tx)
-            .await
-            .map_err(StoreError::backend)?;
-
+        if has_blocking_dependents {
+            // Fan out through every lifecycle edge, but retain the cascade
+            // finalizer only for structural or explicitly blocking edges.
             let row = sqlx::query_as::<_, PgResourceRow>(
                 r#"
                 UPDATE resource_store.resources
@@ -1013,6 +1118,7 @@ impl ResourceStore for PgResourceStore {
             .await
             .map_err(StoreError::backend)?;
             tx.commit().await.map_err(StoreError::backend)?;
+            Self::log_tombstoned_dependents(&row, tombstoned);
             return Ok(DeleteOutcome::MarkedForDeletion(Box::new(row.into())));
         }
 
@@ -1038,6 +1144,7 @@ impl ResourceStore for PgResourceStore {
 
         if !row.finalizers.is_empty() {
             tx.commit().await.map_err(StoreError::backend)?;
+            Self::log_tombstoned_dependents(&row, tombstoned);
             return Ok(DeleteOutcome::MarkedForDeletion(Box::new(row.into())));
         }
 
@@ -1054,6 +1161,7 @@ impl ResourceStore for PgResourceStore {
             .await
             .map_err(StoreError::backend)?;
         tx.commit().await.map_err(StoreError::backend)?;
+        Self::log_tombstoned_dependents(&row, tombstoned);
 
         Ok(DeleteOutcome::Deleted)
     }
@@ -1072,6 +1180,74 @@ impl ResourceStore for PgResourceStore {
         .await
         .map_err(StoreError::backend)?;
         Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn list_deletion_blockers(&self, uid: Uuid) -> Result<DeletionBlockerReport, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *tx)
+            .await
+            .map_err(StoreError::backend)?;
+
+        let resource = sqlx::query_as::<_, PgResourceRow>(
+            "SELECT * FROM resource_store.resources WHERE uid = $1",
+        )
+        .bind(uid)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(StoreError::backend)?
+        .ok_or(StoreError::NotFound)?;
+
+        // A single query gives structural edges precedence when one dependent
+        // also carries a blocking owner reference to the same resource.
+        let rows = sqlx::query_as::<_, PgDeletionBlocker>(
+            r#"
+            SELECT true AS structural, api_version, kind, name, uid,
+                   deletion_timestamp, finalizers
+            FROM resource_store.resources
+            WHERE parent_uid = $1
+
+            UNION ALL
+
+            SELECT false AS structural, api_version, kind, name, uid,
+                   deletion_timestamp, finalizers
+            FROM resource_store.resources
+            WHERE owner_references @> jsonb_build_array(
+                    jsonb_build_object(
+                        'uid', $1::text,
+                        'blockOwnerDeletion', true
+                    )
+                )
+              AND parent_uid IS DISTINCT FROM $1
+
+            ORDER BY structural DESC, api_version, kind, name, uid
+            "#,
+        )
+        .bind(uid)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(StoreError::backend)?;
+
+        tx.commit().await.map_err(StoreError::backend)?;
+        Ok(DeletionBlockerReport {
+            resource: resource.into(),
+            blockers: rows
+                .into_iter()
+                .map(|row| DeletionBlocker {
+                    relationship: if row.structural {
+                        DeletionBlockerRelationship::StructuralChild
+                    } else {
+                        DeletionBlockerRelationship::OwnerReference
+                    },
+                    api_version: row.api_version,
+                    kind: row.kind,
+                    name: row.name,
+                    uid: row.uid,
+                    deletion_timestamp: row.deletion_timestamp,
+                    finalizers: row.finalizers,
+                })
+                .collect(),
+        })
     }
 
     async fn resolve_path(&self, segments: &[PathSegment]) -> Result<Vec<ResourceRow>, StoreError> {
@@ -1589,6 +1765,11 @@ impl ResourceStore for PgResourceStore {
         &self,
         params: CreateResourceParams,
     ) -> Result<ResourceRow, StoreError> {
+        Self::ensure_owner_references_supported(
+            &params.api_version,
+            RESOURCE_DEFINITION_KIND,
+            &params.owner_references,
+        )?;
         // Validate spec format and reserved-name rules first so plural/group are sound.
         ResourceDefinitionValidator.validate_spec(&params.spec)?;
 
@@ -1664,6 +1845,11 @@ impl ResourceStore for PgResourceStore {
         uid: Uuid,
         params: UpdateResourceParams,
     ) -> Result<ResourceRow, StoreError> {
+        Self::ensure_owner_references_supported(
+            API_VERSION_V1ALPHA1,
+            RESOURCE_DEFINITION_KIND,
+            &params.owner_references,
+        )?;
         // Validate the new spec
         ResourceDefinitionValidator.validate_spec(&params.spec)?;
 

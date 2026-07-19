@@ -54,6 +54,13 @@ impl ResourceStore for FakeStore {
     async fn list_pending_collection(&self, _: i64) -> Result<Vec<ResourceRow>, StoreError> {
         Ok(vec![])
     }
+
+    async fn list_deletion_blockers(
+        &self,
+        _: Uuid,
+    ) -> Result<rise_resource_api::DeletionBlockerReport, StoreError> {
+        Err(StoreError::NotFound)
+    }
     async fn resolve_path(&self, segments: &[PathSegment]) -> Result<Vec<ResourceRow>, StoreError> {
         if segments.is_empty() {
             return Err(StoreError::EmptyPath);

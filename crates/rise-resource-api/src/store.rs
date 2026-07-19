@@ -3,6 +3,7 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::{OwnerReference, ResourceParentRef, ResourceRow, ValidationError};
@@ -10,9 +11,9 @@ use crate::{OwnerReference, ResourceParentRef, ResourceRow, ValidationError};
 /// Reserved finalizer prefix for store-managed finalizers. Controllers cannot
 /// add or remove finalizers in this namespace.
 pub const SYSTEM_FINALIZER_PREFIX: &str = "system.rise.dev/";
-/// Finalizer added to a resource while it still has structural or
-/// owner-reference dependents. The store removes it once the lifecycle DAG
-/// below that resource has drained.
+/// Finalizer added to a resource while it still has structural children or
+/// owner-reference dependents that explicitly block owner deletion. The store
+/// removes it once those blocking lifecycle edges have drained.
 pub const CASCADE_DELETION_FINALIZER: &str = "system.rise.dev/cascade-deletion";
 /// Maximum `ResourceDefinition` parent-chain depth. Registration rejects a
 /// longer or cyclic chain, and path resolution caps its walk at this bound.
@@ -155,6 +156,35 @@ pub enum DeleteOutcome {
     MarkedForDeletion(Box<ResourceRow>),
 }
 
+/// Why one dependent currently prevents an owner from being collected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletionBlockerRelationship {
+    /// Structural children are inherently blocking because their URL scope
+    /// cannot outlive the parent.
+    StructuralChild,
+    /// A cross-tree owner reference with `blockOwnerDeletion: true`.
+    OwnerReference,
+}
+
+/// One resource row that currently blocks collection of another resource.
+#[derive(Debug, Clone)]
+pub struct DeletionBlocker {
+    pub relationship: DeletionBlockerRelationship,
+    pub api_version: String,
+    pub kind: String,
+    pub name: String,
+    pub uid: Uuid,
+    pub deletion_timestamp: Option<DateTime<Utc>>,
+    pub finalizers: Vec<String>,
+}
+
+/// One consistent diagnostic snapshot of a resource and its deletion blockers.
+#[derive(Debug, Clone)]
+pub struct DeletionBlockerReport {
+    pub resource: ResourceRow,
+    pub blockers: Vec<DeletionBlocker>,
+}
+
 impl fmt::Debug for DeleteOutcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -218,20 +248,25 @@ pub trait ResourceStore: Send + Sync {
     /// Delete or tombstone a resource while cascading through its lifecycle DAG.
     ///
     /// The store stamps the resource, immediate structural children, and direct
-    /// owner-reference dependents; adds [`CASCADE_DELETION_FINALIZER`] when
-    /// dependents exist; and hard-deletes only once the dependent graph and all
-    /// finalizers have drained. A resource without dependents or finalizers is
+    /// owner-reference dependents. It adds [`CASCADE_DELETION_FINALIZER`] while
+    /// structural children or explicitly blocking owner references remain.
+    /// Non-blocking owner-reference dependents are still tombstoned but do not
+    /// retain the owner. A resource without blocking dependents or finalizers is
     /// deleted immediately.
     async fn delete(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError>;
     /// Idempotent garbage-collection sweep for one resource.
     ///
     /// A live row is returned unchanged as `MarkedForDeletion`. A tombstoned
-    /// row with dependents fans deletion out and retains the cascade finalizer.
-    /// A tombstoned leaf loses the cascade finalizer and is hard-deleted only
-    /// when no other finalizers remain.
+    /// row fans deletion out through every immediate lifecycle edge, retaining
+    /// the cascade finalizer only while structural children or explicitly
+    /// blocking owner-reference dependents remain. A tombstoned leaf loses the
+    /// cascade finalizer and is hard-deleted only when no other finalizers remain.
     async fn try_collect(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError>;
     /// List tombstoned rows oldest-first for the GC worker.
     async fn list_pending_collection(&self, limit: i64) -> Result<Vec<ResourceRow>, StoreError>;
+    /// Return a consistent snapshot of the resource and the structural children
+    /// or explicitly blocking owner-reference dependents that prevent its collection.
+    async fn list_deletion_blockers(&self, uid: Uuid) -> Result<DeletionBlockerReport, StoreError>;
     /// Resolve a path to its root-first ancestor chain, including the leaf.
     /// Tombstoned rows are returned for the caller to interpret. Empty paths
     /// return [`StoreError::EmptyPath`].

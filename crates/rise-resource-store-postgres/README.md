@@ -45,19 +45,24 @@ Lifecycle owner references are stored once, in the resource row's
 UID containment queries for garbage collection. No separate edge table is
 maintained.
 
+`Organization` and `ResourceDefinition` are temporarily rejected as
+owner-reference dependents because their deletion admission still includes
+kind-specific checks outside this generic store. Both remain valid owners.
+
 ## Deletion model
 
 Inspired by Kubernetes finalizers, but adapted to a hierarchical store with a hard FK.
 
 ### Lifecycle
 
-1. `delete(uid)` marks the row (`deletion_timestamp = NOW()`) and stamps its immediate
-   structural children and direct owner-reference dependents.
+1. `delete(uid)` stamps immediate structural children and direct owner-reference
+   dependents, then tombstones the owner when finalizers or blocking dependents
+   remain; otherwise it hard-deletes the owner.
 2. Controllers observe `deletion_timestamp`, do their teardown work, and clear their own
    finalizers via `update_controller_finalizers`.
 3. A GC worker iterates `list_pending_collection()` and calls `try_collect(uid)` on each
-   tombstoned row. When the row has no dependents and no remaining finalizers, `try_collect`
-   hard-deletes it.
+   tombstoned row. When the row has no blocking dependents and no remaining finalizers,
+   `try_collect` hard-deletes it after stamping any non-blocking dependents.
 
 ### Visibility contract
 
@@ -67,12 +72,16 @@ and resolution paths all need to observe in-progress teardown.
 
 ### Cascade
 
-Deletion always cascades. `delete` stamps `deletion_timestamp` on the owner and
-its **immediate structural children and owner-reference dependents**, and
-attaches the store-managed finalizer `system.rise.dev/cascade-deletion` when
-dependents exist. Subsequent GC sweeps via `try_collect` fan out down the
-lifecycle DAG as each level drains. The owner stays observable until every
-dependent has been collected.
+Deletion always cascades. `delete` stamps `deletion_timestamp` on every
+immediate structural child and owner-reference dependent. Structural children
+always block collection; cross-tree dependents block only when the matching
+reference has `blockOwnerDeletion: true` (default `false`). The store-managed
+`system.rise.dev/cascade-deletion` finalizer represents the aggregate condition
+that at least one blocking dependent remains. Non-blocking dependents drain in
+the background after the owner disappears. Each newly tombstoned dependent
+best-effort emits a structured `resource.deletion_cascaded` audit log after
+commit. A transactional outbox or Event resource is required for durable
+delivery.
 
 There is no detach/orphan operation — a non-root resource can never become parentless.
 

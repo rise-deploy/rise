@@ -16,6 +16,8 @@ pub struct OwnerReference {
     kind: String,
     name: String,
     uid: Uuid,
+    #[serde(default)]
+    block_owner_deletion: bool,
 }
 
 impl OwnerReference {
@@ -30,6 +32,7 @@ impl OwnerReference {
             kind: kind.into(),
             name: name.into(),
             uid,
+            block_owner_deletion: false,
         };
         reference.validate()?;
         Ok(reference)
@@ -49,6 +52,19 @@ impl OwnerReference {
 
     pub fn uid(&self) -> Uuid {
         self.uid
+    }
+
+    /// Whether this dependent must be collected before the owner can disappear.
+    ///
+    /// Owner deletion always starts deletion of the dependent. This flag only
+    /// controls whether the dependent retains the owner's cascade finalizer.
+    pub fn block_owner_deletion(&self) -> bool {
+        self.block_owner_deletion
+    }
+
+    pub fn with_block_owner_deletion(mut self, block_owner_deletion: bool) -> Self {
+        self.block_owner_deletion = block_owner_deletion;
+        self
     }
 
     pub fn resource_kind(&self) -> Result<ResourceKind, ValidationError> {
@@ -74,6 +90,8 @@ impl<'de> Deserialize<'de> for OwnerReference {
             kind: String,
             name: String,
             uid: Uuid,
+            #[serde(default)]
+            block_owner_deletion: bool,
         }
 
         let Repr {
@@ -81,8 +99,11 @@ impl<'de> Deserialize<'de> for OwnerReference {
             kind,
             name,
             uid,
+            block_owner_deletion,
         } = Repr::deserialize(deserializer)?;
-        Self::new(api_version, kind, name, uid).map_err(serde::de::Error::custom)
+        Self::new(api_version, kind, name, uid)
+            .map(|reference| reference.with_block_owner_deletion(block_owner_deletion))
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -97,7 +118,7 @@ impl JsonSchema for OwnerReference {
             "properties": {
                 "apiVersion": {
                     "type": "string",
-                    "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*/[a-z0-9]+$"
+                    "pattern": "^(?=.{1,253}\\/)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\\/[a-z0-9]+$"
                 },
                 "kind": {
                     "type": "string",
@@ -112,6 +133,10 @@ impl JsonSchema for OwnerReference {
                     "type": "string",
                     "format": "uuid",
                     "not": { "const": "00000000-0000-0000-0000-000000000000" }
+                },
+                "blockOwnerDeletion": {
+                    "type": "boolean",
+                    "default": false
                 }
             },
             "required": ["apiVersion", "kind", "name", "uid"],

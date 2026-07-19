@@ -6,6 +6,8 @@ use rise_resource_api::{
 use rise_resource_store_postgres::PgResourceStore;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
 use uuid::Uuid;
 
 #[sqlx::test]
@@ -886,7 +888,7 @@ async fn delete_resource_definition_rejects_existing_instances(
         .await
         .unwrap();
 
-    store
+    let instance = store
         .create(CreateResourceParams {
             api_version: "example.dev/v1".to_string(),
             kind: "Widget".to_string(),
@@ -894,7 +896,7 @@ async fn delete_resource_definition_rejects_existing_instances(
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers: vec![],
-            owner_references: vec![],
+            owner_references: vec![owner_reference(&definition).with_block_owner_deletion(true)],
             spec: json!({}),
             validator: None,
         })
@@ -907,6 +909,13 @@ async fn delete_resource_definition_rejects_existing_instances(
         "expected validation error, got {err:?}"
     );
     assert!(store.resolve_collection("widgets").await.unwrap().is_some());
+    assert!(store
+        .get(instance.uid)
+        .await
+        .unwrap()
+        .unwrap()
+        .deletion_timestamp
+        .is_none());
 
     Ok(())
 }
@@ -2126,22 +2135,23 @@ fn owner_reference(row: &ResourceRow) -> OwnerReference {
     OwnerReference::new(&row.api_version, &row.kind, &row.name, row.uid).unwrap()
 }
 
-async fn create_owned_org(
+async fn create_owned_widget(
     store: &PgResourceStore,
     name: &str,
     owner_references: Vec<OwnerReference>,
     finalizers: Vec<String>,
 ) -> ResourceRow {
+    register_example_widget_rd(store).await;
     store
         .create(CreateResourceParams {
-            api_version: API_VERSION_V1ALPHA1.to_string(),
-            kind: ORGANIZATION_KIND.to_string(),
+            api_version: "example.dev/v1".to_string(),
+            kind: "Widget".to_string(),
             name: name.to_string(),
             parent_uid: None,
             annotations: BTreeMap::new(),
             finalizers,
             owner_references,
-            spec: json!({"displayName": name}),
+            spec: json!({}),
             validator: None,
         })
         .await
@@ -2151,9 +2161,9 @@ async fn create_owned_org(
 #[sqlx::test]
 async fn owner_references_are_persisted_and_replaceable(pool: sqlx::PgPool) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
-    let owner = create_org(&store, "owner").await;
+    let owner = create_owned_widget(&store, "owner", vec![], vec![]).await;
     let dependent =
-        create_owned_org(&store, "dependent", vec![owner_reference(&owner)], vec![]).await;
+        create_owned_widget(&store, "dependent", vec![owner_reference(&owner)], vec![]).await;
 
     let fetched = store.get(dependent.uid).await.unwrap().unwrap();
     assert_eq!(fetched.owner_references, vec![owner_reference(&owner)]);
@@ -2190,13 +2200,13 @@ async fn owner_references_are_persisted_and_replaceable(pool: sqlx::PgPool) -> s
 }
 
 #[sqlx::test]
-async fn owner_deletion_cascades_and_waits_for_dependent_finalizers(
+async fn nonblocking_owner_deletion_cascades_without_waiting_for_dependent_finalizers(
     pool: sqlx::PgPool,
 ) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
     let owner = create_org(&store, "owner").await;
     let cleanup_finalizer = "controller.example.com/cleanup".to_string();
-    let dependent = create_owned_org(
+    let dependent = create_owned_widget(
         &store,
         "dependent",
         vec![owner_reference(&owner)],
@@ -2204,9 +2214,80 @@ async fn owner_deletion_cascades_and_waits_for_dependent_finalizers(
     )
     .await;
 
+    assert!(matches!(
+        store.delete(owner.uid).await.unwrap(),
+        DeleteOutcome::Deleted
+    ));
+    assert!(store.get(owner.uid).await.unwrap().is_none());
+    assert!(store
+        .get(dependent.uid)
+        .await
+        .unwrap()
+        .unwrap()
+        .deletion_timestamp
+        .is_some());
+    assert!(store
+        .list_deletion_blockers(dependent.uid)
+        .await
+        .unwrap()
+        .blockers
+        .is_empty());
+
+    store
+        .update_controller_finalizers(
+            dependent.uid,
+            "controller.example.com",
+            &[],
+            &[cleanup_finalizer],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.try_collect(dependent.uid).await.unwrap(),
+        DeleteOutcome::Deleted
+    ));
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn blocking_owner_reference_waits_for_dependent_finalizers(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let owner = create_org(&store, "blocking-owner").await;
+    let cleanup_finalizer = "controller.example.com/cleanup".to_string();
+    let blocking_reference = owner_reference(&owner).with_block_owner_deletion(true);
+    let dependent = create_owned_widget(
+        &store,
+        "blocking-dependent",
+        vec![blocking_reference],
+        vec![cleanup_finalizer.clone()],
+    )
+    .await;
+    let nonblocking_dependent = create_owned_widget(
+        &store,
+        "nonblocking-dependent",
+        vec![owner_reference(&owner)],
+        vec!["controller.example.com/nonblocking-cleanup".to_string()],
+    )
+    .await;
+
+    let blockers = store
+        .list_deletion_blockers(owner.uid)
+        .await
+        .unwrap()
+        .blockers;
+    assert_eq!(blockers.len(), 1);
+    assert_eq!(
+        blockers[0].relationship,
+        rise_resource_api::DeletionBlockerRelationship::OwnerReference
+    );
+    assert_eq!(blockers[0].uid, dependent.uid);
+
     let marked_owner = match store.delete(owner.uid).await.unwrap() {
         DeleteOutcome::MarkedForDeletion(row) => row,
-        DeleteOutcome::Deleted => panic!("owner with a dependent must remain until cascade drains"),
+        DeleteOutcome::Deleted => panic!("blocking dependent must retain its owner"),
     };
     assert!(marked_owner
         .finalizers
@@ -2218,10 +2299,13 @@ async fn owner_deletion_cascades_and_waits_for_dependent_finalizers(
         .unwrap()
         .deletion_timestamp
         .is_some());
-    assert!(matches!(
-        store.try_collect(owner.uid).await.unwrap(),
-        DeleteOutcome::MarkedForDeletion(_)
-    ));
+    assert!(store
+        .get(nonblocking_dependent.uid)
+        .await
+        .unwrap()
+        .unwrap()
+        .deletion_timestamp
+        .is_some());
 
     store
         .update_controller_finalizers(
@@ -2240,6 +2324,14 @@ async fn owner_deletion_cascades_and_waits_for_dependent_finalizers(
         store.try_collect(owner.uid).await.unwrap(),
         DeleteOutcome::Deleted
     ));
+    assert!(
+        store
+            .get(nonblocking_dependent.uid)
+            .await
+            .unwrap()
+            .is_some(),
+        "a non-blocking dependent must not retain its owner"
+    );
 
     Ok(())
 }
@@ -2249,17 +2341,18 @@ async fn owner_references_reject_stale_identity_and_duplicates(
     pool: sqlx::PgPool,
 ) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
+    register_example_widget_rd(&store).await;
     let owner = create_org(&store, "owner").await;
     let wrong_name =
         OwnerReference::new(&owner.api_version, &owner.kind, "different-name", owner.uid).unwrap();
 
     let error = store
         .create(CreateResourceParams {
-            api_version: API_VERSION_V1ALPHA1.to_string(),
-            kind: ORGANIZATION_KIND.to_string(),
+            api_version: "example.dev/v1".to_string(),
+            kind: "Widget".to_string(),
             name: "dependent".to_string(),
             owner_references: vec![wrong_name],
-            spec: json!({"displayName": "dependent"}),
+            spec: json!({}),
             ..Default::default()
         })
         .await
@@ -2269,11 +2362,11 @@ async fn owner_references_reject_stale_identity_and_duplicates(
     let reference = owner_reference(&owner);
     let error = store
         .create(CreateResourceParams {
-            api_version: API_VERSION_V1ALPHA1.to_string(),
-            kind: ORGANIZATION_KIND.to_string(),
+            api_version: "example.dev/v1".to_string(),
+            kind: "Widget".to_string(),
             name: "duplicate-dependent".to_string(),
             owner_references: vec![reference.clone(), reference],
-            spec: json!({"displayName": "duplicate-dependent"}),
+            spec: json!({}),
             ..Default::default()
         })
         .await
@@ -2286,11 +2379,193 @@ async fn owner_references_reject_stale_identity_and_duplicates(
 }
 
 #[sqlx::test]
-async fn owner_references_reject_lifecycle_cycles(pool: sqlx::PgPool) -> sqlx::Result<()> {
+async fn owner_references_reject_protected_dependent_kinds(pool: sqlx::PgPool) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
     let owner = create_org(&store, "owner").await;
+    let reference = owner_reference(&owner);
+
+    let create_error = store
+        .create(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: ORGANIZATION_KIND.to_string(),
+            name: "dependent-org".to_string(),
+            owner_references: vec![reference.clone()],
+            spec: json!({"displayName": "Dependent"}),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(create_error, StoreError::Validation(message) if message.contains("not supported on Organization"))
+    );
+
+    let organization = create_org(&store, "dependent-org").await;
+    let update_error = store
+        .update(
+            organization.uid,
+            UpdateResourceParams {
+                api_version: None,
+                revision: organization.revision,
+                annotations: BTreeMap::new(),
+                finalizers: organization.finalizers,
+                owner_references: vec![reference.clone()],
+                spec: organization.spec,
+                validator: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(update_error, StoreError::Validation(message) if message.contains("not supported on Organization"))
+    );
+
+    let rd_spec = json!({
+        "group": "blocked.example.dev",
+        "kind": "Blocked",
+        "plural": "blockeds",
+        "versions": [{"name": "v1", "served": true, "storage": true}],
+        "allowedStatusControllerIds": []
+    });
+    let register_error = store
+        .register_resource_definition(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: RESOURCE_DEFINITION_KIND.to_string(),
+            name: "blockeds.blocked.example.dev".to_string(),
+            owner_references: vec![reference.clone()],
+            spec: rd_spec,
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(register_error, StoreError::Validation(message) if message.contains("not supported on ResourceDefinition"))
+    );
+
+    register_example_widget_rd(&store).await;
+    let definition = store
+        .get_by_name(
+            API_VERSION_V1ALPHA1,
+            RESOURCE_DEFINITION_KIND,
+            "widgets.example.dev",
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let update_rd_error = store
+        .update_resource_definition(
+            definition.uid,
+            UpdateResourceParams {
+                api_version: None,
+                revision: definition.revision,
+                annotations: BTreeMap::new(),
+                finalizers: definition.finalizers,
+                owner_references: vec![reference.clone()],
+                spec: definition.spec,
+                validator: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(update_rd_error, StoreError::Validation(message) if message.contains("not supported on ResourceDefinition"))
+    );
+
+    store
+        .register_resource_definition(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: RESOURCE_DEFINITION_KIND.to_string(),
+            name: "custom-organizations.custom.example.dev".to_string(),
+            spec: json!({
+                "group": "custom.example.dev",
+                "kind": "Organization",
+                "plural": "custom-organizations",
+                "versions": [{"name": "v1", "served": true, "storage": true}],
+                "allowedStatusControllerIds": []
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let custom_organization = store
+        .create(CreateResourceParams {
+            api_version: "custom.example.dev/v1".to_string(),
+            kind: ORGANIZATION_KIND.to_string(),
+            name: "dependent-custom-org".to_string(),
+            owner_references: vec![reference],
+            spec: json!({}),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(custom_organization.owner_references.len(), 1);
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn owner_reference_add_racing_owner_delete_fails_closed(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = Arc::new(PgResourceStore::new(pool.clone()));
+    let owner = create_org(&store, "race-owner").await;
+    let dependent = create_owned_widget(&store, "race-dependent", vec![], vec![]).await;
+
+    // Hold edge admission at the graph lock. Deletion must not queue behind
+    // this global lock; its owner-row lock is the synchronization boundary.
+    let mut graph_guard = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('resource_owner_reference_cycle')::bigint)")
+        .execute(&mut *graph_guard)
+        .await?;
+
+    let writer_store = Arc::clone(&store);
+    let owner_ref = owner_reference(&owner);
+    let writer = tokio::spawn(async move {
+        writer_store
+            .update(
+                dependent.uid,
+                UpdateResourceParams {
+                    api_version: None,
+                    revision: dependent.revision,
+                    annotations: BTreeMap::new(),
+                    finalizers: dependent.finalizers,
+                    owner_references: vec![owner_ref],
+                    spec: dependent.spec,
+                    validator: None,
+                },
+            )
+            .await
+    });
+    tokio::task::yield_now().await;
+
+    let deletion = tokio::time::timeout(Duration::from_secs(2), store.delete(owner.uid))
+        .await
+        .expect("owner deletion must not wait for the graph-wide admission lock")
+        .unwrap();
+    assert!(matches!(deletion, DeleteOutcome::Deleted));
+
+    graph_guard.commit().await?;
+    let writer_error = writer.await.unwrap().unwrap_err();
+    assert!(
+        matches!(writer_error, StoreError::Validation(message) if message.contains("does not identify a live resource"))
+    );
+    assert!(store
+        .get(dependent.uid)
+        .await
+        .unwrap()
+        .unwrap()
+        .owner_references
+        .is_empty());
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn owner_references_reject_lifecycle_cycles(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let owner = create_owned_widget(&store, "owner", vec![], vec![]).await;
     let dependent =
-        create_owned_org(&store, "dependent", vec![owner_reference(&owner)], vec![]).await;
+        create_owned_widget(&store, "dependent", vec![owner_reference(&owner)], vec![]).await;
 
     let error = store
         .update(
@@ -2403,6 +2678,15 @@ async fn cascade_delete_stamps_immediate_children(pool: sqlx::PgPool) -> sqlx::R
     let parent = create_org(&store, "cascade-org").await;
     let c1 = create_child(&store, parent.uid, "Widget", "w1", vec![]).await;
     let c2 = create_child(&store, parent.uid, "Widget", "w2", vec![]).await;
+
+    let blockers = store
+        .list_deletion_blockers(parent.uid)
+        .await
+        .unwrap()
+        .blockers;
+    assert_eq!(blockers.len(), 2);
+    assert!(blockers.iter().all(|blocker| blocker.relationship
+        == rise_resource_api::DeletionBlockerRelationship::StructuralChild));
 
     let outcome = store.delete(parent.uid).await.unwrap();
     let marked = match outcome {

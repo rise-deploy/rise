@@ -267,9 +267,9 @@ async fn upsert_default_organization(
 /// Organization. Returns `None` only on a fresh install (no Organizations
 /// exist in the store).
 ///
-/// - Fast path: look up by the configured name.
 /// - If no Organizations exist, return `None` so the caller creates the
 ///   configured default.
+/// - If an Organization with the configured name exists, return it.
 /// - If one or more Organizations exist and none matches, fail startup. Names
 ///   are immutable and bootstrap neither renames an existing Organization nor
 ///   creates a second candidate default.
@@ -277,23 +277,18 @@ async fn find_default_organization(
     store: &Arc<dyn ResourceStore>,
     configured_name: &str,
 ) -> Result<Option<ResourceRow>> {
-    if let Some(row) = store
-        .get_by_name(
-            API_VERSION_V1ALPHA1,
-            ORGANIZATION_KIND,
-            configured_name,
-            None,
-        )
-        .await
-        .map_err(|e| anyhow!("Failed to look up default Organization: {e}"))?
-    {
-        return Ok(Some(row));
-    }
-
     let existing = store
         .list_versions(&[API_VERSION_V1ALPHA1.to_string()], ORGANIZATION_KIND, None)
         .await
         .map_err(|e| anyhow!("Failed to list existing Organizations: {e}"))?;
+
+    if let Some(row) = existing
+        .iter()
+        .find(|row| row.name == configured_name)
+        .cloned()
+    {
+        return Ok(Some(row));
+    }
 
     match existing.len() {
         0 => Ok(None),
