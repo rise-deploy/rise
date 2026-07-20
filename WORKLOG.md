@@ -365,8 +365,9 @@ scope and avoiding dead-end compatibility layers.
 
 ## Increment 6 — identity activation and storage projections
 
-- State: implementation in progress.
+- State: draft PR open for review.
 - Branch: `feat/resource-identity-activation`.
+- PR: #421.
 - Acceptance criteria:
   - Keep the public `ResourceStore` and pure/local `SpecValidator` contracts
     unchanged. Contextual built-in admission is selected by the immutable exact
@@ -420,8 +421,7 @@ scope and avoiding dead-end compatibility layers.
   - `RUSTC_WRAPPER= cargo test -p rise-resource-api --test identity_contracts`
     passes all 10 tests.
   - The PostgreSQL-backed `rise-resource-store-postgres` integration suite
-    passes all 71 tests serially, including the new activation, migration,
+    passes all 75 tests serially, including the new activation, migration,
     concurrency, lookup, key-budget, and EXPLAIN coverage.
   - `SQLX_OFFLINE=true RUSTC_WRAPPER= cargo test --workspace --all-features
-    -- --test-threads=1` passes all 1,111 tests serially; 2 documentation tests
-    are ignored.
+    -- --test-threads=1` passes serially; 2 documentation tests are ignored.
