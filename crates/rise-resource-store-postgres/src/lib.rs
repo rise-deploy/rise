@@ -60,6 +60,7 @@ struct ConcurrentIndexMigration {
     drop_sql: &'static str,
     unique: bool,
     keys: &'static [&'static str],
+    collations: &'static [&'static str],
     predicate: &'static str,
 }
 
@@ -70,6 +71,7 @@ const CONCURRENT_INDEX_MIGRATIONS: &[ConcurrentIndexMigration] = &[
         drop_sql: "DROP INDEX CONCURRENTLY resource_store.resources_owner_references_gin",
         unique: false,
         keys: &["owner_references"],
+        collations: &[""],
         predicate: "",
     },
     ConcurrentIndexMigration {
@@ -77,10 +79,8 @@ const CONCURRENT_INDEX_MIGRATIONS: &[ConcurrentIndexMigration] = &[
         name: "user_identities_issuer_subject_unique",
         drop_sql: "DROP INDEX CONCURRENTLY resource_store.user_identities_issuer_subject_unique",
         unique: true,
-        keys: &[
-            "spec->>'issuer'COLLATE\"C\"",
-            "spec->>'subject'COLLATE\"C\"",
-        ],
+        keys: &["(spec->>'issuer')", "(spec->>'subject')"],
+        collations: &["pg_catalog.C", "pg_catalog.C"],
         predicate: "api_version='rise.dev/v1alpha1'ANDsplit_part(api_version,'/',1)='rise.dev'ANDkind='UserIdentity'ANDdeletion_timestampISNULL",
     },
     ConcurrentIndexMigration {
@@ -88,15 +88,17 @@ const CONCURRENT_INDEX_MIGRATIONS: &[ConcurrentIndexMigration] = &[
         name: "workload_trust_parent_issuer",
         drop_sql: "DROP INDEX CONCURRENTLY resource_store.workload_trust_parent_issuer",
         unique: false,
-        keys: &["parent_uid", "spec->>'issuer'COLLATE\"C\""],
-        predicate: "api_version='rise.dev/v1alpha1'ANDsplit_part(api_version,'/',1)='rise.dev'ANDkind=ANYARRAY['ControllerTrustPolicy','ServiceAccountTrustPolicy']ANDdeletion_timestampISNULL",
+        keys: &["parent_uid", "(spec->>'issuer')"],
+        collations: &["", "pg_catalog.C"],
+        predicate: "api_version='rise.dev/v1alpha1'ANDsplit_part(api_version,'/',1)='rise.dev'AND(kind=ANY(ARRAY['ControllerTrustPolicy','ServiceAccountTrustPolicy']))ANDdeletion_timestampISNULL",
     },
     ConcurrentIndexMigration {
         version: 20260719000008,
         name: "group_memberships_user_name",
         drop_sql: "DROP INDEX CONCURRENTLY resource_store.group_memberships_user_name",
         unique: false,
-        keys: &["nameCOLLATE\"C\""],
+        keys: &["name"],
+        collations: &["pg_catalog.C"],
         predicate: "api_version='rise.dev/v1alpha1'ANDsplit_part(api_version,'/',1)='rise.dev'ANDkind='GroupMembership'ANDdeletion_timestampISNULL",
     },
 ];
@@ -111,13 +113,14 @@ struct ConcurrentIndexState {
     table_name: String,
     access_method: String,
     keys: Vec<String>,
+    collations: Vec<String>,
     predicate: Option<String>,
 }
 
 fn normalize_catalog_expression(value: &str) -> String {
     value
         .chars()
-        .filter(|character| !character.is_whitespace() && !matches!(character, '(' | ')'))
+        .filter(|character| !character.is_whitespace())
         .collect::<String>()
         .replace("::text", "")
 }
@@ -139,13 +142,16 @@ fn index_matches_expected(
                 "btree"
             }
         && actual.keys.len() == expected.keys.len()
+        && actual.collations == expected.collations
         && actual
             .keys
             .iter()
             .zip(expected.keys)
-            .all(|(actual, expected)| normalize_catalog_expression(actual) == *expected)
+            .all(|(actual, expected)| {
+                normalize_catalog_expression(actual) == normalize_catalog_expression(expected)
+            })
         && normalize_catalog_expression(actual.predicate.as_deref().unwrap_or_default())
-            == expected.predicate
+            == normalize_catalog_expression(expected.predicate)
 }
 
 /// Recover the crash window between a no-transaction index statement and
@@ -186,6 +192,20 @@ async fn recover_concurrent_indexes(
                        FROM generate_series(1, index.indnkeyatts) AS key_number
                        ORDER BY key_number
                    ) AS keys,
+                   ARRAY(
+                       SELECT CASE
+                                  WHEN key_collation.collation_oid = 0 THEN ''
+                                  ELSE collation_namespace.nspname || '.' || catalog_collation.collname
+                              END
+                       FROM unnest(index.indcollation::oid[]) WITH ORDINALITY
+                           AS key_collation(collation_oid, key_number)
+                       LEFT JOIN pg_catalog.pg_collation catalog_collation
+                         ON catalog_collation.oid = key_collation.collation_oid
+                       LEFT JOIN pg_catalog.pg_namespace collation_namespace
+                         ON collation_namespace.oid = catalog_collation.collnamespace
+                       WHERE key_collation.key_number <= index.indnkeyatts
+                       ORDER BY key_collation.key_number
+                   ) AS collations,
                    pg_get_expr(index.indpred, index.indrelid, true) AS predicate
             FROM pg_catalog.pg_class relation
             JOIN pg_catalog.pg_namespace namespace
@@ -219,7 +239,7 @@ async fn recover_concurrent_indexes(
                     sqlx::Error::Protocol(format!(
                         "recorded migration {} requires the expected valid index resource_store.{}; catalog state is {}",
                         migration.version, migration.name
-                        , state.map(|state| format!("valid={}, ready={}, live={}, unique={}, table={}.{}, method={}, keys={:?}, predicate={:?}", state.indisvalid, state.indisready, state.indislive, state.indisunique, state.table_schema, state.table_name, state.access_method, state.keys, state.predicate)).unwrap_or_else(|| "missing".into())
+                        , state.map(|state| format!("valid={}, ready={}, live={}, unique={}, table={}.{}, method={}, keys={:?}, collations={:?}, predicate={:?}", state.indisvalid, state.indisready, state.indislive, state.indisunique, state.table_schema, state.table_name, state.access_method, state.keys, state.collations, state.predicate)).unwrap_or_else(|| "missing".into())
                     )),
                 ));
             }
@@ -243,6 +263,7 @@ mod migration_tests {
             assert!(migration.no_tx);
             assert!(migration.sql.contains(expected.name));
             assert!(!migration.sql.contains("IF NOT EXISTS"));
+            assert_eq!(expected.keys.len(), expected.collations.len());
         }
     }
 }

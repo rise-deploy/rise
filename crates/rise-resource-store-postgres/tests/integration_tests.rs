@@ -3882,6 +3882,13 @@ async fn migration_runner_recovers_unrecorded_concurrent_indexes_and_fails_on_dr
         .await
         .unwrap();
 
+    // A normal startup after recovery must accept the recorded indexes. In
+    // particular, pg_get_indexdef's per-key rendering may omit an explicit
+    // collation even though pg_index.indcollation records it.
+    rise_resource_store_postgres::run_migrations(&pool)
+        .await
+        .unwrap();
+
     let valid_count: i64 = sqlx::query_scalar(
         r#"
         SELECT count(*)
@@ -3913,6 +3920,28 @@ async fn migration_runner_recovers_unrecorded_concurrent_indexes_and_fails_on_dr
     assert!(error
         .to_string()
         .contains("requires the expected valid index"));
+
+    sqlx::query("DROP INDEX resource_store.group_memberships_user_name")
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        r#"
+        CREATE INDEX group_memberships_user_name
+            ON resource_store.resources (name)
+            WHERE api_version = 'rise.dev/v1alpha1'
+              AND split_part(api_version, '/', 1) = 'rise.dev'
+              AND kind = 'GroupMembership'
+              AND deletion_timestamp IS NULL
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+    let error = rise_resource_store_postgres::run_migrations(&pool)
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("collations=[\"pg_catalog.default\"]"));
     Ok(())
 }
 
