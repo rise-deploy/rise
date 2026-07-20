@@ -4319,6 +4319,7 @@ dependencies = [
  "jsonschema",
  "rand 0.10.2",
  "rise-resource-api",
+ "serde",
  "serde_json",
  "sqlx",
  "tokio",

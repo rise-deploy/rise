@@ -8,7 +8,7 @@ validators, and shared constants from that crate. This crate intentionally
 exports only PostgreSQL/migration/registry concerns and concrete validators:
 `PgResourceStore`, `run_migrations`, `BuiltInRegistry`,
 `OrganizationValidator`, `ResourceDefinitionValidator`, and
-`JsonSchemaValidator`.
+`JsonSchemaValidator`, plus narrow identity/trust/membership lookup adapters.
 
 Keeping SQLX and JSON Schema compilation behind the implementation boundary
 lets authorization and controller code use fake `ResourceStore`
@@ -44,6 +44,35 @@ Lifecycle owner references are stored once, in the resource row's
 `owner_references` JSONB array. A `jsonb_path_ops` GIN index supports reverse
 UID containment queries for garbage collection. No separate edge table is
 maintained.
+
+## Built-in identity admission and projections
+
+The eight `rise.dev/v1alpha1` identity kinds are routed from the immutable
+built-in registry. Pure typed validation and canonicalization run before the
+mutation transaction; contextual admission then locks and verifies the exact
+live built-in parent chain in the same transaction as persistence. Every
+built-in registration's validator is authoritative even when the caller omits
+or forges its optional `SpecValidator`. Identity admission also enforces
+mapping immutability and GroupMembership's optional matching-User owner
+reference. Custom same-named kinds in other API groups remain generic.
+
+Three partial expression indexes project only live built-in rows: global
+UserIdentity issuer/subject uniqueness (including inactive mappings),
+parent-and-issuer workload trust lookup, and reverse GroupMembership name
+lookup. `IdentityLookup`, `TrustPolicyLookup`, and `MembershipLookup` expose
+these fixed reads without adding JSON filters to `ResourceStore`.
+
+Before these routes activate, migrations audit tombstoned and live legacy
+ResourceDefinitions and resource rows that would be shadowed. The durable
+`NOT VALID` write guard commits in a short migration before a following bounded
+count/sample audit. An upgrade that reports a conflict must be rolled back to
+the previously deployed Rise binary; remove every resource identified by the
+diagnostic, then retry. The constraint is validated only after that audit.
+Concurrent index migrations are serialized and recover their narrow
+DDL-before-bookkeeping crash window; a recorded index whose table, access
+method, uniqueness, key expressions, predicate, or validity drifts from the
+expected definition stops startup rather than silently degrading the identity
+path.
 
 A built-in `Organization` or `ResourceDefinition` cannot currently be the
 dependent side of an owner reference: writes that put `owner_references` on

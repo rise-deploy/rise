@@ -35,23 +35,29 @@ scope and avoiding dead-end compatibility layers.
 3. **Merged in PR #418 — policy resources and pure policy algebra.** Add the
    Role/binding schemas, validation, Allow/Deny tuple evaluation, wildcard
    replacement, and subset checks with database-free conformance coverage.
-4. **In progress — identity resource contracts.** Add the closed identity,
+4. **Merged in PR #419 — identity resource contracts.** Add the closed identity,
    membership, and workload-trust schemas plus reserved built-in collection
    definitions, without making the resources writable yet.
-5. **Planned — transaction-scoped resource activation and storage projections.**
-   Add the mutation/admission seam, activate policy and identity built-ins with
-   their structural invariants, and add the ADR-required uniqueness and
-   reverse-lookup indexes with migration/integration coverage.
-6. **Planned — live authorization engine.** Add membership expansion, org-admin
+5. **Merged in PR #420 — generic lifecycle owner references.** Add the canonical
+   owner-reference DAG, cascading collection, blocker reporting, and structured
+   lifecycle logging required before GroupMembership activation.
+6. **In progress — identity activation and storage projections.** Add the
+   transaction-owned admission seam, activate all eight identity built-ins,
+   and add the ADR-required identity/trust/membership indexes and narrow lookup
+   adapters. Policy activation remains a separate reviewable increment.
+7. **Planned — policy activation.** Activate the four policy built-ins through
+   contextual normalization, reference validation, and concurrency-safe
+   admission without yet enforcing live authorization.
+8. **Planned — live authorization engine.** Add membership expansion, org-admin
    classification, effective labels, tier filtering, per-item list filtering,
    request-local snapshots, and explain/audit foundations.
-7. **Planned — mutation grant gate and seeded policy.** Add serializable
+9. **Planned — mutation grant gate and seeded policy.** Add serializable
    authorization-changing writes, label-subtree deltas, bootstrap policy, and
    the centralized generic-resource authorization choke point.
-8. **Planned — identity authentication and token convergence.** Add live
+10. **Planned — identity authentication and token convergence.** Add live
    User/UserIdentity resolution, operator selection/JIT, target-bound workload
    exchange, delegated `/token`, UID checks, caps, and actor-chain handling.
-9. **Planned — full conformance and finalization.** Close every applicable
+11. **Planned — full conformance and finalization.** Close every applicable
    ADR-0001 acceptance scenario, update documentation/status, and audit the
    implementation requirement by requirement.
 
@@ -296,7 +302,7 @@ scope and avoiding dead-end compatibility layers.
 
 ## Increment 5 — generic lifecycle owner references
 
-- State: published as draft PR #420; awaiting review.
+- State: merged in PR #420 at commit `718b8a8`.
 - Branch: `feat/resource-owner-references`.
 - Acceptance criteria:
   - The generic create, update, response, row, and store contracts carry optional
@@ -355,4 +361,67 @@ scope and avoiding dead-end compatibility layers.
     PostgreSQL-backed resource-store integration tests.
   - SQLX metadata verification, generated resource-schema consistency, and
     Helm lint pass.
-- PR: #420, draft.
+- PR: #420, merged.
+
+## Increment 6 — identity activation and storage projections
+
+- State: implementation in progress.
+- Branch: `feat/resource-identity-activation`.
+- Acceptance criteria:
+  - Keep the public `ResourceStore` and pure/local `SpecValidator` contracts
+    unchanged. Contextual built-in admission is selected by the immutable exact
+    registration and owns all database reads and row locks in the mutation
+    transaction, including direct-store calls with no trustworthy validator.
+  - Activate exactly the eight kinds in `IDENTITY_KIND_DEFINITIONS`, consuming
+    that table for placement. Persist typed canonical specs and defaults; lock
+    exact live parents; enforce immutable external mapping identities and the
+    optional matching-User GroupMembership owner rule.
+  - Audit all legacy definitions and rows that route activation could shadow,
+    including tombstones, before activation. Install a durable definition
+    guard and actionable remediation failure without reserving the four policy
+    collections in this increment.
+  - Add the three exact partial expression indexes for live UserIdentity
+    uniqueness, target-and-issuer trust lookup, and reverse membership lookup.
+    Serialize/recover no-transaction concurrent index migrations across their
+    SQLX bookkeeping crash window and fail closed on recorded index drift.
+  - Export only narrow concrete Postgres identity, workload-trust, and
+    membership lookup adapters. Do not add generic JSON filtering, JIT, token
+    exchange, policy evaluation, or grant enforcement.
+  - Cover exact routing/placement, validator bypass, canonical persistence,
+    failed-write atomicity, upgrade conflicts and guards, concurrent mapping
+    uniqueness, membership ownership/deletion races, lookup decoys and
+    tombstones, maximum index keys, and query/index-plan conformance.
+- Decisions:
+  - Lock ordering for every write that adds lifecycle edges is global graph
+    lock, referenced owners and structural parents, then the dependent row.
+    Fresh creates skip only the recursive cycle walk because their new UID
+    cannot already be reachable; retaining the graph lock prevents owner/parent
+    lock-order inversions with concurrent updates.
+  - External identity fields and complete workload trust matchers are immutable;
+    retargeting is delete plus create. An intentionally unowned membership can
+    still receive ordinary metadata/finalizer updates after its named User is
+    deleted, but membership expansion requires a current live User of that name.
+  - Each concurrent index has its own one-statement no-transaction migration.
+    The migration runner uses SQLX's public database migration lock across
+    structural index/version reconciliation and the migration pass, then runs
+    SQLX with its nested lock disabled. This preserves rolling-upgrade
+    serialization without copying SQLX's internal lock-ID algorithm.
+  - UID generation continues to use UUID v4 in this increment. Enforcing
+    `u`-prefixed ULIDs is explicitly deferred until the resource identity
+    contract and migration path are designed together.
+- Verification:
+  - `cargo fmt --all` passes.
+  - `RUSTC_WRAPPER= cargo check -p rise-resource-store-postgres --all-targets`
+    passes.
+  - `SQLX_OFFLINE=true RUSTC_WRAPPER= cargo check --workspace --all-features
+    --all-targets` passes.
+  - `SQLX_OFFLINE=true RUSTC_WRAPPER= cargo clippy --workspace --all-features
+    --all-targets -- -D warnings` passes.
+  - `RUSTC_WRAPPER= cargo test -p rise-resource-api --test identity_contracts`
+    passes all 10 tests.
+  - The PostgreSQL-backed `rise-resource-store-postgres` integration suite
+    passes all 71 tests serially, including the new activation, migration,
+    concurrency, lookup, key-budget, and EXPLAIN coverage.
+  - `SQLX_OFFLINE=true RUSTC_WRAPPER= cargo test --workspace --all-features
+    -- --test-threads=1` passes all 1,111 tests serially; 2 documentation tests
+    are ignored.

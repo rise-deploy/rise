@@ -197,6 +197,7 @@ fn external_subject_is_opaque_nonblank_and_bounded() {
     for invalid in [
         String::new(),
         " \t ".to_string(),
+        "subject\0suffix".to_string(),
         "x".repeat(MAX_EXTERNAL_SUBJECT_CHARS + 1),
     ] {
         assert!(ExternalSubject::new(invalid.clone()).is_err());

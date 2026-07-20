@@ -12,7 +12,8 @@ use rise_resource_api::{
 };
 use sqlx::{PgPool, Row};
 
-use crate::builtin::BuiltInRegistry;
+use crate::admission::IdentityAdmission;
+use crate::builtin::{BuiltInRegistration, BuiltInRegistry};
 use crate::discriminator;
 use crate::models::PgResourceRow;
 use crate::validation::{
@@ -66,16 +67,15 @@ struct PgDeletionBlocker {
 }
 
 impl PgResourceStore {
-    /// Construct a store backed by `pool` with the canonical built-in registry
-    /// (`Organization` + `ResourceDefinition`). The common case.
+    /// Construct a store backed by `pool` with the canonical structural and
+    /// identity built-in registry. The common case.
     pub fn new(pool: PgPool) -> Self {
         Self::with_builtin_registry(pool, Arc::new(BuiltInRegistry::defaults()))
     }
 
     /// Construct a store with an explicit built-in registry. Intended for
     /// tests that want a stripped-down or augmented set of built-ins, and for
-    /// future phases that introduce additional built-ins behind a feature
-    /// flag (see roadmap PRs B2/B3/B4). Production code should keep using
+    /// future phases that introduce additional built-ins. Production code should keep using
     /// [`Self::new`], which threads through [`BuiltInRegistry::defaults`].
     pub fn with_builtin_registry(pool: PgPool, builtins: Arc<BuiltInRegistry>) -> Self {
         Self {
@@ -122,6 +122,40 @@ impl PgResourceStore {
         }
     }
 
+    fn identity_uniqueness_conflict(err: &sqlx::Error) -> Option<StoreError> {
+        let sqlx::Error::Database(db) = err else {
+            return None;
+        };
+        (db.constraint() == Some("user_identities_issuer_subject_unique")).then(|| {
+            StoreError::Validation(
+                "a live UserIdentity with this issuer and subject already exists".into(),
+            )
+        })
+    }
+
+    /// Resolve the exact immutable built-in write registration. A request for
+    /// another version of a reserved group/kind fails closed instead of
+    /// falling through to an external ResourceDefinition.
+    fn builtin_for_write(
+        &self,
+        api_version: &str,
+        kind: &str,
+    ) -> Result<Option<&crate::builtin::BuiltInRegistration>, StoreError> {
+        let Some((group, _)) = api_version.split_once('/') else {
+            return Ok(None);
+        };
+        let Some(registration) = self.builtins.lookup_by_group_kind(group, kind) else {
+            return Ok(None);
+        };
+        if self.builtins.lookup_exact(api_version, kind).is_none() {
+            return Err(StoreError::Validation(format!(
+                "built-in {group}/{kind} must use apiVersion '{}'",
+                registration.api_version
+            )));
+        }
+        Ok(Some(registration))
+    }
+
     fn canonical_owner_references(
         references: &[OwnerReference],
     ) -> Result<Vec<OwnerReference>, StoreError> {
@@ -136,6 +170,90 @@ impl PgResourceStore {
             }
         }
         Ok(references)
+    }
+
+    fn ensure_json_has_no_nul(value: &serde_json::Value, field: &str) -> Result<(), StoreError> {
+        match value {
+            serde_json::Value::String(value) if value.contains('\0') => Err(
+                StoreError::Validation(format!("{field} must not contain U+0000")),
+            ),
+            serde_json::Value::Array(values) => values
+                .iter()
+                .try_for_each(|value| Self::ensure_json_has_no_nul(value, field)),
+            serde_json::Value::Object(values) => values.iter().try_for_each(|(key, value)| {
+                if key.contains('\0') {
+                    return Err(StoreError::Validation(format!(
+                        "{field} object keys must not contain U+0000"
+                    )));
+                }
+                Self::ensure_json_has_no_nul(value, field)
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    fn validate_create_preflight(params: &CreateResourceParams) -> Result<(), StoreError> {
+        for (field, value) in [
+            ("apiVersion", params.api_version.as_str()),
+            ("kind", params.kind.as_str()),
+            ("metadata.name", params.name.as_str()),
+        ] {
+            if value.contains('\0') {
+                return Err(StoreError::Validation(format!(
+                    "{field} must not contain U+0000"
+                )));
+            }
+        }
+        if params
+            .annotations
+            .iter()
+            .any(|(key, value)| key.contains('\0') || value.contains('\0'))
+        {
+            return Err(StoreError::Validation(
+                "metadata.annotations must not contain U+0000".into(),
+            ));
+        }
+        if params.finalizers.iter().any(|value| value.contains('\0')) {
+            return Err(StoreError::Validation(
+                "metadata.finalizers must not contain U+0000".into(),
+            ));
+        }
+        Self::ensure_json_has_no_nul(&params.spec, "spec")?;
+        Self::ensure_json_has_no_nul(
+            &serde_json::to_value(&params.owner_references).map_err(StoreError::backend)?,
+            "metadata.ownerReferences",
+        )
+    }
+
+    fn validate_update_preflight(params: &UpdateResourceParams) -> Result<(), StoreError> {
+        if params
+            .api_version
+            .as_deref()
+            .is_some_and(|value| value.contains('\0'))
+        {
+            return Err(StoreError::Validation(
+                "apiVersion must not contain U+0000".into(),
+            ));
+        }
+        if params
+            .annotations
+            .iter()
+            .any(|(key, value)| key.contains('\0') || value.contains('\0'))
+        {
+            return Err(StoreError::Validation(
+                "metadata.annotations must not contain U+0000".into(),
+            ));
+        }
+        if params.finalizers.iter().any(|value| value.contains('\0')) {
+            return Err(StoreError::Validation(
+                "metadata.finalizers must not contain U+0000".into(),
+            ));
+        }
+        Self::ensure_json_has_no_nul(&params.spec, "spec")?;
+        Self::ensure_json_has_no_nul(
+            &serde_json::to_value(&params.owner_references).map_err(StoreError::backend)?,
+            "metadata.ownerReferences",
+        )
     }
 
     /// These kinds still have deletion admission outside the generic store.
@@ -171,6 +289,7 @@ impl PgResourceStore {
         conn: &mut sqlx::PgConnection,
         dependent_uid: Uuid,
         references: &[OwnerReference],
+        check_cycles: bool,
     ) -> Result<Vec<OwnerReference>, StoreError> {
         let references = Self::canonical_owner_references(references)?;
         if references.is_empty() {
@@ -238,8 +357,9 @@ impl PgResourceStore {
                 }
             }
 
-            let creates_cycle: bool = sqlx::query_scalar(
-                r#"
+            if check_cycles {
+                let creates_cycle: bool = sqlx::query_scalar(
+                    r#"
                 WITH RECURSIVE reachable(uid) AS (
                     SELECT $1::uuid
                     UNION
@@ -255,20 +375,83 @@ impl PgResourceStore {
                     SELECT 1 FROM reachable WHERE uid = ANY($2)
                 )
                 "#,
-            )
-            .bind(dependent_uid)
-            .bind(&owner_uids)
-            .fetch_one(&mut *conn)
-            .await
-            .map_err(StoreError::backend)?;
-            if creates_cycle {
-                return Err(StoreError::Validation(
-                    "owner references would create a lifecycle cycle".into(),
-                ));
+                )
+                .bind(dependent_uid)
+                .bind(&owner_uids)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(StoreError::backend)?;
+                if creates_cycle {
+                    return Err(StoreError::Validation(
+                        "owner references would create a lifecycle cycle".into(),
+                    ));
+                }
             }
         }
 
         Ok(references)
+    }
+
+    /// Verify the complete built-in structural chain against immutable exact
+    /// registrations. This makes placement authoritative for every built-in,
+    /// including Organization and test-only augmented registrations.
+    async fn validate_builtin_placement(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        registration: &BuiltInRegistration,
+        mut parent_uid: Option<Uuid>,
+    ) -> Result<(), StoreError> {
+        let dependent_kind = registration.kind;
+        let mut current = registration;
+        loop {
+            let Some(expected_parent) = &current.parent else {
+                if parent_uid.is_some() {
+                    return Err(StoreError::Validation(format!(
+                        "{dependent_kind} has a malformed built-in parent chain; {} must be root-scoped",
+                        current.kind
+                    )));
+                }
+                return Ok(());
+            };
+            let Some(expected_uid) = parent_uid else {
+                return Err(StoreError::Validation(format!(
+                    "{dependent_kind} requires a {} parent",
+                    expected_parent.kind
+                )));
+            };
+            let parent = sqlx::query_as::<_, PgResourceRow>(
+                "SELECT * FROM resource_store.resources WHERE uid = $1 FOR SHARE",
+            )
+            .bind(expected_uid)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(StoreError::backend)?
+            .ok_or_else(|| {
+                StoreError::Validation(format!(
+                    "{dependent_kind} parent must identify a live {} {}",
+                    expected_parent.api_version, expected_parent.kind
+                ))
+            })?;
+            if parent.api_version != expected_parent.api_version
+                || parent.kind != expected_parent.kind
+                || parent.deletion_timestamp.is_some()
+            {
+                return Err(StoreError::Validation(format!(
+                    "{dependent_kind} parent must identify a live {} {}",
+                    expected_parent.api_version, expected_parent.kind
+                )));
+            }
+            current = self
+                .builtins
+                .lookup_exact(&expected_parent.api_version, &expected_parent.kind)
+                .ok_or_else(|| {
+                    StoreError::Validation(format!(
+                        "{dependent_kind} has an unregistered built-in parent {} {}",
+                        expected_parent.api_version, expected_parent.kind
+                    ))
+                })?;
+            parent_uid = parent.parent_uid;
+        }
     }
 
     /// Tombstone every immediate lifecycle dependent that has not already
@@ -418,6 +601,7 @@ impl PgResourceStore {
     /// "current transaction is aborted" rather than a discriminator conflict.
     async fn insert_resource_row_with_retry(
         conn: &mut sqlx::PgConnection,
+        uid: Uuid,
         params: &CreateResourceParams,
         metadata: serde_json::Value,
     ) -> Result<ResourceRow, StoreError> {
@@ -433,12 +617,13 @@ impl PgResourceStore {
             let result = sqlx::query_as::<_, PgResourceRow>(
                 r#"
                 INSERT INTO resource_store.resources
-                    (api_version, kind, parent_uid, name, discriminator, metadata, spec,
+                    (uid, api_version, kind, parent_uid, name, discriminator, metadata, spec,
                      finalizers, owner_references)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                 RETURNING *
                 "#,
             )
+            .bind(uid)
             .bind(&params.api_version)
             .bind(&params.kind)
             .bind(params.parent_uid)
@@ -478,9 +663,9 @@ impl PgResourceStore {
                         .execute(&mut *conn)
                         .await
                         .map_err(StoreError::backend)?;
-                    return Err(
-                        Self::rd_uniqueness_conflict(&e).unwrap_or_else(|| StoreError::backend(e))
-                    );
+                    return Err(Self::rd_uniqueness_conflict(&e)
+                        .or_else(|| Self::identity_uniqueness_conflict(&e))
+                        .unwrap_or_else(|| StoreError::backend(e)));
                 }
             }
         }
@@ -714,7 +899,7 @@ impl PgResourceStore {
 
 #[async_trait::async_trait]
 impl ResourceStore for PgResourceStore {
-    async fn create(&self, params: CreateResourceParams) -> Result<ResourceRow, StoreError> {
+    async fn create(&self, mut params: CreateResourceParams) -> Result<ResourceRow, StoreError> {
         if params.kind == RESOURCE_DEFINITION_KIND {
             return Err(StoreError::Validation(
                 "ResourceDefinitions must be created through register_resource_definition"
@@ -723,24 +908,54 @@ impl ResourceStore for PgResourceStore {
         }
 
         validate_resource_name(&params.name).map_err(|e| StoreError::Validation(e.to_string()))?;
+        Self::validate_create_preflight(&params)?;
         Self::ensure_owner_references_supported(
             &params.api_version,
             &params.kind,
             &params.owner_references,
         )?;
 
-        if let Some(v) = &params.validator {
-            v.validate_spec(&params.spec)?;
+        // Pure validation and canonicalization happen before opening a
+        // transaction. Contextual checks below still own all database reads
+        // and locks and persist this single canonical value.
+        let builtin = self.builtin_for_write(&params.api_version, &params.kind)?;
+        if let Some(registration) = builtin {
+            if let Some(admission) =
+                IdentityAdmission::for_identity(registration.api_version, registration.kind)
+            {
+                params.spec = admission.canonicalize(&params.spec)?;
+            }
+            registration.spec_validator.validate_spec(&params.spec)?;
+        }
+        if let Some(validator) = &params.validator {
+            validator.validate_spec(&params.spec)?;
         }
 
-        let metadata = serde_json::to_value(&params.annotations).unwrap_or_default();
-
         let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
+
+        // Allocate the dependent UID before insertion so owner validation
+        // happens before the dependent row is created. A fresh UID cannot
+        // already be reachable, so creates skip the recursive cycle walk. They
+        // still take the graph lock before owner/parent rows to preserve the
+        // global lock order shared with owner-reference updates.
+        let uid = Uuid::new_v4();
         if !params.owner_references.is_empty() {
             Self::lock_owner_reference_graph(&mut tx).await?;
         }
-        let is_builtin =
-            params.api_version == API_VERSION_V1ALPHA1 && params.kind == ORGANIZATION_KIND;
+        let owner_references =
+            Self::validate_owner_references(&mut tx, uid, &params.owner_references, false).await?;
+        params.owner_references = owner_references.clone();
+
+        if let Some(registration) = builtin {
+            self.validate_builtin_placement(&mut tx, registration, params.parent_uid)
+                .await?;
+            if let Some(admission) =
+                IdentityAdmission::for_identity(registration.api_version, registration.kind)
+            {
+                admission.admit_create_context(&mut tx, &params).await?;
+            }
+        }
+
         // Always require the lock (and therefore verify the RD exists) unless this is a
         // builtin kind. Without a lock, a concurrent RD hard-deletion could race with the
         // insert, and callers with validator=None would bypass the RD existence check.
@@ -748,12 +963,11 @@ impl ResourceStore for PgResourceStore {
             &mut tx,
             &params.api_version,
             &params.kind,
-            !is_builtin,
+            builtin.is_none(),
         )
         .await?;
-        let row = Self::insert_resource_row_with_retry(&mut tx, &params, metadata).await?;
-        let owner_references =
-            Self::validate_owner_references(&mut tx, row.uid, &params.owner_references).await?;
+        let metadata = serde_json::to_value(&params.annotations).unwrap_or_default();
+        let row = Self::insert_resource_row_with_retry(&mut tx, uid, &params, metadata).await?;
         tx.commit().await.map_err(StoreError::backend)?;
         let mut row = row;
         row.owner_references = owner_references;
@@ -876,59 +1090,125 @@ impl ResourceStore for PgResourceStore {
     async fn update(
         &self,
         uid: Uuid,
-        params: UpdateResourceParams,
+        mut params: UpdateResourceParams,
     ) -> Result<ResourceRow, StoreError> {
-        // ResourceDefinitions must go through update_resource_definition to keep the
-        // resource_definitions projection table in sync.
-        let current_identity: Option<(String, String)> =
-            sqlx::query_as("SELECT api_version, kind FROM resource_store.resources WHERE uid = $1")
-                .bind(uid)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(StoreError::backend)?;
-        let Some((current_api_version, kind)) = current_identity else {
-            return Err(StoreError::NotFound);
-        };
-        if kind == RESOURCE_DEFINITION_KIND {
+        Self::validate_update_preflight(&params)?;
+
+        // Resolve immutable routing identity and run all pure validators before
+        // opening the mutation transaction or taking advisory/row locks.
+        let preflight = sqlx::query_as::<_, PgResourceRow>(
+            "SELECT * FROM resource_store.resources WHERE uid = $1",
+        )
+        .bind(uid)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(StoreError::backend)?
+        .ok_or(StoreError::NotFound)?;
+        if preflight.kind == RESOURCE_DEFINITION_KIND {
             return Err(StoreError::Validation(
-                "ResourceDefinitions must be updated through update_resource_definition"
-                    .to_string(),
+                "ResourceDefinitions must be updated through update_resource_definition".into(),
             ));
         }
-        Self::ensure_owner_references_supported(
-            &current_api_version,
-            &kind,
-            &params.owner_references,
-        )?;
-
-        if let Some(v) = &params.validator {
-            v.validate_spec(&params.spec)?;
+        let preflight_target_api_version = params
+            .api_version
+            .as_deref()
+            .unwrap_or(&preflight.api_version);
+        let preflight_current_builtin =
+            self.builtin_for_write(&preflight.api_version, &preflight.kind)?;
+        let preflight_target_builtin =
+            self.builtin_for_write(preflight_target_api_version, &preflight.kind)?;
+        if preflight_current_builtin
+            .map(|registration| (registration.api_version, registration.kind))
+            != preflight_target_builtin
+                .map(|registration| (registration.api_version, registration.kind))
+        {
+            return Err(StoreError::Validation(
+                "a resource cannot migrate into or out of a built-in API identity".into(),
+            ));
+        }
+        if let Some(registration) = preflight_current_builtin {
+            if let Some(admission) =
+                IdentityAdmission::for_identity(registration.api_version, registration.kind)
+            {
+                params.spec = admission.canonicalize(&params.spec)?;
+            }
+            registration.spec_validator.validate_spec(&params.spec)?;
+        }
+        if let Some(validator) = &params.validator {
+            validator.validate_spec(&params.spec)?;
         }
 
-        let metadata = serde_json::to_value(&params.annotations).unwrap_or_default();
-
-        // Include the expected revision in the WHERE clause so the update is atomic:
-        // a concurrent write that already incremented the revision will cause zero rows
-        // to be affected, which we detect and map to RevisionConflict.
         let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
         if !params.owner_references.is_empty() {
             Self::lock_owner_reference_graph(&mut tx).await?;
         }
+
+        // Read through this transaction before taking row locks so every
+        // admission decision shares one transaction. Parent/owner locks are
+        // acquired before the dependent lock to match deletion's ordering.
+        let snapshot = sqlx::query_as::<_, PgResourceRow>(
+            "SELECT * FROM resource_store.resources WHERE uid = $1",
+        )
+        .bind(uid)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(StoreError::backend)?
+        .ok_or(StoreError::NotFound)?;
+        if snapshot.kind == RESOURCE_DEFINITION_KIND {
+            return Err(StoreError::Validation(
+                "ResourceDefinitions must be updated through update_resource_definition".into(),
+            ));
+        }
+        Self::ensure_owner_references_supported(
+            &snapshot.api_version,
+            &snapshot.kind,
+            &params.owner_references,
+        )?;
+
+        let target_api_version = params
+            .api_version
+            .as_deref()
+            .unwrap_or(&snapshot.api_version)
+            .to_owned();
+        let current_builtin = self.builtin_for_write(&snapshot.api_version, &snapshot.kind)?;
+        let target_builtin = self.builtin_for_write(&target_api_version, &snapshot.kind)?;
+        if current_builtin.map(|r| (r.api_version, r.kind))
+            != target_builtin.map(|r| (r.api_version, r.kind))
+        {
+            return Err(StoreError::Validation(
+                "a resource cannot migrate into or out of a built-in API identity".into(),
+            ));
+        }
+
+        // Owner rows take UPDATE locks. This precedes GroupMembership's live
+        // User SHARE lookup, avoiding lock-upgrade deadlocks for concurrent
+        // owned membership creates/updates.
+        let owner_references =
+            Self::validate_owner_references(&mut tx, uid, &params.owner_references, true).await?;
+        params.owner_references = owner_references.clone();
+
+        if let Some(registration) = current_builtin {
+            self.validate_builtin_placement(&mut tx, registration, snapshot.parent_uid)
+                .await?;
+            if let Some(admission) =
+                IdentityAdmission::for_identity(registration.api_version, registration.kind)
+            {
+                admission
+                    .admit_update_before_dependent(&mut tx, &snapshot, &params)
+                    .await?;
+            }
+        }
+
         // Always acquire the FOR SHARE lock on the matching ResourceDefinition for
         // non-builtin external kinds, regardless of whether a validator was provided.
         // Without the lock, a concurrent hard-delete of the ResourceDefinition can
         // pass its instance-count check and commit while this update is in flight,
         // leaving the resource instance pointing at a definition that no longer exists.
-        let target_api_version = params
-            .api_version
-            .as_deref()
-            .unwrap_or(&current_api_version);
-        let is_builtin = target_api_version == API_VERSION_V1ALPHA1 && kind == ORGANIZATION_KIND;
-        if !is_builtin {
+        if target_builtin.is_none() {
             Self::lock_matching_definition_for_write(
                 &mut tx,
-                target_api_version,
-                &kind,
+                &target_api_version,
+                &snapshot.kind,
                 // Require the RD row to exist (and declare target_api_version as its
                 // storage version) only when the caller is explicitly migrating the
                 // row to a new api_version. A migration target must be a declared
@@ -943,8 +1223,42 @@ impl ResourceStore for PgResourceStore {
             .await?;
         }
 
-        let owner_references =
-            Self::validate_owner_references(&mut tx, uid, &params.owner_references).await?;
+        // The dependent is deliberately the final row lock in the admission
+        // sequence: graph -> parents/owners -> current dependent.
+        let current = sqlx::query_as::<_, PgResourceRow>(
+            "SELECT * FROM resource_store.resources WHERE uid = $1 FOR UPDATE",
+        )
+        .bind(uid)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(StoreError::backend)?
+        .ok_or(StoreError::NotFound)?;
+        if current.revision != params.revision {
+            return Err(StoreError::RevisionConflict {
+                expected: params.revision,
+                found: current.revision,
+            });
+        }
+        if current.api_version != snapshot.api_version
+            || current.kind != snapshot.kind
+            || current.parent_uid != snapshot.parent_uid
+            || current.name != snapshot.name
+        {
+            return Err(StoreError::Validation(
+                "resource identity changed during admission".into(),
+            ));
+        }
+
+        // Re-evaluate old/new immutable-field checks against the locked row;
+        // another writer may have committed between the snapshot and this lock.
+        if let Some(registration) = current_builtin {
+            if let Some(admission) =
+                IdentityAdmission::for_identity(registration.api_version, registration.kind)
+            {
+                admission.validate_update_immutable(&current, &params)?;
+            }
+        }
+        let metadata = serde_json::to_value(&params.annotations).unwrap_or_default();
 
         let updated = sqlx::query_as::<_, PgResourceRow>(
             r#"
@@ -976,7 +1290,10 @@ impl ResourceStore for PgResourceStore {
             // already exists. Surface the partial unique-index violation as NameConflict (409)
             // instead of leaking an internal Database error (500).
             Err(ref e) if Self::is_name_conflict(e) => return Err(StoreError::NameConflict),
-            Err(e) => return Err(StoreError::backend(e)),
+            Err(e) => {
+                return Err(Self::identity_uniqueness_conflict(&e)
+                    .unwrap_or_else(|| StoreError::backend(e)))
+            }
         };
 
         if let Some(row) = updated {
@@ -984,12 +1301,11 @@ impl ResourceStore for PgResourceStore {
             return Ok(row.into());
         }
 
-        // Zero rows affected — revision mismatch (NotFound already handled above)
-        let current = self.get(uid).await?.ok_or(StoreError::NotFound)?;
-        Err(StoreError::RevisionConflict {
-            expected: params.revision,
-            found: current.revision,
-        })
+        // The row is locked and revision-checked above, so zero rows here can
+        // only result from an unexpected backend invariant violation.
+        Err(StoreError::backend(std::io::Error::other(
+            "locked resource update affected zero rows",
+        )))
     }
 
     async fn delete(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError> {
@@ -1765,6 +2081,7 @@ impl ResourceStore for PgResourceStore {
         &self,
         params: CreateResourceParams,
     ) -> Result<ResourceRow, StoreError> {
+        Self::validate_create_preflight(&params)?;
         Self::ensure_owner_references_supported(
             &params.api_version,
             RESOURCE_DEFINITION_KIND,
@@ -1826,10 +2143,16 @@ impl ResourceStore for PgResourceStore {
         // `insert_resource_row_with_retry` maps those violations to a validation
         // error. The `resource_definitions` projection is a view, so there is no
         // second row to write.
-        let resource_row = Self::insert_resource_row_with_retry(&mut tx, &params, metadata).await?;
-        let owner_references =
-            Self::validate_owner_references(&mut tx, resource_row.uid, &params.owner_references)
+        let resource_row =
+            Self::insert_resource_row_with_retry(&mut tx, Uuid::new_v4(), &params, metadata)
                 .await?;
+        let owner_references = Self::validate_owner_references(
+            &mut tx,
+            resource_row.uid,
+            &params.owner_references,
+            false,
+        )
+        .await?;
 
         tx.commit().await.map_err(StoreError::backend)?;
 
@@ -1845,6 +2168,7 @@ impl ResourceStore for PgResourceStore {
         uid: Uuid,
         params: UpdateResourceParams,
     ) -> Result<ResourceRow, StoreError> {
+        Self::validate_update_preflight(&params)?;
         Self::ensure_owner_references_supported(
             API_VERSION_V1ALPHA1,
             RESOURCE_DEFINITION_KIND,
@@ -1944,7 +2268,7 @@ impl ResourceStore for PgResourceStore {
 
         let metadata = serde_json::to_value(&params.annotations).unwrap_or_default();
         let owner_references =
-            Self::validate_owner_references(&mut tx, uid, &params.owner_references).await?;
+            Self::validate_owner_references(&mut tx, uid, &params.owner_references, true).await?;
 
         // Update the resources row with optimistic concurrency
         let updated = sqlx::query_as::<_, PgResourceRow>(
