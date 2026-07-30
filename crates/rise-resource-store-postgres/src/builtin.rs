@@ -12,7 +12,6 @@
 //! two `match` arms in two methods. The registry
 //! collapses that to a single [`BuiltInRegistration`].
 //!
-//! See [`ROADMAP.md`](../../../ROADMAP.md) § "PR A1".
 
 use std::collections::HashMap;
 use std::sync::Arc;

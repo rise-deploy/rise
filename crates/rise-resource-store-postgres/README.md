@@ -67,7 +67,11 @@ ResourceDefinitions and resource rows that would be shadowed. The durable
 `NOT VALID` write guard commits in a short migration before a following bounded
 count/sample audit. An upgrade that reports a conflict must be rolled back to
 the previously deployed Rise binary; remove every resource identified by the
-diagnostic, then retry. The constraint is validated only after that audit.
+diagnostic, then retry. The constraint is validated only after that audit. It
+reserves the whole `rise.dev` group against external ResourceDefinitions, plus
+the eight identity collection names in any group, and it survives a rollback —
+so cleanup under the older binary must delete conflicting definitions rather
+than edit them.
 Concurrent index migrations are serialized and recover their narrow
 DDL-before-bookkeeping crash window; a recorded index whose table, access
 method, uniqueness, key expressions, collations, operator classes, predicate,

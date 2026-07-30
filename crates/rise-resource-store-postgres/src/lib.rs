@@ -10,7 +10,8 @@ mod models;
 pub use builtin::{BuiltInRegistration, BuiltInRegistry};
 pub use lookup::{
     GroupMembershipFact, IdentityLookup, MembershipLookup, TrustPolicyFact, TrustPolicyLookup,
-    UserIdentityFact,
+    UserIdentityFact, CONTROLLER_TRUST_POLICIES_SQL, GROUPS_FOR_USER_SQL,
+    SERVICE_ACCOUNT_TRUST_POLICIES_SQL, USER_IDENTITY_BY_EXTERNAL_IDENTITY_SQL,
 };
 pub use pg_store::PgResourceStore;
 pub use validation::{JsonSchemaValidator, OrganizationValidator, ResourceDefinitionValidator};
@@ -190,6 +191,16 @@ fn index_matches_reference(
         && actual.predicate == reference.predicate
 }
 
+/// A migration-scoped failure. `Configuration` rather than `Protocol`: the
+/// server answered correctly, the database is shaped in a way this binary
+/// cannot accept.
+fn drift_error(version: i64, message: String) -> sqlx::migrate::MigrateError {
+    sqlx::migrate::MigrateError::ExecuteMigration(
+        sqlx::Error::Configuration(message.into()),
+        version,
+    )
+}
+
 /// Read one index's catalog definition, or `None` when it does not exist.
 async fn fetch_index_state(
     conn: &mut sqlx::PgConnection,
@@ -333,25 +344,28 @@ async fn recover_concurrent_indexes(
                     fetch_index_state(&mut *conn, &reference_schema, migration.reference_index)
                         .await?
                         .ok_or_else(|| {
-                            sqlx::migrate::MigrateError::Execute(sqlx::Error::Protocol(format!(
-                                "drift reference index {} was not created",
-                                migration.reference_index
-                            )))
+                            drift_error(
+                                migration.version,
+                                format!(
+                                    "drift reference index {} was not created",
+                                    migration.reference_index
+                                ),
+                            )
                         })?;
                 if !state
                     .as_ref()
                     .is_some_and(|state| index_matches_reference(&reference, state))
                 {
-                    return Err(sqlx::migrate::MigrateError::Execute(
-                        sqlx::Error::Protocol(format!(
-                            "recorded migration {} requires the expected valid index resource_store.{}; catalog state is {}; reference state is {}",
-                            migration.version,
+                    return Err(drift_error(
+                        migration.version,
+                        format!(
+                            "recorded migration requires the expected valid index resource_store.{}; catalog state is {}; reference state is {}",
                             migration.name,
                             state
                                 .map(|state| state.describe())
                                 .unwrap_or_else(|| "missing".into()),
                             reference.describe()
-                        )),
+                        ),
                     ));
                 }
             }

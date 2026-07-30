@@ -66,6 +66,13 @@ struct PgDeletionBlocker {
     finalizers: Vec<String>,
 }
 
+/// Just the immutable routing identity of a row.
+#[derive(sqlx::FromRow)]
+struct PgResourceIdentity {
+    api_version: String,
+    kind: String,
+}
+
 impl PgResourceStore {
     /// Construct a store backed by `pool` with the canonical structural and
     /// identity built-in registry. The common case.
@@ -1135,15 +1142,16 @@ impl ResourceStore for PgResourceStore {
         Self::validate_update_preflight(&params)?;
 
         // Resolve immutable routing identity and run all pure validators before
-        // opening the mutation transaction or taking advisory/row locks.
-        let preflight = sqlx::query_as::<_, PgResourceRow>(
-            "SELECT * FROM resource_store.resources WHERE uid = $1",
-        )
-        .bind(uid)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(StoreError::backend)?
-        .ok_or(StoreError::NotFound)?;
+        // opening the mutation transaction or taking advisory/row locks. Only
+        // the routing identity is needed here; the transaction below reads the
+        // full row and is authoritative for every admission decision.
+        let preflight: PgResourceIdentity =
+            sqlx::query_as("SELECT api_version, kind FROM resource_store.resources WHERE uid = $1")
+                .bind(uid)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(StoreError::backend)?
+                .ok_or(StoreError::NotFound)?;
         if preflight.kind == RESOURCE_DEFINITION_KIND {
             return Err(StoreError::Validation(
                 "ResourceDefinitions must be updated through update_resource_definition".into(),

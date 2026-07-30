@@ -4146,55 +4146,40 @@ async fn maximum_identity_index_keys_fit_and_projection_queries_use_their_indexe
         assert!(definition.contains("deletion_timestamp IS NULL"));
     }
 
+    // Plan the statements the lookup adapters actually run, so editing one of
+    // them cannot silently drop to a sequential scan on the login path.
     let mut connection = pool.acquire().await?;
     connection.execute("SET enable_seqscan = off").await?;
-    let identity_plan: Vec<String> = sqlx::query_scalar(
-        r#"
-        EXPLAIN (COSTS OFF)
-        SELECT uid FROM resource_store.resources
-        WHERE api_version = 'rise.dev/v1alpha1'
-          AND split_part(api_version, '/', 1) = 'rise.dev'
-          AND kind = 'UserIdentity'
-          AND deletion_timestamp IS NULL
-          AND (spec->>'issuer') COLLATE "C" = 'https://issuer.example'
-          AND (spec->>'subject') COLLATE "C" = 'subject'
-        "#,
-    )
+    let identity_plan: Vec<String> = sqlx::query_scalar(&format!(
+        "EXPLAIN (COSTS OFF) {}",
+        rise_resource_store_postgres::USER_IDENTITY_BY_EXTERNAL_IDENTITY_SQL
+    ))
+    .bind("https://issuer.example")
+    .bind("subject")
     .fetch_all(&mut *connection)
     .await?;
     assert!(identity_plan
         .join("\n")
         .contains("user_identities_issuer_subject_unique"));
 
-    let trust_plan: Vec<String> = sqlx::query_scalar(
-        r#"
-        EXPLAIN (COSTS OFF)
-        SELECT uid FROM resource_store.resources
-        WHERE api_version = 'rise.dev/v1alpha1'
-          AND split_part(api_version, '/', 1) = 'rise.dev'
-          AND kind = 'ControllerTrustPolicy'
-          AND deletion_timestamp IS NULL
-          AND parent_uid = '00000000-0000-0000-0000-000000000001'
-          AND (spec->>'issuer') COLLATE "C" = 'https://issuer.example'
-        "#,
-    )
+    let trust_plan: Vec<String> = sqlx::query_scalar(&format!(
+        "EXPLAIN (COSTS OFF) {}",
+        rise_resource_store_postgres::CONTROLLER_TRUST_POLICIES_SQL
+    ))
+    .bind(uuid::Uuid::nil())
+    .bind("https://issuer.example")
     .fetch_all(&mut *connection)
     .await?;
     assert!(trust_plan
         .join("\n")
         .contains("workload_trust_parent_issuer"));
 
-    let membership_plan: Vec<String> = sqlx::query_scalar(
-        r#"
-        EXPLAIN (COSTS OFF)
-        SELECT uid FROM resource_store.resources
-        WHERE api_version = 'rise.dev/v1alpha1'
-          AND split_part(api_version, '/', 1) = 'rise.dev'
-          AND kind = 'GroupMembership'
-          AND deletion_timestamp IS NULL
-          AND name COLLATE "C" = 'member' COLLATE "C"
-        "#,
-    )
+    let membership_plan: Vec<String> = sqlx::query_scalar(&format!(
+        "EXPLAIN (COSTS OFF) {}",
+        rise_resource_store_postgres::GROUPS_FOR_USER_SQL
+    ))
+    .bind(uuid::Uuid::nil())
+    .bind("member")
     .fetch_all(&mut *connection)
     .await?;
     assert!(membership_plan

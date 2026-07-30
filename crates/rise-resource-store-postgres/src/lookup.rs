@@ -32,6 +32,109 @@ pub struct GroupMembershipFact {
     pub organization_uid: Uuid,
 }
 
+/// Exposed so tests can assert the query planner uses the identity projection
+/// index for the statement that actually runs, not a hand-copied lookalike.
+#[doc(hidden)]
+pub const USER_IDENTITY_BY_EXTERNAL_IDENTITY_SQL: &str = r#"
+SELECT identity.uid AS identity_uid,
+       identity.name AS identity_name,
+       identity.spec AS identity_spec,
+       parent.uid AS user_uid,
+       parent.name AS user_name,
+       parent.spec AS user_spec
+FROM resource_store.resources identity
+JOIN resource_store.resources parent
+  ON parent.uid = identity.parent_uid
+ AND parent.api_version = 'rise.dev/v1alpha1'
+ AND parent.kind = 'User'
+ AND parent.parent_uid IS NULL
+ AND parent.deletion_timestamp IS NULL
+WHERE identity.api_version = 'rise.dev/v1alpha1'
+  AND split_part(identity.api_version, '/', 1) = 'rise.dev'
+  AND identity.kind = 'UserIdentity'
+  AND identity.deletion_timestamp IS NULL
+  AND (identity.spec->>'issuer') COLLATE "C" = $1 COLLATE "C"
+  AND (identity.spec->>'subject') COLLATE "C" = $2 COLLATE "C"
+LIMIT 2
+"#;
+
+#[doc(hidden)]
+pub const CONTROLLER_TRUST_POLICIES_SQL: &str = r#"
+SELECT policy.uid, policy.name, policy.parent_uid, policy.spec
+FROM resource_store.resources policy
+JOIN resource_store.resources target
+  ON target.uid = $1
+ AND target.api_version = 'rise.dev/v1alpha1'
+ AND target.kind = 'Controller'
+ AND target.parent_uid IS NULL
+ AND target.deletion_timestamp IS NULL
+WHERE policy.api_version = 'rise.dev/v1alpha1'
+  AND split_part(policy.api_version, '/', 1) = 'rise.dev'
+  AND policy.kind = 'ControllerTrustPolicy'
+  AND policy.deletion_timestamp IS NULL
+  AND policy.parent_uid = target.uid
+  AND (policy.spec->>'issuer') COLLATE "C" = $2 COLLATE "C"
+ORDER BY policy.name, policy.uid
+"#;
+
+#[doc(hidden)]
+pub const SERVICE_ACCOUNT_TRUST_POLICIES_SQL: &str = r#"
+SELECT policy.uid, policy.name, policy.parent_uid, policy.spec
+FROM resource_store.resources policy
+JOIN resource_store.resources target
+  ON target.uid = $1
+ AND target.api_version = 'rise.dev/v1alpha1'
+ AND target.kind = 'ServiceAccount'
+ AND target.deletion_timestamp IS NULL
+JOIN resource_store.resources organization
+  ON organization.uid = target.parent_uid
+ AND organization.api_version = 'rise.dev/v1alpha1'
+ AND organization.kind = 'Organization'
+ AND organization.parent_uid IS NULL
+ AND organization.deletion_timestamp IS NULL
+WHERE policy.api_version = 'rise.dev/v1alpha1'
+  AND split_part(policy.api_version, '/', 1) = 'rise.dev'
+  AND policy.kind = 'ServiceAccountTrustPolicy'
+  AND policy.deletion_timestamp IS NULL
+  AND policy.parent_uid = target.uid
+  AND (policy.spec->>'issuer') COLLATE "C" = $2 COLLATE "C"
+ORDER BY policy.name, policy.uid
+"#;
+
+#[doc(hidden)]
+pub const GROUPS_FOR_USER_SQL: &str = r#"
+SELECT membership.uid AS membership_uid,
+       membership.name AS membership_name,
+       parent.uid AS group_uid,
+       parent.name AS group_name,
+       organization.uid AS organization_uid
+FROM resource_store.resources membership
+JOIN resource_store.resources member
+  ON member.uid = $1
+ AND member.api_version = 'rise.dev/v1alpha1'
+ AND member.kind = 'User'
+ AND member.parent_uid IS NULL
+ AND member.name = $2
+ AND member.deletion_timestamp IS NULL
+JOIN resource_store.resources parent
+  ON parent.uid = membership.parent_uid
+ AND parent.api_version = 'rise.dev/v1alpha1'
+ AND parent.kind = 'Group'
+ AND parent.deletion_timestamp IS NULL
+JOIN resource_store.resources organization
+  ON organization.uid = parent.parent_uid
+ AND organization.api_version = 'rise.dev/v1alpha1'
+ AND organization.kind = 'Organization'
+ AND organization.parent_uid IS NULL
+ AND organization.deletion_timestamp IS NULL
+WHERE membership.api_version = 'rise.dev/v1alpha1'
+  AND split_part(membership.api_version, '/', 1) = 'rise.dev'
+  AND membership.kind = 'GroupMembership'
+  AND membership.deletion_timestamp IS NULL
+  AND membership.name COLLATE "C" = member.name COLLATE "C"
+ORDER BY parent.name, parent.uid, membership.uid
+"#;
+
 #[derive(Clone)]
 pub struct IdentityLookup {
     pool: PgPool,
@@ -49,35 +152,22 @@ impl IdentityLookup {
         issuer: &Issuer,
         subject: &ExternalSubject,
     ) -> Result<Option<UserIdentityFact>, StoreError> {
-        let row = sqlx::query_as::<_, IdentityFactRow>(
-            r#"
-            SELECT identity.uid AS identity_uid,
-                   identity.name AS identity_name,
-                   identity.spec AS identity_spec,
-                   parent.uid AS user_uid,
-                   parent.name AS user_name,
-                   parent.spec AS user_spec
-            FROM resource_store.resources identity
-            JOIN resource_store.resources parent
-              ON parent.uid = identity.parent_uid
-             AND parent.api_version = 'rise.dev/v1alpha1'
-             AND parent.kind = 'User'
-             AND parent.parent_uid IS NULL
-             AND parent.deletion_timestamp IS NULL
-            WHERE identity.api_version = 'rise.dev/v1alpha1'
-              AND split_part(identity.api_version, '/', 1) = 'rise.dev'
-              AND identity.kind = 'UserIdentity'
-              AND identity.deletion_timestamp IS NULL
-              AND (identity.spec->>'issuer') COLLATE "C" = $1 COLLATE "C"
-              AND (identity.spec->>'subject') COLLATE "C" = $2 COLLATE "C"
-            "#,
-        )
-        .bind(issuer.as_str())
-        .bind(subject.as_str())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(StoreError::backend)?;
-        row.map(TryInto::try_into).transpose()
+        // At most one row can match while `user_identities_issuer_subject_unique`
+        // holds. Fetch two and refuse to guess if the invariant is ever broken:
+        // this decides who a login belongs to, so returning an arbitrary row
+        // would be worse than failing.
+        let rows = sqlx::query_as::<_, IdentityFactRow>(USER_IDENTITY_BY_EXTERNAL_IDENTITY_SQL)
+            .bind(issuer.as_str())
+            .bind(subject.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(StoreError::backend)?;
+        if rows.len() > 1 {
+            return Err(StoreError::backend(std::io::Error::other(
+                "external identity resolves to more than one live UserIdentity",
+            )));
+        }
+        rows.into_iter().next().map(TryInto::try_into).transpose()
     }
 }
 
@@ -96,30 +186,12 @@ impl TrustPolicyLookup {
         controller_uid: Uuid,
         issuer: &Issuer,
     ) -> Result<Vec<TrustPolicyFact<ControllerTrustPolicySpec>>, StoreError> {
-        let rows = sqlx::query_as::<_, TrustFactRow>(
-            r#"
-            SELECT policy.uid, policy.name, policy.parent_uid, policy.spec
-            FROM resource_store.resources policy
-            JOIN resource_store.resources target
-              ON target.uid = $1
-             AND target.api_version = 'rise.dev/v1alpha1'
-             AND target.kind = 'Controller'
-             AND target.parent_uid IS NULL
-             AND target.deletion_timestamp IS NULL
-            WHERE policy.api_version = 'rise.dev/v1alpha1'
-              AND split_part(policy.api_version, '/', 1) = 'rise.dev'
-              AND policy.kind = 'ControllerTrustPolicy'
-              AND policy.deletion_timestamp IS NULL
-              AND policy.parent_uid = target.uid
-              AND (policy.spec->>'issuer') COLLATE "C" = $2 COLLATE "C"
-            ORDER BY policy.name, policy.uid
-            "#,
-        )
-        .bind(controller_uid)
-        .bind(issuer.as_str())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(StoreError::backend)?;
+        let rows = sqlx::query_as::<_, TrustFactRow>(CONTROLLER_TRUST_POLICIES_SQL)
+            .bind(controller_uid)
+            .bind(issuer.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(StoreError::backend)?;
         parse_trust_rows(rows)
     }
 
@@ -128,35 +200,12 @@ impl TrustPolicyLookup {
         service_account_uid: Uuid,
         issuer: &Issuer,
     ) -> Result<Vec<TrustPolicyFact<ServiceAccountTrustPolicySpec>>, StoreError> {
-        let rows = sqlx::query_as::<_, TrustFactRow>(
-            r#"
-            SELECT policy.uid, policy.name, policy.parent_uid, policy.spec
-            FROM resource_store.resources policy
-            JOIN resource_store.resources target
-              ON target.uid = $1
-             AND target.api_version = 'rise.dev/v1alpha1'
-             AND target.kind = 'ServiceAccount'
-             AND target.deletion_timestamp IS NULL
-            JOIN resource_store.resources organization
-              ON organization.uid = target.parent_uid
-             AND organization.api_version = 'rise.dev/v1alpha1'
-             AND organization.kind = 'Organization'
-             AND organization.parent_uid IS NULL
-             AND organization.deletion_timestamp IS NULL
-            WHERE policy.api_version = 'rise.dev/v1alpha1'
-              AND split_part(policy.api_version, '/', 1) = 'rise.dev'
-              AND policy.kind = 'ServiceAccountTrustPolicy'
-              AND policy.deletion_timestamp IS NULL
-              AND policy.parent_uid = target.uid
-              AND (policy.spec->>'issuer') COLLATE "C" = $2 COLLATE "C"
-            ORDER BY policy.name, policy.uid
-            "#,
-        )
-        .bind(service_account_uid)
-        .bind(issuer.as_str())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(StoreError::backend)?;
+        let rows = sqlx::query_as::<_, TrustFactRow>(SERVICE_ACCOUNT_TRUST_POLICIES_SQL)
+            .bind(service_account_uid)
+            .bind(issuer.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(StoreError::backend)?;
         parse_trust_rows(rows)
     }
 }
@@ -176,45 +225,12 @@ impl MembershipLookup {
         user_uid: Uuid,
         user_name: &str,
     ) -> Result<Vec<GroupMembershipFact>, StoreError> {
-        let rows = sqlx::query_as::<_, MembershipFactRow>(
-            r#"
-            SELECT membership.uid AS membership_uid,
-                   membership.name AS membership_name,
-                   parent.uid AS group_uid,
-                   parent.name AS group_name,
-                   organization.uid AS organization_uid
-            FROM resource_store.resources membership
-            JOIN resource_store.resources member
-              ON member.uid = $1
-             AND member.api_version = 'rise.dev/v1alpha1'
-             AND member.kind = 'User'
-             AND member.parent_uid IS NULL
-             AND member.name = $2
-             AND member.deletion_timestamp IS NULL
-            JOIN resource_store.resources parent
-              ON parent.uid = membership.parent_uid
-             AND parent.api_version = 'rise.dev/v1alpha1'
-             AND parent.kind = 'Group'
-             AND parent.deletion_timestamp IS NULL
-            JOIN resource_store.resources organization
-              ON organization.uid = parent.parent_uid
-             AND organization.api_version = 'rise.dev/v1alpha1'
-             AND organization.kind = 'Organization'
-             AND organization.parent_uid IS NULL
-             AND organization.deletion_timestamp IS NULL
-            WHERE membership.api_version = 'rise.dev/v1alpha1'
-              AND split_part(membership.api_version, '/', 1) = 'rise.dev'
-              AND membership.kind = 'GroupMembership'
-              AND membership.deletion_timestamp IS NULL
-              AND membership.name COLLATE "C" = member.name COLLATE "C"
-            ORDER BY parent.name, parent.uid, membership.uid
-            "#,
-        )
-        .bind(user_uid)
-        .bind(user_name)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(StoreError::backend)?;
+        let rows = sqlx::query_as::<_, MembershipFactRow>(GROUPS_FOR_USER_SQL)
+            .bind(user_uid)
+            .bind(user_name)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(StoreError::backend)?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
 }
