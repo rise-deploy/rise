@@ -57,7 +57,17 @@ pub async fn run_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::migrate::Mi
 
 /// Empty clone of `resource_store.resources` that every expected index
 /// definition is replayed against. See [`ConcurrentIndexMigration::reference_sql`].
-const DRIFT_REFERENCE_TABLE: &str = "rise_concurrent_index_reference";
+///
+/// Deliberately an ordinary table rather than a temporary one: `CREATE TEMP
+/// TABLE` needs the database-level `TEMPORARY` privilege, which hardened
+/// deployments revoke, and startup must not depend on a privilege the rest of
+/// the migrator never needed. It lives and dies inside the advisory lock the
+/// migrator already holds, so no other process can observe it.
+const DRIFT_REFERENCE_TABLE: &str = "resource_store.rise_concurrent_index_reference";
+
+/// The schema holding both the live indexes and the reference indexes. They
+/// never collide: reference index names are distinct from migration index names.
+const RESOURCE_STORE_SCHEMA: &str = "resource_store";
 
 struct ConcurrentIndexMigration {
     version: i64,
@@ -85,7 +95,7 @@ const CONCURRENT_INDEX_MIGRATIONS: &[ConcurrentIndexMigration] = &[
         reference_index: "reference_resources_owner_references_gin",
         reference_sql: r#"
 CREATE INDEX reference_resources_owner_references_gin
-    ON pg_temp.rise_concurrent_index_reference
+    ON resource_store.rise_concurrent_index_reference
     USING GIN (owner_references jsonb_path_ops)
 "#,
     },
@@ -96,7 +106,7 @@ CREATE INDEX reference_resources_owner_references_gin
         reference_index: "reference_user_identities_issuer_subject_unique",
         reference_sql: r#"
 CREATE UNIQUE INDEX reference_user_identities_issuer_subject_unique
-    ON pg_temp.rise_concurrent_index_reference (
+    ON resource_store.rise_concurrent_index_reference (
         ((spec->>'issuer') COLLATE "C"),
         ((spec->>'subject') COLLATE "C")
     )
@@ -112,7 +122,7 @@ CREATE UNIQUE INDEX reference_user_identities_issuer_subject_unique
         reference_index: "reference_workload_trust_parent_issuer",
         reference_sql: r#"
 CREATE INDEX reference_workload_trust_parent_issuer
-    ON pg_temp.rise_concurrent_index_reference (
+    ON resource_store.rise_concurrent_index_reference (
         parent_uid,
         ((spec->>'issuer') COLLATE "C")
     )
@@ -128,7 +138,7 @@ CREATE INDEX reference_workload_trust_parent_issuer
         reference_index: "reference_group_memberships_user_name",
         reference_sql: r#"
 CREATE INDEX reference_group_memberships_user_name
-    ON pg_temp.rise_concurrent_index_reference ((name COLLATE "C"))
+    ON resource_store.rise_concurrent_index_reference ((name COLLATE "C"))
     WHERE split_part(api_version, '/', 1) = 'rise.dev'
       AND kind = 'GroupMembership'
       AND deletion_timestamp IS NULL
@@ -181,7 +191,7 @@ fn index_matches_reference(
     actual.indisvalid
         && actual.indisready
         && actual.indislive
-        && actual.table_schema == "resource_store"
+        && actual.table_schema == RESOURCE_STORE_SCHEMA
         && actual.table_name == "resources"
         && actual.indisunique == reference.indisunique
         && actual.access_method == reference.access_method
@@ -270,27 +280,35 @@ async fn fetch_index_state(
 }
 
 /// Materialize every expected index against an empty clone of the resources
-/// table and return the temporary schema holding them. The clone is empty, so
-/// each index build is effectively free.
+/// table. The clone is empty, so each index build is effectively free.
+///
+/// Dropped first: a process that died between the create and the drop at the
+/// end of recovery leaves the clone behind, and the next startup must not trip
+/// over it.
 async fn build_drift_reference(
     conn: &mut sqlx::PgConnection,
-) -> Result<String, sqlx::migrate::MigrateError> {
+) -> Result<(), sqlx::migrate::MigrateError> {
     use sqlx::Executor;
 
+    drop_drift_reference(&mut *conn).await?;
     conn.execute(
-        format!("CREATE TEMP TABLE {DRIFT_REFERENCE_TABLE} (LIKE resource_store.resources)")
-            .as_str(),
+        format!("CREATE TABLE {DRIFT_REFERENCE_TABLE} (LIKE resource_store.resources)").as_str(),
     )
     .await?;
     for migration in CONCURRENT_INDEX_MIGRATIONS {
         conn.execute(migration.reference_sql).await?;
     }
-    sqlx::query_scalar(
-        "SELECT nspname FROM pg_catalog.pg_namespace WHERE oid = pg_my_temp_schema()",
-    )
-    .fetch_one(&mut *conn)
-    .await
-    .map_err(Into::into)
+    Ok(())
+}
+
+async fn drop_drift_reference(
+    conn: &mut sqlx::PgConnection,
+) -> Result<(), sqlx::migrate::MigrateError> {
+    use sqlx::Executor;
+
+    conn.execute(format!("DROP TABLE IF EXISTS {DRIFT_REFERENCE_TABLE}").as_str())
+        .await?;
+    Ok(())
 }
 
 /// Recover the crash window between a no-transaction index statement and
@@ -300,8 +318,6 @@ async fn build_drift_reference(
 async fn recover_concurrent_indexes(
     conn: &mut sqlx::PgConnection,
 ) -> Result<(), sqlx::migrate::MigrateError> {
-    use sqlx::Executor;
-
     // A database without the resources table cannot hold any of these indexes,
     // and cannot be cloned for the drift reference either.
     let resources_table_exists: bool =
@@ -316,7 +332,7 @@ async fn recover_concurrent_indexes(
             .fetch_one(&mut *conn)
             .await?;
 
-    let reference_schema = build_drift_reference(&mut *conn).await?;
+    build_drift_reference(&mut *conn).await?;
 
     for migration in CONCURRENT_INDEX_MIGRATIONS {
         let applied = if migrations_table_exists {
@@ -330,7 +346,7 @@ async fn recover_concurrent_indexes(
             false
         };
 
-        let state = fetch_index_state(&mut *conn, "resource_store", migration.name).await?;
+        let state = fetch_index_state(&mut *conn, RESOURCE_STORE_SCHEMA, migration.name).await?;
 
         match (applied, state) {
             (false, Some(_)) => {
@@ -341,7 +357,7 @@ async fn recover_concurrent_indexes(
             (false, None) => {}
             (true, state) => {
                 let reference =
-                    fetch_index_state(&mut *conn, &reference_schema, migration.reference_index)
+                    fetch_index_state(&mut *conn, RESOURCE_STORE_SCHEMA, migration.reference_index)
                         .await?
                         .ok_or_else(|| {
                             drift_error(
@@ -372,9 +388,7 @@ async fn recover_concurrent_indexes(
         }
     }
 
-    conn.execute(format!("DROP TABLE pg_temp.{DRIFT_REFERENCE_TABLE}").as_str())
-        .await?;
-    Ok(())
+    drop_drift_reference(&mut *conn).await
 }
 
 #[cfg(test)]

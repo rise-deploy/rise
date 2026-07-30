@@ -4020,6 +4020,68 @@ async fn migration_runner_recovers_unrecorded_concurrent_indexes_and_fails_on_dr
     assert!(error
         .to_string()
         .contains("collations=[\"pg_catalog.default\"]"));
+
+    // Correct keys, collation, operator class and uniqueness; only the
+    // predicate differs. Nothing but the predicate comparison can reject this,
+    // so dropping that comparison makes this case pass and the test fail.
+    sqlx::query("DROP INDEX resource_store.group_memberships_user_name")
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        r#"
+        CREATE INDEX group_memberships_user_name
+            ON resource_store.resources ((name COLLATE "C"))
+            WHERE split_part(api_version, '/', 1) = 'rise.dev'
+              AND kind = 'GroupMembership'
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+    let error = rise_resource_store_postgres::run_migrations(&pool)
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("requires the expected valid index"));
+    assert!(error.to_string().contains("group_memberships_user_name"));
+
+    // Rebuilding it exactly as the migration declares is accepted again.
+    sqlx::query("DROP INDEX resource_store.group_memberships_user_name")
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        r#"
+        CREATE INDEX group_memberships_user_name
+            ON resource_store.resources ((name COLLATE "C"))
+            WHERE split_part(api_version, '/', 1) = 'rise.dev'
+              AND kind = 'GroupMembership'
+              AND deletion_timestamp IS NULL
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+    rise_resource_store_postgres::run_migrations(&pool)
+        .await
+        .unwrap();
+
+    // Operator classes are invisible to pg_get_indexdef's per-column form, so
+    // only the explicit indclass comparison distinguishes the default
+    // jsonb_ops from the jsonb_path_ops the migration asks for.
+    sqlx::query("DROP INDEX resource_store.resources_owner_references_gin")
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        "CREATE INDEX resources_owner_references_gin
+             ON resource_store.resources USING GIN (owner_references)",
+    )
+    .execute(&pool)
+    .await?;
+    let error = rise_resource_store_postgres::run_migrations(&pool)
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("operator_classes=[\"pg_catalog.jsonb_ops\"]"));
     Ok(())
 }
 
