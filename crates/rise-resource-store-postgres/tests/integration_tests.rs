@@ -3377,7 +3377,7 @@ async fn identity_admission_is_unbypassable_and_persists_canonical_defaults(
 async fn user_identity_uniqueness_is_live_global_and_concurrency_authoritative(
     pool: sqlx::PgPool,
 ) -> sqlx::Result<()> {
-    let store = Arc::new(PgResourceStore::new(pool));
+    let store = Arc::new(PgResourceStore::new(pool.clone()));
     let user_a = create_identity_resource(&store, USER_KIND, "user-a", None, json!({}), vec![])
         .await
         .unwrap();
@@ -3447,6 +3447,31 @@ async fn user_identity_uniqueness_is_live_global_and_concurrency_authoritative(
     .await
     .unwrap();
     assert_ne!(replacement.uid, winner.uid);
+
+    // Uniqueness is a property of the kind, not of one stored api_version. The
+    // store only writes v1alpha1 today, so reach past it to prove a future
+    // second version cannot introduce a duplicate external identity.
+    let cross_version = sqlx::query(
+        r#"
+        INSERT INTO resource_store.resources
+            (api_version, kind, parent_uid, name, discriminator, metadata, spec,
+             finalizers, owner_references)
+        VALUES ('rise.dev/v1alpha2', 'UserIdentity', $1, 'next-version', 'a1b2c3d4',
+                '{}'::jsonb, $2::jsonb, ARRAY[]::text[], '[]'::jsonb)
+        "#,
+    )
+    .bind(user_a.uid)
+    .bind(json!({"issuer":"https://issuer.example","subject":"shared"}))
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert!(
+        cross_version
+            .as_database_error()
+            .and_then(|error| error.constraint())
+            .is_some_and(|constraint| constraint == "user_identities_issuer_subject_unique"),
+        "expected the cross-version duplicate to hit the uniqueness index, got {cross_version:?}"
+    );
     Ok(())
 }
 
@@ -3928,8 +3953,7 @@ async fn migration_runner_recovers_unrecorded_concurrent_indexes_and_fails_on_dr
         r#"
         CREATE INDEX group_memberships_user_name
             ON resource_store.resources (name)
-            WHERE api_version = 'rise.dev/v1alpha1'
-              AND split_part(api_version, '/', 1) = 'rise.dev'
+            WHERE split_part(api_version, '/', 1) = 'rise.dev'
               AND kind = 'GroupMembership'
               AND deletion_timestamp IS NULL
         "#,
@@ -4062,7 +4086,9 @@ async fn maximum_identity_index_keys_fit_and_projection_queries_use_their_indexe
     .await?;
     assert_eq!(definitions.len(), 3);
     for (_, definition) in &definitions {
-        assert!(definition.contains("api_version = 'rise.dev/v1alpha1'"));
+        // Group- and kind-scoped, never pinned to a single api_version.
+        assert!(definition.contains("split_part(api_version, '/'::text, 1) = 'rise.dev'::text"));
+        assert!(!definition.contains("api_version = 'rise.dev/v1alpha1'"));
         assert!(definition.contains("deletion_timestamp IS NULL"));
     }
 
