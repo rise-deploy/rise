@@ -3253,6 +3253,55 @@ async fn persisted_json_and_text_values_reject_nul_as_validation_errors(
             .unwrap_err();
         assert!(matches!(error, StoreError::Validation(message) if message.contains("U+0000")));
     }
+
+    // Subresource writes reach the same columns and must reject NUL the same
+    // way rather than failing as an opaque backend error.
+    let organization = store
+        .create(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.into(),
+            kind: ORGANIZATION_KIND.into(),
+            name: "nul-subresources".into(),
+            spec: json!({"displayName":"Valid"}),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let errors = [
+        store
+            .update_controller_status(organization.uid, "ctrl", json!({"phase":"a\0b"}))
+            .await
+            .unwrap_err(),
+        store
+            .operator_update_status(organization.uid, "op", json!({"phase":"a\0b"}))
+            .await
+            .unwrap_err(),
+        store
+            .update_controller_finalizers(
+                organization.uid,
+                "ctrl",
+                &["controller.example/a\0b".into()],
+                &[],
+            )
+            .await
+            .unwrap_err(),
+        store
+            .operator_update_finalizers(
+                organization.uid,
+                "op",
+                &["operator.example/a\0b".into()],
+                &[],
+            )
+            .await
+            .unwrap_err(),
+        store
+            .operator_update_status(organization.uid, "op\0erator", json!({"phase":"ok"}))
+            .await
+            .unwrap_err(),
+    ];
+    for error in errors {
+        assert!(matches!(error, StoreError::Validation(message) if message.contains("U+0000")));
+    }
     Ok(())
 }
 

@@ -256,6 +256,46 @@ impl PgResourceStore {
         )
     }
 
+    /// Subresource writes do not go through the create/update preflight, so
+    /// they screen their own caller-supplied values. PostgreSQL stores neither
+    /// `text` nor `jsonb` containing U+0000; without this the write surfaces as
+    /// an opaque backend error instead of a rejected request.
+    fn validate_status_preflight(
+        writer: &str,
+        status_value: &serde_json::Value,
+    ) -> Result<(), StoreError> {
+        Self::ensure_writer_has_no_nul(writer)?;
+        Self::ensure_json_has_no_nul(status_value, "status")
+    }
+
+    fn validate_finalizers_preflight(
+        writer: &str,
+        add: &[String],
+        remove: &[String],
+    ) -> Result<(), StoreError> {
+        Self::ensure_writer_has_no_nul(writer)?;
+        if add
+            .iter()
+            .chain(remove.iter())
+            .any(|finalizer| finalizer.contains('\0'))
+        {
+            return Err(StoreError::Validation(
+                "metadata.finalizers must not contain U+0000".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The writer identity becomes a `status.controllers` object key.
+    fn ensure_writer_has_no_nul(writer: &str) -> Result<(), StoreError> {
+        if writer.contains('\0') {
+            return Err(StoreError::Validation(
+                "writer identity must not contain U+0000".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// These kinds still have deletion admission outside the generic store.
     /// Letting them become cross-tree dependents would allow owner-driven GC to
     /// bypass those guards.
@@ -1655,6 +1695,7 @@ impl ResourceStore for PgResourceStore {
         status_value: serde_json::Value,
     ) -> Result<ResourceRow, StoreError> {
         validate_controller_id(controller_id).map_err(|e| StoreError::Validation(e.to_string()))?;
+        Self::validate_status_preflight(controller_id, &status_value)?;
 
         let row = sqlx::query_as::<_, PgResourceRow>(
             r#"
@@ -1689,6 +1730,7 @@ impl ResourceStore for PgResourceStore {
         remove: &[String],
     ) -> Result<ResourceRow, StoreError> {
         validate_controller_id(controller_id).map_err(|e| StoreError::Validation(e.to_string()))?;
+        Self::validate_finalizers_preflight(controller_id, add, remove)?;
 
         // Store-managed finalizers (system.rise.dev/*) cannot be added or removed by controllers.
         for f in add.iter().chain(remove.iter()) {
@@ -1753,6 +1795,8 @@ impl ResourceStore for PgResourceStore {
         operator: &str,
         status_value: serde_json::Value,
     ) -> Result<ResourceRow, StoreError> {
+        Self::validate_status_preflight(operator, &status_value)?;
+
         // Store under `status.controllers.operator:<operator>` — same nested
         // structure as update_controller_status but with the operator key.
         let operator_key = format!("operator:{operator}");
@@ -1788,6 +1832,8 @@ impl ResourceStore for PgResourceStore {
         add: &[String],
         remove: &[String],
     ) -> Result<ResourceRow, StoreError> {
+        Self::validate_finalizers_preflight(operator, add, remove)?;
+
         // Block system-managed finalizers — operators must not clear cascade
         // deletion finalizers to prevent GC corruption.
         for f in add.iter().chain(remove.iter()) {
