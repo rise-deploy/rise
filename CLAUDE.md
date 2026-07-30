@@ -21,30 +21,37 @@ A typical session:
 ```console
 $ rise login
 Please login to rise at https://rise.dev/oauth/login?code=1234-abcd
-Login successful! Welcome back, Niklas!
+✓ Login successful!
+  Token saved to: ~/.config/rise/config.json
 
 $ rise p c secret-app --access-class private --owner team:devopsy
-Team 'devopsy' does not exist or you do not have permission to create projects for it. Did you mean 'devops'?
+Team 'devopsy' does not exist or you do not have permission to create projects for it.
+
+Did you mean one of these?
+  - devops
 
 $ rise p c secret-app --access-class private --owner team:devops
 ✓ Project 'secret-app' created successfully!
   ID: 0f3c…
-  Status: stopped
+  Status: Stopped
 ✓ Created rise.toml at ./rise.toml
 
 $ rise p ls
 NAME            STATUS     ACCESS CLASS   OWNER         ACTIVE DEPLOYMENT   URL
-my-first-app    running    public         user:niklas   2026-07-30T09:12Z   https://my-first-app.rise.dev
-secret-app      stopped    private        team:devops   -                   https://secret-app.rise.dev
+my-first-app    Running    public         user:niklas   Healthy             https://my-first-app.rise.dev
+secret-app      Stopped    private        team:devops   -                   https://secret-app.rise.dev
 
-$ cat rise.toml
+$ cat rise.toml           # what `project create` writes
 version = 1
 
 [project]
 name = "secret-app"
 
+$ cat >> rise.toml <<'TOML'   # pin the build backend
+
 [build]
 backend = "pack"
+TOML
 
 $ rise d c secret-app
 Building container image 'registry.rise.dev/secret-app:latest' using pack...
