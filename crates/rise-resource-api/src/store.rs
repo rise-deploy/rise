@@ -27,6 +27,12 @@ pub enum StoreError {
     RevisionConflict { expected: i64, found: i64 },
     #[error("a resource with this name already exists in this scope")]
     NameConflict,
+    /// A uniqueness constraint other than the name was violated. Separate from
+    /// [`Self::Validation`] because the request is well-formed and the caller's
+    /// correct response is to reconcile with the existing resource, not to fix
+    /// the payload.
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("could not generate a unique discriminator after maximum retries")]
     DiscriminatorExhausted,
     #[error("path segment kind mismatch: expected '{expected}', got '{got}'")]

@@ -3415,7 +3415,12 @@ async fn user_identity_uniqueness_is_live_global_and_concurrency_authoritative(
     };
     let results = [a.await.unwrap(), b.await.unwrap()];
     assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
-    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+    // A losing racer is told to reconcile with the winner, not to fix a payload
+    // that was never malformed.
+    assert!(matches!(
+        results.iter().find_map(|result| result.as_ref().err()),
+        Some(StoreError::Conflict(message)) if message.contains("issuer and subject")
+    ));
     let winner = results.into_iter().find_map(Result::ok).unwrap();
 
     let immutable = store

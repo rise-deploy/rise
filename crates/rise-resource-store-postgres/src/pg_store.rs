@@ -127,7 +127,7 @@ impl PgResourceStore {
             return None;
         };
         (db.constraint() == Some("user_identities_issuer_subject_unique")).then(|| {
-            StoreError::Validation(
+            StoreError::Conflict(
                 "a live UserIdentity with this issuer and subject already exists".into(),
             )
         })
