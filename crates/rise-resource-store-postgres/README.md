@@ -70,9 +70,14 @@ the previously deployed Rise binary; remove every resource identified by the
 diagnostic, then retry. The constraint is validated only after that audit.
 Concurrent index migrations are serialized and recover their narrow
 DDL-before-bookkeeping crash window; a recorded index whose table, access
-method, uniqueness, key expressions, predicate, or validity drifts from the
-expected definition stops startup rather than silently degrading the identity
-path.
+method, uniqueness, key expressions, collations, operator classes, predicate,
+or validity drifts from the expected definition stops startup rather than
+silently degrading the identity path. The expected definition is materialized
+at startup as a set of reference indexes on an empty clone of the resources
+table, so both sides of that comparison are deparsed by the running server —
+PostgreSQL does not promise a stable pretty-printed form for index expressions
+across major versions, and a baked-in literal would eventually fail a correct
+index.
 
 A built-in `Organization` or `ResourceDefinition` cannot currently be the
 dependent side of an owner reference: writes that put `owner_references` on
