@@ -3254,8 +3254,10 @@ async fn persisted_json_and_text_values_reject_nul_as_validation_errors(
         assert!(matches!(error, StoreError::Validation(message) if message.contains("U+0000")));
     }
 
-    // Subresource writes reach the same columns and must reject NUL the same
-    // way rather than failing as an opaque backend error.
+    // Every write path is covered because the translation happens where the
+    // database reports it, not in a per-method payload walk. Subresource writes
+    // reach the same columns and must be rejected the same way rather than
+    // surfacing as an opaque backend error.
     let organization = store
         .create(CreateResourceParams {
             api_version: API_VERSION_V1ALPHA1.into(),
@@ -3277,12 +3279,11 @@ async fn persisted_json_and_text_values_reject_nul_as_validation_errors(
             .await
             .unwrap_err(),
         store
-            .update_controller_finalizers(
-                organization.uid,
-                "ctrl",
-                &["controller.example/a\0b".into()],
-                &[],
-            )
+            .update_controller_finalizers(organization.uid, "ctrl", &["ctrl/a\0b".into()], &[])
+            .await
+            .unwrap_err(),
+        store
+            .operator_update_status(organization.uid, "op\0erator", json!({"phase":"ok"}))
             .await
             .unwrap_err(),
         store
@@ -3294,13 +3295,12 @@ async fn persisted_json_and_text_values_reject_nul_as_validation_errors(
             )
             .await
             .unwrap_err(),
-        store
-            .operator_update_status(organization.uid, "op\0erator", json!({"phase":"ok"}))
-            .await
-            .unwrap_err(),
     ];
     for error in errors {
-        assert!(matches!(error, StoreError::Validation(message) if message.contains("U+0000")));
+        assert!(
+            matches!(&error, StoreError::Validation(message) if message.contains("U+0000")),
+            "expected a U+0000 validation error, got {error:?}"
+        );
     }
     Ok(())
 }

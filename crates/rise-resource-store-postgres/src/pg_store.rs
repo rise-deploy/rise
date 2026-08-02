@@ -101,6 +101,28 @@ impl PgResourceStore {
         false
     }
 
+    /// Map a database error to a `StoreError`, translating the failures that
+    /// are the caller's fault before falling back to an opaque backend error.
+    ///
+    /// PostgreSQL stores neither `text` nor `jsonb` containing U+0000, but JSON
+    /// permits it and `serde_json` carries it happily, so a well-formed request
+    /// can reach the write and be rejected there. That is a bad request, not an
+    /// internal error. Screening for it here rather than walking every payload
+    /// before the write keeps the cost on the error path and covers every
+    /// statement, including ones added later.
+    fn db_error(err: sqlx::Error) -> StoreError {
+        if let sqlx::Error::Database(db) = &err {
+            // 22021 character_not_in_repertoire — a NUL byte in a text value.
+            // 22P05 untranslatable_character — an escaped NUL in a jsonb value.
+            if matches!(db.code().as_deref(), Some("22021") | Some("22P05")) {
+                return StoreError::Validation(
+                    "values must not contain U+0000, which PostgreSQL cannot store".into(),
+                );
+            }
+        }
+        StoreError::backend(err)
+    }
+
     fn is_discriminator_conflict(err: &sqlx::Error) -> bool {
         if let sqlx::Error::Database(db) = err {
             let c = db.constraint().unwrap_or("");
@@ -179,130 +201,11 @@ impl PgResourceStore {
         Ok(references)
     }
 
-    fn ensure_json_has_no_nul(value: &serde_json::Value, field: &str) -> Result<(), StoreError> {
-        match value {
-            serde_json::Value::String(value) if value.contains('\0') => Err(
-                StoreError::Validation(format!("{field} must not contain U+0000")),
-            ),
-            serde_json::Value::Array(values) => values
-                .iter()
-                .try_for_each(|value| Self::ensure_json_has_no_nul(value, field)),
-            serde_json::Value::Object(values) => values.iter().try_for_each(|(key, value)| {
-                if key.contains('\0') {
-                    return Err(StoreError::Validation(format!(
-                        "{field} object keys must not contain U+0000"
-                    )));
-                }
-                Self::ensure_json_has_no_nul(value, field)
-            }),
-            _ => Ok(()),
-        }
-    }
-
-    fn validate_create_preflight(params: &CreateResourceParams) -> Result<(), StoreError> {
-        for (field, value) in [
-            ("apiVersion", params.api_version.as_str()),
-            ("kind", params.kind.as_str()),
-            ("metadata.name", params.name.as_str()),
-        ] {
-            if value.contains('\0') {
-                return Err(StoreError::Validation(format!(
-                    "{field} must not contain U+0000"
-                )));
-            }
-        }
-        if params
-            .annotations
-            .iter()
-            .any(|(key, value)| key.contains('\0') || value.contains('\0'))
-        {
-            return Err(StoreError::Validation(
-                "metadata.annotations must not contain U+0000".into(),
-            ));
-        }
-        if params.finalizers.iter().any(|value| value.contains('\0')) {
-            return Err(StoreError::Validation(
-                "metadata.finalizers must not contain U+0000".into(),
-            ));
-        }
-        Self::ensure_json_has_no_nul(&params.spec, "spec")?;
-        Self::ensure_json_has_no_nul(
-            &serde_json::to_value(&params.owner_references).map_err(StoreError::backend)?,
-            "metadata.ownerReferences",
-        )
-    }
-
-    fn validate_update_preflight(params: &UpdateResourceParams) -> Result<(), StoreError> {
-        if params
-            .api_version
-            .as_deref()
-            .is_some_and(|value| value.contains('\0'))
-        {
-            return Err(StoreError::Validation(
-                "apiVersion must not contain U+0000".into(),
-            ));
-        }
-        if params
-            .annotations
-            .iter()
-            .any(|(key, value)| key.contains('\0') || value.contains('\0'))
-        {
-            return Err(StoreError::Validation(
-                "metadata.annotations must not contain U+0000".into(),
-            ));
-        }
-        if params.finalizers.iter().any(|value| value.contains('\0')) {
-            return Err(StoreError::Validation(
-                "metadata.finalizers must not contain U+0000".into(),
-            ));
-        }
-        Self::ensure_json_has_no_nul(&params.spec, "spec")?;
-        Self::ensure_json_has_no_nul(
-            &serde_json::to_value(&params.owner_references).map_err(StoreError::backend)?,
-            "metadata.ownerReferences",
-        )
-    }
-
     /// Subresource writes do not go through the create/update preflight, so
     /// they screen their own caller-supplied values. PostgreSQL stores neither
     /// `text` nor `jsonb` containing U+0000; without this the write surfaces as
     /// an opaque backend error instead of a rejected request.
-    fn validate_status_preflight(
-        writer: &str,
-        status_value: &serde_json::Value,
-    ) -> Result<(), StoreError> {
-        Self::ensure_writer_has_no_nul(writer)?;
-        Self::ensure_json_has_no_nul(status_value, "status")
-    }
-
-    fn validate_finalizers_preflight(
-        writer: &str,
-        add: &[String],
-        remove: &[String],
-    ) -> Result<(), StoreError> {
-        Self::ensure_writer_has_no_nul(writer)?;
-        if add
-            .iter()
-            .chain(remove.iter())
-            .any(|finalizer| finalizer.contains('\0'))
-        {
-            return Err(StoreError::Validation(
-                "metadata.finalizers must not contain U+0000".into(),
-            ));
-        }
-        Ok(())
-    }
-
     /// The writer identity becomes a `status.controllers` object key.
-    fn ensure_writer_has_no_nul(writer: &str) -> Result<(), StoreError> {
-        if writer.contains('\0') {
-            return Err(StoreError::Validation(
-                "writer identity must not contain U+0000".into(),
-            ));
-        }
-        Ok(())
-    }
-
     /// These kinds still have deletion admission outside the generic store.
     /// Letting them become cross-tree dependents would allow owner-driven GC to
     /// bypass those guards.
@@ -328,7 +231,7 @@ impl PgResourceStore {
         )
         .execute(conn)
         .await
-        .map_err(StoreError::backend)?;
+        .map_err(Self::db_error)?;
         Ok(())
     }
 
@@ -373,7 +276,7 @@ impl PgResourceStore {
             .bind(&owner_uids)
             .fetch_all(&mut *conn)
             .await
-            .map_err(StoreError::backend)?;
+            .map_err(Self::db_error)?;
 
             let owners_by_uid: HashMap<_, _> =
                 owners.into_iter().map(|owner| (owner.0, owner)).collect();
@@ -427,7 +330,7 @@ impl PgResourceStore {
                 .bind(&owner_uids)
                 .fetch_one(&mut *conn)
                 .await
-                .map_err(StoreError::backend)?;
+                .map_err(Self::db_error)?;
                 if creates_cycle {
                     return Err(StoreError::Validation(
                         "owner references would create a lifecycle cycle".into(),
@@ -472,7 +375,7 @@ impl PgResourceStore {
             .bind(expected_uid)
             .fetch_optional(&mut *conn)
             .await
-            .map_err(StoreError::backend)?
+            .map_err(Self::db_error)?
             .ok_or_else(|| {
                 StoreError::Validation(format!(
                     "{dependent_kind} parent must identify a live {} {}",
@@ -523,7 +426,7 @@ impl PgResourceStore {
         .bind(owner_uid)
         .fetch_all(&mut *conn)
         .await
-        .map_err(StoreError::backend)?;
+        .map_err(Self::db_error)?;
 
         let referenced = sqlx::query_as::<_, TombstonedDependentRow>(
             r#"
@@ -546,7 +449,7 @@ impl PgResourceStore {
         .bind(owner_uid)
         .fetch_all(&mut *conn)
         .await
-        .map_err(StoreError::backend)?;
+        .map_err(Self::db_error)?;
 
         let mut tombstoned = Vec::with_capacity(structural.len() + referenced.len());
         tombstoned.extend(structural.into_iter().map(|row| TombstonedDependent {
@@ -595,7 +498,7 @@ impl PgResourceStore {
         .bind(owner_uid)
         .fetch_one(&mut *conn)
         .await
-        .map_err(StoreError::backend)
+        .map_err(Self::db_error)
     }
 
     /// Best-effort emit one structured lifecycle log after the transaction that
@@ -659,7 +562,7 @@ impl PgResourceStore {
             sqlx::query("SAVEPOINT sp_discriminator_retry")
                 .execute(&mut *conn)
                 .await
-                .map_err(StoreError::backend)?;
+                .map_err(Self::db_error)?;
 
             let result = sqlx::query_as::<_, PgResourceRow>(
                 r#"
@@ -688,31 +591,31 @@ impl PgResourceStore {
                     sqlx::query("RELEASE SAVEPOINT sp_discriminator_retry")
                         .execute(&mut *conn)
                         .await
-                        .map_err(StoreError::backend)?;
+                        .map_err(Self::db_error)?;
                     return Ok(row.into());
                 }
                 Err(ref e) if Self::is_name_conflict(e) => {
                     sqlx::query("ROLLBACK TO SAVEPOINT sp_discriminator_retry")
                         .execute(&mut *conn)
                         .await
-                        .map_err(StoreError::backend)?;
+                        .map_err(Self::db_error)?;
                     return Err(StoreError::NameConflict);
                 }
                 Err(ref e) if Self::is_discriminator_conflict(e) => {
                     sqlx::query("ROLLBACK TO SAVEPOINT sp_discriminator_retry")
                         .execute(&mut *conn)
                         .await
-                        .map_err(StoreError::backend)?;
+                        .map_err(Self::db_error)?;
                     continue;
                 }
                 Err(e) => {
                     sqlx::query("ROLLBACK TO SAVEPOINT sp_discriminator_retry")
                         .execute(&mut *conn)
                         .await
-                        .map_err(StoreError::backend)?;
+                        .map_err(Self::db_error)?;
                     return Err(Self::rd_uniqueness_conflict(&e)
                         .or_else(|| Self::identity_uniqueness_conflict(&e))
-                        .unwrap_or_else(|| StoreError::backend(e)));
+                        .unwrap_or_else(|| Self::db_error(e)));
                 }
             }
         }
@@ -743,7 +646,7 @@ impl PgResourceStore {
             .bind(row.uid)
             .execute(&mut **tx)
             .await
-            .map_err(StoreError::backend)?;
+            .map_err(Self::db_error)?;
 
         let instance_count: i64 = sqlx::query_scalar(
             r#"
@@ -757,7 +660,7 @@ impl PgResourceStore {
         .bind(&api_versions)
         .fetch_one(&mut **tx)
         .await
-        .map_err(StoreError::backend)?;
+        .map_err(Self::db_error)?;
 
         if instance_count > 0 {
             return Err(StoreError::Validation(format!(
@@ -807,7 +710,7 @@ impl PgResourceStore {
         .bind(serde_json::json!([{ "name": version, "storage": true }]))
         .fetch_optional(&mut **tx)
         .await
-        .map_err(StoreError::backend)?;
+        .map_err(Self::db_error)?;
 
         if required && row.is_none() {
             return Err(StoreError::Validation(format!(
@@ -888,20 +791,18 @@ impl PgResourceStore {
         .bind(kind)
         .fetch_optional(&mut *conn)
         .await
-        .map_err(StoreError::backend)?;
+        .map_err(Self::db_error)?;
 
         let Some(row) = row else {
             return Ok(None);
         };
 
-        let spec: ResourceDefinitionSpec = serde_json::from_value(
-            row.try_get("spec").map_err(StoreError::backend)?,
-        )
-        .map_err(|e| {
-            StoreError::Validation(format!(
-                "invalid spec in ResourceDefinition '{group}/{kind}': {e}"
-            ))
-        })?;
+        let spec: ResourceDefinitionSpec =
+            serde_json::from_value(row.try_get("spec").map_err(Self::db_error)?).map_err(|e| {
+                StoreError::Validation(format!(
+                    "invalid spec in ResourceDefinition '{group}/{kind}': {e}"
+                ))
+            })?;
         Ok(spec.parent)
     }
 
@@ -955,7 +856,6 @@ impl ResourceStore for PgResourceStore {
         }
 
         validate_resource_name(&params.name).map_err(|e| StoreError::Validation(e.to_string()))?;
-        Self::validate_create_preflight(&params)?;
         Self::ensure_owner_references_supported(
             &params.api_version,
             &params.kind,
@@ -978,7 +878,7 @@ impl ResourceStore for PgResourceStore {
             validator.validate_spec(&params.spec)?;
         }
 
-        let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
+        let mut tx = self.pool.begin().await.map_err(Self::db_error)?;
 
         // Allocate the dependent UID before insertion so owner validation
         // happens before the dependent row is created. A fresh UID cannot
@@ -1015,7 +915,7 @@ impl ResourceStore for PgResourceStore {
         .await?;
         let metadata = serde_json::to_value(&params.annotations).unwrap_or_default();
         let row = Self::insert_resource_row_with_retry(&mut tx, uid, &params, metadata).await?;
-        tx.commit().await.map_err(StoreError::backend)?;
+        tx.commit().await.map_err(Self::db_error)?;
         let mut row = row;
         row.owner_references = owner_references;
         Ok(row)
@@ -1028,7 +928,7 @@ impl ResourceStore for PgResourceStore {
         .bind(uid)
         .fetch_optional(&self.pool)
         .await
-        .map_err(StoreError::backend)?;
+        .map_err(Self::db_error)?;
         Ok(row.map(Into::into))
     }
 
@@ -1053,7 +953,7 @@ impl ResourceStore for PgResourceStore {
                 .bind(name)
                 .fetch_optional(&self.pool)
                 .await
-                .map_err(StoreError::backend)?,
+                .map_err(Self::db_error)?,
                 Some(pid) => {
                     sqlx::query_as::<_, PgResourceRow>(
                         "SELECT * FROM resource_store.resources WHERE split_part(api_version, '/', 1) = split_part($1, '/', 1) AND kind = $2 AND name = $3 AND parent_uid = $4",
@@ -1064,7 +964,7 @@ impl ResourceStore for PgResourceStore {
                     .bind(pid)
                     .fetch_optional(&self.pool)
                     .await
-                    .map_err(StoreError::backend)?
+                    .map_err(Self::db_error)?
                 }
             };
         Ok(row.map(Into::into))
@@ -1087,7 +987,7 @@ impl ResourceStore for PgResourceStore {
                 .bind(kind)
                 .fetch_all(&self.pool)
                 .await
-                .map_err(StoreError::backend)?,
+                .map_err(Self::db_error)?,
                 Some(pid) => {
                     sqlx::query_as::<_, PgResourceRow>(
                         "SELECT * FROM resource_store.resources WHERE split_part(api_version, '/', 1) = split_part($1, '/', 1) AND kind = $2 AND parent_uid = $3 ORDER BY name",
@@ -1097,7 +997,7 @@ impl ResourceStore for PgResourceStore {
                     .bind(pid)
                     .fetch_all(&self.pool)
                     .await
-                    .map_err(StoreError::backend)?
+                    .map_err(Self::db_error)?
                 }
             };
         Ok(rows.into_iter().map(Into::into).collect())
@@ -1118,7 +1018,7 @@ impl ResourceStore for PgResourceStore {
                 .bind(kind)
                 .fetch_all(&self.pool)
                 .await
-                .map_err(StoreError::backend)?,
+                .map_err(Self::db_error)?,
                 Some(pid) => {
                     sqlx::query_as::<_, PgResourceRow>(
                         "SELECT * FROM resource_store.resources WHERE api_version = ANY($1) AND kind = $2 AND parent_uid = $3 ORDER BY name",
@@ -1128,7 +1028,7 @@ impl ResourceStore for PgResourceStore {
                     .bind(pid)
                     .fetch_all(&self.pool)
                     .await
-                    .map_err(StoreError::backend)?
+                    .map_err(Self::db_error)?
                 }
             };
         Ok(rows.into_iter().map(Into::into).collect())
@@ -1139,8 +1039,6 @@ impl ResourceStore for PgResourceStore {
         uid: Uuid,
         mut params: UpdateResourceParams,
     ) -> Result<ResourceRow, StoreError> {
-        Self::validate_update_preflight(&params)?;
-
         // Resolve immutable routing identity and run all pure validators before
         // opening the mutation transaction or taking advisory/row locks. Only
         // the routing identity is needed here; the transaction below reads the
@@ -1150,7 +1048,7 @@ impl ResourceStore for PgResourceStore {
                 .bind(uid)
                 .fetch_optional(&self.pool)
                 .await
-                .map_err(StoreError::backend)?
+                .map_err(Self::db_error)?
                 .ok_or(StoreError::NotFound)?;
         if preflight.kind == RESOURCE_DEFINITION_KIND {
             return Err(StoreError::Validation(
@@ -1186,7 +1084,7 @@ impl ResourceStore for PgResourceStore {
             validator.validate_spec(&params.spec)?;
         }
 
-        let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
+        let mut tx = self.pool.begin().await.map_err(Self::db_error)?;
         if !params.owner_references.is_empty() {
             Self::lock_owner_reference_graph(&mut tx).await?;
         }
@@ -1200,7 +1098,7 @@ impl ResourceStore for PgResourceStore {
         .bind(uid)
         .fetch_optional(&mut *tx)
         .await
-        .map_err(StoreError::backend)?
+        .map_err(Self::db_error)?
         .ok_or(StoreError::NotFound)?;
         if snapshot.kind == RESOURCE_DEFINITION_KIND {
             return Err(StoreError::Validation(
@@ -1279,7 +1177,7 @@ impl ResourceStore for PgResourceStore {
         .bind(uid)
         .fetch_optional(&mut *tx)
         .await
-        .map_err(StoreError::backend)?
+        .map_err(Self::db_error)?
         .ok_or(StoreError::NotFound)?;
         if current.revision != params.revision {
             return Err(StoreError::RevisionConflict {
@@ -1339,13 +1237,14 @@ impl ResourceStore for PgResourceStore {
             // instead of leaking an internal Database error (500).
             Err(ref e) if Self::is_name_conflict(e) => return Err(StoreError::NameConflict),
             Err(e) => {
-                return Err(Self::identity_uniqueness_conflict(&e)
-                    .unwrap_or_else(|| StoreError::backend(e)))
+                return Err(
+                    Self::identity_uniqueness_conflict(&e).unwrap_or_else(|| Self::db_error(e))
+                )
             }
         };
 
         if let Some(row) = updated {
-            tx.commit().await.map_err(StoreError::backend)?;
+            tx.commit().await.map_err(Self::db_error)?;
             return Ok(row.into());
         }
 
@@ -1357,7 +1256,7 @@ impl ResourceStore for PgResourceStore {
     }
 
     async fn delete(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError> {
-        let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
+        let mut tx = self.pool.begin().await.map_err(Self::db_error)?;
 
         // Lock the row inside the transaction so a concurrent update_controller_finalizers()
         // can't add a finalizer between our read and the hard-delete branch below.
@@ -1367,7 +1266,7 @@ impl ResourceStore for PgResourceStore {
         .bind(uid)
         .fetch_optional(&mut *tx)
         .await
-        .map_err(StoreError::backend)?
+        .map_err(Self::db_error)?
         .ok_or(StoreError::NotFound)?;
 
         // ResourceDefinition deletion admission must run before any dependent
@@ -1400,8 +1299,8 @@ impl ResourceStore for PgResourceStore {
             .bind(CASCADE_DELETION_FINALIZER)
             .fetch_one(&mut *tx)
             .await
-            .map_err(StoreError::backend)?;
-            tx.commit().await.map_err(StoreError::backend)?;
+            .map_err(Self::db_error)?;
+            tx.commit().await.map_err(Self::db_error)?;
             Self::log_tombstoned_dependents(&row, tombstoned);
             return Ok(DeleteOutcome::MarkedForDeletion(Box::new(marked.into())));
         }
@@ -1420,8 +1319,8 @@ impl ResourceStore for PgResourceStore {
             .bind(uid)
             .fetch_one(&mut *tx)
             .await
-            .map_err(StoreError::backend)?;
-            tx.commit().await.map_err(StoreError::backend)?;
+            .map_err(Self::db_error)?;
+            tx.commit().await.map_err(Self::db_error)?;
             Self::log_tombstoned_dependents(&row, tombstoned);
             return Ok(DeleteOutcome::MarkedForDeletion(Box::new(marked.into())));
         }
@@ -1431,15 +1330,15 @@ impl ResourceStore for PgResourceStore {
             .bind(uid)
             .execute(&mut *tx)
             .await
-            .map_err(StoreError::backend)?;
-        tx.commit().await.map_err(StoreError::backend)?;
+            .map_err(Self::db_error)?;
+        tx.commit().await.map_err(Self::db_error)?;
         Self::log_tombstoned_dependents(&row, tombstoned);
 
         Ok(DeleteOutcome::Deleted)
     }
 
     async fn try_collect(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError> {
-        let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
+        let mut tx = self.pool.begin().await.map_err(Self::db_error)?;
 
         let row = sqlx::query_as::<_, PgResourceRow>(
             "SELECT * FROM resource_store.resources WHERE uid = $1 FOR UPDATE",
@@ -1447,7 +1346,7 @@ impl ResourceStore for PgResourceStore {
         .bind(uid)
         .fetch_optional(&mut *tx)
         .await
-        .map_err(StoreError::backend)?
+        .map_err(Self::db_error)?
         .ok_or(StoreError::NotFound)?;
 
         // Not tombstoned: nothing to collect, return current state.
@@ -1480,8 +1379,8 @@ impl ResourceStore for PgResourceStore {
             .bind(CASCADE_DELETION_FINALIZER)
             .fetch_one(&mut *tx)
             .await
-            .map_err(StoreError::backend)?;
-            tx.commit().await.map_err(StoreError::backend)?;
+            .map_err(Self::db_error)?;
+            tx.commit().await.map_err(Self::db_error)?;
             Self::log_tombstoned_dependents(&row, tombstoned);
             return Ok(DeleteOutcome::MarkedForDeletion(Box::new(row.into())));
         }
@@ -1504,10 +1403,10 @@ impl ResourceStore for PgResourceStore {
         .bind(CASCADE_DELETION_FINALIZER)
         .fetch_one(&mut *tx)
         .await
-        .map_err(StoreError::backend)?;
+        .map_err(Self::db_error)?;
 
         if !row.finalizers.is_empty() {
-            tx.commit().await.map_err(StoreError::backend)?;
+            tx.commit().await.map_err(Self::db_error)?;
             Self::log_tombstoned_dependents(&row, tombstoned);
             return Ok(DeleteOutcome::MarkedForDeletion(Box::new(row.into())));
         }
@@ -1523,8 +1422,8 @@ impl ResourceStore for PgResourceStore {
             .bind(uid)
             .execute(&mut *tx)
             .await
-            .map_err(StoreError::backend)?;
-        tx.commit().await.map_err(StoreError::backend)?;
+            .map_err(Self::db_error)?;
+        tx.commit().await.map_err(Self::db_error)?;
         Self::log_tombstoned_dependents(&row, tombstoned);
 
         Ok(DeleteOutcome::Deleted)
@@ -1542,16 +1441,16 @@ impl ResourceStore for PgResourceStore {
         .bind(limit)
         .fetch_all(&self.pool)
         .await
-        .map_err(StoreError::backend)?;
+        .map_err(Self::db_error)?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
     async fn list_deletion_blockers(&self, uid: Uuid) -> Result<DeletionBlockerReport, StoreError> {
-        let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
+        let mut tx = self.pool.begin().await.map_err(Self::db_error)?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
             .execute(&mut *tx)
             .await
-            .map_err(StoreError::backend)?;
+            .map_err(Self::db_error)?;
 
         let resource = sqlx::query_as::<_, PgResourceRow>(
             "SELECT * FROM resource_store.resources WHERE uid = $1",
@@ -1559,7 +1458,7 @@ impl ResourceStore for PgResourceStore {
         .bind(uid)
         .fetch_optional(&mut *tx)
         .await
-        .map_err(StoreError::backend)?
+        .map_err(Self::db_error)?
         .ok_or(StoreError::NotFound)?;
 
         // A single query gives structural edges precedence when one dependent
@@ -1590,9 +1489,9 @@ impl ResourceStore for PgResourceStore {
         .bind(uid)
         .fetch_all(&mut *tx)
         .await
-        .map_err(StoreError::backend)?;
+        .map_err(Self::db_error)?;
 
-        tx.commit().await.map_err(StoreError::backend)?;
+        tx.commit().await.map_err(Self::db_error)?;
         Ok(DeletionBlockerReport {
             resource: resource.into(),
             blockers: rows
@@ -1619,7 +1518,7 @@ impl ResourceStore for PgResourceStore {
             return Err(StoreError::EmptyPath);
         }
 
-        let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
+        let mut tx = self.pool.begin().await.map_err(Self::db_error)?;
         let mut chain: Vec<ResourceRow> = Vec::with_capacity(segments.len());
         let mut current_parent: Option<Uuid> = None;
 
@@ -1639,7 +1538,7 @@ impl ResourceStore for PgResourceStore {
                         .bind(name)
                         .fetch_optional(&mut *tx)
                         .await
-                        .map_err(StoreError::backend)?,
+                        .map_err(Self::db_error)?,
                         Some(pid) => sqlx::query_as::<_, PgResourceRow>(
                             "SELECT * FROM resource_store.resources WHERE api_version = ANY($1) AND kind = $2 AND name = $3 AND parent_uid = $4",
                         )
@@ -1649,7 +1548,7 @@ impl ResourceStore for PgResourceStore {
                         .bind(pid)
                         .fetch_optional(&mut *tx)
                         .await
-                        .map_err(StoreError::backend)?,
+                        .map_err(Self::db_error)?,
                     };
                     match row {
                         Some(r) => r,
@@ -1668,7 +1567,7 @@ impl ResourceStore for PgResourceStore {
                     .bind(uid)
                     .fetch_optional(&mut *tx)
                     .await
-                    .map_err(StoreError::backend)?
+                    .map_err(Self::db_error)?
                     {
                         Some(r) => r,
                         None if idx + 1 == segments.len() => return Err(StoreError::NotFound),
@@ -1692,7 +1591,7 @@ impl ResourceStore for PgResourceStore {
             chain.push(row.into());
         }
 
-        tx.commit().await.map_err(StoreError::backend)?;
+        tx.commit().await.map_err(Self::db_error)?;
         Ok(chain)
     }
 
@@ -1703,7 +1602,6 @@ impl ResourceStore for PgResourceStore {
         status_value: serde_json::Value,
     ) -> Result<ResourceRow, StoreError> {
         validate_controller_id(controller_id).map_err(|e| StoreError::Validation(e.to_string()))?;
-        Self::validate_status_preflight(controller_id, &status_value)?;
 
         let row = sqlx::query_as::<_, PgResourceRow>(
             r#"
@@ -1724,7 +1622,7 @@ impl ResourceStore for PgResourceStore {
         .bind(status_value)
         .fetch_optional(&self.pool)
         .await
-        .map_err(StoreError::backend)?
+        .map_err(Self::db_error)?
         .ok_or(StoreError::NotFound)?;
 
         Ok(row.into())
@@ -1738,7 +1636,6 @@ impl ResourceStore for PgResourceStore {
         remove: &[String],
     ) -> Result<ResourceRow, StoreError> {
         validate_controller_id(controller_id).map_err(|e| StoreError::Validation(e.to_string()))?;
-        Self::validate_finalizers_preflight(controller_id, add, remove)?;
 
         // Store-managed finalizers (system.rise.dev/*) cannot be added or removed by controllers.
         for f in add.iter().chain(remove.iter()) {
@@ -1754,7 +1651,7 @@ impl ResourceStore for PgResourceStore {
 
         // Use SELECT FOR UPDATE inside a transaction to serialise concurrent finalizer
         // mutations from different controllers on the same resource, preventing lost updates.
-        let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
+        let mut tx = self.pool.begin().await.map_err(Self::db_error)?;
 
         let current = sqlx::query_as::<_, PgResourceRow>(
             "SELECT * FROM resource_store.resources WHERE uid = $1 FOR UPDATE",
@@ -1762,7 +1659,7 @@ impl ResourceStore for PgResourceStore {
         .bind(uid)
         .fetch_optional(&mut *tx)
         .await
-        .map_err(StoreError::backend)?
+        .map_err(Self::db_error)?
         .ok_or(StoreError::NotFound)?;
 
         let remove_set: std::collections::HashSet<&str> =
@@ -1790,9 +1687,9 @@ impl ResourceStore for PgResourceStore {
         .bind(uid)
         .fetch_one(&mut *tx)
         .await
-        .map_err(StoreError::backend)?;
+        .map_err(Self::db_error)?;
 
-        tx.commit().await.map_err(StoreError::backend)?;
+        tx.commit().await.map_err(Self::db_error)?;
 
         Ok(row.into())
     }
@@ -1803,8 +1700,6 @@ impl ResourceStore for PgResourceStore {
         operator: &str,
         status_value: serde_json::Value,
     ) -> Result<ResourceRow, StoreError> {
-        Self::validate_status_preflight(operator, &status_value)?;
-
         // Store under `status.controllers.operator:<operator>` — same nested
         // structure as update_controller_status but with the operator key.
         let operator_key = format!("operator:{operator}");
@@ -1827,7 +1722,7 @@ impl ResourceStore for PgResourceStore {
         .bind(status_value)
         .fetch_optional(&self.pool)
         .await
-        .map_err(StoreError::backend)?
+        .map_err(Self::db_error)?
         .ok_or(StoreError::NotFound)?;
 
         Ok(row.into())
@@ -1840,8 +1735,6 @@ impl ResourceStore for PgResourceStore {
         add: &[String],
         remove: &[String],
     ) -> Result<ResourceRow, StoreError> {
-        Self::validate_finalizers_preflight(operator, add, remove)?;
-
         // Block system-managed finalizers — operators must not clear cascade
         // deletion finalizers to prevent GC corruption.
         for f in add.iter().chain(remove.iter()) {
@@ -1852,7 +1745,7 @@ impl ResourceStore for PgResourceStore {
 
         let _ = operator; // operator identity is recorded in the audit log by the handler
 
-        let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
+        let mut tx = self.pool.begin().await.map_err(Self::db_error)?;
 
         let current = sqlx::query_as::<_, PgResourceRow>(
             "SELECT * FROM resource_store.resources WHERE uid = $1 FOR UPDATE",
@@ -1860,7 +1753,7 @@ impl ResourceStore for PgResourceStore {
         .bind(uid)
         .fetch_optional(&mut *tx)
         .await
-        .map_err(StoreError::backend)?
+        .map_err(Self::db_error)?
         .ok_or(StoreError::NotFound)?;
 
         let remove_set: std::collections::HashSet<&str> =
@@ -1888,9 +1781,9 @@ impl ResourceStore for PgResourceStore {
         .bind(uid)
         .fetch_one(&mut *tx)
         .await
-        .map_err(StoreError::backend)?;
+        .map_err(Self::db_error)?;
 
-        tx.commit().await.map_err(StoreError::backend)?;
+        tx.commit().await.map_err(Self::db_error)?;
 
         Ok(row.into())
     }
@@ -1916,18 +1809,18 @@ impl ResourceStore for PgResourceStore {
         .bind(collection)
         .fetch_optional(&self.pool)
         .await
-        .map_err(StoreError::backend)?;
+        .map_err(Self::db_error)?;
 
         let Some(row) = row else {
             return Ok(None);
         };
 
         let versions: Vec<rise_resource_api::ResourceDefinitionVersion> =
-            serde_json::from_value(row.try_get("versions").map_err(StoreError::backend)?).map_err(
+            serde_json::from_value(row.try_get("versions").map_err(Self::db_error)?).map_err(
                 |e| StoreError::Validation(format!("invalid versions in ResourceDefinition: {e}")),
             )?;
 
-        let group_name: String = row.try_get("group_name").map_err(StoreError::backend)?;
+        let group_name: String = row.try_get("group_name").map_err(Self::db_error)?;
         // Mirror resolve_collection_by_kind's fallback: if the storage version is not served,
         // pick any served version (resolve_collection_version rejects non-served versions).
         let storage = versions.iter().find(|v| v.storage);
@@ -1988,16 +1881,16 @@ impl ResourceStore for PgResourceStore {
         .bind(collection)
         .fetch_optional(&self.pool)
         .await
-        .map_err(StoreError::backend)?;
+        .map_err(Self::db_error)?;
 
         let Some(row) = row else {
             return Ok(None);
         };
 
-        let spec: ResourceDefinitionSpec = serde_json::from_value(
-            row.try_get("spec").map_err(StoreError::backend)?,
-        )
-        .map_err(|e| StoreError::Validation(format!("invalid ResourceDefinition spec: {e}")))?;
+        let spec: ResourceDefinitionSpec =
+            serde_json::from_value(row.try_get("spec").map_err(Self::db_error)?).map_err(|e| {
+                StoreError::Validation(format!("invalid ResourceDefinition spec: {e}"))
+            })?;
 
         let versions = spec.versions.clone();
         // An undefined or non-served version is not addressable — treat it like
@@ -2037,9 +1930,9 @@ impl ResourceStore for PgResourceStore {
 
         let allowed: Vec<String> = row
             .try_get("allowed_status_controller_ids")
-            .map_err(StoreError::backend)?;
+            .map_err(Self::db_error)?;
 
-        let kind: String = row.try_get("kind").map_err(StoreError::backend)?;
+        let kind: String = row.try_get("kind").map_err(Self::db_error)?;
 
         // Use the cached validator, or compile one and store it in the cache. A schema that
         // fails to compile is a hard error: silently falling back to NoOpValidator would let
@@ -2100,15 +1993,15 @@ impl ResourceStore for PgResourceStore {
         .bind(kind)
         .fetch_optional(&self.pool)
         .await
-        .map_err(StoreError::backend)?;
+        .map_err(Self::db_error)?;
 
         let Some(row) = row else {
             return Ok(None);
         };
 
-        let plural: String = row.try_get("plural").map_err(StoreError::backend)?;
+        let plural: String = row.try_get("plural").map_err(Self::db_error)?;
         let versions: Vec<rise_resource_api::ResourceDefinitionVersion> =
-            serde_json::from_value(row.try_get("versions").map_err(StoreError::backend)?).map_err(
+            serde_json::from_value(row.try_get("versions").map_err(Self::db_error)?).map_err(
                 |e| StoreError::Validation(format!("invalid versions in ResourceDefinition: {e}")),
             )?;
 
@@ -2135,7 +2028,6 @@ impl ResourceStore for PgResourceStore {
         &self,
         params: CreateResourceParams,
     ) -> Result<ResourceRow, StoreError> {
-        Self::validate_create_preflight(&params)?;
         Self::ensure_owner_references_supported(
             &params.api_version,
             RESOURCE_DEFINITION_KIND,
@@ -2170,7 +2062,7 @@ impl ResourceStore for PgResourceStore {
         // fail only when that version is first used.
         Self::validate_version_schemas(&spec, &format!("'{}'", params.name))?;
 
-        let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
+        let mut tx = self.pool.begin().await.map_err(Self::db_error)?;
         if !params.owner_references.is_empty() {
             Self::lock_owner_reference_graph(&mut tx).await?;
         }
@@ -2183,7 +2075,7 @@ impl ResourceStore for PgResourceStore {
         )
         .execute(&mut *tx)
         .await
-        .map_err(StoreError::backend)?;
+        .map_err(Self::db_error)?;
 
         // Reject a parent chain that would cycle back to this kind. The advisory lock above
         // serialises concurrent registrations; reads go through `tx` so they see the same
@@ -2208,7 +2100,7 @@ impl ResourceStore for PgResourceStore {
         )
         .await?;
 
-        tx.commit().await.map_err(StoreError::backend)?;
+        tx.commit().await.map_err(Self::db_error)?;
 
         self.invalidate_schema_cache(&spec.group, &spec.plural);
 
@@ -2222,7 +2114,6 @@ impl ResourceStore for PgResourceStore {
         uid: Uuid,
         params: UpdateResourceParams,
     ) -> Result<ResourceRow, StoreError> {
-        Self::validate_update_preflight(&params)?;
         Self::ensure_owner_references_supported(
             API_VERSION_V1ALPHA1,
             RESOURCE_DEFINITION_KIND,
@@ -2237,7 +2128,7 @@ impl ResourceStore for PgResourceStore {
         // Validate every declared JSON schema compiles. Symmetric with register.
         Self::validate_version_schemas(&new_spec, "")?;
 
-        let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
+        let mut tx = self.pool.begin().await.map_err(Self::db_error)?;
         if !params.owner_references.is_empty() {
             Self::lock_owner_reference_graph(&mut tx).await?;
         }
@@ -2249,7 +2140,7 @@ impl ResourceStore for PgResourceStore {
         .bind(uid)
         .fetch_optional(&mut *tx)
         .await
-        .map_err(StoreError::backend)?
+        .map_err(Self::db_error)?
         .ok_or(StoreError::NotFound)?;
 
         if current.kind != RESOURCE_DEFINITION_KIND {
@@ -2295,7 +2186,7 @@ impl ResourceStore for PgResourceStore {
                 .bind(uid)
                 .execute(&mut *tx)
                 .await
-                .map_err(StoreError::backend)?;
+                .map_err(Self::db_error)?;
 
             let instance_count: i64 = sqlx::query_scalar(
                 r#"
@@ -2309,7 +2200,7 @@ impl ResourceStore for PgResourceStore {
             .bind(&removed_api_versions)
             .fetch_one(&mut *tx)
             .await
-            .map_err(StoreError::backend)?;
+            .map_err(Self::db_error)?;
 
             if instance_count > 0 {
                 return Err(StoreError::Validation(format!(
@@ -2354,7 +2245,7 @@ impl ResourceStore for PgResourceStore {
             // Defensively map a name-uniqueness violation (e.g. an api_version change that
             // collides on (group, kind, name)) to NameConflict rather than a raw DB error.
             Err(ref e) if Self::is_name_conflict(e) => return Err(StoreError::NameConflict),
-            Err(e) => return Err(StoreError::backend(e)),
+            Err(e) => return Err(Self::db_error(e)),
         };
 
         let row = match updated {
@@ -2370,7 +2261,7 @@ impl ResourceStore for PgResourceStore {
         // The mutable fields (versions, allowed_status_controller_ids) live in
         // `spec`, which the `resources` UPDATE above already wrote — the
         // `resource_definitions` view reflects it with no separate sync.
-        tx.commit().await.map_err(StoreError::backend)?;
+        tx.commit().await.map_err(Self::db_error)?;
 
         self.invalidate_schema_cache(&new_spec.group, &new_spec.plural);
 
