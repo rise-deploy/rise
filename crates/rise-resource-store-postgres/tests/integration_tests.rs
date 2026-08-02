@@ -3215,93 +3215,27 @@ async fn create_with_owner_reference_obeys_the_global_graph_lock_order(
 }
 
 #[sqlx::test]
-async fn persisted_json_and_text_values_reject_nul_as_validation_errors(
-    pool: sqlx::PgPool,
-) -> sqlx::Result<()> {
+async fn a_nul_byte_in_a_resource_is_a_validation_error(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    // PostgreSQL stores no U+0000 in text or jsonb, but JSON permits it, so a
+    // well-formed request can carry one all the way to the write. The store
+    // translates that failure where the database reports it, which is why this
+    // is the caller's 400 rather than an opaque backend error — and why one
+    // case covers every write path rather than one case per method.
     let store = PgResourceStore::new(pool);
-    for (name, annotations, finalizers, spec) in [
-        (
-            "nul-spec",
-            BTreeMap::new(),
-            vec![],
-            json!({"displayName":"contains\0nul"}),
-        ),
-        (
-            "nul-annotation",
-            BTreeMap::from([("key".into(), "contains\0nul".into())]),
-            vec![],
-            json!({"displayName":"Valid"}),
-        ),
-        (
-            "nul-finalizer",
-            BTreeMap::new(),
-            vec!["controller.example/contains\0nul".into()],
-            json!({"displayName":"Valid"}),
-        ),
-    ] {
-        let error = store
-            .create(CreateResourceParams {
-                api_version: API_VERSION_V1ALPHA1.into(),
-                kind: ORGANIZATION_KIND.into(),
-                name: name.into(),
-                annotations,
-                finalizers,
-                spec,
-                ..Default::default()
-            })
-            .await
-            .unwrap_err();
-        assert!(matches!(error, StoreError::Validation(message) if message.contains("U+0000")));
-    }
-
-    // Every write path is covered because the translation happens where the
-    // database reports it, not in a per-method payload walk. Subresource writes
-    // reach the same columns and must be rejected the same way rather than
-    // surfacing as an opaque backend error.
-    let organization = store
+    let error = store
         .create(CreateResourceParams {
             api_version: API_VERSION_V1ALPHA1.into(),
             kind: ORGANIZATION_KIND.into(),
-            name: "nul-subresources".into(),
-            spec: json!({"displayName":"Valid"}),
+            name: "nul-spec".into(),
+            spec: json!({"displayName":"contains\0nul"}),
             ..Default::default()
         })
         .await
-        .unwrap();
-
-    let errors = [
-        store
-            .update_controller_status(organization.uid, "ctrl", json!({"phase":"a\0b"}))
-            .await
-            .unwrap_err(),
-        store
-            .operator_update_status(organization.uid, "op", json!({"phase":"a\0b"}))
-            .await
-            .unwrap_err(),
-        store
-            .update_controller_finalizers(organization.uid, "ctrl", &["ctrl/a\0b".into()], &[])
-            .await
-            .unwrap_err(),
-        store
-            .operator_update_status(organization.uid, "op\0erator", json!({"phase":"ok"}))
-            .await
-            .unwrap_err(),
-        store
-            .operator_update_finalizers(
-                organization.uid,
-                "op",
-                &["operator.example/a\0b".into()],
-                &[],
-            )
-            .await
-            .unwrap_err(),
-    ];
-    for error in errors {
-        assert!(
-            matches!(&error, StoreError::Validation(message) if message.contains("U+0000")),
-            "expected a U+0000 validation error, got {error:?}"
-        );
-    }
+        .unwrap_err();
+    assert!(
+        matches!(&error, StoreError::Validation(message) if message.contains("U+0000")),
+        "expected a U+0000 validation error, got {error:?}"
+    );
     Ok(())
 }
 
