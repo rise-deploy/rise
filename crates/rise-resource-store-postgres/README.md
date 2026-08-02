@@ -72,15 +72,16 @@ reserves the whole `rise.dev` group against external ResourceDefinitions, plus
 the eight identity collection names in any group, and it survives a rollback —
 so cleanup under the older binary must delete conflicting definitions rather
 than edit them.
-The identity indexes are built inside their migration's transaction, so the
-build and SQLx's bookkeeping commit together. `CREATE INDEX CONCURRENTLY` would
-avoid the brief write lock a plain build takes, but it cannot run in a
-transaction, and splitting those two steps opens a crash window that can leave
-an unrecorded or `INVALID` index — an `INVALID` unique index enforces nothing
-while looking present, which for the identity mappings means silently losing
-the uniqueness the login path depends on. `resource_store.resources` is small,
-so the lock is the cheaper cost. Revisit if the typed-object migration makes
-this table large.
+
+Every index here is built inside its migration's transaction, so the build and
+SQLx's bookkeeping commit together. `CREATE INDEX CONCURRENTLY` would avoid the
+brief write lock a plain build takes, but it cannot run in a transaction, and
+splitting those two steps opens a crash window that can leave an unrecorded
+index (wedging the next startup on "relation already exists") or an `INVALID`
+one. An `INVALID` unique index enforces nothing while looking present, which
+for the identity mappings means silently losing the uniqueness the login path
+depends on. `resource_store.resources` is small, so the lock is the cheaper
+cost. Revisit if the typed-object migration makes this table large.
 
 A built-in `Organization` or `ResourceDefinition` cannot currently be the
 dependent side of an owner reference: writes that put `owner_references` on

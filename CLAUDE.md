@@ -167,6 +167,25 @@ For user-facing documentation, see the [`/docs`](./docs) directory. Key topics i
 - The default development branch is `develop`. PRs for feature work should target `develop`, not `main`.
 - Always target the branch your feature branch was created from when opening a PR.
 
+## Database Migrations
+
+A migration becomes immutable when it ships in a **release**, not when it merges
+to `develop`. Until then it can be edited in place — rewrite the file, don't
+stack a corrective migration on top.
+
+- **Unreleased** (merged to `develop` or not): edit the file directly. No
+  deployed instance has applied it, so nothing can be out of sync.
+- **Released**: the file is frozen. Change it only by adding a new migration.
+
+SQLX records a checksum per migration, so editing one that a database has
+already applied makes startup fail with `VersionMismatch` ("previously applied
+but has been modified"). That is exactly why the released/unreleased line
+matters — and why the line is drawn at *release*, not at *merge*.
+
+If you edited an unreleased migration and a local development database is now
+stuck, delete its row from the migrations table and drop whatever the migration
+created, then re-run.
+
 ## Rollout Tracking
 
 High-impact, multi-PR, or operator-affecting changes are tracked in the **Rise
