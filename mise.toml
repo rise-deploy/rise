@@ -4,7 +4,7 @@ buildkit = "github:moby/buildkit"
 
 [tools]
 minikube = "1.38.1"
-pack = "0.40.8"
+pack = "0.40.9"
 railpack = "0.15.1"
 buildkit = "0.28.0"
 "cargo:sqlx-cli" = "latest"
