@@ -3797,14 +3797,10 @@ async fn execute_resource_migration(pool: &sqlx::PgPool, version: i64) -> Result
 async fn identity_activation_upgrade_audit_is_actionable_and_guard_is_durable(
     pool: sqlx::PgPool,
 ) -> sqlx::Result<()> {
-    for version in [
-        20260519000000,
-        20260719000000,
-        20260719000001,
-        20260719000002,
-    ] {
-        execute_resource_migration(&pool, version).await?;
-    }
+    // The upgrade this exercises is from an installation that has the resource
+    // store but not the identity built-ins.
+    execute_resource_migration(&pool, 20260519000000).await?;
+    execute_resource_migration(&pool, 20260719000000).await?;
 
     sqlx::query(
         r#"
@@ -3820,34 +3816,34 @@ async fn identity_activation_upgrade_audit_is_actionable_and_guard_is_durable(
     .execute(&pool)
     .await?;
 
-    execute_resource_migration(&pool, 20260719000003).await?;
+    let activation = sqlx::migrate!("./migrations")
+        .iter()
+        .find(|migration| migration.version == 20260719000001)
+        .expect("activation migration exists")
+        .sql
+        .clone();
+
+    // Each conflicting population is named specifically, and a rejected upgrade
+    // leaves nothing behind — including the guard it would have installed.
+    let error = pool.execute(&*activation).await.unwrap_err();
+    assert!(error.to_string().contains("legacy ResourceDefinition(s)"));
     let guard_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM pg_constraint WHERE conname = 'resource_definitions_identity_reservations')",
     )
     .fetch_one(&pool)
     .await?;
-    assert!(guard_exists, "NOT VALID guard commits before the audit");
-
-    let audit_sql = sqlx::migrate!("./migrations")
-        .iter()
-        .find(|migration| migration.version == 20260719000004)
-        .unwrap()
-        .sql
-        .clone();
-    let error = pool.execute(&*audit_sql).await.unwrap_err();
-    assert!(error.to_string().contains("legacy ResourceDefinition(s)"));
+    assert!(!guard_exists, "a rejected upgrade rolls back in full");
 
     sqlx::query("DELETE FROM resource_store.resources WHERE name = 'legacy.example'")
         .execute(&pool)
         .await?;
-    let error = pool.execute(&*audit_sql).await.unwrap_err();
+    let error = pool.execute(&*activation).await.unwrap_err();
     assert!(error.to_string().contains("legacy resource row(s)"));
 
     sqlx::query("DELETE FROM resource_store.resources WHERE name = 'orphan'")
         .execute(&pool)
         .await?;
-    execute_resource_migration(&pool, 20260719000004).await?;
-    execute_resource_migration(&pool, 20260719000005).await?;
+    execute_resource_migration(&pool, 20260719000001).await?;
 
     let custom_survives: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM resource_store.resources WHERE api_version = 'custom.example/v1' AND kind = 'User')",

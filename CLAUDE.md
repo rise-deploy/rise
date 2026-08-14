@@ -170,21 +170,38 @@ For user-facing documentation, see the [`/docs`](./docs) directory. Key topics i
 ## Database Migrations
 
 A migration becomes immutable when it ships in a **release**, not when it merges
-to `develop`. Until then it can be edited in place — rewrite the file, don't
-stack a corrective migration on top.
+to `develop`.
 
-- **Unreleased** (merged to `develop` or not): edit the file directly. No
-  deployed instance has applied it, so nothing can be out of sync.
+- **Unreleased** (merged to `develop` or not): fully editable. Rewrite the file,
+  renumber it, split it, delete it, or **collapse a whole series into one** —
+  whatever leaves the clearest final schema. Don't stack a corrective migration
+  on top of an unreleased one, and don't preserve an increment just because it
+  was reviewed separately; the migration history is a means, not a record.
 - **Released**: the file is frozen. Change it only by adding a new migration.
 
-SQLX records a checksum per migration, so editing one that a database has
-already applied makes startup fail with `VersionMismatch` ("previously applied
-but has been modified"). That is exactly why the released/unreleased line
-matters — and why the line is drawn at *release*, not at *merge*.
+To check which side a migration is on, see whether it exists in the latest
+release tag's tree:
 
-If you edited an unreleased migration and a local development database is now
-stuck, delete its row from the migrations table and drop whatever the migration
-created, then re-run.
+```bash
+git ls-tree -r --name-only "$(git tag --list 'v*' | grep -v -- -rc | sort -V | tail -1)" \
+  | grep <migration-name>
+```
+
+Decide separately whether a release candidate counts — if `-rc` tags get
+deployed anywhere, treat them as released.
+
+SQLX records a checksum per migration, so editing one a database has already
+applied fails startup with `VersionMismatch` ("previously applied but has been
+modified"), and removing one fails with `VersionMissing`. That is exactly why
+the released/unreleased line matters — and why it is drawn at *release*, not at
+*merge*: before a release, the only databases holding the old shape are
+development and CI ones that can be rebuilt.
+
+Rebuilding after an edit or collapse: drop what the migrations created and let
+them re-run. For the resource store that is `DROP SCHEMA resource_store
+CASCADE;` — its migration bookkeeping lives in that schema, so dropping it
+clears both. For the main crate, delete the affected rows from `_sqlx_migrations`
+and drop whatever the migration created.
 
 ## Rollout Tracking
 

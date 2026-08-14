@@ -62,16 +62,14 @@ parent-and-issuer workload trust lookup, and reverse GroupMembership name
 lookup. `IdentityLookup`, `TrustPolicyLookup`, and `MembershipLookup` expose
 these fixed reads without adding JSON filters to `ResourceStore`.
 
-Before these routes activate, migrations audit tombstoned and live legacy
-ResourceDefinitions and resource rows that would be shadowed. The durable
-`NOT VALID` write guard commits in a short migration before a following bounded
-count/sample audit. An upgrade that reports a conflict must be rolled back to
-the previously deployed Rise binary; remove every resource identified by the
-diagnostic, then retry. The constraint is validated only after that audit. It
-reserves the whole `rise.dev` group against external ResourceDefinitions, plus
-the eight identity collection names in any group, and it survives a rollback —
-so cleanup under the older binary must delete conflicting definitions rather
-than edit them.
+Before these routes activate, the activation migration audits tombstoned and
+live legacy ResourceDefinitions and resource rows that would be shadowed,
+reporting a bounded count plus sample. It then installs the durable write
+guard, which reserves the whole `rise.dev` group against external
+ResourceDefinitions plus the eight identity collection names in any group.
+Audit and guard share one transaction, so an upgrade that reports a conflict
+leaves the database untouched: remove every resource the diagnostic names using
+the previously deployed Rise binary, then retry.
 
 Every index here is built inside its migration's transaction, so the build and
 SQLx's bookkeeping commit together. `CREATE INDEX CONCURRENTLY` would avoid the

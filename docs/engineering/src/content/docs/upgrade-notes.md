@@ -42,15 +42,13 @@ In-flight PRs with operator impact (not yet merged):
   custom resources under a non-reserved identity if needed. Installations with
   no reported conflicts require no action.
 
-  Two details worth knowing before you start. First, the reservation is wider
-  than the eight identity kinds: the whole `rise.dev` API group is now closed to
-  external ResourceDefinitions, as are the eight identity collection names in
-  *any* group (collection names have always been globally unique). Second, the
-  database guard is installed by a migration that commits before the conflict
-  audit runs, so rolling back to the previous Rise version leaves the guard in
-  place. Deleting a conflicting ResourceDefinition still works under the old
-  version — that is what the cleanup needs — but modifying one in place does
-  not. Delete and recreate instead of updating.
+  Worth knowing before you start: the reservation is wider than the eight
+  identity kinds. The whole `rise.dev` API group is now closed to external
+  ResourceDefinitions, as are the eight identity collection names in *any*
+  group (collection names have always been globally unique). The activation
+  runs in one transaction, so an upgrade rejected by the audit leaves the
+  database exactly as it was — clean up the conflicts it names under the
+  previous Rise version and retry.
 - **Behavior change — workload identity on the Docker backend** ([#378](https://github.com/rise-deploy/rise/issues/378)).
   The Docker controller now delivers the same workload-identity material as
   Kubernetes — the bootstrap credential and one token file per `[identity].audiences`
