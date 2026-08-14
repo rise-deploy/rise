@@ -43,6 +43,21 @@ impl SubjectId {
     pub fn kind(&self) -> &str {
         self.0.split_once(':').expect("validated SubjectId").0
     }
+
+    /// The identity's own name, without its kind prefix or organization
+    /// segment: `group:acme/platform` is named `platform`, `user:alice` is
+    /// named `alice`.
+    ///
+    /// For a virtual subject this is the predicate's own tail (`acme` for
+    /// `org:acme`, `authenticated` for `system:authenticated`) — parsing does
+    /// not imply a resource of that name exists.
+    pub fn name(&self) -> &str {
+        let (_, value) = self.0.split_once(':').expect("validated SubjectId");
+        match self.kind() {
+            "group" | "serviceaccount" => value.split_once('/').expect("validated SubjectId").1,
+            _ => value,
+        }
+    }
 }
 
 impl fmt::Debug for SubjectId {

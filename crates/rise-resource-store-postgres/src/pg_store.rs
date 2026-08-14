@@ -12,7 +12,7 @@ use rise_resource_api::{
 };
 use sqlx::{PgPool, Row};
 
-use crate::admission::IdentityAdmission;
+use crate::admission::BuiltInAdmission;
 use crate::builtin::{BuiltInRegistration, BuiltInRegistry};
 use crate::discriminator;
 use crate::models::PgResourceRow;
@@ -868,7 +868,7 @@ impl ResourceStore for PgResourceStore {
         let builtin = self.builtin_for_write(&params.api_version, &params.kind)?;
         if let Some(registration) = builtin {
             if let Some(admission) =
-                IdentityAdmission::for_identity(registration.api_version, registration.kind)
+                BuiltInAdmission::for_kind(registration.api_version, registration.kind)
             {
                 params.spec = admission.canonicalize(&params.spec)?;
             }
@@ -897,9 +897,11 @@ impl ResourceStore for PgResourceStore {
             self.validate_builtin_placement(&mut tx, registration, params.parent_uid)
                 .await?;
             if let Some(admission) =
-                IdentityAdmission::for_identity(registration.api_version, registration.kind)
+                BuiltInAdmission::for_kind(registration.api_version, registration.kind)
             {
-                admission.admit_create_context(&mut tx, &params).await?;
+                admission
+                    .admit_create_context(&mut tx, &self.builtins, &mut params)
+                    .await?;
             }
         }
 
@@ -1074,7 +1076,7 @@ impl ResourceStore for PgResourceStore {
         }
         if let Some(registration) = preflight_current_builtin {
             if let Some(admission) =
-                IdentityAdmission::for_identity(registration.api_version, registration.kind)
+                BuiltInAdmission::for_kind(registration.api_version, registration.kind)
             {
                 params.spec = admission.canonicalize(&params.spec)?;
             }
@@ -1137,10 +1139,10 @@ impl ResourceStore for PgResourceStore {
             self.validate_builtin_placement(&mut tx, registration, snapshot.parent_uid)
                 .await?;
             if let Some(admission) =
-                IdentityAdmission::for_identity(registration.api_version, registration.kind)
+                BuiltInAdmission::for_kind(registration.api_version, registration.kind)
             {
                 admission
-                    .admit_update_before_dependent(&mut tx, &snapshot, &params)
+                    .admit_update_before_dependent(&mut tx, &self.builtins, &snapshot, &mut params)
                     .await?;
             }
         }
@@ -1199,7 +1201,7 @@ impl ResourceStore for PgResourceStore {
         // another writer may have committed between the snapshot and this lock.
         if let Some(registration) = current_builtin {
             if let Some(admission) =
-                IdentityAdmission::for_identity(registration.api_version, registration.kind)
+                BuiltInAdmission::for_kind(registration.api_version, registration.kind)
             {
                 admission.validate_update_immutable(&current, &params)?;
             }

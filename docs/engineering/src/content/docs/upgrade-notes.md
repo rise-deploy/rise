@@ -49,6 +49,23 @@ In-flight PRs with operator impact (not yet merged):
   runs in one transaction, so an upgrade rejected by the audit leaves the
   database exactly as it was — clean up the conflicts it names under the
   previous Rise version and retry.
+- **Action required if conflicts exist — policy resource activation**.
+  Rise activates the four reserved `rise.dev/v1alpha1` policy resource kinds —
+  `Role` and `RoleBinding` under an Organization, `PlatformRole` and
+  `PlatformRoleBinding` at the root — in the PostgreSQL resource store. The
+  same fail-closed pattern as the identity activation above applies: before
+  upgrading, remove any stored rows in the `rise.dev` group using those four
+  Kind names, and any ResourceDefinition claiming one of the four collection
+  names (`roles`, `rolebindings`, `platformroles`, `platformrolebindings`) in
+  any group. Startup reports the total plus a bounded sample and leaves the
+  database unchanged, so clean up under the previous Rise version and retry.
+  Installations with no reported conflicts require no action.
+
+  Nothing yet consults these resources: writing a `RoleBinding` grants no
+  access, and `/api/v1/resources` remains operator-gated. Bindings are
+  validated at write time, so creating one requires its `roleRef` target, its
+  `scope` target, and any literal `subject` it names to already exist — create
+  the Role before the RoleBinding that references it.
 - **Behavior change — workload identity on the Docker backend** ([#378](https://github.com/rise-deploy/rise/issues/378)).
   The Docker controller now delivers the same workload-identity material as
   Kubernetes — the bootstrap credential and one token file per `[identity].audiences`
