@@ -179,16 +179,25 @@ to `develop`.
   was reviewed separately; the migration history is a means, not a record.
 - **Released**: the file is frozen. Change it only by adding a new migration.
 
-To check which side a migration is on, see whether it exists in the latest
-release tag's tree:
+**Release candidates count as releases here** — an `-rc` tag can be deployed, so
+a migration that ships in one is frozen.
+
+To check which side a migration is on, look for it in every tag's tree:
 
 ```bash
-git ls-tree -r --name-only "$(git tag --list 'v*' | grep -v -- -rc | sort -V | tail -1)" \
-  | grep <migration-name>
+BASE=20260519000000_create_resource_store.sql
+for t in $(git tag --list 'v*'); do
+  git ls-tree -r --name-only "$t" | grep -q "/$BASE\$" && echo "$t"
+done
+# no output = in no release = editable
 ```
 
-Decide separately whether a release candidate counts — if `-rc` tags get
-deployed anywhere, treat them as released.
+Match on the basename, not the full path, so a crate rename doesn't hide a
+released migration. Don't reach for `git tag --contains <adding-commit>`: it
+reports "unreleased" for migrations that really did ship, because release tags
+do not necessarily descend from the `develop` commit that added the file. And
+don't pick a "latest tag" with `sort -V` — it orders `v0.23.0-rc4` *after*
+`v0.23.0`.
 
 SQLX records a checksum per migration, so editing one a database has already
 applied fails startup with `VersionMismatch` ("previously applied but has been
