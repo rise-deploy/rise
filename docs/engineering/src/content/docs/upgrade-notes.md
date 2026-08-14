@@ -31,6 +31,24 @@ proposed for the next train. Moved into a version section at tag time._
 
 In-flight PRs with operator impact (not yet merged):
 
+- **Config change — admin and Operator roles by IdP group.** `auth.admin_idp_groups`
+  and `auth.operator_idp_groups` grant the admin and Operator roles to everyone in
+  the listed IdP groups, so the IdP stays the source of truth instead of an email
+  allowlist that has to be edited and redeployed. Both default to empty, so
+  installs that grant roles by email alone are unaffected and pay no extra query.
+  A user holds a role if their email is on the allowlist **or** they are in one of
+  the groups; group names match case-insensitively.
+
+  All group matching — including the existing `auth.platform_access.allowed_idp_groups`
+  — now resolves against the **IdP-managed** teams Rise syncs from the IdP's
+  `groups` claim, rather than against every team the user belongs to. **Action
+  required only if** you granted platform access through `allowed_idp_groups`
+  naming a team that Rise did not create from the IdP (i.e. `idp_managed = false`);
+  those users lose platform access until the group comes from the IdP. This closes
+  a privilege-escalation path where a user could create a team named after an
+  allowed group and grant themselves access. Group membership refreshes at login,
+  so revoking a group in the IdP takes effect on the user's next login (or the next
+  Entra active sync).
 - **Behavior change — workload identity on the Docker backend** ([#378](https://github.com/rise-deploy/rise/issues/378)).
   The Docker controller now delivers the same workload-identity material as
   Kubernetes — the bootstrap credential and one token file per `[identity].audiences`

@@ -255,6 +255,8 @@ config:
     client_id: "rise-backend"
     client_secret: ""  # Override with Secret or environment variable
     # admin_users: []  # Optional: List of admin user emails with full permissions
+    # admin_idp_groups: []  # Optional: IdP groups whose members are admins
+    # operator_idp_groups: []  # Optional: IdP groups whose members hold the Operator role
     # Optional: Custom OAuth2 endpoints (autodiscovered from issuer/.well-known/openid-configuration if not set)
     # For Entra ID/Azure AD:
     # authorize_url: "https://login.microsoftonline.com/{tenant-id}/oauth2/v2.0/authorize"
