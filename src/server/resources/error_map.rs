@@ -16,6 +16,7 @@ pub fn store_error_to_server_error(err: StoreError) -> ServerError {
         StoreError::NameConflict => {
             ServerError::conflict("a resource with this name already exists in this scope")
         }
+        StoreError::Conflict(msg) => ServerError::conflict(msg),
         StoreError::DiscriminatorExhausted => ServerError::service_unavailable(
             "could not generate a unique discriminator; please retry",
         ),
@@ -66,6 +67,15 @@ mod tests {
     fn maps_name_conflict() {
         let err = store_error_to_server_error(StoreError::NameConflict);
         assert_eq!(err.status, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn maps_conflict() {
+        let err = store_error_to_server_error(StoreError::Conflict(
+            "a live UserIdentity with this issuer and subject already exists".into(),
+        ));
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert!(err.message.contains("UserIdentity"));
     }
 
     #[test]

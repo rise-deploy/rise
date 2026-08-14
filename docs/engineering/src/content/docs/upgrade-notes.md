@@ -31,6 +31,24 @@ proposed for the next train. Moved into a version section at tag time._
 
 In-flight PRs with operator impact (not yet merged):
 
+- **Action required if conflicts exist — identity resource activation** ([#421](https://github.com/rise-deploy/rise/pull/421)).
+  Rise now activates the eight reserved `rise.dev/v1alpha1` identity resource
+  kinds in the PostgreSQL resource store. Before upgrading, remove any legacy
+  ResourceDefinitions that claim those reserved group/kind or collection
+  identities, and migrate or remove any stored identity rows whose structural
+  parents do not match the built-in hierarchy. Startup fails closed when such
+  conflicts exist and reports the total plus a bounded sample; use the previous
+  Rise version to remove the conflicting definitions and rows, then recreate
+  custom resources under a non-reserved identity if needed. Installations with
+  no reported conflicts require no action.
+
+  Worth knowing before you start: the reservation is wider than the eight
+  identity kinds. The whole `rise.dev` API group is now closed to external
+  ResourceDefinitions, as are the eight identity collection names in *any*
+  group (collection names have always been globally unique). The activation
+  runs in one transaction, so an upgrade rejected by the audit leaves the
+  database exactly as it was — clean up the conflicts it names under the
+  previous Rise version and retry.
 - **Behavior change — workload identity on the Docker backend** ([#378](https://github.com/rise-deploy/rise/issues/378)).
   The Docker controller now delivers the same workload-identity material as
   Kubernetes — the bootstrap credential and one token file per `[identity].audiences`
