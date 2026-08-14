@@ -62,8 +62,8 @@ pub const PLATFORM_ROLE_COLLECTION: &str = "platformroles";
 pub const PLATFORM_ROLE_BINDING_KIND: &str = "PlatformRoleBinding";
 pub const PLATFORM_ROLE_BINDING_COLLECTION: &str = "platformrolebindings";
 
-// Identity resources are reserved before runtime registration so custom
-// ResourceDefinitions cannot claim the API identities that admission will own.
+// Identity resources are reserved for the runtime built-in registrations, so
+// custom ResourceDefinitions cannot claim the API identities admission owns.
 pub const USER_KIND: &str = "User";
 pub const USER_COLLECTION: &str = "users";
 pub const USER_IDENTITY_KIND: &str = "UserIdentity";

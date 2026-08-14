@@ -47,13 +47,13 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
   GroupMembership is an empty marker named for its User.
   Reserve their collection definitions now, but activate them only through the
   transaction-scoped normalization/admission seam.
-- [~] Add optional, UID-authoritative `metadata.ownerReferences` to the generic
+- [x] Add optional, UID-authoritative `metadata.ownerReferences` to the generic
   resource envelope and implement transactional reverse lookup, cycle-safe,
   finalizer-respecting dependent garbage collection. GroupMembership may name
   its User as lifecycle owner; backend-managed memberships normally do so,
   while operator-managed markers may intentionally remain unowned. Land this
   before GroupMembership runtime activation.
-- [ ] Add partial Postgres indexes for unique external User mappings,
+- [x] Add partial Postgres indexes for unique external User mappings,
   target-parent workload trust lookup, and reverse name-based membership edges.
   These remain internal storage projections and do not change the generic
   resource API shape.

@@ -237,6 +237,51 @@ Serve them locally with `mise run docs:serve` / `mise run docs:engineering:serve
 - The default development branch is `develop`. PRs for feature work should target `develop`, not `main`.
 - Always target the branch your feature branch was created from when opening a PR.
 
+## Database Migrations
+
+A migration becomes immutable when it ships in a **release**, not when it merges
+to `develop`.
+
+- **Unreleased** (merged to `develop` or not): fully editable. Rewrite the file,
+  renumber it, split it, delete it, or **collapse a whole series into one** —
+  whatever leaves the clearest final schema. Don't stack a corrective migration
+  on top of an unreleased one, and don't preserve an increment just because it
+  was reviewed separately; the migration history is a means, not a record.
+- **Released**: the file is frozen. Change it only by adding a new migration.
+
+**Release candidates count as releases here** — an `-rc` tag can be deployed, so
+a migration that ships in one is frozen.
+
+To check which side a migration is on, look for it in every tag's tree:
+
+```bash
+BASE=20260519000000_create_resource_store.sql
+for t in $(git tag --list 'v*'); do
+  git ls-tree -r --name-only "$t" | grep -q "/$BASE\$" && echo "$t"
+done
+# no output = in no release = editable
+```
+
+Match on the basename, not the full path, so a crate rename doesn't hide a
+released migration. Don't reach for `git tag --contains <adding-commit>`: it
+reports "unreleased" for migrations that really did ship, because release tags
+do not necessarily descend from the `develop` commit that added the file. And
+don't pick a "latest tag" with `sort -V` — it orders `v0.23.0-rc4` *after*
+`v0.23.0`.
+
+SQLX records a checksum per migration, so editing one a database has already
+applied fails startup with `VersionMismatch` ("previously applied but has been
+modified"), and removing one fails with `VersionMissing`. That is exactly why
+the released/unreleased line matters — and why it is drawn at *release*, not at
+*merge*: before a release, the only databases holding the old shape are
+development and CI ones that can be rebuilt.
+
+Rebuilding after an edit or collapse: drop what the migrations created and let
+them re-run. For the resource store that is `DROP SCHEMA resource_store
+CASCADE;` — its migration bookkeeping lives in that schema, so dropping it
+clears both. For the main crate, delete the affected rows from `_sqlx_migrations`
+and drop whatever the migration created.
+
 ## Rollout Tracking
 
 High-impact, multi-PR, or operator-affecting changes are tracked in the **Rise

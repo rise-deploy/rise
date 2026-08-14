@@ -8,7 +8,7 @@ validators, and shared constants from that crate. This crate intentionally
 exports only PostgreSQL/migration/registry concerns and concrete validators:
 `PgResourceStore`, `run_migrations`, `BuiltInRegistry`,
 `OrganizationValidator`, `ResourceDefinitionValidator`, and
-`JsonSchemaValidator`.
+`JsonSchemaValidator`, plus narrow identity/trust/membership lookup adapters.
 
 Keeping SQLX and JSON Schema compilation behind the implementation boundary
 lets authorization and controller code use fake `ResourceStore`
@@ -44,6 +44,42 @@ Lifecycle owner references are stored once, in the resource row's
 `owner_references` JSONB array. A `jsonb_path_ops` GIN index supports reverse
 UID containment queries for garbage collection. No separate edge table is
 maintained.
+
+## Built-in identity admission and projections
+
+The eight `rise.dev/v1alpha1` identity kinds are routed from the immutable
+built-in registry. Pure typed validation and canonicalization run before the
+mutation transaction; contextual admission then locks and verifies the exact
+live built-in parent chain in the same transaction as persistence. Every
+built-in registration's validator is authoritative even when the caller omits
+or forges its optional `SpecValidator`. Identity admission also enforces
+mapping immutability and GroupMembership's optional matching-User owner
+reference. Custom same-named kinds in other API groups remain generic.
+
+Three partial expression indexes project only live built-in rows: global
+UserIdentity issuer/subject uniqueness (including inactive mappings),
+parent-and-issuer workload trust lookup, and reverse GroupMembership name
+lookup. `IdentityLookup`, `TrustPolicyLookup`, and `MembershipLookup` expose
+these fixed reads without adding JSON filters to `ResourceStore`.
+
+Before these routes activate, the activation migration audits tombstoned and
+live legacy ResourceDefinitions and resource rows that would be shadowed,
+reporting a bounded count plus sample. It then installs the durable write
+guard, which reserves the whole `rise.dev` group against external
+ResourceDefinitions plus the eight identity collection names in any group.
+Audit and guard share one transaction, so an upgrade that reports a conflict
+leaves the database untouched: remove every resource the diagnostic names using
+the previously deployed Rise binary, then retry.
+
+Every index here is built inside its migration's transaction, so the build and
+SQLx's bookkeeping commit together. `CREATE INDEX CONCURRENTLY` would avoid the
+brief write lock a plain build takes, but it cannot run in a transaction, and
+splitting those two steps opens a crash window that can leave an unrecorded
+index (wedging the next startup on "relation already exists") or an `INVALID`
+one. An `INVALID` unique index enforces nothing while looking present, which
+for the identity mappings means silently losing the uniqueness the login path
+depends on. `resource_store.resources` is small, so the lock is the cheaper
+cost. Revisit if the typed-object migration makes this table large.
 
 A built-in `Organization` or `ResourceDefinition` cannot currently be the
 dependent side of an owner reference: writes that put `owner_references` on

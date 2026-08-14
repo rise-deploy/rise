@@ -16,8 +16,8 @@ use crate::{
 
 /// Static API identity and placement of one ADR-0001 identity resource kind.
 ///
-/// This is contract metadata only. Runtime registration remains behind the
-/// transaction-scoped normalization and admission work.
+/// The PostgreSQL built-in registry consumes this contract metadata directly
+/// when installing its transaction-scoped normalization and admission path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IdentityKindDefinition {
     pub api_version: &'static str,
@@ -271,6 +271,11 @@ impl ExternalSubject {
         if value.trim().is_empty() {
             return Err(ValidationError::new("external subject must not be blank"));
         }
+        if value.contains('\0') {
+            return Err(ValidationError::new(
+                "external subject must not contain U+0000",
+            ));
+        }
         if value.chars().count() > MAX_EXTERNAL_SUBJECT_CHARS {
             return Err(ValidationError::new(format!(
                 "external subject must not exceed {MAX_EXTERNAL_SUBJECT_CHARS} characters"
@@ -315,7 +320,10 @@ impl JsonSchema for ExternalSubject {
             "type": "string",
             "minLength": 1,
             "maxLength": MAX_EXTERNAL_SUBJECT_CHARS,
-            "pattern": ".*\\S.*"
+            "allOf": [
+                { "pattern": ".*\\S.*" },
+                { "pattern": "^[^\\u0000]*$" }
+            ]
         })
     }
 }
