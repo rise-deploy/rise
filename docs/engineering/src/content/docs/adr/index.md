@@ -36,3 +36,4 @@ open questions but is not yet ready for review as a proposed architecture.
 |---|---|---|
 | [ADR-0001](./0001-unified-permission-model.md) — Unified Permission Model | Proposed | One Role/RoleBinding model for all subject kinds (Users, Groups, ServiceAccounts, Controllers, Operators) on the generic resource API and token issuance, plus the crate structure that realizes it. |
 | [ADR-0002](./0002-generic-resource-subresource-execution-model.md) — Generic Resource Subresource Execution Model | Draft | A typed registration and execution seam for stored, virtual, generated, streaming, and possible connection-oriented subresources. |
+| [ADR-0003](./0003-release-promotion-and-guarded-rollback.md) — Release Promotion and Guarded Rollback | Proposed | Promoting a deployment between environments via one create-from-source primitive, an append-only migration-compatibility ledger, and a draft direction for automatic rollback on sustained unhealthiness. |
