@@ -12,6 +12,7 @@
 //! record consulted here. Teams a user created themselves are not IdP-managed
 //! and therefore never grant a group-derived role.
 
+use crate::db::models::User;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -33,6 +34,27 @@ pub fn matches_any_group(configured_groups: &[String], user_groups: &[String]) -
             .iter()
             .any(|user_group| user_group.eq_ignore_ascii_case(configured))
     })
+}
+
+/// Resolve a role from an email allowlist plus a list of IdP groups.
+///
+/// A user holds the role if their email is on the allowlist or they belong to
+/// one of the groups. The allowlist is checked first, and the groups are only
+/// looked up when the role actually configures them, so an install that grants
+/// roles by email alone never pays for a query.
+pub async fn has_role(
+    pool: &PgPool,
+    allowed_emails: &[String],
+    allowed_groups: &[String],
+    user: &User,
+) -> bool {
+    if matches_any_email(allowed_emails, &user.email) {
+        return true;
+    }
+    if allowed_groups.is_empty() {
+        return false;
+    }
+    matches_any_group(allowed_groups, &resolve_idp_groups(pool, user.id).await)
 }
 
 /// Resolve the IdP groups a user belongs to.
@@ -116,6 +138,34 @@ mod tests {
 
         let groups = resolve_idp_groups(&pool, user.id).await;
         assert_eq!(groups, vec!["platform-admins".to_string()]);
+    }
+
+    /// `has_role` grants by email allowlist or by IdP group, and only the group
+    /// path touches the database.
+    #[sqlx::test]
+    async fn test_has_role_by_email_or_idp_group(pool: PgPool) {
+        let user = users::create(&pool, "user@example.com").await.unwrap();
+        let emails = vec!["User@Example.Com".to_string()];
+        // Team names are constrained to lowercase, so the case difference that
+        // matters in practice is on the configured side.
+        let groups = vec!["Platform-Admins".to_string()];
+
+        // Email allowlist alone, no groups configured or joined.
+        assert!(has_role(&pool, &emails, &[], &user).await);
+
+        // Neither the allowlist nor any group matches yet.
+        assert!(!has_role(&pool, &[], &groups, &user).await);
+
+        // Joining the IdP-managed group grants the role.
+        let team = teams::create(&pool, "platform-admins").await.unwrap();
+        teams::set_idp_managed(&pool, team.id, true).await.unwrap();
+        teams::add_member(&pool, team.id, user.id, TeamRole::Member)
+            .await
+            .unwrap();
+        assert!(has_role(&pool, &[], &groups, &user).await);
+
+        // Nothing configured grants nothing.
+        assert!(!has_role(&pool, &[], &[], &user).await);
     }
 
     #[sqlx::test]

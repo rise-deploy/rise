@@ -574,25 +574,14 @@ impl AppState {
             .await
     }
 
-    /// Resolve a role from an email allowlist plus a list of IdP groups.
-    ///
-    /// The IdP groups are only looked up when the role actually configures
-    /// them and the email allowlist did not already grant the role, so an
-    /// install that grants roles by email alone never pays for a query.
     async fn has_role(
         &self,
         allowed_emails: &[String],
         allowed_groups: &[String],
         user: &User,
     ) -> bool {
-        if crate::server::auth::roles::matches_any_email(allowed_emails, &user.email) {
-            return true;
-        }
-        if allowed_groups.is_empty() {
-            return false;
-        }
-        let groups = crate::server::auth::roles::resolve_idp_groups(&self.db_pool, user.id).await;
-        crate::server::auth::roles::matches_any_group(allowed_groups, &groups)
+        crate::server::auth::roles::has_role(&self.db_pool, allowed_emails, allowed_groups, user)
+            .await
     }
 
     /// Run database migrations

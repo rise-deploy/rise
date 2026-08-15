@@ -76,14 +76,13 @@ impl ResourceApiCtx {
     /// Resolve the Operator role for a user: the `auth.operator_users` email
     /// allowlist, or membership in one of the `auth.operator_idp_groups`.
     async fn is_operator(&self, user: &User) -> bool {
-        if crate::server::auth::roles::matches_any_email(&self.operator_users, &user.email) {
-            return true;
-        }
-        if self.operator_idp_groups.is_empty() {
-            return false;
-        }
-        let groups = crate::server::auth::roles::resolve_idp_groups(&self.db_pool, user.id).await;
-        crate::server::auth::roles::matches_any_group(&self.operator_idp_groups, &groups)
+        crate::server::auth::roles::has_role(
+            &self.db_pool,
+            &self.operator_users,
+            &self.operator_idp_groups,
+            user,
+        )
+        .await
     }
 }
 
