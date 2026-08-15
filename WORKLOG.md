@@ -41,11 +41,11 @@ scope and avoiding dead-end compatibility layers.
 5. **Merged in PR #420 — generic lifecycle owner references.** Add the canonical
    owner-reference DAG, cascading collection, blocker reporting, and structured
    lifecycle logging required before GroupMembership activation.
-6. **In progress — identity activation and storage projections.** Add the
+6. **In review in PR #421 — identity activation and storage projections.** Add the
    transaction-owned admission seam, activate all eight identity built-ins,
    and add the ADR-required identity/trust/membership indexes and narrow lookup
    adapters. Policy activation remains a separate reviewable increment.
-7. **Planned — policy activation.** Activate the four policy built-ins through
+7. **In progress — policy activation.** Activate the four policy built-ins through
    contextual normalization, reference validation, and concurrency-safe
    admission without yet enforcing live authorization.
 8. **Planned — live authorization engine.** Add membership expansion, org-admin
@@ -425,3 +425,67 @@ scope and avoiding dead-end compatibility layers.
     concurrency, lookup, key-budget, and EXPLAIN coverage.
   - `SQLX_OFFLINE=true RUSTC_WRAPPER= cargo test --workspace --all-features
     -- --test-threads=1` passes serially; 2 documentation tests are ignored.
+
+## Increment 7 — policy activation
+
+- State: draft PR open for review.
+- Branch: `claude/policy-activation-admission-1ojwzz`.
+- Stacked on increment 6 (PR #421), whose admission seam it generalizes.
+- Acceptance criteria:
+  - Activate exactly the four kinds in `POLICY_KIND_DEFINITIONS`, consuming that
+    table for placement: `Role` and `RoleBinding` under an Organization,
+    `PlatformRole` and `PlatformRoleBinding` at the root.
+  - Keep the public `ResourceStore` and pure/local `SpecValidator` contracts
+    unchanged. Contextual admission owns every database read and row lock it
+    needs inside the mutation transaction and stays authoritative for direct
+    store calls with no trustworthy validator.
+  - Normalize each binding contextually and persist the normalized spec: an org
+    binding's omitted `scope` becomes its parent Organization's scope, a
+    platform binding's becomes its static org-native subject's organization or
+    `*`, and `subjectMembership` persists as PascalCase `Any` when omitted while
+    explicit null and unknown values fail closed.
+  - Resolve every reference a binding carries against live rows in the same
+    transaction: `roleRef` at the exact placement its kind implies, `scope`
+    down a registry- or ResourceDefinition-derived parent chain, and any
+    literal `subject`. Enforce both containment rules on the resolved rows.
+  - Audit legacy definitions and rows that policy route activation could shadow
+    and install the durable four-collection reservation guard, with the same
+    single-transaction, actionable-diagnostic behavior as increment 6.
+  - Add no authorization evaluation, grant gate, seeded policy, or binding
+    index. Nothing consults these resources yet.
+- Decisions:
+  - `IdentityAdmission` generalizes to `BuiltInAdmission`, splitting the
+    identity and policy contracts into sibling modules behind one seam. The
+    contextual `admit_*` methods now take `&mut` params, because policy
+    normalization rewrites the spec that gets persisted; identity admission,
+    which only validates, is unaffected.
+  - Canonicalization stays split rather than moving wholesale into the
+    transaction. A Role body and a binding's syntax are context-free and fail
+    before any lock is taken; only the parts that genuinely need a parent
+    Organization, a subject, or a live target run inside it.
+  - A binding's references must resolve at write time. This follows the ADR's
+    explicit "the target must exist or be created in the same atomic
+    transaction" for `scope`, its "nonexistent literals are rejected" for
+    subjects, and increment 6's precedent for GroupMembership's live User.
+    Lifecycle after the fact is unchanged: deleting a referenced Role leaves a
+    dangling binding exactly as deleting a User leaves a dangling membership,
+    which owner references — not write-time validation — are the answer to.
+  - Policy specs get no immutable-field enforcement. ADR-0001 governs Role and
+    binding edits through the write-time grant gate's effective before/after
+    delta, not by freezing fields, so adding immutability here would contradict
+    the increment that implements it.
+  - Reference locks are `FOR SHARE` and sit in the same band as increment 6's
+    identity lookups: after the global graph lock, owners, and structural
+    parents, and before the dependent row lock.
+  - No storage projection for bindings. The identity indexes serve a
+    per-request login path; the authorization engine's binding access patterns
+    are not yet measurable, and a speculative index would be a schema
+    commitment made blind.
+- Verification:
+  - `cargo fmt --all` passes.
+  - `cargo clippy --workspace --all-features --all-targets -- -D warnings` passes.
+  - The PostgreSQL-backed `rise-resource-store-postgres` integration suite
+    passes all 83 tests serially, including the nine new policy routing,
+    normalization, reference-resolution, containment, subject-resolution,
+    update-renormalization, concurrency, and migration-guard tests.
+  - `cargo test --workspace --all-features -- --test-threads=1` passes.

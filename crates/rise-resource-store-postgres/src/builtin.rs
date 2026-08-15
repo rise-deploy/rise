@@ -1,9 +1,9 @@
 //! Built-in resource registry.
 //!
-//! Rise's structural and identity built-ins are first-class resource kinds
-//! owned by Rise itself: they have typed Rust validators, their identity (group,
-//! version, kind, plural) is fixed at compile time, and they have no row in
-//! the `resource_definitions` projection table. Routing for these kinds is
+//! Rise's structural, identity, and policy built-ins are first-class resource
+//! kinds owned by Rise itself: they have typed Rust validators, their identity
+//! (group, version, kind, plural) is fixed at compile time, and they have no row
+//! in the `resource_definitions` projection table. Routing for these kinds is
 //! resolved through this registry instead of through the database.
 //!
 //! The registry is the single source of truth for "what built-ins does this
@@ -17,12 +17,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use rise_resource_api::{
-    CollectionInfo, ResourceParentRef, SpecValidator, API_VERSION_V1ALPHA1,
-    IDENTITY_KIND_DEFINITIONS, ORGANIZATION_COLLECTION, ORGANIZATION_KIND,
+    BuiltInKindDefinition, CollectionInfo, ResourceParentRef, SpecValidator, API_VERSION_V1ALPHA1,
+    IDENTITY_KIND_DEFINITIONS, ORGANIZATION_COLLECTION, ORGANIZATION_KIND, POLICY_KIND_DEFINITIONS,
     RESOURCE_DEFINITION_COLLECTION, RESOURCE_DEFINITION_KIND,
 };
 
-use crate::admission::{IdentityAdmission, IdentitySpecValidator};
+use crate::admission::{BuiltInAdmission, BuiltInSpecValidator};
 use crate::validation::{OrganizationValidator, ResourceDefinitionValidator};
 
 /// Static description of one built-in resource kind.
@@ -131,22 +131,30 @@ impl BuiltInRegistry {
             parent: None,
             spec_validator: Arc::new(ResourceDefinitionValidator),
         });
-        for definition in IDENTITY_KIND_DEFINITIONS {
-            let admission =
-                IdentityAdmission::for_identity(definition.api_version, definition.kind)
-                    .expect("every identity definition has typed admission");
-            r.register(BuiltInRegistration {
-                collection: definition.collection,
-                api_version: definition.api_version,
-                kind: definition.kind,
-                parent: definition.parent.map(|parent| ResourceParentRef {
-                    api_version: parent.api_version.to_string(),
-                    kind: parent.kind.to_string(),
-                }),
-                spec_validator: Arc::new(IdentitySpecValidator(admission)),
-            });
+        for definition in IDENTITY_KIND_DEFINITIONS
+            .iter()
+            .chain(&POLICY_KIND_DEFINITIONS)
+        {
+            r.register(Self::admitted(definition));
         }
         r
+    }
+
+    /// Build the registration for a built-in whose contract is enforced by the
+    /// typed admission seam rather than by a JSON Schema.
+    fn admitted(definition: &BuiltInKindDefinition) -> BuiltInRegistration {
+        let admission = BuiltInAdmission::for_kind(definition.api_version, definition.kind)
+            .expect("every identity and policy definition has typed admission");
+        BuiltInRegistration {
+            collection: definition.collection,
+            api_version: definition.api_version,
+            kind: definition.kind,
+            parent: definition.parent.map(|parent| ResourceParentRef {
+                api_version: parent.api_version.to_string(),
+                kind: parent.kind.to_string(),
+            }),
+            spec_validator: Arc::new(BuiltInSpecValidator(admission)),
+        }
     }
 
     /// Insert a registration. Panics on:
@@ -240,20 +248,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_register_structural_and_identity_builtins() {
+    fn defaults_register_structural_identity_and_policy_builtins() {
         let r = BuiltInRegistry::defaults();
-        assert_eq!(r.len(), 2 + IDENTITY_KIND_DEFINITIONS.len());
+        assert_eq!(
+            r.len(),
+            2 + IDENTITY_KIND_DEFINITIONS.len() + POLICY_KIND_DEFINITIONS.len()
+        );
         assert!(r.lookup_collection(ORGANIZATION_COLLECTION).is_some());
         assert!(r
             .lookup_collection(RESOURCE_DEFINITION_COLLECTION)
             .is_some());
         assert!(r.lookup_collection("unknown").is_none());
-        for definition in IDENTITY_KIND_DEFINITIONS {
+        for definition in IDENTITY_KIND_DEFINITIONS
+            .iter()
+            .chain(&POLICY_KIND_DEFINITIONS)
+        {
             let registration = r
                 .lookup_collection(definition.collection)
-                .expect("identity collection is active");
+                .expect("built-in collection is active");
             assert_eq!(registration.api_version, definition.api_version);
             assert_eq!(registration.kind, definition.kind);
+            assert_eq!(
+                registration
+                    .parent
+                    .as_ref()
+                    .map(|parent| (parent.api_version.as_str(), parent.kind.as_str())),
+                definition
+                    .parent
+                    .map(|parent| (parent.api_version, parent.kind))
+            );
         }
     }
 
@@ -369,6 +392,7 @@ mod tests {
         expected.extend(
             IDENTITY_KIND_DEFINITIONS
                 .iter()
+                .chain(&POLICY_KIND_DEFINITIONS)
                 .map(|definition| definition.collection),
         );
         expected.sort_unstable();

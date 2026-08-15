@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+mod builtin_kind;
 mod identity;
 mod owner_reference;
 mod policy;
@@ -14,11 +15,11 @@ mod store;
 mod subject_id;
 mod subject_ref;
 
+pub use builtin_kind::{BuiltInKindDefinition, BuiltInKindParent};
 pub use identity::{
     ControllerSpec, ControllerTrustPolicySpec, ExternalSubject, GroupMembershipSpec, GroupSpec,
-    IdentityKindDefinition, IdentityKindParent, Issuer, ServiceAccountSpec,
-    ServiceAccountTrustPolicySpec, TrustPolicyClaims, UserIdentitySpec, UserSpec,
-    IDENTITY_KIND_DEFINITIONS, MAX_EXTERNAL_SUBJECT_CHARS, MAX_ISSUER_BYTES,
+    Issuer, ServiceAccountSpec, ServiceAccountTrustPolicySpec, TrustPolicyClaims, UserIdentitySpec,
+    UserSpec, IDENTITY_KIND_DEFINITIONS, MAX_EXTERNAL_SUBJECT_CHARS, MAX_ISSUER_BYTES,
 };
 pub use owner_reference::OwnerReference;
 pub use policy::{
@@ -26,7 +27,7 @@ pub use policy::{
     LocallyNormalizedPlatformRoleBindingSpec, LocallyNormalizedRoleBindingSpec,
     PlatformRoleBindingSpec, PlatformRoleRef, PlatformRoleRefKind, PolicyStatement,
     ResourceKindPattern, RoleBindingSpec, RoleRef, RoleRefKind, RoleSpec, SubjectMembership,
-    SubresourceMatcher, SubresourceName, Verb, VerbMatcher,
+    SubresourceMatcher, SubresourceName, Verb, VerbMatcher, POLICY_KIND_DEFINITIONS,
 };
 pub use resource_kind::ResourceKind;
 pub use resource_row::ResourceRow;
