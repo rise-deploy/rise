@@ -23,6 +23,7 @@ async fn create_and_get_resource(pool: sqlx::PgPool) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
 
     let params = CreateResourceParams {
+        labels: Default::default(),
         api_version: API_VERSION_V1ALPHA1.to_string(),
         kind: ORGANIZATION_KIND.to_string(),
         name: "my-org".to_string(),
@@ -82,6 +83,7 @@ async fn list_resources(pool: sqlx::PgPool) -> sqlx::Result<()> {
     for name in ["beta", "alpha", "gamma"] {
         store
             .create(CreateResourceParams {
+                labels: Default::default(),
                 api_version: API_VERSION_V1ALPHA1.to_string(),
                 kind: ORGANIZATION_KIND.to_string(),
                 name: name.to_string(),
@@ -120,6 +122,7 @@ async fn same_kind_name_is_isolated_by_api_version(pool: sqlx::PgPool) -> sqlx::
     ] {
         store
             .register_resource_definition(CreateResourceParams {
+                labels: Default::default(),
                 api_version: API_VERSION_V1ALPHA1.to_string(),
                 kind: RESOURCE_DEFINITION_KIND.to_string(),
                 name: format!("{plural}.{group}"),
@@ -142,6 +145,7 @@ async fn same_kind_name_is_isolated_by_api_version(pool: sqlx::PgPool) -> sqlx::
 
     let first = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: "alpha.example.dev/v1".to_string(),
             kind: "Widget".to_string(),
             name: "shared".to_string(),
@@ -157,6 +161,7 @@ async fn same_kind_name_is_isolated_by_api_version(pool: sqlx::PgPool) -> sqlx::
 
     let second = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: "beta.example.dev/v1".to_string(),
             kind: "Widget".to_string(),
             name: "shared".to_string(),
@@ -193,6 +198,7 @@ async fn update_resource_increments_revision(pool: sqlx::PgPool) -> sqlx::Result
 
     let row = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: ORGANIZATION_KIND.to_string(),
             name: "my-org".to_string(),
@@ -212,6 +218,7 @@ async fn update_resource_increments_revision(pool: sqlx::PgPool) -> sqlx::Result
         .update(
             row.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: 1,
                 annotations: BTreeMap::new(),
@@ -236,6 +243,7 @@ async fn update_rejects_wrong_revision(pool: sqlx::PgPool) -> sqlx::Result<()> {
 
     let row = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: ORGANIZATION_KIND.to_string(),
             name: "my-org".to_string(),
@@ -253,6 +261,7 @@ async fn update_rejects_wrong_revision(pool: sqlx::PgPool) -> sqlx::Result<()> {
         .update(
             row.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: 99, // wrong
                 annotations: BTreeMap::new(),
@@ -281,6 +290,7 @@ async fn duplicate_name_returns_conflict(pool: sqlx::PgPool) -> sqlx::Result<()>
     let store = PgResourceStore::new(pool);
 
     let params = || CreateResourceParams {
+        labels: Default::default(),
         api_version: API_VERSION_V1ALPHA1.to_string(),
         kind: ORGANIZATION_KIND.to_string(),
         name: "same-name".to_string(),
@@ -307,6 +317,7 @@ async fn duplicate_name_returns_conflict_for_rd_backed_kind(
     register_example_widget_rd(&store).await;
 
     let params = || CreateResourceParams {
+        labels: Default::default(),
         api_version: "example.dev/v1".to_string(),
         kind: "Widget".to_string(),
         name: "same-name".to_string(),
@@ -335,6 +346,7 @@ async fn create_rejects_non_storage_version_at_root(pool: sqlx::PgPool) -> sqlx:
 
     let err = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: "example.dev/v2".to_string(),
             kind: "Widget".to_string(),
             name: "non-storage".to_string(),
@@ -363,6 +375,7 @@ async fn create_rejects_non_storage_version_in_child_scope(pool: sqlx::PgPool) -
 
     let err = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: "example.dev/v2".to_string(),
             kind: "Widget".to_string(),
             name: "non-storage".to_string(),
@@ -396,6 +409,7 @@ async fn update_api_version_collision_returns_name_conflict(
     ] {
         store
             .register_resource_definition(CreateResourceParams {
+                labels: Default::default(),
                 api_version: API_VERSION_V1ALPHA1.to_string(),
                 kind: RESOURCE_DEFINITION_KIND.to_string(),
                 name: format!("{plural}.{group}"),
@@ -419,6 +433,7 @@ async fn update_api_version_collision_returns_name_conflict(
     // Two resources with the same kind + name but in different groups — allowed at root.
     let moving = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: "alpha.example.dev/v1".to_string(),
             kind: "Widget".to_string(),
             name: "shared".to_string(),
@@ -433,6 +448,7 @@ async fn update_api_version_collision_returns_name_conflict(
         .unwrap();
     store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: "beta.example.dev/v1".to_string(),
             kind: "Widget".to_string(),
             name: "shared".to_string(),
@@ -452,6 +468,7 @@ async fn update_api_version_collision_returns_name_conflict(
         .update(
             moving.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: Some("beta.example.dev/v1".to_string()),
                 revision: moving.revision,
                 annotations: BTreeMap::new(),
@@ -478,6 +495,7 @@ async fn update_rejects_non_storage_version(pool: sqlx::PgPool) -> sqlx::Result<
 
     let widget = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: "example.dev/v1".to_string(),
             kind: "Widget".to_string(),
             name: "w1".to_string(),
@@ -497,6 +515,7 @@ async fn update_rejects_non_storage_version(pool: sqlx::PgPool) -> sqlx::Result<
         .update(
             widget.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: Some("example.dev/v2".to_string()),
                 revision: widget.revision,
                 annotations: BTreeMap::new(),
@@ -522,6 +541,7 @@ async fn delete_without_finalizers_removes_row(pool: sqlx::PgPool) -> sqlx::Resu
 
     let row = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: ORGANIZATION_KIND.to_string(),
             name: "to-delete".to_string(),
@@ -548,6 +568,7 @@ async fn delete_with_finalizers_marks_deletion_timestamp(pool: sqlx::PgPool) -> 
 
     let row = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: ORGANIZATION_KIND.to_string(),
             name: "finalized".to_string(),
@@ -580,6 +601,7 @@ async fn finalizer_flow_completes_deletion(pool: sqlx::PgPool) -> sqlx::Result<(
 
     let row = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: ORGANIZATION_KIND.to_string(),
             name: "with-finalizer".to_string(),
@@ -617,6 +639,7 @@ async fn controller_status_update_merges_key(pool: sqlx::PgPool) -> sqlx::Result
 
     let row = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: ORGANIZATION_KIND.to_string(),
             name: "status-org".to_string(),
@@ -665,6 +688,7 @@ async fn controller_finalizers_enforces_ownership(pool: sqlx::PgPool) -> sqlx::R
 
     let row = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: ORGANIZATION_KIND.to_string(),
             name: "owned".to_string(),
@@ -759,6 +783,7 @@ async fn resolve_collection_by_kind_resolves_builtins_and_rds(
     // A registered ResourceDefinition resolves by `(group, kind)`.
     store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "widgets.example.dev".to_string(),
@@ -798,6 +823,7 @@ async fn resolve_collection_by_kind_resolves_builtins_and_rds(
     // version-addressed.
     store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "gauges.example.dev".to_string(),
@@ -844,6 +870,7 @@ async fn register_resource_definition(pool: sqlx::PgPool) -> sqlx::Result<()> {
 
     let row = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "widgets.example.dev".to_string(),
@@ -883,6 +910,7 @@ async fn delete_resource_definition_rejects_existing_instances(
 
     let definition = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "widgets.example.dev".to_string(),
@@ -898,6 +926,7 @@ async fn delete_resource_definition_rejects_existing_instances(
 
     let instance = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: "example.dev/v1".to_string(),
             kind: "Widget".to_string(),
             name: "w1".to_string(),
@@ -947,6 +976,7 @@ async fn delete_resource_definition_rejects_instances_in_any_served_version(
 
     let definition = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "widgets.example.dev".to_string(),
@@ -962,6 +992,7 @@ async fn delete_resource_definition_rejects_instances_in_any_served_version(
 
     store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: "example.dev/v1".to_string(),
             kind: "Widget".to_string(),
             name: "w1".to_string(),
@@ -992,6 +1023,7 @@ async fn delete_resource_definition_rejects_instances_in_any_served_version(
         .update_resource_definition(
             definition.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: definition.revision,
                 annotations: BTreeMap::new(),
@@ -1026,6 +1058,7 @@ async fn register_resource_definition_rejects_reserved_plural(
 
     let err = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "organizations.example.dev".to_string(),
@@ -1052,6 +1085,7 @@ async fn register_rejects_resource_definition_as_a_custom_kind(
 
     let error = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "customdefinitions.other.example".to_string(),
@@ -1127,6 +1161,7 @@ async fn register_resource_definition_rejects_zero_served_versions(
 
     let err = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "widgets.example.dev".to_string(),
@@ -1164,6 +1199,7 @@ async fn register_resource_definition_root_and_parent_validation(
     });
     store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "widgets.example.dev".to_string(),
@@ -1188,6 +1224,7 @@ async fn register_resource_definition_root_and_parent_validation(
     });
     let err = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "gadgets.example.dev".to_string(),
@@ -1225,6 +1262,7 @@ async fn register_resource_definition_rejects_parent_cycles(
             spec["parent"] = json!({"apiVersion": "cycle.dev/v1", "kind": pk});
         }
         CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: format!("{plural}.cycle.dev"),
@@ -1287,6 +1325,7 @@ async fn register_resource_definition_rejects_duplicate_identity(
     let store = PgResourceStore::new(pool);
 
     let rd = |group: &str, kind: &str, plural: &str| CreateResourceParams {
+        labels: Default::default(),
         api_version: API_VERSION_V1ALPHA1.to_string(),
         kind: RESOURCE_DEFINITION_KIND.to_string(),
         name: format!("{plural}.{group}"),
@@ -1340,6 +1379,7 @@ async fn get_by_name(pool: sqlx::PgPool) -> sqlx::Result<()> {
 
     store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: ORGANIZATION_KIND.to_string(),
             name: "lookup-org".to_string(),
@@ -1377,6 +1417,7 @@ async fn get_by_name_and_list_span_all_versions_of_a_group(pool: sqlx::PgPool) -
     // A row stored at one version of a group...
     let created = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: "example.dev/v1".to_string(),
             kind: "Widget".to_string(),
             name: "w1".to_string(),
@@ -1428,6 +1469,7 @@ async fn create_rejects_invalid_name(pool: sqlx::PgPool) -> sqlx::Result<()> {
     // Leading hyphen violates the name format constraint
     let err = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: ORGANIZATION_KIND.to_string(),
             name: "--bad-name".to_string(),
@@ -1456,6 +1498,7 @@ async fn create_invokes_spec_validator(pool: sqlx::PgPool) -> sqlx::Result<()> {
     // OrganizationValidator requires a non-empty displayName
     let err = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: ORGANIZATION_KIND.to_string(),
             name: "bad-spec-org".to_string(),
@@ -1525,6 +1568,7 @@ async fn delete_already_marked_resource_is_idempotent(pool: sqlx::PgPool) -> sql
 
     let row = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: ORGANIZATION_KIND.to_string(),
             name: "marked-org".to_string(),
@@ -1572,6 +1616,7 @@ async fn update_resource_definition_updates_projection(pool: sqlx::PgPool) -> sq
 
     let row = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "widgets.example.dev".to_string(),
@@ -1601,6 +1646,7 @@ async fn update_resource_definition_updates_projection(pool: sqlx::PgPool) -> sq
         .update_resource_definition(
             row.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: row.revision,
                 annotations: BTreeMap::new(),
@@ -1638,6 +1684,7 @@ async fn added_version_serves_existing_instances_without_rewriting(
 
     let rd = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "widgets.example.dev".to_string(),
@@ -1653,6 +1700,7 @@ async fn added_version_serves_existing_instances_without_rewriting(
 
     let widget = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: "example.dev/v1".to_string(),
             kind: "Widget".to_string(),
             name: "w1".to_string(),
@@ -1681,6 +1729,7 @@ async fn added_version_serves_existing_instances_without_rewriting(
         .update_resource_definition(
             rd.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: rd.revision,
                 annotations: BTreeMap::new(),
@@ -1728,6 +1777,7 @@ async fn update_resource_definition_rejects_identity_change(
 
     let row = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "widgets.example.dev".to_string(),
@@ -1754,6 +1804,7 @@ async fn update_resource_definition_rejects_identity_change(
         .update_resource_definition(
             row.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: row.revision,
                 annotations: BTreeMap::new(),
@@ -1793,6 +1844,7 @@ async fn update_resource_definition_rejects_removing_version_with_instances(
 
     let rd = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "widgets.example.dev".to_string(),
@@ -1809,6 +1861,7 @@ async fn update_resource_definition_rejects_removing_version_with_instances(
     // Instances are created at the storage version (v1).
     store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: "example.dev/v1".to_string(),
             kind: "Widget".to_string(),
             name: "w1".to_string(),
@@ -1835,6 +1888,7 @@ async fn update_resource_definition_rejects_removing_version_with_instances(
         .update_resource_definition(
             rd.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: rd.revision,
                 annotations: BTreeMap::new(),
@@ -1864,6 +1918,7 @@ async fn update_resource_definition_rejects_removing_version_with_instances(
         .update_resource_definition(
             rd.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: rd.revision,
                 annotations: BTreeMap::new(),
@@ -1894,6 +1949,7 @@ async fn update_resource_definition_rejects_parent_change(pool: sqlx::PgPool) ->
 
     let row = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "widgets.example.dev".to_string(),
@@ -1920,6 +1976,7 @@ async fn update_resource_definition_rejects_parent_change(pool: sqlx::PgPool) ->
         .update_resource_definition(
             row.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: row.revision,
                 annotations: BTreeMap::new(),
@@ -1959,6 +2016,7 @@ async fn register_resource_definition_rejects_invalid_non_storage_schema(
 
     let err = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "widgets.example.dev".to_string(),
@@ -2005,6 +2063,7 @@ async fn update_resource_definition_invalidates_schema_cache(
 
     let row = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "widgets.example.dev".to_string(),
@@ -2049,6 +2108,7 @@ async fn update_resource_definition_invalidates_schema_cache(
         .update_resource_definition(
             row.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: row.revision,
                 annotations: BTreeMap::new(),
@@ -2097,6 +2157,7 @@ async fn update_rejects_resource_definition(pool: sqlx::PgPool) -> sqlx::Result<
 
     let row = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "gadgets.example.dev".to_string(),
@@ -2115,6 +2176,7 @@ async fn update_rejects_resource_definition(pool: sqlx::PgPool) -> sqlx::Result<
         .update(
             row.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: row.revision,
                 annotations: BTreeMap::new(),
@@ -2142,6 +2204,7 @@ async fn update_rejects_resource_definition(pool: sqlx::PgPool) -> sqlx::Result<
 async fn create_org(store: &PgResourceStore, name: &str) -> ResourceRow {
     store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: ORGANIZATION_KIND.to_string(),
             name: name.to_string(),
@@ -2169,6 +2232,7 @@ async fn create_owned_widget(
     register_example_widget_rd(store).await;
     store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: "example.dev/v1".to_string(),
             kind: "Widget".to_string(),
             name: name.to_string(),
@@ -2202,6 +2266,7 @@ async fn owner_references_are_persisted_and_replaceable(pool: sqlx::PgPool) -> s
         .update(
             dependent.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: fetched.revision,
                 annotations: BTreeMap::new(),
@@ -2429,6 +2494,7 @@ async fn owner_references_reject_protected_dependent_kinds(pool: sqlx::PgPool) -
         .update(
             organization.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: organization.revision,
                 annotations: BTreeMap::new(),
@@ -2481,6 +2547,7 @@ async fn owner_references_reject_protected_dependent_kinds(pool: sqlx::PgPool) -
         .update_resource_definition(
             definition.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: definition.revision,
                 annotations: BTreeMap::new(),
@@ -2550,6 +2617,7 @@ async fn owner_reference_add_racing_owner_delete_fails_closed(
             .update(
                 dependent.uid,
                 UpdateResourceParams {
+                    labels: Default::default(),
                     api_version: None,
                     revision: dependent.revision,
                     annotations: BTreeMap::new(),
@@ -2596,6 +2664,7 @@ async fn owner_references_reject_lifecycle_cycles(pool: sqlx::PgPool) -> sqlx::R
         .update(
             owner.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: owner.revision,
                 annotations: BTreeMap::new(),
@@ -2618,6 +2687,7 @@ async fn owner_references_reject_lifecycle_cycles(pool: sqlx::PgPool) -> sqlx::R
         .update(
             owner.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: current_owner.revision,
                 annotations: BTreeMap::new(),
@@ -2646,6 +2716,7 @@ async fn owner_references_reject_lifecycle_cycles(pool: sqlx::PgPool) -> sqlx::R
 async fn register_example_widget_rd(store: &PgResourceStore) {
     let result = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "widgets.example.dev".to_string(),
@@ -2683,6 +2754,7 @@ async fn create_child(
     register_example_widget_rd(store).await;
     store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: "example.dev/v1".to_string(),
             kind: kind.to_string(),
             name: name.to_string(),
@@ -3298,6 +3370,7 @@ async fn identity_admission_is_unbypassable_and_persists_canonical_defaults(
         .update(
             user.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 revision: user.revision,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
@@ -3410,6 +3483,7 @@ async fn user_identity_uniqueness_is_live_global_and_concurrency_authoritative(
         .update(
             winner.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 revision: winner.revision,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
@@ -3557,6 +3631,7 @@ async fn membership_owner_rules_and_name_bound_reactivation_are_enforced(
         .update(
             unowned.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 revision: unowned.revision,
                 annotations: BTreeMap::from([("note".into(), "durable".into())]),
                 finalizers: vec![],
@@ -4096,6 +4171,7 @@ async fn register_org_widget_rd(store: &PgResourceStore) {
 /// expects), so policy update tests build one through this.
 fn update_spec(revision: i64, spec: serde_json::Value) -> UpdateResourceParams {
     UpdateResourceParams {
+        labels: Default::default(),
         api_version: None,
         revision,
         annotations: BTreeMap::new(),
@@ -4625,6 +4701,7 @@ async fn role_binding_scope_is_resolved_and_contained_by_its_organization(
         .update(
             group.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 finalizers: vec!["example.dev/keep".to_string()],
                 ..update_spec(group.revision, json!({}))
             },
@@ -4975,6 +5052,7 @@ async fn role_binding_create_never_resolves_a_reference_the_deleter_already_won(
         .update(
             tombstoned.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 finalizers: vec!["example.dev/keep".to_string()],
                 ..update_spec(tombstoned.revision, json!({}))
             },
@@ -5127,6 +5205,294 @@ async fn policy_activation_upgrade_audit_is_actionable_and_guard_is_durable(
             .as_database_error()
             .and_then(|error| error.constraint()),
         Some("resource_definitions_policy_reservations")
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Labels and the ancestor chain (ADR-0001 §6.1)
+// ---------------------------------------------------------------------------
+
+#[sqlx::test]
+async fn labels_round_trip_and_are_validated(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool.clone());
+
+    let labeled = store
+        .create(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.into(),
+            kind: ORGANIZATION_KIND.into(),
+            name: "labeled".into(),
+            labels: BTreeMap::from([
+                ("rise.dev/owner".to_string(), "group:platform".to_string()),
+                ("squad".to_string(), "infra".to_string()),
+            ]),
+            spec: json!({"displayName": "Labeled"}),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        labeled.labels.get("rise.dev/owner").unwrap(),
+        "group:platform"
+    );
+    assert_eq!(labeled.labels.get("squad").unwrap(), "infra");
+
+    // Labels survive a re-read and reach the typed envelope.
+    let fetched = store.get(labeled.uid).await.unwrap().unwrap();
+    assert_eq!(fetched.labels, labeled.labels);
+    let resource = fetched
+        .to_resource::<serde_json::Map<String, serde_json::Value>, serde_json::Map<String, serde_json::Value>>();
+    assert_eq!(
+        resource
+            .unwrap()
+            .metadata
+            .labels
+            .get("squad")
+            .map(String::as_str),
+        Some("infra")
+    );
+
+    // An update replaces the whole map, including removal.
+    let updated = store
+        .update(
+            labeled.uid,
+            UpdateResourceParams {
+                labels: BTreeMap::from([("squad".to_string(), "platform".to_string())]),
+                ..update_spec(labeled.revision, json!({"displayName": "Labeled"}))
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.labels.len(), 1);
+    assert_eq!(updated.labels.get("squad").unwrap(), "platform");
+
+    // A resource created without labels has an empty map, not null.
+    let bare = create_org(&store, "bare").await;
+    assert!(bare.labels.is_empty());
+
+    // Keys use the same grammar a binding's labelSelector parses, so a key that
+    // can be written can always be selected on.
+    for (label, key) in [
+        ("empty key", ""),
+        ("bad prefix", "not a domain/owner"),
+        ("trailing dash", "rise.dev/owner-"),
+        ("double slash", "rise.dev/extra/owner"),
+    ] {
+        let error = store
+            .create(CreateResourceParams {
+                api_version: API_VERSION_V1ALPHA1.into(),
+                kind: ORGANIZATION_KIND.into(),
+                name: "rejected".into(),
+                labels: BTreeMap::from([(key.to_string(), "value".to_string())]),
+                spec: json!({"displayName": "Rejected"}),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, StoreError::Validation(message) if message.contains("invalid label key")),
+            "{label} ('{key}') produced {error:?}"
+        );
+    }
+
+    for (label, value) in [
+        ("oversized", "v".repeat(64)),
+        ("newline", "line\nbreak".to_string()),
+        ("nul", "nul\0byte".to_string()),
+    ] {
+        let error = store
+            .create(CreateResourceParams {
+                api_version: API_VERSION_V1ALPHA1.into(),
+                kind: ORGANIZATION_KIND.into(),
+                name: "rejected".into(),
+                labels: BTreeMap::from([("squad".to_string(), value)]),
+                spec: json!({"displayName": "Rejected"}),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, StoreError::Validation(_)),
+            "{label} produced {error:?}"
+        );
+    }
+
+    // The database keeps the stored shape honest against direct SQL.
+    let non_string = sqlx::query(
+        "UPDATE resource_store.resources SET labels = '{\"squad\": 1}'::jsonb WHERE uid = $1",
+    )
+    .bind(labeled.uid)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        non_string
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("resources_labels_are_strings")
+    );
+    Ok(())
+}
+
+#[sqlx::test]
+async fn ancestors_returns_the_root_first_chain_including_the_leaf(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool.clone());
+    let org = create_org(&store, "acme").await;
+    let group = create_builtin_resource(
+        &store,
+        GROUP_KIND,
+        "platform",
+        Some(org.uid),
+        json!({}),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    // Root-first, leaf last.
+    let chain = store.ancestors(group.uid).await.unwrap();
+    assert_eq!(
+        chain
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["acme", "platform"]
+    );
+    assert_eq!(chain.first().unwrap().uid, org.uid);
+    assert_eq!(chain.last().unwrap().uid, group.uid);
+
+    // A root resource is its own single-element chain.
+    let root_chain = store.ancestors(org.uid).await.unwrap();
+    assert_eq!(root_chain.len(), 1);
+    assert_eq!(root_chain[0].uid, org.uid);
+
+    // An unknown UID is an empty chain, not an error: the caller decides.
+    assert!(store.ancestors(Uuid::new_v4()).await.unwrap().is_empty());
+
+    // Labels ride along, since resolving effectiveLabels is the reason this
+    // primitive exists.
+    let labeled = store
+        .update(
+            org.uid,
+            UpdateResourceParams {
+                labels: BTreeMap::from([(
+                    "rise.dev/owner".to_string(),
+                    "group:platform".to_string(),
+                )]),
+                ..update_spec(org.revision, json!({"displayName": "acme"}))
+            },
+        )
+        .await
+        .unwrap();
+    let chain = store.ancestors(group.uid).await.unwrap();
+    assert_eq!(
+        chain[0].labels.get("rise.dev/owner").map(String::as_str),
+        Some("group:platform")
+    );
+    assert_eq!(chain[0].revision, labeled.revision);
+
+    // Tombstoned ancestors are returned for the caller to interpret, matching
+    // resolve_path. An authorization caller must filter them itself.
+    let deep = create_child(&store, group.uid, "Widget", "w1", vec![]).await;
+    store
+        .update(
+            group.uid,
+            UpdateResourceParams {
+                finalizers: vec!["example.dev/keep".to_string()],
+                ..update_spec(group.revision, json!({}))
+            },
+        )
+        .await
+        .unwrap();
+    store.delete(group.uid).await.unwrap();
+    let chain = store.ancestors(deep.uid).await.unwrap();
+    assert_eq!(chain.len(), 3);
+    assert!(chain[1].deletion_timestamp.is_some());
+    Ok(())
+}
+
+#[sqlx::test]
+async fn policy_binding_collection_uses_the_parent_scoped_indexes(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    // The engine collects a resource's applicable bindings as two parent-keyed
+    // reads: org RoleBindings under the resource's Organization, and root
+    // PlatformRoleBindings. Both must stay index-served -- this is why the
+    // policy activation shipped without a dedicated binding index.
+    let store = PgResourceStore::new(pool.clone());
+    let acme = create_org(&store, "acme").await;
+    create_platform_role(&store, "resource-owner").await;
+    create_role(&store, acme.uid, "deploy-viewer").await;
+    create_builtin_resource(&store, USER_KIND, "alice", None, json!({}), vec![])
+        .await
+        .unwrap();
+    create_binding(
+        &store,
+        ROLE_BINDING_KIND,
+        "alice-viewer",
+        Some(acme.uid),
+        json!({
+            "subject": "user:alice",
+            "roleRef": {"kind": "Role", "name": "deploy-viewer"}
+        }),
+    )
+    .await
+    .unwrap();
+    create_binding(
+        &store,
+        PLATFORM_ROLE_BINDING_KIND,
+        "alice-platform",
+        None,
+        json!({
+            "subject": "user:alice",
+            "roleRef": {"kind": "PlatformRole", "name": "resource-owner"}
+        }),
+    )
+    .await
+    .unwrap();
+
+    let org_plan: String = sqlx::query_scalar::<_, String>(
+        r#"
+        EXPLAIN (FORMAT TEXT)
+        SELECT * FROM resource_store.resources
+        WHERE split_part(api_version, '/', 1) = 'rise.dev'
+          AND kind = 'RoleBinding'
+          AND parent_uid = $1
+        "#,
+    )
+    .bind(acme.uid)
+    .fetch_all(&pool)
+    .await?
+    .join("\n");
+    // Two indexes share the leading (parent_uid, group, kind) columns, so the
+    // planner may pick either; what matters is that neither read degrades to a
+    // sequential scan as the table grows.
+    assert!(
+        org_plan.contains("Index Scan")
+            && (org_plan.contains("resources_child_group_kind")
+                || org_plan.contains("resources_child_kind_name_unique")),
+        "org binding collection must be index-served; got:\n{org_plan}"
+    );
+
+    let platform_plan: String = sqlx::query_scalar::<_, String>(
+        r#"
+        EXPLAIN (FORMAT TEXT)
+        SELECT * FROM resource_store.resources
+        WHERE split_part(api_version, '/', 1) = 'rise.dev'
+          AND kind = 'PlatformRoleBinding'
+          AND parent_uid IS NULL
+        "#,
+    )
+    .fetch_all(&pool)
+    .await?
+    .join("\n");
+    assert!(
+        platform_plan.contains("Index Scan")
+            && (platform_plan.contains("resources_root_group_kind")
+                || platform_plan.contains("resources_root_kind_name_unique")),
+        "platform binding collection must be index-served; got:\n{platform_plan}"
     );
     Ok(())
 }

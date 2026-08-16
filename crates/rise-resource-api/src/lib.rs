@@ -127,6 +127,11 @@ pub struct ResourceMetadata {
     pub revision: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discriminator: Option<String>,
+    /// Targeting metadata. A key becomes access-relevant exactly when some
+    /// policy binding's `labelSelector` references it (ADR-0001 §6.1); no key
+    /// carries authorization meaning on its own.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
     #[serde(default)]
     pub annotations: BTreeMap<String, String>,
     #[serde(default)]
@@ -155,6 +160,8 @@ pub struct CreateResourceRequest<TSpec: Default = JsonObject> {
 pub struct CreateResourceMetadata {
     pub name: String,
     #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    #[serde(default)]
     pub annotations: BTreeMap<String, String>,
     #[serde(default)]
     pub finalizers: Vec<String>,
@@ -177,6 +184,8 @@ pub struct UpdateResourceRequest<TSpec: Default = JsonObject> {
 pub struct UpdateResourceMetadata {
     pub name: String,
     pub revision: i64,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
     #[serde(default)]
     pub annotations: BTreeMap<String, String>,
     #[serde(default)]
@@ -283,6 +292,33 @@ pub fn validate_resource_name(value: &str) -> Result<(), ValidationError> {
 /// DNS-subdomain form shared by every persisted resource identity.
 pub fn validate_resource_reference_name(value: &str) -> Result<(), ValidationError> {
     validate_dns_subdomain(value, "resource reference name")
+}
+
+/// Maximum bytes accepted in one label value, matching Kubernetes.
+pub const MAX_LABEL_VALUE_BYTES: usize = 63;
+
+/// Validate a resource's label map.
+///
+/// Keys use the same Kubernetes-shaped grammar a binding's `labelSelector`
+/// parses through, so a key that can be written can always be selected on.
+/// Values are bounded and single-line: a label is a targeting handle, not a
+/// place to store payload.
+pub fn validate_labels(labels: &BTreeMap<String, String>) -> Result<(), ValidationError> {
+    for (key, value) in labels {
+        key.parse::<LabelKey>()
+            .map_err(|error| ValidationError::new(format!("invalid label key '{key}': {error}")))?;
+        if value.len() > MAX_LABEL_VALUE_BYTES {
+            return Err(ValidationError::new(format!(
+                "label '{key}' value must not exceed {MAX_LABEL_VALUE_BYTES} bytes"
+            )));
+        }
+        if value.contains(['\n', '\r', '\0']) {
+            return Err(ValidationError::new(format!(
+                "label '{key}' value must not contain control characters"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub fn validate_discriminator(value: &str) -> Result<(), ValidationError> {
@@ -440,6 +476,45 @@ mod tests {
         assert!(validate_discriminator("abc123d-").is_err());
         assert!(validate_discriminator("abc123d").is_err());
         assert!(validate_discriminator("abc123def").is_err());
+    }
+
+    #[test]
+    fn validates_labels_against_the_selector_key_grammar() {
+        let ok = BTreeMap::from([
+            ("rise.dev/owner".to_string(), "group:platform".to_string()),
+            ("squad".to_string(), String::new()),
+            ("a.b.c/d_e.f-g".to_string(), "v".to_string()),
+        ]);
+        assert!(validate_labels(&ok).is_ok());
+        assert!(validate_labels(&BTreeMap::new()).is_ok());
+
+        // Any key a resource can carry must also be expressible as a binding's
+        // labelSelector key, so both parse through `LabelKey`.
+        for key in ["", "not a domain/owner", "rise.dev/owner-", "rise.dev/a/b"] {
+            let labels = BTreeMap::from([(key.to_string(), "v".to_string())]);
+            assert!(
+                validate_labels(&labels).is_err(),
+                "unexpectedly accepted key '{key}'"
+            );
+            assert!(key.parse::<LabelKey>().is_err(), "'{key}' must not parse");
+        }
+
+        for value in [
+            "v".repeat(MAX_LABEL_VALUE_BYTES + 1),
+            "line\nbreak".to_string(),
+            "carriage\rreturn".to_string(),
+            "nul\0byte".to_string(),
+        ] {
+            let labels = BTreeMap::from([("squad".to_string(), value.clone())]);
+            assert!(
+                validate_labels(&labels).is_err(),
+                "unexpectedly accepted value {value:?}"
+            );
+        }
+
+        // Exactly at the limit is fine.
+        let at_limit = BTreeMap::from([("squad".to_string(), "v".repeat(MAX_LABEL_VALUE_BYTES))]);
+        assert!(validate_labels(&at_limit).is_ok());
     }
 
     #[test]
