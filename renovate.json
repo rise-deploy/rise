@@ -35,6 +35,14 @@
       "description": "Group all GitHub Actions updates",
       "matchManagers": ["github-actions"],
       "groupName": "GitHub Actions"
+    },
+    {
+      "description": "Batch every example app dependency update into one PR on the first of the month. Must stay last so it overrides the per-ecosystem groups above for anything under example/.",
+      "matchFileNames": ["example/**"],
+      "groupName": "example dependencies",
+      "schedule": ["* * 1 * *"],
+      "separateMajorMinor": false,
+      "separateMinorPatch": false
     }
   ]
 }
