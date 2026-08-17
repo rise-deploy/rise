@@ -336,7 +336,7 @@ pub async fn list_projects(
 
     let user = auth.user()?;
     // Admins can see all projects, others only see projects they have access to
-    let projects = if state.is_admin(&user.email) {
+    let projects = if state.is_admin(user).await {
         projects::list(&state.db_pool, None)
             .await
             .internal_err("Failed to list projects")?
@@ -493,7 +493,7 @@ pub async fn list_team_projects(
     // the resolved team — otherwise we'd leak team existence by distinguishing
     // 200-empty from 404-not-found. Service-account access does not count,
     // matching the boundary intended for this endpoint.
-    if !state.is_admin(&user.email) {
+    if !state.is_admin(user).await {
         let is_member = db_teams::is_member(&state.db_pool, team_id, user.id)
             .await
             .internal_err("Failed to check team membership")?;
@@ -1217,7 +1217,7 @@ pub async fn ensure_project_access_or_admin(
     user: &User,
     project: &crate::db::models::Project,
 ) -> Result<(), ServerError> {
-    if state.is_admin(&user.email) {
+    if state.is_admin(user).await {
         return Ok(());
     }
 
@@ -1241,7 +1241,7 @@ pub async fn check_read_permission(
     user: &User,
 ) -> Result<bool, String> {
     // Admins have full access
-    if state.is_admin(&user.email) {
+    if state.is_admin(user).await {
         return Ok(true);
     }
 
@@ -1258,7 +1258,7 @@ pub async fn check_write_permission(
     user: &User,
 ) -> Result<bool, String> {
     // Admins have full access
-    if state.is_admin(&user.email) {
+    if state.is_admin(user).await {
         return Ok(true);
     }
 

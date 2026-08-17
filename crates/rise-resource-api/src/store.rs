@@ -27,6 +27,12 @@ pub enum StoreError {
     RevisionConflict { expected: i64, found: i64 },
     #[error("a resource with this name already exists in this scope")]
     NameConflict,
+    /// A uniqueness constraint other than the name was violated. Separate from
+    /// [`Self::Validation`] because the request is well-formed and the caller's
+    /// correct response is to reconcile with the existing resource, not to fix
+    /// the payload.
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("could not generate a unique discriminator after maximum retries")]
     DiscriminatorExhausted,
     #[error("path segment kind mismatch: expected '{expected}', got '{got}'")]
@@ -95,6 +101,7 @@ pub struct CreateResourceParams {
     pub kind: String,
     pub name: String,
     pub parent_uid: Option<Uuid>,
+    pub labels: BTreeMap<String, String>,
     pub annotations: BTreeMap<String, String>,
     pub finalizers: Vec<String>,
     pub owner_references: Vec<OwnerReference>,
@@ -109,6 +116,7 @@ impl Default for CreateResourceParams {
             kind: String::new(),
             name: String::new(),
             parent_uid: None,
+            labels: BTreeMap::new(),
             annotations: BTreeMap::new(),
             finalizers: Vec::new(),
             owner_references: Vec::new(),
@@ -125,6 +133,7 @@ pub struct UpdateResourceParams {
     /// `storage_api_version` before invoking the store.
     pub api_version: Option<String>,
     pub revision: i64,
+    pub labels: BTreeMap<String, String>,
     pub annotations: BTreeMap<String, String>,
     pub finalizers: Vec<String>,
     pub owner_references: Vec<OwnerReference>,
@@ -271,6 +280,15 @@ pub trait ResourceStore: Send + Sync {
     /// Tombstoned rows are returned for the caller to interpret. Empty paths
     /// return [`StoreError::EmptyPath`].
     async fn resolve_path(&self, segments: &[PathSegment]) -> Result<Vec<ResourceRow>, StoreError>;
+    /// Resolve a resource's structural ancestry by UID, root-first and
+    /// including the resource itself. An unknown UID returns an empty chain.
+    ///
+    /// This is the primitive `effectiveLabels` resolution walks (ADR-0001
+    /// §6.1): nearest-wins label inheritance is a pure function over this
+    /// chain, so it belongs to the caller rather than to SQL. Like
+    /// [`Self::resolve_path`], tombstoned rows are returned for the caller to
+    /// interpret.
+    async fn ancestors(&self, uid: Uuid) -> Result<Vec<ResourceRow>, StoreError>;
     /// Merge one allowed controller's value under `status.controllers`.
     async fn update_controller_status(
         &self,

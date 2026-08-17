@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+mod builtin_kind;
 mod identity;
 mod owner_reference;
 mod policy;
@@ -14,11 +15,11 @@ mod store;
 mod subject_id;
 mod subject_ref;
 
+pub use builtin_kind::{BuiltInKindDefinition, BuiltInKindParent};
 pub use identity::{
     ControllerSpec, ControllerTrustPolicySpec, ExternalSubject, GroupMembershipSpec, GroupSpec,
-    IdentityKindDefinition, IdentityKindParent, Issuer, ServiceAccountSpec,
-    ServiceAccountTrustPolicySpec, TrustPolicyClaims, UserIdentitySpec, UserSpec,
-    IDENTITY_KIND_DEFINITIONS, MAX_EXTERNAL_SUBJECT_CHARS, MAX_ISSUER_BYTES,
+    Issuer, ServiceAccountSpec, ServiceAccountTrustPolicySpec, TrustPolicyClaims, UserIdentitySpec,
+    UserSpec, IDENTITY_KIND_DEFINITIONS, MAX_EXTERNAL_SUBJECT_CHARS, MAX_ISSUER_BYTES,
 };
 pub use owner_reference::OwnerReference;
 pub use policy::{
@@ -26,7 +27,7 @@ pub use policy::{
     LocallyNormalizedPlatformRoleBindingSpec, LocallyNormalizedRoleBindingSpec,
     PlatformRoleBindingSpec, PlatformRoleRef, PlatformRoleRefKind, PolicyStatement,
     ResourceKindPattern, RoleBindingSpec, RoleRef, RoleRefKind, RoleSpec, SubjectMembership,
-    SubresourceMatcher, SubresourceName, Verb, VerbMatcher,
+    SubresourceMatcher, SubresourceName, Verb, VerbMatcher, POLICY_KIND_DEFINITIONS,
 };
 pub use resource_kind::ResourceKind;
 pub use resource_row::ResourceRow;
@@ -62,8 +63,8 @@ pub const PLATFORM_ROLE_COLLECTION: &str = "platformroles";
 pub const PLATFORM_ROLE_BINDING_KIND: &str = "PlatformRoleBinding";
 pub const PLATFORM_ROLE_BINDING_COLLECTION: &str = "platformrolebindings";
 
-// Identity resources are reserved before runtime registration so custom
-// ResourceDefinitions cannot claim the API identities that admission will own.
+// Identity resources are reserved for the runtime built-in registrations, so
+// custom ResourceDefinitions cannot claim the API identities admission owns.
 pub const USER_KIND: &str = "User";
 pub const USER_COLLECTION: &str = "users";
 pub const USER_IDENTITY_KIND: &str = "UserIdentity";
@@ -126,6 +127,11 @@ pub struct ResourceMetadata {
     pub revision: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discriminator: Option<String>,
+    /// Targeting metadata. A key becomes access-relevant exactly when some
+    /// policy binding's `labelSelector` references it (ADR-0001 §6.1); no key
+    /// carries authorization meaning on its own.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
     #[serde(default)]
     pub annotations: BTreeMap<String, String>,
     #[serde(default)]
@@ -154,6 +160,8 @@ pub struct CreateResourceRequest<TSpec: Default = JsonObject> {
 pub struct CreateResourceMetadata {
     pub name: String,
     #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    #[serde(default)]
     pub annotations: BTreeMap<String, String>,
     #[serde(default)]
     pub finalizers: Vec<String>,
@@ -176,6 +184,8 @@ pub struct UpdateResourceRequest<TSpec: Default = JsonObject> {
 pub struct UpdateResourceMetadata {
     pub name: String,
     pub revision: i64,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
     #[serde(default)]
     pub annotations: BTreeMap<String, String>,
     #[serde(default)]
@@ -282,6 +292,36 @@ pub fn validate_resource_name(value: &str) -> Result<(), ValidationError> {
 /// DNS-subdomain form shared by every persisted resource identity.
 pub fn validate_resource_reference_name(value: &str) -> Result<(), ValidationError> {
     validate_dns_subdomain(value, "resource reference name")
+}
+
+/// Maximum bytes accepted in one label value, matching Kubernetes.
+pub const MAX_LABEL_VALUE_BYTES: usize = 63;
+
+/// Validate a resource's label map.
+///
+/// Keys use the same Kubernetes-shaped grammar a binding's `labelSelector`
+/// parses through, so a key that can be written can always be selected on.
+/// Values are bounded and single-line: a label is a targeting handle, not a
+/// place to store payload.
+pub fn validate_labels(labels: &BTreeMap<String, String>) -> Result<(), ValidationError> {
+    for (key, value) in labels {
+        key.parse::<LabelKey>()
+            .map_err(|error| ValidationError::new(format!("invalid label key '{key}': {error}")))?;
+        if value.len() > MAX_LABEL_VALUE_BYTES {
+            return Err(ValidationError::new(format!(
+                "label '{key}' value must not exceed {MAX_LABEL_VALUE_BYTES} bytes"
+            )));
+        }
+        // Every Unicode control character, not just the newline family: a label
+        // value is echoed into selectors, audit records, and explain output,
+        // and no legitimate targeting handle contains one.
+        if value.chars().any(char::is_control) {
+            return Err(ValidationError::new(format!(
+                "label '{key}' value must not contain control characters"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub fn validate_discriminator(value: &str) -> Result<(), ValidationError> {
@@ -439,6 +479,49 @@ mod tests {
         assert!(validate_discriminator("abc123d-").is_err());
         assert!(validate_discriminator("abc123d").is_err());
         assert!(validate_discriminator("abc123def").is_err());
+    }
+
+    #[test]
+    fn validates_labels_against_the_selector_key_grammar() {
+        let ok = BTreeMap::from([
+            ("rise.dev/owner".to_string(), "group:platform".to_string()),
+            ("squad".to_string(), String::new()),
+            ("a.b.c/d_e.f-g".to_string(), "v".to_string()),
+        ]);
+        assert!(validate_labels(&ok).is_ok());
+        assert!(validate_labels(&BTreeMap::new()).is_ok());
+
+        // Any key a resource can carry must also be expressible as a binding's
+        // labelSelector key, so both parse through `LabelKey`.
+        for key in ["", "not a domain/owner", "rise.dev/owner-", "rise.dev/a/b"] {
+            let labels = BTreeMap::from([(key.to_string(), "v".to_string())]);
+            assert!(
+                validate_labels(&labels).is_err(),
+                "unexpectedly accepted key '{key}'"
+            );
+            assert!(key.parse::<LabelKey>().is_err(), "'{key}' must not parse");
+        }
+
+        for value in [
+            "v".repeat(MAX_LABEL_VALUE_BYTES + 1),
+            "line\nbreak".to_string(),
+            "carriage\rreturn".to_string(),
+            "nul\0byte".to_string(),
+            "tab\tseparated".to_string(),
+            "escape\u{001b}[0m".to_string(),
+            "delete\u{007f}char".to_string(),
+            "c1\u{0085}next-line".to_string(),
+        ] {
+            let labels = BTreeMap::from([("squad".to_string(), value.clone())]);
+            assert!(
+                validate_labels(&labels).is_err(),
+                "unexpectedly accepted value {value:?}"
+            );
+        }
+
+        // Exactly at the limit is fine.
+        let at_limit = BTreeMap::from([("squad".to_string(), "v".repeat(MAX_LABEL_VALUE_BYTES))]);
+        assert!(validate_labels(&at_limit).is_ok());
     }
 
     #[test]

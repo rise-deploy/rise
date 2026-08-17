@@ -76,7 +76,7 @@ Focused support crates live under `crates/`:
 | `rise-backend-auth` | Pure-core token signing, verification, and claim matching — the single home for auth-token logic (see `ROADMAP.md` § 2, "Rise-issued authentication and token issuance") | `backend` |
 | `rise-backend-core` | The deployment-backend contract seam: shared deployment models, the `DeploymentBackend` trait, registry/encryption provider traits, the pure `quantity`/`state_machine`/`runtime`/`url_builder`/`token_ttl`/`custom_domain` helpers, and the `DeploymentStore` trait — the database boundary implemented by `rise-deploy`'s `PgDeploymentStore` | `backend` |
 | `rise-backend-docker` | The Docker deployment backend: `DockerBackend` + the in-process `DockerReconciler`, the first controller extracted onto the `rise-backend-core` seam. Re-exported under `crate::server::deployment::controller::docker`, so existing module paths keep resolving | `backend` |
-| `rise-authz` | Authorization policy evaluation. `policy` is a hard Tier-0 boundary: pure functions and canonical values only — no store, database, HTTP, or product-resource dependencies | `backend` |
+| `rise-authz` | Authorization policy evaluation, in two tiers. `policy` is a hard Tier-0 boundary: pure functions and canonical values only — no store, database, HTTP, or product-resource dependencies. `engine` is Tier 1: the live ADR-0001 §4 algorithm over `ResourceStore` reads and one `MembershipResolver` seam — still free of HTTP, SQL, and product kinds | `backend` |
 | `rise-resource-api` | Generic resource API contract (resource kinds, scopes, owner references, identity, policy types) | `backend` |
 | `rise-resource-store-postgres` | PostgreSQL adapter for the resource API. Owns its own migrations in a `resource_store` schema and its own SQLX offline cache | `backend` |
 | `rise-runtime-sync` | Postgres-backed cross-replica primitives: `GlobalLock`, `LeaderElection`, `GlobalSchedule`. Owns its own migrations in a `runtime_sync` schema and its own SQLX offline cache | `backend` |
@@ -237,6 +237,51 @@ Serve them locally with `mise run docs:serve` / `mise run docs:engineering:serve
 - The default development branch is `develop`. PRs for feature work should target `develop`, not `main`.
 - Always target the branch your feature branch was created from when opening a PR.
 
+## Database Migrations
+
+A migration becomes immutable when it ships in a **release**, not when it merges
+to `develop`.
+
+- **Unreleased** (merged to `develop` or not): fully editable. Rewrite the file,
+  renumber it, split it, delete it, or **collapse a whole series into one** —
+  whatever leaves the clearest final schema. Don't stack a corrective migration
+  on top of an unreleased one, and don't preserve an increment just because it
+  was reviewed separately; the migration history is a means, not a record.
+- **Released**: the file is frozen. Change it only by adding a new migration.
+
+**Release candidates count as releases here** — an `-rc` tag can be deployed, so
+a migration that ships in one is frozen.
+
+To check which side a migration is on, look for it in every tag's tree:
+
+```bash
+BASE=20260519000000_create_resource_store.sql
+for t in $(git tag --list 'v*'); do
+  git ls-tree -r --name-only "$t" | grep -q "/$BASE\$" && echo "$t"
+done
+# no output = in no release = editable
+```
+
+Match on the basename, not the full path, so a crate rename doesn't hide a
+released migration. Don't reach for `git tag --contains <adding-commit>`: it
+reports "unreleased" for migrations that really did ship, because release tags
+do not necessarily descend from the `develop` commit that added the file. And
+don't pick a "latest tag" with `sort -V` — it orders `v0.23.0-rc4` *after*
+`v0.23.0`.
+
+SQLX records a checksum per migration, so editing one a database has already
+applied fails startup with `VersionMismatch` ("previously applied but has been
+modified"), and removing one fails with `VersionMissing`. That is exactly why
+the released/unreleased line matters — and why it is drawn at *release*, not at
+*merge*: before a release, the only databases holding the old shape are
+development and CI ones that can be rebuilt.
+
+Rebuilding after an edit or collapse: drop what the migrations created and let
+them re-run. For the resource store that is `DROP SCHEMA resource_store
+CASCADE;` — its migration bookkeeping lives in that schema, so dropping it
+clears both. For the main crate, delete the affected rows from `_sqlx_migrations`
+and drop whatever the migration created.
+
 ## Rollout Tracking
 
 High-impact, multi-PR, or operator-affecting changes are tracked in the **Rise
@@ -280,6 +325,7 @@ Keep it current as work merges:
 - Don't reference previous versions of the code in comments, docs, or commit-independent artifacts (e.g. "the previous design did X", "vs the old tick counter", "this used to be Y"). Comments must describe what the code does *now* and why — a reader has no access to the version you're contrasting against, and such notes rot. Git history is the place for that context. (Referring to runtime/domain concepts like "the previous leader replica" is fine — that's not code history.)
 - The CLI should first and foremost always accept the names of things (e.g. project names, or project names + deployment timestamp). The UUIDs in our tables are only for internal book-keeping.
 - Admin users (`auth.admin_users`) bypass the regular permission checks on the typed APIs (projects, teams, deployments, etc.) — they have full access there without passing ownership/membership checks. This does **not** extend to the generic resource API (`/api/v1/resources`), which is operator-gated (`auth.operator_users`): admins are not operators and do not bypass its checks. Granting admins access to the resource API is intentionally deferred (see `ROADMAP.md`).
+- Both roles can also be granted by IdP group (`auth.admin_idp_groups`, `auth.operator_idp_groups`), as can platform access (`auth.platform_access.allowed_idp_groups`). Group matching resolves against the user's **IdP-managed** teams — the ones `sync_user_groups`/the Entra sync mirror from the IdP's `groups` claim — never against teams users create themselves. `src/server/auth/roles.rs` owns that resolution; role checks go through `AppState::is_admin`/`is_operator`, which are async because a configured group list means a DB lookup.
 - In `rise-deploy`, all SQLX queries must be wrapped by helper functions in the `src/db/` module — no SQLX queries elsewhere in the crate's production code. The support crates that own their own schema and migrations (`rise-resource-store-postgres`, `rise-runtime-sync`) are the exception: their queries live in the crate that owns the tables, alongside its own migrations and offline query cache.
 - When we log errors and don't handle them further, we should include a sensible amount of information about the error. Often logging the error with `{:?}` is good enough.
 - When capturing screenshots, the playwright tool will successfully install the driver even if you might think its install step failed. Always use minimum 1280px width and 800px height for the browser.

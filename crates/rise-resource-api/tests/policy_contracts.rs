@@ -1,6 +1,8 @@
 use jsonschema::validator_for;
 use rise_resource_api::{
     BindingSubject, PlatformRoleBindingSpec, RoleBindingSpec, SubjectMembership,
+    API_VERSION_V1ALPHA1, ORGANIZATION_KIND, PLATFORM_ROLE_BINDING_KIND, PLATFORM_ROLE_KIND,
+    POLICY_KIND_DEFINITIONS, ROLE_BINDING_KIND, ROLE_KIND,
 };
 use schemars::{schema_for, JsonSchema};
 use serde_json::{json, Value};
@@ -237,7 +239,7 @@ fn generated_binding_schemas_match_omission_and_null_rules() {
 }
 
 #[test]
-fn future_policy_collections_are_reserved_before_registration() {
+fn policy_collections_are_reserved_against_external_definitions() {
     for collection in [
         rise_resource_api::ROLE_COLLECTION,
         rise_resource_api::ROLE_BINDING_COLLECTION,
@@ -245,5 +247,36 @@ fn future_policy_collections_are_reserved_before_registration() {
         rise_resource_api::PLATFORM_ROLE_BINDING_COLLECTION,
     ] {
         assert!(rise_resource_api::is_reserved_collection_name(collection));
+    }
+}
+
+#[test]
+fn policy_kind_definitions_capture_fixed_adr_placement() {
+    // Two same-shaped pairs, one per placement level: the org pair hangs under
+    // an Organization, the platform pair at the root (ADR-0001 §3).
+    let definitions: Vec<_> = POLICY_KIND_DEFINITIONS
+        .iter()
+        .map(|definition| {
+            (
+                definition.kind,
+                definition.collection,
+                definition.parent.map(|parent| parent.kind),
+            )
+        })
+        .collect();
+    assert_eq!(
+        definitions,
+        vec![
+            (ROLE_KIND, "roles", Some(ORGANIZATION_KIND)),
+            (ROLE_BINDING_KIND, "rolebindings", Some(ORGANIZATION_KIND)),
+            (PLATFORM_ROLE_KIND, "platformroles", None),
+            (PLATFORM_ROLE_BINDING_KIND, "platformrolebindings", None),
+        ]
+    );
+    for definition in POLICY_KIND_DEFINITIONS {
+        assert_eq!(definition.api_version, API_VERSION_V1ALPHA1);
+        if let Some(parent) = definition.parent {
+            assert_eq!(parent.api_version, API_VERSION_V1ALPHA1);
+        }
     }
 }

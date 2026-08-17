@@ -204,7 +204,9 @@ auth:
                                 # does not use refresh tokens, and some providers
                                 # such as Google reject it); add it here if needed.
   admin_users: ["email@..."]    # Default-organization admin emails (array)
+  admin_idp_groups: ["..."]     # IdP groups whose members are admins (array, optional)
   operator_users: ["ops@..."]   # Operator role allowlist (array, optional)
+  operator_idp_groups: ["..."]  # IdP groups whose members are Operators (array, optional)
   controllers: []               # Trusted external controller identities (array, optional)
   allow_team_creation: true     # Allow regular users to create teams (default: true)
                                 # When false, only admins can create teams
@@ -213,6 +215,35 @@ auth:
 **Roles:**
 - `admin_users`: Admins of the default organization. Admins do **not** implicitly receive the Operator role.
 - `operator_users`: Operators have full access to generic resource storage and built-in resource management. Operators do **not** implicitly receive platform (typed CLI/UI) access — list the email in `admin_users` or `platform_access.allowed_user_emails` separately if both are needed.
+
+Both roles can also be granted by IdP group, so the IdP stays the source of
+truth and adding an admin does not require a config change and a restart:
+
+```yaml
+auth:
+  admin_idp_groups:
+    - "platform-admins"
+  operator_idp_groups:
+    - "platform-operators"
+```
+
+A user holds the role if their email is on the allowlist **or** they are in one
+of the listed groups. Group names match case-insensitively. Users granted a role
+by group bypass `platform_access` exactly as email-listed users do.
+
+**How group membership is resolved.** Rise sees the IdP's `groups` claim at
+login and mirrors it into IdP-managed teams (`sync_user_groups`, and the Entra
+active sync when enabled); those teams are what the group checks read. Two
+consequences:
+
+- Only **IdP-managed** teams count. A team a user creates themselves never
+  grants a role, even if its name matches a configured group — otherwise
+  self-service team creation would be a path to admin.
+- Membership refreshes at login. Removing a user from a group in the IdP takes
+  effect on their next login (or on the next Entra active sync), not
+  immediately. Revoke access that must take effect at once in the IdP itself.
+
+The same resolution backs `platform_access.allowed_idp_groups`.
 
 **Controllers (`auth.controllers`):**
 Trusted external controllers authenticate to Rise with OIDC JWTs. Each entry registers a `ControllerIdentity` that controller endpoints use to validate incoming tokens. Controller endpoints are not yet available; this configuration takes effect when the generic resource API is introduced in a future release. Use a dedicated issuer or a dedicated audience per controller to keep identities unambiguous.
