@@ -485,9 +485,11 @@ is a silent user-visible regression rather than a deferred feature.
 
 ## References
 
-- ADR-0001 §collection authorization — per-item `list` filtering, the response
-  projector's base-field allowlist, and existence masking.
-- ADR-0002 — the subresource execution seam a family list is *not* part of.
+- [ADR-0001: Unified Permission Model](./0001-unified-permission-model.md) —
+  per-item `list` filtering, the response projector's base-field allowlist,
+  existence masking, and the declared-reference `use` rule.
+- [ADR-0002: Generic Resource Subresource Execution Model](./0002-generic-resource-subresource-execution-model.md)
+  — the execution seam a family list is *not* part of.
 - `ROADMAP.md` §4, Typed-object migration — the extension-kind migration this
   decision must precede.
 - [Generic resource API](../generic-resource-api.md) — path grammar, parent
