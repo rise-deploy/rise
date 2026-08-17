@@ -312,7 +312,10 @@ pub fn validate_labels(labels: &BTreeMap<String, String>) -> Result<(), Validati
                 "label '{key}' value must not exceed {MAX_LABEL_VALUE_BYTES} bytes"
             )));
         }
-        if value.contains(['\n', '\r', '\0']) {
+        // Every Unicode control character, not just the newline family: a label
+        // value is echoed into selectors, audit records, and explain output,
+        // and no legitimate targeting handle contains one.
+        if value.chars().any(char::is_control) {
             return Err(ValidationError::new(format!(
                 "label '{key}' value must not contain control characters"
             )));
@@ -504,6 +507,10 @@ mod tests {
             "line\nbreak".to_string(),
             "carriage\rreturn".to_string(),
             "nul\0byte".to_string(),
+            "tab\tseparated".to_string(),
+            "escape\u{001b}[0m".to_string(),
+            "delete\u{007f}char".to_string(),
+            "c1\u{0085}next-line".to_string(),
         ] {
             let labels = BTreeMap::from([("squad".to_string(), value.clone())]);
             assert!(
