@@ -67,6 +67,9 @@ impl ResourceStore for FakeStore {
         }
         Ok(vec![])
     }
+    async fn ancestors(&self, _: Uuid) -> Result<Vec<ResourceRow>, StoreError> {
+        Ok(vec![])
+    }
     async fn update_controller_status(
         &self,
         _: Uuid,
@@ -187,6 +190,7 @@ fn row(
         parent_uid: None,
         name: "widget-a".into(),
         discriminator: "abc123de".into(),
+        labels: Default::default(),
         metadata,
         spec,
         status,

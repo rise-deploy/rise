@@ -65,6 +65,13 @@
           },
           "type": "array"
         },
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Targeting metadata. A key becomes access-relevant exactly when some\npolicy binding's `labelSelector` references it (ADR-0001 §6.1); no key\ncarries authorization meaning on its own.",
+          "type": "object"
+        },
         "name": {
           "type": "string"
         },

@@ -13,6 +13,9 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
 - [ADR-0002: Generic Resource Subresource Execution Model](docs/engineering/src/content/docs/adr/0002-generic-resource-subresource-execution-model.md)
   is Draft and defines the intended execution seam for `status`,
   `finalizers`, `token`, and future generated or streaming subresources.
+- [ADR-0003: Resource Families](docs/engineering/src/content/docs/adr/0003-resource-families.md)
+  groups kinds that share a name pool and list as a unit; it gates the
+  extension-kind migration in §4.
 - Where shipped compatibility behavior differs from an ADR, it is transitional;
   new work converges on the ADR rather than extending the old shape.
 
@@ -31,14 +34,14 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
 - [x] Move the dep-light `ResourceStore` contract and canonical `SubjectId`,
   dynamic-label `SubjectRef`, group-qualified `ResourceKind`, and `Scope` types into `rise-resource-api`;
   keep SQLX and Postgres adapters in `rise-resource-store-postgres`.
-- [~] Implement policy types and validation for `Role`, `RoleBinding`,
+- [x] Implement policy types and validation for `Role`, `RoleBinding`,
   `PlatformRole`, and `PlatformRoleBinding`: structured `roleRef`, one
   subject per binding, normalized PascalCase `subjectMembership: Any |
   ResourceOrganization` on platform bindings (omission becomes `Any`; null is
   invalid), canonical scopes, pure Allow/Deny tuple evaluation, placement
   provenance, wildcard replacement, and Deny-aware subset checks. Activate
   these resources only through transaction-scoped normalization/admission.
-- [~] Add closed contracts for the built-in identity resources: root `User`
+- [x] Add closed contracts for the built-in identity resources: root `User`
   and `Controller`; Organization-owned `Group` and `ServiceAccount`; and
   fixed-parent
   `UserIdentity`, `GroupMembership`, `ControllerTrustPolicy`, and
@@ -47,31 +50,42 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
   GroupMembership is an empty marker named for its User.
   Reserve their collection definitions now, but activate them only through the
   transaction-scoped normalization/admission seam.
-- [~] Add optional, UID-authoritative `metadata.ownerReferences` to the generic
+- [x] Add optional, UID-authoritative `metadata.ownerReferences` to the generic
   resource envelope and implement transactional reverse lookup, cycle-safe,
   finalizer-respecting dependent garbage collection. GroupMembership may name
   its User as lifecycle owner; backend-managed memberships normally do so,
   while operator-managed markers may intentionally remain unowned. Land this
   before GroupMembership runtime activation.
-- [ ] Add partial Postgres indexes for unique external User mappings,
+- [x] Add partial Postgres indexes for unique external User mappings,
   target-parent workload trust lookup, and reverse name-based membership edges.
   These remain internal storage projections and do not change the generic
   resource API shape.
-- [ ] Implement live membership expansion, per-item list filtering/projection,
+- [~] Implement live membership expansion, per-item list filtering/projection,
   effective-label resolution, typed `SubjectRef` values for dynamic ownership,
   tiered platform/org Deny filtering, admin/operator classification, platform
   ceilings, and the centralized authorization choke point replacing
   `require_operator`. Once Controller writes use that path, remove
   `ResourceDefinition.allowedStatusControllerIds` and authorize `status` and
   `finalizers` exclusively through RBAC.
-- [ ] Add Role/policy audit and explain diagnostics for semantically inert
+- [~] Add Role/policy audit and explain diagnostics for semantically inert
   configuration: no-op recipient or membership constraints, owners with no
   current grant, selectors matching nothing, stale references, and shadowed
   Allows. Keep these out of synchronous write rejection when the grant delta is
   safely empty.
-- [ ] Add request-local `AuthorizationSnapshot` memoization for membership,
+- [x] Add request-local `AuthorizationSnapshot` memoization for membership,
   admin classification, and effective policies. Defer cross-request caching
   until it can be invalidated transactionally through an authorization epoch.
+- [ ] Decide cross-request authorization caching on measurement, not ahead of
+  it. The request-local snapshot already removes the repeated cost inside one
+  request; what remains is one role lookup per distinct `roleRef` on a
+  snapshot's first evaluation, which batching fixes with no schema commitment —
+  do that first. Only if authorization is still a measurable share of request
+  time once the typed-object migration (§4) puts real traffic on the engine
+  should a cross-request cache land, and then through a transactionally
+  incremented global `authorization_epoch` keyed by at least principal UID,
+  token-cap hash, epoch, and resource identity. A write path that forgets to
+  bump the epoch is a stale-authorization bug no test will surface, which is
+  why the measurement comes first.
 - [ ] Implement the write-time grant gate for Roles, bindings, membership,
   identity mappings, and access-driving labels. All authorization-changing
   writes use serializable transactions with bounded retry.
@@ -101,6 +115,15 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
 
 ### Resource API maturation
 
+- [ ] Reject `create` below an ancestor that is already tombstoned. Built-in
+  placement validation walks the whole chain and refuses a deleting ancestor;
+  `ResourceDefinition`-registered kinds have no equivalent check, so a create
+  can still add a child to a subtree the garbage collector is draining.
+  Creation is the case that matters, and it matters most under a deleting
+  Organization, whose policy resources are tombstoned with it while an
+  operator-authored platform grant survives. Reads, `delete`, and the
+  `status`/`finalizers` subresources must keep working, or controllers cannot
+  remove their finalizers and the subtree never drains.
 - [ ] Add pagination plus label/field selectors. Labels remain JSONB initially;
   measure before introducing a separate label table.
 - [ ] Add JSON Merge Patch and RFC 6902 Patch through the common mutation
@@ -185,7 +208,12 @@ Ordering: the built-in registry enables data-plane migration; unified RBAC
 must land before user-facing routes flip to the generic API. Pagination/Watch
 and secret handling remain kind-specific prerequisites.
 
-- [ ] Migrate extension kinds to external `ResourceDefinition` resources;
+- [ ] Implement resource families (ADR-0003): `ResourceFamily`, the family
+  name pool, the unversioned family collection route, and printer columns.
+  A family cannot be retrofitted onto kinds that already have instances, so
+  this lands **before** the extension migration below.
+- [ ] Migrate extension kinds to external `ResourceDefinition` resources under
+  the `Extension` family, preserving today's per-project extension name pool;
   secret-bearing extensions wait for encrypted fields.
 - [ ] Migrate `Project` (Organization child) and `Environment` (Project
   child) as built-ins. Authorization ownership is `rise.dev/owner` plus policy;

@@ -1,29 +1,28 @@
 //! Built-in resource registry.
 //!
-//! `Organization` and `ResourceDefinition` are first-class resource kinds owned
-//! by Rise itself: they have typed Rust validators, their identity (group,
-//! version, kind, plural) is fixed at compile time, and they have no row in
-//! the `resource_definitions` projection table. Routing for these kinds is
+//! Rise's structural, identity, and policy built-ins are first-class resource
+//! kinds owned by Rise itself: they have typed Rust validators, their identity
+//! (group, version, kind, plural) is fixed at compile time, and they have no row
+//! in the `resource_definitions` projection table. Routing for these kinds is
 //! resolved through this registry instead of through the database.
 //!
 //! The registry is the single source of truth for "what built-ins does this
 //! store recognise?" The pre-registry implementation matched on hardcoded
-//! collection strings in `PgResourceStore`; adding a new built-in (e.g.
-//! `Project`, `Environment`, `Deployment`, `ServiceAccount` in the upcoming
-//! migration PRs) meant copying two `match` arms in two methods. The registry
+//! collection strings in `PgResourceStore`; adding a new built-in meant copying
+//! two `match` arms in two methods. The registry
 //! collapses that to a single [`BuiltInRegistration`].
 //!
-//! See [`ROADMAP.md`](../../../ROADMAP.md) § "PR A1".
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use rise_resource_api::{
-    CollectionInfo, ResourceParentRef, SpecValidator, API_VERSION_V1ALPHA1,
-    ORGANIZATION_COLLECTION, ORGANIZATION_KIND, RESOURCE_DEFINITION_COLLECTION,
-    RESOURCE_DEFINITION_KIND,
+    BuiltInKindDefinition, CollectionInfo, ResourceParentRef, SpecValidator, API_VERSION_V1ALPHA1,
+    IDENTITY_KIND_DEFINITIONS, ORGANIZATION_COLLECTION, ORGANIZATION_KIND, POLICY_KIND_DEFINITIONS,
+    RESOURCE_DEFINITION_COLLECTION, RESOURCE_DEFINITION_KIND,
 };
 
+use crate::admission::{BuiltInAdmission, BuiltInSpecValidator};
 use crate::validation::{OrganizationValidator, ResourceDefinitionValidator};
 
 /// Static description of one built-in resource kind.
@@ -115,8 +114,7 @@ impl BuiltInRegistry {
 
     /// Construct the registry with every Rise built-in. The canonical set.
     ///
-    /// New built-in kinds (Project, Environment, Deployment, ServiceAccount —
-    /// see roadmap PR B2/B3/B4) get added here in one place.
+    /// New built-in kinds get added here in one place.
     pub fn defaults() -> Self {
         let mut r = Self::empty();
         r.register(BuiltInRegistration {
@@ -133,7 +131,30 @@ impl BuiltInRegistry {
             parent: None,
             spec_validator: Arc::new(ResourceDefinitionValidator),
         });
+        for definition in IDENTITY_KIND_DEFINITIONS
+            .iter()
+            .chain(&POLICY_KIND_DEFINITIONS)
+        {
+            r.register(Self::admitted(definition));
+        }
         r
+    }
+
+    /// Build the registration for a built-in whose contract is enforced by the
+    /// typed admission seam rather than by a JSON Schema.
+    fn admitted(definition: &BuiltInKindDefinition) -> BuiltInRegistration {
+        let admission = BuiltInAdmission::for_kind(definition.api_version, definition.kind)
+            .expect("every identity and policy definition has typed admission");
+        BuiltInRegistration {
+            collection: definition.collection,
+            api_version: definition.api_version,
+            kind: definition.kind,
+            parent: definition.parent.map(|parent| ResourceParentRef {
+                api_version: parent.api_version.to_string(),
+                kind: parent.kind.to_string(),
+            }),
+            spec_validator: Arc::new(BuiltInSpecValidator(admission)),
+        }
     }
 
     /// Insert a registration. Panics on:
@@ -186,6 +207,18 @@ impl BuiltInRegistry {
             .and_then(|c| self.by_collection.get(c))
     }
 
+    /// Look up only an exact built-in storage identity. A different version of
+    /// the reserved group/kind is not silently treated as a custom resource.
+    pub(crate) fn lookup_exact(
+        &self,
+        api_version: &str,
+        kind: &str,
+    ) -> Option<&BuiltInRegistration> {
+        let (group, _) = api_version.split_once('/')?;
+        self.lookup_by_group_kind(group, kind)
+            .filter(|registration| registration.api_version == api_version)
+    }
+
     /// Iterate every registered built-in. Order is unspecified; callers that
     /// need a stable order should sort by `collection` themselves.
     pub fn iter(&self) -> impl Iterator<Item = &BuiltInRegistration> {
@@ -215,14 +248,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_register_organization_and_resource_definition() {
+    fn defaults_register_structural_identity_and_policy_builtins() {
         let r = BuiltInRegistry::defaults();
-        assert_eq!(r.len(), 2);
+        assert_eq!(
+            r.len(),
+            2 + IDENTITY_KIND_DEFINITIONS.len() + POLICY_KIND_DEFINITIONS.len()
+        );
         assert!(r.lookup_collection(ORGANIZATION_COLLECTION).is_some());
         assert!(r
             .lookup_collection(RESOURCE_DEFINITION_COLLECTION)
             .is_some());
         assert!(r.lookup_collection("unknown").is_none());
+        for definition in IDENTITY_KIND_DEFINITIONS
+            .iter()
+            .chain(&POLICY_KIND_DEFINITIONS)
+        {
+            let registration = r
+                .lookup_collection(definition.collection)
+                .expect("built-in collection is active");
+            assert_eq!(registration.api_version, definition.api_version);
+            assert_eq!(registration.kind, definition.kind);
+            assert_eq!(
+                registration
+                    .parent
+                    .as_ref()
+                    .map(|parent| (parent.api_version.as_str(), parent.kind.as_str())),
+                definition
+                    .parent
+                    .map(|parent| (parent.api_version, parent.kind))
+            );
+        }
     }
 
     #[test]
@@ -333,9 +388,14 @@ mod tests {
         let r = BuiltInRegistry::defaults();
         let mut collections: Vec<&str> = r.iter().map(|reg| reg.collection).collect();
         collections.sort_unstable();
-        assert_eq!(
-            collections,
-            vec![ORGANIZATION_COLLECTION, RESOURCE_DEFINITION_COLLECTION]
+        let mut expected = vec![ORGANIZATION_COLLECTION, RESOURCE_DEFINITION_COLLECTION];
+        expected.extend(
+            IDENTITY_KIND_DEFINITIONS
+                .iter()
+                .chain(&POLICY_KIND_DEFINITIONS)
+                .map(|definition| definition.collection),
         );
+        expected.sort_unstable();
+        assert_eq!(collections, expected);
     }
 }

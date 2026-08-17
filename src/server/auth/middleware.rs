@@ -141,10 +141,6 @@ pub async fn auth_middleware(
                 let email = &claims.email;
                 tracing::debug!("Rise session JWT validated for user");
 
-                // Extract groups from Rise JWT for platform access checks
-                let groups = claims.groups.clone();
-                req.extensions_mut().insert(groups);
-
                 // CRITICAL: user creation and default-Organization membership must
                 // happen in a single transaction so bootstrap's validation pass
                 // never sees a user row without a membership.
@@ -393,21 +389,32 @@ pub async fn platform_access_middleware(
         )
     })?;
 
-    // Extract groups from request extensions (stored by auth_middleware)
-    let groups = req.extensions().get::<Option<Vec<String>>>();
+    // Resolve the user's IdP groups. Only needed when some group list is
+    // configured, so an install that grants access by email alone never pays
+    // for the query.
+    let needs_groups = !state
+        .auth_settings
+        .platform_access
+        .allowed_idp_groups
+        .is_empty()
+        || !state.admin_idp_groups.is_empty()
+        || !state.operator_idp_groups.is_empty();
+    let groups = if needs_groups {
+        crate::server::auth::roles::resolve_idp_groups(&state.db_pool, user.id).await
+    } else {
+        Vec::new()
+    };
 
     // Check platform access dynamically
     let checker = ConfigBasedAccessChecker {
         config: &state.auth_settings.platform_access,
         admin_users: &state.admin_users,
+        admin_idp_groups: &state.admin_idp_groups,
         operator_users: &state.operator_users,
+        operator_idp_groups: &state.operator_idp_groups,
     };
 
-    // Pass groups from Rise JWT to platform access checker
-    if !checker.has_platform_access(
-        user,
-        groups.as_ref().and_then(|g| g.as_ref().map(|v| v.as_ref())),
-    ) {
+    if !checker.has_platform_access(user, &groups) {
         tracing::warn!(
             user_id = %user.id,
             user_email = %user.email,

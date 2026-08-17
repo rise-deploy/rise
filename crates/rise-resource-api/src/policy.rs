@@ -5,10 +5,45 @@ use std::str::FromStr;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::builtin_kind::ORGANIZATION_PARENT;
 use crate::{
-    validate_resource_group, validate_resource_name, ResourceKind, Scope, SubjectId,
-    ValidationError,
+    validate_resource_group, validate_resource_name, BuiltInKindDefinition, ResourceKind, Scope,
+    SubjectId, ValidationError, API_VERSION_V1ALPHA1, PLATFORM_ROLE_BINDING_COLLECTION,
+    PLATFORM_ROLE_BINDING_KIND, PLATFORM_ROLE_COLLECTION, PLATFORM_ROLE_KIND,
+    ROLE_BINDING_COLLECTION, ROLE_BINDING_KIND, ROLE_COLLECTION, ROLE_KIND,
 };
+
+/// All persisted ADR-0001 policy kinds and their fixed placement.
+///
+/// The parent model is exact, so each policy object comes as an
+/// organization-parented and a root-parented kind rather than one kind with a
+/// choice of parents (ADR-0001 §3).
+pub const POLICY_KIND_DEFINITIONS: [BuiltInKindDefinition; 4] = [
+    BuiltInKindDefinition {
+        api_version: API_VERSION_V1ALPHA1,
+        kind: ROLE_KIND,
+        collection: ROLE_COLLECTION,
+        parent: Some(ORGANIZATION_PARENT),
+    },
+    BuiltInKindDefinition {
+        api_version: API_VERSION_V1ALPHA1,
+        kind: ROLE_BINDING_KIND,
+        collection: ROLE_BINDING_COLLECTION,
+        parent: Some(ORGANIZATION_PARENT),
+    },
+    BuiltInKindDefinition {
+        api_version: API_VERSION_V1ALPHA1,
+        kind: PLATFORM_ROLE_KIND,
+        collection: PLATFORM_ROLE_COLLECTION,
+        parent: None,
+    },
+    BuiltInKindDefinition {
+        api_version: API_VERSION_V1ALPHA1,
+        kind: PLATFORM_ROLE_BINDING_KIND,
+        collection: PLATFORM_ROLE_BINDING_COLLECTION,
+        parent: None,
+    },
+];
 
 macro_rules! string_serde {
     ($type:ty) => {
@@ -564,7 +599,12 @@ pub struct PlatformRoleBindingSpec {
     pub role_ref: PlatformRoleRef,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+/// A persisted org `RoleBinding` spec: every contextual default already applied.
+///
+/// Deserialization is how the authorization engine reads stored bindings back.
+/// `scope` is required here — admission always persists it — so a row missing
+/// it fails closed instead of being silently re-defaulted at evaluation time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LocallyNormalizedRoleBindingSpec {
     subject: BindingSubject,
@@ -575,7 +615,12 @@ pub struct LocallyNormalizedRoleBindingSpec {
     role_ref: RoleRef,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+/// A persisted `PlatformRoleBinding` spec: every contextual default applied.
+///
+/// `subjectMembership` is required on read for the same reason `scope` is:
+/// admission normalizes an omitted value to `Any` before persisting, so an
+/// absent field means a row that never passed admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LocallyNormalizedPlatformRoleBindingSpec {
     subject: BindingSubject,

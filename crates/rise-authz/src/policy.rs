@@ -156,18 +156,11 @@ pub struct StatementContribution<P> {
 pub fn apply_wildcard_replacement<P: Clone>(
     bindings: &[ApplicableBinding<P>],
 ) -> Vec<StatementContribution<P>> {
+    let suppressed = wildcard_allows_suppressed(bindings);
     let mut contributions = Vec::new();
-    for binding in bindings {
-        let replace_wildcard_allows = binding.scope.is_wildcard()
-            && bindings.iter().any(|candidate| {
-                !candidate.scope.is_wildcard()
-                    && candidate.subject == binding.subject
-                    && selector_key(candidate.selector.as_ref())
-                        == selector_key(binding.selector.as_ref())
-            });
-
+    for (binding, suppressed) in bindings.iter().zip(suppressed) {
         for statement in &binding.statements {
-            if replace_wildcard_allows && statement.effect == Effect::Allow {
+            if suppressed && statement.effect == Effect::Allow {
                 continue;
             }
             contributions.push(StatementContribution {
@@ -178,6 +171,28 @@ pub fn apply_wildcard_replacement<P: Clone>(
         }
     }
     contributions
+}
+
+/// Per-binding wildcard-replacement verdict, positionally aligned with
+/// `bindings`: `true` where a more specific applicable binding supersedes that
+/// binding's Allow content.
+///
+/// [`apply_wildcard_replacement`] is this predicate applied; callers that must
+/// report *why* an Allow contributed nothing read it directly rather than
+/// re-deriving the comparison.
+pub fn wildcard_allows_suppressed<P>(bindings: &[ApplicableBinding<P>]) -> Vec<bool> {
+    bindings
+        .iter()
+        .map(|binding| {
+            binding.scope.is_wildcard()
+                && bindings.iter().any(|candidate| {
+                    !candidate.scope.is_wildcard()
+                        && candidate.subject == binding.subject
+                        && selector_key(candidate.selector.as_ref())
+                            == selector_key(binding.selector.as_ref())
+                })
+        })
+        .collect()
 }
 
 fn selector_key(selector: Option<&LabelSelector>) -> Option<&rise_resource_api::LabelKey> {

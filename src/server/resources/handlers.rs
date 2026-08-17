@@ -54,6 +54,7 @@ use crate::server::state::AppState;
 pub(crate) struct ResourceApiCtx {
     store: Arc<dyn ResourceStore>,
     operator_users: Arc<Vec<String>>,
+    operator_idp_groups: Arc<Vec<String>>,
     /// DB pool used by application-layer guards (e.g. blocking Organization
     /// deletion while typed children — users-via-memberships, teams, projects —
     /// still reference it via `organization_resource_uid`). Required: the
@@ -67,12 +68,21 @@ impl ResourceApiCtx {
         Self {
             store: state.resource_store.clone(),
             operator_users: state.operator_users.clone(),
+            operator_idp_groups: state.operator_idp_groups.clone(),
             db_pool: state.db_pool.clone(),
         }
     }
 
-    fn is_operator(&self, email: &str) -> bool {
-        crate::server::auth::admin::is_operator_user(&self.operator_users, email)
+    /// Resolve the Operator role for a user: the `auth.operator_users` email
+    /// allowlist, or membership in one of the `auth.operator_idp_groups`.
+    async fn is_operator(&self, user: &User) -> bool {
+        crate::server::auth::roles::has_role(
+            &self.db_pool,
+            &self.operator_users,
+            &self.operator_idp_groups,
+            user,
+        )
+        .await
     }
 }
 
@@ -109,9 +119,9 @@ fn response_resource(
 /// APIs — where admins skip permission checks — the generic resource API is
 /// operator-gated only; admin access here is intentionally deferred (see
 /// `ROADMAP.md`). Do not add an `is_admin` shortcut.
-fn require_operator(ctx: &ResourceApiCtx, auth: &AuthContext) -> Result<User, ServerError> {
+async fn require_operator(ctx: &ResourceApiCtx, auth: &AuthContext) -> Result<User, ServerError> {
     let user = auth.user()?.clone();
-    if !ctx.is_operator(&user.email) {
+    if !ctx.is_operator(&user).await {
         tracing::warn!(
             user_email = %user.email,
             "Generic resource API access denied — user is not an Operator"
@@ -593,7 +603,7 @@ async fn dispatch_get_inner(
     let raw_path = parse_resource_path(&raw)?;
     // Every GET path on the generic resource API is operator-only; authorize
     // before any store I/O so collection existence is not probeable.
-    let user = require_operator(ctx, &auth)?;
+    let user = require_operator(ctx, &auth).await?;
     match classify_path(&ctx.store, raw_path).await? {
         ResolvedPath::PendingDeletion => {
             let limit = q.limit.unwrap_or(100).clamp(1, 1000);
@@ -724,7 +734,7 @@ async fn dispatch_post_inner(
 ) -> Result<Response, ServerError> {
     let raw_path = parse_resource_path(&raw)?;
     // Every POST path on the generic resource API is operator-only.
-    let user = require_operator(ctx, &auth)?;
+    let user = require_operator(ctx, &auth).await?;
     match classify_path(&ctx.store, raw_path).await? {
         ResolvedPath::List {
             resolved,
@@ -767,7 +777,7 @@ async fn dispatch_put_inner(
     // without a second call.
     let raw_path = parse_resource_path(&raw)?;
     let operator_user = if let AnyAuth::User(auth_ctx) = &auth {
-        Some(require_operator(ctx, auth_ctx)?)
+        Some(require_operator(ctx, auth_ctx).await?)
     } else {
         None
     };
@@ -910,7 +920,7 @@ async fn dispatch_delete_inner(
 ) -> Result<Response, ServerError> {
     let raw_path = parse_resource_path(&raw)?;
     // Every DELETE path on the generic resource API is operator-only.
-    let user = require_operator(ctx, &auth)?;
+    let user = require_operator(ctx, &auth).await?;
     match classify_path(&ctx.store, raw_path).await? {
         ResolvedPath::Item { resolved, leaf } => {
             let row = resolve_leaf(&ctx.store, &resolved, &leaf).await?;
@@ -971,6 +981,7 @@ async fn create_resource(
         .map_err(|e| ServerError::bad_request(format!("invalid spec: {e}")))?;
 
     let params = CreateResourceParams {
+        labels: body.metadata.labels,
         api_version: resolved.info.storage_api_version.clone(),
         kind: body.kind,
         name: body.metadata.name,
@@ -1063,6 +1074,7 @@ async fn update_resource(
         .map_err(|e| ServerError::bad_request(format!("invalid spec: {e}")))?;
 
     let params = UpdateResourceParams {
+        labels: body.metadata.labels,
         api_version: Some(resolved.info.storage_api_version.clone()),
         revision: body.metadata.revision,
         annotations,
@@ -1345,6 +1357,7 @@ mod tests {
     fn malformed_stored_row_maps_to_contextual_internal_error() {
         let now = chrono::Utc::now();
         let row = ResourceRow {
+            labels: Default::default(),
             uid: Uuid::new_v4(),
             api_version: "example.dev/v1".into(),
             kind: "Widget".into(),
@@ -1406,6 +1419,7 @@ mod dispatch_tests {
         ResourceApiCtx {
             store: Arc::new(PgResourceStore::new(pool.clone())),
             operator_users: Arc::new(vec![OPERATOR.into()]),
+            operator_idp_groups: Arc::new(vec![]),
             db_pool: pool,
         }
     }
@@ -1468,6 +1482,7 @@ mod dispatch_tests {
         });
         ctx.store
             .register_resource_definition(CreateResourceParams {
+                labels: Default::default(),
                 api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
                 kind: RESOURCE_DEFINITION_KIND.to_string(),
                 name: "widgets.example.dev".to_string(),
@@ -1497,6 +1512,7 @@ mod dispatch_tests {
         });
         ctx.store
             .register_resource_definition(CreateResourceParams {
+                labels: Default::default(),
                 api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
                 kind: RESOURCE_DEFINITION_KIND.to_string(),
                 name: "gadgets.example.dev".to_string(),
@@ -1524,6 +1540,7 @@ mod dispatch_tests {
         });
         ctx.store
             .register_resource_definition(CreateResourceParams {
+                labels: Default::default(),
                 api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
                 kind: RESOURCE_DEFINITION_KIND.to_string(),
                 name: "gizmos.example.dev".to_string(),
@@ -1598,6 +1615,100 @@ mod dispatch_tests {
     }
 
     // -------------------------------------------------------------------------
+    // Labels
+    // -------------------------------------------------------------------------
+
+    #[sqlx::test]
+    async fn labels_round_trip_through_the_http_surface(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx, &[]).await;
+
+        let resp = dispatch_post_inner(
+            &ctx,
+            "example.dev/v1/widgets".to_string(),
+            auth(OPERATOR),
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {
+                    "name": "labeled",
+                    "labels": {"rise.dev/owner": "group:platform"}
+                },
+                "spec": {"size": "large"},
+            }),
+        )
+        .await
+        .expect("create labeled widget");
+        let (status, created) = read(resp).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            created["metadata"]["labels"]["rise.dev/owner"],
+            "group:platform"
+        );
+
+        // The stored labels come back on a subsequent read.
+        let resp = dispatch_get_inner(
+            &ctx,
+            "example.dev/v1/widgets/labeled".to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("get labeled widget");
+        let (_, fetched) = read(resp).await;
+        assert_eq!(
+            fetched["metadata"]["labels"]["rise.dev/owner"],
+            "group:platform"
+        );
+
+        // PUT replaces the map wholesale, like annotations.
+        let resp = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/labeled".to_string(),
+            any_user(OPERATOR),
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {
+                    "name": "labeled",
+                    "revision": fetched["metadata"]["revision"],
+                    "labels": {"squad": "infra"}
+                },
+                "spec": {"size": "large"},
+            }),
+        )
+        .await
+        .expect("update labeled widget");
+        let (status, updated) = read(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(updated["metadata"]["labels"]["squad"], "infra");
+        assert!(updated["metadata"]["labels"]
+            .get("rise.dev/owner")
+            .is_none());
+
+        // A resource with no labels omits the key rather than sending an empty
+        // object, matching how ownerReferences is projected.
+        let bare = create_widget(&ctx, "example.dev/v1", "bare").await;
+        assert!(bare["metadata"].get("labels").is_none());
+
+        // An invalid key is a 400, not a 500.
+        let err = dispatch_post_inner(
+            &ctx,
+            "example.dev/v1/widgets".to_string(),
+            auth(OPERATOR),
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {"name": "bad-label", "labels": {"not a key/x": "v"}},
+                "spec": {},
+            }),
+        )
+        .await
+        .expect_err("invalid label key must be rejected");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    // -------------------------------------------------------------------------
     // Auth tier: operator-only paths
     // -------------------------------------------------------------------------
 
@@ -1615,6 +1726,60 @@ mod dispatch_tests {
         .await
         .expect_err("non-operator must be rejected");
         assert_eq!(err.status, StatusCode::FORBIDDEN);
+    }
+
+    /// The Operator role can also be granted by IdP group. Unlike the email
+    /// allowlist this reads the DB, so the user and their IdP-managed team must
+    /// exist — and a team that is *not* IdP-managed must not grant the role.
+    #[sqlx::test]
+    async fn operator_path_allows_operator_by_idp_group(pool: sqlx::PgPool) {
+        let mut ctx = ctx(pool.clone()).await;
+        ctx.operator_users = Arc::new(vec![]);
+        ctx.operator_idp_groups = Arc::new(vec!["platform-operators".into()]);
+        register_widget_rd(&ctx, &[]).await;
+
+        let user = crate::db::users::create(&pool, "grouped@example.com")
+            .await
+            .unwrap();
+        let auth_ctx = AuthContext::User(user.clone());
+
+        // Same-named team that the IdP did not create grants nothing.
+        let self_made = crate::db::teams::create(&pool, "platform-operators")
+            .await
+            .unwrap();
+        crate::db::teams::add_member(
+            &pool,
+            self_made.id,
+            user.id,
+            crate::db::models::TeamRole::Owner,
+        )
+        .await
+        .unwrap();
+
+        let err = dispatch_get_inner(
+            &ctx,
+            "example.dev/v1/widgets".to_string(),
+            auth_ctx.clone(),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect_err("a self-created team must not grant the Operator role");
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+
+        // Once the team is IdP-managed, the same user is an Operator.
+        crate::db::teams::set_idp_managed(&pool, self_made.id, true)
+            .await
+            .unwrap();
+
+        let response = dispatch_get_inner(
+            &ctx,
+            "example.dev/v1/widgets".to_string(),
+            auth_ctx,
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("operator by IdP group must be allowed");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[sqlx::test]
@@ -1957,6 +2122,7 @@ mod dispatch_tests {
         // Seed a widget at the storage version directly so the PUT test has a row.
         ctx.store
             .create(CreateResourceParams {
+                labels: Default::default(),
                 api_version: "example.dev/v1".to_string(),
                 kind: "Widget".to_string(),
                 name: "w1".to_string(),
@@ -2181,6 +2347,7 @@ mod dispatch_tests {
         let org = ctx
             .store
             .create(CreateResourceParams {
+                labels: Default::default(),
                 api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
                 kind: rise_resource_api::ORGANIZATION_KIND.to_string(),
                 name: "guard-test".to_string(),
@@ -2289,6 +2456,7 @@ mod dispatch_tests {
         let org = ctx
             .store
             .create(CreateResourceParams {
+                labels: Default::default(),
                 api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
                 kind: rise_resource_api::ORGANIZATION_KIND.to_string(),
                 name: "membership-guard-test".to_string(),
@@ -2562,6 +2730,7 @@ mod dispatch_tests {
         });
         ctx.store
             .register_resource_definition(CreateResourceParams {
+                labels: Default::default(),
                 api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
                 kind: RESOURCE_DEFINITION_KIND.to_string(),
                 name: "widgets.example.dev".to_string(),
@@ -2580,6 +2749,7 @@ mod dispatch_tests {
         // to non-storage versions are not supported), so we seed the row directly.
         ctx.store
             .create(CreateResourceParams {
+                labels: Default::default(),
                 api_version: "example.dev/v1".to_string(),
                 kind: "Widget".to_string(),
                 name: "w1".to_string(),

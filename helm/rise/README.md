@@ -39,6 +39,9 @@ config:
     client_secret: ""  # Provided via envFrom
     admin_users:
       - "admin@example.com"
+    # Alternatively (or additionally), grant the admin role by IdP group:
+    # admin_idp_groups:
+    #   - "platform-admins"
 
   registry:
     type: "oci-client-auth"
