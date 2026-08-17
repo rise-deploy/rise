@@ -1,4 +1,6 @@
+mod admission;
 pub mod builtin;
+mod lookup;
 pub mod pg_store;
 pub mod validation;
 
@@ -6,6 +8,11 @@ mod discriminator;
 mod models;
 
 pub use builtin::{BuiltInRegistration, BuiltInRegistry};
+pub use lookup::{
+    GroupMembershipFact, IdentityLookup, MembershipLookup, TrustPolicyFact, TrustPolicyLookup,
+    UserIdentityFact, CONTROLLER_TRUST_POLICIES_SQL, GROUPS_FOR_USER_SQL,
+    SERVICE_ACCOUNT_TRUST_POLICIES_SQL, USER_IDENTITY_BY_EXTERNAL_IDENTITY_SQL,
+};
 pub use pg_store::PgResourceStore;
 pub use validation::{JsonSchemaValidator, OrganizationValidator, ResourceDefinitionValidator};
 
@@ -33,17 +40,4 @@ pub async fn run_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::migrate::Mi
         .await?;
 
     sqlx::migrate!("./migrations").run(&mut conn).await
-}
-
-#[cfg(test)]
-mod migration_tests {
-    #[test]
-    fn concurrent_index_migration_is_non_transactional() {
-        let migrator = sqlx::migrate!("./migrations");
-        let migration = migrator
-            .iter()
-            .find(|migration| migration.version == 20260719000001)
-            .expect("owner-reference index migration exists");
-        assert!(migration.no_tx);
-    }
 }

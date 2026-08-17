@@ -1,4 +1,3 @@
-pub mod admin;
 pub mod context;
 pub mod controller;
 pub mod cookie_helpers;
@@ -10,6 +9,7 @@ pub mod jwt;
 pub mod middleware;
 pub mod oauth;
 pub mod platform_access;
+pub mod roles;
 pub mod routes;
 pub mod sa_match;
 pub mod token_storage;

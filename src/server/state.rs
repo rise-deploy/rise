@@ -10,6 +10,7 @@ use crate::server::registry::{
 };
 use rise_backend_auth::RiseTokenSigner;
 
+use crate::db::models::User;
 use crate::server::auth::controller::ControllerIdentity;
 #[cfg(feature = "backend")]
 use crate::server::registry::{
@@ -55,8 +56,12 @@ pub struct AppState {
     pub registry_provider: Arc<dyn RegistryProvider>,
     pub oci_client: Arc<crate::server::oci::OciClient>,
     pub admin_users: Arc<Vec<String>>,
+    /// IdP groups whose members are admins (case-insensitive name match).
+    pub admin_idp_groups: Arc<Vec<String>>,
     /// Operator role allowlist (case-insensitive email match).
     pub operator_users: Arc<Vec<String>>,
+    /// IdP groups whose members hold the Operator role.
+    pub operator_idp_groups: Arc<Vec<String>>,
     /// Controller identities keyed by `id`. Consumed by future generic
     /// resource endpoints; unused in PR3.
     #[allow(dead_code)]
@@ -550,17 +555,33 @@ async fn init_docker_backend(
 }
 
 impl AppState {
-    /// Check if a user is an admin (case-insensitive email match)
-    pub fn is_admin(&self, user_email: &str) -> bool {
-        crate::server::auth::admin::is_admin_user(&self.admin_users, user_email)
+    /// Check if a user is an admin.
+    ///
+    /// Granted by the `auth.admin_users` email allowlist or by membership in
+    /// one of the `auth.admin_idp_groups` IdP groups.
+    pub async fn is_admin(&self, user: &User) -> bool {
+        self.has_role(&self.admin_users, &self.admin_idp_groups, user)
+            .await
     }
 
-    /// Check if a user has the Operator role (case-insensitive email match).
+    /// Check if a user has the Operator role.
     ///
-    /// Operators are a separate role from admins. Use this for access checks
-    /// on generic-resource APIs once they're wired up.
-    pub fn is_operator(&self, user_email: &str) -> bool {
-        crate::server::auth::admin::is_operator_user(&self.operator_users, user_email)
+    /// Operators are a separate role from admins: admins do NOT implicitly
+    /// receive it. Granted by the `auth.operator_users` email allowlist or by
+    /// membership in one of the `auth.operator_idp_groups` IdP groups.
+    pub async fn is_operator(&self, user: &User) -> bool {
+        self.has_role(&self.operator_users, &self.operator_idp_groups, user)
+            .await
+    }
+
+    async fn has_role(
+        &self,
+        allowed_emails: &[String],
+        allowed_groups: &[String],
+        user: &User,
+    ) -> bool {
+        crate::server::auth::roles::has_role(&self.db_pool, allowed_emails, allowed_groups, user)
+            .await
     }
 
     /// Run database migrations
@@ -873,11 +894,22 @@ impl AppState {
         if !admin_users.is_empty() {
             tracing::info!("Configured {} admin user(s)", admin_users.len());
         }
+        let admin_idp_groups = Arc::new(settings.auth.admin_idp_groups.clone());
+        if !admin_idp_groups.is_empty() {
+            tracing::info!("Configured {} admin IdP group(s)", admin_idp_groups.len());
+        }
 
         // Store operator users list (separate role from admin)
         let operator_users = Arc::new(settings.auth.operator_users.clone());
         if !operator_users.is_empty() {
             tracing::info!("Configured {} operator user(s)", operator_users.len());
+        }
+        let operator_idp_groups = Arc::new(settings.auth.operator_idp_groups.clone());
+        if !operator_idp_groups.is_empty() {
+            tracing::info!(
+                "Configured {} operator IdP group(s)",
+                operator_idp_groups.len()
+            );
         }
 
         // Validate and index configured controller identities
@@ -1566,7 +1598,9 @@ impl AppState {
             registry_provider,
             oci_client,
             admin_users,
+            admin_idp_groups,
             operator_users,
+            operator_idp_groups,
             controllers,
             controllers_by_issuer,
             #[cfg(feature = "backend")]
