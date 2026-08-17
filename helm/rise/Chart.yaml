@@ -18,7 +18,7 @@ dependencies:
     alias: metacontroller-operator
     condition: metacontroller.install
   - name: loki
-    version: "6.35.1"
+    version: "6.55.0"
     repository: "https://grafana.github.io/helm-charts"
     condition: logs.loki.enabled
   - name: alloy
