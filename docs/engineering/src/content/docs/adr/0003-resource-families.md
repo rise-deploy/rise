@@ -8,8 +8,8 @@ title: "ADR-0003: Resource Families"
 
 ADR-0001 fixes the authorization shape `(verb, ResourceKind, subresource?)`, the
 declared-reference `use` rule, and the collection-read semantics this decision
-builds on; nothing here changes them. Two questions are deliberately left to
-their own decisions — see Open questions.
+builds on; nothing here changes them. Pagination and Watch mechanics are decided
+by separate work this depends on — see Dependencies.
 
 ## Context
 
@@ -105,11 +105,16 @@ Registration of a member validates:
    The known counterexample is a **placement-tier pair**: `Role` and
    `PlatformRole` are the same concept at two levels, and exist as two kinds
    only because ADR-0001's parent model is exact (§3, "two kind pairs, one per
-   placement level"). That is the natural cross-parent grouping this rule
-   forbids, and it is deferred rather than dismissed — nothing needs it today,
-   and admitting it requires answering how a single list spans an org-parented
-   and a root-scoped collection without asserting the root-scoped members live
-   under the org. It is not a case extension-land will produce.
+   placement level"). A family is *not* the mechanism for that grouping, and
+   this is a decision rather than a deferral. Spanning tiers would require two
+   things a family deliberately does not have: transitive listing across depths
+   (the store matches `parent_uid` exactly, and a root-scoped `PlatformRole`
+   does not live under any organization, so listing it beneath one would be
+   false), and a name pool decoupled from the grouping (names cannot be unique
+   "within a scope" when members occupy different depths). Wanting the second
+   is a signal that listing and name-pooling should be separate concepts — a
+   different feature, arrived at deliberately, not a widened family. Nothing
+   needs it today, and extension-land will not produce the case.
 3. **Immutable after RD creation.** `family` may be set only at RD create.
    Adding one to a kind with live instances would require reconciling existing
    collisions; removing one would silently widen the pool under resources that
@@ -212,15 +217,32 @@ construction. Two implementation constraints:
   a stable-but-odd order rather than a pagination cursor that skips or repeats
   rows.
 
-Pagination and Watch do not exist yet for any collection — both are ROADMAP §4
-prerequisites for the typed-object migration, and designing family pagination
-before the base model exists would be backwards. This decision therefore states
-only what families *require* of whatever lands: a cursor ordered by
-`(name COLLATE "C", uid)` **within a family scope**, and a defined answer for a
-member kind registered or removed mid-pagination — a family's membership can
-change under a paging client in a way a single kind's cannot. Whether that
-answer is a snapshot, a documented weak guarantee, or a cursor invalidation
-belongs to the pagination decision, not this one.
+### Membership stability under pagination and Watch
+
+Pagination and Watch do not exist for any collection yet — both are ROADMAP §4
+prerequisites — so their mechanics are not decided here. One thing is specific
+to families and decidable independently: a family's *membership* can change
+under a client mid-read, which no single-kind collection can do. Registering an
+RD mid-pagination would otherwise inject a kind's entire population into the
+middle of someone's page sequence.
+
+**A family's member-kind set is resolved once, at the first page, and carried in
+the cursor.** Later pages read exactly that set, so a page sequence reflects one
+coherent membership even though it is not a data snapshot. This is cheap in a
+way a data snapshot is not — the frozen set is a short list of kinds, not a
+transaction held open across round trips — and it is orthogonal to whatever
+cursor encoding the base pagination decision picks. Rows admitted under a kind
+that leaves the family mid-sequence still appear; that is correct, since they
+remain in the family's name pool until they are deleted.
+
+**A Watch over a family closes with a defined reason when membership changes**,
+and the client re-establishes against the new set. Silently adding or dropping
+event streams mid-watch would make a member kind's registration
+indistinguishable from a burst of resource creations. Whether the client then
+re-lists follows the general Watch decision.
+
+Beyond membership, families require of whatever pagination model lands only
+that the cursor order be `(name COLLATE "C", uid)` **within a family scope**.
 
 ### Printer columns
 
@@ -379,13 +401,17 @@ the deliberate divergence from kubectl — the hierarchy is the argument, not an
 as an ordinary column and family-declared columns beside it — the printer-column
 split above exists to serve this.
 
-## Open questions
+## Dependencies
 
-- **Pagination and Watch semantics** for a collection whose membership can
-  change mid-page. This decision states the constraint (see Ordering) and
-  defers the model to the ROADMAP §4 pagination work.
-- **Cross-parent families.** Deferred with a known motivating case — the
-  placement-tier pair under validation rule 2 — and no current need.
+No open questions remain. Two items are settled here but land elsewhere:
+
+- **Pagination and Watch mechanics** are decided by the ROADMAP §4 pagination
+  work. This decision fixes the family-specific part — frozen member set in the
+  cursor, Watch closes on membership change, `(name COLLATE "C", uid)` ordering
+  within a family scope — and inherits the rest.
+- **Per-kind printer columns** are specified here because they share the
+  evaluator and renderer, but they are useful independently of families and may
+  ship before the first family exists.
 
 ## Consequences
 
