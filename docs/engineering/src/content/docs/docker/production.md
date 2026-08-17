@@ -127,13 +127,21 @@ forwardAuth-protected app. It is controlled by `auth.platform_access` in
   only") from the platform-access middleware.
 
 `admin_users` (`ADMIN_EMAIL`) and `operator_users` (`RISE_OPERATOR_EMAIL`)
-always bypass this check. `operator_users` defaults to none — no operator is
-configured unless you set `RISE_OPERATOR_EMAIL` (a single email; mount a config
-override for several). Operators have full access to the generic resource API
-(`/api/v1/resources`), so grant the role deliberately.
+always bypass this check, as do the IdP groups in `admin_idp_groups`
+(`RISE_ADMIN_IDP_GROUP`) and `operator_idp_groups` (`RISE_OPERATOR_IDP_GROUP`).
+`operator_users` defaults to none — no operator is configured unless you set
+`RISE_OPERATOR_EMAIL` (a single email; mount a config override for several).
+Operators have full access to the generic resource API (`/api/v1/resources`), so
+grant the role deliberately.
 
 To run a restricted stack via env, set `RISE_PLATFORM_ACCESS_POLICY=restrictive`
 and grant one user with `RISE_PLATFORM_ALLOWED_EMAIL=you@example.com`. To grant
 several users (or IdP groups via `allowed_idp_groups`), mount a config override
 that replaces the `auth.platform_access` block instead of relying on the single
 env var.
+
+Group-based grants — `allowed_idp_groups`, `admin_idp_groups`,
+`operator_idp_groups` — match against the IdP-managed teams Rise syncs from the
+IdP's `groups` claim at login. Teams users create themselves never match, and a
+group removal in the IdP takes effect on the user's next login. See
+[Roles](/operator-docs/configuration/#authentication-auth) for details.

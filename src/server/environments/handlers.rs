@@ -174,7 +174,7 @@ pub async fn update_environment(
         .ok_or_else(|| ServerError::not_found(format!("Environment '{}' not found", env_name)))?;
 
     // Reject early if non-admin tries to set deployment constraints
-    if payload.deployment_constraints.is_some() && !state.is_admin(&user.email) {
+    if payload.deployment_constraints.is_some() && !state.is_admin(user).await {
         return Err(ServerError::forbidden(
             "Only administrators can update deployment constraints",
         ));

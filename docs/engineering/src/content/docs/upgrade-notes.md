@@ -29,8 +29,16 @@ project's "Operator impact" view is the worklist; this page is what operators re
 _Changes merged to `develop` but not yet in a tagged release, plus in-flight PRs
 proposed for the next train. Moved into a version section at tag time._
 
-In-flight PRs with operator impact (not yet merged):
+Merged to `develop`:
 
+- **No action required — generic resource labels**. Resources in the generic
+  resource API carry `metadata.labels` alongside `metadata.annotations`. The
+  migration adds a column with an empty default, so existing rows and clients
+  are unaffected and no backfill runs. Label keys use the Kubernetes-shaped
+  grammar that policy `labelSelector` keys already use; values are capped at 63
+  bytes. Nothing consults labels for access yet — a key becomes access-relevant
+  only once a policy binding selects on it, and the write-time gate for such
+  keys lands with the authorization choke point.
 - **Action required if conflicts exist — identity resource activation** ([#421](https://github.com/rise-deploy/rise/pull/421)).
   Rise now activates the eight reserved `rise.dev/v1alpha1` identity resource
   kinds in the PostgreSQL resource store. Before upgrading, remove any legacy
@@ -49,7 +57,26 @@ In-flight PRs with operator impact (not yet merged):
   runs in one transaction, so an upgrade rejected by the audit leaves the
   database exactly as it was — clean up the conflicts it names under the
   previous Rise version and retry.
-- **Action required if conflicts exist — policy resource activation**.
+- **Config change — admin and Operator roles by IdP group** ([#429](https://github.com/rise-deploy/rise/pull/429)).
+  `auth.admin_idp_groups` and `auth.operator_idp_groups` grant the admin and
+  Operator roles to everyone in the listed IdP groups, so the IdP stays the source
+  of truth instead of an email allowlist that has to be edited and redeployed.
+  Both default to empty, so
+  installs that grant roles by email alone are unaffected and pay no extra query.
+  A user holds a role if their email is on the allowlist **or** they are in one of
+  the groups; group names match case-insensitively.
+
+  All group matching — including the existing `auth.platform_access.allowed_idp_groups`
+  — now resolves against the **IdP-managed** teams Rise syncs from the IdP's
+  `groups` claim, rather than against every team the user belongs to. **Action
+  required only if** you granted platform access through `allowed_idp_groups`
+  naming a team that Rise did not create from the IdP (i.e. `idp_managed = false`);
+  those users lose platform access until the group comes from the IdP. This closes
+  a privilege-escalation path where a user could create a team named after an
+  allowed group and grant themselves access. Group membership refreshes at login,
+  so revoking a group in the IdP takes effect on the user's next login (or the next
+  Entra active sync).
+- **Action required if conflicts exist — policy resource activation** ([#430](https://github.com/rise-deploy/rise/pull/430)).
   Rise activates the four reserved `rise.dev/v1alpha1` policy resource kinds —
   `Role` and `RoleBinding` under an Organization, `PlatformRole` and
   `PlatformRoleBinding` at the root — in the PostgreSQL resource store. The
@@ -66,6 +93,9 @@ In-flight PRs with operator impact (not yet merged):
   validated at write time, so creating one requires its `roleRef` target, its
   `scope` target, and any literal `subject` it names to already exist — create
   the Role before the RoleBinding that references it.
+
+In-flight PRs with operator impact (not yet merged):
+
 - **Behavior change — workload identity on the Docker backend** ([#378](https://github.com/rise-deploy/rise/issues/378)).
   The Docker controller now delivers the same workload-identity material as
   Kubernetes — the bootstrap credential and one token file per `[identity].audiences`

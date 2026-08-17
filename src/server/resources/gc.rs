@@ -517,6 +517,7 @@ mod tests {
     async fn create_org(store: &dyn ResourceStore, name: &str) -> ResourceRow {
         store
             .create(CreateResourceParams {
+                labels: Default::default(),
                 api_version: API_VERSION_V1ALPHA1.to_string(),
                 kind: ORGANIZATION_KIND.to_string(),
                 name: name.to_string(),
@@ -536,6 +537,7 @@ mod tests {
     async fn create_org_with_finalizer(store: &dyn ResourceStore, name: &str) -> ResourceRow {
         store
             .create(CreateResourceParams {
+                labels: Default::default(),
                 api_version: API_VERSION_V1ALPHA1.to_string(),
                 kind: ORGANIZATION_KIND.to_string(),
                 name: name.to_string(),
@@ -553,6 +555,7 @@ mod tests {
     async fn register_widget_definition(store: &dyn ResourceStore) {
         store
             .register_resource_definition(CreateResourceParams {
+                labels: Default::default(),
                 api_version: API_VERSION_V1ALPHA1.to_string(),
                 kind: RESOURCE_DEFINITION_KIND.to_string(),
                 name: "widgets.example.dev".to_string(),
@@ -582,6 +585,7 @@ mod tests {
     ) -> ResourceRow {
         store
             .create(CreateResourceParams {
+                labels: Default::default(),
                 api_version: "example.dev/v1".to_string(),
                 kind: "Widget".to_string(),
                 name: name.to_string(),
@@ -889,6 +893,7 @@ mod tests {
 
     fn sample_row() -> ResourceRow {
         ResourceRow {
+            labels: Default::default(),
             uid: Uuid::new_v4(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: ORGANIZATION_KIND.to_string(),
@@ -922,6 +927,10 @@ mod tests {
 
         async fn get(&self, uid: Uuid) -> Result<Option<ResourceRow>, StoreError> {
             self.inner.get(uid).await
+        }
+
+        async fn ancestors(&self, uid: Uuid) -> Result<Vec<ResourceRow>, StoreError> {
+            self.inner.ancestors(uid).await
         }
 
         async fn get_by_name(
@@ -1101,6 +1110,10 @@ mod tests {
 
         async fn get(&self, uid: Uuid) -> Result<Option<ResourceRow>, StoreError> {
             self.inner.get(uid).await
+        }
+
+        async fn ancestors(&self, uid: Uuid) -> Result<Vec<ResourceRow>, StoreError> {
+            self.inner.ancestors(uid).await
         }
 
         async fn get_by_name(
