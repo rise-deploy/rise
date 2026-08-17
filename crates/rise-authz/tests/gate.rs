@@ -950,6 +950,102 @@ async fn a_member_of_an_owning_group_may_add_another_member() {
     );
 }
 
+/// An organization's admin manages membership of any Group in that organization
+/// without belonging to it.
+///
+/// Their authority is scope-only and label-independent (§5), so it covers the
+/// ownership domain a Group's membership confers even though no label names them.
+/// Both delivery forms §5 permits are checked: a binding naming the User
+/// directly, and one naming an ordinary Group they belong to.
+#[tokio::test]
+async fn an_org_admin_may_manage_a_group_they_do_not_belong_to() {
+    for admin_subject in ["user:sam", "group:acme/leads"] {
+        let mut builder = StoreBuilder::new();
+        seeded_ownership(&mut builder);
+        builder.role(PLATFORM_ROLE, ORG_ADMIN_PLATFORM_ROLE, None, allow_all());
+        let acme = builder.resource(ORGANIZATION, "acme", None);
+        // A resource the target Group already owns, so the write really does
+        // delegate `resource-owner` over it.
+        builder.labeled(PROJECT, "web", Some(acme), &[(OWNER_KEY, "group:platform")]);
+        builder.binding(
+            ROLE_BINDING,
+            "sam-admin",
+            Some(acme),
+            org_admin_spec(admin_subject, "acme"),
+        );
+        let store = builder.build();
+        // Sam is in neither the owning Group nor, in the direct case, any Group.
+        let memberships = if admin_subject == "user:sam" {
+            FakeMemberships::none()
+        } else {
+            FakeMemberships::groups(&["group:acme/leads"])
+        };
+        let engine = engine(store, memberships);
+        let sam = snapshot(&engine, principal("user:sam")).await;
+
+        let outcome = gate(
+            &engine,
+            &sam,
+            AuthorizationChange::GroupMembership(GroupMembershipChange {
+                user: "user:newcomer".parse().expect("valid subject"),
+                group: "group:acme/platform".parse().expect("valid subject"),
+            }),
+        )
+        .await;
+
+        assert!(
+            outcome.permitted(),
+            "an admin of acme (via {admin_subject}) must be able to manage \
+             group:acme/platform without joining it, got {:?}",
+            outcome.rejections
+        );
+        assert!(
+            !outcome.claims.is_empty(),
+            "the write was still gated, not skipped"
+        );
+    }
+}
+
+/// Admin standing does not cross organizations: an admin of one org cannot manage
+/// another org's Groups.
+#[tokio::test]
+async fn an_org_admin_cannot_manage_another_organizations_group() {
+    let mut builder = StoreBuilder::new();
+    seeded_ownership(&mut builder);
+    builder.role(PLATFORM_ROLE, ORG_ADMIN_PLATFORM_ROLE, None, allow_all());
+    let acme = builder.resource(ORGANIZATION, "acme", None);
+    let other = builder.resource(ORGANIZATION, "other", None);
+    builder.labeled(
+        PROJECT,
+        "theirs",
+        Some(other),
+        &[(OWNER_KEY, "group:platform")],
+    );
+    builder.binding(
+        ROLE_BINDING,
+        "sam-admin",
+        Some(acme),
+        org_admin_spec("user:sam", "acme"),
+    );
+    let store = builder.build();
+    let engine = engine(store, FakeMemberships::none());
+    let sam = snapshot(&engine, principal("user:sam")).await;
+
+    let outcome = gate(
+        &engine,
+        &sam,
+        AuthorizationChange::GroupMembership(GroupMembershipChange {
+            user: "user:newcomer".parse().expect("valid subject"),
+            group: "group:other/platform".parse().expect("valid subject"),
+        }),
+    )
+    .await;
+    assert!(
+        !outcome.permitted(),
+        "acme's admin holds nothing in the other organization"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Token ceiling
 // -----------------------------------------------------------------------------
