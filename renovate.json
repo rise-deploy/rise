@@ -1,6 +1,11 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended", "customManagers:githubActionsVersions", ":automergeMinor", ":automergePatch"],
+  "lockFileMaintenance": {
+    "description": "Refresh transitive pins in Cargo.lock, docs/package-lock.json and example/hello-world-py/uv.lock. Without this, a lock whose package file only carries open ranges (as the uv example does) never moves, because Renovate has no constraint left to bump.",
+    "enabled": true,
+    "schedule": ["* * 1 * *"]
+  },
   "packageRules": [
     {
       "description": "Group all Rust toolchain version updates",
