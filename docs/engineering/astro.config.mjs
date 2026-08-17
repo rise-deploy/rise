@@ -110,7 +110,7 @@ export default defineConfig({
         },
         {
           label: 'Architecture Decisions',
-          autogenerate: { directory: 'adr' },
+          items: [{ autogenerate: { directory: 'adr' } }],
         },
       ],
     }),
