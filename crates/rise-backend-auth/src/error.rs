@@ -43,6 +43,15 @@ pub enum JwtSignerError {
     RsaKeyError(String),
     #[error("PEM encoding failed: {0}")]
     PemError(String),
+    /// Signing a workload token for a specific audience failed. Wraps the
+    /// underlying error so a partial minting failure (one of several
+    /// `[identity].audiences`) names the audience that failed.
+    #[error("failed to sign workload token for audience {audience}: {source}")]
+    WorkloadAudience {
+        audience: String,
+        #[source]
+        source: Box<JwtSignerError>,
+    },
 }
 
 /// Bridge for the legacy verify adapters (`verify_user_jwt` /

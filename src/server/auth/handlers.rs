@@ -762,8 +762,8 @@ pub async fn me(
     let user = auth.user().map_err(|e| (e.status, e.message))?;
     // User is injected by auth middleware
     tracing::debug!("GET /me: user_id={}, email={}", user.id, user.email);
-    let is_admin = state.is_admin(&user.email);
-    let is_operator = state.is_operator(&user.email);
+    let is_admin = state.is_admin(user).await;
+    let is_operator = state.is_operator(user).await;
     let can_create_teams = is_admin || state.auth_settings.allow_team_creation;
     Ok(Json(MeResponse {
         id: user.id.to_string(),
@@ -1558,6 +1558,15 @@ pub struct IngressAuthQuery {
     /// byte-identical — nginx itself performs the auth-signin redirect.
     #[serde(default, deserialize_with = "deserialize_bool_flag")]
     pub signin_redirect: bool,
+    /// Per-route access requirement, stamped into the `auth-url` / `forwardAuth`
+    /// address by the reconciler for the route group this ingress/router serves.
+    /// When present it is enforced instead of the project's access-class default,
+    /// so a single route can be opened or tightened. Control-plane input only —
+    /// the client never influences which `auth-url` the proxy calls; it supplies
+    /// only the path, and the proxy selects the matching route group. When absent,
+    /// the project's access-class requirement applies (unchanged behavior).
+    #[serde(default)]
+    pub access: Option<crate::server::settings::AccessRequirement>,
 }
 
 /// Deserialize a query flag that may be `1`/`true`/`0`/`false` (or absent).
@@ -1778,14 +1787,23 @@ pub async fn ingress_auth(
             )
         })?;
 
+    // The effective requirement is the per-route `access` override stamped into
+    // the auth-url by the reconciler (control-plane input), falling back to the
+    // project's access-class requirement. The proxy — not the client — selects
+    // which route group's auth-url is called, so trusting this param is safe.
+    let requirement = params
+        .access
+        .clone()
+        .unwrap_or_else(|| access_class.access_requirement.clone());
+
     // Handle different access requirements
-    match access_class.access_requirement {
+    match requirement {
         AccessRequirement::None => {
-            // Should never be called - None means no nginx auth annotations
+            // Should never be called - None means no auth annotations/middleware
             // But if it is called, deny access as a safety measure
             tracing::warn!(
                 project = %params.project,
-                "Auth endpoint called for AccessRequirement::None project"
+                "Auth endpoint called for AccessRequirement::None route"
             );
             Err((
                 StatusCode::FORBIDDEN,
@@ -2103,6 +2121,19 @@ mod tests {
         let q: IngressAuthQuery =
             serde_urlencoded::from_str("project=app&signin_redirect=0").unwrap();
         assert!(!q.signin_redirect);
+    }
+
+    #[test]
+    fn ingress_auth_query_parses_reconciler_stamped_access_param() {
+        use crate::server::settings::AccessRequirement;
+        // The reconciler stamps `&access=<PascalCase>` into the auth-url; the
+        // handler must parse it back to override the project's requirement.
+        let q: IngressAuthQuery =
+            serde_urlencoded::from_str("project=app&access=Member&signin_redirect=1").unwrap();
+        assert_eq!(q.access, Some(AccessRequirement::Member));
+        // Absent → None → project default applies (unchanged behavior).
+        let q: IngressAuthQuery = serde_urlencoded::from_str("project=app").unwrap();
+        assert_eq!(q.access, None);
     }
 
     #[test]

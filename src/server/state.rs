@@ -10,6 +10,7 @@ use crate::server::registry::{
 };
 use rise_backend_auth::RiseTokenSigner;
 
+use crate::db::models::User;
 use crate::server::auth::controller::ControllerIdentity;
 #[cfg(feature = "backend")]
 use crate::server::registry::{
@@ -55,8 +56,12 @@ pub struct AppState {
     pub registry_provider: Arc<dyn RegistryProvider>,
     pub oci_client: Arc<crate::server::oci::OciClient>,
     pub admin_users: Arc<Vec<String>>,
+    /// IdP groups whose members are admins (case-insensitive name match).
+    pub admin_idp_groups: Arc<Vec<String>>,
     /// Operator role allowlist (case-insensitive email match).
     pub operator_users: Arc<Vec<String>>,
+    /// IdP groups whose members hold the Operator role.
+    pub operator_idp_groups: Arc<Vec<String>>,
     /// Controller identities keyed by `id`. Consumed by future generic
     /// resource endpoints; unused in PR3.
     #[allow(dead_code)]
@@ -67,7 +72,7 @@ pub struct AppState {
     /// (later) by internal controllers wanting to reconcile against Rise state
     /// without a network round-trip.
     #[cfg(feature = "backend")]
-    pub resource_store: Arc<dyn rise_resource_store::ResourceStore>,
+    pub resource_store: Arc<dyn rise_resource_api::ResourceStore>,
     /// Resource UID of the default Organization. Populated by the bootstrap
     /// pass at startup; typed APIs use this to stamp newly created
     /// users/teams/projects with the configured default Organization.
@@ -95,6 +100,13 @@ pub struct AppState {
     pub public_url: String,
     pub encryption_provider: Option<Arc<dyn EncryptionProvider>>,
     pub deployment_backend: Arc<dyn crate::server::deployment::controller::DeploymentBackend>,
+    /// The deployment persistence boundary (`DeploymentStore` trait, implemented
+    /// by `PgDeploymentStore`). The Metacontroller webhook and the
+    /// identity-refresh/CRD-backfill controllers read and mutate deployment
+    /// state through this trait rather than reaching into `crate::db` directly,
+    /// so they can move into a backend crate later.
+    #[cfg(feature = "backend")]
+    pub deployment_store: Arc<dyn rise_backend_core::DeploymentStore>,
     #[cfg(feature = "backend")]
     pub runtime_log_backend: Arc<dyn crate::server::deployment::logs::RuntimeLogBackend>,
     pub extension_registry: Arc<crate::server::extensions::registry::ExtensionRegistry>,
@@ -243,11 +255,10 @@ async fn test_encryption_provider(provider: &dyn EncryptionProvider) -> Result<(
 async fn init_kubernetes_backend(
     resource_builder: Arc<crate::server::deployment::resource_builder::ResourceBuilder>,
     kube_client: kube::Client,
-    db_pool: PgPool,
+    store: Arc<dyn rise_backend_core::DeploymentStore>,
 ) -> Result<Arc<dyn DeploymentBackend>> {
     use crate::server::deployment::controller::KubernetesBackend;
 
-    let store = Arc::new(crate::db::deployment_store::PgDeploymentStore::new(db_pool));
     let backend = KubernetesBackend::new(kube_client, resource_builder, store);
 
     // Test Kubernetes API connection
@@ -335,9 +346,10 @@ async fn init_docker_backend(
     settings: &crate::server::settings::DeploymentControllerSettings,
     registry_provider: Arc<dyn RegistryProvider>,
     encryption_provider: Option<Arc<dyn EncryptionProvider>>,
-    resource_store: Arc<dyn rise_resource_store::ResourceStore>,
+    resource_store: Arc<dyn rise_resource_api::ResourceStore>,
     jwt_signer: Arc<RiseTokenSigner>,
     db_pool: PgPool,
+    store: Arc<dyn rise_backend_core::DeploymentStore>,
     public_url: &str,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<(
@@ -349,8 +361,8 @@ async fn init_docker_backend(
         DockerReconciler, ReconcilerConfig,
     };
     use crate::server::deployment::controller::{docker::client, DockerBackend};
-    use crate::server::deployment::resource_builder::ResourceBuilder;
     use crate::server::settings::DeploymentControllerSettings;
+    use rise_backend_core::DeploymentUrlBuilder;
 
     let DeploymentControllerSettings::Docker {
         docker_host,
@@ -382,46 +394,22 @@ async fn init_docker_backend(
         ));
     };
 
-    // ResourceBuilder for the Docker runtime. The Kubernetes-only fields are
-    // empty/None — `compute_*_urls` and `primary_ingress_hosts` only read the
-    // URL templates, schema, port and registry provider.
-    let resource_builder = Arc::new(ResourceBuilder {
+    // URL/image resolver for the Docker runtime — the backend-agnostic subset
+    // of deployment-spec computation the Docker controller needs. The K8s-only
+    // resource-spec fields don't apply here.
+    let url_builder = Arc::new(DeploymentUrlBuilder {
         production_ingress_url_template: production_ingress_url_template.clone(),
         staging_ingress_url_template: staging_ingress_url_template.clone(),
         environment_ingress_url_template: environment_ingress_url_template.clone(),
         ingress_port: *ingress_port,
         ingress_schema: ingress_schema.clone(),
         registry_provider: registry_provider.clone(),
-        auth_backend_url: String::new(),
-        auth_signin_url: String::new(),
-        backend_address: None,
-        namespace_labels: HashMap::new(),
-        namespace_annotations: HashMap::new(),
-        ingress_annotations: HashMap::new(),
-        ingress_tls_secret_name: None,
-        custom_domain_tls_mode: crate::server::settings::CustomDomainTlsMode::PerDomain,
-        custom_domain_ingress_annotations: HashMap::new(),
-        node_selector: HashMap::new(),
-        image_pull_secret_name: None,
-        access_classes: HashMap::new(),
-        host_aliases: HashMap::new(),
-        extra_service_token_audiences: HashMap::new(),
-        use_default_service_account_for_production: true,
-        network_policy: crate::server::settings::NetworkPolicyConfig {
-            ingress: Vec::new(),
-            egress: None,
-        },
-        pod_security_enabled: true,
-        health_probes: health_probes.clone(),
     });
 
     // Connect bollard.
     let docker = client::connect(docker_host.as_deref())?;
 
-    let store = Arc::new(crate::db::deployment_store::PgDeploymentStore::new(
-        db_pool.clone(),
-    ));
-    let backend = DockerBackend::new(docker.clone(), resource_builder.clone(), store);
+    let backend = DockerBackend::new(docker.clone(), url_builder.clone(), store.clone());
     backend.test_connection().await?;
     tracing::info!("Docker deployment backend initialized and connection tested");
 
@@ -522,8 +510,9 @@ async fn init_docker_backend(
 
     let reconciler = DockerReconciler::new(
         docker.clone(),
+        store,
         db_pool,
-        resource_builder,
+        url_builder,
         registry_provider,
         encryption_provider,
         resource_store,
@@ -566,17 +555,33 @@ async fn init_docker_backend(
 }
 
 impl AppState {
-    /// Check if a user is an admin (case-insensitive email match)
-    pub fn is_admin(&self, user_email: &str) -> bool {
-        crate::server::auth::admin::is_admin_user(&self.admin_users, user_email)
+    /// Check if a user is an admin.
+    ///
+    /// Granted by the `auth.admin_users` email allowlist or by membership in
+    /// one of the `auth.admin_idp_groups` IdP groups.
+    pub async fn is_admin(&self, user: &User) -> bool {
+        self.has_role(&self.admin_users, &self.admin_idp_groups, user)
+            .await
     }
 
-    /// Check if a user has the Operator role (case-insensitive email match).
+    /// Check if a user has the Operator role.
     ///
-    /// Operators are a separate role from admins. Use this for access checks
-    /// on generic-resource APIs once they're wired up.
-    pub fn is_operator(&self, user_email: &str) -> bool {
-        crate::server::auth::admin::is_operator_user(&self.operator_users, user_email)
+    /// Operators are a separate role from admins: admins do NOT implicitly
+    /// receive it. Granted by the `auth.operator_users` email allowlist or by
+    /// membership in one of the `auth.operator_idp_groups` IdP groups.
+    pub async fn is_operator(&self, user: &User) -> bool {
+        self.has_role(&self.operator_users, &self.operator_idp_groups, user)
+            .await
+    }
+
+    async fn has_role(
+        &self,
+        allowed_emails: &[String],
+        allowed_groups: &[String],
+        user: &User,
+    ) -> bool {
+        crate::server::auth::roles::has_role(&self.db_pool, allowed_emails, allowed_groups, user)
+            .await
     }
 
     /// Run database migrations
@@ -607,7 +612,7 @@ impl AppState {
         Self::run_migrations(&db_pool).await?;
 
         // Run resource-store migrations immediately after root migrations
-        rise_resource_store::run_migrations(&db_pool)
+        rise_resource_store_postgres::run_migrations(&db_pool)
             .await
             .context("Failed to run resource store migrations")?;
 
@@ -620,8 +625,9 @@ impl AppState {
         // store is cheap to construct (it caches compiled JSON schemas lazily),
         // so we instantiate it once and clone the Arc into every handler.
         #[cfg(feature = "backend")]
-        let resource_store: Arc<dyn rise_resource_store::ResourceStore> =
-            Arc::new(rise_resource_store::PgResourceStore::new(db_pool.clone()));
+        let resource_store: Arc<dyn rise_resource_api::ResourceStore> = Arc::new(
+            rise_resource_store_postgres::PgResourceStore::new(db_pool.clone()),
+        );
 
         // Run default-Organization bootstrap. Must complete before
         // controllers begin processing typed projects, so we await it before
@@ -888,11 +894,22 @@ impl AppState {
         if !admin_users.is_empty() {
             tracing::info!("Configured {} admin user(s)", admin_users.len());
         }
+        let admin_idp_groups = Arc::new(settings.auth.admin_idp_groups.clone());
+        if !admin_idp_groups.is_empty() {
+            tracing::info!("Configured {} admin IdP group(s)", admin_idp_groups.len());
+        }
 
         // Store operator users list (separate role from admin)
         let operator_users = Arc::new(settings.auth.operator_users.clone());
         if !operator_users.is_empty() {
             tracing::info!("Configured {} operator user(s)", operator_users.len());
+        }
+        let operator_idp_groups = Arc::new(settings.auth.operator_idp_groups.clone());
+        if !operator_idp_groups.is_empty() {
+            tracing::info!(
+                "Configured {} operator IdP group(s)",
+                operator_idp_groups.len()
+            );
         }
 
         // Validate and index configured controller identities
@@ -1041,12 +1058,14 @@ impl AppState {
                 // string.
 
                 let rb = ResourceBuilder {
-                    production_ingress_url_template: production_ingress_url_template.clone(),
-                    staging_ingress_url_template: staging_ingress_url_template.clone(),
-                    environment_ingress_url_template: environment_ingress_url_template.clone(),
-                    ingress_port: *ingress_port,
-                    ingress_schema: ingress_schema.clone(),
-                    registry_provider: registry_provider.clone(),
+                    url_builder: rise_backend_core::DeploymentUrlBuilder {
+                        production_ingress_url_template: production_ingress_url_template.clone(),
+                        staging_ingress_url_template: staging_ingress_url_template.clone(),
+                        environment_ingress_url_template: environment_ingress_url_template.clone(),
+                        ingress_port: *ingress_port,
+                        ingress_schema: ingress_schema.clone(),
+                        registry_provider: registry_provider.clone(),
+                    },
                     auth_backend_url: auth_backend_url.clone(),
                     auth_signin_url: auth_signin_url.clone(),
                     backend_address: Some(parsed_backend_address),
@@ -1137,6 +1156,15 @@ impl AppState {
         // election can be wired to it.
         let shutdown = tokio_util::sync::CancellationToken::new();
 
+        // The single `DeploymentStore` implementation, shared by the deployment
+        // backend, the Metacontroller webhook, and the identity-refresh/CRD
+        // controllers. Constructed once here and threaded everywhere those need
+        // deployment persistence.
+        #[cfg(feature = "backend")]
+        let deployment_store: Arc<dyn rise_backend_core::DeploymentStore> = Arc::new(
+            crate::db::deployment_store::PgDeploymentStore::new(db_pool.clone()),
+        );
+
         // Initialize the deployment backend by matching on the configured
         // controller variant. Kubernetes uses the slim Metacontroller-backed
         // backend; Docker connects bollard, builds its own ResourceBuilder, and
@@ -1153,7 +1181,7 @@ impl AppState {
                         .clone()
                         .ok_or_else(|| anyhow::anyhow!("Kubernetes client not initialized"))?;
                     (
-                        init_kubernetes_backend(rb, kc, db_pool.clone()).await?,
+                        init_kubernetes_backend(rb, kc, deployment_store.clone()).await?,
                         None,
                         None,
                     )
@@ -1166,6 +1194,7 @@ impl AppState {
                         resource_store.clone(),
                         jwt_signer.clone(),
                         db_pool.clone(),
+                        deployment_store.clone(),
                         &public_url,
                         shutdown.clone(),
                     )
@@ -1569,7 +1598,9 @@ impl AppState {
             registry_provider,
             oci_client,
             admin_users,
+            admin_idp_groups,
             operator_users,
+            operator_idp_groups,
             controllers,
             controllers_by_issuer,
             #[cfg(feature = "backend")]
@@ -1587,6 +1618,8 @@ impl AppState {
             public_url,
             encryption_provider,
             deployment_backend,
+            #[cfg(feature = "backend")]
+            deployment_store,
             #[cfg(feature = "backend")]
             runtime_log_backend,
             extension_registry,

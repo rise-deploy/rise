@@ -15,7 +15,7 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use k8s_openapi::api::apps::v1::Deployment as K8sDeployment;
 use k8s_openapi::api::core::v1::{EnvVar, Secret};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -24,13 +24,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 
-use crate::db::models::{
-    Deployment, DeploymentEnvVar, DeploymentStatus, Project, TerminationReason,
-};
-use crate::db::{
-    deployments as db_deployments, env_vars as db_env_vars, environments as db_environments,
-    projects as db_projects,
-};
+use crate::db::models::{Deployment, DeploymentStatus, Project, TerminationReason};
 use crate::server::deployment::crd;
 use crate::server::deployment::resource_builder::{
     IdentityMount, ResourceBuilder, ANNOTATION_ENV_SECRET_HASH, ANNOTATION_LAST_REFRESH,
@@ -41,6 +35,12 @@ use crate::server::deployment::state_machine;
 use crate::server::state::AppState;
 use crate::server::workload_tokens::{sha256_hex, workload_subject, NO_ENVIRONMENT};
 use rise_backend_auth::WorkloadSubjectInfo;
+// Backend-agnostic runtime helpers live in `rise-backend-core`; re-exported here
+// so existing `crate::server::deployment::webhook::*` callers stay unchanged.
+pub(crate) use rise_backend_core::runtime::{
+    resolve_deployment_env_vars, resolve_runtime_containers, should_have_infrastructure,
+    ResolvedDeploymentEnvVars, DEPLOYING_TIMEOUT_MINUTES, PRE_PUSHED_TIMEOUT_MINUTES,
+};
 
 // ── Metacontroller webhook protocol types ──────────────────────────────
 
@@ -100,20 +100,10 @@ pub struct FinalizeResponse {
 
 // ── Deployment timeout ─────────────────────────────────────────────────
 
-/// Duration a deployment can be in Deploying state before timing out
-pub(crate) const DEPLOYING_TIMEOUT_MINUTES: i64 = 5;
-/// Duration a deployment can be in pre-Pushed states before timing out
-pub(crate) const PRE_PUSHED_TIMEOUT_MINUTES: i64 = 10;
 /// Duration after which image pull secret is refreshed (6 hours)
 const SECRET_REFRESH_HOURS: i64 = 6;
 /// Maximum number of terminating/terminated pods to carry forward in controller_metadata
 const MAX_INACTIVE_PODS: usize = 5;
-
-#[derive(Debug, Default)]
-pub(crate) struct ResolvedDeploymentEnvVars {
-    pub(crate) plain_env_vars: Vec<EnvVar>,
-    pub(crate) secret_env_vars: BTreeMap<String, ByteString>,
-}
 
 #[derive(Debug)]
 struct PreparedDeploymentEnvSecret {
@@ -166,7 +156,23 @@ pub async fn handle_sync(
         }
     };
 
-    match process_sync(&state, &project_name, &request.children).await {
+    // The parent RiseProject CR's UID is the GC anchor for resources we apply
+    // directly (outside Metacontroller), e.g. the backend EndpointSlice.
+    let project_uid = request
+        .parent
+        .get("metadata")
+        .and_then(|m| m.get("uid"))
+        .and_then(|u| u.as_str())
+        .map(|s| s.to_string());
+
+    match process_sync(
+        &state,
+        &project_name,
+        project_uid.as_deref(),
+        &request.children,
+    )
+    .await
+    {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(SyncError::WrongController {
             project,
@@ -216,10 +222,15 @@ pub async fn handle_sync(
 async fn process_sync(
     state: &AppState,
     project_name: &str,
+    rise_project_uid: Option<&str>,
     observed: &ObservedChildren,
 ) -> Result<SyncResponse, SyncError> {
     // 1. Load project from DB
-    let project = match db_projects::find_by_name(&state.db_pool, project_name).await? {
+    let project = match state
+        .deployment_store
+        .find_project_by_name(project_name)
+        .await?
+    {
         Some(p) => p,
         None => {
             warn!(project = %project_name, "Project not found in DB, deleting orphaned RiseProject CRD");
@@ -263,8 +274,10 @@ async fn process_sync(
     let namespace_prefix = resolve_project_namespace_prefix(state, &project, org_uid).await?;
 
     // 2. Load non-terminal deployments for this project (avoids loading full history)
-    let non_terminal_deployments =
-        db_deployments::list_non_terminal_for_project(&state.db_pool, project.id).await?;
+    let non_terminal_deployments = state
+        .deployment_store
+        .list_non_terminal_deployments_for_project(project.id)
+        .await?;
 
     let non_terminal: Vec<&Deployment> = non_terminal_deployments.iter().collect();
 
@@ -272,16 +285,21 @@ async fn process_sync(
     perform_status_transitions(state, &project, &non_terminal, observed, &namespace_prefix).await?;
 
     // 4. Re-load non-terminal deployments since statuses may have changed
-    let all_deployments =
-        db_deployments::list_non_terminal_for_project(&state.db_pool, project.id).await?;
-    let project = match db_projects::find_by_id(&state.db_pool, project.id).await? {
+    let all_deployments = state
+        .deployment_store
+        .list_non_terminal_deployments_for_project(project.id)
+        .await?;
+    let project = match state.deployment_store.find_project(project.id).await? {
         Some(p) => p,
         None => {
             // Project was deleted between initial lookup and now — return empty children
             return Ok(SyncResponse {
-                status: serde_json::json!({
-                    "lastSyncTime": Utc::now().to_rfc3339(),
-                }),
+                status: serde_json::to_value(crd::RiseProjectStatus {
+                    last_sync_time: Some(Utc::now().to_rfc3339()),
+                    identity_refresh_due_at: None,
+                    observed_generation: None,
+                })
+                .map_err(anyhow::Error::from)?,
                 children: vec![],
                 resync_after_seconds: Some(300.0),
             });
@@ -301,20 +319,29 @@ async fn process_sync(
     };
 
     // 6. Compute desired children
-    let children = compute_desired_children(
+    let (children, identity_refresh_due_at) = compute_desired_children(
         state,
         resource_builder,
         &project,
+        rise_project_uid,
         &all_deployments,
         observed,
         &namespace_prefix,
     )
     .await?;
 
+    // Build the status from the typed struct so its serde naming (camelCase) is
+    // the single source of truth shared with the identity-refresh controller,
+    // which reads it back as `RiseProjectStatus`.
+    let status = serde_json::to_value(crd::RiseProjectStatus {
+        last_sync_time: Some(Utc::now().to_rfc3339()),
+        identity_refresh_due_at: identity_refresh_due_at.map(|due| due.to_rfc3339()),
+        observed_generation: None,
+    })
+    .map_err(anyhow::Error::from)?;
+
     Ok(SyncResponse {
-        status: serde_json::json!({
-            "lastSyncTime": Utc::now().to_rfc3339(),
-        }),
+        status,
         children,
         resync_after_seconds: None,
     })
@@ -381,7 +408,7 @@ pub struct CachedOrganizationView {
 /// memoising a transient "not found" (`try_get_with` only retains
 /// successful loads).
 async fn load_org_view(
-    store: std::sync::Arc<dyn rise_resource_store::ResourceStore>,
+    store: std::sync::Arc<dyn rise_resource_api::ResourceStore>,
     uid: uuid::Uuid,
 ) -> anyhow::Result<CachedOrganizationView> {
     let row = store
@@ -410,7 +437,7 @@ pub async fn resolve_project_organization_uid(
     state: &AppState,
     project: &Project,
 ) -> anyhow::Result<uuid::Uuid> {
-    crate::db::organization_links::organization_uid_for_project(&state.db_pool, project.id)
+    state.deployment_store.organization_uid_for_project(project.id)
         .await?
         .ok_or_else(|| {
             error!(
@@ -518,8 +545,14 @@ async fn perform_status_transitions(
                 deployment_id = %deployment.deployment_id,
                 "Cancelling deployment — marking as Cancelled"
             );
-            db_deployments::mark_cancelled(&state.db_pool, deployment.id).await?;
-            db_projects::update_calculated_status(&state.db_pool, project.id).await?;
+            state
+                .deployment_store
+                .mark_deployment_cancelled(deployment.id)
+                .await?;
+            state
+                .deployment_store
+                .update_project_calculated_status(project.id)
+                .await?;
             continue;
         }
 
@@ -538,13 +571,14 @@ async fn perform_status_transitions(
                     deployment_id = %deployment.deployment_id,
                     "Deployment image pushed, transitioning to Deploying"
                 );
-                db_deployments::update_status(
-                    &state.db_pool,
-                    deployment.id,
-                    DeploymentStatus::Deploying,
-                )
-                .await?;
-                db_projects::update_calculated_status(&state.db_pool, project.id).await?;
+                state
+                    .deployment_store
+                    .update_deployment_status(deployment.id, DeploymentStatus::Deploying)
+                    .await?;
+                state
+                    .deployment_store
+                    .update_project_calculated_status(project.id)
+                    .await?;
             }
 
             DeploymentStatus::Deploying => {
@@ -598,8 +632,14 @@ async fn check_pre_pushed_timeout(state: &AppState, deployment: &Deployment) -> 
              This usually indicates the CLI was interrupted during build/push.",
             PRE_PUSHED_TIMEOUT_MINUTES, deployment.status
         );
-        db_deployments::mark_failed(&state.db_pool, deployment.id, &error_msg).await?;
-        db_projects::update_calculated_status(&state.db_pool, deployment.project_id).await?;
+        state
+            .deployment_store
+            .mark_deployment_failed(deployment.id, &error_msg)
+            .await?;
+        state
+            .deployment_store
+            .update_project_calculated_status(deployment.project_id)
+            .await?;
     }
     Ok(())
 }
@@ -621,8 +661,14 @@ async fn check_deploying_timeout(
                 deployment_id = %deployment.deployment_id,
                 "{}", error_msg
             );
-            db_deployments::mark_failed(&state.db_pool, deployment.id, &error_msg).await?;
-            db_projects::update_calculated_status(&state.db_pool, project.id).await?;
+            state
+                .deployment_store
+                .mark_deployment_failed(deployment.id, &error_msg)
+                .await?;
+            state
+                .deployment_store
+                .update_project_calculated_status(project.id)
+                .await?;
         }
     }
     Ok(())
@@ -636,34 +682,53 @@ async fn complete_termination(
 ) -> anyhow::Result<()> {
     match deployment.termination_reason {
         Some(TerminationReason::Superseded) => {
-            db_deployments::mark_superseded(&state.db_pool, deployment.id).await?;
+            state
+                .deployment_store
+                .mark_deployment_superseded(deployment.id)
+                .await?;
         }
         Some(TerminationReason::UserStopped) => {
-            db_deployments::mark_stopped(&state.db_pool, deployment.id).await?;
+            state
+                .deployment_store
+                .mark_deployment_stopped(deployment.id)
+                .await?;
         }
         Some(TerminationReason::Expired) => {
-            db_deployments::mark_expired(&state.db_pool, deployment.id).await?;
+            state
+                .deployment_store
+                .mark_deployment_expired(deployment.id)
+                .await?;
         }
         Some(TerminationReason::Failed) => {
-            db_deployments::mark_failed(
-                &state.db_pool,
-                deployment.id,
-                deployment
-                    .error_message
-                    .as_deref()
-                    .unwrap_or("Deployment failed"),
-            )
-            .await?;
+            state
+                .deployment_store
+                .mark_deployment_failed(
+                    deployment.id,
+                    deployment
+                        .error_message
+                        .as_deref()
+                        .unwrap_or("Deployment failed"),
+                )
+                .await?;
         }
         Some(TerminationReason::Cancelled) => {
-            db_deployments::mark_cancelled(&state.db_pool, deployment.id).await?;
+            state
+                .deployment_store
+                .mark_deployment_cancelled(deployment.id)
+                .await?;
         }
         None => {
             // Missing termination reason resolves to Stopped
-            db_deployments::mark_stopped(&state.db_pool, deployment.id).await?;
+            state
+                .deployment_store
+                .mark_deployment_stopped(deployment.id)
+                .await?;
         }
     }
-    db_projects::update_calculated_status(&state.db_pool, project.id).await?;
+    state
+        .deployment_store
+        .update_project_calculated_status(project.id)
+        .await?;
     Ok(())
 }
 
@@ -698,13 +763,17 @@ async fn check_deployment_health_from_observed(
                 deployment_id = %deployment.deployment_id,
                 "container side-data could not be deserialized; marking deployment Failed: {:?}", e
             );
-            db_deployments::mark_failed(
-                &state.db_pool,
-                deployment.id,
-                "container side-data could not be deserialized",
-            )
-            .await?;
-            db_projects::update_calculated_status(&state.db_pool, project.id).await?;
+            state
+                .deployment_store
+                .mark_deployment_failed(
+                    deployment.id,
+                    "container side-data could not be deserialized",
+                )
+                .await?;
+            state
+                .deployment_store
+                .update_project_calculated_status(project.id)
+                .await?;
             return Ok(());
         }
     };
@@ -769,9 +838,10 @@ async fn check_deployment_health_from_observed(
                 "healthy": is_healthy,
             },
         });
-        if let Err(e) =
-            db_deployments::update_controller_metadata(&state.db_pool, deployment.id, &metadata)
-                .await
+        if let Err(e) = state
+            .deployment_store
+            .update_deployment_controller_metadata(deployment.id, &metadata)
+            .await
         {
             warn!(
                 deployment_id = %deployment.deployment_id,
@@ -792,8 +862,14 @@ async fn check_deployment_health_from_observed(
                     deployment_id = %deployment.deployment_id,
                     "Deployment has irrecoverable pod error: {}", error_msg
                 );
-                db_deployments::mark_failed(&state.db_pool, deployment.id, &error_msg).await?;
-                db_projects::update_calculated_status(&state.db_pool, project.id).await?;
+                state
+                    .deployment_store
+                    .mark_deployment_failed(deployment.id, &error_msg)
+                    .await?;
+                state
+                    .deployment_store
+                    .update_project_calculated_status(project.id)
+                    .await?;
             } else if is_ready {
                 info!(
                     deployment_id = %deployment.deployment_id,
@@ -816,8 +892,14 @@ async fn check_deployment_health_from_observed(
                 deployment_id = %deployment.deployment_id,
                 "Healthy deployment is now unhealthy: {}", msg
             );
-            db_deployments::mark_unhealthy(&state.db_pool, deployment.id, msg).await?;
-            db_projects::update_calculated_status(&state.db_pool, project.id).await?;
+            state
+                .deployment_store
+                .mark_deployment_unhealthy(deployment.id, msg)
+                .await?;
+            state
+                .deployment_store
+                .update_project_calculated_status(project.id)
+                .await?;
         }
 
         DeploymentStatus::Unhealthy if !pod_check.has_error && is_ready => {
@@ -825,8 +907,14 @@ async fn check_deployment_health_from_observed(
                 deployment_id = %deployment.deployment_id,
                 "Unhealthy deployment has recovered, marking as Healthy"
             );
-            db_deployments::mark_healthy(&state.db_pool, deployment.id).await?;
-            db_projects::update_calculated_status(&state.db_pool, project.id).await?;
+            state
+                .deployment_store
+                .mark_deployment_healthy(deployment.id)
+                .await?;
+            state
+                .deployment_store
+                .update_project_calculated_status(project.id)
+                .await?;
         }
 
         _ => {}
@@ -1139,15 +1227,16 @@ async fn handle_deployment_became_healthy(
     project: &Project,
 ) -> anyhow::Result<()> {
     // Find currently active deployment in this group BEFORE marking new as Healthy
-    let active_in_group = db_deployments::find_active_for_project_and_group(
-        &state.db_pool,
-        project.id,
-        &deployment.deployment_group,
-    )
-    .await?;
+    let active_in_group = state
+        .deployment_store
+        .find_active_deployment_for_project_and_group(project.id, &deployment.deployment_group)
+        .await?;
 
     // Mark the new deployment as healthy
-    db_deployments::mark_healthy(&state.db_pool, deployment.id).await?;
+    state
+        .deployment_store
+        .mark_deployment_healthy(deployment.id)
+        .await?;
 
     // Supersede the old active deployment
     if let Some(old_active) = active_in_group {
@@ -1156,22 +1245,21 @@ async fn handle_deployment_became_healthy(
                 "Deployment {} replacing {} in group '{}', marking old as Terminating",
                 deployment.deployment_id, old_active.deployment_id, deployment.deployment_group
             );
-            db_deployments::mark_terminating(
-                &state.db_pool,
-                old_active.id,
-                TerminationReason::Superseded,
-            )
-            .await?;
+            state
+                .deployment_store
+                .mark_deployment_terminating(old_active.id, TerminationReason::Superseded)
+                .await?;
         }
     }
 
     // Clean up other active (Healthy/Unhealthy) deployments in the group
-    let others = db_deployments::find_non_terminal_for_project_and_group(
-        &state.db_pool,
-        project.id,
-        &deployment.deployment_group,
-    )
-    .await?;
+    let others = state
+        .deployment_store
+        .find_non_terminal_deployments_for_project_and_group(
+            project.id,
+            &deployment.deployment_group,
+        )
+        .await?;
 
     for other in others {
         if other.id != deployment.id
@@ -1182,25 +1270,23 @@ async fn handle_deployment_became_healthy(
                 "Cleaning up non-active deployment {} in group '{}', marking as Terminating",
                 other.deployment_id, deployment.deployment_group
             );
-            db_deployments::mark_terminating(
-                &state.db_pool,
-                other.id,
-                TerminationReason::Superseded,
-            )
-            .await?;
+            state
+                .deployment_store
+                .mark_deployment_terminating(other.id, TerminationReason::Superseded)
+                .await?;
         }
     }
 
     // Mark deployment as active
-    db_deployments::mark_as_active(
-        &state.db_pool,
-        deployment.id,
-        project.id,
-        &deployment.deployment_group,
-    )
-    .await?;
+    state
+        .deployment_store
+        .mark_deployment_as_active(deployment.id, project.id, &deployment.deployment_group)
+        .await?;
 
-    db_projects::update_calculated_status(&state.db_pool, project.id).await?;
+    state
+        .deployment_store
+        .update_project_calculated_status(project.id)
+        .await?;
 
     Ok(())
 }
@@ -1224,13 +1310,14 @@ async fn check_expirations(
                     deployment_id = %deployment.deployment_id,
                     "Deployment has expired, marking as Terminating"
                 );
-                db_deployments::mark_terminating(
-                    &state.db_pool,
-                    deployment.id,
-                    TerminationReason::Expired,
-                )
-                .await?;
-                db_projects::update_calculated_status(&state.db_pool, project.id).await?;
+                state
+                    .deployment_store
+                    .mark_deployment_terminating(deployment.id, TerminationReason::Expired)
+                    .await?;
+                state
+                    .deployment_store
+                    .update_project_calculated_status(project.id)
+                    .await?;
             }
         }
     }
@@ -1246,20 +1333,26 @@ async fn compute_desired_children(
     state: &AppState,
     resource_builder: &ResourceBuilder,
     project: &Project,
+    rise_project_uid: Option<&str>,
     all_deployments: &[Deployment],
     observed: &ObservedChildren,
     namespace_prefix: &str,
-) -> anyhow::Result<Vec<serde_json::Value>> {
+) -> anyhow::Result<(Vec<serde_json::Value>, Option<DateTime<Utc>>)> {
     let mut children: Vec<serde_json::Value> = Vec::new();
+    // Earliest re-mint time across this project's identity-bearing deployments,
+    // returned for the `RiseProject` status so the identity-refresh controller
+    // knows when to resync. `None` when no deployment has identity tokens.
+    let mut identity_refresh_due_at: Option<DateTime<Utc>> = None;
     let namespace = ResourceBuilder::namespace_name(project, namespace_prefix);
 
     // Preload all environments for this project to avoid per-deployment DB lookups
-    let environments: HashMap<uuid::Uuid, crate::db::models::Environment> =
-        db_environments::list_for_project(&state.db_pool, project.id)
-            .await?
-            .into_iter()
-            .map(|env| (env.id, env))
-            .collect();
+    let environments: HashMap<uuid::Uuid, crate::db::models::Environment> = state
+        .deployment_store
+        .list_environments_for_project(project.id)
+        .await?
+        .into_iter()
+        .map(|env| (env.id, env))
+        .collect();
 
     // 1. Namespace (always)
     let ns = resource_builder.create_namespace(project, namespace_prefix);
@@ -1267,7 +1360,10 @@ async fn compute_desired_children(
 
     // 2. Image pull secret (if needed)
     if resource_builder.image_pull_secret_name.is_none()
-        && resource_builder.registry_provider.requires_pull_secret()
+        && resource_builder
+            .url_builder
+            .registry_provider
+            .requires_pull_secret()
     {
         if let Some(secret) =
             build_image_pull_secret(resource_builder, project, &namespace, observed).await?
@@ -1283,6 +1379,7 @@ async fn compute_desired_children(
             &mut children,
             resource_builder,
             project,
+            rise_project_uid,
             &namespace,
             backend_address,
         )
@@ -1354,18 +1451,19 @@ async fn compute_desired_children(
                     deployment_id = %d.deployment_id,
                     "container side-data could not be deserialized; marking deployment Failed: {:?}", e
                 );
-                db_deployments::mark_failed(
-                    &state.db_pool,
-                    d.id,
-                    "container side-data could not be deserialized",
-                )
-                .await?;
+                state
+                    .deployment_store
+                    .mark_deployment_failed(d.id, "container side-data could not be deserialized")
+                    .await?;
                 failed_to_parse.insert(d.id);
             }
         }
     }
     if !failed_to_parse.is_empty() {
-        db_projects::update_calculated_status(&state.db_pool, project.id).await?;
+        state
+            .deployment_store
+            .update_project_calculated_status(project.id)
+            .await?;
         infra_deployments.retain(|d| !failed_to_parse.contains(&d.id));
     }
 
@@ -1420,7 +1518,11 @@ async fn compute_desired_children(
                 &namespace,
                 env_name.as_deref(),
                 &observed.secrets,
-                env_vars.secret_env_vars,
+                env_vars
+                    .secret_env_vars
+                    .into_iter()
+                    .map(|(k, v)| (k, ByteString(v)))
+                    .collect(),
             ))
         };
 
@@ -1476,7 +1578,9 @@ async fn compute_desired_children(
         // Resolve image
         let source_deployment_id =
             if let Some(source_id) = deployment.rolled_back_from_deployment_id {
-                db_deployments::find_by_id(&state.db_pool, source_id)
+                state
+                    .deployment_store
+                    .find_deployment(source_id)
                     .await?
                     .map(|d| d.deployment_id)
             } else {
@@ -1516,6 +1620,10 @@ async fn compute_desired_children(
         )
         .await?;
         children.push(serde_json::to_value(&identity.secret)?);
+        if let Some(due) = identity.identity_refresh_due_at {
+            identity_refresh_due_at =
+                Some(identity_refresh_due_at.map_or(due, |earliest| earliest.min(due)));
+        }
 
         // Emit one K8s Deployment per container. A single-container deployment
         // has a single synthesised `app` container (see `resolve_runtime_containers`);
@@ -1538,7 +1646,15 @@ async fn compute_desired_children(
         };
 
         for spec in &container_specs {
-            let mut per_container_env = env_vars.plain_env_vars.clone();
+            let mut per_container_env: Vec<EnvVar> = env_vars
+                .plain_env_vars
+                .iter()
+                .map(|(name, value)| EnvVar {
+                    name: name.clone(),
+                    value: Some(value.clone()),
+                    ..Default::default()
+                })
+                .collect();
             for var in &injected_host_env {
                 if per_container_env.iter().any(|v| v.name == var.name) {
                     continue;
@@ -1637,8 +1753,10 @@ async fn compute_desired_children(
     }
 
     // Services, Ingresses, NetworkPolicies — one per group with an active deployment
-    let custom_domains =
-        crate::db::custom_domains::list_project_custom_domains(&state.db_pool, project.id).await?;
+    let custom_domains = state
+        .deployment_store
+        .list_project_custom_domains(project.id)
+        .await?;
     let valid_custom_domains = resource_builder.filter_valid_custom_domains(&custom_domains);
 
     // Index custom domains by environment_id.
@@ -1708,25 +1826,43 @@ async fn compute_desired_children(
             .map(|s| s.name.as_str())
             .collect();
         let service_name_base = ResourceBuilder::service_name(project, active_deployment);
-        let routes: Vec<(String, String)> = routes_by_deployment
-            .get(&active_deployment.id)
-            .map(|route_specs| {
-                route_specs
-                    .iter()
-                    .filter(|r| routable_names.contains(r.container.as_str()))
-                    .map(|r| {
-                        (
-                            r.path.clone(),
-                            format!("{}-{}", service_name_base, r.container),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Routable route specs: those targeting a container that exposes a port.
+        let routable_specs: Vec<&crate::server::deployment::models::RouteSpec> =
+            routes_by_deployment
+                .get(&active_deployment.id)
+                .map(|route_specs| {
+                    route_specs
+                        .iter()
+                        .filter(|r| routable_names.contains(r.container.as_str()))
+                        .collect()
+                })
+                .unwrap_or_default();
 
-        // A workers-only deployment (no routable container) emits no ingress.
-        if !routes.is_empty() {
-            if let Some(ingress) = resource_builder.create_primary_ingress(
+        // A workers-only deployment (no routable container) emits no ingress. The
+        // builder resolves the project's access class itself (after host
+        // selection), so a workers-only group — or a group whose hosts all
+        // collide — never forces a missing/misconfigured access class to resolve.
+        if !routable_specs.is_empty() {
+            // Carry each route's per-route `access` override; the builder resolves
+            // the effective requirement (override, else the project default) and
+            // partitions by it, gating each path group independently.
+            let routes: Vec<crate::server::deployment::resource_builder::IngressRoute> =
+                routable_specs
+                    .iter()
+                    .map(
+                        |r| crate::server::deployment::resource_builder::IngressRoute {
+                            path: r.path.clone(),
+                            service_name: format!("{}-{}", service_name_base, r.container),
+                            access_override: r.access.clone(),
+                        },
+                    )
+                    .collect();
+
+            // One or more Ingresses (one per effective-requirement group). An
+            // empty result means every candidate host collided with another env's
+            // URL — skip so nginx admission doesn't reject it (warning already
+            // logged); the deployment still runs.
+            for ingress in resource_builder.create_primary_ingress(
                 project,
                 active_deployment,
                 &namespace,
@@ -1738,23 +1874,19 @@ async fn compute_desired_children(
             )? {
                 children.push(serde_json::to_value(&ingress)?);
             }
-            // When `create_primary_ingress` returns `None`, every candidate host for
-            // this group collided with another env's URL (e.g. a deployment group
-            // named the same as an environment whose primary group is different).
-            // Skip the ingress so nginx admission doesn't reject it; the deployment
-            // still runs and a warning was logged in `create_primary_ingress`.
 
             // Sibling custom-domain ingress, only when carve-out annotations are set.
             if split_custom_domains && !domains_for_group.is_empty() {
-                let custom_ingress = resource_builder.create_custom_domain_ingress(
+                for custom_ingress in resource_builder.create_custom_domain_ingress(
                     project,
                     active_deployment,
                     &namespace,
                     &domains_for_group,
                     env_name.as_deref(),
                     &routes,
-                )?;
-                children.push(serde_json::to_value(&custom_ingress)?);
+                )? {
+                    children.push(serde_json::to_value(&custom_ingress)?);
+                }
             }
         }
 
@@ -1768,7 +1900,7 @@ async fn compute_desired_children(
         children.push(serde_json::to_value(&np)?);
     }
 
-    Ok(children)
+    Ok((children, identity_refresh_due_at))
 }
 
 /// Returns true if ANY of a deployment's per-container K8s Deployments has been
@@ -1818,93 +1950,6 @@ fn apply_container_port_env(env: &mut Vec<EnvVar>, container_port: Option<u16>) 
     }
 }
 
-/// Resolve the container + route list the reconciler should emit for a
-/// deployment. A multi-container deployment parses its persisted side-data; a
-/// single-container deployment (`containers IS NULL`) synthesises an implicit
-/// `app` container from the row's columns plus a `/` route. The synthesised
-/// `app` carries no image (`image: None`) — the reconciler fills it from the
-/// deployment's resolved image, so the existing single-container image (tagged
-/// with the deployment ID) is reused with no rebuild.
-///
-/// `containers`/`routes` come folded onto the [`Deployment`] row. A `None`
-/// `containers` column is a legitimate single-container deployment and triggers
-/// the synthesised `app`. A `Some` column that fails to deserialize is treated
-/// as a hard error for *this* deployment (returned `Err`): silently collapsing
-/// it to the single-container fallback would drop every per-container resource.
-pub(crate) fn resolve_runtime_containers(
-    deployment: &Deployment,
-) -> anyhow::Result<(
-    Vec<crate::server::deployment::models::ContainerSpec>,
-    Vec<crate::server::deployment::models::RouteSpec>,
-)> {
-    use crate::server::deployment::models::{decode_side_data, ContainerSpec, RouteSpec};
-
-    if let Some(containers_value) = deployment.containers.as_ref() {
-        let specs: Vec<ContainerSpec> = decode_side_data(containers_value).with_context(|| {
-            format!(
-                "deployment {} ({}) has a non-NULL `containers` column that could not be \
-                 decoded into Vec<ContainerSpec>",
-                deployment.id, deployment.deployment_id
-            )
-        })?;
-        if specs.is_empty() {
-            anyhow::bail!(
-                "deployment {} ({}) has a non-NULL `containers` column with an empty items list; \
-                 this is a degenerate state that should have been rejected at write time",
-                deployment.id,
-                deployment.deployment_id
-            );
-        }
-        let routes: Vec<RouteSpec> = match deployment.routes.as_ref() {
-            Some(routes_value) => decode_side_data(routes_value).with_context(|| {
-                format!(
-                    "deployment {} ({}) has a non-NULL `routes` column that could not be \
-                     decoded into Vec<RouteSpec>",
-                    deployment.id, deployment.deployment_id
-                )
-            })?,
-            None => Vec::new(),
-        };
-        return Ok((specs, routes));
-    }
-
-    // Single-container deployment: synthesise the implicit `app` container.
-    // A single-container deployment always has an http port (NOT NULL, default
-    // 8080), so it is always routable at `/`.
-    let resolved =
-        crate::rise_toml::ResolvedDeploy::implicit_app(crate::rise_toml::ImplicitAppContainer {
-            port: deployment.http_port as u16,
-            replicas: Some(deployment.replicas as u32),
-            cpu: Some(deployment.cpu.clone()),
-            memory: Some(deployment.memory.clone()),
-            ..Default::default()
-        });
-    let specs = resolved
-        .containers
-        .into_iter()
-        .map(|container| ContainerSpec {
-            name: container.name,
-            image: container.image,
-            port: container.port,
-            replicas: container.replicas,
-            cpu: container.cpu,
-            memory: container.memory,
-            env_overrides: Vec::new(),
-            health_check: None,
-        })
-        .collect();
-    let routes = resolved
-        .routes
-        .into_iter()
-        .map(|route| RouteSpec {
-            path: route.path,
-            container: route.container,
-        })
-        .collect();
-    Ok((specs, routes))
-}
-
-/// Returns true if this deployment should have K8s infrastructure (K8s Deployment resource).
 /// Compute Service ownership per (group, container_name) across the project's
 /// in-play deployments. The owner is the deployment whose labels/port the
 /// canonical Service `<group>-<container>` points at.
@@ -1974,17 +2019,6 @@ pub(crate) fn compute_service_owner_per_container(
     owner
 }
 
-pub(crate) fn should_have_infrastructure(deployment: &Deployment) -> bool {
-    matches!(
-        deployment.status,
-        DeploymentStatus::Pushed
-            | DeploymentStatus::Deploying
-            | DeploymentStatus::Healthy
-            | DeploymentStatus::Unhealthy
-            | DeploymentStatus::Terminating
-    )
-}
-
 /// Build image pull secret, refreshing if stale.
 async fn build_image_pull_secret(
     resource_builder: &ResourceBuilder,
@@ -2049,10 +2083,14 @@ async fn build_image_pull_secret(
 
     // Fetch fresh pull credentials (scoped to this project's repository)
     let credentials = resource_builder
+        .url_builder
         .registry_provider
         .get_k8s_pull_credentials(&project.name)
         .await?;
-    let registry_host = resource_builder.registry_provider.registry_host();
+    let registry_host = resource_builder
+        .url_builder
+        .registry_provider
+        .registry_host();
 
     let secret = resource_builder.create_dockerconfigjson_secret(
         IMAGE_PULL_SECRET_NAME,
@@ -2068,6 +2106,11 @@ async fn build_image_pull_secret(
 struct PreparedIdentitySecret {
     secret: Secret,
     mount: IdentityMount,
+    /// When this deployment's identity tokens next need re-minting (~2/3 of the
+    /// TTL after the last mint), or `None` when the deployment has no tokens.
+    /// Folded into the project's `RiseProject` status so the identity-refresh
+    /// controller knows when to resync.
+    identity_refresh_due_at: Option<DateTime<Utc>>,
 }
 
 /// Build the per-deployment workload-identity Secret.
@@ -2112,13 +2155,11 @@ async fn prepare_identity_secret(
             // same applied Secret and writes the same hash.
             let credential_hash = sha256_hex(c.as_bytes());
             if deployment.identity_credential_hash.as_deref() != Some(credential_hash.as_str()) {
-                db_deployments::set_identity_credential_hash(
-                    &state.db_pool,
-                    deployment.id,
-                    &credential_hash,
-                )
-                .await
-                .context("Failed to persist identity credential hash")?;
+                state
+                    .deployment_store
+                    .set_identity_credential_hash(deployment.id, &credential_hash)
+                    .await
+                    .context("Failed to persist identity credential hash")?;
             }
             c
         }
@@ -2196,19 +2237,28 @@ async fn prepare_identity_secret(
                 ttl_secs,
             )?;
             let refreshed_at = Utc::now();
-            // Schedule the next re-mint at ~2/3 of the TTL: the identity-refresh
-            // controller resyncs this project once this is due, just before the
-            // token would expire (Metacontroller won't resync a steady project on
-            // its own). Only set when we actually mint — the reuse path keeps the
-            // existing schedule.
-            let due_at = refreshed_at
-                + chrono::Duration::seconds(
-                    crate::server::workload_tokens::refresh_due_after_secs(ttl_secs) as i64,
-                );
-            db_deployments::set_identity_refresh_due_at(&state.db_pool, deployment.id, due_at)
-                .await?;
             (minted, refreshed_at)
         }
+    };
+
+    // When this deployment's tokens next need re-minting: ~2/3 of the TTL after
+    // the last mint (`refreshed_at`). Computed on every sync (mint or reuse) so
+    // the value the webhook returns into the `RiseProject` status is stable until
+    // a real re-mint moves it forward. `None` when there's nothing to refresh.
+    // The identity-refresh controller resyncs a project once this is due, just
+    // before the token would expire (Metacontroller won't resync a steady project
+    // on its own).
+    let identity_refresh_due_at = if audiences.is_empty() {
+        None
+    } else {
+        Some(
+            refreshed_at
+                + chrono::Duration::seconds(
+                    crate::server::workload_tokens::refresh_due_after_secs(
+                        state.identity_token_ttl_seconds,
+                    ) as i64,
+                ),
+        )
     };
 
     let secret = resource_builder.create_identity_secret(
@@ -2227,6 +2277,7 @@ async fn prepare_identity_secret(
             secret_name,
             token_filenames,
         },
+        identity_refresh_due_at,
     })
 }
 
@@ -2299,25 +2350,26 @@ fn prepare_deployment_env_secret(
     }
 }
 
-/// Add backend service + endpoints resources.
+/// Add backend service + EndpointSlice resources.
 ///
 /// The Service is returned as a Metacontroller child. For IP-based backends,
-/// the Endpoints are applied directly via kube-rs because Endpoints cannot be
-/// a Metacontroller child resource type — Kubernetes auto-creates Endpoints
-/// for Services with selectors (e.g. the deployment `default` Service), and
-/// Metacontroller would thrash deleting/adopting those in an infinite loop.
-/// Since child resource types are all-or-nothing, we manage the `rise-backend`
-/// Endpoints outside of Metacontroller as well.
+/// the EndpointSlice is applied directly via kube-rs because EndpointSlices
+/// cannot be a Metacontroller child resource type — Kubernetes auto-creates
+/// EndpointSlices for Services with selectors (e.g. the deployment `default`
+/// Service), and Metacontroller would thrash deleting/adopting those in an
+/// infinite loop. Since child resource types are all-or-nothing, we manage the
+/// `rise-backend` EndpointSlice outside of Metacontroller as well.
 async fn add_backend_resources(
     state: &AppState,
     children: &mut Vec<serde_json::Value>,
     resource_builder: &ResourceBuilder,
     project: &Project,
+    rise_project_uid: Option<&str>,
     namespace: &str,
     backend_address: &crate::server::settings::BackendAddress,
 ) -> anyhow::Result<()> {
     if backend_address.is_ip_address() {
-        // IP address → ClusterIP Service (as child) + Endpoints (applied directly)
+        // IP address → ClusterIP Service (as child) + EndpointSlice (applied directly)
         let svc = resource_builder.create_backend_service_clusterip(
             project,
             namespace,
@@ -2325,13 +2377,14 @@ async fn add_backend_resources(
         );
         children.push(serde_json::to_value(&svc)?);
 
-        let endpoints = resource_builder.create_backend_endpoints(
+        let endpoint_slice = resource_builder.create_backend_endpoint_slice(
             project,
             namespace,
             &backend_address.host,
             backend_address.port,
+            rise_project_uid,
         );
-        apply_backend_endpoints(state, &endpoints, namespace).await;
+        apply_backend_endpoint_slice(state, &endpoint_slice, namespace).await;
     } else {
         // DNS name → ExternalName
         let svc = resource_builder.create_backend_service_externalname(
@@ -2345,39 +2398,43 @@ async fn add_backend_resources(
     Ok(())
 }
 
-/// Apply backend Endpoints directly via kube-rs server-side apply.
+/// Apply backend EndpointSlice directly via kube-rs server-side apply.
 ///
 /// On the first sync for a new project the namespace returned in this sync's
 /// children list has not yet been applied by Metacontroller, so the apply
 /// 404s. That's expected and self-heals on the next resync, so the 404 is
 /// logged at debug instead of warning.
-async fn apply_backend_endpoints(
+async fn apply_backend_endpoint_slice(
     state: &AppState,
-    endpoints: &k8s_openapi::api::core::v1::Endpoints,
+    endpoint_slice: &k8s_openapi::api::discovery::v1::EndpointSlice,
     namespace: &str,
 ) {
     let Some(ref kube_client) = state.kube_client else {
         return;
     };
-    let api: kube::Api<k8s_openapi::api::core::v1::Endpoints> =
+    let api: kube::Api<k8s_openapi::api::discovery::v1::EndpointSlice> =
         kube::Api::namespaced(kube_client.clone(), namespace);
-    let name = endpoints.metadata.name.as_deref().unwrap_or("rise-backend");
+    let name = endpoint_slice
+        .metadata
+        .name
+        .as_deref()
+        .unwrap_or("rise-backend");
     let params = kube::api::PatchParams::apply("rise-controller").force();
     match api
-        .patch(name, &params, &kube::api::Patch::Apply(endpoints))
+        .patch(name, &params, &kube::api::Patch::Apply(endpoint_slice))
         .await
     {
         Ok(_) => {}
         Err(kube::Error::Api(err)) if err.code == 404 => {
             debug!(
                 namespace = %namespace,
-                "Backend Endpoints apply deferred: namespace not yet created (will retry on next resync)"
+                "Backend EndpointSlice apply deferred: namespace not yet created (will retry on next resync)"
             );
         }
         Err(e) => {
             warn!(
                 namespace = %namespace,
-                "Failed to apply backend Endpoints: {:?}", e
+                "Failed to apply backend EndpointSlice: {:?}", e
             );
         }
     }
@@ -2389,61 +2446,11 @@ async fn load_env_vars(
     _project: &Project,
     deployment: &Deployment,
 ) -> anyhow::Result<ResolvedDeploymentEnvVars> {
-    let env_vars = db_env_vars::list_deployment_env_vars(&state.db_pool, deployment.id).await?;
+    let env_vars = state
+        .deployment_store
+        .list_deployment_env_vars(deployment.id)
+        .await?;
     resolve_deployment_env_vars(env_vars, state.encryption_provider.as_deref()).await
-}
-
-pub(crate) async fn resolve_deployment_env_vars(
-    env_vars: Vec<DeploymentEnvVar>,
-    encryption_provider: Option<&dyn crate::server::encryption::EncryptionProvider>,
-) -> anyhow::Result<ResolvedDeploymentEnvVars> {
-    let mut resolved = ResolvedDeploymentEnvVars::default();
-
-    for var in env_vars {
-        let key = var.key.trim().to_string();
-        if key != var.key {
-            tracing::warn!(
-                "Environment variable key {:?} has surrounding whitespace; trimming to {:?}",
-                var.key,
-                key
-            );
-        }
-
-        let value = if var.is_secret {
-            match encryption_provider {
-                Some(provider) => provider
-                    .decrypt(&var.value)
-                    .await
-                    .with_context(|| format!("Failed to decrypt secret variable '{}'", key))?,
-                None => {
-                    tracing::error!(
-                        "Encountered secret variable '{}' but no encryption provider configured",
-                        key
-                    );
-                    return Err(anyhow::anyhow!(
-                        "Cannot decrypt secret variable '{}': no encryption provider",
-                        key
-                    ));
-                }
-            }
-        } else {
-            var.value
-        };
-
-        if var.is_secret {
-            resolved
-                .secret_env_vars
-                .insert(key, ByteString(value.into_bytes()));
-        } else {
-            resolved.plain_env_vars.push(EnvVar {
-                name: key,
-                value: Some(value),
-                ..Default::default()
-            });
-        }
-    }
-
-    Ok(resolved)
 }
 
 // ── Finalize webhook handler ───────────────────────────────────────────
@@ -2506,10 +2513,16 @@ async fn process_finalize(
 ) -> anyhow::Result<FinalizeResponse> {
     info!(project = %project_name, "Processing finalize webhook — marking all deployments as stopped");
 
-    if let Some(project) = db_projects::find_by_name(&state.db_pool, project_name).await? {
+    if let Some(project) = state
+        .deployment_store
+        .find_project_by_name(project_name)
+        .await?
+    {
         // Mark all non-terminal deployments as Stopped
-        let deployments =
-            db_deployments::list_non_terminal_for_project(&state.db_pool, project.id).await?;
+        let deployments = state
+            .deployment_store
+            .list_non_terminal_deployments_for_project(project.id)
+            .await?;
         for deployment in deployments {
             {
                 info!(
@@ -2521,20 +2534,30 @@ async fn process_finalize(
                     &deployment.status,
                     &DeploymentStatus::Cancelling,
                 ) {
-                    db_deployments::mark_cancelling(&state.db_pool, deployment.id).await?;
-                    db_deployments::mark_cancelled(&state.db_pool, deployment.id).await?;
+                    state
+                        .deployment_store
+                        .mark_deployment_cancelling(deployment.id)
+                        .await?;
+                    state
+                        .deployment_store
+                        .mark_deployment_cancelled(deployment.id)
+                        .await?;
                 } else {
-                    db_deployments::mark_terminating(
-                        &state.db_pool,
-                        deployment.id,
-                        TerminationReason::UserStopped,
-                    )
-                    .await?;
-                    db_deployments::mark_stopped(&state.db_pool, deployment.id).await?;
+                    state
+                        .deployment_store
+                        .mark_deployment_terminating(deployment.id, TerminationReason::UserStopped)
+                        .await?;
+                    state
+                        .deployment_store
+                        .mark_deployment_stopped(deployment.id)
+                        .await?;
                 }
             }
         }
-        db_projects::update_calculated_status(&state.db_pool, project.id).await?;
+        state
+            .deployment_store
+            .update_project_calculated_status(project.id)
+            .await?;
     }
 
     Ok(FinalizeResponse {
@@ -2547,7 +2570,7 @@ async fn process_finalize(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::models::{DeploymentStatus, Project, ProjectStatus};
+    use crate::db::models::{DeploymentEnvVar, DeploymentStatus, Project, ProjectStatus};
     use crate::server::deployment::resource_builder::ResourceBuilder;
     use crate::server::encryption::EncryptionProvider;
     use crate::server::registry::models::RegistryCredentials;
@@ -2704,15 +2727,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(resolved.plain_env_vars.len(), 1);
-        assert_eq!(resolved.plain_env_vars[0].name, "PORT");
-        assert_eq!(resolved.plain_env_vars[0].value.as_deref(), Some("8080"));
+        assert_eq!(resolved.plain_env_vars[0].0, "PORT");
+        assert_eq!(resolved.plain_env_vars[0].1, "8080");
         assert_eq!(resolved.secret_env_vars.len(), 2);
         assert_eq!(
-            resolved.secret_env_vars["API_KEY"].0,
+            resolved.secret_env_vars["API_KEY"],
             b"ciphertext-a".to_vec()
         );
         assert_eq!(
-            resolved.secret_env_vars["SESSION_SECRET"].0,
+            resolved.secret_env_vars["SESSION_SECRET"],
             b"ciphertext-b".to_vec()
         );
     }
@@ -2788,12 +2811,14 @@ mod tests {
 
     fn test_resource_builder() -> ResourceBuilder {
         ResourceBuilder {
-            production_ingress_url_template: "{project_name}.example.test".to_string(),
-            staging_ingress_url_template: None,
-            environment_ingress_url_template: None,
-            ingress_port: None,
-            ingress_schema: "https".to_string(),
-            registry_provider: Arc::new(TestRegistryProvider),
+            url_builder: rise_backend_core::DeploymentUrlBuilder {
+                production_ingress_url_template: "{project_name}.example.test".to_string(),
+                staging_ingress_url_template: None,
+                environment_ingress_url_template: None,
+                ingress_port: None,
+                ingress_schema: "https".to_string(),
+                registry_provider: Arc::new(TestRegistryProvider),
+            },
             auth_backend_url: "https://auth.example.test".to_string(),
             auth_signin_url: "https://signin.example.test".to_string(),
             backend_address: None,
@@ -2906,7 +2931,7 @@ mod tests {
         let names: Vec<&str> = resolved
             .plain_env_vars
             .iter()
-            .map(|v| v.name.as_str())
+            .map(|(name, _)| name.as_str())
             .collect();
         assert!(
             names.contains(&"LEADING_SPACE"),

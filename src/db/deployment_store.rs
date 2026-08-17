@@ -38,6 +38,14 @@ impl DeploymentStore for PgDeploymentStore {
         crate::db::projects::find_by_id(&self.pool, id).await
     }
 
+    async fn find_project_by_name(&self, name: &str) -> Result<Option<Project>> {
+        crate::db::projects::find_by_name(&self.pool, name).await
+    }
+
+    async fn list_active_projects(&self) -> Result<Vec<Project>> {
+        crate::db::projects::list_active(&self.pool).await
+    }
+
     async fn update_project_calculated_status(&self, project_id: Uuid) -> Result<Project> {
         crate::db::projects::update_calculated_status(&self.pool, project_id).await
     }
@@ -113,6 +121,10 @@ impl DeploymentStore for PgDeploymentStore {
         crate::db::deployments::mark_failed(&self.pool, id, error_message).await
     }
 
+    async fn mark_deployment_cancelling(&self, id: Uuid) -> Result<Deployment> {
+        crate::db::deployments::mark_cancelling(&self.pool, id).await
+    }
+
     async fn mark_deployment_cancelled(&self, id: Uuid) -> Result<Deployment> {
         crate::db::deployments::mark_cancelled(&self.pool, id).await
     }
@@ -158,5 +170,9 @@ impl DeploymentStore for PgDeploymentStore {
             deployment_group,
         )
         .await
+    }
+
+    async fn set_identity_credential_hash(&self, id: Uuid, hash: &str) -> Result<()> {
+        crate::db::deployments::set_identity_credential_hash(&self.pool, id, hash).await
     }
 }

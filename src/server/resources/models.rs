@@ -5,10 +5,7 @@
 //! per-endpoint payloads (status, finalizers), and the conversion from a
 //! stored `ResourceRow` to the wire `Resource` envelope.
 
-use std::collections::BTreeMap;
-
-use rise_resource_api::{Resource, ResourceMetadata};
-use rise_resource_store::ResourceRow;
+use rise_resource_api::{JsonObject, Resource, ResourceRow, ValidationError};
 use serde::{Deserialize, Serialize};
 
 /// Outcome of a controller status update — what was previously
@@ -40,74 +37,20 @@ pub struct ResourceList {
 
 /// Convert a stored row into the wire envelope.
 ///
-/// We don't use `ResourceRow::to_resource` here because that helper requires
-/// typed spec/status. The generic API returns spec/status verbatim so callers
-/// can round-trip arbitrary external resources; `apiVersion` is projected to
-/// the requested served version by `row_to_resource_with_api_version`.
-pub fn row_to_resource(row: &ResourceRow) -> Resource {
+/// Conversion validates metadata, spec, and status fail-closed. The generic
+/// JSON object types preserve valid external resource fields verbatim, while
+/// `apiVersion` is projected separately for the requested served route.
+pub fn row_to_resource(row: &ResourceRow) -> Result<Resource, ValidationError> {
     row_to_resource_with_api_version(row, &row.api_version)
 }
 
-pub fn row_to_resource_with_api_version(row: &ResourceRow, api_version: &str) -> Resource {
-    let annotations: BTreeMap<String, String> =
-        match serde_json::from_value::<BTreeMap<String, serde_json::Value>>(row.metadata.clone()) {
-            Ok(map) => map
-                .into_iter()
-                .map(|(k, v)| match v {
-                    serde_json::Value::String(s) => (k, s),
-                    // Non-string annotation values are preserved as their JSON
-                    // representation so that round-trip GET → PUT does not silently
-                    // erase them.  The conversion is lossless: `42` → `"42"`,
-                    // `{"x":1}` → `"{\"x\":1}"`.
-                    other => {
-                        tracing::warn!(
-                            uid = %row.uid,
-                            kind = %row.kind,
-                            name = %row.name,
-                            key = %k,
-                            value = %other,
-                            "annotation value is not a string — serialising to JSON string"
-                        );
-                        (k, other.to_string())
-                    }
-                })
-                .collect(),
-            Err(e) => {
-                tracing::warn!(
-                    uid = %row.uid,
-                    kind = %row.kind,
-                    name = %row.name,
-                    error = %e,
-                    "resource metadata is not a JSON object — annotations will be empty"
-                );
-                BTreeMap::new()
-            }
-        };
-
-    let spec: BTreeMap<String, serde_json::Value> = match &row.spec {
-        serde_json::Value::Object(map) => map.clone().into_iter().collect(),
-        _ => BTreeMap::new(),
-    };
-    let status: BTreeMap<String, serde_json::Value> = match &row.status {
-        serde_json::Value::Object(map) => map.clone().into_iter().collect(),
-        _ => BTreeMap::new(),
-    };
-
-    Resource {
-        api_version: api_version.to_string(),
-        kind: row.kind.clone(),
-        metadata: ResourceMetadata {
-            name: row.name.clone(),
-            uid: Some(row.uid),
-            revision: Some(row.revision),
-            discriminator: Some(row.discriminator.clone()),
-            annotations,
-            finalizers: row.finalizers.clone(),
-            deletion_timestamp: row.deletion_timestamp,
-        },
-        spec,
-        status,
-    }
+pub fn row_to_resource_with_api_version(
+    row: &ResourceRow,
+    api_version: &str,
+) -> Result<Resource, ValidationError> {
+    let mut resource = row.to_resource::<JsonObject, JsonObject>()?;
+    resource.api_version = api_version.to_owned();
+    Ok(resource)
 }
 
 #[cfg(test)]
@@ -117,19 +60,25 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    fn row(spec: serde_json::Value, status: serde_json::Value) -> ResourceRow {
+    fn row(
+        metadata: serde_json::Value,
+        spec: serde_json::Value,
+        status: serde_json::Value,
+    ) -> ResourceRow {
         ResourceRow {
+            labels: Default::default(),
             uid: Uuid::new_v4(),
             api_version: "rise.dev/v1alpha1".into(),
             kind: "Organization".into(),
             parent_uid: None,
             name: "acme".into(),
             discriminator: "abcd1234".into(),
-            metadata: json!({"team": "platform"}),
+            metadata,
             spec,
             status,
             revision: 3,
             finalizers: vec!["controller.example.com/cleanup".into()],
+            owner_references: vec![],
             deletion_timestamp: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -138,8 +87,12 @@ mod tests {
 
     #[test]
     fn row_to_resource_round_trips_spec_and_status() {
-        let r = row(json!({"displayName": "Acme"}), json!({"controllers": {}}));
-        let resource = row_to_resource(&r);
+        let r = row(
+            json!({"team": "platform"}),
+            json!({"displayName": "Acme"}),
+            json!({"controllers": {}}),
+        );
+        let resource = row_to_resource(&r).unwrap();
 
         assert_eq!(resource.api_version, "rise.dev/v1alpha1");
         assert_eq!(resource.kind, "Organization");
@@ -159,32 +112,37 @@ mod tests {
     }
 
     #[test]
-    fn row_to_resource_preserves_non_string_annotations_as_json_strings() {
-        // Annotations written by external tools may store numbers, booleans, or
-        // objects.  They must survive a GET → PUT round-trip rather than being
-        // silently dropped.
-        let mut r = row(json!({}), json!({}));
-        r.metadata = json!({
-            "count": 42,
-            "flag": true,
-            "nested": {"x": 1},
-            "normal": "hello"
-        });
-        let resource = row_to_resource(&r);
-        let ann = &resource.metadata.annotations;
-        assert_eq!(ann.get("count").map(String::as_str), Some("42"));
-        assert_eq!(ann.get("flag").map(String::as_str), Some("true"));
-        assert_eq!(ann.get("nested").map(String::as_str), Some("{\"x\":1}"));
-        assert_eq!(ann.get("normal").map(String::as_str), Some("hello"));
+    fn row_to_resource_projects_the_served_api_version() {
+        let r = row(json!({}), json!({"value": 1}), json!({}));
+        let resource = row_to_resource_with_api_version(&r, "rise.dev/v1").unwrap();
+        assert_eq!(resource.api_version, "rise.dev/v1");
+        assert_eq!(resource.spec.get("value"), Some(&json!(1)));
     }
 
     #[test]
-    fn row_to_resource_treats_non_object_spec_as_empty() {
-        // The DB-level CHECK constraint forbids non-object spec/status, so this
-        // is a defensive fallback rather than a regular code path.
-        let r = row(json!("not an object"), json!(null));
-        let resource = row_to_resource(&r);
-        assert!(resource.spec.is_empty());
-        assert!(resource.status.is_empty());
+    fn row_to_resource_rejects_malformed_metadata() {
+        let r = row(json!({"count": 42}), json!({}), json!({}));
+        assert!(row_to_resource(&r)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid metadata"));
+    }
+
+    #[test]
+    fn row_to_resource_rejects_malformed_spec() {
+        let r = row(json!({}), json!("not an object"), json!({}));
+        assert!(row_to_resource(&r)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid spec"));
+    }
+
+    #[test]
+    fn row_to_resource_rejects_malformed_status() {
+        let r = row(json!({}), json!({}), json!(null));
+        assert!(row_to_resource(&r)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid status"));
     }
 }

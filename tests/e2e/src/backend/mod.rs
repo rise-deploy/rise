@@ -54,6 +54,14 @@ pub trait Backend {
         self.rise_cli(args, auth)
     }
 
+    /// Absolute path to `rel` under the repo root, as the CLI sees it. Both
+    /// backends run the CLI with the repo root as cwd — the Minikube harness runs
+    /// it in a container that bind-mounts the repo root at the same path — so a
+    /// path under the repo root is readable by the CLI on either backend, unlike
+    /// `/tmp` (which the Minikube CLI container does not mount). Use this for
+    /// dir-based deploys (a generated `rise.toml`) that must run on both backends.
+    fn cli_visible_path(&self, rel: &str) -> String;
+
     /// GET an app path through this backend's ingress. `Ok(None)` means app-HTTP
     /// reach isn't wired for this backend yet — a *declared* gap the scenario
     /// logs, never silent drift.
@@ -169,6 +177,21 @@ pub trait Backend {
     fn reapply_chart(&self) -> Result<()> {
         anyhow::bail!(
             "chart reapply is not supported by the {} backend",
+            self.name()
+        )
+    }
+
+    /// Upgrade the running stack in place to the target version (`RISE_IMAGE_TAG`)
+    /// and make the CLI usable again, then wait for the control plane to be
+    /// healthy. Only meaningful in the upgrade flow, where `bring_up` first stood
+    /// the stack up at the older `RISE_E2E_UPGRADE_FROM` version: Docker recreates
+    /// the `rise` service on the new image (the DB volume — and its data — is kept,
+    /// so the new server runs its migrations against it); Kubernetes `helm
+    /// upgrade`s from the old released chart to the in-repo chart on the new image.
+    /// Default: unsupported.
+    fn upgrade(&mut self) -> Result<()> {
+        anyhow::bail!(
+            "in-place upgrade is not supported by the {} backend",
             self.name()
         )
     }

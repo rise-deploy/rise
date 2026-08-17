@@ -551,12 +551,24 @@ pub struct AuthSettings {
     /// `operator_users` separately if needed.
     #[serde(default)]
     pub admin_users: Vec<String>,
+    /// IdP groups whose members are admins, as an alternative to listing every
+    /// admin email in `admin_users`. A user matches when they belong to an
+    /// IdP-managed team of that name (matching is case-insensitive). Blank
+    /// entries are filtered out so an unset `${VAR}` default collapses to an
+    /// empty list.
+    #[serde(default, deserialize_with = "deserialize_blank_filtered_list")]
+    pub admin_idp_groups: Vec<String>,
     /// List of Operator user emails. Operators have full access to generic
     /// resource storage and built-in resource management. This is a separate
     /// role from `admin_users`. Matching is case-insensitive. Blank entries are
     /// filtered out so an unset `${VAR}` default collapses to an empty list.
     #[serde(default, deserialize_with = "deserialize_blank_filtered_list")]
     pub operator_users: Vec<String>,
+    /// IdP groups whose members hold the Operator role, as an alternative to
+    /// listing every Operator email in `operator_users`. Matches the same way
+    /// as `admin_idp_groups`.
+    #[serde(default, deserialize_with = "deserialize_blank_filtered_list")]
+    pub operator_idp_groups: Vec<String>,
     /// Trusted external controller identities. Each entry binds a stable
     /// controller ID to an OIDC issuer plus required claim constraints.
     /// Used by generic-resource controller endpoints.
@@ -753,17 +765,7 @@ fn default_custom_domain_tls_mode() -> CustomDomainTlsMode {
     CustomDomainTlsMode::PerDomain
 }
 
-/// Access requirement level for project ingress
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
-#[serde(rename_all = "PascalCase")]
-pub enum AccessRequirement {
-    /// No authentication required - fully public access
-    None,
-    /// Must be authenticated, but no project membership required
-    Authenticated,
-    /// Must be authenticated AND have project membership (owner or team member)
-    Member,
-}
+pub use rise_backend_core::AccessRequirement;
 
 /// Access class configuration for ingress authentication
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -3165,7 +3167,8 @@ pub struct PlatformAccessConfig {
     #[serde(default, deserialize_with = "deserialize_blank_filtered_list")]
     pub allowed_user_emails: Vec<String>,
 
-    /// IdP groups whose members get platform access
+    /// IdP groups whose members get platform access. A user matches when they
+    /// belong to an IdP-managed team of that name (case-insensitive).
     #[serde(default, deserialize_with = "deserialize_blank_filtered_list")]
     pub allowed_idp_groups: Vec<String>,
 }

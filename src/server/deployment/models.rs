@@ -1,4 +1,3 @@
-use super::controller::DeploymentUrls;
 use crate::server::error::ServerError;
 pub use rise_deployment_spec::request_spec::{
     ContainerSpec, EnvOverride, HealthCheckSpec, RouteSpec,
@@ -139,88 +138,25 @@ fn default_memory() -> String {
     "256Mi".to_string()
 }
 
-/// The default deployment group name
-/// This group drives the overall project status and is used for primary deployments
-pub const DEFAULT_DEPLOYMENT_GROUP: &str = "default";
+// The default deployment group name, the group-name normalizer, and the Rise
+// system env-var builder live in `rise-backend-core` (shared with the deployment
+// backends); re-exported here so existing `crate::server::deployment::models::*`
+// paths keep working.
+pub use rise_backend_core::group::{normalize_deployment_group, DEFAULT_DEPLOYMENT_GROUP};
+pub use rise_backend_core::system_env::rise_system_env_vars;
 
-/// Normalize a deployment group name for use in URLs and resource names.
+/// Prefix reserved for Rise-injected pod env vars (see `rise_system_env_vars`).
 ///
-/// Replaces sequences of characters that are not alphanumeric, `-`, `_`, or `.`
-/// with `--` (e.g., `mr/123` → `mr--123`). The result is also trimmed so it
-/// starts and ends with an alphanumeric character, satisfying the Kubernetes
-/// label value regex: `(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])?`
-///
-/// **Collision safety**: This function is injective (collision-free) only when
-/// input group names do not contain `--`. The deployment group validation in
-/// `is_valid_group_name` enforces this constraint.
-///
-/// This matches the normalization used in the `{deployment_group}` placeholder
-/// of `staging_ingress_url_template`.
-pub fn normalize_deployment_group(deployment_group: &str) -> String {
-    let mut result = String::new();
-    let mut last_was_invalid = false;
+/// User-supplied env-var keys in this namespace are rejected so they cannot
+/// silently collide with / shadow a Rise-injected value (injected vars are set
+/// as explicit pod `env`, which Kubernetes resolves *after* `envFrom`).
+pub const RESERVED_ENV_VAR_PREFIX: &str = "RISE_";
 
-    for ch in deployment_group.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
-            result.push(ch);
-            last_was_invalid = false;
-        } else if !last_was_invalid {
-            result.push_str("--");
-            last_was_invalid = true;
-        }
-    }
-
-    result
-        .trim_matches(|c: char| !c.is_ascii_alphanumeric())
-        .to_string()
-}
-
-/// Generate the Rise system environment variables for a deployment.
-///
-/// Returns `(key, value)` pairs for:
-/// - `RISE_ISSUER` — Rise server URL (base URL for all Rise endpoints and JWT issuer)
-/// - `RISE_APP_URL` — Canonical URL where the app is accessible
-/// - `RISE_APP_URLS` — JSON array of all URLs where the app can be accessed
-/// - `RISE_DEPLOYMENT_GROUP` — The deployment group name (e.g. "default", "mr/123")
-/// - `RISE_DEPLOYMENT_GROUP_NORMALIZED` — The group name normalized for URLs (e.g. "mr--123")
-/// - `RISE_ENVIRONMENT` — The environment name (e.g. "production", "staging"), if set
-pub fn rise_system_env_vars(
-    public_url: &str,
-    deployment_group: &str,
-    deployment_urls: &DeploymentUrls,
-    environment_name: Option<&str>,
-) -> Vec<(String, String)> {
-    let urls_for_env: Vec<String> = if deployment_urls.all_urls.is_empty() {
-        let mut combined = vec![deployment_urls.default_url.clone()];
-        combined.extend(deployment_urls.custom_domain_urls.clone());
-        combined
-    } else {
-        deployment_urls.all_urls.clone()
-    };
-    let app_urls_json = serde_json::to_string(&urls_for_env).unwrap_or_else(|_| "[]".to_string());
-
-    let mut vars = vec![
-        ("RISE_ISSUER".to_string(), public_url.to_string()),
-        (
-            "RISE_APP_URL".to_string(),
-            deployment_urls.primary_url.clone(),
-        ),
-        ("RISE_APP_URLS".to_string(), app_urls_json),
-        (
-            "RISE_DEPLOYMENT_GROUP".to_string(),
-            deployment_group.to_string(),
-        ),
-        (
-            "RISE_DEPLOYMENT_GROUP_NORMALIZED".to_string(),
-            normalize_deployment_group(deployment_group),
-        ),
-    ];
-
-    if let Some(env_name) = environment_name {
-        vars.push(("RISE_ENVIRONMENT".to_string(), env_name.to_string()));
-    }
-
-    vars
+/// True if `key` falls in the reserved `RISE_*` namespace and must be rejected
+/// for user-supplied env vars. Case-sensitive: K8s env names are case-sensitive
+/// and the injected vars are uppercase.
+pub fn is_reserved_env_var_key(key: &str) -> bool {
+    key.starts_with(RESERVED_ENV_VAR_PREFIX)
 }
 
 /// Validate the wire-level multi-container spec (containers + routes) from a
@@ -327,6 +263,7 @@ pub struct UpdateDeploymentStatusRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::deployment::controller::DeploymentUrls;
     use rise_deployment_spec::side_data::CONTAINER_SIDE_DATA_VERSION;
     use serde_json::json;
 
@@ -452,6 +389,7 @@ mod tests {
         let routes = vec![RouteSpec {
             path: "/".to_string(),
             container: "app".to_string(),
+            access: None,
         }];
         assert!(validate_containers_and_routes(None, &routes).is_err());
     }
@@ -471,6 +409,7 @@ mod tests {
         let routes = vec![RouteSpec {
             path: "/".to_string(),
             container: "api".to_string(),
+            access: None,
         }];
         validate_containers_and_routes(Some(&containers), &routes).unwrap();
     }
@@ -552,6 +491,7 @@ mod tests {
         let routes = vec![RouteSpec {
             path: "/".to_string(),
             container: "ghost".to_string(),
+            access: None,
         }];
         let err = validate_containers_and_routes(Some(&containers), &routes).unwrap_err();
         assert!(
@@ -567,6 +507,7 @@ mod tests {
         let routes = vec![RouteSpec {
             path: "/".to_string(),
             container: "worker".to_string(),
+            access: None,
         }];
         let err = validate_containers_and_routes(Some(&containers), &routes).unwrap_err();
         assert!(err.message.contains("no port"), "got: {}", err.message);
@@ -578,6 +519,7 @@ mod tests {
         let routes = vec![RouteSpec {
             path: "api".to_string(),
             container: "api".to_string(),
+            access: None,
         }];
         let err = validate_containers_and_routes(Some(&containers), &routes).unwrap_err();
         assert!(
@@ -594,6 +536,7 @@ mod tests {
             let routes = vec![RouteSpec {
                 path: reserved.to_string(),
                 container: "api".to_string(),
+                access: None,
             }];
             let err = validate_containers_and_routes(Some(&containers), &routes).unwrap_err();
             assert!(
@@ -610,6 +553,7 @@ mod tests {
         let routes = vec![RouteSpec {
             path: "/api".to_string(),
             container: "api".to_string(),
+            access: None,
         }];
         validate_containers_and_routes(Some(&containers), &routes).unwrap();
     }
@@ -621,6 +565,7 @@ mod tests {
             let routes = vec![RouteSpec {
                 path: bad.to_string(),
                 container: "api".to_string(),
+                access: None,
             }];
             let err = validate_containers_and_routes(Some(&containers), &routes).unwrap_err();
             assert!(
@@ -747,6 +692,7 @@ mod tests {
         let routes = vec![RouteSpec {
             path: "/api".to_string(),
             container: "api".to_string(),
+            access: None,
         }];
         let routes_decoded: Vec<RouteSpec> =
             decode_side_data(&encode_side_data(&routes).unwrap()).unwrap();

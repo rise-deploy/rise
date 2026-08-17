@@ -1,19 +1,22 @@
 //! Background garbage-collection worker for the generic resource store.
 //!
-//! `store.delete()` always cascades by stamping `deletion_timestamp` on the
-//! target and its *immediate* children, then attaching the
-//! `system.rise.dev/cascade-deletion` system finalizer to the target when
-//! children exist. Nothing in the request path drains the resulting subtree —
+//! `store.delete()` cascades by stamping `deletion_timestamp` on every immediate
+//! structural child and owner-reference dependent. The
+//! `system.rise.dev/cascade-deletion` finalizer retains the target only while a
+//! structural child or an owner reference with `blockOwnerDeletion: true`
+//! remains. Non-blocking cross-tree dependents continue draining after their
+//! owner disappears. Nothing in the request path drains the resulting graph —
 //! that is this worker's job.
 //!
 //! On each tick the leader fetches a batch of tombstoned rows oldest-first
 //! (`list_pending_collection`) and calls `try_collect` on each. The store
 //! handles per-row mechanics:
-//!   - children remain → stamps the next layer and keeps the cascade finalizer
+//!   - lifecycle dependents remain → stamps the next layer and keeps the
+//!     cascade finalizer only for blocking edges
 //!   - all finalizers (controller + cascade) clear → hard-deletes the row
 //!
-//! Controllers progressively shed their own finalizers from the bottom of the
-//! tree; successive sweeps eventually drain each subtree.
+//! Controllers progressively shed their own finalizers from lifecycle leaves;
+//! successive sweeps eventually drain the graph.
 //!
 //! Robustness properties worth knowing:
 //!   - **Forward-progress guard**: within a single sweep we track which UIDs
@@ -44,7 +47,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use rise_resource_store::{DeleteOutcome, ResourceRow, ResourceStore, StoreError};
+use rise_resource_api::{DeleteOutcome, ResourceRow, ResourceStore, StoreError};
 use sqlx::PgPool;
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
@@ -432,11 +435,11 @@ fn stuck_for_secs(row: &ResourceRow, now: DateTime<Utc>) -> u64 {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use rise_resource_api::{API_VERSION_V1ALPHA1, ORGANIZATION_KIND, RESOURCE_DEFINITION_KIND};
-    use rise_resource_store::{
-        CollectionInfo, CreateResourceParams, PathSegment, PgResourceStore, StoreError,
-        UpdateResourceParams,
+    use rise_resource_api::{
+        CollectionInfo, CreateResourceParams, PathSegment, StoreError, UpdateResourceParams,
     };
+    use rise_resource_api::{API_VERSION_V1ALPHA1, ORGANIZATION_KIND, RESOURCE_DEFINITION_KIND};
+    use rise_resource_store_postgres::PgResourceStore;
     use serde_json::json;
     use std::collections::BTreeMap;
 
@@ -502,7 +505,7 @@ mod tests {
     /// `GlobalSchedule`, which write to `runtime_sync.leader_leases` /
     /// `runtime_sync.leader_schedules`.
     async fn store_for(pool: PgPool) -> Arc<dyn ResourceStore> {
-        rise_resource_store::run_migrations(&pool)
+        rise_resource_store_postgres::run_migrations(&pool)
             .await
             .expect("resource store migrations");
         rise_runtime_sync::run_migrations(&pool)
@@ -514,12 +517,14 @@ mod tests {
     async fn create_org(store: &dyn ResourceStore, name: &str) -> ResourceRow {
         store
             .create(CreateResourceParams {
+                labels: Default::default(),
                 api_version: API_VERSION_V1ALPHA1.to_string(),
                 kind: ORGANIZATION_KIND.to_string(),
                 name: name.to_string(),
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: json!({"displayName": name}),
                 validator: None,
             })
@@ -532,12 +537,14 @@ mod tests {
     async fn create_org_with_finalizer(store: &dyn ResourceStore, name: &str) -> ResourceRow {
         store
             .create(CreateResourceParams {
+                labels: Default::default(),
                 api_version: API_VERSION_V1ALPHA1.to_string(),
                 kind: ORGANIZATION_KIND.to_string(),
                 name: name.to_string(),
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![CONTROLLER_FINALIZER.to_string()],
+                owner_references: vec![],
                 spec: json!({"displayName": name}),
                 validator: None,
             })
@@ -548,12 +555,14 @@ mod tests {
     async fn register_widget_definition(store: &dyn ResourceStore) {
         store
             .register_resource_definition(CreateResourceParams {
+                labels: Default::default(),
                 api_version: API_VERSION_V1ALPHA1.to_string(),
                 kind: RESOURCE_DEFINITION_KIND.to_string(),
                 name: "widgets.example.dev".to_string(),
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: json!({
                     "group": "example.dev",
                     "kind": "Widget",
@@ -576,12 +585,14 @@ mod tests {
     ) -> ResourceRow {
         store
             .create(CreateResourceParams {
+                labels: Default::default(),
                 api_version: "example.dev/v1".to_string(),
                 kind: "Widget".to_string(),
                 name: name.to_string(),
                 parent_uid: Some(parent),
                 annotations: BTreeMap::new(),
                 finalizers,
+                owner_references: vec![],
                 spec: json!({}),
                 validator: None,
             })
@@ -882,6 +893,7 @@ mod tests {
 
     fn sample_row() -> ResourceRow {
         ResourceRow {
+            labels: Default::default(),
             uid: Uuid::new_v4(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: ORGANIZATION_KIND.to_string(),
@@ -893,6 +905,7 @@ mod tests {
             status: json!({}),
             revision: 1,
             finalizers: vec![],
+            owner_references: vec![],
             deletion_timestamp: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -914,6 +927,10 @@ mod tests {
 
         async fn get(&self, uid: Uuid) -> Result<Option<ResourceRow>, StoreError> {
             self.inner.get(uid).await
+        }
+
+        async fn ancestors(&self, uid: Uuid) -> Result<Vec<ResourceRow>, StoreError> {
+            self.inner.ancestors(uid).await
         }
 
         async fn get_by_name(
@@ -956,10 +973,6 @@ mod tests {
             self.inner.update(uid, params).await
         }
 
-        async fn rename(&self, uid: Uuid, new_name: &str) -> Result<ResourceRow, StoreError> {
-            self.inner.rename(uid, new_name).await
-        }
-
         async fn delete(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError> {
             self.inner.delete(uid).await
         }
@@ -976,6 +989,13 @@ mod tests {
             limit: i64,
         ) -> Result<Vec<ResourceRow>, StoreError> {
             self.inner.list_pending_collection(limit).await
+        }
+
+        async fn list_deletion_blockers(
+            &self,
+            uid: Uuid,
+        ) -> Result<rise_resource_api::DeletionBlockerReport, StoreError> {
+            self.inner.list_deletion_blockers(uid).await
         }
 
         async fn resolve_path(
@@ -1092,6 +1112,10 @@ mod tests {
             self.inner.get(uid).await
         }
 
+        async fn ancestors(&self, uid: Uuid) -> Result<Vec<ResourceRow>, StoreError> {
+            self.inner.ancestors(uid).await
+        }
+
         async fn get_by_name(
             &self,
             api_version: &str,
@@ -1132,10 +1156,6 @@ mod tests {
             self.inner.update(uid, params).await
         }
 
-        async fn rename(&self, uid: Uuid, new_name: &str) -> Result<ResourceRow, StoreError> {
-            self.inner.rename(uid, new_name).await
-        }
-
         async fn delete(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError> {
             self.inner.delete(uid).await
         }
@@ -1149,6 +1169,13 @@ mod tests {
             limit: i64,
         ) -> Result<Vec<ResourceRow>, StoreError> {
             self.inner.list_pending_collection(limit).await
+        }
+
+        async fn list_deletion_blockers(
+            &self,
+            uid: Uuid,
+        ) -> Result<rise_resource_api::DeletionBlockerReport, StoreError> {
+            self.inner.list_deletion_blockers(uid).await
         }
 
         async fn resolve_path(

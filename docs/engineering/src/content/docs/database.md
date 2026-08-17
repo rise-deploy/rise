@@ -37,7 +37,7 @@ isolated in a dedicated Postgres schema with its own `_sqlx_migrations` tracking
 table (sqlx 0.8 hard-codes that table name, so the crates switch `search_path`
 when migrating):
 
-- **`rise-resource-store`** → schema `resource_store` (generic resource storage).
+- **`rise-resource-store-postgres`** → schema `resource_store` (generic resource storage).
 - **`rise-runtime-sync`** → schema `runtime_sync` (cross-replica synchronization
   primitives: leader leases and schedules backing `LeaderElection`,
   `GlobalSchedule`, and `GlobalLock`).

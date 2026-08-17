@@ -16,6 +16,7 @@ pub mod http;
 pub mod report;
 pub mod scenario;
 pub mod token;
+pub mod upgrade;
 
 /// Which backend the current process targets. CI runs one backend per job.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

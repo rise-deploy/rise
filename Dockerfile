@@ -18,24 +18,30 @@ FROM chef AS planner
 
 # Copy workspace project files
 COPY Cargo.toml Cargo.lock ./
+COPY crates/rise-authz/Cargo.toml ./crates/rise-authz/Cargo.toml
 COPY crates/rise-resource-api/Cargo.toml ./crates/rise-resource-api/Cargo.toml
-COPY crates/rise-resource-store/Cargo.toml ./crates/rise-resource-store/Cargo.toml
+COPY crates/rise-resource-store-postgres/Cargo.toml ./crates/rise-resource-store-postgres/Cargo.toml
 COPY crates/rise-backend-auth/Cargo.toml ./crates/rise-backend-auth/Cargo.toml
 COPY crates/rise-backend-core/Cargo.toml ./crates/rise-backend-core/Cargo.toml
+COPY crates/rise-backend-docker/Cargo.toml ./crates/rise-backend-docker/Cargo.toml
 COPY crates/rise-deployment-spec/Cargo.toml ./crates/rise-deployment-spec/Cargo.toml
 COPY crates/rise-runtime-sync/Cargo.toml ./crates/rise-runtime-sync/Cargo.toml
 
 # Create dummy sources for cargo to be happy
 RUN mkdir -p src && \
     echo "fn main() {}" > src/main.rs && \
+    mkdir -p crates/rise-authz/src && \
+    echo "" > crates/rise-authz/src/lib.rs && \
     mkdir -p crates/rise-resource-api/src && \
     echo "" > crates/rise-resource-api/src/lib.rs && \
-    mkdir -p crates/rise-resource-store/src && \
-    echo "" > crates/rise-resource-store/src/lib.rs && \
+    mkdir -p crates/rise-resource-store-postgres/src && \
+    echo "" > crates/rise-resource-store-postgres/src/lib.rs && \
     mkdir -p crates/rise-backend-auth/src && \
     echo "" > crates/rise-backend-auth/src/lib.rs && \
     mkdir -p crates/rise-backend-core/src && \
     echo "" > crates/rise-backend-core/src/lib.rs && \
+    mkdir -p crates/rise-backend-docker/src && \
+    echo "" > crates/rise-backend-docker/src/lib.rs && \
     mkdir -p crates/rise-deployment-spec/src && \
     echo "" > crates/rise-deployment-spec/src/lib.rs && \
     mkdir -p crates/rise-runtime-sync/src && \

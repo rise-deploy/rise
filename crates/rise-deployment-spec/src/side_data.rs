@@ -114,13 +114,36 @@ mod tests {
 
     #[test]
     fn side_data_routes_round_trip_same_envelope() {
-        let routes = vec![RouteSpec {
-            path: "/api".to_string(),
-            container: "api".to_string(),
-        }];
+        use crate::access::AccessRequirement;
+        let routes = vec![
+            RouteSpec {
+                path: "/api".to_string(),
+                container: "api".to_string(),
+                access: None,
+            },
+            RouteSpec {
+                path: "/admin".to_string(),
+                container: "api".to_string(),
+                access: Some(AccessRequirement::Member),
+            },
+        ];
         let decoded: Vec<RouteSpec> =
             decode_side_data(&encode_side_data(&routes).unwrap()).unwrap();
         assert_eq!(decoded[0].path, "/api");
+        assert_eq!(decoded[0].access, None);
+        assert_eq!(decoded[1].access, Some(AccessRequirement::Member));
+    }
+
+    #[test]
+    fn side_data_routes_without_access_field_decode_as_none() {
+        // A version-1 payload written before `access` existed must still decode
+        // (the field is `#[serde(default)]`) — no version bump required.
+        let legacy = json!({
+            "version": CONTAINER_SIDE_DATA_VERSION,
+            "items": [{ "path": "/", "container": "app" }],
+        });
+        let decoded: Vec<RouteSpec> = decode_side_data(&legacy).unwrap();
+        assert_eq!(decoded[0].access, None);
     }
 
     #[test]

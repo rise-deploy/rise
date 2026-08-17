@@ -108,6 +108,10 @@ export default defineConfig({
             { label: 'Schema Reference', slug: 'resources/schemas' },
           ],
         },
+        {
+          label: 'Architecture Decisions',
+          autogenerate: { directory: 'adr' },
+        },
       ],
     }),
   ],

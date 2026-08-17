@@ -17,7 +17,7 @@ through the `docker` deployment controller (`deployment_controller.type: docker`
 
 The reconciler creates one container per running deployment and stamps two
 families of labels on each (see
-`src/server/deployment/controller/docker/labels.rs`):
+`crates/rise-backend-docker/src/labels.rs`):
 
 - **Bookkeeping labels** (`rise.dev/managed-by=rise`, `…/project`,
   `…/deployment-id`, `…/route-hash`, etc.) so the reconciler can find its

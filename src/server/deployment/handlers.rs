@@ -544,6 +544,14 @@ fn validate_env_override(env_override: &models::EnvOverride) -> Result<bool, Ser
         ));
     }
 
+    if models::is_reserved_env_var_key(&env_override.key) {
+        return Err(ServerError::bad_request(format!(
+            "Env override '{}' uses the reserved '{}' prefix, which is reserved for Rise-injected variables.",
+            env_override.key,
+            models::RESERVED_ENV_VAR_PREFIX,
+        )));
+    }
+
     let is_protected = normalize_env_override_is_protected(env_override);
     if is_protected && !env_override.is_secret {
         return Err(ServerError::bad_request(format!(
@@ -3255,6 +3263,22 @@ mod tests {
             err.message,
             "PORT cannot be set via env overrides. Use http_port/--http-port instead."
         );
+    }
+
+    #[test]
+    fn env_override_validation_rejects_reserved_rise_prefix() {
+        let err = validate_env_override(&EnvOverride {
+            key: "RISE_APP_URL".to_string(),
+            value: "value".to_string(),
+            is_secret: false,
+            is_protected: None,
+            source: None,
+            for_environment: None,
+        })
+        .unwrap_err();
+
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("reserved"));
     }
 
     #[test]

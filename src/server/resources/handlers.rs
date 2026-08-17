@@ -15,12 +15,14 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use rise_resource_api::{CreateResourceRequest, UpdateResourceRequest};
-use rise_resource_store::{
-    CollectionInfo, CreateResourceParams, DeleteOutcome, PathSegment, ResourceRow, ResourceStore,
-    UpdateResourceParams,
+#[cfg(test)]
+use rise_resource_api::NoOpValidator;
+use rise_resource_api::{
+    CollectionInfo, CreateResourceParams, CreateResourceRequest, DeleteOutcome, PathSegment,
+    ResourceRow, ResourceStore, UpdateResourceParams, UpdateResourceRequest,
+    CASCADE_DELETION_FINALIZER, MAX_PARENT_CHAIN_DEPTH,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::error_map::store_error_to_server_error;
@@ -52,6 +54,7 @@ use crate::server::state::AppState;
 pub(crate) struct ResourceApiCtx {
     store: Arc<dyn ResourceStore>,
     operator_users: Arc<Vec<String>>,
+    operator_idp_groups: Arc<Vec<String>>,
     /// DB pool used by application-layer guards (e.g. blocking Organization
     /// deletion while typed children — users-via-memberships, teams, projects —
     /// still reference it via `organization_resource_uid`). Required: the
@@ -65,13 +68,44 @@ impl ResourceApiCtx {
         Self {
             store: state.resource_store.clone(),
             operator_users: state.operator_users.clone(),
+            operator_idp_groups: state.operator_idp_groups.clone(),
             db_pool: state.db_pool.clone(),
         }
     }
 
-    fn is_operator(&self, email: &str) -> bool {
-        crate::server::auth::admin::is_operator_user(&self.operator_users, email)
+    /// Resolve the Operator role for a user: the `auth.operator_users` email
+    /// allowlist, or membership in one of the `auth.operator_idp_groups`.
+    async fn is_operator(&self, user: &User) -> bool {
+        crate::server::auth::roles::has_role(
+            &self.db_pool,
+            &self.operator_users,
+            &self.operator_idp_groups,
+            user,
+        )
+        .await
     }
+}
+
+fn response_resource(
+    row: &ResourceRow,
+    response_api_version: &str,
+) -> Result<rise_resource_api::Resource, ServerError> {
+    let converted = if response_api_version == row.api_version {
+        row_to_resource(row)
+    } else {
+        row_to_resource_with_api_version(row, response_api_version)
+    };
+    converted.map_err(|error| {
+        ServerError::internal_anyhow(
+            anyhow::Error::new(error),
+            "stored resource could not be converted to an API response",
+        )
+        .with_context("resource_uid", row.uid.to_string())
+        .with_context("resource_kind", row.kind.clone())
+        .with_context("resource_name", row.name.clone())
+        .with_context("stored_api_version", row.api_version.clone())
+        .with_context("response_api_version", response_api_version.to_owned())
+    })
 }
 
 // -----------------------------------------------------------------------------
@@ -85,9 +119,9 @@ impl ResourceApiCtx {
 /// APIs — where admins skip permission checks — the generic resource API is
 /// operator-gated only; admin access here is intentionally deferred (see
 /// `ROADMAP.md`). Do not add an `is_admin` shortcut.
-fn require_operator(ctx: &ResourceApiCtx, auth: &AuthContext) -> Result<User, ServerError> {
+async fn require_operator(ctx: &ResourceApiCtx, auth: &AuthContext) -> Result<User, ServerError> {
     let user = auth.user()?.clone();
-    if !ctx.is_operator(&user.email) {
+    if !ctx.is_operator(&user).await {
         tracing::warn!(
             user_email = %user.email,
             "Generic resource API access denied — user is not an Operator"
@@ -230,12 +264,11 @@ async fn resolve_parent_chain(
     let mut chain: Vec<CollectionInfo> = Vec::new();
     let mut current = leaf.parent.clone();
     while let Some(parent_ref) = current {
-        if chain.len() >= rise_resource_store::MAX_PARENT_CHAIN_DEPTH {
+        if chain.len() >= MAX_PARENT_CHAIN_DEPTH {
             return Err(ServerError::internal(format!(
                 "ResourceDefinition parent chain for kind '{}' exceeds the maximum depth \
                  of {}; the parent graph may contain a cycle",
-                leaf.kind,
-                rise_resource_store::MAX_PARENT_CHAIN_DEPTH,
+                leaf.kind, MAX_PARENT_CHAIN_DEPTH,
             )));
         }
         let group = api_group(&parent_ref.api_version);
@@ -320,6 +353,28 @@ pub struct PendingDeletionQuery {
     /// Maximum number of tombstoned resources to return (default 100).
     #[serde(default)]
     pub limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeletionBlockersResponse {
+    resource_uid: Uuid,
+    cascade_finalizer_present: bool,
+    blockers: Vec<DeletionBlockerResponse>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeletionBlockerResponse {
+    relationship: &'static str,
+    api_version: String,
+    kind: String,
+    name: String,
+    uid: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    block_owner_deletion: Option<bool>,
+    deletion_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+    finalizers: Vec<String>,
 }
 
 // -----------------------------------------------------------------------------
@@ -474,9 +529,9 @@ async fn classify_path(
         2 => {
             let subresource = Subresource::from_keyword(&segments[depth + 1]).ok_or_else(|| {
                 ServerError::bad_request(format!(
-                    "expected a subresource keyword (status, finalizers) after \
-                     the item name, got '{}'",
-                    segments[depth + 1]
+                    "expected a subresource keyword ({}) after the item name, got '{}'",
+                    Subresource::KEYWORDS,
+                    segments[depth + 1],
                 ))
             })?;
             Ok(ResolvedPath::Subresource {
@@ -548,7 +603,7 @@ async fn dispatch_get_inner(
     let raw_path = parse_resource_path(&raw)?;
     // Every GET path on the generic resource API is operator-only; authorize
     // before any store I/O so collection existence is not probeable.
-    let user = require_operator(ctx, &auth)?;
+    let user = require_operator(ctx, &auth).await?;
     match classify_path(&ctx.store, raw_path).await? {
         ResolvedPath::PendingDeletion => {
             let limit = q.limit.unwrap_or(100).clamp(1, 1000);
@@ -563,8 +618,10 @@ async fn dispatch_get_inner(
                 count = rows.len(),
                 "resource.pending_deletion_listed"
             );
-            let items: Vec<rise_resource_api::Resource> =
-                rows.iter().map(row_to_resource).collect();
+            let items = rows
+                .iter()
+                .map(|row| response_resource(row, &row.api_version))
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(Json(serde_json::json!({ "items": items })).into_response())
         }
         ResolvedPath::List {
@@ -588,22 +645,74 @@ async fn dispatch_get_inner(
                 kind: resolved.info.kind,
                 items: rows
                     .iter()
-                    .map(|row| row_to_resource_with_api_version(row, &resolved.info.api_version))
-                    .collect(),
+                    .map(|row| response_resource(row, &resolved.info.api_version))
+                    .collect::<Result<Vec<_>, _>>()?,
             })
             .into_response())
         }
         ResolvedPath::Item { resolved, leaf } => {
             let row = resolve_leaf(&ctx.store, &resolved, &leaf).await?;
-            Ok(Json(row_to_resource_with_api_version(
-                &row,
-                &resolved.info.api_version,
-            ))
+            Ok(Json(response_resource(&row, &resolved.info.api_version)?).into_response())
+        }
+        ResolvedPath::Subresource {
+            resolved,
+            leaf,
+            subresource: Subresource::DeletionBlockers,
+        } => {
+            let row = resolve_leaf(&ctx.store, &resolved, &leaf).await?;
+            let report = ctx
+                .store
+                .list_deletion_blockers(row.uid)
+                .await
+                .map_err(store_error_to_server_error)?;
+            let row = report.resource;
+            let blockers = report
+                .blockers
+                .into_iter()
+                .map(|blocker| {
+                    let (relationship, block_owner_deletion) = match blocker.relationship {
+                        rise_resource_api::DeletionBlockerRelationship::StructuralChild => {
+                            ("structuralChild", None)
+                        }
+                        rise_resource_api::DeletionBlockerRelationship::OwnerReference => {
+                            ("ownerReference", Some(true))
+                        }
+                    };
+                    DeletionBlockerResponse {
+                        relationship,
+                        api_version: blocker.api_version,
+                        kind: blocker.kind,
+                        name: blocker.name,
+                        uid: blocker.uid,
+                        block_owner_deletion,
+                        deletion_timestamp: blocker.deletion_timestamp,
+                        finalizers: blocker.finalizers,
+                    }
+                })
+                .collect::<Vec<_>>();
+            tracing::info!(
+                target: "rise::audit",
+                actor = %user.email,
+                uid = %row.uid,
+                api_version = %row.api_version,
+                kind = %row.kind,
+                name = %row.name,
+                blocker_count = blockers.len(),
+                "resource.deletion_blockers_listed"
+            );
+            Ok(Json(DeletionBlockersResponse {
+                resource_uid: row.uid,
+                cascade_finalizer_present: row
+                    .finalizers
+                    .iter()
+                    .any(|finalizer| finalizer == CASCADE_DELETION_FINALIZER),
+                blockers,
+            })
             .into_response())
         }
         ResolvedPath::Subresource { .. } => Err(ServerError::new(
             StatusCode::METHOD_NOT_ALLOWED,
-            "GET is not supported for subresource paths",
+            "GET is only supported for the deletion-blockers subresource",
         )),
     }
 }
@@ -625,7 +734,7 @@ async fn dispatch_post_inner(
 ) -> Result<Response, ServerError> {
     let raw_path = parse_resource_path(&raw)?;
     // Every POST path on the generic resource API is operator-only.
-    let user = require_operator(ctx, &auth)?;
+    let user = require_operator(ctx, &auth).await?;
     match classify_path(&ctx.store, raw_path).await? {
         ResolvedPath::List {
             resolved,
@@ -668,7 +777,7 @@ async fn dispatch_put_inner(
     // without a second call.
     let raw_path = parse_resource_path(&raw)?;
     let operator_user = if let AnyAuth::User(auth_ctx) = &auth {
-        Some(require_operator(ctx, auth_ctx)?)
+        Some(require_operator(ctx, auth_ctx).await?)
     } else {
         None
     };
@@ -741,6 +850,10 @@ async fn dispatch_put_inner(
                             .await?;
                             Ok(resp.into_response())
                         }
+                        Subresource::DeletionBlockers => Err(ServerError::new(
+                            StatusCode::METHOD_NOT_ALLOWED,
+                            "deletion-blockers is a read-only subresource",
+                        )),
                     }
                 }
                 AnyAuth::User(_) => {
@@ -777,6 +890,10 @@ async fn dispatch_put_inner(
                             .await?;
                             Ok(resp.into_response())
                         }
+                        Subresource::DeletionBlockers => Err(ServerError::new(
+                            StatusCode::METHOD_NOT_ALLOWED,
+                            "deletion-blockers is a read-only subresource",
+                        )),
                     }
                 }
             }
@@ -803,7 +920,7 @@ async fn dispatch_delete_inner(
 ) -> Result<Response, ServerError> {
     let raw_path = parse_resource_path(&raw)?;
     // Every DELETE path on the generic resource API is operator-only.
-    let user = require_operator(ctx, &auth)?;
+    let user = require_operator(ctx, &auth).await?;
     match classify_path(&ctx.store, raw_path).await? {
         ResolvedPath::Item { resolved, leaf } => {
             let row = resolve_leaf(&ctx.store, &resolved, &leaf).await?;
@@ -864,12 +981,14 @@ async fn create_resource(
         .map_err(|e| ServerError::bad_request(format!("invalid spec: {e}")))?;
 
     let params = CreateResourceParams {
+        labels: body.metadata.labels,
         api_version: resolved.info.storage_api_version.clone(),
         kind: body.kind,
         name: body.metadata.name,
         parent_uid,
         annotations,
         finalizers: body.metadata.finalizers,
+        owner_references: body.metadata.owner_references,
         spec,
         validator: Some(resolved.info.spec_validator.clone()),
     };
@@ -901,10 +1020,7 @@ async fn create_resource(
     );
     Ok((
         StatusCode::CREATED,
-        Json(row_to_resource_with_api_version(
-            &row,
-            &resolved.info.api_version,
-        )),
+        Json(response_resource(&row, &resolved.info.api_version)?),
     ))
 }
 
@@ -958,10 +1074,12 @@ async fn update_resource(
         .map_err(|e| ServerError::bad_request(format!("invalid spec: {e}")))?;
 
     let params = UpdateResourceParams {
+        labels: body.metadata.labels,
         api_version: Some(resolved.info.storage_api_version.clone()),
         revision: body.metadata.revision,
         annotations,
         finalizers: body.metadata.finalizers,
+        owner_references: body.metadata.owner_references,
         spec,
         validator: Some(resolved.info.spec_validator.clone()),
     };
@@ -988,10 +1106,10 @@ async fn update_resource(
         revision = updated.revision,
         "resource.updated"
     );
-    Ok(Json(row_to_resource_with_api_version(
+    Ok(Json(response_resource(
         &updated,
         &resolved.info.api_version,
-    )))
+    )?))
 }
 
 async fn delete_resource(
@@ -1052,15 +1170,18 @@ async fn delete_resource(
             Json(serde_json::json!({"deleted": true, "uid": row.uid})),
         )
             .into_response()),
-        DeleteOutcome::MarkedForDeletion(marked) => Ok((
-            StatusCode::ACCEPTED,
-            Json(serde_json::json!({
-                "deleted": false,
-                "markedForDeletion": true,
-                "resource": row_to_resource_with_api_version(&marked, response_api_version),
-            })),
-        )
-            .into_response()),
+        DeleteOutcome::MarkedForDeletion(marked) => {
+            let resource = response_resource(&marked, response_api_version)?;
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "deleted": false,
+                    "markedForDeletion": true,
+                    "resource": resource,
+                })),
+            )
+                .into_response())
+        }
     }
 }
 
@@ -1085,10 +1206,7 @@ async fn apply_controller_status(
         name = %row.name,
         "resource.controller_status_updated"
     );
-    Ok(Json(row_to_resource_with_api_version(
-        &updated,
-        response_api_version,
-    )))
+    Ok(Json(response_resource(&updated, response_api_version)?))
 }
 
 async fn apply_controller_finalizers(
@@ -1112,10 +1230,7 @@ async fn apply_controller_finalizers(
         name = %row.name,
         "resource.controller_finalizers_updated"
     );
-    Ok(Json(row_to_resource_with_api_version(
-        &updated,
-        response_api_version,
-    )))
+    Ok(Json(response_resource(&updated, response_api_version)?))
 }
 
 async fn apply_operator_status(
@@ -1139,10 +1254,7 @@ async fn apply_operator_status(
         name = %row.name,
         "resource.operator_status_updated"
     );
-    Ok(Json(row_to_resource_with_api_version(
-        &updated,
-        response_api_version,
-    )))
+    Ok(Json(response_resource(&updated, response_api_version)?))
 }
 
 async fn apply_operator_finalizers(
@@ -1166,10 +1278,7 @@ async fn apply_operator_finalizers(
         name = %row.name,
         "resource.operator_finalizers_updated"
     );
-    Ok(Json(row_to_resource_with_api_version(
-        &updated,
-        response_api_version,
-    )))
+    Ok(Json(response_resource(&updated, response_api_version)?))
 }
 
 #[cfg(test)]
@@ -1185,7 +1294,7 @@ mod tests {
             declared_api_versions: vec!["rise.dev/v1alpha1".into()],
             kind: "Organization".into(),
             parent: None,
-            spec_validator: std::sync::Arc::new(rise_resource_store::NoOpValidator),
+            spec_validator: std::sync::Arc::new(NoOpValidator),
             allowed_status_controller_ids: vec![],
         };
 
@@ -1207,7 +1316,7 @@ mod tests {
             declared_api_versions: vec!["example.dev/v1".into()],
             kind: "Widget".into(),
             parent: None,
-            spec_validator: std::sync::Arc::new(rise_resource_store::NoOpValidator),
+            spec_validator: std::sync::Arc::new(NoOpValidator),
             allowed_status_controller_ids: allowed,
         }
     }
@@ -1243,6 +1352,41 @@ mod tests {
         assert_eq!(api_group("plaingroup"), "plaingroup");
         assert_eq!(api_group(""), "");
     }
+
+    #[test]
+    fn malformed_stored_row_maps_to_contextual_internal_error() {
+        let now = chrono::Utc::now();
+        let row = ResourceRow {
+            labels: Default::default(),
+            uid: Uuid::new_v4(),
+            api_version: "example.dev/v1".into(),
+            kind: "Widget".into(),
+            parent_uid: None,
+            name: "widget-a".into(),
+            discriminator: "abcd1234".into(),
+            metadata: serde_json::json!({"invalid": 42}),
+            spec: serde_json::json!({}),
+            status: serde_json::json!({}),
+            revision: 1,
+            finalizers: vec![],
+            owner_references: vec![],
+            deletion_timestamp: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let error = response_resource(&row, "example.dev/v1").unwrap_err();
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(error.source.is_some());
+        assert!(error
+            .context
+            .iter()
+            .any(|(key, value)| *key == "resource_uid" && value == &row.uid.to_string()));
+        assert!(error
+            .context
+            .iter()
+            .any(|(key, value)| *key == "response_api_version" && value == "example.dev/v1"));
+    }
 }
 
 /// DB-backed tests that drive the generic resource API through the
@@ -1259,7 +1403,7 @@ mod tests {
 mod dispatch_tests {
     use super::*;
     use rise_resource_api::RESOURCE_DEFINITION_KIND;
-    use rise_resource_store::PgResourceStore;
+    use rise_resource_store_postgres::PgResourceStore;
     use serde_json::{json, Value};
 
     const OPERATOR: &str = "operator@example.com";
@@ -1269,12 +1413,13 @@ mod dispatch_tests {
     /// store schema is layered on top of the root migrations `#[sqlx::test]`
     /// already ran.
     async fn ctx(pool: sqlx::PgPool) -> ResourceApiCtx {
-        rise_resource_store::run_migrations(&pool)
+        rise_resource_store_postgres::run_migrations(&pool)
             .await
             .expect("resource store migrations");
         ResourceApiCtx {
             store: Arc::new(PgResourceStore::new(pool.clone())),
             operator_users: Arc::new(vec![OPERATOR.into()]),
+            operator_idp_groups: Arc::new(vec![]),
             db_pool: pool,
         }
     }
@@ -1337,12 +1482,14 @@ mod dispatch_tests {
         });
         ctx.store
             .register_resource_definition(CreateResourceParams {
+                labels: Default::default(),
                 api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
                 kind: RESOURCE_DEFINITION_KIND.to_string(),
                 name: "widgets.example.dev".to_string(),
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec,
                 validator: None,
             })
@@ -1365,12 +1512,14 @@ mod dispatch_tests {
         });
         ctx.store
             .register_resource_definition(CreateResourceParams {
+                labels: Default::default(),
                 api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
                 kind: RESOURCE_DEFINITION_KIND.to_string(),
                 name: "gadgets.example.dev".to_string(),
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec,
                 validator: None,
             })
@@ -1391,12 +1540,14 @@ mod dispatch_tests {
         });
         ctx.store
             .register_resource_definition(CreateResourceParams {
+                labels: Default::default(),
                 api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
                 kind: RESOURCE_DEFINITION_KIND.to_string(),
                 name: "gizmos.example.dev".to_string(),
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec,
                 validator: None,
             })
@@ -1464,6 +1615,100 @@ mod dispatch_tests {
     }
 
     // -------------------------------------------------------------------------
+    // Labels
+    // -------------------------------------------------------------------------
+
+    #[sqlx::test]
+    async fn labels_round_trip_through_the_http_surface(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx, &[]).await;
+
+        let resp = dispatch_post_inner(
+            &ctx,
+            "example.dev/v1/widgets".to_string(),
+            auth(OPERATOR),
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {
+                    "name": "labeled",
+                    "labels": {"rise.dev/owner": "group:platform"}
+                },
+                "spec": {"size": "large"},
+            }),
+        )
+        .await
+        .expect("create labeled widget");
+        let (status, created) = read(resp).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            created["metadata"]["labels"]["rise.dev/owner"],
+            "group:platform"
+        );
+
+        // The stored labels come back on a subsequent read.
+        let resp = dispatch_get_inner(
+            &ctx,
+            "example.dev/v1/widgets/labeled".to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("get labeled widget");
+        let (_, fetched) = read(resp).await;
+        assert_eq!(
+            fetched["metadata"]["labels"]["rise.dev/owner"],
+            "group:platform"
+        );
+
+        // PUT replaces the map wholesale, like annotations.
+        let resp = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/labeled".to_string(),
+            any_user(OPERATOR),
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {
+                    "name": "labeled",
+                    "revision": fetched["metadata"]["revision"],
+                    "labels": {"squad": "infra"}
+                },
+                "spec": {"size": "large"},
+            }),
+        )
+        .await
+        .expect("update labeled widget");
+        let (status, updated) = read(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(updated["metadata"]["labels"]["squad"], "infra");
+        assert!(updated["metadata"]["labels"]
+            .get("rise.dev/owner")
+            .is_none());
+
+        // A resource with no labels omits the key rather than sending an empty
+        // object, matching how ownerReferences is projected.
+        let bare = create_widget(&ctx, "example.dev/v1", "bare").await;
+        assert!(bare["metadata"].get("labels").is_none());
+
+        // An invalid key is a 400, not a 500.
+        let err = dispatch_post_inner(
+            &ctx,
+            "example.dev/v1/widgets".to_string(),
+            auth(OPERATOR),
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {"name": "bad-label", "labels": {"not a key/x": "v"}},
+                "spec": {},
+            }),
+        )
+        .await
+        .expect_err("invalid label key must be rejected");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    // -------------------------------------------------------------------------
     // Auth tier: operator-only paths
     // -------------------------------------------------------------------------
 
@@ -1481,6 +1726,60 @@ mod dispatch_tests {
         .await
         .expect_err("non-operator must be rejected");
         assert_eq!(err.status, StatusCode::FORBIDDEN);
+    }
+
+    /// The Operator role can also be granted by IdP group. Unlike the email
+    /// allowlist this reads the DB, so the user and their IdP-managed team must
+    /// exist — and a team that is *not* IdP-managed must not grant the role.
+    #[sqlx::test]
+    async fn operator_path_allows_operator_by_idp_group(pool: sqlx::PgPool) {
+        let mut ctx = ctx(pool.clone()).await;
+        ctx.operator_users = Arc::new(vec![]);
+        ctx.operator_idp_groups = Arc::new(vec!["platform-operators".into()]);
+        register_widget_rd(&ctx, &[]).await;
+
+        let user = crate::db::users::create(&pool, "grouped@example.com")
+            .await
+            .unwrap();
+        let auth_ctx = AuthContext::User(user.clone());
+
+        // Same-named team that the IdP did not create grants nothing.
+        let self_made = crate::db::teams::create(&pool, "platform-operators")
+            .await
+            .unwrap();
+        crate::db::teams::add_member(
+            &pool,
+            self_made.id,
+            user.id,
+            crate::db::models::TeamRole::Owner,
+        )
+        .await
+        .unwrap();
+
+        let err = dispatch_get_inner(
+            &ctx,
+            "example.dev/v1/widgets".to_string(),
+            auth_ctx.clone(),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect_err("a self-created team must not grant the Operator role");
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+
+        // Once the team is IdP-managed, the same user is an Operator.
+        crate::db::teams::set_idp_managed(&pool, self_made.id, true)
+            .await
+            .unwrap();
+
+        let response = dispatch_get_inner(
+            &ctx,
+            "example.dev/v1/widgets".to_string(),
+            auth_ctx,
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("operator by IdP group must be allowed");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[sqlx::test]
@@ -1823,12 +2122,14 @@ mod dispatch_tests {
         // Seed a widget at the storage version directly so the PUT test has a row.
         ctx.store
             .create(CreateResourceParams {
+                labels: Default::default(),
                 api_version: "example.dev/v1".to_string(),
                 kind: "Widget".to_string(),
                 name: "w1".to_string(),
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: serde_json::json!({"size": "large"}),
                 validator: None,
             })
@@ -2046,14 +2347,18 @@ mod dispatch_tests {
         let org = ctx
             .store
             .create(CreateResourceParams {
+                labels: Default::default(),
                 api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
                 kind: rise_resource_api::ORGANIZATION_KIND.to_string(),
                 name: "guard-test".to_string(),
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: org_spec,
-                validator: Some(Arc::new(rise_resource_store::OrganizationValidator)),
+                validator: Some(Arc::new(
+                    rise_resource_store_postgres::OrganizationValidator,
+                )),
             })
             .await
             .expect("create organization");
@@ -2151,14 +2456,18 @@ mod dispatch_tests {
         let org = ctx
             .store
             .create(CreateResourceParams {
+                labels: Default::default(),
                 api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
                 kind: rise_resource_api::ORGANIZATION_KIND.to_string(),
                 name: "membership-guard-test".to_string(),
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: org_spec,
-                validator: Some(Arc::new(rise_resource_store::OrganizationValidator)),
+                validator: Some(Arc::new(
+                    rise_resource_store_postgres::OrganizationValidator,
+                )),
             })
             .await
             .expect("create organization");
@@ -2325,6 +2634,79 @@ mod dispatch_tests {
         assert_eq!(err.status, StatusCode::FORBIDDEN);
     }
 
+    #[sqlx::test]
+    async fn deletion_blockers_reports_blocking_relationships(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx, &[]).await;
+        let owner = ctx
+            .store
+            .create(CreateResourceParams {
+                api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
+                kind: rise_resource_api::ORGANIZATION_KIND.to_string(),
+                name: "blocker-owner".to_string(),
+                spec: json!({"displayName": "Blocker Owner"}),
+                ..Default::default()
+            })
+            .await
+            .expect("create owner");
+        let blocking_reference = rise_resource_api::OwnerReference::new(
+            &owner.api_version,
+            &owner.kind,
+            &owner.name,
+            owner.uid,
+        )
+        .expect("owner reference")
+        .with_block_owner_deletion(true);
+        let dependent = ctx
+            .store
+            .create(CreateResourceParams {
+                api_version: "example.dev/v1".to_string(),
+                kind: "Widget".to_string(),
+                name: "blocker-dependent".to_string(),
+                owner_references: vec![blocking_reference],
+                finalizers: vec!["controller.example.com/cleanup".to_string()],
+                spec: json!({}),
+                ..Default::default()
+            })
+            .await
+            .expect("create dependent");
+
+        ctx.store.delete(owner.uid).await.expect("delete owner");
+
+        let resp = dispatch_get_inner(
+            &ctx,
+            "rise.dev/v1alpha1/organizations/blocker-owner/deletion-blockers".to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("list deletion blockers");
+        let (status, body) = read(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["resourceUid"], owner.uid.to_string());
+        assert_eq!(body["cascadeFinalizerPresent"], true);
+        let blockers = body["blockers"].as_array().expect("blockers array");
+        assert_eq!(blockers.len(), 1);
+        assert_eq!(blockers[0]["relationship"], "ownerReference");
+        assert_eq!(blockers[0]["uid"], dependent.uid.to_string());
+        assert_eq!(blockers[0]["blockOwnerDeletion"], true);
+        assert!(blockers[0]["deletionTimestamp"].is_string());
+        assert_eq!(
+            blockers[0]["finalizers"],
+            json!(["controller.example.com/cleanup"])
+        );
+
+        let err = dispatch_get_inner(
+            &ctx,
+            "rise.dev/v1alpha1/organizations/blocker-owner/deletion-blockers".to_string(),
+            auth(PLAIN_USER),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect_err("non-operator must be rejected");
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+    }
+
     // -------------------------------------------------------------------------
     // Version-independent lookup
     // -------------------------------------------------------------------------
@@ -2348,12 +2730,14 @@ mod dispatch_tests {
         });
         ctx.store
             .register_resource_definition(CreateResourceParams {
+                labels: Default::default(),
                 api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
                 kind: RESOURCE_DEFINITION_KIND.to_string(),
                 name: "widgets.example.dev".to_string(),
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec,
                 validator: None,
             })
@@ -2365,12 +2749,14 @@ mod dispatch_tests {
         // to non-storage versions are not supported), so we seed the row directly.
         ctx.store
             .create(CreateResourceParams {
+                labels: Default::default(),
                 api_version: "example.dev/v1".to_string(),
                 kind: "Widget".to_string(),
                 name: "w1".to_string(),
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: serde_json::json!({"size": "large"}),
                 validator: None,
             })

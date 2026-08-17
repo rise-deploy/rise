@@ -44,14 +44,18 @@ pub struct CollectionRef {
 pub enum Subresource {
     Status,
     Finalizers,
+    DeletionBlockers,
 }
 
 impl Subresource {
+    pub const KEYWORDS: &str = "status, finalizers, deletion-blockers";
+
     /// Parse a reserved subresource keyword. Returns `None` for any other value.
     pub fn from_keyword(value: &str) -> Option<Self> {
         match value {
             "status" => Some(Self::Status),
             "finalizers" => Some(Self::Finalizers),
+            "deletion-blockers" => Some(Self::DeletionBlockers),
             _ => None,
         }
     }
@@ -153,6 +157,10 @@ mod tests {
         assert_eq!(
             Subresource::from_keyword("finalizers"),
             Some(Subresource::Finalizers)
+        );
+        assert_eq!(
+            Subresource::from_keyword("deletion-blockers"),
+            Some(Subresource::DeletionBlockers)
         );
         assert_eq!(Subresource::from_keyword("reparent"), None);
         assert_eq!(Subresource::from_keyword("widgets"), None);

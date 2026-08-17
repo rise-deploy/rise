@@ -1,11 +1,13 @@
 [workspace]
 members = [
     ".",
+    "crates/rise-authz",
     "crates/rise-backend-auth",
     "crates/rise-backend-core",
+    "crates/rise-backend-docker",
     "crates/rise-deployment-spec",
     "crates/rise-resource-api",
-    "crates/rise-resource-store",
+    "crates/rise-resource-store-postgres",
     "crates/rise-runtime-sync",
 ]
 # The rise-e2e harness is its own standalone workspace (tests/e2e/Cargo.toml) so
@@ -31,6 +33,8 @@ thiserror = "2.0"
 tokio = { version = "1.48.0", features = ["full"] }
 rise-deployment-spec = { path = "crates/rise-deployment-spec" }
 tracing = "0.1.43"
+regex = "1.11"
+url = "2.5"
 uuid = { version = "1.18.1", features = ["v4", "serde"] }
 
 [package]
@@ -78,8 +82,9 @@ backend = [
     # Server core (former "server" feature)
     "dep:rise-backend-auth", # strip-on-publish
     "dep:rise-backend-core", # strip-on-publish
+    "dep:rise-backend-docker", # strip-on-publish
     "dep:rise-resource-api", # strip-on-publish
-    "dep:rise-resource-store", # strip-on-publish
+    "dep:rise-resource-store-postgres", # strip-on-publish
     "dep:rise-runtime-sync", # strip-on-publish
     "dep:config",
     "dep:openssl",
@@ -103,6 +108,7 @@ backend = [
     "dep:serde_yaml",
     "dep:tokio-tungstenite",
     "rise-deployment-spec/schema",
+    "rise-backend-core/schema",
     # Kubernetes (former "k8s" feature)
     "dep:kube",
     "dep:k8s-openapi",
@@ -127,8 +133,9 @@ backend = [
 # Workspace crates (backend only)
 rise-backend-auth = { path = "crates/rise-backend-auth", optional = true }
 rise-backend-core = { path = "crates/rise-backend-core", optional = true }
+rise-backend-docker = { path = "crates/rise-backend-docker", optional = true }
 rise-resource-api = { path = "crates/rise-resource-api", optional = true }
-rise-resource-store = { path = "crates/rise-resource-store", optional = true }
+rise-resource-store-postgres = { path = "crates/rise-resource-store-postgres", optional = true }
 rise-runtime-sync = { path = "crates/rise-runtime-sync", optional = true }
 # --- END BACKEND ---
 
@@ -162,7 +169,7 @@ comfy-table = { version = "7.1", optional = true }
 dirs = { version = "6.0", optional = true }
 tempfile = { version = "3.0", optional = true }
 toml = { version = "1", optional = true }
-url = { version = "2.5", optional = true }
+url = { workspace = true, optional = true }
 webbrowser = { version = "1.0.2", optional = true }
 serde_ignored = { version = "0.1", optional = true }
 
@@ -173,7 +180,7 @@ sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "postgres", "u
 tower = { version = "0.5.2", optional = true }
 tower-http = { version = "0.6.7", features = ["trace", "cors"], optional = true }
 tokio-util = { version = "0.7", optional = true }
-regex = { version = "1.11", optional = true }
+regex = { workspace = true, optional = true }
 rsa = { workspace = true, optional = true }
 
 # Server: Encryption (non-KMS mode)

@@ -31,6 +31,12 @@ pub trait DeploymentStore: Send + Sync {
     /// Look up a project by its primary key.
     async fn find_project(&self, id: Uuid) -> Result<Option<Project>>;
 
+    /// Look up a project by its (unique) name.
+    async fn find_project_by_name(&self, name: &str) -> Result<Option<Project>>;
+
+    /// List active (non-terminated) projects — used by the CRD backfill.
+    async fn list_active_projects(&self) -> Result<Vec<Project>>;
+
     /// Recompute and persist a project's status from its deployments.
     async fn update_project_calculated_status(&self, project_id: Uuid) -> Result<Project>;
 
@@ -99,6 +105,9 @@ pub trait DeploymentStore: Send + Sync {
     /// Mark a deployment failed with an error message.
     async fn mark_deployment_failed(&self, id: Uuid, error_message: &str) -> Result<Deployment>;
 
+    /// Transition a deployment into the cancelling state.
+    async fn mark_deployment_cancelling(&self, id: Uuid) -> Result<Deployment>;
+
     /// Mark a deployment cancelled.
     async fn mark_deployment_cancelled(&self, id: Uuid) -> Result<Deployment>;
 
@@ -131,4 +140,8 @@ pub trait DeploymentStore: Send + Sync {
         project_id: Uuid,
         deployment_group: &str,
     ) -> Result<()>;
+
+    /// Persist the hash of a deployment's workload-identity bootstrap credential
+    /// once it has been delivered to a running container.
+    async fn set_identity_credential_hash(&self, id: Uuid, hash: &str) -> Result<()>;
 }

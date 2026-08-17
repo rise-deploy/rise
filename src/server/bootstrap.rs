@@ -1,7 +1,7 @@
 //! Default-Organization bootstrap.
 //!
 //! Runs after both the root migrations (`./migrations/`) and the
-//! `rise-resource-store` migrations have applied. The bootstrap pass:
+//! `rise-resource-store-postgres` migrations have applied. The bootstrap pass:
 //!
 //! 1. Acquires a single Postgres advisory lock (so concurrent replicas don't
 //!    race), the only mutator of the default-Organization linkage state.
@@ -24,10 +24,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
-use rise_resource_api::{OrganizationSpec, API_VERSION_V1ALPHA1, ORGANIZATION_KIND};
-use rise_resource_store::{
-    CreateResourceParams, OrganizationValidator, ResourceRow, ResourceStore, UpdateResourceParams,
+use rise_resource_api::{
+    CreateResourceParams, OrganizationSpec, ResourceRow, ResourceStore, UpdateResourceParams,
+    API_VERSION_V1ALPHA1, ORGANIZATION_KIND,
 };
+use rise_resource_store_postgres::OrganizationValidator;
 use sqlx::PgPool;
 use tracing::info;
 
@@ -177,13 +178,10 @@ fn controller_class_name_for_bootstrap(settings: &Settings) -> Option<&str> {
 /// `spec.deploymentControllerClass`. Unrelated annotations on an existing
 /// row are preserved.
 ///
-/// Lookup is by configured name first; if that misses, falls back to the
-/// single-Org world's "find the only Organization in the store" rule so
-/// renaming `default_organization.name` in config re-keys the existing row
-/// (preserving its UID and every typed-row linkage) rather than minting a
-/// new Organization and orphaning the linkages. Two or more existing
-/// Organizations is treated as a configuration error: this PR's bootstrap
-/// cannot guess which one is "the default."
+/// Lookup is by configured name. If no Organizations exist, bootstrap creates
+/// it. If any Organizations exist but none has the configured name, startup
+/// fails rather than renaming an existing resource or guessing which one is
+/// the default.
 async fn upsert_default_organization(
     store: &Arc<dyn ResourceStore>,
     default_org: &DefaultOrganizationSettings,
@@ -208,12 +206,14 @@ async fn upsert_default_organization(
         // Fresh install: no Organizations exist yet.
         let created = store
             .create(CreateResourceParams {
+                labels: Default::default(),
                 api_version: API_VERSION_V1ALPHA1.to_string(),
                 kind: ORGANIZATION_KIND.to_string(),
                 name: default_org.name.clone(),
                 parent_uid: None,
                 annotations: desired_annotations,
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: spec_value,
                 validator: Some(Arc::new(OrganizationValidator)),
             })
@@ -225,35 +225,6 @@ async fn upsert_default_organization(
                 )
             })?;
         return Ok(created);
-    };
-
-    // If the row was located by the fallback (single-Org world) its name may
-    // differ from the configured one. Rename first; UID and discriminator
-    // are preserved, so every typed row's `organization_resource_uid`
-    // linkage remains valid.
-    let row = if row.name != default_org.name {
-        // Fires only via the single-Org-world fallback (exactly one Organization
-        // exists and its name differs from the configured one); once multi-Org is
-        // reachable this heuristic stops firing, so this is not a general
-        // "Organization renamed" event — general rename visibility needs a
-        // separate mechanism (e.g. an audit-log entry from `ResourceStore::rename`).
-        info!(
-            old_name = %row.name,
-            new_name = %default_org.name,
-            uid = %row.uid,
-            "Renaming existing default Organization to match configured default_organization.name"
-        );
-        store
-            .rename(row.uid, &default_org.name)
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "Failed to rename default Organization to '{}': {e}",
-                    default_org.name
-                )
-            })?
-    } else {
-        row
     };
 
     // Preserve unrelated annotations on the existing row; only ensure our
@@ -274,10 +245,12 @@ async fn upsert_default_organization(
         .update(
             row.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: row.revision,
                 annotations: merged_annotations,
                 finalizers: row.finalizers.clone(),
+                owner_references: row.owner_references.clone(),
                 spec: spec_value,
                 validator: Some(Arc::new(OrganizationValidator)),
             },
@@ -296,47 +269,43 @@ async fn upsert_default_organization(
 /// Organization. Returns `None` only on a fresh install (no Organizations
 /// exist in the store).
 ///
-/// - Fast path: look up by the configured name.
-/// - Fallback: list every Organization in the store. If exactly one exists,
-///   treat it as the default regardless of name (this is the rename path:
-///   `default_organization.name` was changed in config; the caller will
-///   rename the row's `name` to match).
-/// - If two or more Organizations exist and none match the configured name,
-///   refuse to guess and bail. This is unreachable on PR5 installs (only
-///   bootstrap mints Organizations and only the configured name) but is the
-///   safe behaviour once multi-org becomes reachable.
+/// - If no Organizations exist, return `None` so the caller creates the
+///   configured default.
+/// - If an Organization with the configured name exists, return it.
+/// - If one or more Organizations exist and none matches, fail startup. Names
+///   are immutable and bootstrap neither renames an existing Organization nor
+///   creates a second candidate default.
 async fn find_default_organization(
     store: &Arc<dyn ResourceStore>,
     configured_name: &str,
 ) -> Result<Option<ResourceRow>> {
-    if let Some(row) = store
-        .get_by_name(
-            API_VERSION_V1ALPHA1,
-            ORGANIZATION_KIND,
-            configured_name,
-            None,
-        )
-        .await
-        .map_err(|e| anyhow!("Failed to look up default Organization: {e}"))?
-    {
-        return Ok(Some(row));
-    }
-
-    let mut existing = store
+    let existing = store
         .list_versions(&[API_VERSION_V1ALPHA1.to_string()], ORGANIZATION_KIND, None)
         .await
         .map_err(|e| anyhow!("Failed to list existing Organizations: {e}"))?;
 
+    if let Some(row) = existing
+        .iter()
+        .find(|row| row.name == configured_name)
+        .cloned()
+    {
+        return Ok(Some(row));
+    }
+
     match existing.len() {
         0 => Ok(None),
-        1 => Ok(Some(existing.remove(0))),
         n => {
             let names: Vec<&str> = existing.iter().map(|r| r.name.as_str()).collect();
+            let noun = if n == 1 {
+                "Organization"
+            } else {
+                "Organizations"
+            };
             bail!(
-                "Found {n} existing Organizations (names: {names:?}) but none match the configured \
-                 default_organization.name '{configured_name}'. Refusing to guess which one is the \
-                 default. Set default_organization.name to one of the existing Organizations, or \
-                 delete the unwanted ones."
+                "Found {n} existing {noun} (names: {names:?}) but none match the configured \
+                 default_organization.name '{configured_name}'. Resource names are immutable and \
+                 bootstrap will not rename an existing Organization or create another candidate \
+                 default. Set default_organization.name to an existing Organization name."
             )
         }
     }
@@ -594,11 +563,12 @@ mod tests {
     async fn bootstrap_is_idempotent(pool: sqlx::PgPool) {
         // Layer the resource-store schema on top of the root migrations that
         // `#[sqlx::test]` already ran.
-        rise_resource_store::run_migrations(&pool)
+        rise_resource_store_postgres::run_migrations(&pool)
             .await
             .expect("resource store migrations");
-        let store: Arc<dyn ResourceStore> =
-            Arc::new(rise_resource_store::PgResourceStore::new(pool.clone()));
+        let store: Arc<dyn ResourceStore> = Arc::new(
+            rise_resource_store_postgres::PgResourceStore::new(pool.clone()),
+        );
 
         let settings = test_settings();
 
@@ -677,59 +647,56 @@ mod tests {
         assert_eq!(third.projects_backfilled, 0);
     }
 
-    /// Renaming `default_organization.name` in config re-keys the existing
-    /// row rather than creating a new Organization. UID is preserved so
-    /// every typed-row linkage remains valid.
+    /// Changing `default_organization.name` after an Organization exists is a
+    /// configuration error. Bootstrap neither renames the row nor creates a
+    /// second candidate default.
     #[sqlx::test]
-    async fn bootstrap_renames_existing_default_organization(pool: sqlx::PgPool) {
-        rise_resource_store::run_migrations(&pool)
+    async fn bootstrap_rejects_nonmatching_existing_organization(pool: sqlx::PgPool) {
+        rise_resource_store_postgres::run_migrations(&pool)
             .await
             .expect("resource store migrations");
-        let store: Arc<dyn ResourceStore> =
-            Arc::new(rise_resource_store::PgResourceStore::new(pool.clone()));
+        let store: Arc<dyn ResourceStore> = Arc::new(
+            rise_resource_store_postgres::PgResourceStore::new(pool.clone()),
+        );
 
         // First boot mints the Org under the configured name.
         let first = run(&pool, &store, &test_settings_with_org_name("default"))
             .await
             .expect("first run");
 
-        // Second boot with a different name must reuse the same row.
-        let renamed = run(&pool, &store, &test_settings_with_org_name("acme"))
+        // Second boot with a different configured name must fail closed.
+        let error = run(&pool, &store, &test_settings_with_org_name("acme"))
             .await
-            .expect("second run after rename");
-        assert_eq!(
-            renamed.default_organization_uid, first.default_organization_uid,
-            "rename must preserve the Organization UID"
-        );
+            .expect_err("bootstrap must reject a nonmatching existing Organization");
+        let message = format!("{error:#}");
+        assert!(message.contains("Found 1 existing Organization"));
+        assert!(message.contains("Resource names are immutable"));
 
-        // The store row's name is now the new one.
+        // The original row remains unchanged and no second Organization is minted.
         let row = store
             .get(first.default_organization_uid)
             .await
-            .expect("get post-rename")
+            .expect("get after rejected bootstrap")
             .expect("row exists");
-        assert_eq!(row.name, "acme");
-
-        // Third boot with the new name takes the fast path (no rename).
-        let again = run(&pool, &store, &test_settings_with_org_name("acme"))
+        assert_eq!(row.name, "default");
+        assert!(store
+            .get_by_name(API_VERSION_V1ALPHA1, ORGANIZATION_KIND, "acme", None)
             .await
-            .expect("third run");
-        assert_eq!(
-            again.default_organization_uid,
-            first.default_organization_uid
-        );
+            .expect("look up rejected configured name")
+            .is_none());
     }
 
-    /// Rename path must preserve any operator-supplied annotations on the
-    /// existing row. Bootstrap merges its managed annotations on top of the
-    /// existing set rather than overwriting them.
+    /// Exact-name upsert preserves operator-supplied annotations on an
+    /// existing row. Bootstrap merges its managed annotations rather than
+    /// overwriting unrelated values.
     #[sqlx::test]
-    async fn bootstrap_rename_preserves_non_default_annotations(pool: sqlx::PgPool) {
-        rise_resource_store::run_migrations(&pool)
+    async fn bootstrap_exact_match_preserves_non_default_annotations(pool: sqlx::PgPool) {
+        rise_resource_store_postgres::run_migrations(&pool)
             .await
             .expect("resource store migrations");
-        let store: Arc<dyn ResourceStore> =
-            Arc::new(rise_resource_store::PgResourceStore::new(pool.clone()));
+        let store: Arc<dyn ResourceStore> = Arc::new(
+            rise_resource_store_postgres::PgResourceStore::new(pool.clone()),
+        );
 
         // First boot mints the Org under the configured name.
         let first = run(&pool, &store, &test_settings_with_org_name("default"))
@@ -750,10 +717,12 @@ mod tests {
             .update(
                 uid,
                 UpdateResourceParams {
+                    labels: Default::default(),
                     api_version: None,
                     revision: row.revision,
                     annotations,
                     finalizers: row.finalizers.clone(),
+                    owner_references: row.owner_references.clone(),
                     spec: row.spec.clone(),
                     validator: Some(Arc::new(OrganizationValidator)),
                 },
@@ -761,29 +730,28 @@ mod tests {
             .await
             .expect("stamp custom annotation");
 
-        // Second boot with a different name takes the single-Org-world rename
-        // path. The UID must be preserved.
-        let renamed = run(&pool, &store, &test_settings_with_org_name("acme"))
+        // A subsequent exact-name bootstrap reuses the same row.
+        let upserted = run(&pool, &store, &test_settings_with_org_name("default"))
             .await
-            .expect("second run after rename");
+            .expect("second exact-name run");
         assert_eq!(
-            renamed.default_organization_uid, uid,
-            "rename must preserve the Organization UID"
+            upserted.default_organization_uid, uid,
+            "exact-name upsert must preserve the Organization UID"
         );
 
-        // The operator-supplied annotation must survive the rename. Bootstrap
+        // The operator-supplied annotation must survive the upsert. Bootstrap
         // may have added managed annotations of its own, so assert containment
         // rather than equality to stay robust against future managed keys.
         let row = store
             .get(uid)
             .await
-            .expect("get post-rename")
+            .expect("get post-upsert")
             .expect("row exists");
         let annotations = annotations_from_metadata(&row.metadata);
         assert_eq!(
             annotations.get("custom-key").map(String::as_str),
             Some("custom-value"),
-            "operator-supplied annotation must survive the rename"
+            "operator-supplied annotation must survive the upsert"
         );
     }
 
@@ -792,11 +760,12 @@ mod tests {
     /// default and refuses to start.
     #[sqlx::test]
     async fn bootstrap_bails_on_multiple_existing_orgs_with_no_name_match(pool: sqlx::PgPool) {
-        rise_resource_store::run_migrations(&pool)
+        rise_resource_store_postgres::run_migrations(&pool)
             .await
             .expect("resource store migrations");
-        let store: Arc<dyn ResourceStore> =
-            Arc::new(rise_resource_store::PgResourceStore::new(pool.clone()));
+        let store: Arc<dyn ResourceStore> = Arc::new(
+            rise_resource_store_postgres::PgResourceStore::new(pool.clone()),
+        );
 
         // Mint the first Org via bootstrap.
         run(&pool, &store, &test_settings_with_org_name("default"))
@@ -806,12 +775,14 @@ mod tests {
         // Mint a second Org directly through the store.
         store
             .create(CreateResourceParams {
+                labels: Default::default(),
                 api_version: API_VERSION_V1ALPHA1.to_string(),
                 kind: ORGANIZATION_KIND.to_string(),
                 name: "other".to_string(),
                 parent_uid: None,
                 annotations: BTreeMap::new(),
                 finalizers: vec![],
+                owner_references: vec![],
                 spec: serde_json::json!({"displayName": "Other"}),
                 validator: Some(Arc::new(OrganizationValidator)),
             })

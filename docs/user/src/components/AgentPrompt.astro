@@ -1,0 +1,25 @@
+---
+import { buildAgentPrompt } from '../../../scripts/agent-prompt.mjs';
+
+const docsBasePath = import.meta.env.BASE_URL.replace(/\/$/, '');
+---
+
+<pre><code data-rise-agent-prompt data-docs-base={docsBasePath}>{buildAgentPrompt(docsBasePath)}</code></pre>
+
+<style>
+	pre,
+	code {
+		white-space: pre-wrap;
+		overflow-wrap: anywhere;
+	}
+</style>
+
+<script>
+	import { buildAgentPrompt } from '../../../scripts/agent-prompt.mjs';
+
+	for (const code of document.querySelectorAll('[data-rise-agent-prompt]')) {
+		const basePath = code.getAttribute('data-docs-base') || '/';
+		const docsBase = new URL(basePath, window.location.origin).href.replace(/\/$/, '');
+		code.textContent = buildAgentPrompt(docsBase);
+	}
+</script>

@@ -37,7 +37,7 @@
       "type": "object"
     },
     "AccessRequirement": {
-      "description": "Access requirement level for project ingress",
+      "description": "Access requirement level for ingress authentication.\n\nThis is the internal/wire representation: the `access_requirement` of a\nserver-configured access class, the per-route requirement carried on a\ndeployment's route side-data, and the `access` query param the reconciler\nstamps into the auth-url. Spelled PascalCase to match the access-class\nsettings. The `.rise.toml` surface uses [`RouteAccess`] instead, whose\n`public` reads more naturally on a route than `None`.",
       "oneOf": [
         {
           "const": "None",
@@ -85,6 +85,14 @@
             }
           ],
           "description": "Optional active sync source for pulling users and groups from an external IdP.\nWhen configured, Rise will periodically query the IdP for users and groups\nassigned to the app and sync them as Rise teams."
+        },
+        "admin_idp_groups": {
+          "default": [],
+          "description": "IdP groups whose members are admins, as an alternative to listing every\nadmin email in `admin_users`. A user matches when they belong to an\nIdP-managed team of that name (matching is case-insensitive). Blank\nentries are filtered out so an unset `${VAR}` default collapses to an\nempty list.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         },
         "admin_users": {
           "default": [],
@@ -138,6 +146,14 @@
         },
         "issuer": {
           "type": "string"
+        },
+        "operator_idp_groups": {
+          "default": [],
+          "description": "IdP groups whose members hold the Operator role, as an alternative to\nlisting every Operator email in `operator_users`. Matches the same way\nas `admin_idp_groups`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         },
         "operator_users": {
           "default": [],
@@ -1425,7 +1441,7 @@
       "properties": {
         "allowed_idp_groups": {
           "default": [],
-          "description": "IdP groups whose members get platform access",
+          "description": "IdP groups whose members get platform access. A user matches when they\nbelong to an IdP-managed team of that name (case-insensitive).",
           "items": {
             "type": "string"
           },

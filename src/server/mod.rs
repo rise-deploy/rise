@@ -126,12 +126,12 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
             _ => 1000,
         };
         let kube_client = kube_client.clone();
-        let db_pool = state.db_pool.clone();
+        let deployment_store = state.deployment_store.clone();
         let controller_class = state.deployment_controller_class_name.clone();
         tokio::spawn(async move {
             if let Err(e) = deployment::crd::backfill_rise_projects(
                 &kube_client,
-                &db_pool,
+                deployment_store.as_ref(),
                 controller_class.as_deref(),
                 std::time::Duration::from_millis(interval_ms),
             )
