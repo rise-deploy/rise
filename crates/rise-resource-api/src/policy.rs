@@ -599,7 +599,12 @@ pub struct PlatformRoleBindingSpec {
     pub role_ref: PlatformRoleRef,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+/// A persisted org `RoleBinding` spec: every contextual default already applied.
+///
+/// Deserialization is how the authorization engine reads stored bindings back.
+/// `scope` is required here — admission always persists it — so a row missing
+/// it fails closed instead of being silently re-defaulted at evaluation time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LocallyNormalizedRoleBindingSpec {
     subject: BindingSubject,
@@ -610,7 +615,12 @@ pub struct LocallyNormalizedRoleBindingSpec {
     role_ref: RoleRef,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+/// A persisted `PlatformRoleBinding` spec: every contextual default applied.
+///
+/// `subjectMembership` is required on read for the same reason `scope` is:
+/// admission normalizes an omitted value to `Any` before persisting, so an
+/// absent field means a row that never passed admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LocallyNormalizedPlatformRoleBindingSpec {
     subject: BindingSubject,

@@ -68,12 +68,18 @@ auth:
   client_id: "${OIDC_CLIENT_ID:-rise-backend}"
   client_secret: "${OIDC_CLIENT_SECRET:-rise-backend-secret}"
   admin_users: ["${ADMIN_EMAIL:-admin@example.com}"]
+  # Grant the admin role to everyone in an IdP group instead of listing emails.
+  # Blank entries are filtered out, so an unset var collapses to an empty list.
+  admin_idp_groups:
+    - "${RISE_ADMIN_IDP_GROUP:-}"
   # Operators have full access to the generic resource API (/api/v1/resources)
   # and always bypass platform_access. Defaults to none — set RISE_OPERATOR_EMAIL
   # to grant a single operator (mount a config override for several). The blank
   # entry is filtered out when the var is unset, so this collapses to an empty list.
   operator_users:
     - "${RISE_OPERATOR_EMAIL:-}"
+  operator_idp_groups:
+    - "${RISE_OPERATOR_IDP_GROUP:-}"
   allow_team_creation: true
   allow_list_all_teams: true
   # Who may use the CLI/API/dashboard (the "platform"), as opposed to merely

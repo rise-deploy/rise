@@ -41,16 +41,17 @@ scope and avoiding dead-end compatibility layers.
 5. **Merged in PR #420 — generic lifecycle owner references.** Add the canonical
    owner-reference DAG, cascading collection, blocker reporting, and structured
    lifecycle logging required before GroupMembership activation.
-6. **In review in PR #421 — identity activation and storage projections.** Add the
+6. **Merged in PR #421 — identity activation and storage projections.** Add the
    transaction-owned admission seam, activate all eight identity built-ins,
    and add the ADR-required identity/trust/membership indexes and narrow lookup
    adapters. Policy activation remains a separate reviewable increment.
-7. **In progress — policy activation.** Activate the four policy built-ins through
+7. **Merged in PR #430 — policy activation.** Activate the four policy built-ins through
    contextual normalization, reference validation, and concurrency-safe
    admission without yet enforcing live authorization.
-8. **Planned — live authorization engine.** Add membership expansion, org-admin
-   classification, effective labels, tier filtering, per-item list filtering,
-   request-local snapshots, and explain/audit foundations.
+8. **Merged in PR #432 (8a) — live authorization engine.** Add membership expansion,
+   org-admin classification, effective labels, tier filtering, per-item list
+   filtering, request-local snapshots, and explain/audit foundations. Split into
+   8a (generic label and ancestry store surface) and 8b (the engine itself).
 9. **Planned — mutation grant gate and seeded policy.** Add serializable
    authorization-changing writes, label-subtree deltas, bootstrap policy, and
    the centralized generic-resource authorization choke point.
@@ -365,7 +366,8 @@ scope and avoiding dead-end compatibility layers.
 
 ## Increment 6 — identity activation and storage projections
 
-- State: draft PR open for review.
+- State: merged in PR #421 at commit
+  `39a7daa31d3202b3abc6421ad1dc6f0c7aaddaec`.
 - Branch: `feat/resource-identity-activation`.
 - PR: #421.
 - Acceptance criteria:
@@ -428,7 +430,8 @@ scope and avoiding dead-end compatibility layers.
 
 ## Increment 7 — policy activation
 
-- State: draft PR open for review.
+- State: merged in PR #430 at commit
+  `71baf3f`.
 - Branch: `claude/policy-activation-admission-1ojwzz`.
 - Stacked on increment 6 (PR #421), whose admission seam it generalizes.
 - Acceptance criteria:
@@ -489,3 +492,192 @@ scope and avoiding dead-end compatibility layers.
     normalization, reference-resolution, containment, subject-resolution,
     update-renormalization, concurrency, and migration-guard tests.
   - `cargo test --workspace --all-features -- --test-threads=1` passes.
+
+## Increment 8a — generic resource labels and ancestry
+
+- State: merged in PR #432 at commit `ecb32b6`.
+- Branch: `claude/policy-activation-admission-1ojwzz` (restarted from `develop`
+  after #430 merged).
+- First half of increment 8: the generic store surface the authorization engine
+  reads, with no authorization semantics of its own.
+- Acceptance criteria:
+  - Resources carry `metadata.labels` end to end — request bodies, storage,
+    responses, and the typed envelope — validated against the same `LabelKey`
+    grammar a binding's `labelSelector` parses, with bounded single-line values.
+  - `ResourceStore` gains `ancestors(uid)`, returning the root-first structural
+    chain including the leaf in one query.
+  - No authorization behavior changes. `require_operator` is untouched and no
+    label is consulted for access.
+- Decisions:
+  - Labels live in a dedicated column, not inside `metadata`. That column
+    stores exactly the annotations map and is read back as a flat
+    string-to-string map, so nesting a label object inside it would break every
+    read and require rewriting every row; a new column is additive and needs no
+    backfill.
+  - `effectiveLabels` is deliberately *not* a store operation. ADR-0001 §6.1
+    resolves it nearest-wins over an already-fetched ancestor chain, which makes
+    it a pure function; only the chain itself needs SQL.
+  - `ancestors` is a `ResourceStore` trait method rather than a side adapter.
+    The ADR puts tree and label reads on the existing trait and reserves narrow
+    Postgres adapters for the identity lookups. It has no default
+    implementation: a defaulted method returning an empty chain would let a
+    forgotten implementor fail open later.
+  - Binding collection needs no new store method or index. Org `RoleBinding`s
+    are parented under their Organization and `PlatformRoleBinding`s at the
+    root, so the existing `list` reads serve them through the existing
+    `(parent_uid, group, kind)` indexes. This settles the index question
+    deliberately deferred in #430.
+  - Label writes are ungated in this increment, which is safe only because the
+    generic resource API is still operator-only. ADR-0001 §6.6's write gate for
+    access-driving labels must land with the increment-9 choke point, before
+    the API opens to non-operators.
+- Verification:
+  - `cargo fmt --all` and `cargo clippy --workspace --all-features --all-targets
+    -- -D warnings` pass.
+  - `cargo test --workspace --all-features -- --test-threads=1` passes; the
+    PostgreSQL-backed store suite is at 86 tests and the backend suite at 652.
+  - New coverage: label round-tripping and validation at the store and HTTP
+    layers, the database shape constraint, the ancestor chain (deep chain, root
+    resource, unknown UID, tombstoned ancestors, labels carried along), and an
+    EXPLAIN assertion that both binding-collection reads stay index-served.
+  - Generated resource schemas regenerated for the envelope change.
+
+## Increment 8b — the live authorization engine
+
+- State: implemented on this branch; not yet reviewed.
+- Branch: `claude/milestone-8b-4y4scb`.
+- Second half of increment 8: ADR-0001 §4's algorithm as a Tier-1 module
+  (`rise-authz::engine`) beside the pure Tier-0 algebra, testable end to end
+  against fakes.
+- Acceptance criteria:
+  - The evaluator runs §4 steps 1–5 for one resource: membership expansion,
+    binding collection against `effectiveLabels`, wildcard replacement, Deny
+    filtering by placement tier, and the token authorization-detail ceiling.
+  - Its entry point accepts only a typed `AuthenticatedPrincipal`; Group and
+    virtual subjects are rejected at construction rather than in the evaluator.
+  - `MembershipResolver` is the engine's only product-specific seam. Group ties
+    and operator status arrive through it; every other fact is an ordinary
+    `ResourceStore` read.
+  - Org-admin standing is the exact structural predicate — org-root placement,
+    no selector, `PlatformRole/org-admin` — computed before Deny filtering and
+    never inferred from the Role's current statements.
+  - Collections filter per item with `list` and `get` decided independently.
+  - One immutable `AuthorizationSnapshot` per request memoizes membership,
+    standing, and loaded bindings. Nothing is reused across requests.
+  - Explain output retains every contribution's binding UID and tier, including
+    Denies the caller's tier ignored, plus the bindings that target the caller
+    but grant nothing.
+  - No behavior change: `require_operator` is untouched, nothing calls the
+    engine yet, and no seed data or write gate is added.
+- Decisions:
+  - Tier 0 and Tier 1 stay one crate with a hard module boundary, as ADR-0001's
+    implementation structure leans. `policy` gained no dependency; `engine`
+    depends on `rise-resource-api` and nothing else.
+  - Binding collection reads the existing `ResourceStore`: platform bindings at
+    the root and org bindings under the target's Organization. Write-time
+    containment makes that pair complete for any resource in that org, so no
+    scope index is needed — the question deferred in #430 and settled in #432.
+  - The evaluation target is an ancestry chain of `(kind, name, labels)` rather
+    than a UID. A create request has no row yet, so it supplies the proposed
+    leaf; a list item reuses its siblings' ancestry. One target shape serves
+    every verb, and the whole algorithm is exercisable without a store.
+  - An operator's Allow is hardcoded in the evaluator, not read from the seeded
+    `system-admin` binding. ADR-0001 §1 requires the guarantee to survive a bad
+    restore or a direct database write, which a row cannot.
+  - The token ceiling lands here rather than with token convergence. It is step
+    5 of the algorithm; parsing `authorization_details` into `AuthorizationCap`
+    stays authentication-plane work in `rise-backend-auth`.
+  - Stored policy that no longer parses fails the request instead of being
+    skipped. Skipping would silently drop that row's Deny statements, turning
+    corrupt data into a privilege gain. A dangling `roleRef` is different and
+    resolves to no statements: ADR-0001 deletes a Role without deleting its
+    bindings.
+  - Inert-binding reporting is deliberately narrow — only bindings that match
+    the caller and are then removed by a recipient boundary, a
+    `subjectMembership` clamp, or an unresolvable template. Reporting every
+    binding aimed at someone else would bury the cases that answer "why don't I
+    have access?".
+  - `LocallyNormalized{,Platform}RoleBindingSpec` gained `Deserialize` with
+    `scope` and `subjectMembership` required. Admission always persists both, so
+    a row missing either never passed admission and now fails closed instead of
+    being re-defaulted at evaluation time.
+- Verification:
+  - `cargo fmt --all` and `cargo clippy --workspace --all-features --all-targets
+    -- -D warnings` pass.
+  - `cargo test --workspace --all-features -- --test-threads=1` passes; the new
+    engine suite is 27 tests and the generated resource schemas are unchanged.
+  - Coverage follows the ADR's acceptance scenarios 11–23: Allow union and
+    default deny, retained Deny wins, platform Deny reaching an admin, org Deny
+    exempting only that org's admins, operator ignoring every Deny, Deny
+    provenance surviving replacement, live Group expansion, the group-tie
+    requirement and its direct-admin bootstrap exception, foreign-subject
+    inertness, the `ResourceOrganization` clamp and Controller exclusion,
+    absolute `org:` subjects on a root resource, authored-form wildcard
+    collision, value-narrowed selectors, and multi-org admin standing. Plus
+    nearest-wins ownership through `effectiveLabels`, per-item list filtering
+    with independent `get`, ceiling narrowing including for operators, explain
+    retention, tombstoned/dangling bindings, corrupt policy, scope subtree
+    matching, and a guard that no mutex guard is held across an await.
+- Review — adversarial pass over the evaluator, fixed in the same increment:
+  - **Org-admin standing ignored the recipient boundary.** A qualifying
+    `org-admin` binding naming a Group of *another* org classified that Group's
+    members as admins of this one, so an inert cross-org binding — which
+    ADR-0001 §1 says grants nothing, and which policy auditing would report as
+    contributing nothing — silently exempted them from their own org's caps.
+    The predicate now requires a Group subject to carry the binding's own
+    organization. Regression test confirmed failing before the fix.
+  - **The membership seam was trusted without checking its contract.** A
+    resolver returning an `org:` predicate among the Group ties would have
+    conferred org affiliation with no `GroupMembership` behind it, and one
+    returning ties or operator status for a ServiceAccount or Controller would
+    have granted authority no identity resource can express. Snapshot
+    construction now rejects all three, fail-closed.
+  - **A truncated ancestor chain would have dropped an organization's whole
+    policy tier.** The store's ancestry walk is depth-bounded and truncates at
+    the root end; everything downstream reads position 0 as the root, so a
+    truncated chain would evaluate the resource as belonging to no
+    organization — losing its Denies, not just its Allows. Registration keeps
+    real ancestry inside the bound, so this is unreachable today; the chain is
+    now anchor-checked rather than assumed.
+  - **One test passed for the wrong reason.** The org-admin Deny exemption case
+    capped a Group the admin was not in, so it would have passed with the
+    exemption removed entirely. It now caps the whole org population and asserts
+    the exemption actually fired.
+  - Reviewed and kept as-is: an unresolvable dynamic subject drops its whole
+    binding, Denies included, which is correct because a binding with no
+    resolvable subject applies to nobody — and §6.7's write-time referential
+    integrity is what keeps such a value from being persisted. Wildcard
+    replacement runs over step-2's collected set, so a binding made inert by a
+    membership boundary does not supersede a wildcard; that is the ADR's literal
+    step ordering.
+  - Known costs, not defects: binding loads are one query per Role on a
+    snapshot's first evaluation, and `filter_list` is O(items × bindings) of
+    pure computation over cached facts. Both are bounded per request. Batching
+    the role lookups fixes the first with no schema commitment and should come
+    before any cross-request cache; the sequencing is tracked under `ROADMAP.md`
+    § Unified identity and RBAC.
+- Follow-ups this increment deliberately leaves open:
+  - The centralized choke point replacing `require_operator`, the write-time
+    grant gate, and seeded `system-admin`/`resource-owner`/`org-admin` data are
+    increment 9. Two hazards for it: `EffectivePolicy::retained_statements` is
+    RBAC only and must be combined with the ceiling before any subset
+    comparison, and `Explanation` names bindings and Roles the caller may hold
+    no read access to.
+  - The live `MembershipResolver` over `GroupMembership` rows and configured
+    operator selectors, and `authorization_details` parsing, are increment 10.
+  - Policy auditing beyond the inert-binding reasons above — owners granting
+    nobody, selectors matching nothing, stale references — remains open.
+  - An Organization tombstone takes its policy resources with it, so its whole
+    tier stops applying while the subtree drains. That is narrower than it
+    sounds: membership lookup requires a live Group *and* a live Organization,
+    so every member loses affiliation at the same moment, which also drops
+    org-parented bindings, `org:<name>` grants, and every
+    `subjectMembership: ResourceOrganization` binding — the seeded ownership
+    default included. What survives is exactly operator-authored non-member
+    access and Controllers, which is the case ADR-0001 §4 already settles for
+    membership loss ("an explicit operator-governance case"). Ordering the
+    cascade to collect policy last would preserve Denies that reach nobody, and
+    denying everyone but operators would deadlock the drain on controllers that
+    still need to remove their finalizers. The one real gap is `create` below a
+    deleting ancestor, now tracked under `ROADMAP.md` § Resource API
+    maturation, as a lifecycle rule rather than an authorization one.

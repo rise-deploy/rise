@@ -762,8 +762,8 @@ pub async fn me(
     let user = auth.user().map_err(|e| (e.status, e.message))?;
     // User is injected by auth middleware
     tracing::debug!("GET /me: user_id={}, email={}", user.id, user.email);
-    let is_admin = state.is_admin(&user.email);
-    let is_operator = state.is_operator(&user.email);
+    let is_admin = state.is_admin(user).await;
+    let is_operator = state.is_operator(user).await;
     let can_create_teams = is_admin || state.auth_settings.allow_team_creation;
     Ok(Json(MeResponse {
         id: user.id.to_string(),
