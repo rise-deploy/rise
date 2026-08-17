@@ -67,7 +67,20 @@ impl ResourceTree {
     }
 
     /// Build from a store ancestor chain, which already includes the leaf.
+    ///
+    /// The chain must reach the root. Everything downstream reads position 0 as
+    /// the root — that is how the Organization is identified and how a Scope's
+    /// names are aligned — so a chain truncated at the root end would silently
+    /// drop that resource's whole organization tier, Denies included. The store
+    /// caps its walk at a bounded depth, and registration keeps real ancestry
+    /// inside that bound; if the two ever disagree, this fails the request
+    /// instead of quietly evaluating a resource with no organization.
     pub fn from_rows(rows: &[ResourceRow]) -> Result<Self, AuthorizationError> {
+        if rows.first().is_some_and(|root| root.parent_uid.is_some()) {
+            return Err(AuthorizationError::invalid_target(
+                "ancestor chain does not reach a root resource",
+            ));
+        }
         Self::new(
             rows.iter()
                 .map(ResourceNode::from_row)

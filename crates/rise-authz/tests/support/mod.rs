@@ -22,6 +22,7 @@ pub const V1ALPHA1: &str = API_VERSION_V1ALPHA1;
 #[derive(Default)]
 pub struct StoreBuilder {
     rows: Vec<ResourceRow>,
+    ancestor_depth: Option<usize>,
 }
 
 impl StoreBuilder {
@@ -120,13 +121,24 @@ impl StoreBuilder {
         }
     }
 
+    /// Cap `ancestors` at this many rows, counted from the leaf, the way the
+    /// Postgres walk truncates a chain deeper than its bound.
+    pub fn truncating_at(mut self, depth: usize) -> Self {
+        self.ancestor_depth = Some(depth);
+        self
+    }
+
     pub fn build(self) -> Arc<FakeStore> {
-        Arc::new(FakeStore { rows: self.rows })
+        Arc::new(FakeStore {
+            rows: self.rows,
+            ancestor_depth: self.ancestor_depth,
+        })
     }
 }
 
 pub struct FakeStore {
     rows: Vec<ResourceRow>,
+    ancestor_depth: Option<usize>,
 }
 
 impl FakeStore {
@@ -189,6 +201,9 @@ impl ResourceStore for FakeStore {
             };
             cursor = row.parent_uid;
             chain.push(row.clone());
+            if self.ancestor_depth == Some(chain.len()) {
+                break;
+            }
         }
         chain.reverse();
         Ok(chain)

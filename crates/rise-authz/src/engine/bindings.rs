@@ -158,9 +158,14 @@ pub(crate) async fn load_organization_bindings(
     Ok(bindings)
 }
 
+/// Role bodies resolved during one load.
+///
+/// Keyed by placement as well as name: Role names are unique per Organization,
+/// not globally, so dropping the parent from the key would let one org's Role
+/// answer for another's the moment this cache outlives a single org's load.
 #[derive(Default)]
 struct RoleCache {
-    statements: HashMap<(&'static str, String), Vec<PolicyStatement>>,
+    statements: HashMap<(&'static str, Option<Uuid>, String), Vec<PolicyStatement>>,
 }
 
 impl RoleCache {
@@ -175,7 +180,8 @@ impl RoleCache {
             RoleRefKind::Role => ROLE_KIND,
             RoleRefKind::PlatformRole => PLATFORM_ROLE_KIND,
         };
-        if let Some(statements) = self.statements.get(&(stored_kind, name.to_owned())) {
+        let key = (stored_kind, parent_uid, name.to_owned());
+        if let Some(statements) = self.statements.get(&key) {
             return Ok(statements.clone());
         }
         let statements = match store
@@ -186,8 +192,7 @@ impl RoleCache {
             Some(row) => parse_spec::<RoleSpec>(&row)?.statements,
             None => Vec::new(),
         };
-        self.statements
-            .insert((stored_kind, name.to_owned()), statements.clone());
+        self.statements.insert(key, statements.clone());
         Ok(statements)
     }
 }

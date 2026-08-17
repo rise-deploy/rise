@@ -223,12 +223,15 @@ async fn an_org_deny_exempts_that_orgs_admins_only() {
             "roleRef": { "kind": "PlatformRole", "name": "everything" }
         }),
     );
+    // The cap targets the whole org population, so it genuinely covers the
+    // admin too: a cap aimed only at a Group the admin is not in would let this
+    // test pass without the tier exemption ever running.
     builder.binding(
         ROLE_BINDING,
         "member-cap",
         Some(acme),
         json!({
-            "subject": "group:acme/platform",
+            "subject": "system:authenticated",
             "scope": "rise.dev/Organization/acme",
             "roleRef": { "kind": "Role", "name": "no-delete" }
         }),
@@ -238,8 +241,19 @@ async fn an_org_deny_exempts_that_orgs_admins_only() {
 
     let admin_engine = engine(store.clone(), FakeMemberships::none());
     let admin = snapshot_for(&admin_engine, "user:u-alice").await;
+    let target = admin_engine.resource_tree(deployment).await.unwrap();
+    let policy = admin_engine
+        .effective_policy(&admin, &target)
+        .await
+        .unwrap();
+    assert!(
+        policy.contributions().iter().any(|contribution| {
+            contribution.retention == Retention::ExemptDeny(DenyExemption::OrganizationAdmin)
+        }),
+        "the cap must actually reach the admin for the exemption to mean anything"
+    );
     assert_eq!(
-        decide(&admin_engine, &admin, deployment, &delete).await,
+        policy.decide(&delete),
         Decision::Allow,
         "the org's own Deny does not cap its own admin"
     );
@@ -530,6 +544,106 @@ async fn a_group_targeted_admin_binding_needs_no_special_name() {
         .await
         .unwrap()
         .is_organization_admin());
+}
+
+#[tokio::test]
+async fn a_foreign_group_cannot_be_promoted_to_org_admin() {
+    let mut builder = StoreBuilder::new();
+    let acme = builder.resource(ORGANIZATION, "acme", None);
+    let app = builder.resource(PROJECT, "app", Some(acme));
+    let deployment = builder.resource(DEPLOYMENT, "foo", Some(app));
+    builder.role(PLATFORM_ROLE, ORG_ADMIN_PLATFORM_ROLE, None, allow_all());
+    builder.role(PLATFORM_ROLE, "everything", None, allow_all());
+    builder.role(
+        ROLE,
+        "no-delete",
+        Some(acme),
+        json!([{ "effect": "Deny", "kinds": ["rise.dev/Deployment"], "verbs": ["delete"] }]),
+    );
+    // An acme admin names a *beta* Group. §1 makes that binding provably
+    // foreign and inert; admission accepts it as ordinary policy data.
+    builder.binding(
+        ROLE_BINDING,
+        "foreign-admin",
+        Some(acme),
+        org_admin_binding("group:beta/admins", "acme"),
+    );
+    // The caller is an ordinary acme member through a real tie, so acme's own
+    // grant and its own cap both reach them. Admin standing — and only admin
+    // standing — would drop that cap.
+    builder.binding(
+        ROLE_BINDING,
+        "members",
+        Some(acme),
+        json!({
+            "subject": "group:acme/devs",
+            "scope": "rise.dev/Organization/acme",
+            "roleRef": { "kind": "PlatformRole", "name": "everything" }
+        }),
+    );
+    builder.binding(
+        ROLE_BINDING,
+        "acme-cap",
+        Some(acme),
+        json!({
+            "subject": "group:acme/devs",
+            "scope": "rise.dev/Organization/acme",
+            "roleRef": { "kind": "Role", "name": "no-delete" }
+        }),
+    );
+    let store = builder.build();
+    let engine = engine(
+        store.clone(),
+        FakeMemberships::groups(&["group:acme/devs", "group:beta/admins"]),
+    );
+    let snapshot = snapshot_for(&engine, "user:u-mallory").await;
+    let target = engine.resource_tree(deployment).await.unwrap();
+    let policy = engine.effective_policy(&snapshot, &target).await.unwrap();
+
+    assert!(
+        !policy.is_organization_admin(),
+        "a Group of another org is not a member of this one, so it confers no admin standing"
+    );
+    assert_eq!(
+        policy.decide(&tuple(Verb::Update, "rise.dev/Deployment")),
+        Decision::Allow
+    );
+    assert_eq!(
+        policy.decide(&tuple(Verb::Delete, "rise.dev/Deployment")),
+        Decision::Deny,
+        "an inert foreign binding must not quietly exempt them from their org's cap"
+    );
+}
+
+#[tokio::test]
+async fn membership_facts_outside_the_seam_contract_fail_closed() {
+    let mut builder = StoreBuilder::new();
+    builder.resource(ORGANIZATION, "acme", None);
+    let store = builder.build();
+
+    // `org:acme` would otherwise be read as an acme affiliation, widening every
+    // org-clamped grant without any GroupMembership existing.
+    let widened = engine(store.clone(), FakeMemberships::groups(&["org:acme"]));
+    assert!(matches!(
+        widened.snapshot(principal("user:u-mallory")).await,
+        Err(AuthorizationError::Membership(_))
+    ));
+
+    // A GroupMembership names a User and an operator is a User, so neither can
+    // belong to a workload identity.
+    let workload = engine(
+        store.clone(),
+        FakeMemberships::groups(&["group:acme/platform"]),
+    );
+    assert!(matches!(
+        workload.snapshot(principal("serviceaccount:acme/ci")).await,
+        Err(AuthorizationError::Membership(_))
+    ));
+    let elevated = engine(store, FakeMemberships::operator());
+    assert!(matches!(
+        elevated.snapshot(principal("controller:reconciler")).await,
+        Err(AuthorizationError::Membership(_))
+    ));
 }
 
 #[tokio::test]
@@ -1315,6 +1429,77 @@ async fn only_identity_resources_can_authenticate() {
         AuthorizationCap::Unrestricted
     )
     .is_ok());
+}
+
+/// The grant gate compares statement lists, so the list an operator's policy
+/// reports has to say the same thing their decisions do.
+#[tokio::test]
+async fn the_statement_list_a_policy_reports_agrees_with_its_decisions() {
+    let mut builder = StoreBuilder::new();
+    let acme = builder.resource(ORGANIZATION, "acme", None);
+    let app = builder.resource(PROJECT, "app", Some(acme));
+    builder.role(
+        ROLE,
+        "project-reader",
+        Some(acme),
+        json!([{ "effect": "Allow", "kinds": ["rise.dev/Project"], "verbs": ["get"] }]),
+    );
+    builder.binding(
+        ROLE_BINDING,
+        "reader",
+        Some(acme),
+        json!({
+            "subject": "group:acme/platform",
+            "scope": "rise.dev/Organization/acme",
+            "roleRef": { "kind": "Role", "name": "project-reader" }
+        }),
+    );
+    let store = builder.build();
+    let probes = [
+        tuple(Verb::Get, "rise.dev/Project"),
+        tuple(Verb::Delete, "rise.dev/Project"),
+        PermissionTuple {
+            verb: Verb::Update,
+            kind: "rise.dev/Deployment".parse().unwrap(),
+            subresource: Some("status".parse().unwrap()),
+        },
+    ];
+
+    for memberships in [
+        FakeMemberships::groups(&["group:acme/platform"]),
+        FakeMemberships::operator(),
+    ] {
+        let engine = engine(store.clone(), memberships);
+        let snapshot = snapshot_for(&engine, "user:u-alice").await;
+        let target = engine.resource_tree(app).await.unwrap();
+        let policy = engine.effective_policy(&snapshot, &target).await.unwrap();
+        let statements = policy.effective_statements();
+        for probe in &probes {
+            assert_eq!(
+                rise_authz::policy::evaluate(statements.iter(), probe),
+                policy.decide(probe),
+                "{probe:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_ancestor_chain_that_misses_the_root_is_rejected() {
+    let mut builder = StoreBuilder::new();
+    let acme = builder.resource(ORGANIZATION, "acme", None);
+    let app = builder.resource(PROJECT, "app", Some(acme));
+    let deployment = builder.resource(DEPLOYMENT, "foo", Some(app));
+    let store = builder.truncating_at(2).build();
+    let engine = engine(store, FakeMemberships::none());
+
+    // A chain cut short at the root end would read as a resource in no
+    // organization, dropping acme's whole tier — Denies included — instead of
+    // failing.
+    assert!(matches!(
+        engine.resource_tree(deployment).await,
+        Err(AuthorizationError::InvalidInput(_))
+    ));
 }
 
 #[tokio::test]

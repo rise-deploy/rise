@@ -605,7 +605,7 @@ scope and avoiding dead-end compatibility layers.
   - `cargo fmt --all` and `cargo clippy --workspace --all-features --all-targets
     -- -D warnings` pass.
   - `cargo test --workspace --all-features -- --test-threads=1` passes; the new
-    engine suite is 24 tests and the generated resource schemas are unchanged.
+    engine suite is 27 tests and the generated resource schemas are unchanged.
   - Coverage follows the ADR's acceptance scenarios 11–23: Allow union and
     default deny, retained Deny wins, platform Deny reaching an admin, org Deny
     exempting only that org's admins, operator ignoring every Deny, Deny
@@ -618,11 +618,54 @@ scope and avoiding dead-end compatibility layers.
     with independent `get`, ceiling narrowing including for operators, explain
     retention, tombstoned/dangling bindings, corrupt policy, scope subtree
     matching, and a guard that no mutex guard is held across an await.
+- Review — adversarial pass over the evaluator, fixed in the same increment:
+  - **Org-admin standing ignored the recipient boundary.** A qualifying
+    `org-admin` binding naming a Group of *another* org classified that Group's
+    members as admins of this one, so an inert cross-org binding — which
+    ADR-0001 §1 says grants nothing, and which policy auditing would report as
+    contributing nothing — silently exempted them from their own org's caps.
+    The predicate now requires a Group subject to carry the binding's own
+    organization. Regression test confirmed failing before the fix.
+  - **The membership seam was trusted without checking its contract.** A
+    resolver returning an `org:` predicate among the Group ties would have
+    conferred org affiliation with no `GroupMembership` behind it, and one
+    returning ties or operator status for a ServiceAccount or Controller would
+    have granted authority no identity resource can express. Snapshot
+    construction now rejects all three, fail-closed.
+  - **A truncated ancestor chain would have dropped an organization's whole
+    policy tier.** The store's ancestry walk is depth-bounded and truncates at
+    the root end; everything downstream reads position 0 as the root, so a
+    truncated chain would evaluate the resource as belonging to no
+    organization — losing its Denies, not just its Allows. Registration keeps
+    real ancestry inside the bound, so this is unreachable today; the chain is
+    now anchor-checked rather than assumed.
+  - **One test passed for the wrong reason.** The org-admin Deny exemption case
+    capped a Group the admin was not in, so it would have passed with the
+    exemption removed entirely. It now caps the whole org population and asserts
+    the exemption actually fired.
+  - Reviewed and kept as-is: an unresolvable dynamic subject drops its whole
+    binding, Denies included, which is correct because a binding with no
+    resolvable subject applies to nobody — and §6.7's write-time referential
+    integrity is what keeps such a value from being persisted. Wildcard
+    replacement runs over step-2's collected set, so a binding made inert by a
+    membership boundary does not supersede a wildcard; that is the ADR's literal
+    step ordering.
+  - Known costs, not defects: binding loads are one query per Role on a
+    snapshot's first evaluation, and `filter_list` is O(items × bindings) of
+    pure computation over cached facts. Both are bounded per request and are
+    what the ADR's deferred cross-request cache addresses.
 - Follow-ups this increment deliberately leaves open:
   - The centralized choke point replacing `require_operator`, the write-time
     grant gate, and seeded `system-admin`/`resource-owner`/`org-admin` data are
-    increment 9.
+    increment 9. Two hazards for it: `EffectivePolicy::retained_statements` is
+    RBAC only and must be combined with the ceiling before any subset
+    comparison, and `Explanation` names bindings and Roles the caller may hold
+    no read access to.
   - The live `MembershipResolver` over `GroupMembership` rows and configured
     operator selectors, and `authorization_details` parsing, are increment 10.
   - Policy auditing beyond the inert-binding reasons above — owners granting
     nobody, selectors matching nothing, stale references — remains open.
+  - An Organization tombstone takes its bindings with it, so org-tier Denies
+    stop applying to whatever remains of its subtree while it drains. The choke
+    point deciding whether a resource under deletion is addressable at all is
+    the right place to settle that.

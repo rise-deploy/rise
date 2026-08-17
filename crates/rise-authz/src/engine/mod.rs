@@ -20,8 +20,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use rise_resource_api::{
-    Effect, PolicyStatement, ResourceStore, RoleRefKind, StoreError, SubjectId, SubjectMembership,
-    ValidationError, API_GROUP, ORGANIZATION_KIND,
+    Effect, KindMatcher, PolicyStatement, ResourceStore, RoleRefKind, StoreError, SubjectId,
+    SubjectMembership, SubresourceMatcher, ValidationError, VerbMatcher, API_GROUP,
+    ORGANIZATION_KIND,
 };
 use uuid::Uuid;
 
@@ -54,6 +55,8 @@ pub enum AuthorizationError {
     InvalidPrincipal(String),
     #[error("corrupt stored policy: {0}")]
     CorruptPolicy(String),
+    #[error("membership resolver contract violated: {0}")]
+    Membership(String),
     #[error("resource {0} does not exist")]
     UnknownResource(Uuid),
 }
@@ -176,12 +179,30 @@ impl EffectivePolicy {
         &self.inert
     }
 
-    /// The statements that survive replacement and tier filtering.
-    pub fn retained_statements(&self) -> impl Iterator<Item = &PolicyStatement> {
+    fn retained_statements(&self) -> impl Iterator<Item = &PolicyStatement> {
         self.contributions
             .iter()
             .filter(|contribution| contribution.retention == Retention::Retained)
             .map(|contribution| &contribution.statement)
+    }
+
+    /// This caller's RBAC authority on the resource as a statement list, for
+    /// the policy comparisons ADR-0001 §5's grant gate performs.
+    ///
+    /// An operator's list is the complete main-resource and subresource
+    /// permission, not the bindings that happened to match them — reading the
+    /// matched bindings instead would understate an operator's authority and
+    /// wrongly block grants they are entitled to hand out.
+    ///
+    /// The token ceiling is deliberately *not* folded in: it intersects with
+    /// this set, and an intersection is not expressible as a flat statement
+    /// list. A comparison that must respect the caller's ceiling has to apply
+    /// [`Self::ceiling`] alongside this.
+    pub fn effective_statements(&self) -> Vec<PolicyStatement> {
+        if self.operator {
+            return universal_allow();
+        }
+        self.retained_statements().cloned().collect()
     }
 
     pub fn ceiling(&self) -> Option<&[PolicyStatement]> {
@@ -232,6 +253,10 @@ impl EffectivePolicy {
 }
 
 /// Why one request was allowed or denied, in terms a human can audit.
+///
+/// This names binding UIDs, Roles, and placement tiers the caller may hold no
+/// read access to, so it is diagnostic output for an authorized reader, not
+/// something to return on an ordinary denial.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Explanation {
     pub decision: Decision,
@@ -321,6 +346,29 @@ impl AuthorizationEngine {
         principal: AuthenticatedPrincipal,
     ) -> Result<AuthorizationSnapshot, AuthorizationError> {
         let membership = self.memberships.resolve(&principal).await?;
+        // The seam is implemented outside this crate and its answers widen
+        // access, so its contract is checked rather than assumed. A tie is a
+        // Group; anything else — an `org:` predicate, a ServiceAccount — would
+        // silently confer org affiliation. And both ties and operator status
+        // belong to Users alone: a GroupMembership names a User, and an
+        // operator is an active User with a matching UserIdentity, so
+        // accepting either for a workload identity would hand a token holder
+        // authority no identity resource could express.
+        if let Some(subject) = membership
+            .groups
+            .iter()
+            .find(|subject| subject.kind() != "group")
+        {
+            return Err(AuthorizationError::Membership(format!(
+                "{subject} is not a Group subject and cannot be a membership tie"
+            )));
+        }
+        if !principal.is_user() && (membership.is_operator || !membership.groups.is_empty()) {
+            return Err(AuthorizationError::Membership(format!(
+                "{} is not a User and can hold neither Group ties nor operator status",
+                principal.subject()
+            )));
+        }
         Ok(AuthorizationSnapshot {
             principal,
             membership,
@@ -331,6 +379,12 @@ impl AuthorizationEngine {
     }
 
     /// Load an existing resource's evaluation target from its structural chain.
+    ///
+    /// Tombstoned rows are included, matching `ResourceStore::ancestors`:
+    /// whether a resource being collected is still addressable is the API
+    /// layer's decision, not an authorization one. Note that an Organization
+    /// tombstone takes its own bindings with it, so org-tier Denies stop
+    /// applying to what remains of its subtree while it drains.
     pub async fn resource_tree(&self, uid: Uuid) -> Result<ResourceTree, AuthorizationError> {
         let rows = self.store.ancestors(uid).await?;
         if rows.is_empty() {
@@ -696,6 +750,28 @@ impl AuthorizationEngine {
     }
 }
 
+/// The policy ADR-0001 §1 guarantees every operator request, as data.
+///
+/// Two statements, because `kinds: "*"` covers the main resource only: a Role
+/// that needs both writes both (§3), and `PlatformRole/system-admin` is defined
+/// exactly this way.
+fn universal_allow() -> Vec<PolicyStatement> {
+    vec![
+        PolicyStatement {
+            effect: Effect::Allow,
+            kinds: KindMatcher::All,
+            verbs: VerbMatcher::All,
+            subresources: None,
+        },
+        PolicyStatement {
+            effect: Effect::Allow,
+            kinds: KindMatcher::All,
+            verbs: VerbMatcher::All,
+            subresources: Some(SubresourceMatcher::All),
+        },
+    ]
+}
+
 /// ADR-0001 §5's structural org-admin predicate.
 ///
 /// Exact org-root placement, no selector, and a `PlatformRole/org-admin`
@@ -708,8 +784,21 @@ fn qualifies_as_org_admin(binding: &BindingFact, organization: &str) -> bool {
         && binding.provenance.role.name == ORG_ADMIN_PLATFORM_ROLE
         && matches!(&binding.tier, BindingTier::Organization(org) if org == organization)
         && binding.scope.as_ref() == format!("{API_GROUP}/{ORGANIZATION_KIND}/{organization}")
-        && binding
-            .subject
-            .literal()
-            .is_some_and(|subject| matches!(subject.kind(), "user" | "group"))
+        && binding.subject.literal().is_some_and(|subject| {
+            match subject.kind() {
+                // The direct edge: §5's binding may name the User itself, and
+                // that binding is also that first administrator's affiliation
+                // with the org.
+                "user" => true,
+                // A Group carries its own organization, so §1's recipient
+                // boundary settles this before membership is consulted: a
+                // foreign Group is provably not a member of this org and its
+                // binding grants nothing — admin standing included. Without
+                // this, an admin could promote another org's Group by naming
+                // it, and its members would inherit the Deny exemption that
+                // admin standing carries.
+                "group" => subject.organization() == Some(organization),
+                _ => false,
+            }
+        })
 }
