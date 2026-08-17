@@ -13,7 +13,7 @@ sources:
   - https://github.com/rise-deploy/rise
 dependencies:
   - name: metacontroller-helm
-    version: "4.15.0"
+    version: "4.15.1"
     repository: "oci://ghcr.io/metacontroller"
     alias: metacontroller-operator
     condition: metacontroller.install
