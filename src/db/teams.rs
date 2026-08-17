@@ -440,6 +440,31 @@ pub async fn get_team_names_for_user(pool: &PgPool, user_id: Uuid) -> Result<Vec
     Ok(records.into_iter().map(|r| r.name).collect())
 }
 
+/// Get the names of the IdP-managed teams a user is a member of.
+///
+/// These are the user's IdP groups as Rise knows them: `sync_user_groups`
+/// (login) and the Entra active sync both mirror the IdP's groups into
+/// `idp_managed` teams. Teams users create themselves are excluded, so a
+/// self-service team named after a privileged group cannot grant that group's
+/// permissions.
+pub async fn list_idp_group_names_for_user(pool: &PgPool, user_id: Uuid) -> Result<Vec<String>> {
+    let records = sqlx::query!(
+        r#"
+        SELECT DISTINCT t.name
+        FROM teams t
+        INNER JOIN team_members tm ON t.id = tm.team_id
+        WHERE tm.user_id = $1 AND t.idp_managed = TRUE
+        ORDER BY t.name
+        "#,
+        user_id
+    )
+    .fetch_all(pool)
+    .await
+    .context("Failed to get IdP group names for user")?;
+
+    Ok(records.into_iter().map(|r| r.name).collect())
+}
+
 /// Remove all members from a team (all roles)
 pub async fn remove_all_team_members<'a, E>(executor: E, team_id: Uuid) -> Result<u64>
 where

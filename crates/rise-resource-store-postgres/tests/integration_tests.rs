@@ -1,10 +1,18 @@
 use rise_resource_api::{
-    CreateResourceParams, DeleteOutcome, OwnerReference, PathSegment, ResourceRow, ResourceStore,
-    StoreError, UpdateResourceParams, API_VERSION_V1ALPHA1, CASCADE_DELETION_FINALIZER,
-    ORGANIZATION_KIND, RESOURCE_DEFINITION_KIND,
+    CreateResourceParams, DeleteOutcome, ExternalSubject, Issuer, NoOpValidator, OwnerReference,
+    PathSegment, ResourceRow, ResourceStore, StoreError, UpdateResourceParams,
+    API_VERSION_V1ALPHA1, CASCADE_DELETION_FINALIZER, CONTROLLER_KIND,
+    CONTROLLER_TRUST_POLICY_KIND, GROUP_KIND, GROUP_MEMBERSHIP_KIND, IDENTITY_KIND_DEFINITIONS,
+    ORGANIZATION_KIND, PLATFORM_ROLE_BINDING_KIND, PLATFORM_ROLE_KIND, POLICY_KIND_DEFINITIONS,
+    RESOURCE_DEFINITION_KIND, ROLE_BINDING_KIND, ROLE_KIND, SERVICE_ACCOUNT_KIND,
+    SERVICE_ACCOUNT_TRUST_POLICY_KIND, USER_IDENTITY_KIND, USER_KIND,
 };
-use rise_resource_store_postgres::PgResourceStore;
+use rise_resource_store_postgres::{
+    BuiltInRegistration, BuiltInRegistry, IdentityLookup, MembershipLookup, OrganizationValidator,
+    PgResourceStore, TrustPolicyLookup,
+};
 use serde_json::json;
+use sqlx::Executor;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,6 +23,7 @@ async fn create_and_get_resource(pool: sqlx::PgPool) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
 
     let params = CreateResourceParams {
+        labels: Default::default(),
         api_version: API_VERSION_V1ALPHA1.to_string(),
         kind: ORGANIZATION_KIND.to_string(),
         name: "my-org".to_string(),
@@ -74,6 +83,7 @@ async fn list_resources(pool: sqlx::PgPool) -> sqlx::Result<()> {
     for name in ["beta", "alpha", "gamma"] {
         store
             .create(CreateResourceParams {
+                labels: Default::default(),
                 api_version: API_VERSION_V1ALPHA1.to_string(),
                 kind: ORGANIZATION_KIND.to_string(),
                 name: name.to_string(),
@@ -112,6 +122,7 @@ async fn same_kind_name_is_isolated_by_api_version(pool: sqlx::PgPool) -> sqlx::
     ] {
         store
             .register_resource_definition(CreateResourceParams {
+                labels: Default::default(),
                 api_version: API_VERSION_V1ALPHA1.to_string(),
                 kind: RESOURCE_DEFINITION_KIND.to_string(),
                 name: format!("{plural}.{group}"),
@@ -134,6 +145,7 @@ async fn same_kind_name_is_isolated_by_api_version(pool: sqlx::PgPool) -> sqlx::
 
     let first = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: "alpha.example.dev/v1".to_string(),
             kind: "Widget".to_string(),
             name: "shared".to_string(),
@@ -149,6 +161,7 @@ async fn same_kind_name_is_isolated_by_api_version(pool: sqlx::PgPool) -> sqlx::
 
     let second = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: "beta.example.dev/v1".to_string(),
             kind: "Widget".to_string(),
             name: "shared".to_string(),
@@ -185,6 +198,7 @@ async fn update_resource_increments_revision(pool: sqlx::PgPool) -> sqlx::Result
 
     let row = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: ORGANIZATION_KIND.to_string(),
             name: "my-org".to_string(),
@@ -204,6 +218,7 @@ async fn update_resource_increments_revision(pool: sqlx::PgPool) -> sqlx::Result
         .update(
             row.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: 1,
                 annotations: BTreeMap::new(),
@@ -228,6 +243,7 @@ async fn update_rejects_wrong_revision(pool: sqlx::PgPool) -> sqlx::Result<()> {
 
     let row = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: ORGANIZATION_KIND.to_string(),
             name: "my-org".to_string(),
@@ -245,6 +261,7 @@ async fn update_rejects_wrong_revision(pool: sqlx::PgPool) -> sqlx::Result<()> {
         .update(
             row.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: 99, // wrong
                 annotations: BTreeMap::new(),
@@ -273,6 +290,7 @@ async fn duplicate_name_returns_conflict(pool: sqlx::PgPool) -> sqlx::Result<()>
     let store = PgResourceStore::new(pool);
 
     let params = || CreateResourceParams {
+        labels: Default::default(),
         api_version: API_VERSION_V1ALPHA1.to_string(),
         kind: ORGANIZATION_KIND.to_string(),
         name: "same-name".to_string(),
@@ -299,6 +317,7 @@ async fn duplicate_name_returns_conflict_for_rd_backed_kind(
     register_example_widget_rd(&store).await;
 
     let params = || CreateResourceParams {
+        labels: Default::default(),
         api_version: "example.dev/v1".to_string(),
         kind: "Widget".to_string(),
         name: "same-name".to_string(),
@@ -327,6 +346,7 @@ async fn create_rejects_non_storage_version_at_root(pool: sqlx::PgPool) -> sqlx:
 
     let err = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: "example.dev/v2".to_string(),
             kind: "Widget".to_string(),
             name: "non-storage".to_string(),
@@ -355,6 +375,7 @@ async fn create_rejects_non_storage_version_in_child_scope(pool: sqlx::PgPool) -
 
     let err = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: "example.dev/v2".to_string(),
             kind: "Widget".to_string(),
             name: "non-storage".to_string(),
@@ -388,6 +409,7 @@ async fn update_api_version_collision_returns_name_conflict(
     ] {
         store
             .register_resource_definition(CreateResourceParams {
+                labels: Default::default(),
                 api_version: API_VERSION_V1ALPHA1.to_string(),
                 kind: RESOURCE_DEFINITION_KIND.to_string(),
                 name: format!("{plural}.{group}"),
@@ -411,6 +433,7 @@ async fn update_api_version_collision_returns_name_conflict(
     // Two resources with the same kind + name but in different groups — allowed at root.
     let moving = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: "alpha.example.dev/v1".to_string(),
             kind: "Widget".to_string(),
             name: "shared".to_string(),
@@ -425,6 +448,7 @@ async fn update_api_version_collision_returns_name_conflict(
         .unwrap();
     store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: "beta.example.dev/v1".to_string(),
             kind: "Widget".to_string(),
             name: "shared".to_string(),
@@ -444,6 +468,7 @@ async fn update_api_version_collision_returns_name_conflict(
         .update(
             moving.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: Some("beta.example.dev/v1".to_string()),
                 revision: moving.revision,
                 annotations: BTreeMap::new(),
@@ -470,6 +495,7 @@ async fn update_rejects_non_storage_version(pool: sqlx::PgPool) -> sqlx::Result<
 
     let widget = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: "example.dev/v1".to_string(),
             kind: "Widget".to_string(),
             name: "w1".to_string(),
@@ -489,6 +515,7 @@ async fn update_rejects_non_storage_version(pool: sqlx::PgPool) -> sqlx::Result<
         .update(
             widget.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: Some("example.dev/v2".to_string()),
                 revision: widget.revision,
                 annotations: BTreeMap::new(),
@@ -514,6 +541,7 @@ async fn delete_without_finalizers_removes_row(pool: sqlx::PgPool) -> sqlx::Resu
 
     let row = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: ORGANIZATION_KIND.to_string(),
             name: "to-delete".to_string(),
@@ -540,6 +568,7 @@ async fn delete_with_finalizers_marks_deletion_timestamp(pool: sqlx::PgPool) -> 
 
     let row = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: ORGANIZATION_KIND.to_string(),
             name: "finalized".to_string(),
@@ -572,6 +601,7 @@ async fn finalizer_flow_completes_deletion(pool: sqlx::PgPool) -> sqlx::Result<(
 
     let row = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: ORGANIZATION_KIND.to_string(),
             name: "with-finalizer".to_string(),
@@ -609,6 +639,7 @@ async fn controller_status_update_merges_key(pool: sqlx::PgPool) -> sqlx::Result
 
     let row = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: ORGANIZATION_KIND.to_string(),
             name: "status-org".to_string(),
@@ -657,6 +688,7 @@ async fn controller_finalizers_enforces_ownership(pool: sqlx::PgPool) -> sqlx::R
 
     let row = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: ORGANIZATION_KIND.to_string(),
             name: "owned".to_string(),
@@ -751,6 +783,7 @@ async fn resolve_collection_by_kind_resolves_builtins_and_rds(
     // A registered ResourceDefinition resolves by `(group, kind)`.
     store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "widgets.example.dev".to_string(),
@@ -790,6 +823,7 @@ async fn resolve_collection_by_kind_resolves_builtins_and_rds(
     // version-addressed.
     store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "gauges.example.dev".to_string(),
@@ -836,6 +870,7 @@ async fn register_resource_definition(pool: sqlx::PgPool) -> sqlx::Result<()> {
 
     let row = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "widgets.example.dev".to_string(),
@@ -875,6 +910,7 @@ async fn delete_resource_definition_rejects_existing_instances(
 
     let definition = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "widgets.example.dev".to_string(),
@@ -890,6 +926,7 @@ async fn delete_resource_definition_rejects_existing_instances(
 
     let instance = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: "example.dev/v1".to_string(),
             kind: "Widget".to_string(),
             name: "w1".to_string(),
@@ -939,6 +976,7 @@ async fn delete_resource_definition_rejects_instances_in_any_served_version(
 
     let definition = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "widgets.example.dev".to_string(),
@@ -954,6 +992,7 @@ async fn delete_resource_definition_rejects_instances_in_any_served_version(
 
     store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: "example.dev/v1".to_string(),
             kind: "Widget".to_string(),
             name: "w1".to_string(),
@@ -984,6 +1023,7 @@ async fn delete_resource_definition_rejects_instances_in_any_served_version(
         .update_resource_definition(
             definition.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: definition.revision,
                 annotations: BTreeMap::new(),
@@ -1018,6 +1058,7 @@ async fn register_resource_definition_rejects_reserved_plural(
 
     let err = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "organizations.example.dev".to_string(),
@@ -1044,6 +1085,7 @@ async fn register_rejects_resource_definition_as_a_custom_kind(
 
     let error = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "customdefinitions.other.example".to_string(),
@@ -1070,18 +1112,15 @@ async fn register_rejects_resource_definition_as_a_custom_kind(
 }
 
 #[sqlx::test]
-async fn update_allows_an_unchanged_legacy_reserved_definition(
+async fn database_guard_rejects_post_activation_legacy_definition_bypass(
     pool: sqlx::PgPool,
 ) -> sqlx::Result<()> {
-    // Model a definition created before `rise.dev/User` and `users` were reserved. Upgrading must
-    // not freeze unrelated schema updates while identity activation remains deferred.
-    let uid: Uuid = sqlx::query_scalar(
+    let error = sqlx::query(
         r#"
         INSERT INTO resource_store.resources
             (api_version, kind, name, discriminator, spec)
         VALUES
             ('rise.dev/v1alpha1', 'ResourceDefinition', 'users.rise.dev', 'legacy00', $1)
-        RETURNING uid
         "#,
     )
     .bind(json!({
@@ -1091,34 +1130,15 @@ async fn update_allows_an_unchanged_legacy_reserved_definition(
         "versions": [{"name": "v1", "served": true, "storage": true}],
         "allowedStatusControllerIds": []
     }))
-    .fetch_one(&pool)
-    .await?;
-
-    let store = PgResourceStore::new(pool);
-    let updated = store
-        .update_resource_definition(
-            uid,
-            UpdateResourceParams {
-                api_version: None,
-                revision: 1,
-                annotations: BTreeMap::new(),
-                finalizers: vec![],
-                owner_references: vec![],
-                spec: json!({
-                    "group": "rise.dev",
-                    "kind": "User",
-                    "plural": "users",
-                    "versions": [{"name": "v1", "served": true, "storage": true}],
-                    "allowedStatusControllerIds": ["schema-controller"]
-                }),
-                validator: None,
-            },
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(updated.revision, 2);
-    assert_eq!(updated.spec["kind"], "User");
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("resource_definitions_identity_reservations")
+    );
 
     Ok(())
 }
@@ -1141,6 +1161,7 @@ async fn register_resource_definition_rejects_zero_served_versions(
 
     let err = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "widgets.example.dev".to_string(),
@@ -1178,6 +1199,7 @@ async fn register_resource_definition_root_and_parent_validation(
     });
     store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "widgets.example.dev".to_string(),
@@ -1202,6 +1224,7 @@ async fn register_resource_definition_root_and_parent_validation(
     });
     let err = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "gadgets.example.dev".to_string(),
@@ -1239,6 +1262,7 @@ async fn register_resource_definition_rejects_parent_cycles(
             spec["parent"] = json!({"apiVersion": "cycle.dev/v1", "kind": pk});
         }
         CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: format!("{plural}.cycle.dev"),
@@ -1301,6 +1325,7 @@ async fn register_resource_definition_rejects_duplicate_identity(
     let store = PgResourceStore::new(pool);
 
     let rd = |group: &str, kind: &str, plural: &str| CreateResourceParams {
+        labels: Default::default(),
         api_version: API_VERSION_V1ALPHA1.to_string(),
         kind: RESOURCE_DEFINITION_KIND.to_string(),
         name: format!("{plural}.{group}"),
@@ -1354,6 +1379,7 @@ async fn get_by_name(pool: sqlx::PgPool) -> sqlx::Result<()> {
 
     store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: ORGANIZATION_KIND.to_string(),
             name: "lookup-org".to_string(),
@@ -1391,6 +1417,7 @@ async fn get_by_name_and_list_span_all_versions_of_a_group(pool: sqlx::PgPool) -
     // A row stored at one version of a group...
     let created = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: "example.dev/v1".to_string(),
             kind: "Widget".to_string(),
             name: "w1".to_string(),
@@ -1442,6 +1469,7 @@ async fn create_rejects_invalid_name(pool: sqlx::PgPool) -> sqlx::Result<()> {
     // Leading hyphen violates the name format constraint
     let err = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: ORGANIZATION_KIND.to_string(),
             name: "--bad-name".to_string(),
@@ -1465,14 +1493,12 @@ async fn create_rejects_invalid_name(pool: sqlx::PgPool) -> sqlx::Result<()> {
 
 #[sqlx::test]
 async fn create_invokes_spec_validator(pool: sqlx::PgPool) -> sqlx::Result<()> {
-    use rise_resource_store_postgres::OrganizationValidator;
-    use std::sync::Arc;
-
     let store = PgResourceStore::new(pool);
 
     // OrganizationValidator requires a non-empty displayName
     let err = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: ORGANIZATION_KIND.to_string(),
             name: "bad-spec-org".to_string(),
@@ -1495,11 +1521,54 @@ async fn create_invokes_spec_validator(pool: sqlx::PgPool) -> sqlx::Result<()> {
 }
 
 #[sqlx::test]
+async fn every_builtin_validator_is_authoritative_without_a_caller_validator(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool.clone());
+    let invalid_organization = store
+        .create(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.into(),
+            kind: ORGANIZATION_KIND.into(),
+            name: "invalid-organization".into(),
+            spec: json!({"displayName":"   "}),
+            validator: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(invalid_organization, StoreError::Validation(_)));
+
+    let mut registry = BuiltInRegistry::empty();
+    registry.register(BuiltInRegistration {
+        collection: "augmentedorganizations",
+        api_version: "augmented.example/v1",
+        kind: "AugmentedOrganization",
+        parent: None,
+        spec_validator: Arc::new(OrganizationValidator),
+    });
+    let augmented = PgResourceStore::with_builtin_registry(pool, Arc::new(registry));
+    let invalid_augmented = augmented
+        .create(CreateResourceParams {
+            api_version: "augmented.example/v1".into(),
+            kind: "AugmentedOrganization".into(),
+            name: "invalid-augmented".into(),
+            spec: json!({"displayName":""}),
+            validator: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(invalid_augmented, StoreError::Validation(_)));
+    Ok(())
+}
+
+#[sqlx::test]
 async fn delete_already_marked_resource_is_idempotent(pool: sqlx::PgPool) -> sqlx::Result<()> {
     let store = PgResourceStore::new(pool);
 
     let row = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: ORGANIZATION_KIND.to_string(),
             name: "marked-org".to_string(),
@@ -1547,6 +1616,7 @@ async fn update_resource_definition_updates_projection(pool: sqlx::PgPool) -> sq
 
     let row = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "widgets.example.dev".to_string(),
@@ -1576,6 +1646,7 @@ async fn update_resource_definition_updates_projection(pool: sqlx::PgPool) -> sq
         .update_resource_definition(
             row.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: row.revision,
                 annotations: BTreeMap::new(),
@@ -1613,6 +1684,7 @@ async fn added_version_serves_existing_instances_without_rewriting(
 
     let rd = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "widgets.example.dev".to_string(),
@@ -1628,6 +1700,7 @@ async fn added_version_serves_existing_instances_without_rewriting(
 
     let widget = store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: "example.dev/v1".to_string(),
             kind: "Widget".to_string(),
             name: "w1".to_string(),
@@ -1656,6 +1729,7 @@ async fn added_version_serves_existing_instances_without_rewriting(
         .update_resource_definition(
             rd.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: rd.revision,
                 annotations: BTreeMap::new(),
@@ -1703,6 +1777,7 @@ async fn update_resource_definition_rejects_identity_change(
 
     let row = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "widgets.example.dev".to_string(),
@@ -1729,6 +1804,7 @@ async fn update_resource_definition_rejects_identity_change(
         .update_resource_definition(
             row.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: row.revision,
                 annotations: BTreeMap::new(),
@@ -1768,6 +1844,7 @@ async fn update_resource_definition_rejects_removing_version_with_instances(
 
     let rd = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "widgets.example.dev".to_string(),
@@ -1784,6 +1861,7 @@ async fn update_resource_definition_rejects_removing_version_with_instances(
     // Instances are created at the storage version (v1).
     store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: "example.dev/v1".to_string(),
             kind: "Widget".to_string(),
             name: "w1".to_string(),
@@ -1810,6 +1888,7 @@ async fn update_resource_definition_rejects_removing_version_with_instances(
         .update_resource_definition(
             rd.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: rd.revision,
                 annotations: BTreeMap::new(),
@@ -1839,6 +1918,7 @@ async fn update_resource_definition_rejects_removing_version_with_instances(
         .update_resource_definition(
             rd.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: rd.revision,
                 annotations: BTreeMap::new(),
@@ -1869,6 +1949,7 @@ async fn update_resource_definition_rejects_parent_change(pool: sqlx::PgPool) ->
 
     let row = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "widgets.example.dev".to_string(),
@@ -1895,6 +1976,7 @@ async fn update_resource_definition_rejects_parent_change(pool: sqlx::PgPool) ->
         .update_resource_definition(
             row.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: row.revision,
                 annotations: BTreeMap::new(),
@@ -1934,6 +2016,7 @@ async fn register_resource_definition_rejects_invalid_non_storage_schema(
 
     let err = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "widgets.example.dev".to_string(),
@@ -1980,6 +2063,7 @@ async fn update_resource_definition_invalidates_schema_cache(
 
     let row = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "widgets.example.dev".to_string(),
@@ -2024,6 +2108,7 @@ async fn update_resource_definition_invalidates_schema_cache(
         .update_resource_definition(
             row.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: row.revision,
                 annotations: BTreeMap::new(),
@@ -2072,6 +2157,7 @@ async fn update_rejects_resource_definition(pool: sqlx::PgPool) -> sqlx::Result<
 
     let row = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "gadgets.example.dev".to_string(),
@@ -2090,6 +2176,7 @@ async fn update_rejects_resource_definition(pool: sqlx::PgPool) -> sqlx::Result<
         .update(
             row.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: row.revision,
                 annotations: BTreeMap::new(),
@@ -2117,6 +2204,7 @@ async fn update_rejects_resource_definition(pool: sqlx::PgPool) -> sqlx::Result<
 async fn create_org(store: &PgResourceStore, name: &str) -> ResourceRow {
     store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: ORGANIZATION_KIND.to_string(),
             name: name.to_string(),
@@ -2144,6 +2232,7 @@ async fn create_owned_widget(
     register_example_widget_rd(store).await;
     store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: "example.dev/v1".to_string(),
             kind: "Widget".to_string(),
             name: name.to_string(),
@@ -2177,6 +2266,7 @@ async fn owner_references_are_persisted_and_replaceable(pool: sqlx::PgPool) -> s
         .update(
             dependent.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: fetched.revision,
                 annotations: BTreeMap::new(),
@@ -2404,6 +2494,7 @@ async fn owner_references_reject_protected_dependent_kinds(pool: sqlx::PgPool) -
         .update(
             organization.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: organization.revision,
                 annotations: BTreeMap::new(),
@@ -2456,6 +2547,7 @@ async fn owner_references_reject_protected_dependent_kinds(pool: sqlx::PgPool) -
         .update_resource_definition(
             definition.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: definition.revision,
                 annotations: BTreeMap::new(),
@@ -2525,6 +2617,7 @@ async fn owner_reference_add_racing_owner_delete_fails_closed(
             .update(
                 dependent.uid,
                 UpdateResourceParams {
+                    labels: Default::default(),
                     api_version: None,
                     revision: dependent.revision,
                     annotations: BTreeMap::new(),
@@ -2571,6 +2664,7 @@ async fn owner_references_reject_lifecycle_cycles(pool: sqlx::PgPool) -> sqlx::R
         .update(
             owner.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: owner.revision,
                 annotations: BTreeMap::new(),
@@ -2593,6 +2687,7 @@ async fn owner_references_reject_lifecycle_cycles(pool: sqlx::PgPool) -> sqlx::R
         .update(
             owner.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: current_owner.revision,
                 annotations: BTreeMap::new(),
@@ -2621,6 +2716,7 @@ async fn owner_references_reject_lifecycle_cycles(pool: sqlx::PgPool) -> sqlx::R
 async fn register_example_widget_rd(store: &PgResourceStore) {
     let result = store
         .register_resource_definition(CreateResourceParams {
+            labels: Default::default(),
             api_version: API_VERSION_V1ALPHA1.to_string(),
             kind: RESOURCE_DEFINITION_KIND.to_string(),
             name: "widgets.example.dev".to_string(),
@@ -2658,6 +2754,7 @@ async fn create_child(
     register_example_widget_rd(store).await;
     store
         .create(CreateResourceParams {
+            labels: Default::default(),
             api_version: "example.dev/v1".to_string(),
             kind: kind.to_string(),
             name: name.to_string(),
@@ -3017,5 +3114,2385 @@ async fn resolve_path_empty_returns_error(pool: sqlx::PgPool) -> sqlx::Result<()
     let store = PgResourceStore::new(pool);
     let err = store.resolve_path(&[]).await.unwrap_err();
     assert!(matches!(err, StoreError::EmptyPath));
+    Ok(())
+}
+
+async fn create_builtin_resource(
+    store: &PgResourceStore,
+    kind: &str,
+    name: &str,
+    parent_uid: Option<Uuid>,
+    spec: serde_json::Value,
+    owner_references: Vec<OwnerReference>,
+) -> Result<ResourceRow, StoreError> {
+    store
+        .create(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: kind.to_string(),
+            name: name.to_string(),
+            parent_uid,
+            owner_references,
+            spec,
+            validator: None,
+            ..Default::default()
+        })
+        .await
+}
+
+#[sqlx::test]
+async fn identity_routes_and_placement_are_activated_from_contract_definitions(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    for definition in IDENTITY_KIND_DEFINITIONS {
+        let info = store
+            .resolve_collection(definition.collection)
+            .await
+            .unwrap()
+            .expect("identity collection is routed");
+        assert_eq!(info.api_version, definition.api_version);
+        assert_eq!(info.kind, definition.kind);
+        assert_eq!(
+            info.parent
+                .as_ref()
+                .map(|parent| (parent.api_version.as_str(), parent.kind.as_str())),
+            definition
+                .parent
+                .map(|parent| (parent.api_version, parent.kind))
+        );
+    }
+
+    assert!(store
+        .resolve_collection_version("rise.dev", "v2", "users")
+        .await
+        .unwrap()
+        .is_none());
+    Ok(())
+}
+
+#[sqlx::test]
+async fn builtin_placement_rejects_nonroot_organizations_and_malformed_parent_chains(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool.clone());
+    let root = create_org(&store, "placement-root").await;
+
+    let nested_organization = store
+        .create(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.into(),
+            kind: ORGANIZATION_KIND.into(),
+            name: "nested-organization".into(),
+            parent_uid: Some(root.uid),
+            spec: json!({"displayName":"Nested"}),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(nested_organization, StoreError::Validation(message) if message.contains("root-scoped"))
+    );
+
+    let malformed_uid: Uuid = sqlx::query_scalar(
+        r#"
+        INSERT INTO resource_store.resources
+            (api_version, kind, name, discriminator, parent_uid, spec)
+        VALUES
+            ('rise.dev/v1alpha1', 'Organization', 'legacy-nested-org',
+             'nested01', $1, '{"displayName":"Legacy nested"}'::jsonb)
+        RETURNING uid
+        "#,
+    )
+    .bind(root.uid)
+    .fetch_one(&pool)
+    .await?;
+
+    for kind in [GROUP_KIND, SERVICE_ACCOUNT_KIND] {
+        let error = create_builtin_resource(
+            &store,
+            kind,
+            &format!("malformed-{}", kind.to_ascii_lowercase()),
+            Some(malformed_uid),
+            json!({}),
+            vec![],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, StoreError::Validation(message) if message.contains("Organization must be root-scoped"))
+        );
+    }
+    Ok(())
+}
+
+#[sqlx::test]
+async fn create_with_owner_reference_obeys_the_global_graph_lock_order(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = Arc::new(PgResourceStore::new(pool.clone()));
+    let owner = create_builtin_resource(&store, USER_KIND, "create-owner", None, json!({}), vec![])
+        .await
+        .unwrap();
+    store
+        .register_resource_definition(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.into(),
+            kind: RESOURCE_DEFINITION_KIND.into(),
+            name: "ownedmarkers.example.dev".into(),
+            spec: json!({
+                "group":"example.dev", "kind":"OwnedMarker", "plural":"ownedmarkers",
+                "versions":[{"name":"v1","served":true,"storage":true}]
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut graph_lock = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('resource_owner_reference_cycle')::bigint)")
+        .execute(&mut *graph_lock)
+        .await?;
+
+    let reference =
+        OwnerReference::new(API_VERSION_V1ALPHA1, USER_KIND, "create-owner", owner.uid).unwrap();
+    let mut create_task = tokio::spawn({
+        let store = store.clone();
+        async move {
+            store
+                .create(CreateResourceParams {
+                    api_version: "example.dev/v1".into(),
+                    kind: "OwnedMarker".into(),
+                    name: "marker".into(),
+                    owner_references: vec![reference],
+                    spec: json!({}),
+                    ..Default::default()
+                })
+                .await
+        }
+    });
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut create_task)
+            .await
+            .is_err(),
+        "owner-bearing create must queue behind the graph lock before taking resource locks"
+    );
+    graph_lock.rollback().await?;
+
+    let created = tokio::time::timeout(Duration::from_secs(1), create_task)
+        .await
+        .expect("create should resume after the graph lock is released")
+        .expect("create task must not panic")
+        .unwrap();
+    assert_eq!(created.owner_references.len(), 1);
+    Ok(())
+}
+
+#[sqlx::test]
+async fn a_nul_byte_in_a_resource_is_a_validation_error(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    // PostgreSQL stores no U+0000 in text or jsonb, but JSON permits it, so a
+    // well-formed request can carry one all the way to the write. The store
+    // translates that failure where the database reports it, which is why this
+    // is the caller's 400 rather than an opaque backend error — and why one
+    // case covers every write path rather than one case per method.
+    let store = PgResourceStore::new(pool);
+    let error = store
+        .create(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.into(),
+            kind: ORGANIZATION_KIND.into(),
+            name: "nul-spec".into(),
+            spec: json!({"displayName":"contains\0nul"}),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, StoreError::Validation(message) if message.contains("U+0000")),
+        "expected a U+0000 validation error, got {error:?}"
+    );
+    Ok(())
+}
+
+#[sqlx::test]
+async fn identity_admission_is_unbypassable_and_persists_canonical_defaults(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool.clone());
+    let user = store
+        .create(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: USER_KIND.to_string(),
+            name: "alice".to_string(),
+            spec: json!({}),
+            validator: Some(Arc::new(NoOpValidator)),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(user.spec, json!({"active": true}));
+
+    let org = create_org(&store, "acme").await;
+    let wrong_parent = create_builtin_resource(
+        &store,
+        USER_IDENTITY_KIND,
+        "primary",
+        Some(org.uid),
+        json!({"issuer":"https://issuer.example","subject":"alice"}),
+        vec![],
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(wrong_parent, StoreError::Validation(message) if message.contains("live rise.dev/v1alpha1 User"))
+    );
+
+    let malformed = create_builtin_resource(
+        &store,
+        USER_IDENTITY_KIND,
+        "malformed",
+        Some(user.uid),
+        json!({"issuer":"https://issuer.example/","subject":"alice"}),
+        vec![],
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(malformed, StoreError::Validation(_)));
+    assert!(store
+        .get_by_name(
+            API_VERSION_V1ALPHA1,
+            USER_IDENTITY_KIND,
+            "malformed",
+            Some(user.uid)
+        )
+        .await
+        .unwrap()
+        .is_none());
+
+    let forged_update = store
+        .update(
+            user.uid,
+            UpdateResourceParams {
+                labels: Default::default(),
+                revision: user.revision,
+                annotations: BTreeMap::new(),
+                finalizers: vec![],
+                owner_references: vec![],
+                spec: json!({"extra":"bypass"}),
+                api_version: None,
+                validator: Some(Arc::new(NoOpValidator)),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(forged_update, StoreError::Validation(_)));
+    let unchanged = store.get(user.uid).await.unwrap().unwrap();
+    assert_eq!(unchanged.revision, user.revision);
+    assert_eq!(unchanged.spec, json!({"active":true}));
+
+    let wrong_version = store
+        .create(CreateResourceParams {
+            api_version: "rise.dev/v2".into(),
+            kind: USER_KIND.into(),
+            name: "wrong-version".into(),
+            spec: json!({}),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(wrong_version, StoreError::Validation(message) if message.contains("must use apiVersion"))
+    );
+
+    // A same-named kind in another API group remains an ordinary custom kind.
+    store
+        .register_resource_definition(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.into(),
+            kind: RESOURCE_DEFINITION_KIND.into(),
+            name: "externalusers.example.dev".into(),
+            spec: json!({
+                "group":"example.dev", "kind":"User", "plural":"externalusers",
+                "versions":[{"name":"v1","served":true,"storage":true}]
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let custom = store
+        .create(CreateResourceParams {
+            api_version: "example.dev/v1".into(),
+            kind: USER_KIND.into(),
+            name: "custom".into(),
+            spec: json!({"anything": true}),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(custom.spec, json!({"anything": true}));
+    Ok(())
+}
+
+#[sqlx::test]
+async fn user_identity_uniqueness_is_live_global_and_concurrency_authoritative(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = Arc::new(PgResourceStore::new(pool.clone()));
+    let user_a = create_builtin_resource(&store, USER_KIND, "user-a", None, json!({}), vec![])
+        .await
+        .unwrap();
+    let user_b = create_builtin_resource(&store, USER_KIND, "user-b", None, json!({}), vec![])
+        .await
+        .unwrap();
+
+    let a = {
+        let store = store.clone();
+        tokio::spawn(async move {
+            create_builtin_resource(
+                &store,
+                USER_IDENTITY_KIND,
+                "mapping-a",
+                Some(user_a.uid),
+                json!({"issuer":"https://issuer.example","subject":"shared","active":false}),
+                vec![],
+            )
+            .await
+        })
+    };
+    let b = {
+        let store = store.clone();
+        tokio::spawn(async move {
+            create_builtin_resource(
+                &store,
+                USER_IDENTITY_KIND,
+                "mapping-b",
+                Some(user_b.uid),
+                json!({"issuer":"https://issuer.example","subject":"shared"}),
+                vec![],
+            )
+            .await
+        })
+    };
+    let results = [a.await.unwrap(), b.await.unwrap()];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    // A losing racer is told to reconcile with the winner, not to fix a payload
+    // that was never malformed.
+    assert!(matches!(
+        results.iter().find_map(|result| result.as_ref().err()),
+        Some(StoreError::Conflict(message)) if message.contains("issuer and subject")
+    ));
+    let winner = results.into_iter().find_map(Result::ok).unwrap();
+
+    let immutable = store
+        .update(
+            winner.uid,
+            UpdateResourceParams {
+                labels: Default::default(),
+                revision: winner.revision,
+                annotations: BTreeMap::new(),
+                finalizers: vec![],
+                owner_references: vec![],
+                spec: json!({"issuer":"https://issuer.example","subject":"retargeted"}),
+                api_version: None,
+                validator: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(immutable, StoreError::Validation(message) if message.contains("immutable")));
+
+    store.delete(winner.uid).await.unwrap();
+    let replacement = create_builtin_resource(
+        &store,
+        USER_IDENTITY_KIND,
+        "replacement",
+        Some(user_a.uid),
+        json!({"issuer":"https://issuer.example","subject":"shared"}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert_ne!(replacement.uid, winner.uid);
+
+    // Uniqueness is a property of the kind, not of one stored api_version. The
+    // store only writes v1alpha1 today, so reach past it to prove a future
+    // second version cannot introduce a duplicate external identity.
+    let cross_version = sqlx::query(
+        r#"
+        INSERT INTO resource_store.resources
+            (api_version, kind, parent_uid, name, discriminator, metadata, spec,
+             finalizers, owner_references)
+        VALUES ('rise.dev/v1alpha2', 'UserIdentity', $1, 'next-version', 'a1b2c3d4',
+                '{}'::jsonb, $2::jsonb, ARRAY[]::text[], '[]'::jsonb)
+        "#,
+    )
+    .bind(user_a.uid)
+    .bind(json!({"issuer":"https://issuer.example","subject":"shared"}))
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert!(
+        cross_version
+            .as_database_error()
+            .and_then(|error| error.constraint())
+            .is_some_and(|constraint| constraint == "user_identities_issuer_subject_unique"),
+        "expected the cross-version duplicate to hit the uniqueness index, got {cross_version:?}"
+    );
+    Ok(())
+}
+
+#[sqlx::test]
+async fn membership_owner_rules_and_name_bound_reactivation_are_enforced(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool.clone());
+    let org = create_org(&store, "membership-org").await;
+    let group = create_builtin_resource(
+        &store,
+        GROUP_KIND,
+        "developers",
+        Some(org.uid),
+        json!({}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    let group_owned = create_builtin_resource(
+        &store,
+        GROUP_KIND,
+        "managed",
+        Some(org.uid),
+        json!({}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    let group_second = create_builtin_resource(
+        &store,
+        GROUP_KIND,
+        "second",
+        Some(org.uid),
+        json!({}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    let user = create_builtin_resource(&store, USER_KIND, "member", None, json!({}), vec![])
+        .await
+        .unwrap();
+    let other = create_builtin_resource(&store, USER_KIND, "other", None, json!({}), vec![])
+        .await
+        .unwrap();
+
+    let unowned = create_builtin_resource(
+        &store,
+        GROUP_MEMBERSHIP_KIND,
+        "member",
+        Some(group.uid),
+        json!({}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    create_builtin_resource(
+        &store,
+        GROUP_MEMBERSHIP_KIND,
+        "member",
+        Some(group_second.uid),
+        json!({}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    let wrong_owner =
+        OwnerReference::new(API_VERSION_V1ALPHA1, USER_KIND, "other", other.uid).unwrap();
+    assert!(create_builtin_resource(
+        &store,
+        GROUP_MEMBERSHIP_KIND,
+        "member",
+        Some(group_owned.uid),
+        json!({}),
+        vec![wrong_owner],
+    )
+    .await
+    .is_err());
+
+    let owner = OwnerReference::new("rise.dev/v9", USER_KIND, "member", user.uid).unwrap();
+    let owned = create_builtin_resource(
+        &store,
+        GROUP_MEMBERSHIP_KIND,
+        "member",
+        Some(group_owned.uid),
+        json!({}),
+        vec![owner],
+    )
+    .await
+    .unwrap();
+    assert_eq!(owned.owner_references.len(), 1);
+
+    store.delete(user.uid).await.unwrap();
+    let updated = store
+        .update(
+            unowned.uid,
+            UpdateResourceParams {
+                labels: Default::default(),
+                revision: unowned.revision,
+                annotations: BTreeMap::from([("note".into(), "durable".into())]),
+                finalizers: vec![],
+                owner_references: vec![],
+                spec: json!({}),
+                api_version: None,
+                validator: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.metadata["note"], "durable");
+    assert!(store
+        .get(owned.uid)
+        .await
+        .unwrap()
+        .is_some_and(|row| row.deletion_timestamp.is_some()));
+
+    let memberships = MembershipLookup::new(pool.clone());
+    assert!(memberships
+        .groups_for_user(user.uid, "member")
+        .await
+        .unwrap()
+        .is_empty());
+    let recreated = create_builtin_resource(&store, USER_KIND, "member", None, json!({}), vec![])
+        .await
+        .unwrap();
+    store
+        .register_resource_definition(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.into(),
+            kind: RESOURCE_DEFINITION_KIND.into(),
+            name: "externalmemberships.example.dev".into(),
+            spec: json!({
+                "group":"example.dev", "kind":"GroupMembership",
+                "plural":"externalmemberships",
+                "parent":{"apiVersion":"rise.dev/v1alpha1","kind":"Group"},
+                "versions":[{"name":"v1","served":true,"storage":true}]
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    store
+        .create(CreateResourceParams {
+            api_version: "example.dev/v1".into(),
+            kind: GROUP_MEMBERSHIP_KIND.into(),
+            name: "member".into(),
+            parent_uid: Some(group.uid),
+            spec: json!({"custom":true}),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let facts = memberships
+        .groups_for_user(recreated.uid, "member")
+        .await
+        .unwrap();
+    assert_eq!(facts.len(), 2);
+    assert_eq!(
+        facts.iter().map(|fact| fact.group_uid).collect::<Vec<_>>(),
+        vec![group.uid, group_second.uid]
+    );
+    Ok(())
+}
+
+#[sqlx::test]
+async fn narrow_identity_trust_and_membership_lookups_filter_live_builtin_facts(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool.clone());
+    let user = create_builtin_resource(
+        &store,
+        USER_KIND,
+        "lookup-user",
+        None,
+        json!({"active":false}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    let identity = create_builtin_resource(
+        &store,
+        USER_IDENTITY_KIND,
+        "login",
+        Some(user.uid),
+        json!({"issuer":"https://identity.example","subject":"CaseSensitive","active":false}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    let identity_lookup = IdentityLookup::new(pool.clone());
+    let fact = identity_lookup
+        .by_external_identity(
+            &Issuer::new("https://identity.example").unwrap(),
+            &ExternalSubject::new("CaseSensitive").unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fact.identity_uid, identity.uid);
+    assert!(!fact.identity.active);
+    assert!(!fact.user.active);
+
+    let controller =
+        create_builtin_resource(&store, CONTROLLER_KIND, "builder", None, json!({}), vec![])
+            .await
+            .unwrap();
+    for name in ["github-a", "github-b"] {
+        create_builtin_resource(
+            &store,
+            CONTROLLER_TRUST_POLICY_KIND,
+            name,
+            Some(controller.uid),
+            json!({"issuer":"https://token.example","claims":{"aud":"rise","sub":name}}),
+            vec![],
+        )
+        .await
+        .unwrap();
+    }
+    let deleted = create_builtin_resource(
+        &store,
+        CONTROLLER_TRUST_POLICY_KIND,
+        "deleted",
+        Some(controller.uid),
+        json!({"issuer":"https://token.example","claims":{"aud":"rise"}}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    store.delete(deleted.uid).await.unwrap();
+
+    store
+        .register_resource_definition(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.into(),
+            kind: RESOURCE_DEFINITION_KIND.into(),
+            name: "externaltrustpolicies.example.dev".into(),
+            spec: json!({
+                "group":"example.dev",
+                "kind":"ControllerTrustPolicy",
+                "plural":"externaltrustpolicies",
+                "parent":{"apiVersion":"rise.dev/v1alpha1","kind":"Controller"},
+                "versions":[{"name":"v1","served":true,"storage":true}]
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    store
+        .create(CreateResourceParams {
+            api_version: "example.dev/v1".into(),
+            kind: CONTROLLER_TRUST_POLICY_KIND.into(),
+            name: "custom-decoy".into(),
+            parent_uid: Some(controller.uid),
+            spec: json!({"issuer":"https://token.example","claims":{"aud":"rise"}}),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let trust = TrustPolicyLookup::new(pool);
+    let policies = trust
+        .for_controller(
+            controller.uid,
+            &Issuer::new("https://token.example").unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(policies.len(), 2);
+    assert_eq!(policies[0].name, "github-a");
+    assert_eq!(policies[1].name, "github-b");
+    assert!(trust
+        .for_controller(
+            controller.uid,
+            &Issuer::new("https://other.example").unwrap()
+        )
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(trust
+        .for_controller(user.uid, &Issuer::new("https://token.example").unwrap())
+        .await
+        .unwrap()
+        .is_empty());
+
+    let org = create_org(&store, "trust-org").await;
+    let service_account = create_builtin_resource(
+        &store,
+        SERVICE_ACCOUNT_KIND,
+        "deployer",
+        Some(org.uid),
+        json!({}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    create_builtin_resource(
+        &store,
+        SERVICE_ACCOUNT_TRUST_POLICY_KIND,
+        "ci",
+        Some(service_account.uid),
+        json!({"issuer":"https://ci.example","claims":{"aud":"rise"}}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        trust
+            .for_service_account(
+                service_account.uid,
+                &Issuer::new("https://ci.example").unwrap()
+            )
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    Ok(())
+}
+
+async fn execute_resource_migration(pool: &sqlx::PgPool, version: i64) -> Result<(), sqlx::Error> {
+    let migrator = sqlx::migrate!("./migrations");
+    let migration = migrator
+        .iter()
+        .find(|migration| migration.version == version)
+        .expect("test migration exists");
+    let mut connection = pool.acquire().await?;
+    connection
+        .execute("CREATE SCHEMA IF NOT EXISTS resource_store")
+        .await?;
+    connection
+        .execute("SET search_path TO resource_store, public")
+        .await?;
+    connection.execute(&*migration.sql).await?;
+    Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+async fn identity_activation_upgrade_audit_is_actionable_and_guard_is_durable(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    // The upgrade this exercises is from an installation that has the resource
+    // store but not the identity built-ins.
+    execute_resource_migration(&pool, 20260519000000).await?;
+    execute_resource_migration(&pool, 20260719000000).await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO resource_store.resources
+            (api_version, kind, name, discriminator, spec)
+        VALUES
+            ('rise.dev/v1alpha1', 'ResourceDefinition', 'legacy.example', 'legacy01',
+             '{"group":"legacy.example","kind":"Legacy","plural":"users","versions":[{"name":"v1","served":true,"storage":true}]}'::jsonb),
+            ('rise.dev/v9', 'User', 'orphan', 'orphan01', '{}'::jsonb),
+            ('custom.example/v1', 'User', 'custom-user', 'custom01', '{}'::jsonb)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    let activation = sqlx::migrate!("./migrations")
+        .iter()
+        .find(|migration| migration.version == 20260719000001)
+        .expect("activation migration exists")
+        .sql
+        .clone();
+
+    // Each conflicting population is named specifically, and a rejected upgrade
+    // leaves nothing behind — including the guard it would have installed.
+    let error = pool.execute(&*activation).await.unwrap_err();
+    assert!(error.to_string().contains("legacy ResourceDefinition(s)"));
+    let guard_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pg_constraint WHERE conname = 'resource_definitions_identity_reservations')",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert!(!guard_exists, "a rejected upgrade rolls back in full");
+
+    sqlx::query("DELETE FROM resource_store.resources WHERE name = 'legacy.example'")
+        .execute(&pool)
+        .await?;
+    let error = pool.execute(&*activation).await.unwrap_err();
+    assert!(error.to_string().contains("legacy resource row(s)"));
+
+    sqlx::query("DELETE FROM resource_store.resources WHERE name = 'orphan'")
+        .execute(&pool)
+        .await?;
+    execute_resource_migration(&pool, 20260719000001).await?;
+
+    let custom_survives: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM resource_store.resources WHERE api_version = 'custom.example/v1' AND kind = 'User')",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert!(custom_survives);
+
+    let guarded = sqlx::query(
+        r#"
+        INSERT INTO resource_store.resources
+            (api_version, kind, name, discriminator, spec)
+        VALUES ('rise.dev/v1alpha1', 'ResourceDefinition', 'blocked.example', 'blocked1',
+                '{"group":"other.example","kind":"Blocked","plural":"groups","versions":[{"name":"v1","served":true,"storage":true}]}'::jsonb)
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        guarded
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("resource_definitions_identity_reservations")
+    );
+    Ok(())
+}
+
+#[sqlx::test]
+async fn membership_create_racing_user_delete_never_leaves_a_live_dangling_edge(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = Arc::new(PgResourceStore::new(pool.clone()));
+    let org = create_org(&store, "race-org").await;
+    let group = create_builtin_resource(
+        &store,
+        GROUP_KIND,
+        "race-group",
+        Some(org.uid),
+        json!({}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    let user = create_builtin_resource(&store, USER_KIND, "race-user", None, json!({}), vec![])
+        .await
+        .unwrap();
+    let owner =
+        OwnerReference::new(API_VERSION_V1ALPHA1, USER_KIND, "race-user", user.uid).unwrap();
+    let user_uid = user.uid;
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+    let create = {
+        let store = store.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            create_builtin_resource(
+                &store,
+                GROUP_MEMBERSHIP_KIND,
+                "race-user",
+                Some(group.uid),
+                json!({}),
+                vec![owner],
+            )
+            .await
+        })
+    };
+    let delete = {
+        let store = store.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            store.delete(user_uid).await
+        })
+    };
+    barrier.wait().await;
+    let _ = create.await.unwrap();
+    delete.await.unwrap().unwrap();
+
+    let dangling: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM resource_store.resources membership
+            WHERE membership.api_version = 'rise.dev/v1alpha1'
+              AND membership.kind = 'GroupMembership'
+              AND membership.name = 'race-user'
+              AND membership.deletion_timestamp IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM resource_store.resources member
+                  WHERE member.uid = $1
+                    AND member.api_version = 'rise.dev/v1alpha1'
+                    AND member.kind = 'User'
+                    AND member.deletion_timestamp IS NULL
+              )
+        )
+        "#,
+    )
+    .bind(user_uid)
+    .fetch_one(&pool)
+    .await?;
+    assert!(!dangling);
+    Ok(())
+}
+
+#[sqlx::test]
+async fn maximum_identity_index_keys_fit_and_projection_queries_use_their_indexes(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool.clone());
+    let user = create_builtin_resource(&store, USER_KIND, "max-key", None, json!({}), vec![])
+        .await
+        .unwrap();
+    let issuer = format!("https://issuer.example/{}", "a".repeat(1000));
+    assert!(issuer.len() <= rise_resource_api::MAX_ISSUER_BYTES);
+    let subject = "🦀".repeat(rise_resource_api::MAX_EXTERNAL_SUBJECT_CHARS);
+    create_builtin_resource(
+        &store,
+        USER_IDENTITY_KIND,
+        "max-key-login",
+        Some(user.uid),
+        json!({"issuer":issuer,"subject":subject}),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    let definitions: Vec<(String, String)> = sqlx::query_as(
+        r#"
+        SELECT indexname, indexdef
+        FROM pg_indexes
+        WHERE schemaname = 'resource_store'
+          AND indexname IN (
+              'user_identities_issuer_subject_unique',
+              'workload_trust_parent_issuer',
+              'group_memberships_user_name'
+          )
+        ORDER BY indexname
+        "#,
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(definitions.len(), 3);
+    for (_, definition) in &definitions {
+        // Group- and kind-scoped, never pinned to a single api_version.
+        assert!(definition.contains("split_part(api_version, '/'::text, 1) = 'rise.dev'::text"));
+        assert!(!definition.contains("api_version = 'rise.dev/v1alpha1'"));
+        assert!(definition.contains("deletion_timestamp IS NULL"));
+    }
+
+    // Plan the statements the lookup adapters actually run, so editing one of
+    // them cannot silently drop to a sequential scan on the login path.
+    let mut connection = pool.acquire().await?;
+    connection.execute("SET enable_seqscan = off").await?;
+    let identity_plan: Vec<String> = sqlx::query_scalar(&format!(
+        "EXPLAIN (COSTS OFF) {}",
+        rise_resource_store_postgres::USER_IDENTITY_BY_EXTERNAL_IDENTITY_SQL
+    ))
+    .bind("https://issuer.example")
+    .bind("subject")
+    .fetch_all(&mut *connection)
+    .await?;
+    assert!(identity_plan
+        .join("\n")
+        .contains("user_identities_issuer_subject_unique"));
+
+    let trust_plan: Vec<String> = sqlx::query_scalar(&format!(
+        "EXPLAIN (COSTS OFF) {}",
+        rise_resource_store_postgres::CONTROLLER_TRUST_POLICIES_SQL
+    ))
+    .bind(uuid::Uuid::nil())
+    .bind("https://issuer.example")
+    .fetch_all(&mut *connection)
+    .await?;
+    assert!(trust_plan
+        .join("\n")
+        .contains("workload_trust_parent_issuer"));
+
+    let membership_plan: Vec<String> = sqlx::query_scalar(&format!(
+        "EXPLAIN (COSTS OFF) {}",
+        rise_resource_store_postgres::GROUPS_FOR_USER_SQL
+    ))
+    .bind(uuid::Uuid::nil())
+    .bind("member")
+    .fetch_all(&mut *connection)
+    .await?;
+    assert!(membership_plan
+        .join("\n")
+        .contains("group_memberships_user_name"));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Policy resources (ADR-0001 §3, §4)
+// ---------------------------------------------------------------------------
+
+async fn create_platform_role(store: &PgResourceStore, name: &str) -> ResourceRow {
+    create_builtin_resource(store, PLATFORM_ROLE_KIND, name, None, json!({}), vec![])
+        .await
+        .unwrap()
+}
+
+async fn create_role(store: &PgResourceStore, organization: Uuid, name: &str) -> ResourceRow {
+    create_builtin_resource(
+        store,
+        ROLE_KIND,
+        name,
+        Some(organization),
+        json!({}),
+        vec![],
+    )
+    .await
+    .unwrap()
+}
+
+async fn create_binding(
+    store: &PgResourceStore,
+    kind: &str,
+    name: &str,
+    parent_uid: Option<Uuid>,
+    spec: serde_json::Value,
+) -> Result<ResourceRow, StoreError> {
+    create_builtin_resource(store, kind, name, parent_uid, spec, vec![]).await
+}
+
+/// An Organization-parented external kind, so scope resolution is exercised
+/// against a `ResourceDefinition` parent chain and not only built-in kinds.
+async fn register_org_widget_rd(store: &PgResourceStore) {
+    store
+        .register_resource_definition(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: RESOURCE_DEFINITION_KIND.to_string(),
+            name: "orgwidgets.example.dev".to_string(),
+            spec: json!({
+                "group": "example.dev",
+                "kind": "OrgWidget",
+                "plural": "orgwidgets",
+                "parent": {"apiVersion": API_VERSION_V1ALPHA1, "kind": ORGANIZATION_KIND},
+                "versions": [{"name": "v1", "served": true, "storage": true}],
+                "allowedStatusControllerIds": []
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect("org widget definition registers");
+}
+
+/// `UpdateResourceParams` has no `Default` (a caller must state the revision it
+/// expects), so policy update tests build one through this.
+fn update_spec(revision: i64, spec: serde_json::Value) -> UpdateResourceParams {
+    UpdateResourceParams {
+        labels: Default::default(),
+        api_version: None,
+        revision,
+        annotations: BTreeMap::new(),
+        finalizers: vec![],
+        owner_references: vec![],
+        spec,
+        validator: None,
+    }
+}
+
+#[sqlx::test]
+async fn policy_routes_and_placement_are_activated_from_contract_definitions(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    for definition in POLICY_KIND_DEFINITIONS {
+        let info = store
+            .resolve_collection(definition.collection)
+            .await
+            .unwrap()
+            .expect("policy collection is routed");
+        assert_eq!(info.api_version, definition.api_version);
+        assert_eq!(info.kind, definition.kind);
+        assert_eq!(
+            info.parent
+                .as_ref()
+                .map(|parent| (parent.api_version.as_str(), parent.kind.as_str())),
+            definition
+                .parent
+                .map(|parent| (parent.api_version, parent.kind))
+        );
+    }
+
+    // The org pair is Organization-parented and the platform pair is root-scoped.
+    assert!(store
+        .resolve_collection("roles")
+        .await
+        .unwrap()
+        .unwrap()
+        .parent
+        .is_some());
+    assert!(store
+        .resolve_collection("platformroles")
+        .await
+        .unwrap()
+        .unwrap()
+        .parent
+        .is_none());
+
+    // Another version of a reserved policy identity is not silently treated as
+    // a custom resource.
+    assert!(store
+        .resolve_collection_version("rise.dev", "v2", "rolebindings")
+        .await
+        .unwrap()
+        .is_none());
+    Ok(())
+}
+
+#[sqlx::test]
+async fn policy_admission_normalizes_bindings_and_is_unbypassable(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let acme = create_org(&store, "acme").await;
+    create_platform_role(&store, "resource-owner").await;
+    create_role(&store, acme.uid, "deploy-viewer").await;
+    create_builtin_resource(&store, USER_KIND, "alice", None, json!({}), vec![])
+        .await
+        .unwrap();
+
+    // A Role body is context-free: `statements` defaults, and the canonical
+    // form is what gets persisted.
+    let role = store
+        .get_by_name(
+            API_VERSION_V1ALPHA1,
+            ROLE_KIND,
+            "deploy-viewer",
+            Some(acme.uid),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(role.spec, json!({"statements": []}));
+
+    // An org binding's omitted scope becomes its parent Organization's scope,
+    // and a caller-supplied validator cannot suppress that normalization.
+    let binding = store
+        .create(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.into(),
+            kind: ROLE_BINDING_KIND.into(),
+            name: "alice-viewer".into(),
+            parent_uid: Some(acme.uid),
+            spec: json!({
+                "subject": "user:alice",
+                "roleRef": {"kind": "Role", "name": "deploy-viewer"}
+            }),
+            validator: Some(Arc::new(NoOpValidator)),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        binding.spec,
+        json!({
+            "subject": "user:alice",
+            "scope": "rise.dev/Organization/acme",
+            "roleRef": {"kind": "Role", "name": "deploy-viewer"}
+        })
+    );
+
+    // Platform bindings persist the PascalCase membership enum; omission is Any.
+    let platform = create_binding(
+        &store,
+        PLATFORM_ROLE_BINDING_KIND,
+        "alice-platform",
+        None,
+        json!({
+            "subject": "user:alice",
+            "roleRef": {"kind": "PlatformRole", "name": "resource-owner"}
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        platform.spec,
+        json!({
+            "subject": "user:alice",
+            "subjectMembership": "Any",
+            "scope": "*",
+            "roleRef": {"kind": "PlatformRole", "name": "resource-owner"}
+        })
+    );
+
+    let constrained = create_binding(
+        &store,
+        PLATFORM_ROLE_BINDING_KIND,
+        "alice-members-only",
+        None,
+        json!({
+            "subject": "user:alice",
+            "subjectMembership": "ResourceOrganization",
+            "roleRef": {"kind": "PlatformRole", "name": "resource-owner"}
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        constrained.spec["subjectMembership"],
+        json!("ResourceOrganization")
+    );
+
+    // The closed schema: one lowercase `subject` field, no plural or
+    // capitalized spellings, and `subjectMembership` only on platform bindings.
+    for (kind, parent_uid, spec) in [
+        (
+            ROLE_BINDING_KIND,
+            Some(acme.uid),
+            json!({
+                "subjects": ["user:alice"],
+                "roleRef": {"kind": "Role", "name": "deploy-viewer"}
+            }),
+        ),
+        (
+            ROLE_BINDING_KIND,
+            Some(acme.uid),
+            json!({
+                "Subject": "user:alice",
+                "roleRef": {"kind": "Role", "name": "deploy-viewer"}
+            }),
+        ),
+        (
+            ROLE_BINDING_KIND,
+            Some(acme.uid),
+            json!({
+                "subject": "user:alice",
+                "subjectMembership": "Any",
+                "roleRef": {"kind": "Role", "name": "deploy-viewer"}
+            }),
+        ),
+        (
+            PLATFORM_ROLE_BINDING_KIND,
+            None,
+            json!({
+                "subject": "user:alice",
+                "subjectMembership": null,
+                "roleRef": {"kind": "PlatformRole", "name": "resource-owner"}
+            }),
+        ),
+        (
+            PLATFORM_ROLE_BINDING_KIND,
+            None,
+            json!({
+                "subject": "user:alice",
+                "subjectMembership": "any",
+                "roleRef": {"kind": "PlatformRole", "name": "resource-owner"}
+            }),
+        ),
+        (
+            PLATFORM_ROLE_BINDING_KIND,
+            None,
+            json!({
+                "subject": "user:alice",
+                "roleRef": {"kind": "Role", "name": "deploy-viewer"}
+            }),
+        ),
+    ] {
+        let error = create_binding(&store, kind, "rejected", parent_uid, spec.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, StoreError::Validation(_)),
+            "expected {kind} {spec} to be rejected"
+        );
+    }
+
+    // `system:operators` is reserved for the seeded bootstrap binding.
+    let reserved = create_binding(
+        &store,
+        PLATFORM_ROLE_BINDING_KIND,
+        "operators",
+        None,
+        json!({
+            "subject": "system:operators",
+            "roleRef": {"kind": "PlatformRole", "name": "resource-owner"}
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(reserved, StoreError::Validation(message) if message.contains("system:operators"))
+    );
+
+    // A dynamic subject needs a selector to resolve against; a static one
+    // cannot pair with a value-less selector.
+    let dynamic = create_binding(
+        &store,
+        PLATFORM_ROLE_BINDING_KIND,
+        "dynamic",
+        None,
+        json!({
+            "subject": "group:${ref.name}",
+            "roleRef": {"kind": "PlatformRole", "name": "resource-owner"}
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(dynamic, StoreError::Validation(message) if message.contains("labelSelector"))
+    );
+
+    let valueless = create_binding(
+        &store,
+        PLATFORM_ROLE_BINDING_KIND,
+        "valueless",
+        None,
+        json!({
+            "subject": "user:alice",
+            "labelSelector": {"key": "rise.dev/owner"},
+            "roleRef": {"kind": "PlatformRole", "name": "resource-owner"}
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(valueless, StoreError::Validation(_)));
+
+    // A dynamic subject resolves per-resource at evaluation time, so it needs
+    // no identity to exist now.
+    let templated = create_binding(
+        &store,
+        PLATFORM_ROLE_BINDING_KIND,
+        "owner-template",
+        None,
+        json!({
+            "subject": "${ref.subject}",
+            "labelSelector": {"key": "rise.dev/owner"},
+            "roleRef": {"kind": "PlatformRole", "name": "resource-owner"}
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(templated.spec["subject"], json!("${ref.subject}"));
+    Ok(())
+}
+
+#[sqlx::test]
+async fn policy_role_ref_resolves_by_kind_and_placement(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let acme = create_org(&store, "acme").await;
+    let other = create_org(&store, "other").await;
+    create_builtin_resource(&store, USER_KIND, "alice", None, json!({}), vec![])
+        .await
+        .unwrap();
+    create_platform_role(&store, "resource-owner").await;
+    create_role(&store, acme.uid, "deploy-viewer").await;
+    create_role(&store, other.uid, "other-only").await;
+    // An org Role deliberately sharing a PlatformRole's name.
+    create_role(&store, acme.uid, "resource-owner").await;
+
+    let binding_spec = |kind: &str, name: &str| {
+        json!({
+            "subject": "user:alice",
+            "roleRef": {"kind": kind, "name": name}
+        })
+    };
+
+    // Own-org Role and any PlatformRole both resolve for an org binding.
+    for (index, (kind, name)) in [
+        ("Role", "deploy-viewer"),
+        ("PlatformRole", "resource-owner"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        create_binding(
+            &store,
+            ROLE_BINDING_KIND,
+            &format!("ok-{index}"),
+            Some(acme.uid),
+            binding_spec(kind, name),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Another organization's Role is not a candidate: references resolve by
+    // placement, never by bare name.
+    let cross_org = create_binding(
+        &store,
+        ROLE_BINDING_KIND,
+        "cross-org",
+        Some(acme.uid),
+        binding_spec("Role", "other-only"),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(cross_org, StoreError::Validation(message) if message.contains("own Organization"))
+    );
+
+    let missing = create_binding(
+        &store,
+        ROLE_BINDING_KIND,
+        "missing",
+        Some(acme.uid),
+        binding_spec("PlatformRole", "does-not-exist"),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(missing, StoreError::Validation(message) if message.contains("root-scoped PlatformRole"))
+    );
+
+    // The org Role named `resource-owner` shadows nothing: deleting the
+    // PlatformRole of that name breaks the PlatformRole reference even though a
+    // same-named org Role remains.
+    let platform_role = store
+        .get_by_name(
+            API_VERSION_V1ALPHA1,
+            PLATFORM_ROLE_KIND,
+            "resource-owner",
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    store.delete(platform_role.uid).await.unwrap();
+    let shadowed = create_binding(
+        &store,
+        ROLE_BINDING_KIND,
+        "shadowed",
+        Some(acme.uid),
+        binding_spec("PlatformRole", "resource-owner"),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(shadowed, StoreError::Validation(_)));
+
+    // A platform binding can only reference a PlatformRole; the closed enum
+    // rejects `Role` before any lookup happens.
+    let org_role_from_platform = create_binding(
+        &store,
+        PLATFORM_ROLE_BINDING_KIND,
+        "platform-org-role",
+        None,
+        binding_spec("Role", "deploy-viewer"),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(org_role_from_platform, StoreError::Validation(_)));
+    Ok(())
+}
+
+#[sqlx::test]
+async fn role_binding_scope_is_resolved_and_contained_by_its_organization(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let acme = create_org(&store, "acme").await;
+    let other = create_org(&store, "other").await;
+    create_builtin_resource(&store, USER_KIND, "alice", None, json!({}), vec![])
+        .await
+        .unwrap();
+    create_role(&store, acme.uid, "deploy-viewer").await;
+    create_builtin_resource(
+        &store,
+        GROUP_KIND,
+        "platform",
+        Some(acme.uid),
+        json!({}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    register_org_widget_rd(&store).await;
+    store
+        .create(CreateResourceParams {
+            api_version: "example.dev/v1".into(),
+            kind: "OrgWidget".into(),
+            name: "w1".into(),
+            parent_uid: Some(acme.uid),
+            spec: json!({}),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let with_scope = |scope: &str| {
+        json!({
+            "subject": "user:alice",
+            "scope": scope,
+            "roleRef": {"kind": "Role", "name": "deploy-viewer"}
+        })
+    };
+
+    // A built-in and an external kind inside the parent org both resolve; the
+    // ancestor chain of an external kind comes from its ResourceDefinition.
+    for (index, scope) in [
+        "rise.dev/Organization/acme",
+        "rise.dev/Group/acme/platform",
+        "example.dev/OrgWidget/acme/w1",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let row = create_binding(
+            &store,
+            ROLE_BINDING_KIND,
+            &format!("scoped-{index}"),
+            Some(acme.uid),
+            with_scope(scope),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{scope}: {error:?}"));
+        assert_eq!(row.spec["scope"], json!(scope));
+    }
+
+    // Containment, existence, arity, and the wildcard escape all fail closed.
+    for (label, scope, fragment) in [
+        (
+            "another org",
+            "rise.dev/Organization/other",
+            "not Organization 'acme'",
+        ),
+        (
+            "another org's subtree",
+            "rise.dev/Group/other/nope",
+            "live resource",
+        ),
+        (
+            "a root-scoped kind",
+            "rise.dev/User/alice",
+            "not Organization 'acme'",
+        ),
+        (
+            "an absent target",
+            "rise.dev/Group/acme/absent",
+            "live resource",
+        ),
+        (
+            "an unknown kind",
+            "unknown.example/Widget/acme/x",
+            "unknown ResourceKind",
+        ),
+        ("too few names", "rise.dev/Group/acme", "ancestor"),
+        (
+            "too many names",
+            "rise.dev/Organization/acme/extra",
+            "ancestor",
+        ),
+    ] {
+        let error = create_binding(
+            &store,
+            ROLE_BINDING_KIND,
+            "rejected",
+            Some(acme.uid),
+            with_scope(scope),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&error, StoreError::Validation(message) if message.contains(fragment)),
+            "{label} ({scope}) produced {error:?}"
+        );
+    }
+
+    let wildcard = create_binding(
+        &store,
+        ROLE_BINDING_KIND,
+        "wildcard",
+        Some(acme.uid),
+        with_scope("*"),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(wildcard, StoreError::Validation(message) if message.contains("wildcard scope"))
+    );
+
+    // A tombstoned target is not a live anchor for a new binding.
+    let group = store
+        .get_by_name(API_VERSION_V1ALPHA1, GROUP_KIND, "platform", Some(acme.uid))
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .update(
+            group.uid,
+            UpdateResourceParams {
+                labels: Default::default(),
+                finalizers: vec!["example.dev/keep".to_string()],
+                ..update_spec(group.revision, json!({}))
+            },
+        )
+        .await
+        .unwrap();
+    store.delete(group.uid).await.unwrap();
+    let tombstoned = create_binding(
+        &store,
+        ROLE_BINDING_KIND,
+        "tombstoned-scope",
+        Some(acme.uid),
+        with_scope("rise.dev/Group/acme/platform"),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(tombstoned, StoreError::Validation(message) if message.contains("live resource"))
+    );
+
+    // `other` is untouched by acme's failures.
+    assert!(store.get(other.uid).await.unwrap().is_some());
+    Ok(())
+}
+
+#[sqlx::test]
+async fn platform_role_binding_scope_defaults_to_the_subjects_own_reach(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let acme = create_org(&store, "acme").await;
+    create_org(&store, "beta").await;
+    create_platform_role(&store, "resource-owner").await;
+    create_builtin_resource(&store, USER_KIND, "alice", None, json!({}), vec![])
+        .await
+        .unwrap();
+    create_builtin_resource(
+        &store,
+        GROUP_KIND,
+        "platform",
+        Some(acme.uid),
+        json!({}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    create_builtin_resource(
+        &store,
+        SERVICE_ACCOUNT_KIND,
+        "ci",
+        Some(acme.uid),
+        json!({}),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    let spec = |subject: &str, scope: Option<&str>| {
+        let mut spec = json!({
+            "subject": subject,
+            "roleRef": {"kind": "PlatformRole", "name": "resource-owner"}
+        });
+        if let Some(scope) = scope {
+            spec["scope"] = json!(scope);
+        }
+        spec
+    };
+
+    // An org-agnostic subject defaults to the wildcard; a static org-native one
+    // defaults to its own organization.
+    for (index, (subject, expected)) in [
+        ("user:alice", "*"),
+        ("group:acme/platform", "rise.dev/Organization/acme"),
+        ("serviceaccount:acme/ci", "rise.dev/Organization/acme"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let row = create_binding(
+            &store,
+            PLATFORM_ROLE_BINDING_KIND,
+            &format!("default-{index}"),
+            None,
+            spec(subject, None),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{subject}: {error:?}"));
+        assert_eq!(row.spec["scope"], json!(expected), "{subject}");
+    }
+
+    // A platform binding's scope is otherwise unrestricted: a root-scoped
+    // instance and another org's subtree are both legitimate platform policy.
+    for (index, scope) in ["rise.dev/User/alice", "rise.dev/Organization/beta"]
+        .into_iter()
+        .enumerate()
+    {
+        create_binding(
+            &store,
+            PLATFORM_ROLE_BINDING_KIND,
+            &format!("platform-scope-{index}"),
+            None,
+            spec("user:alice", Some(scope)),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{scope}: {error:?}"));
+    }
+
+    // A static org-native subject cannot leave its own org, by explicit
+    // wildcard or by naming another org.
+    let explicit_wildcard = create_binding(
+        &store,
+        PLATFORM_ROLE_BINDING_KIND,
+        "org-native-wildcard",
+        None,
+        spec("group:acme/platform", Some("*")),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(explicit_wildcard, StoreError::Validation(message) if message.contains("wildcard scope"))
+    );
+
+    let cross_org = create_binding(
+        &store,
+        PLATFORM_ROLE_BINDING_KIND,
+        "org-native-cross",
+        None,
+        spec("serviceaccount:acme/ci", Some("rise.dev/Organization/beta")),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(cross_org, StoreError::Validation(message) if message.contains("own Organization"))
+    );
+    Ok(())
+}
+
+#[sqlx::test]
+async fn policy_subjects_must_identify_live_identities(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let acme = create_org(&store, "acme").await;
+    create_platform_role(&store, "resource-owner").await;
+    create_builtin_resource(&store, USER_KIND, "alice", None, json!({}), vec![])
+        .await
+        .unwrap();
+    create_builtin_resource(&store, CONTROLLER_KIND, "deployer", None, json!({}), vec![])
+        .await
+        .unwrap();
+    create_builtin_resource(
+        &store,
+        GROUP_KIND,
+        "platform",
+        Some(acme.uid),
+        json!({}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    create_builtin_resource(
+        &store,
+        SERVICE_ACCOUNT_KIND,
+        "ci",
+        Some(acme.uid),
+        json!({}),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    // A static org-native subject rejects a wildcard scope outright, so each
+    // case carries the scope its own subject kind admits.
+    let spec = |subject: &str| {
+        let scope = match subject.split_once(':') {
+            Some(("group" | "serviceaccount", name)) => {
+                format!("rise.dev/Organization/{}", name.split('/').next().unwrap())
+            }
+            _ => "*".to_string(),
+        };
+        json!({
+            "subject": subject,
+            "scope": scope,
+            "roleRef": {"kind": "PlatformRole", "name": "resource-owner"}
+        })
+    };
+
+    // Every literal identity kind resolves, and the two virtual populations
+    // that name no row are accepted as written.
+    for (index, subject) in [
+        "user:alice",
+        "controller:deployer",
+        "group:acme/platform",
+        "serviceaccount:acme/ci",
+        "org:acme",
+        "system:authenticated",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        create_binding(
+            &store,
+            PLATFORM_ROLE_BINDING_KIND,
+            &format!("subject-{index}"),
+            None,
+            spec(subject),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{subject}: {error:?}"));
+    }
+
+    // A syntactically valid subject naming nothing fails the write rather than
+    // persisting a binding that could never match.
+    for subject in [
+        "user:nobody",
+        "controller:nobody",
+        "group:acme/nobody",
+        "group:nowhere/platform",
+        "serviceaccount:acme/nobody",
+        "org:nowhere",
+    ] {
+        let error = create_binding(
+            &store,
+            PLATFORM_ROLE_BINDING_KIND,
+            "absent-subject",
+            None,
+            spec(subject),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&error, StoreError::Validation(message) if message.contains("must identify a live")),
+            "{subject} produced {error:?}"
+        );
+    }
+
+    // A Group is looked up under its own organization, not globally: acme's
+    // Group name does not satisfy a subject naming another org.
+    create_org(&store, "beta").await;
+    let wrong_org = create_binding(
+        &store,
+        PLATFORM_ROLE_BINDING_KIND,
+        "wrong-org-group",
+        None,
+        spec("group:beta/platform"),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(wrong_org, StoreError::Validation(_)));
+    Ok(())
+}
+
+#[sqlx::test]
+async fn policy_updates_renormalize_and_revalidate_references(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let acme = create_org(&store, "acme").await;
+    create_builtin_resource(&store, USER_KIND, "alice", None, json!({}), vec![])
+        .await
+        .unwrap();
+    create_platform_role(&store, "resource-owner").await;
+    let role = create_role(&store, acme.uid, "deploy-viewer").await;
+
+    let binding = create_binding(
+        &store,
+        ROLE_BINDING_KIND,
+        "alice-viewer",
+        Some(acme.uid),
+        json!({
+            "subject": "user:alice",
+            "roleRef": {"kind": "Role", "name": "deploy-viewer"}
+        }),
+    )
+    .await
+    .unwrap();
+    let normalized = binding.spec.clone();
+
+    // Re-submitting the stored normalized spec is idempotent: an explicit scope
+    // normalizes to itself.
+    let updated = store
+        .update(
+            binding.uid,
+            update_spec(binding.revision, normalized.clone()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.spec, normalized);
+
+    // An update is re-validated against current rows, so a reference that has
+    // since been deleted cannot be carried forward untouched.
+    store.delete(role.uid).await.unwrap();
+    let dangling = store
+        .update(
+            updated.uid,
+            update_spec(updated.revision, normalized.clone()),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(dangling, StoreError::Validation(message) if message.contains("roleRef")));
+
+    // Retargeting at a live reference succeeds and renormalizes in place.
+    let retargeted = store
+        .update(
+            updated.uid,
+            update_spec(
+                updated.revision,
+                json!({
+                    "subject": "user:alice",
+                    "roleRef": {"kind": "PlatformRole", "name": "resource-owner"}
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        retargeted.spec,
+        json!({
+            "subject": "user:alice",
+            "scope": "rise.dev/Organization/acme",
+            "roleRef": {"kind": "PlatformRole", "name": "resource-owner"}
+        })
+    );
+    Ok(())
+}
+
+#[sqlx::test]
+async fn role_binding_create_never_resolves_a_reference_the_deleter_already_won(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = Arc::new(PgResourceStore::new(pool.clone()));
+    let acme = create_org(&store, "race-org").await;
+    create_builtin_resource(&store, USER_KIND, "alice", None, json!({}), vec![])
+        .await
+        .unwrap();
+
+    // Deterministic half: a reference that has already entered deletion is not
+    // a live target, so the FOR SHARE lookup rejects it outright.
+    let tombstoned = create_builtin_resource(
+        &store,
+        ROLE_KIND,
+        "tombstoned",
+        Some(acme.uid),
+        json!({}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    store
+        .update(
+            tombstoned.uid,
+            UpdateResourceParams {
+                labels: Default::default(),
+                finalizers: vec!["example.dev/keep".to_string()],
+                ..update_spec(tombstoned.revision, json!({}))
+            },
+        )
+        .await
+        .unwrap();
+    store.delete(tombstoned.uid).await.unwrap();
+    let error = create_binding(
+        &store,
+        ROLE_BINDING_KIND,
+        "against-tombstone",
+        Some(acme.uid),
+        json!({
+            "subject": "user:alice",
+            "roleRef": {"kind": "Role", "name": "tombstoned"}
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, StoreError::Validation(message) if message.contains("roleRef")));
+
+    // Concurrent half: the binding's FOR SHARE lock on its roleRef target and
+    // the deleter's FOR UPDATE lock serialize, so the pair always lands on one
+    // of two consistent outcomes -- never a half-normalized binding.
+    let role = create_role(&store, acme.uid, "raced").await;
+    let role_uid = role.uid;
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let create = {
+        let store = store.clone();
+        let barrier = barrier.clone();
+        let parent = acme.uid;
+        tokio::spawn(async move {
+            barrier.wait().await;
+            create_binding(
+                &store,
+                ROLE_BINDING_KIND,
+                "raced-binding",
+                Some(parent),
+                json!({
+                    "subject": "user:alice",
+                    "roleRef": {"kind": "Role", "name": "raced"}
+                }),
+            )
+            .await
+        })
+    };
+    let delete = {
+        let store = store.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            store.delete(role_uid).await
+        })
+    };
+    barrier.wait().await;
+    let created = create.await.unwrap();
+    delete.await.unwrap().unwrap();
+
+    match created {
+        Ok(row) => assert_eq!(
+            row.spec,
+            json!({
+                "subject": "user:alice",
+                "scope": "rise.dev/Organization/race-org",
+                "roleRef": {"kind": "Role", "name": "raced"}
+            }),
+            "a committed binding is always fully normalized"
+        ),
+        Err(StoreError::Validation(message)) => assert!(message.contains("roleRef")),
+        Err(other) => panic!("unexpected outcome: {other:?}"),
+    }
+    Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+async fn policy_activation_upgrade_audit_is_actionable_and_guard_is_durable(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    // The upgrade this exercises is from an installation that has the identity
+    // built-ins but not the policy ones.
+    execute_resource_migration(&pool, 20260519000000).await?;
+    execute_resource_migration(&pool, 20260719000000).await?;
+    execute_resource_migration(&pool, 20260719000001).await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO resource_store.resources
+            (api_version, kind, name, discriminator, spec)
+        VALUES
+            ('rise.dev/v1alpha1', 'ResourceDefinition', 'legacy.example', 'legacy02',
+             '{"group":"legacy.example","kind":"Legacy","plural":"rolebindings","versions":[{"name":"v1","served":true,"storage":true}]}'::jsonb),
+            ('rise.dev/v9', 'Role', 'orphan', 'orphan02', '{}'::jsonb),
+            ('custom.example/v1', 'Role', 'custom-role', 'custom02', '{}'::jsonb)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    let activation = sqlx::migrate!("./migrations")
+        .iter()
+        .find(|migration| migration.version == 20260814000000)
+        .expect("activation migration exists")
+        .sql
+        .clone();
+
+    // Each conflicting population is named specifically, and a rejected upgrade
+    // leaves nothing behind — including the guard it would have installed.
+    let error = pool.execute(&*activation).await.unwrap_err();
+    assert!(error.to_string().contains("legacy ResourceDefinition(s)"));
+    let guard_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pg_constraint WHERE conname = 'resource_definitions_policy_reservations')",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert!(!guard_exists, "a rejected upgrade rolls back in full");
+
+    sqlx::query("DELETE FROM resource_store.resources WHERE name = 'legacy.example'")
+        .execute(&pool)
+        .await?;
+    let error = pool.execute(&*activation).await.unwrap_err();
+    assert!(error.to_string().contains("legacy resource row(s)"));
+
+    sqlx::query("DELETE FROM resource_store.resources WHERE name = 'orphan'")
+        .execute(&pool)
+        .await?;
+    execute_resource_migration(&pool, 20260814000000).await?;
+
+    // A same-named Kind in another API group was never a policy built-in and
+    // survives activation untouched.
+    let custom_survives: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM resource_store.resources WHERE api_version = 'custom.example/v1' AND kind = 'Role')",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert!(custom_survives);
+
+    let guarded = sqlx::query(
+        r#"
+        INSERT INTO resource_store.resources
+            (api_version, kind, name, discriminator, spec)
+        VALUES ('rise.dev/v1alpha1', 'ResourceDefinition', 'blocked.example', 'blocked2',
+                '{"group":"other.example","kind":"Blocked","plural":"platformroles","versions":[{"name":"v1","served":true,"storage":true}]}'::jsonb)
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        guarded
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("resource_definitions_policy_reservations")
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Labels and the ancestor chain (ADR-0001 §6.1)
+// ---------------------------------------------------------------------------
+
+#[sqlx::test]
+async fn labels_round_trip_and_are_validated(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool.clone());
+
+    let labeled = store
+        .create(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.into(),
+            kind: ORGANIZATION_KIND.into(),
+            name: "labeled".into(),
+            labels: BTreeMap::from([
+                ("rise.dev/owner".to_string(), "group:platform".to_string()),
+                ("squad".to_string(), "infra".to_string()),
+            ]),
+            spec: json!({"displayName": "Labeled"}),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        labeled.labels.get("rise.dev/owner").unwrap(),
+        "group:platform"
+    );
+    assert_eq!(labeled.labels.get("squad").unwrap(), "infra");
+
+    // Labels survive a re-read and reach the typed envelope.
+    let fetched = store.get(labeled.uid).await.unwrap().unwrap();
+    assert_eq!(fetched.labels, labeled.labels);
+    let resource = fetched
+        .to_resource::<serde_json::Map<String, serde_json::Value>, serde_json::Map<String, serde_json::Value>>();
+    assert_eq!(
+        resource
+            .unwrap()
+            .metadata
+            .labels
+            .get("squad")
+            .map(String::as_str),
+        Some("infra")
+    );
+
+    // An update replaces the whole map, including removal.
+    let updated = store
+        .update(
+            labeled.uid,
+            UpdateResourceParams {
+                labels: BTreeMap::from([("squad".to_string(), "platform".to_string())]),
+                ..update_spec(labeled.revision, json!({"displayName": "Labeled"}))
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.labels.len(), 1);
+    assert_eq!(updated.labels.get("squad").unwrap(), "platform");
+
+    // A resource created without labels has an empty map, not null.
+    let bare = create_org(&store, "bare").await;
+    assert!(bare.labels.is_empty());
+
+    // Keys use the same grammar a binding's labelSelector parses, so a key that
+    // can be written can always be selected on.
+    for (label, key) in [
+        ("empty key", ""),
+        ("bad prefix", "not a domain/owner"),
+        ("trailing dash", "rise.dev/owner-"),
+        ("double slash", "rise.dev/extra/owner"),
+    ] {
+        let error = store
+            .create(CreateResourceParams {
+                api_version: API_VERSION_V1ALPHA1.into(),
+                kind: ORGANIZATION_KIND.into(),
+                name: "rejected".into(),
+                labels: BTreeMap::from([(key.to_string(), "value".to_string())]),
+                spec: json!({"displayName": "Rejected"}),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, StoreError::Validation(message) if message.contains("invalid label key")),
+            "{label} ('{key}') produced {error:?}"
+        );
+    }
+
+    for (label, value) in [
+        ("oversized", "v".repeat(64)),
+        ("newline", "line\nbreak".to_string()),
+        ("nul", "nul\0byte".to_string()),
+    ] {
+        let error = store
+            .create(CreateResourceParams {
+                api_version: API_VERSION_V1ALPHA1.into(),
+                kind: ORGANIZATION_KIND.into(),
+                name: "rejected".into(),
+                labels: BTreeMap::from([("squad".to_string(), value)]),
+                spec: json!({"displayName": "Rejected"}),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, StoreError::Validation(_)),
+            "{label} produced {error:?}"
+        );
+    }
+
+    // The database keeps the stored shape honest against direct SQL.
+    let non_string = sqlx::query(
+        "UPDATE resource_store.resources SET labels = '{\"squad\": 1}'::jsonb WHERE uid = $1",
+    )
+    .bind(labeled.uid)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        non_string
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("resources_labels_are_strings")
+    );
+    Ok(())
+}
+
+#[sqlx::test]
+async fn ancestors_returns_the_root_first_chain_including_the_leaf(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool.clone());
+    let org = create_org(&store, "acme").await;
+    let group = create_builtin_resource(
+        &store,
+        GROUP_KIND,
+        "platform",
+        Some(org.uid),
+        json!({}),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    // Root-first, leaf last.
+    let chain = store.ancestors(group.uid).await.unwrap();
+    assert_eq!(
+        chain
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["acme", "platform"]
+    );
+    assert_eq!(chain.first().unwrap().uid, org.uid);
+    assert_eq!(chain.last().unwrap().uid, group.uid);
+
+    // A root resource is its own single-element chain.
+    let root_chain = store.ancestors(org.uid).await.unwrap();
+    assert_eq!(root_chain.len(), 1);
+    assert_eq!(root_chain[0].uid, org.uid);
+
+    // An unknown UID is an empty chain, not an error: the caller decides.
+    assert!(store.ancestors(Uuid::new_v4()).await.unwrap().is_empty());
+
+    // Labels ride along, since resolving effectiveLabels is the reason this
+    // primitive exists.
+    let labeled = store
+        .update(
+            org.uid,
+            UpdateResourceParams {
+                labels: BTreeMap::from([(
+                    "rise.dev/owner".to_string(),
+                    "group:platform".to_string(),
+                )]),
+                ..update_spec(org.revision, json!({"displayName": "acme"}))
+            },
+        )
+        .await
+        .unwrap();
+    let chain = store.ancestors(group.uid).await.unwrap();
+    assert_eq!(
+        chain[0].labels.get("rise.dev/owner").map(String::as_str),
+        Some("group:platform")
+    );
+    assert_eq!(chain[0].revision, labeled.revision);
+
+    // Tombstoned ancestors are returned for the caller to interpret, matching
+    // resolve_path. An authorization caller must filter them itself.
+    let deep = create_child(&store, group.uid, "Widget", "w1", vec![]).await;
+    store
+        .update(
+            group.uid,
+            UpdateResourceParams {
+                finalizers: vec!["example.dev/keep".to_string()],
+                ..update_spec(group.revision, json!({}))
+            },
+        )
+        .await
+        .unwrap();
+    store.delete(group.uid).await.unwrap();
+    let chain = store.ancestors(deep.uid).await.unwrap();
+    assert_eq!(chain.len(), 3);
+    assert!(chain[1].deletion_timestamp.is_some());
+    Ok(())
+}
+
+#[sqlx::test]
+async fn policy_binding_collection_uses_the_parent_scoped_indexes(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    // The engine collects a resource's applicable bindings as two parent-keyed
+    // reads: org RoleBindings under the resource's Organization, and root
+    // PlatformRoleBindings. Both must stay index-served -- this is why the
+    // policy activation shipped without a dedicated binding index.
+    let store = PgResourceStore::new(pool.clone());
+    let acme = create_org(&store, "acme").await;
+    create_platform_role(&store, "resource-owner").await;
+    create_role(&store, acme.uid, "deploy-viewer").await;
+    create_builtin_resource(&store, USER_KIND, "alice", None, json!({}), vec![])
+        .await
+        .unwrap();
+    create_binding(
+        &store,
+        ROLE_BINDING_KIND,
+        "alice-viewer",
+        Some(acme.uid),
+        json!({
+            "subject": "user:alice",
+            "roleRef": {"kind": "Role", "name": "deploy-viewer"}
+        }),
+    )
+    .await
+    .unwrap();
+    create_binding(
+        &store,
+        PLATFORM_ROLE_BINDING_KIND,
+        "alice-platform",
+        None,
+        json!({
+            "subject": "user:alice",
+            "roleRef": {"kind": "PlatformRole", "name": "resource-owner"}
+        }),
+    )
+    .await
+    .unwrap();
+
+    let org_plan: String = sqlx::query_scalar::<_, String>(
+        r#"
+        EXPLAIN (FORMAT TEXT)
+        SELECT * FROM resource_store.resources
+        WHERE split_part(api_version, '/', 1) = 'rise.dev'
+          AND kind = 'RoleBinding'
+          AND parent_uid = $1
+        "#,
+    )
+    .bind(acme.uid)
+    .fetch_all(&pool)
+    .await?
+    .join("\n");
+    // Two indexes share the leading (parent_uid, group, kind) columns, so the
+    // planner may pick either; what matters is that neither read degrades to a
+    // sequential scan as the table grows.
+    assert!(
+        org_plan.contains("Index Scan")
+            && (org_plan.contains("resources_child_group_kind")
+                || org_plan.contains("resources_child_kind_name_unique")),
+        "org binding collection must be index-served; got:\n{org_plan}"
+    );
+
+    let platform_plan: String = sqlx::query_scalar::<_, String>(
+        r#"
+        EXPLAIN (FORMAT TEXT)
+        SELECT * FROM resource_store.resources
+        WHERE split_part(api_version, '/', 1) = 'rise.dev'
+          AND kind = 'PlatformRoleBinding'
+          AND parent_uid IS NULL
+        "#,
+    )
+    .fetch_all(&pool)
+    .await?
+    .join("\n");
+    assert!(
+        platform_plan.contains("Index Scan")
+            && (platform_plan.contains("resources_root_group_kind")
+                || platform_plan.contains("resources_root_kind_name_unique")),
+        "platform binding collection must be index-served; got:\n{platform_plan}"
+    );
     Ok(())
 }

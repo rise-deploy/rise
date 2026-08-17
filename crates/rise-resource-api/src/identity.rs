@@ -5,104 +5,81 @@ use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
 
+use crate::builtin_kind::ORGANIZATION_PARENT;
 use crate::{
-    ValidationError, API_VERSION_V1ALPHA1, CONTROLLER_COLLECTION, CONTROLLER_KIND,
-    CONTROLLER_TRUST_POLICY_COLLECTION, CONTROLLER_TRUST_POLICY_KIND, GROUP_COLLECTION, GROUP_KIND,
-    GROUP_MEMBERSHIP_COLLECTION, GROUP_MEMBERSHIP_KIND, ORGANIZATION_KIND,
-    SERVICE_ACCOUNT_COLLECTION, SERVICE_ACCOUNT_KIND, SERVICE_ACCOUNT_TRUST_POLICY_COLLECTION,
-    SERVICE_ACCOUNT_TRUST_POLICY_KIND, USER_COLLECTION, USER_IDENTITY_COLLECTION,
-    USER_IDENTITY_KIND, USER_KIND,
+    BuiltInKindDefinition, BuiltInKindParent, ValidationError, API_VERSION_V1ALPHA1,
+    CONTROLLER_COLLECTION, CONTROLLER_KIND, CONTROLLER_TRUST_POLICY_COLLECTION,
+    CONTROLLER_TRUST_POLICY_KIND, GROUP_COLLECTION, GROUP_KIND, GROUP_MEMBERSHIP_COLLECTION,
+    GROUP_MEMBERSHIP_KIND, SERVICE_ACCOUNT_COLLECTION, SERVICE_ACCOUNT_KIND,
+    SERVICE_ACCOUNT_TRUST_POLICY_COLLECTION, SERVICE_ACCOUNT_TRUST_POLICY_KIND, USER_COLLECTION,
+    USER_IDENTITY_COLLECTION, USER_IDENTITY_KIND, USER_KIND,
 };
 
-/// Static API identity and placement of one ADR-0001 identity resource kind.
-///
-/// This is contract metadata only. Runtime registration remains behind the
-/// transaction-scoped normalization and admission work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IdentityKindDefinition {
-    pub api_version: &'static str,
-    pub kind: &'static str,
-    pub collection: &'static str,
-    pub parent: Option<IdentityKindParent>,
-}
-
-/// Fixed parent identity for an ADR-0001 identity resource kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IdentityKindParent {
-    pub api_version: &'static str,
-    pub kind: &'static str,
-}
-
-const ORGANIZATION_PARENT: IdentityKindParent = IdentityKindParent {
-    api_version: API_VERSION_V1ALPHA1,
-    kind: ORGANIZATION_KIND,
-};
-
-const USER_PARENT: IdentityKindParent = IdentityKindParent {
+const USER_PARENT: BuiltInKindParent = BuiltInKindParent {
     api_version: API_VERSION_V1ALPHA1,
     kind: USER_KIND,
 };
 
-const CONTROLLER_PARENT: IdentityKindParent = IdentityKindParent {
+const CONTROLLER_PARENT: BuiltInKindParent = BuiltInKindParent {
     api_version: API_VERSION_V1ALPHA1,
     kind: CONTROLLER_KIND,
 };
 
-const GROUP_PARENT: IdentityKindParent = IdentityKindParent {
+const GROUP_PARENT: BuiltInKindParent = BuiltInKindParent {
     api_version: API_VERSION_V1ALPHA1,
     kind: GROUP_KIND,
 };
 
-const SERVICE_ACCOUNT_PARENT: IdentityKindParent = IdentityKindParent {
+const SERVICE_ACCOUNT_PARENT: BuiltInKindParent = BuiltInKindParent {
     api_version: API_VERSION_V1ALPHA1,
     kind: SERVICE_ACCOUNT_KIND,
 };
 
 /// All persisted ADR-0001 identity kinds and their fixed placement.
-pub const IDENTITY_KIND_DEFINITIONS: [IdentityKindDefinition; 8] = [
-    IdentityKindDefinition {
+pub const IDENTITY_KIND_DEFINITIONS: [BuiltInKindDefinition; 8] = [
+    BuiltInKindDefinition {
         api_version: API_VERSION_V1ALPHA1,
         kind: USER_KIND,
         collection: USER_COLLECTION,
         parent: None,
     },
-    IdentityKindDefinition {
+    BuiltInKindDefinition {
         api_version: API_VERSION_V1ALPHA1,
         kind: USER_IDENTITY_KIND,
         collection: USER_IDENTITY_COLLECTION,
         parent: Some(USER_PARENT),
     },
-    IdentityKindDefinition {
+    BuiltInKindDefinition {
         api_version: API_VERSION_V1ALPHA1,
         kind: CONTROLLER_KIND,
         collection: CONTROLLER_COLLECTION,
         parent: None,
     },
-    IdentityKindDefinition {
+    BuiltInKindDefinition {
         api_version: API_VERSION_V1ALPHA1,
         kind: CONTROLLER_TRUST_POLICY_KIND,
         collection: CONTROLLER_TRUST_POLICY_COLLECTION,
         parent: Some(CONTROLLER_PARENT),
     },
-    IdentityKindDefinition {
+    BuiltInKindDefinition {
         api_version: API_VERSION_V1ALPHA1,
         kind: GROUP_KIND,
         collection: GROUP_COLLECTION,
         parent: Some(ORGANIZATION_PARENT),
     },
-    IdentityKindDefinition {
+    BuiltInKindDefinition {
         api_version: API_VERSION_V1ALPHA1,
         kind: GROUP_MEMBERSHIP_KIND,
         collection: GROUP_MEMBERSHIP_COLLECTION,
         parent: Some(GROUP_PARENT),
     },
-    IdentityKindDefinition {
+    BuiltInKindDefinition {
         api_version: API_VERSION_V1ALPHA1,
         kind: SERVICE_ACCOUNT_KIND,
         collection: SERVICE_ACCOUNT_COLLECTION,
         parent: Some(ORGANIZATION_PARENT),
     },
-    IdentityKindDefinition {
+    BuiltInKindDefinition {
         api_version: API_VERSION_V1ALPHA1,
         kind: SERVICE_ACCOUNT_TRUST_POLICY_KIND,
         collection: SERVICE_ACCOUNT_TRUST_POLICY_COLLECTION,
@@ -271,6 +248,11 @@ impl ExternalSubject {
         if value.trim().is_empty() {
             return Err(ValidationError::new("external subject must not be blank"));
         }
+        if value.contains('\0') {
+            return Err(ValidationError::new(
+                "external subject must not contain U+0000",
+            ));
+        }
         if value.chars().count() > MAX_EXTERNAL_SUBJECT_CHARS {
             return Err(ValidationError::new(format!(
                 "external subject must not exceed {MAX_EXTERNAL_SUBJECT_CHARS} characters"
@@ -315,7 +297,10 @@ impl JsonSchema for ExternalSubject {
             "type": "string",
             "minLength": 1,
             "maxLength": MAX_EXTERNAL_SUBJECT_CHARS,
-            "pattern": ".*\\S.*"
+            "allOf": [
+                { "pattern": ".*\\S.*" },
+                { "pattern": "^[^\\u0000]*$" }
+            ]
         })
     }
 }
