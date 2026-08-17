@@ -1527,3 +1527,114 @@ async fn a_scope_matches_only_its_own_subtree() {
         assert!(!tree.covered_by(&scope.parse().unwrap()), "{scope}");
     }
 }
+
+/// ADR-0001 §6.5 — an organization redefines what ownership means for itself.
+///
+/// The seeded ownership binding is wildcard-scoped, so §1's replacement rule lets
+/// an org-parented binding for the same authored subject and selector key
+/// *replace* it outright inside that organization rather than union with it. Two
+/// properties are load-bearing and neither is obvious: replacement crosses tiers
+/// (an org binding supersedes a platform one), and it is confined to the
+/// organization that authored it — every other org stays on the default.
+#[tokio::test]
+async fn an_org_binding_replaces_the_platform_ownership_default_for_its_own_org() {
+    let mut builder = StoreBuilder::new();
+    let acme = builder.resource(ORGANIZATION, "acme", None);
+    let other = builder.resource(ORGANIZATION, "other", None);
+    let acme_app = builder.labeled(
+        PROJECT,
+        "web",
+        Some(acme),
+        &[("rise.dev/owner", "group:platform")],
+    );
+    let other_app = builder.labeled(
+        PROJECT,
+        "theirs",
+        Some(other),
+        &[("rise.dev/owner", "group:platform")],
+    );
+
+    // The shipped platform default: owners may read and write.
+    builder.role(
+        PLATFORM_ROLE,
+        "resource-owner",
+        None,
+        json!([{ "effect": "Allow", "kinds": "*", "verbs": ["get", "list", "update", "delete"] }]),
+    );
+    builder.binding(
+        PLATFORM_ROLE_BINDING,
+        "resource-owner",
+        None,
+        json!({
+            "subject": "${ref.subject}",
+            "subjectMembership": "ResourceOrganization",
+            "scope": "*",
+            "labelSelector": { "key": "rise.dev/owner" },
+            "roleRef": { "kind": "PlatformRole", "name": "resource-owner" }
+        }),
+    );
+
+    // acme's override: read-only ownership. Same authored subject, same selector
+    // key, non-wildcard scope — so it replaces the default for acme.
+    builder.role(
+        ROLE,
+        "project-viewer",
+        Some(acme),
+        json!([{ "effect": "Allow", "kinds": "*", "verbs": ["get", "list"] }]),
+    );
+    builder.binding(
+        ROLE_BINDING,
+        "acme-ownership-override",
+        Some(acme),
+        json!({
+            "subject": "${ref.subject}",
+            "scope": "rise.dev/Organization/acme",
+            "labelSelector": { "key": "rise.dev/owner" },
+            "roleRef": { "kind": "Role", "name": "project-viewer" }
+        }),
+    );
+
+    let store = builder.build();
+    // One User who owns a resource in each organization.
+    let engine = engine(
+        store,
+        FakeMemberships::groups(&["group:acme/platform", "group:other/platform"]),
+    );
+    let owner = snapshot_for(&engine, "user:olive").await;
+
+    // In acme the override governs: reads survive, writes do not.
+    assert_eq!(
+        decide(
+            &engine,
+            &owner,
+            acme_app,
+            &tuple(Verb::Get, "rise.dev/Project")
+        )
+        .await,
+        Decision::Allow
+    );
+    assert_eq!(
+        decide(
+            &engine,
+            &owner,
+            acme_app,
+            &tuple(Verb::Update, "rise.dev/Project")
+        )
+        .await,
+        Decision::Deny,
+        "the org override replaces the platform default rather than unioning with it"
+    );
+
+    // The other organization is untouched by acme's decision.
+    assert_eq!(
+        decide(
+            &engine,
+            &owner,
+            other_app,
+            &tuple(Verb::Update, "rise.dev/Project")
+        )
+        .await,
+        Decision::Allow,
+        "replacement is confined to the organization that authored the override"
+    );
+}

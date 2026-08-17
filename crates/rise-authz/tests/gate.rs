@@ -1642,3 +1642,65 @@ async fn admin_access_is_independent_of_ownership_labels() {
         outcome.rejections
     );
 }
+
+/// The delegation recipe for a group manager who is neither an operator, an org
+/// admin, nor a member of the Group they administer.
+///
+/// The gate asks whether the writer holds what joining the Group confers, which
+/// for the seeded ownership rule is `resource-owner` over that Group's ownership
+/// domain. An explicit binding pinning `rise.dev/owner` to that Group's value
+/// supplies exactly that domain — so the same write is refused without it and
+/// permitted with it, and the binding is demonstrably what makes the difference.
+#[tokio::test]
+async fn an_explicit_ownership_grant_lets_a_non_member_manage_group_membership() {
+    // `grant` decides whether team-leads are handed the ownership domain.
+    async fn attempt(grant: bool) -> GateOutcome {
+        let mut builder = StoreBuilder::new();
+        seeded_ownership(&mut builder);
+        let acme = builder.resource(ORGANIZATION, "acme", None);
+        builder.labeled(PROJECT, "web", Some(acme), &[(OWNER_KEY, "group:platform")]);
+        if grant {
+            builder.binding(
+                ROLE_BINDING,
+                "leads-hold-platform-ownership",
+                Some(acme),
+                json!({
+                    "subject": "group:acme/team-leads",
+                    "scope": "rise.dev/Organization/acme",
+                    "labelSelector": { "key": OWNER_KEY, "value": "group:platform" },
+                    "roleRef": { "kind": "PlatformRole", "name": "resource-owner" }
+                }),
+            );
+        }
+        let store = builder.build();
+        // Lee manages the Group without belonging to it and is not an admin.
+        let engine = engine(store, FakeMemberships::groups(&["group:acme/team-leads"]));
+        let lee = snapshot(&engine, principal("user:lee")).await;
+        gate(
+            &engine,
+            &lee,
+            AuthorizationChange::GroupMembership(GroupMembershipChange {
+                user: "user:newcomer".parse().expect("valid subject"),
+                group: "group:acme/platform".parse().expect("valid subject"),
+            }),
+        )
+        .await
+    }
+
+    let without = attempt(false).await;
+    assert!(
+        !without.permitted(),
+        "a non-member, non-admin holds none of what joining the Group confers"
+    );
+
+    let with = attempt(true).await;
+    assert!(
+        with.permitted(),
+        "the pinned ownership grant covers the claim's domain exactly, got {:?}",
+        with.rejections
+    );
+    assert!(
+        !with.claims.is_empty(),
+        "the write was still gated, not skipped"
+    );
+}
