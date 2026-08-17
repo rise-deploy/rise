@@ -54,6 +54,22 @@ Controller tokens cannot perform item-level PUT or other operator operations.
 
 Operators have full, unrestricted access to all resource API endpoints including the `status` and `finalizers` subresources. When an operator updates finalizers, controller ownership checks are bypassed — this is the intended recovery path for stuck cascade deletions when a controller has been deprovisioned. All operator subresource writes are audit-logged.
 
+### Seeded baseline policy
+
+Startup seeds five root policy resources, described by [ADR-0001](/operator-docs/adr/0001-unified-permission-model/). They exist and are inspectable today; nothing consults them yet, because the API is still operator-gated.
+
+| Resource | Grants | Mutability |
+|---|---|---|
+| `PlatformRole/system-admin` | every verb on every kind and subresource | immutable |
+| `PlatformRoleBinding/system-admin` | `system-admin` to `system:operators` | immutable |
+| `PlatformRole/org-admin` | the global org-admin baseline | operator-editable |
+| `PlatformRole/resource-owner` | `get`, `list`, `update`, `delete` — no `create`, no subresources | operator-editable |
+| `PlatformRoleBinding/resource-owner` | `resource-owner` to whoever `rise.dev/owner` names | operator-editable |
+
+The two immutable rows are not the *source* of operator authority — the evaluator hardcodes that so the guarantee survives a bad restore or a direct database write. They are its only inspectable record, which is why the store refuses to update or delete them, and why a startup that finds one diverged fails with instructions rather than silently rewriting it. Deleting an editable default is safe: the next restart re-seeds it.
+
+Editing `org-admin` changes what administrators may do in every organization, never *who* they are — admin standing comes from an exact org-root, scope-only `RoleBinding`, so no label or Group name can confer it. Editing `resource-owner` changes what ownership means platform-wide; an organization can instead override the default for itself with its own binding on the same `(subject, label key)` pair.
+
 ## Resource Definitions
 
 `ResourceDefinition` declares the group, kind, plural, versions, storage version, and parent type for a collection.

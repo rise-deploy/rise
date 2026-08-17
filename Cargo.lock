@@ -4180,7 +4180,7 @@ dependencies = [
  "rise-resource-api",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "uuid",
 ]

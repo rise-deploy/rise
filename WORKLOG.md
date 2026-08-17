@@ -52,12 +52,20 @@ scope and avoiding dead-end compatibility layers.
    org-admin classification, effective labels, tier filtering, per-item list
    filtering, request-local snapshots, and explain/audit foundations. Split into
    8a (generic label and ancestry store surface) and 8b (the engine itself).
-9. **Planned — mutation grant gate and seeded policy.** Add serializable
-   authorization-changing writes, label-subtree deltas, bootstrap policy, and
-   the centralized generic-resource authorization choke point.
+9. **Split into 9a and 9b — mutation grant gate, seeded policy, and the choke
+   point.** 9a (implemented) is the gate itself plus the shipped baseline
+   policy: ADR-0001 §5's effective-delta subset check over policy domains,
+   §6.6's label gate and its K-inheriting subtree store read, and the seeded
+   `system-admin`/`resource-owner`/`org-admin` data. Nothing consults it yet,
+   mirroring 8b. 9b is the centralized choke point replacing `require_operator`,
+   the `SERIALIZABLE` write path with bounded retry, and list projection — plus
+   the live `MembershipResolver`, pulled forward from increment 10 so the choke
+   point has a real principal to build a snapshot from.
 10. **Planned — identity authentication and token convergence.** Add live
    User/UserIdentity resolution, operator selection/JIT, target-bound workload
    exchange, delegated `/token`, UID checks, caps, and actor-chain handling.
+   The live `MembershipResolver` moved to 9b; `authorization_details` parsing
+   stays here.
 11. **Planned — full conformance and finalization.** Close every applicable
    ADR-0001 acceptance scenario, update documentation/status, and audit the
    implementation requirement by requirement.
@@ -681,3 +689,129 @@ scope and avoiding dead-end compatibility layers.
     still need to remove their finalizers. The one real gap is `create` below a
     deleting ancestor, now tracked under `ROADMAP.md` § Resource API
     maturation, as a lifecycle rule rather than an authorization one.
+
+## Increment 9a — the write-time grant gate and seeded policy
+
+- State: implemented on this branch; not yet reviewed.
+- Branch: `claude/milestone-9-l6139m`.
+- First half of increment 9: ADR-0001 §5's grant gate and §6.6's label gate as a
+  Tier-1 module (`rise-authz::engine::gate`) beside the evaluator, plus the
+  shipped baseline policy as data. No enforcement change.
+- Acceptance criteria:
+  - One comparison serves every authorization-changing write. A change produces
+    `GrantClaim`s — recipient, domain, before policy, after policy — and each is
+    checked against the writer's own authority over that domain. Role bodies,
+    binding create/edit/move/delete, GroupMembership, identity mappings, and
+    access-driving labels all reduce to claims.
+  - The comparison folds in the writer's credential ceiling. Tier 0 gained
+    `unjustified_new_tuples_under_ceiling`, so an intersection that a flat
+    statement list cannot express is applied tuple-wise where the algebra
+    already enumerates equivalence classes.
+  - `ResourceStore::label_inheriting_descendants` returns the K-inheriting
+    subtree in one `WITH RECURSIVE` pass, pruning at any node that sets the key.
+  - Concrete-scope containment resolves through the registered parent chain
+    rather than string equality, so an Organization-scoped writer covers a grant
+    on a Project beneath it.
+  - `PlatformRole/system-admin` and its `system:operators` binding are seeded,
+    immutable through the API, and healed when missing; `resource-owner`,
+    `org-admin`, and the ownership binding are shipped defaults that seeding
+    never overwrites.
+  - No behavior change: `require_operator` is untouched and nothing calls the
+    gate.
+- Decisions:
+  - **Recipients are authored subjects, not expanded identities.** A claim's
+    recipient is the `subject` a binding literally carries. Expanding a
+    recipient's Groups could only reveal authority they already hold, which
+    shrinks the delta — the unsafe direction on a gate. It also keeps the gate
+    off a second membership seam, which is the fact that changes fastest.
+  - **One exception, where the arrow reverses.** An identity mapping makes the
+    parent identity's *whole* policy reachable, so leaving out its Group ties
+    would understate the delta. `MembershipResolver` gained `groups_for_user`
+    for exactly that case.
+  - **Provable reach, not exact-subject reach, on aggregation.** Authored-subject
+    equality alone fails ADR-0001 scenario 29: a capped admin must be able to
+    appoint another admin under the same platform Deny, and that Deny arrives
+    through `org:acme`, not the appointee's name. Aggregation therefore includes
+    `system:authenticated`, and `org:<O>` where the recipient's affiliation is
+    provable — an org-native subject, or §5's direct admin bootstrap edge. It
+    never consults live membership. Mis-modelling a Deny present in *both*
+    universes cannot manufacture a grant, because it suppresses the tuple on
+    both sides; a Deny the write itself changes belongs to a changed binding,
+    whose subject is the claim's recipient by construction.
+  - **`subjectMembership` is modelled as part of the domain, not the
+    statements.** `ResourceOrganization` narrows which resources a binding
+    reaches. An unclamped domain covers its clamped twin and never the reverse,
+    which is what makes relaxing the clamp to `Any` register as the grant §5 says
+    it is instead of a no-op diff.
+  - **The writer's side is measured on the before-state.** For a label write the
+    delta is computed over the domain the new value creates, while the writer is
+    measured over the same resource with the *old* value pinned. Without that
+    split, a resource's current owner — whose access arrives through the very
+    label being replaced — could not transfer ownership, which §6.6 explicitly
+    requires to work.
+  - **Asymmetric containment.** An Allow counts toward the writer only when its
+    domain provably covers the claim's; a Deny counts against them unless its
+    domain provably misses it. Tier 0 gained `domains_provably_disjoint_with`
+    for the second half, since `domain_covers` alone cannot express it.
+  - **Binding universes fan out rather than guess.** Editing a `PlatformRole`,
+    or writing a wildcard-scoped platform binding, can reach every organization;
+    under-loading a tier would drop its Denies, and a missing Deny makes the
+    before-policy look larger. `OrganizationScope::All` pays for the cold path.
+  - **Scope containment consults the registry.** A scope names its leaf kind and
+    its names but not the kinds between, so a prefix rule alone would let a
+    scope naming a nonexistent resource claim coverage of a real one. Chains are
+    resolved once per comparison into a `ScopeLattice`, keeping the predicate
+    pure and the aggregation synchronous.
+  - **The reserved-subject rule moved to admission.** `system:operators` used to
+    be rejected in context-free `normalize()`, which made the seed unwritable
+    through its own contract. Enforcing it needs the resource's name and
+    placement, so it now lives in transaction-scoped admission — authoritative
+    for direct store calls too — as "only the root binding named `system-admin`,
+    and only with its shipped body".
+  - **Immutable seeds fail startup rather than self-heal on divergence.** The
+    store refuses edits and deletes, so a divergent row can only come from a
+    direct database write. Repair would need a privileged path around the very
+    rules that keep the rows fixed; an actionable error is more honest.
+  - **Writer-side facts load once per call, not once per claim.** A §6.6 subtree
+    diff produces one claim per inheriting descendant, and each measures the
+    writer over its own domain, so a per-claim reload multiplied a cold path by
+    the size of the subtree. The tiers, registry chains, and per-scope
+    organizations are resolved together once the claims are known, and an ungated
+    write — no claims — costs no reads at all. Nothing is cached beyond the call:
+    a gate decision must see current facts.
+- Verification:
+  - `cargo fmt --all` and `cargo clippy --workspace --all-features --all-targets
+    -- -D warnings` pass.
+  - `cargo test --workspace --all-features -- --test-threads=1` passes: 1,195
+    tests, with two ignored documentation examples.
+  - Generated resource, backend-settings, and `rise.toml` schemas are unchanged,
+    and both SQLX offline caches verify clean. `cargo audit` and `helm lint` were
+    not run locally (neither tool is available in this environment); no
+    dependency was added and the chart is untouched, so CI covers both.
+  - The new `rise-authz` gate suite is 23 tests; the engine suite (28) and policy
+    suite (16) are unchanged.
+  - The PostgreSQL-backed store suite is at 91 tests, adding the subtree read's
+    pruning/tombstone/ordering behaviour and the seed's create-once,
+    no-update, no-delete, placement-scoped reservation.
+  - Coverage follows ADR-0001 scenarios 29–32, 34, and 39–43: the capped-admin
+    appointment and its narrow-writer counterpart, per-binding Role-edit spans
+    and the ungated unbound Role, Deny deletion as a grant, exact scope and
+    selector containment plus parent-chain containment, clamp relaxation,
+    identity mappings including the operator-standing refusal, GroupMembership
+    delegation, ceiling narrowing, the unauthorized owner redirect, owner
+    transfer, the subtree-wide relabel diff with a shadowing sibling excluded,
+    both ungated steps, removing the last owner label in a chain, and the
+    creation exception's four cases.
+  - Scenario 33 (serializable with revocation) is a property of the transaction
+    the gate runs inside, not of the gate; it lands with 9b's write path.
+- Follow-ups this increment deliberately leaves open:
+  - 9b: the choke point replacing `require_operator`, `SERIALIZABLE` writes with
+    bounded retry, list projection (scenarios 37/38), the live
+    `MembershipResolver`, and Organization creation as one atomic transaction
+    with its org-admin binding.
+  - `GateRejection`'s witnesses include synthetic probe kinds from Tier 0's
+    equivalence-class enumeration (`policy-subset-probe.invalid/…`). They mean
+    "any other kind" and are correct as data, but 9b's HTTP layer must render
+    them rather than echo them.
+  - `Explanation` and `GateRejection` both name bindings and Roles the caller may
+    hold no read access to. 9b decides what a denial actually returns.

@@ -12,6 +12,7 @@
 //! request, with nothing carried in a token.
 
 mod bindings;
+mod gate;
 mod membership;
 mod principal;
 mod tree;
@@ -32,6 +33,11 @@ use crate::policy::{
 };
 
 pub use bindings::{BindingKind, BindingProvenance, RoleReference};
+pub use gate::{
+    AuthorizationChange, BindingChange, BindingState, GateDomain, GateOutcome, GateRejection,
+    GrantClaim, GroupMembershipChange, IdentityMappingChange, LabelChange, RejectionReason,
+    RoleBodyChange,
+};
 pub use membership::{MembershipResolver, PrincipalMembership};
 pub use principal::{AuthenticatedPrincipal, AuthorizationCap, CapEntry, CapPermission};
 pub use tree::{ResourceNode, ResourceTree};
@@ -43,7 +49,10 @@ use bindings::{load_organization_bindings, load_platform_bindings, BindingFact};
 /// The predicate is structural: it reads this reference, the binding's
 /// placement, and its scope — never the Role's current statements. An operator
 /// editing the Role changes what admins may do, not who they are.
-pub const ORG_ADMIN_PLATFORM_ROLE: &str = "org-admin";
+///
+/// Re-exported from the resource API so the evaluator and the seeded row can
+/// never disagree about the name.
+pub use rise_resource_api::ORG_ADMIN_PLATFORM_ROLE;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthorizationError {
@@ -63,6 +72,10 @@ pub enum AuthorizationError {
 
 impl AuthorizationError {
     pub(crate) fn invalid_target(message: impl Into<String>) -> Self {
+        Self::InvalidInput(message.into())
+    }
+
+    pub(crate) fn invalid_input(message: impl Into<String>) -> Self {
         Self::InvalidInput(message.into())
     }
 

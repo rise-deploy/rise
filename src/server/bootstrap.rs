@@ -63,6 +63,10 @@ pub struct BootstrapOutcome {
     /// typed-row backfill.
     #[allow(dead_code)]
     pub memberships_backfilled: u64,
+    /// Number of baseline policy resources this pass created. Zero on every boot
+    /// after the first, unless an operator deleted an editable default.
+    #[allow(dead_code)]
+    pub policies_seeded: u64,
 }
 
 /// Bootstrap entry point. Idempotent and concurrency-safe; safe to invoke on
@@ -135,7 +139,14 @@ async fn run_inner(
         );
     }
 
-    // Step 3: validate.
+    // Step 3: seed ADR-0001's baseline authorization policy. Root-parented, so
+    // it does not depend on the Organization above, but it runs under the same
+    // advisory lock so concurrent replicas do not race to create it.
+    let policies_seeded = crate::server::policy_seed::run(store)
+        .await
+        .context("Seeding baseline authorization policy failed")?;
+
+    // Step 4: validate.
     //
     // We only fail startup once a full backfill pass has completed — a
     // process crash mid-backfill leaves some rows unlinked, but the next
@@ -148,6 +159,7 @@ async fn run_inner(
         teams_backfilled,
         projects_backfilled,
         memberships_backfilled,
+        policies_seeded,
     })
 }
 

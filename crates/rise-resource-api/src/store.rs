@@ -289,6 +289,26 @@ pub trait ResourceStore: Send + Sync {
     /// [`Self::resolve_path`], tombstoned rows are returned for the caller to
     /// interpret.
     async fn ancestors(&self, uid: Uuid) -> Result<Vec<ResourceRow>, StoreError>;
+    /// Resolve the strict descendants of `uid` that inherit its effective value
+    /// for one label key — the resource's *K-inheriting subtree*.
+    ///
+    /// A descendant that sets `label_key` itself supplies its own value under
+    /// nearest-wins resolution (ADR-0001 §6.1), so it and everything beneath it
+    /// are excluded: the walk stops at the first node that shadows the key.
+    /// `uid` itself is never included.
+    ///
+    /// This is the surface ADR-0001 §6.6's write gate needs. Relabelling a
+    /// resource changes the effective value on exactly this set, so the gate's
+    /// before/after authority diff has to span it rather than the written
+    /// resource alone. Rows come back parent-before-child and include
+    /// tombstoned resources, matching [`Self::ancestors`]: a resource still
+    /// draining is still addressable, and omitting it would under-report the
+    /// delta.
+    async fn label_inheriting_descendants(
+        &self,
+        uid: Uuid,
+        label_key: &str,
+    ) -> Result<Vec<ResourceRow>, StoreError>;
     /// Merge one allowed controller's value under `status.controllers`.
     async fn update_controller_status(
         &self,

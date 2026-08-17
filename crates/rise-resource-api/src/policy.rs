@@ -45,6 +45,122 @@ pub const POLICY_KIND_DEFINITIONS: [BuiltInKindDefinition; 4] = [
     },
 ];
 
+/// The `PlatformRole` whose authority the evaluator guarantees operators
+/// unconditionally, seeded together with its `system:operators` binding.
+///
+/// Both are immutable through the resource API (ADR-0001 §5): the guarantee has
+/// to survive a bad restore or a direct database write, so it is hardcoded in the
+/// evaluator and these rows exist to make the same fact inspectable, never to be
+/// the source of it.
+pub const SYSTEM_ADMIN_PLATFORM_ROLE: &str = "system-admin";
+/// The shipped `PlatformRole` ADR-0001 §6.2's ownership binding delivers.
+/// Operator-editable: changing it changes what ownership means platform-wide.
+pub const RESOURCE_OWNER_PLATFORM_ROLE: &str = "resource-owner";
+/// The shipped `PlatformRole` whose exact org-root binding confers org-admin
+/// standing (ADR-0001 §5). Operator-editable: changing it changes the global
+/// admin baseline for every organization, but never *who* is an admin.
+pub const ORG_ADMIN_PLATFORM_ROLE: &str = "org-admin";
+/// The reserved attribution label key (ADR-0001 §6.1). It carries no
+/// authorization semantics of its own; the seeded ownership binding's
+/// `labelSelector` is what makes it access-relevant.
+pub const OWNER_LABEL_KEY: &str = "rise.dev/owner";
+/// The virtual subject reserved for the seeded bootstrap binding.
+pub const OPERATORS_SUBJECT: &str = "system:operators";
+
+/// The root-parented policy rows that must not be edited or deleted through the
+/// resource API, as `(kind, name)` pairs.
+pub const IMMUTABLE_POLICY_SEEDS: [(&str, &str); 2] = [
+    (PLATFORM_ROLE_KIND, SYSTEM_ADMIN_PLATFORM_ROLE),
+    (PLATFORM_ROLE_BINDING_KIND, SYSTEM_ADMIN_PLATFORM_ROLE),
+];
+
+/// Whether a root-parented policy row is one of the immutable seeds.
+///
+/// Placement is part of the identity: only the root rows are reserved, so an
+/// organization's own `Role` named `system-admin` is ordinary data.
+pub fn is_immutable_policy_seed(kind: &str, name: &str) -> bool {
+    IMMUTABLE_POLICY_SEEDS
+        .iter()
+        .any(|(seed_kind, seed_name)| *seed_kind == kind && *seed_name == name)
+}
+
+/// Build a shipped default from its literal declaration.
+///
+/// The seeds are written as the JSON an operator would see, then parsed through
+/// the same closed contract every caller uses. That keeps the shipped policy and
+/// the accepted grammar from drifting: a default that no longer parses fails
+/// here, at startup, rather than becoming a row nothing can read back.
+fn shipped<T: for<'de> Deserialize<'de>>(value: serde_json::Value) -> T {
+    serde_json::from_value(value).expect("shipped policy default parses")
+}
+
+/// `{ Allow: * on * }`, main resources and subresources alike.
+///
+/// Two statements, because `kinds: "*"` covers the main resource only: a Role
+/// that needs both writes both (ADR-0001 §3).
+fn allow_everything() -> serde_json::Value {
+    serde_json::json!([
+        { "effect": "Allow", "kinds": "*", "verbs": "*" },
+        { "effect": "Allow", "kinds": "*", "verbs": "*", "subresources": "*" }
+    ])
+}
+
+/// `PlatformRole/system-admin` — the complete permission, immutable.
+pub fn system_admin_role_spec() -> RoleSpec {
+    shipped(serde_json::json!({ "statements": allow_everything() }))
+}
+
+/// `PlatformRole/org-admin` — the shipped global admin baseline (ADR-0001 §5).
+///
+/// Allow-only as shipped, but an ordinary Role body: an operator may edit it, and
+/// a Deny added here is org-tier when delivered through a qualifying org binding
+/// and is therefore ignored by the very admin it establishes. Per-org and
+/// instance-wide admin ceilings are operator-authored platform Denies instead.
+pub fn org_admin_role_spec() -> RoleSpec {
+    shipped(serde_json::json!({ "statements": allow_everything() }))
+}
+
+/// `PlatformRole/resource-owner` — ADR-0001 §6.2's shipped ownership role.
+///
+/// Deliberately excludes `create` and every subresource: ownership alone never
+/// grants the ability to update `/status` or `/finalizers`, mint a token for an
+/// owned ServiceAccount, or create child resources.
+pub fn resource_owner_role_spec() -> RoleSpec {
+    shipped(serde_json::json!({
+        "statements": [{
+            "effect": "Allow",
+            "kinds": "*",
+            "verbs": ["get", "list", "update", "delete"]
+        }]
+    }))
+}
+
+/// The seeded `system:operators` → `system-admin` binding, immutable.
+pub fn system_admin_binding_spec() -> PlatformRoleBindingSpec {
+    shipped(serde_json::json!({
+        "subject": OPERATORS_SUBJECT,
+        "subjectMembership": "Any",
+        "scope": "*",
+        "roleRef": { "kind": "PlatformRole", "name": SYSTEM_ADMIN_PLATFORM_ROLE }
+    }))
+}
+
+/// ADR-0001 §6.2's default ownership rule, as one seeded dynamic binding.
+///
+/// `subjectMembership: ResourceOrganization` keeps the grant live only while the
+/// named User remains affiliated with the resource's organization, and the
+/// wildcard scope is what lets an organization *replace* the default for itself
+/// under §1's wildcard-replacement rule (§6.5) rather than merely union with it.
+pub fn resource_owner_binding_spec() -> PlatformRoleBindingSpec {
+    shipped(serde_json::json!({
+        "subject": "${ref.subject}",
+        "subjectMembership": "ResourceOrganization",
+        "scope": "*",
+        "labelSelector": { "key": OWNER_LABEL_KEY },
+        "roleRef": { "kind": "PlatformRole", "name": RESOURCE_OWNER_PLATFORM_ROLE }
+    }))
+}
+
 macro_rules! string_serde {
     ($type:ty) => {
         impl Serialize for $type {
@@ -727,18 +843,18 @@ impl PlatformRoleBindingSpec {
     }
 }
 
+/// Syntax-level subject/selector agreement.
+///
+/// `system:operators` is deliberately *not* rejected here. It is reserved for the
+/// seeded bootstrap binding, but enforcing that needs the resource's name and
+/// placement — facts this context-free parse cannot see — so the reservation
+/// lives in transaction-scoped admission, which is authoritative for direct store
+/// calls too. Rejecting it here as well would make the seed unwritable through
+/// its own contract.
 fn validate_subject_selector(
     subject: &BindingSubject,
     selector: Option<&LabelSelector>,
 ) -> Result<(), ValidationError> {
-    if subject
-        .literal()
-        .is_some_and(|subject| subject.as_ref() == "system:operators")
-    {
-        return Err(ValidationError::new(
-            "system:operators is reserved for the seeded bootstrap binding",
-        ));
-    }
     match (subject.is_dynamic(), selector) {
         (true, None) => Err(ValidationError::new(
             "a dynamic subject requires labelSelector",

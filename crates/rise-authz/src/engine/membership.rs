@@ -29,4 +29,26 @@ pub trait MembershipResolver: Send + Sync {
         &self,
         principal: &AuthenticatedPrincipal,
     ) -> Result<PrincipalMembership, AuthorizationError>;
+
+    /// The live Group ties of a User who is not the caller.
+    ///
+    /// The grant gate needs this for one case: adding or retargeting an identity
+    /// mapping makes the *whole* effective policy of the mapped User reachable
+    /// through a new credential (ADR-0001 §5), and that policy includes whatever
+    /// the User's Groups grant. Aggregating only the bindings that name the User
+    /// directly would under-report the delta, which on a gate is the unsafe
+    /// direction.
+    ///
+    /// Everywhere else the gate deliberately avoids expanding a recipient's
+    /// membership: over-reporting a delta only blocks writes, so authored-subject
+    /// aggregation is both cheaper and fail-closed. This method exists for the
+    /// one shape where the arrow points the other way.
+    ///
+    /// `user` must be a canonical `user:<name>` subject. Implementations return
+    /// canonical `group:<org>/<name>` subjects and must not report a tie for an
+    /// unknown or inactive User.
+    async fn groups_for_user(
+        &self,
+        user: &SubjectId,
+    ) -> Result<BTreeSet<SubjectId>, AuthorizationError>;
 }

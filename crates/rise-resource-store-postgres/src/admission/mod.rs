@@ -22,7 +22,8 @@ mod policy;
 mod reference;
 
 use rise_resource_api::{
-    CreateResourceParams, SpecValidator, StoreError, UpdateResourceParams, ValidationError,
+    is_immutable_policy_seed, CreateResourceParams, SpecValidator, StoreError,
+    UpdateResourceParams, ValidationError,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use sqlx::PgConnection;
@@ -73,7 +74,13 @@ impl BuiltInAdmission {
             Self::Identity(admission) => admission.admit_create_context(conn, params).await,
             Self::Policy(admission) => {
                 params.spec = admission
-                    .admit_context(conn, builtins, params.parent_uid, &params.spec)
+                    .admit_context(
+                        conn,
+                        builtins,
+                        params.parent_uid,
+                        &params.name,
+                        &params.spec,
+                    )
                     .await?;
                 Ok(())
             }
@@ -97,7 +104,13 @@ impl BuiltInAdmission {
             }
             Self::Policy(admission) => {
                 params.spec = admission
-                    .admit_context(conn, builtins, current.parent_uid, &params.spec)
+                    .admit_context(
+                        conn,
+                        builtins,
+                        current.parent_uid,
+                        &current.name,
+                        &params.spec,
+                    )
                     .await?;
                 Ok(())
             }
@@ -113,10 +126,26 @@ impl BuiltInAdmission {
     ) -> Result<(), StoreError> {
         match self {
             Self::Identity(admission) => admission.validate_update_immutable(current, params),
-            // Policy specs carry no immutable fields: ADR-0001 governs binding
+            // Policy specs carry no immutable *fields*: ADR-0001 governs binding
             // and Role edits through the write-time grant gate, which evaluates
             // the effective before/after delta rather than freezing fields.
-            Self::Policy(_) => Ok(()),
+            //
+            // Two whole rows are the exception. `PlatformRole/system-admin` and
+            // its `system:operators` binding are seeded and fixed (§5), so no
+            // update reaches them — not even one that leaves the spec alone,
+            // since a label or annotation on the row the platform points at as
+            // "this is what operators hold" is content too.
+            Self::Policy(_) => {
+                if current.parent_uid.is_none()
+                    && is_immutable_policy_seed(&current.kind, &current.name)
+                {
+                    return Err(StoreError::Validation(format!(
+                        "{} '{}' is seeded and immutable and cannot be updated",
+                        current.kind, current.name
+                    )));
+                }
+                Ok(())
+            }
         }
     }
 }

@@ -207,16 +207,75 @@ fn binding_normalization_is_contextual_and_fail_closed() {
     .unwrap();
     assert!(static_exists_selector.normalize().is_err());
 
+    // `system:operators` parses and normalizes: it is the subject of the seeded
+    // bootstrap binding, which has to be writable through this same contract.
+    // Reserving it to that one root binding needs the resource's name and
+    // placement, which this context-free step cannot see, so the reservation
+    // lives in transaction-scoped admission instead.
     let reserved_platform: PlatformRoleBindingSpec =
         serde_json::from_value(platform_binding("system:operators")).unwrap();
-    assert!(reserved_platform.normalize().is_err());
+    let normalized = reserved_platform
+        .normalize()
+        .expect("parses and normalizes");
+    assert_eq!(normalized.subject().to_string(), "system:operators");
 
     let reserved_org: RoleBindingSpec = serde_json::from_value(json!({
         "subject": "system:operators",
         "roleRef": { "kind": "PlatformRole", "name": "system-admin" }
     }))
     .unwrap();
-    assert!(reserved_org.normalize("acme").is_err());
+    assert!(reserved_org.normalize("acme").is_ok());
+}
+
+/// The shipped defaults must round-trip through the closed contracts they are
+/// written against, so a default that drifts out of the grammar fails here
+/// rather than becoming a row nothing can read back.
+#[test]
+fn shipped_policy_defaults_parse_and_normalize() {
+    use rise_resource_api::{
+        is_immutable_policy_seed, org_admin_role_spec, resource_owner_binding_spec,
+        resource_owner_role_spec, system_admin_binding_spec, system_admin_role_spec,
+        PLATFORM_ROLE_BINDING_KIND, PLATFORM_ROLE_KIND, RESOURCE_OWNER_PLATFORM_ROLE,
+        SYSTEM_ADMIN_PLATFORM_ROLE,
+    };
+
+    // Both bindings normalize, which is the form the store persists.
+    let system_admin = system_admin_binding_spec().normalize().unwrap();
+    assert_eq!(system_admin.scope().as_ref(), "*");
+    assert_eq!(system_admin.role_ref().name, SYSTEM_ADMIN_PLATFORM_ROLE);
+
+    let owner = resource_owner_binding_spec().normalize().unwrap();
+    assert_eq!(owner.scope().as_ref(), "*");
+    assert_eq!(
+        owner
+            .label_selector()
+            .map(|selector| selector.key.to_string()),
+        Some("rise.dev/owner".to_owned())
+    );
+    assert_eq!(owner.role_ref().name, RESOURCE_OWNER_PLATFORM_ROLE);
+
+    // The Role bodies are non-empty, or the seeds would grant nothing.
+    for spec in [
+        system_admin_role_spec(),
+        org_admin_role_spec(),
+        resource_owner_role_spec(),
+    ] {
+        assert!(!spec.statements.is_empty());
+    }
+
+    // Only the operator pair is reserved.
+    assert!(is_immutable_policy_seed(
+        PLATFORM_ROLE_KIND,
+        SYSTEM_ADMIN_PLATFORM_ROLE
+    ));
+    assert!(is_immutable_policy_seed(
+        PLATFORM_ROLE_BINDING_KIND,
+        SYSTEM_ADMIN_PLATFORM_ROLE
+    ));
+    assert!(!is_immutable_policy_seed(
+        PLATFORM_ROLE_KIND,
+        RESOURCE_OWNER_PLATFORM_ROLE
+    ));
 }
 
 #[test]

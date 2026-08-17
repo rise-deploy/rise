@@ -31,6 +31,24 @@ proposed for the next train. Moved into a version section at tag time._
 
 Merged to `develop`:
 
+- **No action required — seeded baseline authorization policy**. Startup now
+  creates five root policy resources described by ADR-0001:
+  `PlatformRole/system-admin` with its `system:operators` binding, and the
+  editable `PlatformRole/org-admin`, `PlatformRole/resource-owner`, and
+  `PlatformRoleBinding/resource-owner` defaults. Seeding is idempotent and never
+  overwrites the three editable rows, so an operator edit survives every restart
+  and a deleted one is re-created on the next.
+
+  Nothing consults them yet — the generic resource API is still operator-gated —
+  so this changes no access. Two of the five are immutable through the API: the
+  resource store refuses to update or delete `PlatformRole/system-admin` or its
+  binding, because they are the inspectable record of operator authority rather
+  than its source (the evaluator hardcodes that, so it survives a bad restore).
+  If startup ever reports one of those two as diverging from its shipped
+  definition, something wrote to `resource_store.resources` directly; the error
+  names the row and the fix is to delete it and restart. No migration and no
+  backfill runs.
+
 - **No action required — generic resource labels**. Resources in the generic
   resource API carry `metadata.labels` alongside `metadata.annotations`. The
   migration adds a column with an empty default, so existing rows and clients

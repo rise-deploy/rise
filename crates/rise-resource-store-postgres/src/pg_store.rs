@@ -3,12 +3,12 @@ use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
 use rise_resource_api::{
-    validate_controller_id, validate_labels, validate_resource_name, CollectionInfo,
-    CreateResourceParams, DeleteOutcome, DeletionBlocker, DeletionBlockerRelationship,
-    DeletionBlockerReport, NoOpValidator, OwnerReference, PathSegment, ResourceDefinitionSpec,
-    ResourceKind, ResourceRow, ResourceStore, SpecValidator, StoreError, UpdateResourceParams,
-    API_VERSION_V1ALPHA1, CASCADE_DELETION_FINALIZER, MAX_PARENT_CHAIN_DEPTH, ORGANIZATION_KIND,
-    RESOURCE_DEFINITION_KIND, SYSTEM_FINALIZER_PREFIX,
+    is_immutable_policy_seed, validate_controller_id, validate_labels, validate_resource_name,
+    CollectionInfo, CreateResourceParams, DeleteOutcome, DeletionBlocker,
+    DeletionBlockerRelationship, DeletionBlockerReport, NoOpValidator, OwnerReference, PathSegment,
+    ResourceDefinitionSpec, ResourceKind, ResourceRow, ResourceStore, SpecValidator, StoreError,
+    UpdateResourceParams, API_VERSION_V1ALPHA1, CASCADE_DELETION_FINALIZER, MAX_PARENT_CHAIN_DEPTH,
+    ORGANIZATION_KIND, RESOURCE_DEFINITION_KIND, SYSTEM_FINALIZER_PREFIX,
 };
 use sqlx::{PgPool, Row};
 
@@ -1283,6 +1283,18 @@ impl ResourceStore for PgResourceStore {
                 .await?;
         }
 
+        // The seeded operator policy is fixed (ADR-0001 §5). Deleting it would
+        // not remove operator authority — that is hardcoded in the evaluator —
+        // but it would remove the only inspectable record of it, so the delete is
+        // refused rather than silently leaving the platform's most privileged
+        // grant undocumented.
+        if row.parent_uid.is_none() && is_immutable_policy_seed(&row.kind, &row.name) {
+            return Err(StoreError::Validation(format!(
+                "{} '{}' is seeded and immutable and cannot be deleted",
+                row.kind, row.name
+            )));
+        }
+
         let tombstoned = Self::tombstone_immediate_dependents(&mut tx, uid).await?;
         let has_blocking_dependents = Self::has_blocking_dependents(&mut tx, uid).await?;
 
@@ -1551,6 +1563,53 @@ impl ResourceStore for PgResourceStore {
             "#,
         )
         .bind(uid)
+        .bind(MAX_PARENT_CHAIN_DEPTH as i32)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Self::db_error)?;
+
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn label_inheriting_descendants(
+        &self,
+        uid: Uuid,
+        label_key: &str,
+    ) -> Result<Vec<ResourceRow>, StoreError> {
+        // The recursion prunes rather than filters: a row carrying `label_key`
+        // is not merely dropped from the result, it terminates that branch,
+        // because its own descendants inherit *its* value and are unaffected by
+        // a write to `uid`. Expressing that as a WHERE on the recursive term is
+        // what makes one query equal to the nearest-wins walk.
+        //
+        // `depth` orders parent-before-child as the contract promises, and caps
+        // the walk at the same bound as `ancestors` so a structure that somehow
+        // exceeds the registered parent-chain depth cannot make this read
+        // unbounded.
+        let rows = sqlx::query_as::<_, PgResourceRow>(
+            r#"
+            WITH RECURSIVE subtree AS (
+                SELECT child.*, 1 AS depth
+                FROM resource_store.resources child
+                WHERE child.parent_uid = $1
+                  AND NOT (child.labels ? $2)
+                UNION ALL
+                SELECT descendant.*, subtree.depth + 1
+                FROM subtree
+                JOIN resource_store.resources descendant
+                  ON descendant.parent_uid = subtree.uid
+                WHERE NOT (descendant.labels ? $2)
+                  AND subtree.depth < $3
+            )
+            SELECT uid, api_version, kind, parent_uid, name, discriminator, labels, metadata,
+                   spec, status, revision, finalizers, owner_references, deletion_timestamp,
+                   created_at, updated_at
+            FROM subtree
+            ORDER BY depth, uid
+            "#,
+        )
+        .bind(uid)
+        .bind(label_key)
         .bind(MAX_PARENT_CHAIN_DEPTH as i32)
         .fetch_all(&self.pool)
         .await

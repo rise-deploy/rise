@@ -14,6 +14,8 @@ pub mod frontend;
 pub mod middleware;
 pub mod oci;
 pub mod platform;
+#[cfg(feature = "backend")]
+pub mod policy_seed;
 pub mod project;
 pub mod quickstart;
 pub mod rate_limit;

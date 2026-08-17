@@ -5,7 +5,7 @@ use rise_resource_api::{
     CONTROLLER_TRUST_POLICY_KIND, GROUP_KIND, GROUP_MEMBERSHIP_KIND, IDENTITY_KIND_DEFINITIONS,
     ORGANIZATION_KIND, PLATFORM_ROLE_BINDING_KIND, PLATFORM_ROLE_KIND, POLICY_KIND_DEFINITIONS,
     RESOURCE_DEFINITION_KIND, ROLE_BINDING_KIND, ROLE_KIND, SERVICE_ACCOUNT_KIND,
-    SERVICE_ACCOUNT_TRUST_POLICY_KIND, USER_IDENTITY_KIND, USER_KIND,
+    SERVICE_ACCOUNT_TRUST_POLICY_KIND, SYSTEM_ADMIN_PLATFORM_ROLE, USER_IDENTITY_KIND, USER_KIND,
 };
 use rise_resource_store_postgres::{
     BuiltInRegistration, BuiltInRegistry, IdentityLookup, MembershipLookup, OrganizationValidator,
@@ -4388,7 +4388,9 @@ async fn policy_admission_normalizes_bindings_and_is_unbypassable(
         );
     }
 
-    // `system:operators` is reserved for the seeded bootstrap binding.
+    // `system:operators` is reserved for the seeded bootstrap binding, and the
+    // reservation is name- and placement-aware: any *other* root binding naming
+    // it is refused.
     let reserved = create_binding(
         &store,
         PLATFORM_ROLE_BINDING_KIND,
@@ -4402,7 +4404,8 @@ async fn policy_admission_normalizes_bindings_and_is_unbypassable(
     .await
     .unwrap_err();
     assert!(
-        matches!(reserved, StoreError::Validation(message) if message.contains("system:operators"))
+        matches!(reserved, StoreError::Validation(message) if message.contains("system:operators")),
+        "expected the reserved-subject rejection"
     );
 
     // A dynamic subject needs a selector to resolve against; a static one
@@ -5494,5 +5497,298 @@ async fn policy_binding_collection_uses_the_parent_scoped_indexes(
                 || platform_plan.contains("resources_root_kind_name_unique")),
         "platform binding collection must be index-served; got:\n{platform_plan}"
     );
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// ADR-0001 §6.6 — the K-inheriting subtree
+// -----------------------------------------------------------------------------
+
+/// The grant gate's subtree read must match nearest-wins label resolution: a
+/// descendant that sets the key supplies its own value, so it and everything
+/// beneath it are unaffected by a write to the ancestor. The recursion has to
+/// *prune* at that node rather than merely skip it.
+#[sqlx::test]
+async fn label_inheriting_descendants_prune_at_a_shadowing_node(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    register_org_widget_rd(&store).await;
+
+    let org = create_labeled(&store, ORGANIZATION_KIND, "acme", None, &[]).await;
+    // Two children: one inherits, one shadows.
+    let inheriting = create_labeled(&store, "OrgWidget", "inheriting", Some(org.uid), &[]).await;
+    let shadowing = create_labeled(
+        &store,
+        "OrgWidget",
+        "shadowing",
+        Some(org.uid),
+        &[("rise.dev/owner", "group:other")],
+    )
+    .await;
+    // A grandchild under each. Only the one below `inheriting` inherits the org's
+    // value; the one below `shadowing` inherits *its* value instead.
+    let deep_inheriting =
+        create_labeled(&store, "OrgWidget", "deep-a", Some(inheriting.uid), &[]).await;
+    let below_shadow =
+        create_labeled(&store, "OrgWidget", "deep-b", Some(shadowing.uid), &[]).await;
+    // A descendant carrying an unrelated key is not shadowing this one.
+    let unrelated_key = create_labeled(
+        &store,
+        "OrgWidget",
+        "unrelated",
+        Some(inheriting.uid),
+        &[("rise.dev/team", "group:x")],
+    )
+    .await;
+
+    let found = store
+        .label_inheriting_descendants(org.uid, "rise.dev/owner")
+        .await
+        .unwrap();
+    let uids: Vec<Uuid> = found.iter().map(|row| row.uid).collect();
+
+    assert!(uids.contains(&inheriting.uid));
+    assert!(uids.contains(&deep_inheriting.uid));
+    assert!(
+        uids.contains(&unrelated_key.uid),
+        "a different label key does not shadow this one"
+    );
+    assert!(
+        !uids.contains(&shadowing.uid),
+        "a node with its own value is excluded"
+    );
+    assert!(
+        !uids.contains(&below_shadow.uid),
+        "the walk prunes at the shadowing node, so its subtree is excluded too"
+    );
+    assert!(
+        !uids.contains(&org.uid),
+        "the written resource itself is never returned"
+    );
+
+    // Rows arrive parent-before-child, which is what lets the caller stitch each
+    // descendant's own ancestry from its parent's.
+    let position = |uid: Uuid| uids.iter().position(|found| *found == uid).unwrap();
+    assert!(position(inheriting.uid) < position(deep_inheriting.uid));
+
+    // Labels ride along, so the caller can resolve each descendant's effective
+    // value without a second read.
+    let carried = found
+        .iter()
+        .find(|row| row.uid == unrelated_key.uid)
+        .unwrap();
+    assert_eq!(
+        carried.labels.get("rise.dev/team").map(String::as_str),
+        Some("group:x")
+    );
+
+    Ok(())
+}
+
+/// A resource still draining is still addressable, so its authority still
+/// matters: omitting tombstoned descendants would under-report the delta, which
+/// on a gate is the unsafe direction.
+#[sqlx::test]
+async fn label_inheriting_descendants_include_tombstoned_rows(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    register_org_widget_rd(&store).await;
+
+    let org = create_labeled(&store, ORGANIZATION_KIND, "acme", None, &[]).await;
+    let child = create_labeled(&store, "OrgWidget", "draining", Some(org.uid), &[]).await;
+    // A finalizer keeps the row present as a tombstone rather than hard-deleting.
+    store
+        .operator_update_finalizers(child.uid, "test", &["example.dev/hold".to_string()], &[])
+        .await
+        .unwrap();
+    store.delete(child.uid).await.unwrap();
+    let tombstoned = store.get(child.uid).await.unwrap().unwrap();
+    assert!(tombstoned.deletion_timestamp.is_some());
+
+    let found = store
+        .label_inheriting_descendants(org.uid, "rise.dev/owner")
+        .await
+        .unwrap();
+    assert!(found.iter().any(|row| row.uid == child.uid));
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn label_inheriting_descendants_of_an_unknown_uid_are_empty(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    assert!(store
+        .label_inheriting_descendants(Uuid::new_v4(), "rise.dev/owner")
+        .await
+        .unwrap()
+        .is_empty());
+    Ok(())
+}
+
+/// A no-op update: every mutable field carried over from the current row, so a
+/// test can isolate the one field it means to change.
+fn update_params(row: &ResourceRow) -> UpdateResourceParams {
+    UpdateResourceParams {
+        api_version: None,
+        revision: row.revision,
+        labels: row.labels.clone(),
+        annotations: Default::default(),
+        finalizers: row.finalizers.clone(),
+        owner_references: row.owner_references.clone(),
+        spec: row.spec.clone(),
+        validator: None,
+    }
+}
+
+async fn create_labeled(
+    store: &PgResourceStore,
+    kind: &str,
+    name: &str,
+    parent_uid: Option<Uuid>,
+    labels: &[(&str, &str)],
+) -> ResourceRow {
+    let api_version = if kind == "OrgWidget" {
+        "example.dev/v1"
+    } else {
+        API_VERSION_V1ALPHA1
+    };
+    store
+        .create(CreateResourceParams {
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+            name: name.to_string(),
+            parent_uid,
+            labels: labels
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+            spec: if kind == ORGANIZATION_KIND {
+                json!({"displayName": name})
+            } else {
+                json!({})
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap_or_else(|error| panic!("create {kind} '{name}': {error}"))
+}
+
+// -----------------------------------------------------------------------------
+// ADR-0001 §5 — the immutable seeded operator policy
+// -----------------------------------------------------------------------------
+
+/// The seeded pair can be written exactly once, with exactly its shipped body,
+/// and then neither edited nor deleted. The rows are not the source of operator
+/// authority — the evaluator hardcodes that — they are its only inspectable
+/// record, which is what the reservation protects.
+#[sqlx::test]
+async fn seeded_operator_policy_is_immutable(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+
+    // A body other than the shipped one is refused outright.
+    let wrong_body = create_builtin_resource(
+        &store,
+        PLATFORM_ROLE_KIND,
+        SYSTEM_ADMIN_PLATFORM_ROLE,
+        None,
+        json!({"statements": [{"effect": "Allow", "kinds": "*", "verbs": ["get"]}]}),
+        vec![],
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&wrong_body, StoreError::Validation(message) if message.contains("immutable")),
+        "a drifted seed body must be refused, got {wrong_body:?}"
+    );
+
+    let role = create_builtin_resource(
+        &store,
+        PLATFORM_ROLE_KIND,
+        SYSTEM_ADMIN_PLATFORM_ROLE,
+        None,
+        serde_json::to_value(rise_resource_api::system_admin_role_spec()).unwrap(),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    let binding = create_binding(
+        &store,
+        PLATFORM_ROLE_BINDING_KIND,
+        SYSTEM_ADMIN_PLATFORM_ROLE,
+        None,
+        serde_json::to_value(rise_resource_api::system_admin_binding_spec()).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    // Neither can be updated, even to its own current content.
+    for row in [&role, &binding] {
+        let error = store.update(row.uid, update_params(row)).await.unwrap_err();
+        assert!(
+            matches!(&error, StoreError::Validation(message) if message.contains("immutable")),
+            "{} must reject updates, got {error:?}",
+            row.kind
+        );
+    }
+
+    // Nor deleted.
+    for row in [&role, &binding] {
+        let error = store.delete(row.uid).await.unwrap_err();
+        assert!(
+            matches!(&error, StoreError::Validation(message) if message.contains("immutable")),
+            "{} must reject deletes, got {error:?}",
+            row.kind
+        );
+        assert!(store.get(row.uid).await.unwrap().is_some(), "row survives");
+    }
+
+    Ok(())
+}
+
+/// The reservation is placement-scoped: an organization's own `Role` named
+/// `system-admin` is ordinary data, because only the root rows are reserved.
+#[sqlx::test]
+async fn an_organization_role_may_be_named_system_admin(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let org = create_builtin_resource(
+        &store,
+        ORGANIZATION_KIND,
+        "acme",
+        None,
+        json!({"displayName": "Acme"}),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    let role = create_builtin_resource(
+        &store,
+        ROLE_KIND,
+        SYSTEM_ADMIN_PLATFORM_ROLE,
+        Some(org.uid),
+        json!({"statements": [{"effect": "Allow", "kinds": "*", "verbs": ["get"]}]}),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    // And it stays editable and deletable.
+    store
+        .update(
+            role.uid,
+            UpdateResourceParams {
+                spec: json!({"statements": []}),
+                ..update_params(&role)
+            },
+        )
+        .await
+        .unwrap();
+    store.delete(role.uid).await.unwrap();
+
     Ok(())
 }
