@@ -57,6 +57,25 @@ Merged to `develop`:
   runs in one transaction, so an upgrade rejected by the audit leaves the
   database exactly as it was — clean up the conflicts it names under the
   previous Rise version and retry.
+- **Config change — admin and Operator roles by IdP group** ([#429](https://github.com/rise-deploy/rise/pull/429)).
+  `auth.admin_idp_groups` and `auth.operator_idp_groups` grant the admin and
+  Operator roles to everyone in the listed IdP groups, so the IdP stays the source
+  of truth instead of an email allowlist that has to be edited and redeployed.
+  Both default to empty, so
+  installs that grant roles by email alone are unaffected and pay no extra query.
+  A user holds a role if their email is on the allowlist **or** they are in one of
+  the groups; group names match case-insensitively.
+
+  All group matching — including the existing `auth.platform_access.allowed_idp_groups`
+  — now resolves against the **IdP-managed** teams Rise syncs from the IdP's
+  `groups` claim, rather than against every team the user belongs to. **Action
+  required only if** you granted platform access through `allowed_idp_groups`
+  naming a team that Rise did not create from the IdP (i.e. `idp_managed = false`);
+  those users lose platform access until the group comes from the IdP. This closes
+  a privilege-escalation path where a user could create a team named after an
+  allowed group and grant themselves access. Group membership refreshes at login,
+  so revoking a group in the IdP takes effect on the user's next login (or the next
+  Entra active sync).
 - **Action required if conflicts exist — policy resource activation** ([#430](https://github.com/rise-deploy/rise/pull/430)).
   Rise activates the four reserved `rise.dev/v1alpha1` policy resource kinds —
   `Role` and `RoleBinding` under an Organization, `PlatformRole` and

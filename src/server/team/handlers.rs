@@ -22,7 +22,7 @@ pub async fn create_team(
 ) -> Result<Json<CreateTeamResponse>, ServerError> {
     let user = auth.user()?;
     // Check if user is allowed to create teams
-    let is_admin = state.is_admin(&user.email);
+    let is_admin = state.is_admin(user).await;
     if !state.auth_settings.allow_team_creation && !is_admin {
         tracing::warn!(
             "User {} attempted to create team '{}' but team creation is disabled for non-admins",
@@ -170,7 +170,7 @@ pub async fn update_team(
     let team = resolve_team(&state, &id_or_name, params.by_id).await?;
 
     // Check if user is an admin or owner of the team
-    let is_admin = state.is_admin(&user.email);
+    let is_admin = state.is_admin(user).await;
     let is_owner = if !is_admin {
         db_teams::is_owner(&state.db_pool, team.id, user.id)
             .await
@@ -338,7 +338,7 @@ pub async fn delete_team(
     let team = resolve_team(&state, &id_or_name, params.by_id).await?;
 
     // Check if user is an admin or owner of the team
-    let is_admin = state.is_admin(&user.email);
+    let is_admin = state.is_admin(user).await;
     let is_owner = if !is_admin {
         db_teams::is_owner(&state.db_pool, team.id, user.id)
             .await
@@ -384,7 +384,7 @@ pub async fn list_teams(
 ) -> Result<Json<Vec<ApiTeam>>, ServerError> {
     let user = auth.user()?;
     // Admins can see all teams; other users see all teams if allow_list_all_teams is enabled
-    let teams = if state.is_admin(&user.email) || state.auth_settings.allow_list_all_teams {
+    let teams = if state.is_admin(user).await || state.auth_settings.allow_list_all_teams {
         db_teams::list(&state.db_pool)
             .await
             .internal_err("Failed to list teams")?

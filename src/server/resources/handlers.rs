@@ -54,6 +54,7 @@ use crate::server::state::AppState;
 pub(crate) struct ResourceApiCtx {
     store: Arc<dyn ResourceStore>,
     operator_users: Arc<Vec<String>>,
+    operator_idp_groups: Arc<Vec<String>>,
     /// DB pool used by application-layer guards (e.g. blocking Organization
     /// deletion while typed children — users-via-memberships, teams, projects —
     /// still reference it via `organization_resource_uid`). Required: the
@@ -67,12 +68,21 @@ impl ResourceApiCtx {
         Self {
             store: state.resource_store.clone(),
             operator_users: state.operator_users.clone(),
+            operator_idp_groups: state.operator_idp_groups.clone(),
             db_pool: state.db_pool.clone(),
         }
     }
 
-    fn is_operator(&self, email: &str) -> bool {
-        crate::server::auth::admin::is_operator_user(&self.operator_users, email)
+    /// Resolve the Operator role for a user: the `auth.operator_users` email
+    /// allowlist, or membership in one of the `auth.operator_idp_groups`.
+    async fn is_operator(&self, user: &User) -> bool {
+        crate::server::auth::roles::has_role(
+            &self.db_pool,
+            &self.operator_users,
+            &self.operator_idp_groups,
+            user,
+        )
+        .await
     }
 }
 
@@ -109,9 +119,9 @@ fn response_resource(
 /// APIs — where admins skip permission checks — the generic resource API is
 /// operator-gated only; admin access here is intentionally deferred (see
 /// `ROADMAP.md`). Do not add an `is_admin` shortcut.
-fn require_operator(ctx: &ResourceApiCtx, auth: &AuthContext) -> Result<User, ServerError> {
+async fn require_operator(ctx: &ResourceApiCtx, auth: &AuthContext) -> Result<User, ServerError> {
     let user = auth.user()?.clone();
-    if !ctx.is_operator(&user.email) {
+    if !ctx.is_operator(&user).await {
         tracing::warn!(
             user_email = %user.email,
             "Generic resource API access denied — user is not an Operator"
@@ -593,7 +603,7 @@ async fn dispatch_get_inner(
     let raw_path = parse_resource_path(&raw)?;
     // Every GET path on the generic resource API is operator-only; authorize
     // before any store I/O so collection existence is not probeable.
-    let user = require_operator(ctx, &auth)?;
+    let user = require_operator(ctx, &auth).await?;
     match classify_path(&ctx.store, raw_path).await? {
         ResolvedPath::PendingDeletion => {
             let limit = q.limit.unwrap_or(100).clamp(1, 1000);
@@ -724,7 +734,7 @@ async fn dispatch_post_inner(
 ) -> Result<Response, ServerError> {
     let raw_path = parse_resource_path(&raw)?;
     // Every POST path on the generic resource API is operator-only.
-    let user = require_operator(ctx, &auth)?;
+    let user = require_operator(ctx, &auth).await?;
     match classify_path(&ctx.store, raw_path).await? {
         ResolvedPath::List {
             resolved,
@@ -767,7 +777,7 @@ async fn dispatch_put_inner(
     // without a second call.
     let raw_path = parse_resource_path(&raw)?;
     let operator_user = if let AnyAuth::User(auth_ctx) = &auth {
-        Some(require_operator(ctx, auth_ctx)?)
+        Some(require_operator(ctx, auth_ctx).await?)
     } else {
         None
     };
@@ -910,7 +920,7 @@ async fn dispatch_delete_inner(
 ) -> Result<Response, ServerError> {
     let raw_path = parse_resource_path(&raw)?;
     // Every DELETE path on the generic resource API is operator-only.
-    let user = require_operator(ctx, &auth)?;
+    let user = require_operator(ctx, &auth).await?;
     match classify_path(&ctx.store, raw_path).await? {
         ResolvedPath::Item { resolved, leaf } => {
             let row = resolve_leaf(&ctx.store, &resolved, &leaf).await?;
@@ -1409,6 +1419,7 @@ mod dispatch_tests {
         ResourceApiCtx {
             store: Arc::new(PgResourceStore::new(pool.clone())),
             operator_users: Arc::new(vec![OPERATOR.into()]),
+            operator_idp_groups: Arc::new(vec![]),
             db_pool: pool,
         }
     }
@@ -1715,6 +1726,60 @@ mod dispatch_tests {
         .await
         .expect_err("non-operator must be rejected");
         assert_eq!(err.status, StatusCode::FORBIDDEN);
+    }
+
+    /// The Operator role can also be granted by IdP group. Unlike the email
+    /// allowlist this reads the DB, so the user and their IdP-managed team must
+    /// exist — and a team that is *not* IdP-managed must not grant the role.
+    #[sqlx::test]
+    async fn operator_path_allows_operator_by_idp_group(pool: sqlx::PgPool) {
+        let mut ctx = ctx(pool.clone()).await;
+        ctx.operator_users = Arc::new(vec![]);
+        ctx.operator_idp_groups = Arc::new(vec!["platform-operators".into()]);
+        register_widget_rd(&ctx, &[]).await;
+
+        let user = crate::db::users::create(&pool, "grouped@example.com")
+            .await
+            .unwrap();
+        let auth_ctx = AuthContext::User(user.clone());
+
+        // Same-named team that the IdP did not create grants nothing.
+        let self_made = crate::db::teams::create(&pool, "platform-operators")
+            .await
+            .unwrap();
+        crate::db::teams::add_member(
+            &pool,
+            self_made.id,
+            user.id,
+            crate::db::models::TeamRole::Owner,
+        )
+        .await
+        .unwrap();
+
+        let err = dispatch_get_inner(
+            &ctx,
+            "example.dev/v1/widgets".to_string(),
+            auth_ctx.clone(),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect_err("a self-created team must not grant the Operator role");
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+
+        // Once the team is IdP-managed, the same user is an Operator.
+        crate::db::teams::set_idp_managed(&pool, self_made.id, true)
+            .await
+            .unwrap();
+
+        let response = dispatch_get_inner(
+            &ctx,
+            "example.dev/v1/widgets".to_string(),
+            auth_ctx,
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("operator by IdP group must be allowed");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[sqlx::test]
