@@ -68,6 +68,11 @@ but three things need a declaration site that a bare string does not have: the
 family's own `plural`/`singular`/`shortNames` (which a CLI resolves against),
 its printer-column contract (below), and eventually its membership governance.
 
+A family carries both spellings a kind carries, for the same two jobs:
+`{group}/{Family}` is its canonical identity, in the same namespace
+`ResourceKind` occupies, while `plural`/`singular`/`shortNames` are what URLs
+and CLI arguments resolve against.
+
 ```yaml
 apiVersion: rise.dev/v1alpha1
 kind: ResourceFamily
@@ -75,6 +80,7 @@ metadata:
   name: extensions.extensions.rise.dev
 spec:
   group: extensions.rise.dev
+  family: Extension
   plural: extensions
   singular: extension
   shortNames: [ext]
@@ -98,10 +104,19 @@ Registration of a member validates:
    Adding one to a kind with live instances would require reconciling existing
    collisions; removing one would silently widen the pool under resources that
    were admitted under the narrower rule.
-4. **Shared identifier namespace.** A family's `plural`, `singular`, and
-   `shortNames` are unique against each other and against every kind's, and
-   follow the existing collection-name grammar and reserved-name list. A CLI
-   argument resolves to exactly one family or one kind, never both.
+4. **Distinct identity.** `{group}/{Family}` must not collide with any
+   `ResourceKind` in that group, and a family's `plural`, `singular`, and
+   `shortNames` must not collide with any kind's or any other family's. Both
+   levels matter: the first keeps canonical identities unambiguous, the second
+   keeps a URL segment or CLI argument resolving to exactly one family or one
+   kind, never both. Family collection names follow the existing
+   collection-name grammar and reserved-name list.
+5. **`use` on the family.** Registering a member sets a declared reference to
+   the `ResourceFamily`, so ADR-0001's reference rule applies unchanged: the
+   writer must hold `use` on the referenced instance. A family owner controls
+   who may join by granting `use`; no bespoke allowlist is introduced. This is
+   inert while RD creation is operator-gated and becomes the operative gate
+   when ADR-0001 delegates it.
 
 Nothing here requires a family to know its members: membership is declared
 outward-in by each RD, so registering a kind never mutates the family object.
@@ -110,6 +125,48 @@ Nothing else is required of members. Family kinds need not share spec fields, a
 status shape, a controller, or a served version set. A family is not an
 inheritance mechanism, and no part of the engine may read a member's spec
 through a family-level schema.
+
+Built-in `rise.dev` kinds may declare a family. Because the reserved group
+rejects `ResourceDefinition`s, a built-in family is registered in the built-in
+registry rather than created through the API: `BuiltInKindDefinition` gains a
+`family` field and its `ResourceFamily` is seeded alongside the kinds. No
+built-in family is declared by this decision — see the note under Consequences
+on why the policy kinds are not one.
+
+### Addressing
+
+A family collection route carries **no version segment**. Diverse schemas imply
+diverse versioning: members version independently, a result is heterogeneous,
+and a single collection-wide version would either exclude members that do not
+serve it or assert a uniformity that does not exist. Each item is served at its
+own kind's preferred served version and self-describes through its
+`apiVersion`, exactly as a mixed result must.
+
+That makes the family route a second, shorter grammar beside the kind route,
+distinguished by a leading keyword rather than by parsing:
+
+```
+{group}/{version}/{plural}/{ancestor}…        # kind collection (existing)
+families/{group}/{plural}/{ancestor}…         # family collection
+families/{group}/{plural}/{ancestor}…/{name}  # family item
+```
+
+List versus get follows from depth exactly as it does for kinds: `D` ancestor
+segments list, `D+1` gets, where `D` is the family's parent-chain depth — well
+defined because every member shares the family's parent.
+
+### Lifecycle
+
+Deleting a `ResourceFamily` is **rejected while any member RD names it**. A
+family is a namespace its members and their instances depend on; cascading
+would let one delete of a registry object destroy customer data, and
+tombstoning would leave instances in a pool with no contract. Deleting the
+member RDs first is the deliberate, visible path.
+
+`columns` are **append-only**. Adding one is safe by the unbound-renders-empty
+rule. Removing or retyping one breaks existing member bindings and any client
+rendering the table itself (columns are public API surface — see below), so
+both are rejected rather than left to operator discipline.
 
 ### Storage and uniqueness
 
@@ -288,28 +345,14 @@ split above exists to serve this.
 
 ## Open questions before Proposed
 
-- **Family membership governance.** Once RD creation is delegable beyond
-  operators, same-group is the only gate on joining an existing family, which
-  reduces to "who governs an API group" — a concept Rise does not have yet.
-  A `ResourceFamily` object gives that rule somewhere to live; it does not
-  supply the rule.
 - **Per-kind printer columns.** A family list is covered above, but a
   single-kind list (`risectl get awsrdsinstances …`) still has no columns
   beyond the base ones. Presumably the same binding mechanism with a per-RD
   contract, but it is a separate decision and not required by this one.
-- **`ResourceFamily` lifecycle.** What deleting a family with live member RDs
-  (or live instances) means — reject, cascade, or tombstone — and whether
-  `columns` may be edited after members bind to them. Adding a column is safe
-  by the unbound-renders-empty rule; removing or retyping one breaks both
-  existing bindings and any client rendering the table itself.
-- **Route shape for family collections.** Whether a family occupies the same
-  URL position as a `plural` (relying on the shared identifier namespace) or a
-  distinct segment.
 - **Cross-kind pagination and Watch.** Both are already prerequisites for the
   typed-object migration (`ROADMAP.md` §4); a family list inherits them and may
-  add constraints of its own.
-- **Whether built-in kinds may declare families.** Nothing here requires it,
-  and admitting it early risks a family becoming a de-facto type hierarchy.
+  add constraints of its own — notably a cursor that stays stable while a
+  member kind is registered or removed mid-page.
 
 ## Consequences if adopted
 
@@ -323,13 +366,25 @@ split above exists to serve this.
   kind is first registered — for extensions, that means this decision lands
   *before* the `ROADMAP.md` §4 extension migration, not after.
 - `ResourceDefinitionSpec` grows `family`, `singular`, `shortNames`, and
-  per-version `familyColumns`; `ResourceFamily` arrives as a new built-in kind.
-  The schemas under `docs/engineering/public/schemas/` regenerate with them.
+  per-version `familyColumns`; `BuiltInKindDefinition` grows `family`; and
+  `ResourceFamily` arrives as a new built-in kind. The schemas under
+  `docs/engineering/public/schemas/` regenerate with them.
 - The API gains server-side table rendering — a restricted JSONPath evaluator
   and a table content type — which no current endpoint needs.
 - A family's `columns` become public API surface, readable by any client that
-  can `get` the `ResourceFamily`. Adding one stays compatible; removing or
-  retyping one breaks clients that render tables themselves.
+  can `get` the `ResourceFamily`. Hence append-only.
+- The API gains a second collection grammar under a `families/` keyword,
+  unversioned where the kind grammar is versioned. Discovery, client libraries,
+  and any path-aware middleware must handle both.
+- **A family asserts that its members' names must not collide — a semantic
+  claim, not just a listing convenience — and for some obvious groupings that
+  claim is false.** The org-parented policy kinds are the sharp case: `Role` and
+  `RoleBinding` share a parent and a group, so they *could* form a family, but
+  naming a binding after the role it binds is a common and useful pattern that a
+  shared pool would forbid. Built-ins may declare families; that is not a reason
+  for any particular set of them to be one. Plausible first candidates are the
+  org-parented subject kinds (`Group`, `ServiceAccount`) and the root-scoped
+  identities (`User`, `Controller`), each deferred to its own decision.
 - Discovery becomes a hard dependency of the CLI workstream.
 
 ## Alternatives considered
