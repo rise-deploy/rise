@@ -59,28 +59,52 @@ grouping.
 
 ### Declaration
 
-`ResourceDefinitionSpec` gains an optional `family` field naming the family the
-kind joins. A family has no separate registry object; it exists as the set of
-RDs that name it.
+A family is a registry resource, `ResourceFamily`, and `ResourceDefinitionSpec`
+gains an optional `family` field naming the family the kind joins. The family
+must exist before a kind joins it.
 
-Registration validates:
+A family could instead have been implicit — the set of RDs naming a string —
+but three things need a declaration site that a bare string does not have: the
+family's own `plural`/`singular`/`shortNames` (which a CLI resolves against),
+its printer-column contract (below), and eventually its membership governance.
 
-1. **Same API group.** Every member kind's `group` equals the family's group.
+```yaml
+apiVersion: rise.dev/v1alpha1
+kind: ResourceFamily
+metadata:
+  name: extensions.extensions.rise.dev
+spec:
+  group: extensions.rise.dev
+  plural: extensions
+  singular: extension
+  shortNames: [ext]
+  parent:
+    apiVersion: rise.dev/v1alpha1
+    kind: Project
+```
+
+Registration of a member validates:
+
+1. **Same API group.** A member kind's `group` equals the family's `group`.
    Without this, any RD author could inject a kind into another group's family,
    consuming names in its pool and appearing in its listings. RD creation is
    operator-gated today, so this is latent — but ADR-0001 delegates creation,
    so the rule is encoded now rather than retrofitted.
-2. **Same parent kind.** An RD declares exactly one parent. Members that parent
-   under different kinds have no common scope, leaving "unique within the
-   family under this scope" undefined and family-scoped listing unaddressable.
+2. **Same parent kind.** An RD declares exactly one parent, and it must equal
+   the family's `parent`. Members parented under different kinds have no common
+   scope, leaving "unique within the family under this scope" undefined and
+   family-scoped listing unaddressable.
 3. **Immutable after RD creation.** `family` may be set only at RD create.
    Adding one to a kind with live instances would require reconciling existing
    collisions; removing one would silently widen the pool under resources that
    were admitted under the narrower rule.
-4. **Shared identifier namespace.** Family names are unique against each other
-   *and* against every kind's `plural`, `singular`, and `shortNames`
-   (below), and follow the existing collection-name grammar and reserved-name
-   list. A CLI argument resolves to exactly one family or one kind, never both.
+4. **Shared identifier namespace.** A family's `plural`, `singular`, and
+   `shortNames` are unique against each other and against every kind's, and
+   follow the existing collection-name grammar and reserved-name list. A CLI
+   argument resolves to exactly one family or one kind, never both.
+
+Nothing here requires a family to know its members: membership is declared
+outward-in by each RD, so registering a kind never mutates the family object.
 
 Nothing else is required of members. Family kinds need not share spec fields, a
 status shape, a controller, or a served version set. A family is not an
@@ -121,6 +145,73 @@ construction. Two implementation constraints:
   a stable-but-odd order rather than a pagination cursor that skips or repeats
   rows.
 
+### Printer columns
+
+A family list is heterogeneous, so a column cannot be a single path evaluated
+against every row: members share no spec shape, and requiring one would make a
+family the inheritance mechanism this decision refuses to make it. The
+declaration therefore splits in two.
+
+**The family declares the contract** — an ordered list of columns, each with a
+`name` (the header, and the identifier members bind against), a `type`
+(`string`, `integer`, `number`, `boolean`, `date`), an optional `description`,
+and an optional `priority` (`0`, the default, always renders; higher values
+render only under `-o wide`).
+
+**Each member binds the data**, per version, alongside that version's `schema`
+— the place where shape already varies:
+
+```yaml
+kind: ResourceFamily
+spec:
+  columns:
+    - {name: Status,   type: string, description: Provisioning state}
+    - {name: Endpoint, type: string, priority: 1}
+---
+kind: ResourceDefinition
+spec:
+  kind: AwsRdsInstance
+  family: extensions
+  versions:
+    - name: v1
+      familyColumns:
+        Status: .status.phase
+        Endpoint: .status.endpoint
+```
+
+Rules:
+
+- **An unbound column renders empty**, and is never a registration error.
+  Otherwise adding a column to a family breaks every member RD already
+  registered against it.
+- **Bindings match by column `name`**, exactly. A binding naming a column the
+  family does not declare is rejected at RD registration.
+- **Paths use a restricted JSONPath subset** — field traversal and array
+  indexing only, no filters, recursion, or wildcards. Evaluation stays bounded
+  and deterministic, which matters once RD creation is delegated beyond
+  operators.
+- **Types are advisory at registration.** A version's `schema` is optional, so
+  the store generally cannot prove a path yields the declared type; a value
+  that does not match renders empty rather than failing the request. Where a
+  version does declare a schema, registration may validate the binding against
+  it.
+- **`NAME` and `KIND` are implicit and always present**, first and second;
+  family columns follow in declared order; `AGE` renders last.
+
+**Tables are rendered server-side**, through content negotiation on the
+ordinary collection GET rather than a subresource. Clients never receive column
+definitions or evaluate paths, and the projection rule below applies in exactly
+one place.
+
+That projection rule is the notable consequence: column *values* follow
+ADR-0001's per-item read granularity exactly. `KIND` is free — the list
+projector's base-field allowlist includes it — but a column pathing into `spec`
+or `status` has nothing to read for an item the caller can `list` but not
+`get`. Those cells render empty, so a table is ragged across rows of differing
+access. Widening the projection because a column was declared would let an RD
+author make fields readable under `list` alone, which is a policy hole, not a
+formatting choice.
+
 ### Authorization
 
 A family confers no permissions. ADR-0001 keys policy on `ResourceKind` and
@@ -145,10 +236,10 @@ tree. Two commands drive the design:
 
 ```console
 $ risectl get extensions acme-corp/web-app          # every kind in the family
-NAME        KIND               AGE
-analytics   SnowflakeOAuth     12d
-db          AwsRdsInstance     30d
-uploads     AwsS3Bucket        5d
+NAME        KIND               STATUS      AGE
+analytics   SnowflakeOAuth     Ready       12d
+db          AwsRdsInstance     Available   30d
+uploads     AwsS3Bucket        Ready       5d
 
 $ risectl get extension acme-corp/web-app/db        # one named item
 ```
@@ -157,13 +248,15 @@ They force four things the API does not have today:
 
 **Singular and short names.** `ResourceDefinitionSpec` carries only `plural`.
 `get extension` versus `get extensions` needs `singular`, and kubectl parity
-needs `shortNames`. Both join the shared identifier namespace above.
+needs `shortNames` — on kinds and on families alike, all in one identifier
+namespace.
 
 **A discovery endpoint.** None exists. risectl cannot resolve `extensions` to a
 family, enumerate its member kinds, learn their parent-chain depth, or pick a
 served version without hardcoding. Family-aware discovery is therefore a
 prerequisite for the CLI, not an enhancement, and must report families and
 their members alongside per-kind aliases, parent chain, and served versions.
+Column definitions need not be published there — tables render server-side.
 
 **The positional path is the scope.** `<org>/<project>[/<name>]` is the
 existing URL grammar minus `{group}/{version}`, whose ancestor *types* are
@@ -172,21 +265,25 @@ depth: `D` ancestor segments list the collection, `D+1` gets an item. This is
 the deliberate divergence from kubectl — the hierarchy is the argument, not an
 `-n namespace` flag.
 
-**Heterogeneous table output.** `KIND` as a column is free: ADR-0001's list
-projector allowlists `apiVersion`, `kind`, and `metadata`, so it renders even
-for items the caller can `list` but not `get`. Beyond NAME/KIND/AGE, a
-cross-kind table can only show columns every member carries — see open
-questions.
+**Heterogeneous table output.** One table, not one table per kind, with `KIND`
+as an ordinary column and family-declared columns beside it — the printer-column
+split above exists to serve this.
 
 ## Open questions before Proposed
 
-- **Printer columns.** Either family lists stay at base metadata columns, or a
-  family declares its own printer columns resolved by JSONPath into each member
-  object (with kinds declaring their own for single-kind lists). The latter is
-  more useful and more machinery; undecided.
 - **Family membership governance.** Once RD creation is delegable beyond
   operators, same-group is the only gate on joining an existing family, which
   reduces to "who governs an API group" — a concept Rise does not have yet.
+  A `ResourceFamily` object gives that rule somewhere to live; it does not
+  supply the rule.
+- **Per-kind printer columns.** A family list is covered above, but a
+  single-kind list (`risectl get awsrdsinstances …`) still has no columns
+  beyond the base ones. Presumably the same binding mechanism with a per-RD
+  contract, but it is a separate decision and not required by this one.
+- **`ResourceFamily` lifecycle.** What deleting a family with live member RDs
+  (or live instances) means — reject, cascade, or tombstone — and whether
+  `columns` may be edited after members bind to them. Adding a column is safe
+  by the unbound-renders-empty rule; removing or retyping one is not.
 - **Route shape for family collections.** Whether a family occupies the same
   URL position as a `plural` (relying on the shared identifier namespace) or a
   distinct segment.
@@ -207,8 +304,11 @@ questions.
   without a collision-reconciling migration. Families must be declared when a
   kind is first registered — for extensions, that means this decision lands
   *before* the `ROADMAP.md` §4 extension migration, not after.
-- `ResourceDefinitionSpec` grows `family`, `singular`, and `shortNames`, and
-  the schema under `docs/engineering/public/schemas/` regenerates with it.
+- `ResourceDefinitionSpec` grows `family`, `singular`, `shortNames`, and
+  per-version `familyColumns`; `ResourceFamily` arrives as a new built-in kind.
+  The schemas under `docs/engineering/public/schemas/` regenerate with them.
+- The API gains server-side table rendering — a restricted JSONPath evaluator
+  and a table content type — which no current endpoint needs.
 - Discovery becomes a hard dependency of the CLI workstream.
 
 ## Alternatives considered
@@ -225,6 +325,19 @@ key on `(parent, group, name)`. Rejected because a group is a namespace for
 kind identity, not a product grouping — it would force unrelated kinds sharing
 a vendor's group into one pool, and would still leave polymorphic listing
 without a way to name which kinds belong together.
+
+**One table per member kind, each with its own columns** (`kubectl get all`).
+Sidesteps the heterogeneous-column problem entirely and needs no family-level
+column contract. Rejected because the result is not one sortable, scannable
+list — the thing that makes `KIND` a column rather than a section heading — and
+because it scales badly as a family grows: three providers become three
+stanzas to read.
+
+**A single family-level path per column.** One JSONPath evaluated against every
+member, no per-member binding. Rejected because it only reaches fields every
+member happens to share, so either the columns stay trivial or the family
+acquires a de-facto common schema — exactly the inheritance this decision
+refuses.
 
 **Client-side aggregation.** risectl could fan out one list per kind and merge.
 Rejected because it needs the same discovery data anyway, gives no name-pool
