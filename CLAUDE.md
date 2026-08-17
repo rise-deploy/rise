@@ -227,7 +227,7 @@ Documentation lives in two Astro Starlight sites under [`/docs`](./docs):
   - Architecture and process design: [development.md](docs/engineering/src/content/docs/development.md)
   - Backend configuration: [configuration.md](docs/engineering/src/content/docs/configuration.md)
   - Deployment backends and the feature matrix: [deployment-backends.md](docs/engineering/src/content/docs/deployment-backends.md)
-  - Generic resource API: [generic-resource-api.md](docs/engineering/src/content/docs/generic-resource-api.md)
+  - Generic resource API: [resources/](docs/engineering/src/content/docs/resources/) — HTTP API, storage model, custom resources, schemas
   - Architecture decision records: [adr/](docs/engineering/src/content/docs/adr/)
 
 Serve them locally with `mise run docs:serve` / `mise run docs:engineering:serve`.
