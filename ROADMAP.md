@@ -13,6 +13,9 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
 - [ADR-0002: Generic Resource Subresource Execution Model](docs/engineering/src/content/docs/adr/0002-generic-resource-subresource-execution-model.md)
   is Draft and defines the intended execution seam for `status`,
   `finalizers`, `token`, and future generated or streaming subresources.
+- [ADR-0003: Resource Families](docs/engineering/src/content/docs/adr/0003-resource-families.md)
+  groups kinds that share a name pool and list as a unit; it gates the
+  extension-kind migration in §4.
 - Where shipped compatibility behavior differs from an ADR, it is transitional;
   new work converges on the ADR rather than extending the old shape.
 
@@ -185,7 +188,12 @@ Ordering: the built-in registry enables data-plane migration; unified RBAC
 must land before user-facing routes flip to the generic API. Pagination/Watch
 and secret handling remain kind-specific prerequisites.
 
-- [ ] Migrate extension kinds to external `ResourceDefinition` resources;
+- [ ] Implement resource families (ADR-0003): `ResourceFamily`, the family
+  name pool, the unversioned family collection route, and printer columns.
+  A family cannot be retrofitted onto kinds that already have instances, so
+  this lands **before** the extension migration below.
+- [ ] Migrate extension kinds to external `ResourceDefinition` resources under
+  the `Extension` family, preserving today's per-project extension name pool;
   secret-bearing extensions wait for encrypted fields.
 - [ ] Migrate `Project` (Organization child) and `Environment` (Project
   child) as built-ins. Authorization ownership is `rise.dev/owner` plus policy;

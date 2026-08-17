@@ -4,12 +4,12 @@ title: "ADR-0003: Resource Families"
 
 ## Status
 
-**Draft.** Date: 2026-08-17.
+**Proposed** (under review). Date: 2026-08-17.
 
-This is an exploratory design, not yet a proposed decision. It may change
-substantially before promotion to **Proposed**. ADR-0001 fixes the
-authorization shape `(verb, ResourceKind, subresource?)` and the collection-read
-semantics this draft builds on; nothing here changes them.
+ADR-0001 fixes the authorization shape `(verb, ResourceKind, subresource?)`, the
+declared-reference `use` rule, and the collection-read semantics this decision
+builds on; nothing here changes them. Two questions are deliberately left to
+their own decisions — see Open questions.
 
 ## Context
 
@@ -48,7 +48,7 @@ The store already enforces a cross-kind, per-scope allocation pool for
 `discriminator` (`resources_child_discriminator_unique`), so the mechanism is
 not novel — only its exposure as a user-chosen, kind-spanning identity is.
 
-## Draft decision
+## Decision
 
 Introduce a **resource family**: a named set of kinds that share one name pool
 within a parent scope and can be listed and addressed as a unit.
@@ -99,7 +99,17 @@ Registration of a member validates:
 2. **Same parent kind.** An RD declares exactly one parent, and it must equal
    the family's `parent`. Members parented under different kinds have no common
    scope, leaving "unique within the family under this scope" undefined and
-   family-scoped listing unaddressable.
+   family-scoped listing unaddressable — a mixed-depth result also has no
+   copy-pasteable `NAME`, since each item's path differs.
+
+   The known counterexample is a **placement-tier pair**: `Role` and
+   `PlatformRole` are the same concept at two levels, and exist as two kinds
+   only because ADR-0001's parent model is exact (§3, "two kind pairs, one per
+   placement level"). That is the natural cross-parent grouping this rule
+   forbids, and it is deferred rather than dismissed — nothing needs it today,
+   and admitting it requires answering how a single list spans an org-parented
+   and a root-scoped collection without asserting the root-scoped members live
+   under the org. It is not a case extension-land will produce.
 3. **Immutable after RD creation.** `family` may be set only at RD create.
    Adding one to a kind with live instances would require reconciling existing
    collisions; removing one would silently widen the pool under resources that
@@ -202,6 +212,16 @@ construction. Two implementation constraints:
   a stable-but-odd order rather than a pagination cursor that skips or repeats
   rows.
 
+Pagination and Watch do not exist yet for any collection — both are ROADMAP §4
+prerequisites for the typed-object migration, and designing family pagination
+before the base model exists would be backwards. This decision therefore states
+only what families *require* of whatever lands: a cursor ordered by
+`(name COLLATE "C", uid)` **within a family scope**, and a defined answer for a
+member kind registered or removed mid-pagination — a family's membership can
+change under a paging client in a way a single kind's cannot. Whether that
+answer is a snapshot, a documented weak guarantee, or a cursor invalidation
+belongs to the pagination decision, not this one.
+
 ### Printer columns
 
 A family list is heterogeneous, so a column cannot be a single path evaluated
@@ -221,6 +241,7 @@ render only under `-o wide`).
 ```yaml
 kind: ResourceFamily
 spec:
+  family: Extension
   columns:
     - {name: Status,   type: string, description: Provisioning state}
     - {name: Endpoint, type: string, priority: 1}
@@ -228,21 +249,35 @@ spec:
 kind: ResourceDefinition
 spec:
   kind: AwsRdsInstance
-  family: extensions
+  family: Extension
   versions:
     - name: v1
-      familyColumns:
+      familyColumns:                       # fills the family's table
         Status: .status.phase
         Endpoint: .status.endpoint
+      columns:                             # this kind's own table
+        - {name: Engine,   type: string, path: .spec.engine}
+        - {name: Class,    type: string, path: .spec.instanceClass}
+        - {name: Endpoint, type: string, path: .status.endpoint, priority: 1}
 ```
 
-Rules:
+**A kind declares its own columns** the same way, per version, for single-kind
+lists (`risectl get awsrdsinstances …`). Same field shape, same evaluator, same
+renderer — a kind's own table simply carries the contract and the binding in one
+place, because there is no second party to agree with. Without this, a kind in a
+family would print a richer table than the same kind listed directly, and kinds
+outside any family would never print more than `NAME` and `AGE`. A kind's own
+columns are unrelated to its `familyColumns`: the family's table shows what the
+family agreed on, the kind's table shows what that kind finds worth showing.
 
-- **An unbound column renders empty**, and is never a registration error.
-  Otherwise adding a column to a family breaks every member RD already
-  registered against it.
-- **Bindings match by column `name`**, exactly. A binding naming a column the
-  family does not declare is rejected at RD registration.
+Rules (applying to both column sets unless stated):
+
+- **An unbound family column renders empty**, and is never a registration
+  error. Otherwise adding a column to a family breaks every member RD already
+  registered against it. A kind's own columns cannot be unbound — contract and
+  path are declared together.
+- **Family bindings match by column `name`**, exactly. A binding naming a
+  column the family does not declare is rejected at RD registration.
 - **Paths use a restricted JSONPath subset** — field traversal and array
   indexing only, no filters, recursion, or wildcards. Evaluation stays bounded
   and deterministic, which matters once RD creation is delegated beyond
@@ -252,8 +287,9 @@ Rules:
   that does not match renders empty rather than failing the request. Where a
   version does declare a schema, registration may validate the binding against
   it.
-- **`NAME` and `KIND` are implicit and always present**, first and second;
-  family columns follow in declared order; `AGE` renders last.
+- **`NAME` is implicit and first, `AGE` implicit and last**, with declared
+  columns in between. A family table additionally carries `KIND` second; a
+  single-kind table omits it, being redundant with the request.
 
 **Tables are rendered server-side**, through content negotiation on the
 ordinary collection GET rather than a subresource. A client sends one request
@@ -343,18 +379,15 @@ the deliberate divergence from kubectl — the hierarchy is the argument, not an
 as an ordinary column and family-declared columns beside it — the printer-column
 split above exists to serve this.
 
-## Open questions before Proposed
+## Open questions
 
-- **Per-kind printer columns.** A family list is covered above, but a
-  single-kind list (`risectl get awsrdsinstances …`) still has no columns
-  beyond the base ones. Presumably the same binding mechanism with a per-RD
-  contract, but it is a separate decision and not required by this one.
-- **Cross-kind pagination and Watch.** Both are already prerequisites for the
-  typed-object migration (`ROADMAP.md` §4); a family list inherits them and may
-  add constraints of its own — notably a cursor that stays stable while a
-  member kind is registered or removed mid-page.
+- **Pagination and Watch semantics** for a collection whose membership can
+  change mid-page. This decision states the constraint (see Ordering) and
+  defers the model to the ROADMAP §4 pagination work.
+- **Cross-parent families.** Deferred with a known motivating case — the
+  placement-tier pair under validation rule 2 — and no current need.
 
-## Consequences if adopted
+## Consequences
 
 - The extension name guarantee users have today survives the move to per-kind
   `ResourceDefinition`s, and `rise extension list` keeps its single query.

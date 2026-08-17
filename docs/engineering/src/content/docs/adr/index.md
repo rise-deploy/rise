@@ -36,4 +36,4 @@ open questions but is not yet ready for review as a proposed architecture.
 |---|---|---|
 | [ADR-0001](./0001-unified-permission-model.md) — Unified Permission Model | Proposed | One Role/RoleBinding model for all subject kinds (Users, Groups, ServiceAccounts, Controllers, Operators) on the generic resource API and token issuance, plus the crate structure that realizes it. |
 | [ADR-0002](./0002-generic-resource-subresource-execution-model.md) — Generic Resource Subresource Execution Model | Draft | A typed registration and execution seam for stored, virtual, generated, streaming, and possible connection-oriented subresources. |
-| [ADR-0003](./0003-resource-families.md) — Resource Families | Draft | A named set of kinds sharing one name pool within a parent scope, listable and addressable as a unit — the grouping polymorphic listing and the extension-kind migration need. |
+| [ADR-0003](./0003-resource-families.md) — Resource Families | Proposed | A named set of kinds sharing one name pool within a parent scope, listable and addressable as a unit — the grouping polymorphic listing and the extension-kind migration need. |
