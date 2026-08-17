@@ -66,6 +66,7 @@ mod tests {
         status: serde_json::Value,
     ) -> ResourceRow {
         ResourceRow {
+            labels: Default::default(),
             uid: Uuid::new_v4(),
             api_version: "rise.dev/v1alpha1".into(),
             kind: "Organization".into(),

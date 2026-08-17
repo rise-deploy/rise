@@ -1,14 +1,14 @@
 use rise_resource_api::{
     ControllerSpec, ControllerTrustPolicySpec, CreateResourceParams, GroupMembershipSpec,
-    GroupSpec, OwnerReference, ServiceAccountSpec, ServiceAccountTrustPolicySpec, SpecValidator,
-    StoreError, UpdateResourceParams, UserIdentitySpec, UserSpec, ValidationError,
-    API_VERSION_V1ALPHA1, CONTROLLER_KIND, CONTROLLER_TRUST_POLICY_KIND, GROUP_KIND,
-    GROUP_MEMBERSHIP_KIND, SERVICE_ACCOUNT_KIND, SERVICE_ACCOUNT_TRUST_POLICY_KIND,
-    USER_IDENTITY_KIND, USER_KIND,
+    GroupSpec, OwnerReference, ServiceAccountSpec, ServiceAccountTrustPolicySpec, StoreError,
+    UpdateResourceParams, UserIdentitySpec, UserSpec, API_VERSION_V1ALPHA1, CONTROLLER_KIND,
+    CONTROLLER_TRUST_POLICY_KIND, GROUP_KIND, GROUP_MEMBERSHIP_KIND, SERVICE_ACCOUNT_KIND,
+    SERVICE_ACCOUNT_TRUST_POLICY_KIND, USER_IDENTITY_KIND, USER_KIND,
 };
-use serde::{de::DeserializeOwned, Serialize};
+use serde::de::DeserializeOwned;
 use sqlx::PgConnection;
 
+use crate::admission::{canonicalize, parse_existing};
 use crate::models::PgResourceRow;
 
 /// Identity-specific admission attached to an immutable built-in registration.
@@ -119,40 +119,6 @@ impl IdentityAdmission {
         }
         Ok(())
     }
-}
-
-/// Pure/local validator projected into `CollectionInfo`. Contextual admission
-/// above remains authoritative for every direct store call.
-pub(crate) struct IdentitySpecValidator(pub(crate) IdentityAdmission);
-
-impl SpecValidator for IdentitySpecValidator {
-    fn validate_spec(&self, spec: &serde_json::Value) -> Result<(), ValidationError> {
-        self.0
-            .canonicalize(spec)
-            .map(|_| ())
-            .map_err(|error| ValidationError::new(error.to_string()))
-    }
-
-    fn validate_status(&self, _status: &serde_json::Value) -> Result<(), ValidationError> {
-        Ok(())
-    }
-}
-
-fn canonicalize<T>(value: &serde_json::Value, kind: &str) -> Result<serde_json::Value, StoreError>
-where
-    T: DeserializeOwned + Serialize,
-{
-    let typed: T = serde_json::from_value(value.clone())
-        .map_err(|error| StoreError::Validation(format!("invalid {kind} spec: {error}")))?;
-    serde_json::to_value(typed).map_err(StoreError::backend)
-}
-
-fn parse_existing<T: DeserializeOwned>(
-    value: &serde_json::Value,
-    kind: &str,
-) -> Result<T, StoreError> {
-    serde_json::from_value(value.clone())
-        .map_err(|error| StoreError::Validation(format!("stored {kind} spec is invalid: {error}")))
 }
 
 fn immutable_trust<T>(

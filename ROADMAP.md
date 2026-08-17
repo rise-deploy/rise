@@ -31,14 +31,14 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
 - [x] Move the dep-light `ResourceStore` contract and canonical `SubjectId`,
   dynamic-label `SubjectRef`, group-qualified `ResourceKind`, and `Scope` types into `rise-resource-api`;
   keep SQLX and Postgres adapters in `rise-resource-store-postgres`.
-- [~] Implement policy types and validation for `Role`, `RoleBinding`,
+- [x] Implement policy types and validation for `Role`, `RoleBinding`,
   `PlatformRole`, and `PlatformRoleBinding`: structured `roleRef`, one
   subject per binding, normalized PascalCase `subjectMembership: Any |
   ResourceOrganization` on platform bindings (omission becomes `Any`; null is
   invalid), canonical scopes, pure Allow/Deny tuple evaluation, placement
   provenance, wildcard replacement, and Deny-aware subset checks. Activate
   these resources only through transaction-scoped normalization/admission.
-- [~] Add closed contracts for the built-in identity resources: root `User`
+- [x] Add closed contracts for the built-in identity resources: root `User`
   and `Controller`; Organization-owned `Group` and `ServiceAccount`; and
   fixed-parent
   `UserIdentity`, `GroupMembership`, `ControllerTrustPolicy`, and
@@ -57,7 +57,7 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
   target-parent workload trust lookup, and reverse name-based membership edges.
   These remain internal storage projections and do not change the generic
   resource API shape.
-- [ ] Implement live membership expansion, per-item list filtering/projection,
+- [~] Implement live membership expansion, per-item list filtering/projection,
   effective-label resolution, typed `SubjectRef` values for dynamic ownership,
   tiered platform/org Deny filtering, admin/operator classification, platform
   ceilings, and the centralized authorization choke point replacing

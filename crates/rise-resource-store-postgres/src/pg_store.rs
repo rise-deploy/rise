@@ -3,16 +3,16 @@ use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
 use rise_resource_api::{
-    validate_controller_id, validate_resource_name, CollectionInfo, CreateResourceParams,
-    DeleteOutcome, DeletionBlocker, DeletionBlockerRelationship, DeletionBlockerReport,
-    NoOpValidator, OwnerReference, PathSegment, ResourceDefinitionSpec, ResourceKind, ResourceRow,
-    ResourceStore, SpecValidator, StoreError, UpdateResourceParams, API_VERSION_V1ALPHA1,
-    CASCADE_DELETION_FINALIZER, MAX_PARENT_CHAIN_DEPTH, ORGANIZATION_KIND,
+    validate_controller_id, validate_labels, validate_resource_name, CollectionInfo,
+    CreateResourceParams, DeleteOutcome, DeletionBlocker, DeletionBlockerRelationship,
+    DeletionBlockerReport, NoOpValidator, OwnerReference, PathSegment, ResourceDefinitionSpec,
+    ResourceKind, ResourceRow, ResourceStore, SpecValidator, StoreError, UpdateResourceParams,
+    API_VERSION_V1ALPHA1, CASCADE_DELETION_FINALIZER, MAX_PARENT_CHAIN_DEPTH, ORGANIZATION_KIND,
     RESOURCE_DEFINITION_KIND, SYSTEM_FINALIZER_PREFIX,
 };
 use sqlx::{PgPool, Row};
 
-use crate::admission::IdentityAdmission;
+use crate::admission::BuiltInAdmission;
 use crate::builtin::{BuiltInRegistration, BuiltInRegistry};
 use crate::discriminator;
 use crate::models::PgResourceRow;
@@ -567,9 +567,9 @@ impl PgResourceStore {
             let result = sqlx::query_as::<_, PgResourceRow>(
                 r#"
                 INSERT INTO resource_store.resources
-                    (uid, api_version, kind, parent_uid, name, discriminator, metadata, spec,
-                     finalizers, owner_references)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    (uid, api_version, kind, parent_uid, name, discriminator, labels, metadata,
+                     spec, finalizers, owner_references)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 RETURNING *
                 "#,
             )
@@ -579,6 +579,7 @@ impl PgResourceStore {
             .bind(params.parent_uid)
             .bind(&params.name)
             .bind(&discriminator)
+            .bind(sqlx::types::Json(&params.labels))
             .bind(metadata.clone())
             .bind(&params.spec)
             .bind(&params.finalizers)
@@ -856,6 +857,7 @@ impl ResourceStore for PgResourceStore {
         }
 
         validate_resource_name(&params.name).map_err(|e| StoreError::Validation(e.to_string()))?;
+        validate_labels(&params.labels).map_err(|e| StoreError::Validation(e.to_string()))?;
         Self::ensure_owner_references_supported(
             &params.api_version,
             &params.kind,
@@ -868,7 +870,7 @@ impl ResourceStore for PgResourceStore {
         let builtin = self.builtin_for_write(&params.api_version, &params.kind)?;
         if let Some(registration) = builtin {
             if let Some(admission) =
-                IdentityAdmission::for_identity(registration.api_version, registration.kind)
+                BuiltInAdmission::for_kind(registration.api_version, registration.kind)
             {
                 params.spec = admission.canonicalize(&params.spec)?;
             }
@@ -897,9 +899,11 @@ impl ResourceStore for PgResourceStore {
             self.validate_builtin_placement(&mut tx, registration, params.parent_uid)
                 .await?;
             if let Some(admission) =
-                IdentityAdmission::for_identity(registration.api_version, registration.kind)
+                BuiltInAdmission::for_kind(registration.api_version, registration.kind)
             {
-                admission.admit_create_context(&mut tx, &params).await?;
+                admission
+                    .admit_create_context(&mut tx, &self.builtins, &mut params)
+                    .await?;
             }
         }
 
@@ -1055,6 +1059,7 @@ impl ResourceStore for PgResourceStore {
                 "ResourceDefinitions must be updated through update_resource_definition".into(),
             ));
         }
+        validate_labels(&params.labels).map_err(|e| StoreError::Validation(e.to_string()))?;
         let preflight_target_api_version = params
             .api_version
             .as_deref()
@@ -1074,7 +1079,7 @@ impl ResourceStore for PgResourceStore {
         }
         if let Some(registration) = preflight_current_builtin {
             if let Some(admission) =
-                IdentityAdmission::for_identity(registration.api_version, registration.kind)
+                BuiltInAdmission::for_kind(registration.api_version, registration.kind)
             {
                 params.spec = admission.canonicalize(&params.spec)?;
             }
@@ -1137,10 +1142,10 @@ impl ResourceStore for PgResourceStore {
             self.validate_builtin_placement(&mut tx, registration, snapshot.parent_uid)
                 .await?;
             if let Some(admission) =
-                IdentityAdmission::for_identity(registration.api_version, registration.kind)
+                BuiltInAdmission::for_kind(registration.api_version, registration.kind)
             {
                 admission
-                    .admit_update_before_dependent(&mut tx, &snapshot, &params)
+                    .admit_update_before_dependent(&mut tx, &self.builtins, &snapshot, &mut params)
                     .await?;
             }
         }
@@ -1199,7 +1204,7 @@ impl ResourceStore for PgResourceStore {
         // another writer may have committed between the snapshot and this lock.
         if let Some(registration) = current_builtin {
             if let Some(admission) =
-                IdentityAdmission::for_identity(registration.api_version, registration.kind)
+                BuiltInAdmission::for_kind(registration.api_version, registration.kind)
             {
                 admission.validate_update_immutable(&current, &params)?;
             }
@@ -1214,6 +1219,7 @@ impl ResourceStore for PgResourceStore {
                 spec       = $3,
                 finalizers = $4,
                 owner_references = $7,
+                labels     = $8,
                 revision   = revision + 1,
                 updated_at = NOW()
             WHERE uid = $5 AND revision = $6
@@ -1227,6 +1233,7 @@ impl ResourceStore for PgResourceStore {
         .bind(uid)
         .bind(params.revision)
         .bind(serde_json::to_value(&owner_references).unwrap_or_default())
+        .bind(sqlx::types::Json(&params.labels))
         .fetch_optional(&mut *tx)
         .await;
 
@@ -1511,6 +1518,45 @@ impl ResourceStore for PgResourceStore {
                 })
                 .collect(),
         })
+    }
+
+    async fn ancestors(&self, uid: Uuid) -> Result<Vec<ResourceRow>, StoreError> {
+        // One round trip rather than the per-level walk the placement and
+        // path-resolution paths use: this read is on the authorization hot
+        // path, where the caller knows the UID and wants the whole chain.
+        //
+        // `depth` counts upward from the leaf, so ordering by it descending
+        // yields the root-first chain the contract promises. The chain is
+        // bounded by MAX_PARENT_CHAIN_DEPTH; a row whose ancestry somehow
+        // exceeds it is truncated at the root end rather than looping, and
+        // parent_uid's foreign key plus the write-time cycle checks keep real
+        // ancestry acyclic.
+        let rows = sqlx::query_as::<_, PgResourceRow>(
+            r#"
+            WITH RECURSIVE chain AS (
+                SELECT resource.*, 0 AS depth
+                FROM resource_store.resources resource
+                WHERE resource.uid = $1
+                UNION ALL
+                SELECT parent.*, chain.depth + 1
+                FROM chain
+                JOIN resource_store.resources parent ON parent.uid = chain.parent_uid
+                WHERE chain.depth < $2
+            )
+            SELECT uid, api_version, kind, parent_uid, name, discriminator, labels, metadata,
+                   spec, status, revision, finalizers, owner_references, deletion_timestamp,
+                   created_at, updated_at
+            FROM chain
+            ORDER BY depth DESC
+            "#,
+        )
+        .bind(uid)
+        .bind(MAX_PARENT_CHAIN_DEPTH as i32)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Self::db_error)?;
+
+        Ok(rows.into_iter().map(Into::into).collect())
     }
 
     async fn resolve_path(&self, segments: &[PathSegment]) -> Result<Vec<ResourceRow>, StoreError> {
@@ -2224,6 +2270,7 @@ impl ResourceStore for PgResourceStore {
                 spec       = $3,
                 finalizers = $4,
                 owner_references = $7,
+                labels     = $8,
                 revision   = revision + 1,
                 updated_at = NOW()
             WHERE uid = $5 AND revision = $6
@@ -2237,6 +2284,7 @@ impl ResourceStore for PgResourceStore {
         .bind(uid)
         .bind(params.revision)
         .bind(serde_json::to_value(&owner_references).unwrap_or_default())
+        .bind(sqlx::types::Json(&params.labels))
         .fetch_optional(&mut *tx)
         .await;
 

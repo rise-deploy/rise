@@ -29,8 +29,16 @@ project's "Operator impact" view is the worklist; this page is what operators re
 _Changes merged to `develop` but not yet in a tagged release, plus in-flight PRs
 proposed for the next train. Moved into a version section at tag time._
 
-In-flight PRs with operator impact (not yet merged):
+Merged to `develop`:
 
+- **No action required — generic resource labels**. Resources in the generic
+  resource API carry `metadata.labels` alongside `metadata.annotations`. The
+  migration adds a column with an empty default, so existing rows and clients
+  are unaffected and no backfill runs. Label keys use the Kubernetes-shaped
+  grammar that policy `labelSelector` keys already use; values are capped at 63
+  bytes. Nothing consults labels for access yet — a key becomes access-relevant
+  only once a policy binding selects on it, and the write-time gate for such
+  keys lands with the authorization choke point.
 - **Action required if conflicts exist — identity resource activation** ([#421](https://github.com/rise-deploy/rise/pull/421)).
   Rise now activates the eight reserved `rise.dev/v1alpha1` identity resource
   kinds in the PostgreSQL resource store. Before upgrading, remove any legacy
@@ -68,6 +76,26 @@ In-flight PRs with operator impact (not yet merged):
   allowed group and grant themselves access. Group membership refreshes at login,
   so revoking a group in the IdP takes effect on the user's next login (or the next
   Entra active sync).
+- **Action required if conflicts exist — policy resource activation** ([#430](https://github.com/rise-deploy/rise/pull/430)).
+  Rise activates the four reserved `rise.dev/v1alpha1` policy resource kinds —
+  `Role` and `RoleBinding` under an Organization, `PlatformRole` and
+  `PlatformRoleBinding` at the root — in the PostgreSQL resource store. The
+  same fail-closed pattern as the identity activation above applies: before
+  upgrading, remove any stored rows in the `rise.dev` group using those four
+  Kind names, and any ResourceDefinition claiming one of the four collection
+  names (`roles`, `rolebindings`, `platformroles`, `platformrolebindings`) in
+  any group. Startup reports the total plus a bounded sample and leaves the
+  database unchanged, so clean up under the previous Rise version and retry.
+  Installations with no reported conflicts require no action.
+
+  Nothing yet consults these resources: writing a `RoleBinding` grants no
+  access, and `/api/v1/resources` remains operator-gated. Bindings are
+  validated at write time, so creating one requires its `roleRef` target, its
+  `scope` target, and any literal `subject` it names to already exist — create
+  the Role before the RoleBinding that references it.
+
+In-flight PRs with operator impact (not yet merged):
+
 - **Behavior change — workload identity on the Docker backend** ([#378](https://github.com/rise-deploy/rise/issues/378)).
   The Docker controller now delivers the same workload-identity material as
   Kubernetes — the bootstrap credential and one token file per `[identity].audiences`

@@ -41,16 +41,17 @@ scope and avoiding dead-end compatibility layers.
 5. **Merged in PR #420 — generic lifecycle owner references.** Add the canonical
    owner-reference DAG, cascading collection, blocker reporting, and structured
    lifecycle logging required before GroupMembership activation.
-6. **In progress — identity activation and storage projections.** Add the
+6. **Merged in PR #421 — identity activation and storage projections.** Add the
    transaction-owned admission seam, activate all eight identity built-ins,
    and add the ADR-required identity/trust/membership indexes and narrow lookup
    adapters. Policy activation remains a separate reviewable increment.
-7. **Planned — policy activation.** Activate the four policy built-ins through
+7. **Merged in PR #430 — policy activation.** Activate the four policy built-ins through
    contextual normalization, reference validation, and concurrency-safe
    admission without yet enforcing live authorization.
-8. **Planned — live authorization engine.** Add membership expansion, org-admin
+8. **In progress — live authorization engine.** Add membership expansion, org-admin
    classification, effective labels, tier filtering, per-item list filtering,
-   request-local snapshots, and explain/audit foundations.
+   request-local snapshots, and explain/audit foundations. Split into 8a
+   (generic label and ancestry store surface) and 8b (the engine itself).
 9. **Planned — mutation grant gate and seeded policy.** Add serializable
    authorization-changing writes, label-subtree deltas, bootstrap policy, and
    the centralized generic-resource authorization choke point.
@@ -365,7 +366,8 @@ scope and avoiding dead-end compatibility layers.
 
 ## Increment 6 — identity activation and storage projections
 
-- State: draft PR open for review.
+- State: merged in PR #421 at commit
+  `39a7daa31d3202b3abc6421ad1dc6f0c7aaddaec`.
 - Branch: `feat/resource-identity-activation`.
 - PR: #421.
 - Acceptance criteria:
@@ -425,3 +427,117 @@ scope and avoiding dead-end compatibility layers.
     concurrency, lookup, key-budget, and EXPLAIN coverage.
   - `SQLX_OFFLINE=true RUSTC_WRAPPER= cargo test --workspace --all-features
     -- --test-threads=1` passes serially; 2 documentation tests are ignored.
+
+## Increment 7 — policy activation
+
+- State: merged in PR #430 at commit
+  `71baf3f`.
+- Branch: `claude/policy-activation-admission-1ojwzz`.
+- Stacked on increment 6 (PR #421), whose admission seam it generalizes.
+- Acceptance criteria:
+  - Activate exactly the four kinds in `POLICY_KIND_DEFINITIONS`, consuming that
+    table for placement: `Role` and `RoleBinding` under an Organization,
+    `PlatformRole` and `PlatformRoleBinding` at the root.
+  - Keep the public `ResourceStore` and pure/local `SpecValidator` contracts
+    unchanged. Contextual admission owns every database read and row lock it
+    needs inside the mutation transaction and stays authoritative for direct
+    store calls with no trustworthy validator.
+  - Normalize each binding contextually and persist the normalized spec: an org
+    binding's omitted `scope` becomes its parent Organization's scope, a
+    platform binding's becomes its static org-native subject's organization or
+    `*`, and `subjectMembership` persists as PascalCase `Any` when omitted while
+    explicit null and unknown values fail closed.
+  - Resolve every reference a binding carries against live rows in the same
+    transaction: `roleRef` at the exact placement its kind implies, `scope`
+    down a registry- or ResourceDefinition-derived parent chain, and any
+    literal `subject`. Enforce both containment rules on the resolved rows.
+  - Audit legacy definitions and rows that policy route activation could shadow
+    and install the durable four-collection reservation guard, with the same
+    single-transaction, actionable-diagnostic behavior as increment 6.
+  - Add no authorization evaluation, grant gate, seeded policy, or binding
+    index. Nothing consults these resources yet.
+- Decisions:
+  - `IdentityAdmission` generalizes to `BuiltInAdmission`, splitting the
+    identity and policy contracts into sibling modules behind one seam. The
+    contextual `admit_*` methods now take `&mut` params, because policy
+    normalization rewrites the spec that gets persisted; identity admission,
+    which only validates, is unaffected.
+  - Canonicalization stays split rather than moving wholesale into the
+    transaction. A Role body and a binding's syntax are context-free and fail
+    before any lock is taken; only the parts that genuinely need a parent
+    Organization, a subject, or a live target run inside it.
+  - A binding's references must resolve at write time. This follows the ADR's
+    explicit "the target must exist or be created in the same atomic
+    transaction" for `scope`, its "nonexistent literals are rejected" for
+    subjects, and increment 6's precedent for GroupMembership's live User.
+    Lifecycle after the fact is unchanged: deleting a referenced Role leaves a
+    dangling binding exactly as deleting a User leaves a dangling membership,
+    which owner references — not write-time validation — are the answer to.
+  - Policy specs get no immutable-field enforcement. ADR-0001 governs Role and
+    binding edits through the write-time grant gate's effective before/after
+    delta, not by freezing fields, so adding immutability here would contradict
+    the increment that implements it.
+  - Reference locks are `FOR SHARE` and sit in the same band as increment 6's
+    identity lookups: after the global graph lock, owners, and structural
+    parents, and before the dependent row lock.
+  - No storage projection for bindings. The identity indexes serve a
+    per-request login path; the authorization engine's binding access patterns
+    are not yet measurable, and a speculative index would be a schema
+    commitment made blind.
+- Verification:
+  - `cargo fmt --all` passes.
+  - `cargo clippy --workspace --all-features --all-targets -- -D warnings` passes.
+  - The PostgreSQL-backed `rise-resource-store-postgres` integration suite
+    passes all 83 tests serially, including the nine new policy routing,
+    normalization, reference-resolution, containment, subject-resolution,
+    update-renormalization, concurrency, and migration-guard tests.
+  - `cargo test --workspace --all-features -- --test-threads=1` passes.
+
+## Increment 8a — generic resource labels and ancestry
+
+- State: draft PR open for review.
+- Branch: `claude/policy-activation-admission-1ojwzz` (restarted from `develop`
+  after #430 merged).
+- First half of increment 8: the generic store surface the authorization engine
+  reads, with no authorization semantics of its own.
+- Acceptance criteria:
+  - Resources carry `metadata.labels` end to end — request bodies, storage,
+    responses, and the typed envelope — validated against the same `LabelKey`
+    grammar a binding's `labelSelector` parses, with bounded single-line values.
+  - `ResourceStore` gains `ancestors(uid)`, returning the root-first structural
+    chain including the leaf in one query.
+  - No authorization behavior changes. `require_operator` is untouched and no
+    label is consulted for access.
+- Decisions:
+  - Labels live in a dedicated column, not inside `metadata`. That column
+    stores exactly the annotations map and is read back as a flat
+    string-to-string map, so nesting a label object inside it would break every
+    read and require rewriting every row; a new column is additive and needs no
+    backfill.
+  - `effectiveLabels` is deliberately *not* a store operation. ADR-0001 §6.1
+    resolves it nearest-wins over an already-fetched ancestor chain, which makes
+    it a pure function; only the chain itself needs SQL.
+  - `ancestors` is a `ResourceStore` trait method rather than a side adapter.
+    The ADR puts tree and label reads on the existing trait and reserves narrow
+    Postgres adapters for the identity lookups. It has no default
+    implementation: a defaulted method returning an empty chain would let a
+    forgotten implementor fail open later.
+  - Binding collection needs no new store method or index. Org `RoleBinding`s
+    are parented under their Organization and `PlatformRoleBinding`s at the
+    root, so the existing `list` reads serve them through the existing
+    `(parent_uid, group, kind)` indexes. This settles the index question
+    deliberately deferred in #430.
+  - Label writes are ungated in this increment, which is safe only because the
+    generic resource API is still operator-only. ADR-0001 §6.6's write gate for
+    access-driving labels must land with the increment-9 choke point, before
+    the API opens to non-operators.
+- Verification:
+  - `cargo fmt --all` and `cargo clippy --workspace --all-features --all-targets
+    -- -D warnings` pass.
+  - `cargo test --workspace --all-features -- --test-threads=1` passes; the
+    PostgreSQL-backed store suite is at 86 tests and the backend suite at 652.
+  - New coverage: label round-tripping and validation at the store and HTTP
+    layers, the database shape constraint, the ancestor chain (deep chain, root
+    resource, unknown UID, tombstoned ancestors, labels carried along), and an
+    EXPLAIN assertion that both binding-collection reads stay index-served.
+  - Generated resource schemas regenerated for the envelope change.

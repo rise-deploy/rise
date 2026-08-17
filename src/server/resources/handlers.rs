@@ -981,6 +981,7 @@ async fn create_resource(
         .map_err(|e| ServerError::bad_request(format!("invalid spec: {e}")))?;
 
     let params = CreateResourceParams {
+        labels: body.metadata.labels,
         api_version: resolved.info.storage_api_version.clone(),
         kind: body.kind,
         name: body.metadata.name,
@@ -1073,6 +1074,7 @@ async fn update_resource(
         .map_err(|e| ServerError::bad_request(format!("invalid spec: {e}")))?;
 
     let params = UpdateResourceParams {
+        labels: body.metadata.labels,
         api_version: Some(resolved.info.storage_api_version.clone()),
         revision: body.metadata.revision,
         annotations,
@@ -1355,6 +1357,7 @@ mod tests {
     fn malformed_stored_row_maps_to_contextual_internal_error() {
         let now = chrono::Utc::now();
         let row = ResourceRow {
+            labels: Default::default(),
             uid: Uuid::new_v4(),
             api_version: "example.dev/v1".into(),
             kind: "Widget".into(),
@@ -1479,6 +1482,7 @@ mod dispatch_tests {
         });
         ctx.store
             .register_resource_definition(CreateResourceParams {
+                labels: Default::default(),
                 api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
                 kind: RESOURCE_DEFINITION_KIND.to_string(),
                 name: "widgets.example.dev".to_string(),
@@ -1508,6 +1512,7 @@ mod dispatch_tests {
         });
         ctx.store
             .register_resource_definition(CreateResourceParams {
+                labels: Default::default(),
                 api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
                 kind: RESOURCE_DEFINITION_KIND.to_string(),
                 name: "gadgets.example.dev".to_string(),
@@ -1535,6 +1540,7 @@ mod dispatch_tests {
         });
         ctx.store
             .register_resource_definition(CreateResourceParams {
+                labels: Default::default(),
                 api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
                 kind: RESOURCE_DEFINITION_KIND.to_string(),
                 name: "gizmos.example.dev".to_string(),
@@ -1606,6 +1612,100 @@ mod dispatch_tests {
         let (status, body) = read(resp).await;
         assert_eq!(status, StatusCode::CREATED, "unexpected create status");
         body
+    }
+
+    // -------------------------------------------------------------------------
+    // Labels
+    // -------------------------------------------------------------------------
+
+    #[sqlx::test]
+    async fn labels_round_trip_through_the_http_surface(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx, &[]).await;
+
+        let resp = dispatch_post_inner(
+            &ctx,
+            "example.dev/v1/widgets".to_string(),
+            auth(OPERATOR),
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {
+                    "name": "labeled",
+                    "labels": {"rise.dev/owner": "group:platform"}
+                },
+                "spec": {"size": "large"},
+            }),
+        )
+        .await
+        .expect("create labeled widget");
+        let (status, created) = read(resp).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            created["metadata"]["labels"]["rise.dev/owner"],
+            "group:platform"
+        );
+
+        // The stored labels come back on a subsequent read.
+        let resp = dispatch_get_inner(
+            &ctx,
+            "example.dev/v1/widgets/labeled".to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("get labeled widget");
+        let (_, fetched) = read(resp).await;
+        assert_eq!(
+            fetched["metadata"]["labels"]["rise.dev/owner"],
+            "group:platform"
+        );
+
+        // PUT replaces the map wholesale, like annotations.
+        let resp = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/labeled".to_string(),
+            any_user(OPERATOR),
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {
+                    "name": "labeled",
+                    "revision": fetched["metadata"]["revision"],
+                    "labels": {"squad": "infra"}
+                },
+                "spec": {"size": "large"},
+            }),
+        )
+        .await
+        .expect("update labeled widget");
+        let (status, updated) = read(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(updated["metadata"]["labels"]["squad"], "infra");
+        assert!(updated["metadata"]["labels"]
+            .get("rise.dev/owner")
+            .is_none());
+
+        // A resource with no labels omits the key rather than sending an empty
+        // object, matching how ownerReferences is projected.
+        let bare = create_widget(&ctx, "example.dev/v1", "bare").await;
+        assert!(bare["metadata"].get("labels").is_none());
+
+        // An invalid key is a 400, not a 500.
+        let err = dispatch_post_inner(
+            &ctx,
+            "example.dev/v1/widgets".to_string(),
+            auth(OPERATOR),
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {"name": "bad-label", "labels": {"not a key/x": "v"}},
+                "spec": {},
+            }),
+        )
+        .await
+        .expect_err("invalid label key must be rejected");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
     // -------------------------------------------------------------------------
@@ -2022,6 +2122,7 @@ mod dispatch_tests {
         // Seed a widget at the storage version directly so the PUT test has a row.
         ctx.store
             .create(CreateResourceParams {
+                labels: Default::default(),
                 api_version: "example.dev/v1".to_string(),
                 kind: "Widget".to_string(),
                 name: "w1".to_string(),
@@ -2246,6 +2347,7 @@ mod dispatch_tests {
         let org = ctx
             .store
             .create(CreateResourceParams {
+                labels: Default::default(),
                 api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
                 kind: rise_resource_api::ORGANIZATION_KIND.to_string(),
                 name: "guard-test".to_string(),
@@ -2354,6 +2456,7 @@ mod dispatch_tests {
         let org = ctx
             .store
             .create(CreateResourceParams {
+                labels: Default::default(),
                 api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
                 kind: rise_resource_api::ORGANIZATION_KIND.to_string(),
                 name: "membership-guard-test".to_string(),
@@ -2627,6 +2730,7 @@ mod dispatch_tests {
         });
         ctx.store
             .register_resource_definition(CreateResourceParams {
+                labels: Default::default(),
                 api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
                 kind: RESOURCE_DEFINITION_KIND.to_string(),
                 name: "widgets.example.dev".to_string(),
@@ -2645,6 +2749,7 @@ mod dispatch_tests {
         // to non-storage versions are not supported), so we seed the row directly.
         ctx.store
             .create(CreateResourceParams {
+                labels: Default::default(),
                 api_version: "example.dev/v1".to_string(),
                 kind: "Widget".to_string(),
                 name: "w1".to_string(),
