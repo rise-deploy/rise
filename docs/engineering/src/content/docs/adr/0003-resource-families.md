@@ -199,11 +199,27 @@ Rules:
   family columns follow in declared order; `AGE` renders last.
 
 **Tables are rendered server-side**, through content negotiation on the
-ordinary collection GET rather than a subresource. Clients never receive column
-definitions or evaluate paths, and the projection rule below applies in exactly
-one place.
+ordinary collection GET rather than a subresource. A client sends one request
+and receives cells rather than whole objects, and no client reimplements path
+evaluation.
 
-That projection rule is the notable consequence: column *values* follow
+This is a convenience and a transfer optimization, never a security boundary.
+`ResourceFamily` and `ResourceDefinition` are ordinary resources, so a client
+holding `get` on them reads the column contract and the members' bindings and
+may render the same table itself, from the same objects the server would have
+read. Column definitions are therefore public API surface, not private
+configuration.
+
+The transfer saving is on the wire and in client parsing; the store still reads
+whole rows to evaluate paths. A database-side saving is available but not
+automatic: the bound paths can be extracted in SQL, selecting scalars instead
+of whole `spec`/`status` documents. That extraction must run *after* the
+per-item read decision, which is decidable from metadata and ancestry alone —
+so the shape is: read metadata for the scope, authorize per item, extract
+columns only for items that cleared `get`. Worth doing when a family list is
+measurably slow, not before.
+
+The per-item read decision is the notable consequence: column *values* follow
 ADR-0001's per-item read granularity exactly. `KIND` is free — the list
 projector's base-field allowlist includes it — but a column pathing into `spec`
 or `status` has nothing to read for an item the caller can `list` but not
@@ -256,7 +272,8 @@ family, enumerate its member kinds, learn their parent-chain depth, or pick a
 served version without hardcoding. Family-aware discovery is therefore a
 prerequisite for the CLI, not an enhancement, and must report families and
 their members alongside per-kind aliases, parent chain, and served versions.
-Column definitions need not be published there — tables render server-side.
+Column definitions need not be duplicated there: a client that wants them reads
+the `ResourceFamily` and the member RDs directly.
 
 **The positional path is the scope.** `<org>/<project>[/<name>]` is the
 existing URL grammar minus `{group}/{version}`, whose ancestor *types* are
@@ -283,7 +300,8 @@ split above exists to serve this.
 - **`ResourceFamily` lifecycle.** What deleting a family with live member RDs
   (or live instances) means — reject, cascade, or tombstone — and whether
   `columns` may be edited after members bind to them. Adding a column is safe
-  by the unbound-renders-empty rule; removing or retyping one is not.
+  by the unbound-renders-empty rule; removing or retyping one breaks both
+  existing bindings and any client rendering the table itself.
 - **Route shape for family collections.** Whether a family occupies the same
   URL position as a `plural` (relying on the shared identifier namespace) or a
   distinct segment.
@@ -309,6 +327,9 @@ split above exists to serve this.
   The schemas under `docs/engineering/public/schemas/` regenerate with them.
 - The API gains server-side table rendering — a restricted JSONPath evaluator
   and a table content type — which no current endpoint needs.
+- A family's `columns` become public API surface, readable by any client that
+  can `get` the `ResourceFamily`. Adding one stays compatible; removing or
+  retyping one breaks clients that render tables themselves.
 - Discovery becomes a hard dependency of the CLI workstream.
 
 ## Alternatives considered
