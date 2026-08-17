@@ -64,12 +64,12 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
   `require_operator`. Once Controller writes use that path, remove
   `ResourceDefinition.allowedStatusControllerIds` and authorize `status` and
   `finalizers` exclusively through RBAC.
-- [ ] Add Role/policy audit and explain diagnostics for semantically inert
+- [~] Add Role/policy audit and explain diagnostics for semantically inert
   configuration: no-op recipient or membership constraints, owners with no
   current grant, selectors matching nothing, stale references, and shadowed
   Allows. Keep these out of synchronous write rejection when the grant delta is
   safely empty.
-- [ ] Add request-local `AuthorizationSnapshot` memoization for membership,
+- [x] Add request-local `AuthorizationSnapshot` memoization for membership,
   admin classification, and effective policies. Defer cross-request caching
   until it can be invalidated transactionally through an authorization epoch.
 - [ ] Implement the write-time grant gate for Roles, bindings, membership,
