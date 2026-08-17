@@ -622,6 +622,106 @@ async fn relaxing_the_membership_clamp_is_a_grant() {
     );
 }
 
+/// An org Role body change that omits its Organization is refused, not silently
+/// ungated. Loading no org tier would match no binding and produce no claims,
+/// which is the one direction a gate must never fail in.
+#[tokio::test]
+async fn an_org_role_change_without_its_organization_fails_closed() {
+    let store = StoreBuilder::new().build();
+    let engine = engine(store, FakeMemberships::none());
+    let nobody = snapshot(&engine, principal("user:nobody")).await;
+
+    let error = engine
+        .evaluate_grant(
+            &nobody,
+            &AuthorizationChange::RoleBody(RoleBodyChange {
+                kind: RoleRefKind::Role,
+                name: "viewer".to_owned(),
+                organization: None,
+                before: Vec::new(),
+                after: statements(allow_all()),
+            }),
+        )
+        .await
+        .expect_err("a Role change with no Organization cannot be evaluated");
+    assert!(
+        error.to_string().contains("Organization"),
+        "the error names what is missing, got {error}"
+    );
+}
+
+/// A Deny whose scope names an unregistered kind is retained, not dropped.
+///
+/// `covers` answers "no" both for a scope that genuinely misses another and for
+/// one the registry cannot resolve, and only the first is evidence of
+/// disjointness. Treating the second as disjoint would silently remove a
+/// restriction from the writer — and the state is reachable, since deleting a
+/// `ResourceDefinition` does not delete bindings whose scope named that kind.
+#[tokio::test]
+async fn a_deny_scoped_to_an_unregistered_kind_still_limits_the_writer() {
+    let mut builder = StoreBuilder::new();
+    let acme = builder.resource(ORGANIZATION, "acme", None);
+    builder.role(ROLE, "project-admin", Some(acme), allow_all());
+    builder.role(
+        ROLE,
+        "no-delete",
+        Some(acme),
+        json!([{ "effect": "Deny", "kinds": "*", "verbs": ["delete"] }]),
+    );
+    builder.binding(
+        ROLE_BINDING,
+        "tess-admin",
+        Some(acme),
+        json!({
+            "subject": "user:tess",
+            "scope": "rise.dev/Organization/acme",
+            "roleRef": { "kind": "Role", "name": "project-admin" }
+        }),
+    );
+    // `Gadget` is not a registered kind, so this scope resolves to nothing.
+    builder.binding(
+        ROLE_BINDING,
+        "tess-cap",
+        Some(acme),
+        json!({
+            "subject": "user:tess",
+            "scope": "rise.dev/Gadget/acme/thing",
+            "roleRef": { "kind": "Role", "name": "no-delete" }
+        }),
+    );
+    let store = builder.build();
+    let engine = engine(store, FakeMemberships::none());
+    let tess = snapshot(&engine, principal("user:tess")).await;
+
+    let outcome = gate(
+        &engine,
+        &tess,
+        AuthorizationChange::Binding(BindingChange {
+            before: None,
+            after: Some(Box::new(BindingState {
+                uid: Uuid::new_v4(),
+                kind: BindingKind::RoleBinding,
+                organization: Some("acme".to_owned()),
+                subject: "user:umar".parse().expect("valid subject"),
+                subject_membership: SubjectMembership::Any,
+                scope: "rise.dev/Organization/acme".parse().expect("valid scope"),
+                selector: None,
+                role: RoleReference {
+                    kind: RoleRefKind::Role,
+                    name: "project-admin".to_owned(),
+                },
+            })),
+        }),
+    )
+    .await;
+
+    assert!(
+        !outcome.permitted(),
+        "the unresolvable-scope Deny must still count against the writer"
+    );
+    assert_eq!(missing_verbs(&outcome), vec!["delete".to_owned()]);
+}
+
 // -----------------------------------------------------------------------------
 // Scenario 34 — identity mapping is a grant
 // -----------------------------------------------------------------------------
@@ -774,6 +874,80 @@ async fn adding_a_group_membership_delegates_the_groups_authority() {
         "a reader cannot add someone to a Group that can delete Projects"
     );
     assert_eq!(missing_verbs(&outcome), vec!["delete".to_owned()]);
+}
+
+/// Scenario 42's last clause: a membership write that *activates* a dynamic
+/// ownership grant passes the ordinary effective-delta gate.
+///
+/// The grant is not delivered by any binding naming the Group — it comes from the
+/// seeded `${ref.subject}` binding, whose authored subject is a template. Looking
+/// only at literal-subject bindings would wave this through.
+#[tokio::test]
+async fn joining_a_group_that_owns_resources_is_gated() {
+    let mut builder = StoreBuilder::new();
+    seeded_ownership(&mut builder);
+    let acme = builder.resource(ORGANIZATION, "acme", None);
+    builder.labeled(PROJECT, "web", Some(acme), &[(OWNER_KEY, "group:platform")]);
+    let store = builder.build();
+    // Mallory is not in the owning Group, so she holds none of what joining it
+    // would confer.
+    let engine = engine(store, FakeMemberships::groups(&["group:acme/bystanders"]));
+    let mallory = snapshot(&engine, principal("user:mallory")).await;
+
+    let outcome = gate(
+        &engine,
+        &mallory,
+        AuthorizationChange::GroupMembership(GroupMembershipChange {
+            user: "user:victim".parse().expect("valid subject"),
+            group: "group:acme/platform".parse().expect("valid subject"),
+        }),
+    )
+    .await;
+
+    assert!(
+        !outcome.permitted(),
+        "joining a Group that owns resources delegates resource-owner over them"
+    );
+    let mut verbs = missing_verbs(&outcome);
+    verbs.sort();
+    assert_eq!(
+        verbs,
+        vec![
+            "delete".to_owned(),
+            "get".to_owned(),
+            "list".to_owned(),
+            "update".to_owned()
+        ],
+        "the whole of resource-owner is what the write hands over"
+    );
+}
+
+/// A current member of the owning Group may add another member: they already hold
+/// exactly what joining confers, so the subset check passes.
+#[tokio::test]
+async fn a_member_of_an_owning_group_may_add_another_member() {
+    let mut builder = StoreBuilder::new();
+    seeded_ownership(&mut builder);
+    let acme = builder.resource(ORGANIZATION, "acme", None);
+    builder.labeled(PROJECT, "web", Some(acme), &[(OWNER_KEY, "group:platform")]);
+    let store = builder.build();
+    let engine = engine(store, FakeMemberships::groups(&["group:acme/platform"]));
+    let owner = snapshot(&engine, principal("user:olive")).await;
+
+    let outcome = gate(
+        &engine,
+        &owner,
+        AuthorizationChange::GroupMembership(GroupMembershipChange {
+            user: "user:newcomer".parse().expect("valid subject"),
+            group: "group:acme/platform".parse().expect("valid subject"),
+        }),
+    )
+    .await;
+    assert!(
+        outcome.permitted(),
+        "a current member holds what they are handing on, got {:?}",
+        outcome.rejections
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -1117,6 +1291,73 @@ async fn removing_the_last_owner_label_grants_nobody() {
                 claim.domain.domain.scope.as_ref()
             ))
             .collect::<Vec<_>>()
+    );
+}
+
+/// A binding scoped *below* the written resource still makes the key gated.
+///
+/// Relabelling an Organization changes what a Project-scoped ownership binding
+/// resolves to on that Project, so applicability cannot be tested against the
+/// written resource alone — the write reaches the binding through inheritance,
+/// not through covering it.
+#[tokio::test]
+async fn a_binding_scoped_below_the_written_resource_still_gates_the_key() {
+    let mut builder = StoreBuilder::new();
+    // Deliberately no wildcard-scoped ownership binding: the only selector on the
+    // key sits on a Project, strictly below the Organization being relabelled.
+    builder.role(
+        PLATFORM_ROLE,
+        "resource-owner",
+        None,
+        json!([{ "effect": "Allow", "kinds": "*", "verbs": ["get", "list", "update", "delete"] }]),
+    );
+    let acme = builder.labeled(ORGANIZATION, "acme", None, &[(OWNER_KEY, "group:victims")]);
+    builder.resource(PROJECT, "web", Some(acme));
+    builder.binding(
+        PLATFORM_ROLE_BINDING,
+        "web-owner",
+        None,
+        json!({
+            "subject": "${ref.subject}",
+            "subjectMembership": "ResourceOrganization",
+            "scope": "rise.dev/Project/acme/web",
+            "labelSelector": { "key": OWNER_KEY },
+            "roleRef": { "kind": "PlatformRole", "name": "resource-owner" }
+        }),
+    );
+    let store = builder.build();
+    let engine = engine(
+        store.clone(),
+        FakeMemberships::groups(&["group:acme/interlopers"]),
+    );
+    let mallory = snapshot(&engine, principal("user:mallory")).await;
+
+    let outcome = gate(
+        &engine,
+        &mallory,
+        AuthorizationChange::Label(LabelChange {
+            target: tree(&store, &[acme]),
+            target_uid: Some(acme),
+            key: OWNER_KEY.parse().expect("valid label key"),
+            after_value: Some("group:interlopers".to_owned()),
+            creation: false,
+        }),
+    )
+    .await;
+
+    assert!(
+        !outcome.permitted(),
+        "the Project-scoped binding hands `web` to the writer's own Group"
+    );
+    let scopes: Vec<&str> = outcome
+        .claims
+        .iter()
+        .map(|claim| claim.domain.domain.scope.as_ref())
+        .collect();
+    assert_eq!(
+        scopes,
+        vec!["rise.dev/Project/acme/web"],
+        "only the resource the binding actually reaches is claimed"
     );
 }
 

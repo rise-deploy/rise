@@ -89,7 +89,7 @@ impl PolicyAdmission {
                 Ok(spec.clone())
             }
             Self::RoleBinding => {
-                self.admit_role_binding(conn, builtins, parent_uid, spec)
+                self.admit_role_binding(conn, builtins, parent_uid, name, spec)
                     .await
             }
             Self::PlatformRoleBinding => {
@@ -104,6 +104,7 @@ impl PolicyAdmission {
         conn: &mut PgConnection,
         builtins: &BuiltInRegistry,
         parent_uid: Option<Uuid>,
+        name: &str,
         spec: &serde_json::Value,
     ) -> Result<serde_json::Value, StoreError> {
         let organization = self.parent_organization(conn, parent_uid).await?;
@@ -112,6 +113,7 @@ impl PolicyAdmission {
             .normalize(&organization.name)
             .map_err(|error| StoreError::Validation(error.to_string()))?;
 
+        require_authorable_subject(normalized.subject(), parent_uid, name)?;
         resolve_binding_subject(conn, normalized.subject()).await?;
 
         // Reference direction (ADR-0001 §4): an org binding reaches its own
@@ -156,20 +158,7 @@ impl PolicyAdmission {
             .normalize()
             .map_err(|error| StoreError::Validation(error.to_string()))?;
 
-        // `system:operators` is the one subject nobody may author: the recovery
-        // tier is hardcoded in the evaluator, and a second binding naming it
-        // would look like the source of that authority without being it. Only
-        // the reserved seed may carry it, and only with its shipped body.
-        let names_operators = normalized
-            .subject()
-            .literal()
-            .is_some_and(|subject| subject.as_ref() == OPERATORS_SUBJECT);
-        if names_operators && !(parent_uid.is_none() && name == SYSTEM_ADMIN_PLATFORM_ROLE) {
-            return Err(StoreError::Validation(format!(
-                "{OPERATORS_SUBJECT} is reserved for the seeded root \
-                 {PLATFORM_ROLE_BINDING_KIND} '{SYSTEM_ADMIN_PLATFORM_ROLE}'"
-            )));
-        }
+        require_authorable_subject(normalized.subject(), parent_uid, name)?;
         // Compare the *normalized* forms: the spec that reaches the row has its
         // contextual defaults applied, so comparing the caller's pre-normalized
         // input against a normalized default would never match.
@@ -294,4 +283,35 @@ where
     Err(StoreError::Validation(format!(
         "{kind} '{name}' is seeded and immutable; its spec must be the shipped default"
     )))
+}
+
+/// Reject the one subject nobody may author.
+///
+/// The recovery tier is hardcoded in the evaluator, so a binding naming
+/// `system:operators` would look like the source of that authority without being
+/// it. Exactly one row may carry it — the seeded root `PlatformRoleBinding` named
+/// `system-admin` — and this applies to *both* binding kinds: an org
+/// `RoleBinding` naming it is inert under §1's recipient boundary today, and
+/// admitting misleading policy on the strength of it being currently inert is how
+/// it stops being inert later.
+///
+/// This lives here rather than in context-free `normalize()` because it needs the
+/// resource's name and placement, and because admission is authoritative for
+/// direct store calls that supply no validator.
+fn require_authorable_subject(
+    subject: &rise_resource_api::BindingSubject,
+    parent_uid: Option<Uuid>,
+    name: &str,
+) -> Result<(), StoreError> {
+    let names_operators = subject
+        .literal()
+        .is_some_and(|subject| subject.as_ref() == OPERATORS_SUBJECT);
+    let is_reserved_seed = parent_uid.is_none() && name == SYSTEM_ADMIN_PLATFORM_ROLE;
+    if names_operators && !is_reserved_seed {
+        return Err(StoreError::Validation(format!(
+            "{OPERATORS_SUBJECT} is reserved for the seeded root \
+             {PLATFORM_ROLE_BINDING_KIND} '{SYSTEM_ADMIN_PLATFORM_ROLE}'"
+        )));
+    }
+    Ok(())
 }

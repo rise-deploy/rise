@@ -435,7 +435,17 @@ impl AuthorizationEngine {
     ) -> Result<Vec<GrantClaim>, AuthorizationError> {
         let organizations = match change.kind {
             RoleRefKind::PlatformRole => OrganizationScope::All,
-            RoleRefKind::Role => OrganizationScope::named(change.organization.clone()),
+            // An org Role is only ever reachable from its own Organization's
+            // bindings, so a change that omits the Organization would load no org
+            // tier, match no binding, and produce no claims — an ungated Role
+            // edit. That is the one direction this must never fail in.
+            RoleRefKind::Role => {
+                OrganizationScope::named(Some(change.organization.clone().ok_or_else(|| {
+                    AuthorizationError::invalid_input(
+                        "an org Role body change requires the Role's Organization",
+                    )
+                })?))
+            }
         };
         let universe = self.binding_universe(&organizations).await?;
         let lattice = self.scope_lattice(&universe, &[]).await?;
@@ -572,11 +582,16 @@ impl AuthorizationEngine {
         let organizations =
             OrganizationScope::named(change.group.organization().map(str::to_owned));
         let universe = self.binding_universe(&organizations).await?;
-        let lattice = self.scope_lattice(&universe, &[]).await?;
+        let lattice = self
+            .scope_lattice(
+                &universe,
+                &organization_scopes(std::slice::from_ref(&change.group))?,
+            )
+            .await?;
 
         let recipient = BindingSubject::Literal(change.user.clone());
         let group = BindingSubject::Literal(change.group.clone());
-        let claims = authored_domains(&universe, &group)
+        let mut claims: Vec<GrantClaim> = authored_domains(&universe, &group)
             .into_iter()
             .map(|domain| {
                 let before = aggregate(&universe, &recipient, &domain, &lattice);
@@ -591,6 +606,20 @@ impl AuthorizationEngine {
                 }
             })
             .collect();
+
+        // The Group's authority is not only what bindings name it: a templated
+        // binding delivers to whoever a label resolves to, and the seeded
+        // ownership rule is exactly one of those.
+        for (domain, statements) in dynamic_grants(&universe, &change.group, &lattice) {
+            let before = aggregate(&universe, &recipient, &domain, &lattice);
+            claims.push(GrantClaim {
+                recipient: recipient.clone(),
+                writer_domain: domain.clone(),
+                domain,
+                after: merge_statements(&before, &statements),
+                before,
+            });
+        }
         Ok(dedupe_claims(claims))
     }
 
@@ -617,7 +646,13 @@ impl AuthorizationEngine {
         // including one it holds no membership in — an operator-authored binding
         // naming it directly. Loading every tier is the only complete answer.
         let universe = self.binding_universe(&OrganizationScope::All).await?;
-        let lattice = self.scope_lattice(&universe, &[]).await?;
+        let subjects: Vec<SubjectId> = reachable
+            .iter()
+            .filter_map(|subject| subject.literal().cloned())
+            .collect();
+        let lattice = self
+            .scope_lattice(&universe, &organization_scopes(&subjects)?)
+            .await?;
 
         let mut claims = Vec::new();
         for recipient in &reachable {
@@ -629,6 +664,19 @@ impl AuthorizationEngine {
                     domain,
                     before: Vec::new(),
                     after,
+                });
+            }
+        }
+        // A label naming this identity, or one of its Groups, reaches it through a
+        // templated binding no authored subject would match.
+        for subject in &subjects {
+            for (domain, statements) in dynamic_grants(&universe, subject, &lattice) {
+                claims.push(GrantClaim {
+                    recipient: BindingSubject::Literal(subject.clone()),
+                    writer_domain: domain.clone(),
+                    domain,
+                    before: Vec::new(),
+                    after: statements,
                 });
             }
         }
@@ -678,6 +726,13 @@ impl AuthorizationEngine {
         let organizations =
             OrganizationScope::named(change.target.organization().map(str::to_owned));
         let universe = self.binding_universe(&organizations).await?;
+        //
+        // Applicability is deliberately *not* narrowed to bindings covering the
+        // written resource. A binding scoped strictly below it is reached through
+        // inheritance rather than by covering: relabelling an Organization changes
+        // what a Project-scoped ownership binding resolves to on that Project. The
+        // per-resource loop below applies the coverage test where it belongs, once
+        // the affected set is known.
         let selecting: Vec<&BindingFact> = universe
             .iter()
             .filter(|binding| {
@@ -687,11 +742,7 @@ impl AuthorizationEngine {
                     .is_some_and(|selector| selector.key.as_ref() == key)
             })
             .collect();
-        if selecting.is_empty()
-            || !selecting
-                .iter()
-                .any(|binding| change.target.covered_by(&binding.scope))
-        {
+        if selecting.is_empty() {
             return Ok((Vec::new(), false));
         }
 
@@ -1187,6 +1238,12 @@ impl ScopeLattice {
         Ok(Self { chains })
     }
 
+    /// Whether this scope's shape is known: either the wildcard, which needs no
+    /// registry, or a concrete scope whose kind chain resolved.
+    fn resolves(&self, scope: &Scope) -> bool {
+        scope.is_wildcard() || self.chains.contains_key(scope.as_ref())
+    }
+
     /// Whether one concrete scope's subtree contains another's.
     ///
     /// `covering`'s names must be a root-first prefix of `covered`'s, and
@@ -1256,6 +1313,20 @@ fn gate_domain_covers(covering: &GateDomain, covered: &GateDomain, lattice: &Sco
 }
 
 fn gate_domains_disjoint(left: &GateDomain, right: &GateDomain, lattice: &ScopeLattice) -> bool {
+    // Concluding disjointness drops a Deny, so an unresolved scope must not be
+    // allowed to conclude it. `covers` answers "no" both for a scope that
+    // genuinely misses another and for one the registry could not resolve, and
+    // only the first of those is evidence — so resolution is required explicitly
+    // before the two are compared at all.
+    //
+    // Every scope one comparison uses is loaded into the lattice up front, so
+    // reaching this with an unresolved scope means a kind that is not registered,
+    // whose scope therefore describes no resource. Treating it as overlapping
+    // costs a retained Deny that matches nothing; the opposite mistake silently
+    // removes a restriction.
+    if !lattice.resolves(&left.domain.scope) || !lattice.resolves(&right.domain.scope) {
+        return false;
+    }
     // A clamp narrows a domain but never proves it misses another one, so
     // disjointness is decided on scope and selector alone.
     domains_provably_disjoint_with(&left.domain, &right.domain, &|left, right| {
@@ -1396,6 +1467,123 @@ fn recipient_is_organization_admin(
         .iter()
         .filter(|binding| &binding.subject == recipient)
         .any(|binding| qualifies_as_org_admin(binding, organization))
+}
+
+/// The authority *templated* bindings deliver to one concrete subject, with the
+/// domain each reaches for it.
+///
+/// A templated binding's authored subject is `${ref.subject}` (or one of the two
+/// name templates), never the subject it resolves to, so authored-subject
+/// aggregation cannot see it — and ADR-0001 §6.2's seeded ownership rule is
+/// exactly such a binding. Scenario 42 requires a membership write that
+/// *activates* one to pass the ordinary gate, which is what this supplies.
+///
+/// It stays intensional, as §5 demands: no resource is enumerated. The domain is
+/// the binding's own, narrowed two ways — the selector pinned to the label value
+/// that names this subject, and, for a Group, the scope confined to that Group's
+/// Organization, because §6.3 resolves a relative `group:<name>` against the
+/// matched resource's organization and so reaches nothing outside it.
+fn dynamic_grants(
+    universe: &[BindingFact],
+    subject: &SubjectId,
+    lattice: &ScopeLattice,
+) -> Vec<(GateDomain, Vec<PolicyStatement>)> {
+    let mut grants = Vec::new();
+    for binding in universe
+        .iter()
+        .filter(|binding| binding.subject.is_dynamic())
+    {
+        let Some(selector) = binding.selector.as_ref() else {
+            continue;
+        };
+        let Some(value) = label_value_naming(&binding.subject, subject) else {
+            continue;
+        };
+        // A value-pinned selector that names somebody else reaches nothing here.
+        if selector
+            .value
+            .as_ref()
+            .is_some_and(|wanted| *wanted != value)
+        {
+            continue;
+        }
+        let Some(scope) = confine_to_subject_organization(&binding.scope, subject, lattice) else {
+            continue;
+        };
+        grants.push((
+            GateDomain::new(
+                scope,
+                Some(LabelSelector {
+                    key: selector.key.clone(),
+                    value: Some(value),
+                }),
+                binding.subject_membership,
+            ),
+            binding.statements.clone(),
+        ));
+    }
+    grants
+}
+
+/// The label value that makes one templated binding resolve to this subject, in
+/// the form ADR-0001 §6.1 permits a label to carry.
+fn label_value_naming(template: &BindingSubject, subject: &SubjectId) -> Option<String> {
+    match template {
+        BindingSubject::Literal(_) => None,
+        // A `SubjectRef` is absolute for a User and relative for a Group; the full
+        // cross-org Group identifier is not a legal label value.
+        BindingSubject::SubjectRefTemplate => match subject.kind() {
+            "user" => Some(format!("user:{}", subject.name())),
+            "group" => Some(format!("group:{}", subject.name())),
+            _ => None,
+        },
+        BindingSubject::UserNameTemplate => {
+            (subject.kind() == "user").then(|| subject.name().to_owned())
+        }
+        BindingSubject::GroupNameTemplate => {
+            (subject.kind() == "group").then(|| subject.name().to_owned())
+        }
+    }
+}
+
+/// Narrow a binding's scope to the part that can reach an org-bound subject.
+///
+/// A Group is only ever resolved from a label against the matched resource's own
+/// organization, so a wildcard-scoped binding reaches that Group solely inside its
+/// own Organization. A scope already confined there is kept as-is, one confined
+/// elsewhere reaches nothing, and a subject that carries no organization — a
+/// root-absolute User — is not narrowed at all.
+fn confine_to_subject_organization(
+    scope: &Scope,
+    subject: &SubjectId,
+    lattice: &ScopeLattice,
+) -> Option<Scope> {
+    let Some(organization) = subject.organization() else {
+        return Some(scope.clone());
+    };
+    let organization_scope = organization_scope(organization).ok()?;
+    if scope.is_wildcard() {
+        return Some(organization_scope);
+    }
+    lattice
+        .covers(&organization_scope, scope)
+        .then(|| scope.clone())
+}
+
+fn organization_scope(organization: &str) -> Result<Scope, AuthorizationError> {
+    format!("{API_GROUP}/{ORGANIZATION_KIND}/{organization}")
+        .parse()
+        .map_err(AuthorizationError::from)
+}
+
+/// The Organization scopes a set of subjects can be confined to, so the lattice
+/// resolves them before [`confine_to_subject_organization`] compares against them.
+fn organization_scopes(subjects: &[SubjectId]) -> Result<Vec<Scope>, AuthorizationError> {
+    subjects
+        .iter()
+        .filter_map(SubjectId::organization)
+        .map(organization_scope)
+        .collect()
 }
 
 /// Every distinct domain over which some binding delivers authority to this

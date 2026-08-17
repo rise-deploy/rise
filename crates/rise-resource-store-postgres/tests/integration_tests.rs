@@ -5792,3 +5792,53 @@ async fn an_organization_role_may_be_named_system_admin(pool: sqlx::PgPool) -> s
 
     Ok(())
 }
+
+/// The `system:operators` reservation covers *both* binding kinds. An org
+/// `RoleBinding` naming it is refused for the same reason a stray platform one
+/// is: the recovery tier is hardcoded in the evaluator, so a second row naming
+/// it would look like the source of that authority without being it.
+#[sqlx::test]
+async fn an_org_role_binding_cannot_name_the_operators_subject(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let org = create_builtin_resource(
+        &store,
+        ORGANIZATION_KIND,
+        "acme",
+        None,
+        json!({"displayName": "Acme"}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    create_builtin_resource(
+        &store,
+        ROLE_KIND,
+        "viewer",
+        Some(org.uid),
+        json!({"statements": [{"effect": "Allow", "kinds": "*", "verbs": ["get"]}]}),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    let error = create_binding(
+        &store,
+        ROLE_BINDING_KIND,
+        "operators",
+        Some(org.uid),
+        json!({
+            "subject": "system:operators",
+            "roleRef": {"kind": "Role", "name": "viewer"}
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&error, StoreError::Validation(message) if message.contains("system:operators")),
+        "an org RoleBinding must not name the operators subject, got {error:?}"
+    );
+
+    Ok(())
+}

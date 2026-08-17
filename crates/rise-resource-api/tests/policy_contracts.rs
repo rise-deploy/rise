@@ -207,11 +207,12 @@ fn binding_normalization_is_contextual_and_fail_closed() {
     .unwrap();
     assert!(static_exists_selector.normalize().is_err());
 
-    // `system:operators` parses and normalizes: it is the subject of the seeded
-    // bootstrap binding, which has to be writable through this same contract.
-    // Reserving it to that one root binding needs the resource's name and
-    // placement, which this context-free step cannot see, so the reservation
-    // lives in transaction-scoped admission instead.
+    // `system:operators` parses and normalizes on both binding kinds: it is the
+    // subject of the seeded bootstrap binding, which has to be writable through
+    // this same contract. Reserving it to that one root `PlatformRoleBinding`
+    // needs the resource's name and placement, which this context-free step
+    // cannot see, so the reservation lives in transaction-scoped admission — and
+    // covers *both* kinds there, which the store's integration suite pins.
     let reserved_platform: PlatformRoleBindingSpec =
         serde_json::from_value(platform_binding("system:operators")).unwrap();
     let normalized = reserved_platform

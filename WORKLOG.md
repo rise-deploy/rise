@@ -782,15 +782,15 @@ scope and avoiding dead-end compatibility layers.
 - Verification:
   - `cargo fmt --all` and `cargo clippy --workspace --all-features --all-targets
     -- -D warnings` pass.
-  - `cargo test --workspace --all-features -- --test-threads=1` passes: 1,195
+  - `cargo test --workspace --all-features -- --test-threads=1` passes: 1,202
     tests, with two ignored documentation examples.
   - Generated resource, backend-settings, and `rise.toml` schemas are unchanged,
     and both SQLX offline caches verify clean. `cargo audit` and `helm lint` were
     not run locally (neither tool is available in this environment); no
     dependency was added and the chart is untouched, so CI covers both.
-  - The new `rise-authz` gate suite is 23 tests; the engine suite (28) and policy
+  - The `rise-authz` gate suite is 28 tests; the engine suite (28) and policy
     suite (16) are unchanged.
-  - The PostgreSQL-backed store suite is at 91 tests, adding the subtree read's
+  - The PostgreSQL-backed store suite is at 92 tests, adding the subtree read's
     pruning/tombstone/ordering behaviour and the seed's create-once,
     no-update, no-delete, placement-scoped reservation.
   - Coverage follows ADR-0001 scenarios 29–32, 34, and 39–43: the capped-admin
@@ -804,6 +804,63 @@ scope and avoiding dead-end compatibility layers.
     creation exception's four cases.
   - Scenario 33 (serializable with revocation) is a property of the transaction
     the gate runs inside, not of the gate; it lands with 9b's write path.
+- Review — adversarial pass over the gate, fixed in the same increment. Each
+  finding was reproduced as a failing test before the fix, and the
+  unresolvable-scope fix was re-verified by disabling it and confirming the test
+  fails again:
+  - **A binding scoped below the written resource escaped the label gate.** §6.6
+    step 2's applicability test was evaluated against the written resource alone,
+    so a selecting binding placed *under* it was missed and the write was waved
+    through ungated — even though relabelling an ancestor is precisely how such a
+    binding is reached, through inheritance rather than coverage. Relabelling an
+    Organization could hand a Project-scoped ownership binding to the writer's own
+    Group. The early return now tests only whether *any* binding selects on the
+    key; the per-resource loop applies coverage where it belongs, once the
+    affected set is known.
+  - **A membership write could activate a dynamic ownership grant ungated.** A
+    templated binding's authored subject is `${ref.subject}`, never the subject it
+    resolves to, so authored-subject aggregation could not see the seeded
+    ownership rule. Adding a User to a Group that owns resources therefore
+    delegated `resource-owner` over them with no check — contradicting scenario
+    42's closing requirement that "a later membership write that would activate
+    that ownership passes the ordinary effective-delta grant gate". Membership and
+    identity-mapping claims now include templated bindings, with the domain
+    narrowed twice: the selector pinned to the label value naming the subject, and
+    the scope confined to a Group's own Organization, because §6.3 resolves a
+    relative `group:<name>` against the matched resource's organization and so
+    reaches nothing outside it. It stays intensional — no resource is enumerated.
+  - **The `system:operators` reservation stopped covering org `RoleBinding`s.**
+    Moving the check out of context-free `normalize()` re-added it only on the
+    platform path, and a contract test was changed to assert the relaxation. Inert
+    today, because §1's recipient boundary makes such a binding grant nothing —
+    but admitting misleading policy on the strength of it being currently inert is
+    how it stops being inert. Both binding paths now share one reservation helper.
+  - **Two fail-open paths closed.** A `RoleBodyChange` for an org `Role` that
+    omitted its Organization loaded no org tier, matched no binding, and produced
+    no claims — an ungated Role edit; it is now an error. And
+    `domains_provably_disjoint_with` concluded disjointness when a scope could not
+    be resolved, silently dropping that binding's Deny from the writer's authority;
+    `covers` answers "no" both for a scope that genuinely misses another and for
+    one the registry cannot resolve, and only the first is evidence. Resolution is
+    now required before disjointness is considered. The state is reachable:
+    deleting a `ResourceDefinition` does not delete bindings whose scope named
+    that kind.
+  - Reviewed and kept as-is: symmetric Deny modelling across the before/after
+    universes, which cannot manufacture a grant because a Deny present in both
+    suppresses the tuple on both sides; an operator's short-circuited outcome
+    carrying no claims, at the cost of an audit trail 9b must supply itself; and
+    `get_by_name` returning tombstoned rows, which makes a draining editable
+    default skip re-creation until the collector finishes rather than fail
+    startup.
+  - Known consequence, not a defect: because the seeded ownership binding always
+    exists, adding a member to *any* Group now requires the writer to hold
+    `resource-owner` over that Group's ownership domain — satisfied by an org
+    admin, or by a current member of the Group. That follows from §5's intensional
+    rule ("never merely over resources that exist now"): the domain is non-empty
+    in principle even for a Group that owns nothing yet. Group membership is
+    therefore an admin-or-member operation, which 9b's error messages should say
+    plainly.
+
 - Follow-ups this increment deliberately leaves open:
   - 9b: the choke point replacing `require_operator`, `SERIALIZABLE` writes with
     bounded retry, list projection (scenarios 37/38), the live
@@ -815,3 +872,6 @@ scope and avoiding dead-end compatibility layers.
     them rather than echo them.
   - `Explanation` and `GateRejection` both name bindings and Roles the caller may
     hold no read access to. 9b decides what a denial actually returns.
+  - Policy auditing for semantically inert dynamic grants — a Group named as an
+    owner that no longer exists, a selector matching nothing — remains open, and
+    is now the natural home for explaining *why* a membership write was refused.
