@@ -112,6 +112,23 @@ use a ResourceDefinition. Both kinds remain valid owners, and a custom
 `Organization` kind in another API group is unaffected. The restriction can be
 removed once those guards move into the transaction-scoped lifecycle layer.
 
+## Labels and ancestry
+
+Resources carry `metadata.labels` in a dedicated `labels` column rather than
+inside `metadata`, which stores exactly the annotations map and is read back as
+a flat string-to-string map. Keys parse through the same `LabelKey` grammar a
+binding's `labelSelector` uses, so any key that can be written can also be
+selected on; values are bounded and single-line. A database CHECK keeps the
+stored shape honest against direct SQL.
+
+`ancestors(uid)` returns the root-first structural chain including the
+resource itself, in one recursive query rather than the per-level walk that
+placement and path resolution use. It exists for `effectiveLabels`: ADR-0001
+resolves label inheritance nearest-wins over an already-fetched ancestor
+chain, so the inheritance itself is a pure function on the caller's side and
+never a query. Like `resolve_path`, the chain includes tombstoned rows for the
+caller to interpret.
+
 ## Deletion model
 
 Inspired by Kubernetes finalizers, but adapted to a hierarchical store with a hard FK.

@@ -57,7 +57,7 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
   target-parent workload trust lookup, and reverse name-based membership edges.
   These remain internal storage projections and do not change the generic
   resource API shape.
-- [ ] Implement live membership expansion, per-item list filtering/projection,
+- [~] Implement live membership expansion, per-item list filtering/projection,
   effective-label resolution, typed `SubjectRef` values for dynamic ownership,
   tiered platform/org Deny filtering, admin/operator classification, platform
   ceilings, and the centralized authorization choke point replacing

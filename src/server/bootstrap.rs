@@ -206,6 +206,7 @@ async fn upsert_default_organization(
         // Fresh install: no Organizations exist yet.
         let created = store
             .create(CreateResourceParams {
+                labels: Default::default(),
                 api_version: API_VERSION_V1ALPHA1.to_string(),
                 kind: ORGANIZATION_KIND.to_string(),
                 name: default_org.name.clone(),
@@ -244,6 +245,7 @@ async fn upsert_default_organization(
         .update(
             row.uid,
             UpdateResourceParams {
+                labels: Default::default(),
                 api_version: None,
                 revision: row.revision,
                 annotations: merged_annotations,
@@ -715,6 +717,7 @@ mod tests {
             .update(
                 uid,
                 UpdateResourceParams {
+                    labels: Default::default(),
                     api_version: None,
                     revision: row.revision,
                     annotations,
@@ -772,6 +775,7 @@ mod tests {
         // Mint a second Org directly through the store.
         store
             .create(CreateResourceParams {
+                labels: Default::default(),
                 api_version: API_VERSION_V1ALPHA1.to_string(),
                 kind: ORGANIZATION_KIND.to_string(),
                 name: "other".to_string(),
