@@ -652,8 +652,10 @@ scope and avoiding dead-end compatibility layers.
     step ordering.
   - Known costs, not defects: binding loads are one query per Role on a
     snapshot's first evaluation, and `filter_list` is O(items × bindings) of
-    pure computation over cached facts. Both are bounded per request and are
-    what the ADR's deferred cross-request cache addresses.
+    pure computation over cached facts. Both are bounded per request. Batching
+    the role lookups fixes the first with no schema commitment and should come
+    before any cross-request cache; the sequencing is tracked under `ROADMAP.md`
+    § Unified identity and RBAC.
 - Follow-ups this increment deliberately leaves open:
   - The centralized choke point replacing `require_operator`, the write-time
     grant gate, and seeded `system-admin`/`resource-owner`/`org-admin` data are
@@ -665,7 +667,17 @@ scope and avoiding dead-end compatibility layers.
     operator selectors, and `authorization_details` parsing, are increment 10.
   - Policy auditing beyond the inert-binding reasons above — owners granting
     nobody, selectors matching nothing, stale references — remains open.
-  - An Organization tombstone takes its bindings with it, so org-tier Denies
-    stop applying to whatever remains of its subtree while it drains. The choke
-    point deciding whether a resource under deletion is addressable at all is
-    the right place to settle that.
+  - An Organization tombstone takes its policy resources with it, so its whole
+    tier stops applying while the subtree drains. That is narrower than it
+    sounds: membership lookup requires a live Group *and* a live Organization,
+    so every member loses affiliation at the same moment, which also drops
+    org-parented bindings, `org:<name>` grants, and every
+    `subjectMembership: ResourceOrganization` binding — the seeded ownership
+    default included. What survives is exactly operator-authored non-member
+    access and Controllers, which is the case ADR-0001 §4 already settles for
+    membership loss ("an explicit operator-governance case"). Ordering the
+    cascade to collect policy last would preserve Denies that reach nobody, and
+    denying everyone but operators would deadlock the drain on controllers that
+    still need to remove their finalizers. The one real gap is `create` below a
+    deleting ancestor, now tracked under `ROADMAP.md` § Resource API
+    maturation, as a lifecycle rule rather than an authorization one.

@@ -72,6 +72,17 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
 - [x] Add request-local `AuthorizationSnapshot` memoization for membership,
   admin classification, and effective policies. Defer cross-request caching
   until it can be invalidated transactionally through an authorization epoch.
+- [ ] Decide cross-request authorization caching on measurement, not ahead of
+  it. The request-local snapshot already removes the repeated cost inside one
+  request; what remains is one role lookup per distinct `roleRef` on a
+  snapshot's first evaluation, which batching fixes with no schema commitment —
+  do that first. Only if authorization is still a measurable share of request
+  time once the typed-object migration (§4) puts real traffic on the engine
+  should a cross-request cache land, and then through a transactionally
+  incremented global `authorization_epoch` keyed by at least principal UID,
+  token-cap hash, epoch, and resource identity. A write path that forgets to
+  bump the epoch is a stale-authorization bug no test will surface, which is
+  why the measurement comes first.
 - [ ] Implement the write-time grant gate for Roles, bindings, membership,
   identity mappings, and access-driving labels. All authorization-changing
   writes use serializable transactions with bounded retry.
@@ -101,6 +112,15 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
 
 ### Resource API maturation
 
+- [ ] Reject `create` below an ancestor that is already tombstoned. Built-in
+  placement validation walks the whole chain and refuses a deleting ancestor;
+  `ResourceDefinition`-registered kinds have no equivalent check, so a create
+  can still add a child to a subtree the garbage collector is draining.
+  Creation is the case that matters, and it matters most under a deleting
+  Organization, whose policy resources are tombstoned with it while an
+  operator-authored platform grant survives. Reads, `delete`, and the
+  `status`/`finalizers` subresources must keep working, or controllers cannot
+  remove their finalizers and the subtree never drains.
 - [ ] Add pagination plus label/field selectors. Labels remain JSONB initially;
   measure before introducing a separate label table.
 - [ ] Add JSON Merge Patch and RFC 6902 Patch through the common mutation
