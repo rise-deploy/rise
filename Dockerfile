@@ -165,6 +165,7 @@ ARG DOCKER_CLI_VERSION=29.0.4
 ARG RAILPACK_VERSION=0.15.1
 ARG BUILDX_VERSION=0.34.1
 ARG BUILDKIT_VERSION=0.28.0
+ARG TARGETARCH
 
 RUN /root/.local/bin/mise use -g pack@${PACK_VERSION} && \
     /root/.local/bin/mise use -g docker-cli@${DOCKER_CLI_VERSION} && \
@@ -173,11 +174,11 @@ RUN /root/.local/bin/mise use -g pack@${PACK_VERSION} && \
 
 # Install Docker buildx plugin manually (pinned).
 RUN mkdir -p /root/.docker/cli-plugins && \
-    curl -sSL "https://github.com/docker/buildx/releases/download/v${BUILDX_VERSION}/buildx-v${BUILDX_VERSION}.linux-amd64" -o /root/.docker/cli-plugins/docker-buildx && \
+    curl -sSL "https://github.com/docker/buildx/releases/download/v${BUILDX_VERSION}/buildx-v${BUILDX_VERSION}.linux-${TARGETARCH}" -o /root/.docker/cli-plugins/docker-buildx && \
     chmod +x /root/.docker/cli-plugins/docker-buildx
 
 # Install buildctl from buildkit (pinned).
-RUN curl -sSL "https://github.com/moby/buildkit/releases/download/v${BUILDKIT_VERSION}/buildkit-v${BUILDKIT_VERSION}.linux-amd64.tar.gz" | tar -xz -C /usr/local bin/buildctl && \
+RUN curl -sSL "https://github.com/moby/buildkit/releases/download/v${BUILDKIT_VERSION}/buildkit-v${BUILDKIT_VERSION}.linux-${TARGETARCH}.tar.gz" | tar -xz -C /usr/local bin/buildctl && \
     chmod +x /usr/local/bin/buildctl
 
 # Verify installations
