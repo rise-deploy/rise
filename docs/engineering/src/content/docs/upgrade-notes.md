@@ -26,8 +26,8 @@ project's "Operator impact" view is the worklist; this page is what operators re
 
 ## Unreleased
 
-_Changes merged to `develop` but not yet in a tagged release, plus in-flight PRs
-proposed for the next train. Moved into a version section at tag time._
+_Changes merged to `develop` but not yet in a tagged release. Moved into a
+version section at tag time._
 
 Merged to `develop`:
 
@@ -94,9 +94,8 @@ Merged to `develop`:
   `scope` target, and any literal `subject` it names to already exist — create
   the Role before the RoleBinding that references it.
 
-In-flight PRs with operator impact (not yet merged):
-
-- **Behavior change — workload identity on the Docker backend** ([#378](https://github.com/rise-deploy/rise/issues/378)).
+- **Behavior change — workload identity on the Docker backend** ([#382](https://github.com/rise-deploy/rise/pull/382),
+  closing [#378](https://github.com/rise-deploy/rise/issues/378)).
   The Docker controller now delivers the same workload-identity material as
   Kubernetes — the bootstrap credential and one token file per `[identity].audiences`
   entry — to `/var/run/secrets/rise/identity/` inside each app container (via the
@@ -123,7 +122,7 @@ In-flight PRs with operator impact (not yet merged):
   so this closes the gap on Kubernetes. The per-project re-mint due time is
   tracked on the `RiseProject` CR's `status.identityRefreshDueAt` (written by the
   sync webhook), so there is no deployments-table schema change.
-- **Action required — raw external token deprecation signal** ([#374](https://github.com/rise-deploy/rise/issues/374)).
+- **Action required — raw external token deprecation signal** ([#394](https://github.com/rise-deploy/rise/pull/394)).
   While `auth.allow_raw_external_tokens` is `true`, each *accepted* raw-token
   request now emits one metric-shaped `tracing` event
   (`target=rise::deprecation`, `metric=raw_external_token`) carrying the
@@ -164,6 +163,29 @@ In-flight PRs with operator impact (not yet merged):
   the API and at deploy time (project env vars and per-container
   `[containers.X.env]`). If any of your users' apps set `RISE_*` keys, rename them
   before upgrading.
+
+### Known release-candidate limitations
+
+- **Docker drift-driven recreation can briefly interrupt a single replica.** A
+  normal deployment cutover uses the documented health-driven rolling overlap,
+  but replacing an already-running container whose runtime configuration drifted
+  still removes the old container before creating its replacement. Multi-replica
+  workloads recreate one healthy replica at a time; a single-replica workload
+  has a short gap. Tracked in [#379](https://github.com/rise-deploy/rise/issues/379).
+- **Docker HA status writes have a bounded stale-leader race.** Destructive Docker
+  operations re-check leadership immediately before acting. The slower health
+  reconciliation pass can, however, finish a status-only database write after
+  its previously confirmed lease window has elapsed. A current leader corrects
+  that status on a later tick; no stale leader performs a container create or
+  removal through this path. Tracked in
+  [#401](https://github.com/rise-deploy/rise/issues/401).
+- **This release has no earlier Docker-enabled upgrade baseline.** The upgrade
+  harness already supports the Docker backend, but every release before this
+  one predates the standalone Docker stack. CI therefore runs the in-place
+  upgrade suite on Kubernetes for this release. Publishing this version
+  establishes the Docker baseline; enable the Docker upgrade job for the next
+  release cycle so subsequent versions exercise image and database migrations
+  from it.
 
 ---
 
