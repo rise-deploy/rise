@@ -2139,6 +2139,19 @@
         }
       ]
     },
+    "reserved_project_names": {
+      "default": [
+        "rise",
+        "dex",
+        "registry",
+        "www"
+      ],
+      "description": "Project names that are reserved for control-plane hostnames and cannot\nbe used when creating a project. Later config layers replace this list\nas a whole. Default: [\"rise\", \"dex\", \"registry\", \"www\"].",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
     "resource_gc": {
       "anyOf": [
         {

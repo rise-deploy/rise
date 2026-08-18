@@ -7,6 +7,11 @@ use std::env;
 pub struct Settings {
     pub server: ServerSettings,
     pub auth: AuthSettings,
+    /// Project names that are reserved for control-plane hostnames and cannot
+    /// be used when creating a project. Later config layers replace this list
+    /// as a whole. Default: ["rise", "dex", "registry", "www"].
+    #[serde(default = "default_reserved_project_names")]
+    pub reserved_project_names: Vec<String>,
     #[serde(default)]
     pub database: DatabaseSettings,
     #[serde(default)]
@@ -45,6 +50,13 @@ pub struct Settings {
     /// who want to add to the defaults must re-include them.
     #[serde(default)]
     pub quickstart: Option<QuickstartSettings>,
+}
+
+fn default_reserved_project_names() -> Vec<String> {
+    ["rise", "dex", "registry", "www"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
 }
 
 /// Catalog of quickstart templates exposed via `GET /api/v1/quickstart-templates`.
@@ -2007,6 +2019,42 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn minimal_settings_json() -> serde_json::Value {
+        serde_json::json!({
+            "server": {
+                "host": "0.0.0.0",
+                "port": 3000,
+                "public_url": "http://test.local",
+                "jwt_signing_secret": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            },
+            "auth": {
+                "issuer": "http://test.local",
+                "client_id": "test",
+                "client_secret": "test"
+            }
+        })
+    }
+
+    #[test]
+    fn reserved_project_names_use_control_plane_defaults() {
+        let settings: Settings = serde_json::from_value(minimal_settings_json()).unwrap();
+
+        assert_eq!(
+            settings.reserved_project_names,
+            ["rise", "dex", "registry", "www"]
+        );
+    }
+
+    #[test]
+    fn reserved_project_names_can_be_replaced_by_configuration() {
+        let mut json = minimal_settings_json();
+        json["reserved_project_names"] = serde_json::json!(["grafana", "prometheus"]);
+
+        let settings: Settings = serde_json::from_value(json).unwrap();
+
+        assert_eq!(settings.reserved_project_names, ["grafana", "prometheus"]);
+    }
 
     #[test]
     fn deserialize_u32_flexible_accepts_number_and_numeric_string() {

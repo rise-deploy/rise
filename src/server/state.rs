@@ -116,6 +116,9 @@ pub struct AppState {
     pub oauth_rate_limiter: Arc<crate::server::rate_limit::OAuthRateLimiter>,
     pub access_classes:
         Arc<std::collections::HashMap<String, crate::server::settings::AccessClass>>,
+    /// Project-name labels reserved for control-plane hosts. Normalized to
+    /// lowercase at startup because DNS hostnames are case-insensitive.
+    pub reserved_project_names: Arc<std::collections::HashSet<String>>,
     /// Browser-facing base URL used to build the login redirect when the
     /// `ingress_auth` handler runs in Traefik mode (`signin_redirect=1`).
     /// Sourced from the Docker controller's `auth_signin_url` (falling back to
@@ -955,6 +958,13 @@ impl AppState {
         }
 
         let public_url = settings.server.public_url.clone();
+        let reserved_project_names = Arc::new(
+            settings
+                .reserved_project_names
+                .iter()
+                .map(|name| name.trim().to_ascii_lowercase())
+                .collect(),
+        );
         tracing::info!("Public URL: {}", public_url);
         if let Some(ref docs_dir) = settings.server.docs_dir {
             tracing::info!("Documentation directory: {}", docs_dir);
@@ -1626,6 +1636,7 @@ impl AppState {
             encrypt_rate_limiter,
             oauth_rate_limiter,
             access_classes,
+            reserved_project_names,
             signin_base_url,
             production_ingress_url_template,
             staging_ingress_url_template,
