@@ -15,6 +15,11 @@ Both are first-class. Pick Kubernetes for multi-node, autoscaling, production
 clusters; pick Docker for a single host, edge boxes, demos, or local
 development.
 
+A third backend, **Amazon ECS** (Fargate), is designed in
+[ADR-0004](/operator-docs/adr/0004-ecs-deployment-backend/) and does not ship
+yet — it gains a column in this matrix in the change that first makes it
+selectable.
+
 ## Feature parity is a goal, not an accident
 
 Rise aims for **semantic feature parity and correctness across all deployment
