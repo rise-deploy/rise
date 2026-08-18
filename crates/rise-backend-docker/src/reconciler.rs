@@ -9,6 +9,8 @@
 //! unit-tested without a daemon.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::error::Error as StdError;
+use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -66,6 +68,29 @@ const MAX_REPLICAS: u32 = 50;
 /// fast path (zero DB cost) succeeds essentially always while heartbeats are
 /// healthy.
 const PER_PROJECT_MIN_VALIDITY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Image-pull failure with the daemon's useful stream message preserved.
+/// Bollard's `DockerStreamError` display text omits its `error` field, so a
+/// wrapper is required both for user-facing deployment errors and reliable
+/// terminal/retryable classification.
+#[derive(Debug)]
+struct ImagePullError {
+    image: String,
+    detail: String,
+    source: bollard::errors::Error,
+}
+
+impl fmt::Display for ImagePullError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Image pull failed for {}: {}", self.image, self.detail)
+    }
+}
+
+impl StdError for ImagePullError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(&self.source)
+    }
+}
 
 /// Route-aware adapter shared by desired-state and readiness reconciliation.
 /// Keeping this selection in one place prevents either path from accidentally
@@ -1147,6 +1172,10 @@ impl DockerReconciler {
         election: &LeaderElection,
     ) -> Result<()> {
         let builder_cfg = self.builder_cfg();
+        // A multi-container/replica deployment can have several Create actions
+        // in one tick. Once one action proves the image permanently unusable,
+        // skip its remaining actions while still reconciling other deployments.
+        let mut failed_deployment_uuids = HashSet::new();
         // Index desired containers by their stable IDENTITY tuple so an action
         // (which carries the identity, not the generation-ful name) can find the
         // desired container regardless of the `_g{n}` name suffix.
@@ -1182,6 +1211,9 @@ impl DockerReconciler {
                     generation,
                 } => {
                     if let Some(d) = by_identity.get(identity.as_str()) {
+                        if failed_deployment_uuids.contains(&d.deployment_uuid) {
+                            continue;
+                        }
                         // Stamp the resolved generation on a clone so the created
                         // container's name + `generation` label match the action.
                         let mut d = (*d).clone();
@@ -1192,11 +1224,36 @@ impl DockerReconciler {
                             .create_container(&d, &builder_cfg, false, identity)
                             .await
                         {
-                            error!(
-                                project = %project.name,
-                                container = %name,
-                                "Failed to create container: {:?}", e
-                            );
+                            if is_terminal_image_pull_error(&e) {
+                                let message =
+                                    format!("Failed to create container '{}': {}", d.container, e);
+                                error!(
+                                    project = %project.name,
+                                    deployment_id = %d.deployment_id,
+                                    container = %name,
+                                    error = %e,
+                                    "Terminal container creation failure; marking deployment Failed"
+                                );
+                                let deployment_uuid = Uuid::parse_str(&d.deployment_uuid)
+                                    .context("Desired container has an invalid deployment UUID")?;
+                                self.store
+                                    .mark_deployment_failed(deployment_uuid, &message)
+                                    .await
+                                    .context(
+                                        "Failed to persist terminal container creation failure",
+                                    )?;
+                                self.store
+                                    .update_project_calculated_status(project.id)
+                                    .await
+                                    .context("Failed to update project status after container creation failure")?;
+                                failed_deployment_uuids.insert(d.deployment_uuid.clone());
+                            } else {
+                                error!(
+                                    project = %project.name,
+                                    container = %name,
+                                    "Failed to create container; will retry: {:?}", e
+                                );
+                            }
                         }
                     }
                 }
@@ -1219,6 +1276,9 @@ impl DockerReconciler {
                     // confirm it started, then remove the old one — eliminating
                     // the outage window entirely.
                     if let Some(d) = by_identity.get(identity.as_str()) {
+                        if failed_deployment_uuids.contains(&d.deployment_uuid) {
+                            continue;
+                        }
                         // Stamp the resolved (bumped) generation on a clone so the
                         // replacement's name + `generation` label match the action.
                         let mut d = (*d).clone();
@@ -1761,7 +1821,15 @@ impl DockerReconciler {
         });
         let mut stream = self.docker.create_image(options, None, creds);
         while let Some(item) = stream.next().await {
-            item.map_err(|e| anyhow::anyhow!("Image pull failed for {}: {:?}", image, e))?;
+            if let Err(source) = item {
+                let detail = docker_error_detail(&source);
+                return Err(ImagePullError {
+                    image: image.to_string(),
+                    detail,
+                    source,
+                }
+                .into());
+            }
         }
         Ok(())
     }
@@ -2455,6 +2523,41 @@ fn controller_class_matches(configured: &str, org_class: Option<&str>) -> bool {
     org_class == Some(configured)
 }
 
+/// Extract the daemon-provided detail that Bollard's Display implementation
+/// omits for stream errors.
+fn docker_error_detail(error: &bollard::errors::Error) -> String {
+    match error {
+        bollard::errors::Error::DockerStreamError { error } => error.clone(),
+        bollard::errors::Error::DockerResponseServerError { message, .. } => message.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Permanent image metadata/platform failures cannot recover on another
+/// reconcile tick. Authentication, transport, timeout, and daemon availability
+/// errors deliberately remain retryable because credentials or infrastructure
+/// may recover without creating a new deployment.
+fn is_terminal_image_pull_error(error: &anyhow::Error) -> bool {
+    let Some(pull_error) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ImagePullError>())
+    else {
+        return false;
+    };
+
+    let detail = pull_error.detail.to_ascii_lowercase();
+    [
+        "no matching manifest for",
+        "no match for platform in manifest",
+        "does not match the specified platform",
+        "manifest unknown",
+        "unsupported media type",
+        "invalid reference format",
+    ]
+    .iter()
+    .any(|needle| detail.contains(needle))
+}
+
 /// Resolve a spec's requested replica count to the actual number of containers
 /// to run: default 1 (unset), clamped to `[1, MAX_REPLICAS]`. Shared by desired
 /// computation and health aggregation so both always agree on the replica count.
@@ -2603,6 +2706,50 @@ mod tests {
                 message: "boom".to_string(),
             }
         ));
+    }
+
+    fn pull_error(detail: &str) -> anyhow::Error {
+        ImagePullError {
+            image: "registry.example/app:tag".to_string(),
+            detail: detail.to_string(),
+            source: bollard::errors::Error::DockerStreamError {
+                error: detail.to_string(),
+            },
+        }
+        .into()
+    }
+
+    #[test]
+    fn terminal_image_pull_errors_are_not_retried() {
+        for detail in [
+            "no matching manifest for linux/amd64 in the manifest list entries",
+            "manifest unknown: manifest unknown",
+            "unsupported media type application/example",
+            "invalid reference format",
+        ] {
+            assert!(
+                is_terminal_image_pull_error(&pull_error(detail)),
+                "expected terminal classification for {detail:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn transient_image_pull_errors_remain_retryable() {
+        for detail in [
+            "connection reset by peer",
+            "dial tcp: connection refused",
+            "unauthorized: authentication required",
+            "request timed out",
+        ] {
+            assert!(
+                !is_terminal_image_pull_error(&pull_error(detail)),
+                "expected retryable classification for {detail:?}"
+            );
+        }
+        assert!(!is_terminal_image_pull_error(&anyhow::anyhow!(
+            "container start failed"
+        )));
     }
 
     #[test]

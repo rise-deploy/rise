@@ -137,6 +137,13 @@ pub struct AppState {
     /// ResourceBuilder for Metacontroller webhook (builds K8s resource specs)
     #[cfg(feature = "backend")]
     pub resource_builder: Option<Arc<crate::server::deployment::resource_builder::ResourceBuilder>>,
+    /// Native architecture accepted by the configured deployment runtime.
+    ///
+    /// Kubernetes derives this from its architecture node selector. Docker
+    /// derives it from the connected daemon (which may be remote), rather than
+    /// from the machine running the Rise process.
+    #[cfg(feature = "backend")]
+    pub runtime_arch: Option<String>,
     /// Kubernetes client for direct API calls (pod health checks, log streaming)
     #[cfg(feature = "backend")]
     pub kube_client: Option<kube::Client>,
@@ -1244,6 +1251,32 @@ impl AppState {
         )
         .await?;
 
+        // Resolve the architecture from the deployment runtime itself. The
+        // Docker daemon may be remote, so the backend process's compile-time or
+        // host architecture is not authoritative.
+        #[cfg(feature = "backend")]
+        let runtime_arch = if let Some(resource_builder) = resource_builder.as_ref() {
+            resource_builder
+                .node_selector
+                .get("kubernetes.io/arch")
+                .and_then(|arch| crate::server::platform::models::normalize_runtime_arch(arch))
+        } else if let Some(docker) = docker_client.as_ref() {
+            let info = docker
+                .info()
+                .await
+                .context("Failed to query Docker daemon architecture")?;
+            let raw_arch = info
+                .architecture
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("Docker daemon did not report its architecture"))?;
+            let arch = crate::server::platform::models::normalize_runtime_arch(raw_arch)
+                .ok_or_else(|| anyhow::anyhow!("Docker daemon reported an empty architecture"))?;
+            tracing::info!(runtime_arch = %arch, "Detected Docker daemon architecture");
+            Some(arch)
+        } else {
+            None
+        };
+
         // Initialize extension registry
         #[allow(unused_mut)]
         let mut extension_registry = crate::server::extensions::registry::ExtensionRegistry::new();
@@ -1649,6 +1682,8 @@ impl AppState {
             ingress_port,
             #[cfg(feature = "backend")]
             resource_builder,
+            #[cfg(feature = "backend")]
+            runtime_arch,
             #[cfg(feature = "backend")]
             kube_client: webhook_kube_client,
             #[cfg(feature = "backend")]

@@ -92,7 +92,7 @@ no_cache = true
 
 Rise normally picks the right build platform for you:
 
-- **`rise deploy`**: the backend tells the CLI what architecture its cluster expects (read from the controller's `node_selector["kubernetes.io/arch"]`). A production backend pinning amd64 will produce amd64 images even when you deploy from an ARM Mac.
+- **`rise deploy`**: the backend tells the CLI what architecture its runtime expects. Kubernetes reads this from the controller's `node_selector["kubernetes.io/arch"]`; the Docker backend reads it from the connected Docker daemon, including a remote daemon configured through `docker_host`. An amd64 runtime will therefore produce amd64 images even when you deploy from an ARM Mac.
 - **`rise build` / `rise run` / no backend hint**: the CLI builds for your host architecture (so an ARM Mac builds `linux/arm64`, an Intel machine builds `linux/amd64`).
 
 You only need to specify a platform explicitly to override the inference — for example, building an amd64 image on an ARM Mac for sharing with a colleague:
