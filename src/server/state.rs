@@ -715,11 +715,15 @@ impl AppState {
                     registry_url,
                     namespace,
                     client_registry_url,
+                    username,
+                    password,
                 } => {
                     let oci_config = OciClientAuthConfig {
                         registry_url: registry_url.clone(),
                         namespace: namespace.clone(),
                         client_registry_url: client_registry_url.clone(),
+                        username: username.clone(),
+                        password: password.clone(),
                     };
                     let provider = OciClientAuthProvider::new(oci_config)
                         .context("Failed to initialize OCI client-auth registry provider")?;

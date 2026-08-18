@@ -106,8 +106,13 @@ registry:
   namespace: "rise-apps"
   # Public URL the CLI PUSHES to. Local default is the loopback-published
   # registry (localhost:5000); prod sets registry.${RISE_DOMAIN} (behind Traefik
-  # basicauth). The CLI does its own `docker login`; oci-client-auth mints none.
+  # basicauth).
   client_registry_url: "${RISE_CLIENT_REGISTRY_URL:-localhost:5000}"
+  # Optional static credentials. When set, Rise returns these through the
+  # authenticated, deployment-scoped credentials endpoint so the CLI can log in
+  # automatically. This deliberately trusts every user allowed to deploy.
+  username: "${RISE_REGISTRY_USERNAME:-}"
+  password: "${RISE_REGISTRY_PASSWORD:-}"
 deployment_controller:
   type: "docker"
   traefik_network: "rise_default"

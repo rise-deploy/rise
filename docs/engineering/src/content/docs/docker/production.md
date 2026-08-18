@@ -78,6 +78,8 @@ export ACME_CA_SERVER=https://acme-staging-v02.api.letsencrypt.org/directory
 | `ACME_EMAIL` | — | Contact for Let's Encrypt. |
 | `ACME_CA_SERVER` | LE production | Set to LE staging while testing. |
 | `REGISTRY_BASIC_AUTH` | empty | htpasswd users for the public registry (see [Container registry](/operator-docs/docker/registry/)). |
+| `RISE_REGISTRY_USERNAME` | empty | Optional static registry username returned to trusted users during deploy. |
+| `RISE_REGISTRY_PASSWORD` | empty | Optional static registry password returned to trusted users during deploy. |
 | `DEX_ISSUER` | `https://dex.${RISE_DOMAIN}` | OIDC issuer (see [Authentication / Dex](/operator-docs/docker/authentication/)). |
 | `RISE_IMAGE_TAG` | `0.23.0` | **Manual stable image pin** — bump on upgrade; set an exact published tag for a prerelease. There is no automatic "latest released" resolution. |
 | `RISE_IMAGE_REPOSITORY` | `ghcr.io/rise-deploy/rise` | Override for a fork/mirror. |

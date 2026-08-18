@@ -1470,6 +1470,13 @@ pub enum RegistrySettings {
         /// If not specified, defaults to registry_url
         #[serde(default)]
         client_registry_url: Option<String>,
+        /// Optional static registry username. When set with `password`, Rise returns
+        /// the credentials to authorized clients instead of relying on prior docker login.
+        #[serde(default)]
+        username: String,
+        /// Optional static registry password. Intended for small trusted-user setups.
+        #[serde(default)]
+        password: String,
     },
     /// GitLab container registry — mints scoped JWTs per deployment
     #[serde(rename = "gitlab")]
@@ -1807,6 +1814,21 @@ impl Settings {
             return Err(ConfigError::Message(
                 "JWT signing secret not configured. Set RISE_SERVER__JWT_SIGNING_SECRET environment variable or [server] jwt_signing_secret in config. Generate with: openssl rand -base64 32".to_string()
             ));
+        }
+
+        // A password without a username would be silently treated by the CLI as
+        // client-managed auth, while a username without a password would cause a
+        // confusing login failure. Keep static registry auth explicitly paired.
+        if let Some(RegistrySettings::OciClientAuth {
+            username, password, ..
+        }) = &settings.registry
+        {
+            if username.is_empty() != password.is_empty() {
+                return Err(ConfigError::Message(
+                    "OCI registry static credentials require both username and password"
+                        .to_string(),
+                ));
+            }
         }
 
         // Validate deployment controller settings if configured
