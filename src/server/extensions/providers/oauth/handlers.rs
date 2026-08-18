@@ -3,6 +3,7 @@ use super::models::{
     OAuthExtensionSpec, OAuthExtensionStatus, OAuthState, TokenRequest,
 };
 use crate::db::{extensions as db_extensions, oauth_transient_state, projects as db_projects};
+use crate::server::auth::redirect::{is_loopback_host, origins_match};
 use crate::server::state::AppState;
 use axum::{
     extract::{Path, Query, State},
@@ -24,6 +25,134 @@ struct OidcDiscoveryDocument {
     authorization_endpoint: Option<String>,
     token_endpoint: Option<String>,
     jwks_uri: Option<String>,
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    use super::redirect_uri_is_allowed;
+    use url::Url;
+
+    fn is_allowed(redirect: &str, public_url: &str, app_origins: &[&str]) -> bool {
+        let Ok(redirect) = Url::parse(redirect) else {
+            return false;
+        };
+        let public_url = Url::parse(public_url).unwrap();
+        let app_origins = app_origins
+            .iter()
+            .map(|origin| Url::parse(origin).unwrap())
+            .collect::<Vec<_>>();
+
+        redirect_uri_is_allowed(&redirect, &public_url, &app_origins)
+    }
+
+    #[test]
+    fn oauth_redirect_requires_an_exact_trusted_origin() {
+        let public_url = "https://rise.example.com";
+        let app_origins = ["https://victim.example.com"];
+
+        for redirect in [
+            "https://rise.example.com/oidc/done",
+            "https://rise.example.com:443/oidc/done",
+            "https://victim.example.com/callback",
+            "https://victim.example.com:443/callback?state=ok",
+            "https://victim.example.com./callback",
+        ] {
+            assert!(
+                is_allowed(redirect, public_url, &app_origins),
+                "expected {redirect} to be allowed"
+            );
+        }
+
+        for redirect in [
+            // Raw string prefix attacks: both URLs resolve to evil.com.
+            "https://victim.example.com.evil.com/callback",
+            "https://victim.example.com@evil.com/callback",
+            // Origin mismatches.
+            "https://victim.example.com:444/callback",
+            "http://victim.example.com/callback",
+            "https://sub.victim.example.com/callback",
+            "https://victim-example.com/callback",
+            "https://other.example.com/callback",
+        ] {
+            assert!(
+                !is_allowed(redirect, public_url, &app_origins),
+                "expected {redirect} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn oauth_redirect_rejects_invalid_and_non_http_schemes_before_loopback() {
+        let public_url = "http://rise.localhost:3000";
+
+        for redirect in [
+            "javascript://localhost/alert(1)",
+            "data:text/html,hello",
+            "file://localhost/tmp/code",
+            "//localhost/callback",
+            "not a URL",
+        ] {
+            assert!(
+                !is_allowed(redirect, public_url, &[]),
+                "expected {redirect} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn oauth_loopback_exception_is_limited_to_local_rise_installations() {
+        for redirect in [
+            "http://localhost:5173/callback",
+            "http://app.localhost:8080/callback",
+            "http://127.0.0.1:9000/callback",
+            "http://[::1]:9000/callback",
+        ] {
+            assert!(
+                is_allowed(redirect, "http://rise.localhost:3000", &[]),
+                "expected {redirect} to be allowed for local Rise"
+            );
+            assert!(
+                !is_allowed(redirect, "https://rise.example.com", &[]),
+                "expected {redirect} to be rejected for production Rise"
+            );
+        }
+
+        assert!(!is_allowed(
+            "http://localhost.evil.com/callback",
+            "http://rise.localhost:3000",
+            &[]
+        ));
+    }
+
+    #[test]
+    fn oauth_redirect_supports_kubernetes_https_and_docker_local_http_origins() {
+        assert!(is_allowed(
+            "https://app.example.com/oauth/callback",
+            "https://rise.example.com",
+            &["https://app.example.com"]
+        ));
+        assert!(is_allowed(
+            "http://app.rise.localhost/oauth/callback",
+            "http://rise.localhost:3000",
+            &["http://app.rise.localhost"]
+        ));
+        assert!(is_allowed(
+            "http://app.rise.localhost:80/oauth/callback",
+            "http://rise.localhost:3000",
+            &["http://app.rise.localhost"]
+        ));
+
+        assert!(!is_allowed(
+            "http://app.example.com/oauth/callback",
+            "https://rise.example.com",
+            &["https://app.example.com"]
+        ));
+        assert!(!is_allowed(
+            "https://app.rise.localhost/oauth/callback",
+            "http://rise.localhost:3000",
+            &["http://app.rise.localhost"]
+        ));
+    }
 }
 
 /// Resolved OAuth endpoints from spec or OIDC discovery
@@ -259,6 +388,29 @@ fn cors_headers(origin: &str) -> HeaderMap {
     headers
 }
 
+/// Decide whether a parsed OAuth redirect target is allowed.
+///
+/// Redirects may target the exact Rise origin or one of this project's exact
+/// active deployment origins. Loopback targets (including `*.localhost`) are a
+/// development exception and are accepted on any port only when Rise itself is
+/// running on a loopback origin.
+fn redirect_uri_is_allowed(redirect: &Url, public_url: &Url, app_origins: &[Url]) -> bool {
+    // This gate must run before the loopback exception: URLs such as
+    // `javascript://localhost/...` also have a parsed host.
+    if !matches!(redirect.scheme(), "http" | "https") {
+        return false;
+    }
+
+    let loopback_redirect_allowed = redirect.host_str().is_some_and(is_loopback_host)
+        && public_url.host_str().is_some_and(is_loopback_host);
+
+    loopback_redirect_allowed
+        || origins_match(redirect, public_url)
+        || app_origins
+            .iter()
+            .any(|allowed| origins_match(redirect, allowed))
+}
+
 /// Validate redirect URI against allowed origins
 async fn validate_redirect_uri(
     pool: &sqlx::PgPool,
@@ -269,18 +421,9 @@ async fn validate_redirect_uri(
 ) -> Result<(), String> {
     let redirect_url =
         Url::parse(redirect_uri).map_err(|e| format!("Invalid redirect URI: {}", e))?;
-
-    // Allow localhost for local development (any port and path)
-    if let Some(host) = redirect_url.host_str() {
-        if host == "localhost" || host == "127.0.0.1" {
-            return Ok(());
-        }
-    }
-
-    // Allow any redirect URL beginning with the Rise public URL
-    if redirect_uri.starts_with(rise_public_url) {
-        return Ok(());
-    }
+    let public_url = Url::parse(rise_public_url)
+        .map_err(|e| format!("Invalid configured Rise public URL: {}", e))?;
+    let mut app_origins = Vec::new();
 
     // Get project's deployment URLs from the deployment backend
     // Check all active deployments (including staging/non-default groups)
@@ -296,22 +439,35 @@ async fn validate_redirect_uri(
             }
         };
 
-    // Check if redirect URI starts with any deployment URL (primary or custom domain)
+    // Resolve all configured deployment origins. Invalid backend-provided URLs
+    // are ignored rather than treated as trusted string prefixes.
     for deployment in &all_deployments {
         match deployment_backend
             .get_deployment_urls(deployment, project)
             .await
         {
             Ok(urls) => {
-                // Check default URL
-                if !urls.default_url.is_empty() && redirect_uri.starts_with(&urls.default_url) {
-                    return Ok(());
+                if !urls.default_url.is_empty() {
+                    match Url::parse(&urls.default_url) {
+                        Ok(url) => app_origins.push(url),
+                        Err(error) => warn!(
+                            url = %urls.default_url,
+                            deployment_id = %deployment.deployment_id,
+                            %error,
+                            "Ignoring invalid deployment URL while validating OAuth redirect"
+                        ),
+                    }
                 }
 
-                // Check custom domain URLs
                 for custom_url in &urls.custom_domain_urls {
-                    if redirect_uri.starts_with(custom_url) {
-                        return Ok(());
+                    match Url::parse(custom_url) {
+                        Ok(url) => app_origins.push(url),
+                        Err(error) => warn!(
+                            url = %custom_url,
+                            deployment_id = %deployment.deployment_id,
+                            %error,
+                            "Ignoring invalid custom domain URL while validating OAuth redirect"
+                        ),
                     }
                 }
             }
@@ -324,8 +480,12 @@ async fn validate_redirect_uri(
         }
     }
 
+    if redirect_uri_is_allowed(&redirect_url, &public_url, &app_origins) {
+        return Ok(());
+    }
+
     Err(format!(
-        "Invalid redirect URI: not authorized for this project. Allowed: localhost, URLs starting with Rise public URL ({}), or any active deployment URL",
+        "Invalid redirect URI: origin is not authorized for this project. Allowed: the Rise public origin ({}), any active deployment origin, or loopback when Rise is running locally",
         rise_public_url
     ))
 }

@@ -214,14 +214,8 @@ fn validate_redirect_url(redirect_url: &str, public_url: &str, allowed_hosts: &[
         }
     };
 
-    // Allow redirects to the same host as public_url
-    if redirect_host == public_host {
-        return redirect_url.to_string();
-    }
-
-    // Allow redirects to subdomains of the public domain
-    // e.g., if public_url is "https://rise.dev", allow "https://app.rise.dev"
-    if redirect_host.ends_with(&format!(".{}", public_host)) {
+    // Allow the public host and its dot-anchored subdomains.
+    if crate::server::auth::redirect::host_is_same_or_subdomain(redirect_host, public_host) {
         return redirect_url.to_string();
     }
 
@@ -232,23 +226,19 @@ fn validate_redirect_url(redirect_url: &str, public_url: &str, allowed_hosts: &[
     // (case-insensitive) against the project's canonical + deployment hosts —
     // never a string prefix and never the whole parent domain — so a sibling
     // project's host or a lookalike (`secret.example.com.evil.com`) is rejected.
-    if allowed_hosts
-        .iter()
-        .any(|h| redirect_host.eq_ignore_ascii_case(h))
-    {
+    if allowed_hosts.iter().any(|allowed_host| {
+        // This policy requires exact host equality, so check the shared
+        // same-or-subdomain primitive in both directions.
+        crate::server::auth::redirect::host_is_same_or_subdomain(redirect_host, allowed_host)
+            && crate::server::auth::redirect::host_is_same_or_subdomain(allowed_host, redirect_host)
+    }) {
         return redirect_url.to_string();
     }
 
-    // Allow localhost and 127.0.0.1 for development (only if public_url is also local)
-    // Extract host without port for comparison
-    let redirect_host_base = redirect_host.split(':').next().unwrap_or(redirect_host);
-    let public_host_base = public_host.split(':').next().unwrap_or(public_host);
-
-    let is_redirect_localhost =
-        redirect_host_base == "localhost" || redirect_host_base == "127.0.0.1";
-    let is_public_localhost = public_host_base == "localhost" || public_host_base == "127.0.0.1";
-
-    if is_redirect_localhost && is_public_localhost {
+    // Allow loopback redirects for development only when Rise itself is local.
+    if crate::server::auth::redirect::is_loopback_host(redirect_host)
+        && crate::server::auth::redirect::is_loopback_host(public_host)
+    {
         return redirect_url.to_string();
     }
 

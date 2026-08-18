@@ -9,6 +9,7 @@ pub mod jwt;
 pub mod middleware;
 pub mod oauth;
 pub mod platform_access;
+pub(crate) mod redirect;
 pub mod roles;
 pub mod routes;
 pub mod sa_match;
