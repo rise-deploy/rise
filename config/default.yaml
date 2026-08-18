@@ -6,6 +6,12 @@
 # catalog with custom entries, copy the templates below into your own config
 # and add to the list.
 
+# Project labels used by control-plane hostnames. Project creation rejects
+# these names before either deployment backend can create a colliding route.
+# Later config layers replace this list, so repeat these defaults when adding
+# topology-specific labels.
+reserved_project_names: [rise, dex, registry, www]
+
 quickstart:
   templates:
     - id: welcome

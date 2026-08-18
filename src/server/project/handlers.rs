@@ -36,7 +36,10 @@ pub fn validate_http_url(url: &str) -> Result<String, String> {
 /// (`<name>.<domain>`) and part of Kubernetes resource names, so it must be
 /// lowercase alphanumeric plus hyphens, start and end alphanumeric, contain no
 /// dots or spaces, and be at most 63 characters.
-pub fn validate_project_name(name: &str) -> Result<(), String> {
+pub fn validate_project_name(
+    name: &str,
+    reserved_project_names: &std::collections::HashSet<String>,
+) -> Result<(), String> {
     if name.is_empty() {
         return Err("must not be empty".to_string());
     }
@@ -57,6 +60,9 @@ pub fn validate_project_name(name: &str) -> Result<(), String> {
     let ends_ok = name.chars().last().unwrap().is_ascii_alphanumeric();
     if !starts_ok || !ends_ok {
         return Err("must start and end with a letter or digit".to_string());
+    }
+    if reserved_project_names.contains(name) {
+        return Err("is reserved for a control-plane hostname".to_string());
     }
     Ok(())
 }
@@ -135,7 +141,7 @@ pub async fn create_project(
 ) -> Result<Json<CreateProjectResponse>, ServerError> {
     let user = auth.user()?;
     // Validate the project name (becomes a subdomain + K8s resource names).
-    validate_project_name(&payload.name).map_err(|e| {
+    validate_project_name(&payload.name, &state.reserved_project_names).map_err(|e| {
         ServerError::bad_request(format!("Invalid project name '{}': {e}", payload.name))
     })?;
     // Validate access_class against configured access classes
@@ -1272,15 +1278,27 @@ pub async fn check_write_permission(
 mod tests {
     use super::validate_project_name;
 
+    fn reserved_project_names() -> std::collections::HashSet<String> {
+        ["rise", "dex", "registry", "www"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
     #[test]
     fn accepts_dns_label_names() {
+        let reserved = reserved_project_names();
         for ok in ["app", "my-app", "web1", "a", "a1-b2-c3"] {
-            assert!(validate_project_name(ok).is_ok(), "{ok} should be valid");
+            assert!(
+                validate_project_name(ok, &reserved).is_ok(),
+                "{ok} should be valid"
+            );
         }
     }
 
     #[test]
     fn rejects_non_dns_names() {
+        let reserved = reserved_project_names();
         for bad in [
             "",       // empty
             "My-App", // uppercase
@@ -1291,11 +1309,32 @@ mod tests {
             "app_1",  // underscore
         ] {
             assert!(
-                validate_project_name(bad).is_err(),
+                validate_project_name(bad, &reserved).is_err(),
                 "{bad:?} should be rejected"
             );
         }
         // Over 63 chars.
-        assert!(validate_project_name(&"a".repeat(64)).is_err());
+        assert!(validate_project_name(&"a".repeat(64), &reserved).is_err());
+    }
+
+    #[test]
+    fn rejects_reserved_control_plane_names() {
+        let reserved = reserved_project_names();
+
+        for name in ["rise", "dex", "registry", "www"] {
+            assert_eq!(
+                validate_project_name(name, &reserved),
+                Err("is reserved for a control-plane hostname".to_string()),
+                "{name} should be reserved"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_operator_configured_reserved_names() {
+        let reserved = ["grafana".to_string()].into_iter().collect();
+
+        assert!(validate_project_name("grafana", &reserved).is_err());
+        assert!(validate_project_name("rise", &reserved).is_ok());
     }
 }

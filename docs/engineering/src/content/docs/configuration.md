@@ -90,6 +90,26 @@ database:
 
 **Note**: `DATABASE_URL` is also required at **compile time** for SQLX query verification. See the [Developer Guide](./developer-guide.md#database_url-at-compile-time) for details.
 
+## Reserved project names
+
+Project names become application host labels. To prevent an application route
+from shadowing a control-plane service, Rise rejects project creation when the
+name appears in the top-level `reserved_project_names` list. This applies to
+both Docker and Kubernetes deployment controllers.
+
+```yaml
+reserved_project_names:
+  - rise
+  - dex
+  - registry
+  - www
+  - grafana # topology-specific control-plane hostname
+```
+
+When omitted, the list defaults to `rise`, `dex`, `registry`, and `www`. Config
+arrays are replaced rather than merged, so an override that adds names must
+repeat the defaults it still needs to reserve.
+
 ## Examples
 
 ### Development (development.yaml)
