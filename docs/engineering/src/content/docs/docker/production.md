@@ -51,6 +51,15 @@ export RISE_DOMAIN=rise.example.com ACME_EMAIL=ops@example.com
 docker compose -f docker-compose.standalone.yaml up -d
 ```
 
+This uses the Compose file's pinned stable image. For a release candidate, set
+`RISE_IMAGE_TAG` to its exact published GHCR tag (without the Git tag's leading
+`v`) before bringing up the stack. From an exact tagged checkout:
+
+```bash
+export RISE_IMAGE_TAG="$(git describe --tags --exact-match --match 'v*' HEAD | sed 's/^v//')"
+docker compose -f docker-compose.standalone.yaml up -d
+```
+
 Traefik requests certificates via the HTTP-01 challenge on the `web` entrypoint
 (`certificatesresolvers.le`); all plain HTTP is redirected to HTTPS.
 
@@ -70,7 +79,7 @@ export ACME_CA_SERVER=https://acme-staging-v02.api.letsencrypt.org/directory
 | `ACME_CA_SERVER` | LE production | Set to LE staging while testing. |
 | `REGISTRY_BASIC_AUTH` | empty | htpasswd users for the public registry (see [Container registry](/operator-docs/docker/registry/)). |
 | `DEX_ISSUER` | `https://dex.${RISE_DOMAIN}` | OIDC issuer (see [Authentication / Dex](/operator-docs/docker/authentication/)). |
-| `RISE_IMAGE_TAG` | `0.23.0` | **Manual** image pin — bump on upgrade. There is no automatic "latest released" resolution. |
+| `RISE_IMAGE_TAG` | `0.23.0` | **Manual stable image pin** — bump on upgrade; set an exact published tag for a prerelease. There is no automatic "latest released" resolution. |
 | `RISE_IMAGE_REPOSITORY` | `ghcr.io/rise-deploy/rise` | Override for a fork/mirror. |
 | `POSTGRES_PASSWORD` | `rise123` | Change it. |
 | `RISE_JWT_SIGNING_SECRET` | insecure repo placeholder | **Set it.** Overrides the demo secret baked into `config/docker.yaml`. `openssl rand -base64 32`. |

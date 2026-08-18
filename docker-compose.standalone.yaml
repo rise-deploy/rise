@@ -10,6 +10,11 @@
 #   docker compose -f docker-compose.standalone.yaml \
 #                  -f docker-compose.standalone.local.yaml up -d
 #
+#   # Tagged release candidate — use its exact published GHCR tag (without `v`):
+#   export RISE_IMAGE_TAG="$(git describe --tags --exact-match --match 'v*' HEAD | sed 's/^v//')"
+#   docker compose -f docker-compose.standalone.yaml \
+#                  -f docker-compose.standalone.local.yaml up -d
+#
 # This file is fully self-contained — it does NOT layer on top of the dev
 # docker-compose.yml. It brings up everything Rise needs to deploy apps through
 # the `docker` deployment controller: Postgres for state, Dex as the OIDC
@@ -60,7 +65,8 @@
 #     goes through Traefik. (The local overlay re-publishes them on 127.0.0.1 for
 #     direct dev access.)
 #
-# Image tag is overridable for CI via RISE_IMAGE_REPOSITORY / RISE_IMAGE_TAG.
+# Image source is overridable for CI and prerelease validation via
+# RISE_IMAGE_REPOSITORY / RISE_IMAGE_TAG.
 # =============================================================================
 
 # Fixed project name so the network is always "rise_default", regardless of the
@@ -221,9 +227,10 @@ services:
   # the real domain. The host Docker socket is mounted so it can create/route app
   # containers.
   rise:
-    # RISE_IMAGE_TAG is MANUALLY PINNED to a known-good released version; bump on
+    # RISE_IMAGE_TAG is MANUALLY PINNED to a known-good stable version; bump on
     # upgrade — there is no automatic 'latest released' resolution. Override with
-    # RISE_IMAGE_TAG (CI/e2e does this) or RISE_IMAGE_REPOSITORY for a fork/mirror.
+    # the exact published tag for CI/e2e or prerelease validation (release tags
+    # drop their leading `v` on GHCR), or use RISE_IMAGE_REPOSITORY for a mirror.
     image: ${RISE_IMAGE_REPOSITORY:-ghcr.io/rise-deploy/rise}:${RISE_IMAGE_TAG:-0.23.0}
     container_name: rise-backend
     restart: unless-stopped
