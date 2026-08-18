@@ -100,7 +100,7 @@ mod redirect_tests {
     }
 
     #[test]
-    fn oauth_loopback_exception_is_limited_to_local_rise_installations() {
+    fn oauth_loopback_exception_supports_local_apps_using_remote_rise() {
         for redirect in [
             "http://localhost:5173/callback",
             "http://app.localhost:8080/callback",
@@ -112,8 +112,8 @@ mod redirect_tests {
                 "expected {redirect} to be allowed for local Rise"
             );
             assert!(
-                !is_allowed(redirect, "https://rise.example.com", &[]),
-                "expected {redirect} to be rejected for production Rise"
+                is_allowed(redirect, "https://rise.example.com", &[]),
+                "expected {redirect} to be allowed for local development against remote Rise"
             );
         }
 
@@ -391,9 +391,9 @@ fn cors_headers(origin: &str) -> HeaderMap {
 /// Decide whether a parsed OAuth redirect target is allowed.
 ///
 /// Redirects may target the exact Rise origin or one of this project's exact
-/// active deployment origins. Loopback targets (including `*.localhost`) are a
-/// development exception and are accepted on any port only when Rise itself is
-/// running on a loopback origin.
+/// active deployment origins. HTTP loopback targets (including `*.localhost`)
+/// are a development exception and are accepted on any port so `rise run` can
+/// use a remote Rise installation.
 fn redirect_uri_is_allowed(redirect: &Url, public_url: &Url, app_origins: &[Url]) -> bool {
     // This gate must run before the loopback exception: URLs such as
     // `javascript://localhost/...` also have a parsed host.
@@ -401,9 +401,8 @@ fn redirect_uri_is_allowed(redirect: &Url, public_url: &Url, app_origins: &[Url]
         return false;
     }
 
-    let loopback_redirect_allowed = redirect.scheme() == public_url.scheme()
-        && redirect.host_str().is_some_and(is_loopback_host)
-        && public_url.host_str().is_some_and(is_loopback_host);
+    let loopback_redirect_allowed =
+        redirect.scheme() == "http" && redirect.host_str().is_some_and(is_loopback_host);
 
     loopback_redirect_allowed
         || origins_match(redirect, public_url)
@@ -486,7 +485,7 @@ async fn validate_redirect_uri(
     }
 
     Err(format!(
-        "Invalid redirect URI: origin is not authorized for this project. Allowed: the Rise public origin ({}), any active deployment origin, or loopback when Rise is running locally",
+        "Invalid redirect URI: origin is not authorized for this project. Allowed: the Rise public origin ({}), any active deployment origin, or an HTTP loopback origin for local development",
         rise_public_url
     ))
 }
