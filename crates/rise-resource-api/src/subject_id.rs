@@ -40,6 +40,27 @@ impl SubjectId {
         }
     }
 
+    /// Whether this subject could ever satisfy ADR-0001 §1's recipient boundary
+    /// for `organization`, judged from the identifier alone.
+    ///
+    /// A subject that names its own organization — `group:`, `serviceaccount:`,
+    /// `org:` — answers definitively, and both facts are frozen at write time,
+    /// so a `false` here is permanent. Every other kind is *contingent*: a
+    /// `user:` or `system:authenticated` subject belongs exactly while the
+    /// caller is affiliated, which only the evaluator can decide. Those report
+    /// `true` and leave the live question open.
+    ///
+    /// `controller:` is the one kind that belongs to no organization yet still
+    /// reports `true`. Making that a write-time error would collide with the
+    /// org opt-in enablement design tracked in rise-deploy/rise#437, under
+    /// which an org-parented binding naming a controller becomes meaningful.
+    pub fn may_belong_to(&self, organization: &str) -> bool {
+        match self.organization() {
+            Some(own) => own == organization,
+            None => true,
+        }
+    }
+
     pub fn kind(&self) -> &str {
         self.0.split_once(':').expect("validated SubjectId").0
     }

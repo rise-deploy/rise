@@ -31,6 +31,42 @@ proposed for the next train. Moved into a version section at tag time._
 
 Merged to `develop`:
 
+- **Action required if you author org `RoleBinding`s — subject bounded to its own
+  Organization**. An org `RoleBinding` whose `subject` names a *different*
+  organization — `group:<other>/x`, `serviceaccount:<other>/x`, `org:<other>` —
+  is now refused at write time. Such a binding never granted anything: ADR-0001
+  §1's recipient boundary already required the subject to belong to the binding's
+  own Organization, so the row read as a cross-org grant while being permanently
+  dead. Only the generic resource API is affected, and only for operators, who
+  are its only writers.
+
+  Existing rows keep being readable and keep granting exactly what they granted
+  before (nothing), but **an update to such a row now fails**. To find them:
+
+  ```sql
+  SELECT parent.name AS organization, r.name, r.spec->>'subject' AS subject
+  FROM resource_store.resources r
+  JOIN resource_store.resources parent ON parent.uid = r.parent_uid
+  WHERE r.kind = 'RoleBinding'
+    AND r.deletion_timestamp IS NULL
+    AND r.spec->>'subject' ~ '^((group|serviceaccount):[a-z0-9-]+/[a-z0-9-]+|org:[a-z0-9-]+)$'
+    AND CASE
+          WHEN r.spec->>'subject' LIKE 'org:%'
+            THEN split_part(r.spec->>'subject', ':', 2)
+          ELSE split_part(split_part(r.spec->>'subject', ':', 2), '/', 1)
+        END <> parent.name;
+  ```
+
+  Delete what it returns, or re-point each subject at a Group in the binding's
+  own Organization. `user:` and `system:authenticated` subjects are unaffected —
+  their affiliation is a live membership question, not a property of the
+  identifier — as are `controller:` subjects.
+
+  The same field now also accepts the relative form `group:<name>`, expanded
+  against the parent Organization before storage, so `group:platform` under
+  `acme` stores `group:acme/platform`. Absolute subjects are unchanged, and
+  `PlatformRoleBinding` still takes absolute subjects only.
+
 - **No action required — seeded baseline authorization policy**. Startup now
   creates five root policy resources described by ADR-0001:
   `PlatformRole/system-admin` with its `system:operators` binding, and the

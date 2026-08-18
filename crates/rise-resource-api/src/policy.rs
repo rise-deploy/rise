@@ -635,6 +635,91 @@ impl JsonSchema for BindingSubject {
     }
 }
 
+/// The `subject` of an org `RoleBinding` as authored, before normalization.
+///
+/// An org `RoleBinding` already sits inside exactly one Organization, so
+/// `group:platform` is unambiguous there and spelling the organization twice is
+/// the common way to typo a binding into permanent inertness. This type accepts
+/// the short form and [`Self::resolve`] expands it against the parent
+/// Organization, so the row still stores a canonical [`BindingSubject`].
+///
+/// Following §6.1's precedent, the relative form is a distinct type rather than
+/// an overload of [`SubjectId`]: parsing a subject never becomes
+/// context-sensitive, and only the one field where an organization is implied
+/// accepts the short spelling.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RoleBindingSubject {
+    /// Already canonical, or one of the closed subject templates.
+    Absolute(BindingSubject),
+    /// `group:<name>`, naming a Group in the binding's own Organization.
+    RelativeGroup(String),
+}
+
+impl RoleBindingSubject {
+    /// Expand the relative form against the Organization the binding hangs under.
+    pub fn resolve(self, parent_organization: &str) -> Result<BindingSubject, ValidationError> {
+        match self {
+            Self::Absolute(subject) => Ok(subject),
+            Self::RelativeGroup(name) => {
+                validate_resource_name(parent_organization)?;
+                Ok(BindingSubject::Literal(
+                    format!("group:{parent_organization}/{name}").parse()?,
+                ))
+            }
+        }
+    }
+}
+
+impl fmt::Debug for RoleBindingSubject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("RoleBindingSubject")
+            .field(&self.to_string())
+            .finish()
+    }
+}
+
+impl fmt::Display for RoleBindingSubject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Absolute(subject) => subject.fmt(f),
+            Self::RelativeGroup(name) => write!(f, "group:{name}"),
+        }
+    }
+}
+
+impl FromStr for RoleBindingSubject {
+    type Err = ValidationError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        // Templates carry `${…}` and belong to `BindingSubject`; an absolute
+        // Group carries the `/` separator. What is left is the relative form.
+        if let Some(name) = value.strip_prefix("group:") {
+            if !name.contains('/') && !name.contains("${") {
+                validate_resource_name(name)?;
+                return Ok(Self::RelativeGroup(name.to_owned()));
+            }
+        }
+        Ok(Self::Absolute(value.parse()?))
+    }
+}
+
+string_serde!(RoleBindingSubject);
+
+impl JsonSchema for RoleBindingSubject {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "RoleBindingSubject".into()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        schemars::json_schema!({
+            "oneOf": [
+                BindingSubject::json_schema(generator),
+                { "pattern": "^group:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", "maxLength": 69 }
+            ]
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum SubjectMembership {
     #[default]
@@ -674,7 +759,7 @@ pub enum PlatformRoleRefKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RoleBindingSpec {
-    pub subject: BindingSubject,
+    pub subject: RoleBindingSubject,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -794,7 +879,8 @@ impl RoleBindingSpec {
         parent_organization: &str,
     ) -> Result<LocallyNormalizedRoleBindingSpec, ValidationError> {
         validate_resource_name(parent_organization)?;
-        validate_subject_selector(&self.subject, self.label_selector.as_ref())?;
+        let subject = self.subject.resolve(parent_organization)?;
+        validate_subject_selector(&subject, self.label_selector.as_ref())?;
         let scope = match self.scope {
             Some(scope) if scope.is_wildcard() => {
                 return Err(ValidationError::new(
@@ -805,7 +891,7 @@ impl RoleBindingSpec {
             None => format!("rise.dev/Organization/{parent_organization}").parse()?,
         };
         Ok(LocallyNormalizedRoleBindingSpec {
-            subject: self.subject,
+            subject,
             scope,
             label_selector: self.label_selector,
             role_ref: self.role_ref,

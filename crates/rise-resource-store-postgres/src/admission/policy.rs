@@ -114,6 +114,7 @@ impl PolicyAdmission {
             .map_err(|error| StoreError::Validation(error.to_string()))?;
 
         require_authorable_subject(normalized.subject(), parent_uid, name)?;
+        require_subject_within_organization(normalized.subject(), &organization.name)?;
         resolve_binding_subject(conn, normalized.subject()).await?;
 
         // Reference direction (ADR-0001 §4): an org binding reaches its own
@@ -282,6 +283,36 @@ where
     }
     Err(StoreError::Validation(format!(
         "{kind} '{name}' is seeded and immutable; its spec must be the shipped default"
+    )))
+}
+
+/// Hold an org `RoleBinding`'s subject to its own Organization.
+///
+/// ADR-0001 §1's recipient boundary makes an org-tier binding grant nothing
+/// unless the subject belongs to the binding's own Organization. For a subject
+/// that names its organization in its own identifier — `group:`,
+/// `serviceaccount:`, `org:` — both sides of that comparison are frozen at
+/// write time, so a mismatch is inert on every resource forever: policy that
+/// reads as a cross-org grant and can never become one.
+///
+/// §6.7 keeps *contingently* inert policy admissible, and this respects that
+/// line. `user:alice` and `system:authenticated` are live exactly while the
+/// caller is affiliated with this organization, so `SubjectId::may_belong_to`
+/// passes them through untouched.
+fn require_subject_within_organization(
+    subject: &rise_resource_api::BindingSubject,
+    organization: &str,
+) -> Result<(), StoreError> {
+    let Some(literal) = subject.literal() else {
+        return Ok(());
+    };
+    if literal.may_belong_to(organization) {
+        return Ok(());
+    }
+    Err(StoreError::Validation(format!(
+        "subject '{literal}' belongs to Organization '{}', not '{organization}'; \
+         an org {ROLE_BINDING_KIND}'s subject must belong to its own Organization",
+        literal.organization().unwrap_or_default()
     )))
 }
 

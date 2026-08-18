@@ -900,3 +900,46 @@ scope and avoiding dead-end compatibility layers.
   - Policy auditing for semantically inert dynamic grants — a Group named as an
     owner that no longer exists, a selector matching nothing — remains open, and
     is now the natural home for explaining *why* a membership write was refused.
+
+### Bounding an org RoleBinding's subject to its own Organization
+
+Reviewing a worked example of org-admin-authored policy surfaced an asymmetry.
+Admission fenced an org `RoleBinding`'s **scope** to its parent Organization, and
+a platform binding's **static org-native subject** to that subject's own org, but
+nothing constrained an org binding's own subject. So an admin of `acme` could
+store a `RoleBinding` naming `group:beta/team-leads` and have it grant nothing:
+policy that reads as a cross-org grant and is permanently dead.
+
+The criterion for what admission may reject is **decidability from the stored
+row**, not "is this inert right now". §6.7 keeps inert policy admissible, but
+every case it protects is *contingently* inert — a membership that can change, a
+selector that can match later. The recipient boundary compares the subject's
+organization against the *binding's* organization, and both are frozen at write
+time, so a mismatch is inert on every resource forever. `subjectMembership:
+ResourceOrganization` compares against the *resource's* organization, which
+varies per request, and stays admissible for exactly that reason.
+
+`SubjectId::may_belong_to` is the one predicate both tiers read: admission
+refuses on `false`, and the engine's `subject_belongs_to` uses it as the
+structural arm before falling through to the live affiliation lookup. Kinds that
+name no organization report `true` and stay contingent.
+
+Controller subjects were in the original finding and are deliberately out. They
+are decidable — a Controller belongs to no organization at all — but the org
+opt-in enablement design (#437) would make an org-parented binding naming a
+controller the natural way an org admin enables a platform-offered controller.
+Shipping the rejection now means unshipping it there.
+
+Alongside it, `RoleBindingSubject` accepts the relative form `group:<name>` on an
+org `RoleBinding` and expands it against the parent before storage. Following
+§6.1's precedent, it is a separate type rather than an overload of `SubjectId`,
+so parsing a subject never becomes context-sensitive and only the one field where
+an organization is implied accepts the short spelling. This is ergonomics — it
+does not stop anyone writing another organization explicitly, which is what the
+check above is for.
+
+The coverage gap the finding named is closed too: the clamped-controller case was
+asserted only on an org-contained resource. The other half — live on a
+root-scoped resource, because the clamp's guard requires the resource to have an
+organization — is what keeps the platform-binding combination legitimate, and it
+is now pinned rather than derived.

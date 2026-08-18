@@ -689,6 +689,7 @@ async fn resource_organization_clamps_users_and_excludes_controllers() {
     let mut builder = StoreBuilder::new();
     let acme = builder.resource(ORGANIZATION, "acme", None);
     let app = builder.resource(PROJECT, "app", Some(acme));
+    let class = builder.resource("RuntimeClass", "gpu", None);
     builder.role(PLATFORM_ROLE, "everything", None, allow_all());
     builder.binding(
         PLATFORM_ROLE_BINDING,
@@ -757,6 +758,23 @@ async fn resource_organization_clamps_users_and_excludes_controllers() {
         decide(&controller, &snapshot, app, &get).await,
         Decision::Deny,
         "a Controller belongs to no organization and never matches the clamp"
+    );
+
+    // The clamp compares the subject against the *resource's* organization, and
+    // a root-scoped resource lies in none, so it has nothing to compare and
+    // stands down. That is what keeps `ResourceOrganization` on a Controller
+    // subject a legitimate configuration rather than a permanently dead row:
+    // it is inert inside every organization and live everywhere above them.
+    let use_class = tuple(Verb::Get, "rise.dev/RuntimeClass");
+    assert_eq!(
+        decide(&controller, &snapshot, class, &use_class).await,
+        Decision::Allow,
+        "the clamp only bites where the resource has an organization"
+    );
+    let snapshot = snapshot_for(&stranger, "user:u-alice").await;
+    assert_eq!(
+        decide(&stranger, &snapshot, class, &use_class).await,
+        Decision::Allow
     );
 }
 

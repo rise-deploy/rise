@@ -5842,3 +5842,111 @@ async fn an_org_role_binding_cannot_name_the_operators_subject(
 
     Ok(())
 }
+
+/// An org `RoleBinding`'s subject is bounded to its own Organization, and a
+/// relative Group subject is expanded against it.
+///
+/// The rejected shapes are exactly the ones ADR-0001 §1's recipient boundary
+/// decides from the identifier alone: both organizations are frozen at write
+/// time, so the binding would be inert on every resource forever. The accepted
+/// shapes are the contingent ones §6.7 protects — `user:` and
+/// `system:authenticated` are live precisely while the caller is affiliated.
+#[sqlx::test]
+async fn an_org_role_binding_subject_is_bounded_to_its_own_organization(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let acme = create_org(&store, "acme").await;
+    let beta = create_org(&store, "beta").await;
+    create_role(&store, acme.uid, "viewer").await;
+    create_role(&store, beta.uid, "viewer").await;
+    create_builtin_resource(&store, USER_KIND, "alice", None, json!({}), vec![])
+        .await
+        .unwrap();
+    for (kind, parent) in [
+        (GROUP_KIND, acme.uid),
+        (GROUP_KIND, beta.uid),
+        (SERVICE_ACCOUNT_KIND, beta.uid),
+    ] {
+        create_builtin_resource(&store, kind, "team-leads", Some(parent), json!({}), vec![])
+            .await
+            .unwrap();
+    }
+
+    let with_subject = |subject: &str| {
+        json!({
+            "subject": subject,
+            "roleRef": {"kind": "Role", "name": "viewer"}
+        })
+    };
+
+    for subject in [
+        "group:beta/team-leads",
+        "serviceaccount:beta/team-leads",
+        "org:beta",
+    ] {
+        let error = create_binding(
+            &store,
+            ROLE_BINDING_KIND,
+            "foreign",
+            Some(acme.uid),
+            with_subject(subject),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&error, StoreError::Validation(message)
+                if message.contains("belongs to Organization 'beta', not 'acme'")),
+            "{subject} should be refused, got {error:?}"
+        );
+    }
+
+    // Root-absolute subjects stay admissible: their affiliation is a live
+    // membership question, not a property of the identifier.
+    for (index, subject) in ["user:alice", "system:authenticated"]
+        .into_iter()
+        .enumerate()
+    {
+        create_binding(
+            &store,
+            ROLE_BINDING_KIND,
+            &format!("contingent-{index}"),
+            Some(acme.uid),
+            with_subject(subject),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{subject}: {error:?}"));
+    }
+
+    // The relative form names a Group in the binding's own Organization, and
+    // the row stores the expanded, canonical subject.
+    let relative = create_binding(
+        &store,
+        ROLE_BINDING_KIND,
+        "relative",
+        Some(acme.uid),
+        with_subject("group:team-leads"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(relative.spec["subject"], json!("group:acme/team-leads"));
+
+    // It resolves against the parent, not against whatever org happens to own
+    // a Group of that name — `beta/team-leads` exists and is not reachable.
+    let absent = create_binding(
+        &store,
+        ROLE_BINDING_KIND,
+        "relative-absent",
+        Some(beta.uid),
+        with_subject("group:platform"),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&absent, StoreError::Validation(message)
+            if message.contains("subject 'group:beta/platform'")),
+        "a relative subject must resolve against its own org, got {absent:?}"
+    );
+
+    Ok(())
+}

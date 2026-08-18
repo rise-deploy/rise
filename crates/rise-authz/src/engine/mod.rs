@@ -657,8 +657,15 @@ impl AuthorizationEngine {
         subject: &SubjectId,
         organization: &str,
     ) -> Result<bool, AuthorizationError> {
+        // `may_belong_to` settles every kind that names its own organization —
+        // the same structural predicate admission holds an org `RoleBinding`'s
+        // subject to — and admits the rest as contingent, which is where the
+        // live affiliation lookup below takes over.
+        if !subject.may_belong_to(organization) {
+            return Ok(false);
+        }
         Ok(match subject.kind() {
-            "group" | "serviceaccount" | "org" => subject.organization() == Some(organization),
+            "group" | "serviceaccount" | "org" => true,
             "user" => self.standing(snapshot, organization).await?.affiliated,
             "system" if subject.name() == "authenticated" => {
                 self.standing(snapshot, organization).await?.affiliated

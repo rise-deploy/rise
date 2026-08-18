@@ -296,6 +296,102 @@ fn generated_binding_schemas_match_omission_and_null_rules() {
         "roleRef": { "kind": "Role", "name": "viewer" }
     });
     assert!(!schema_accepts::<RoleBindingSpec>(null_scope));
+
+    // The relative Group form is org-`RoleBinding`-only, so the two subject
+    // grammars must differ in exactly that one spelling.
+    let relative = json!({
+        "subject": "group:platform",
+        "roleRef": { "kind": "Role", "name": "viewer" }
+    });
+    assert!(schema_accepts::<RoleBindingSpec>(relative));
+    assert!(!schema_accepts::<PlatformRoleBindingSpec>(
+        platform_binding("group:platform")
+    ));
+}
+
+/// An org `RoleBinding` already sits in exactly one Organization, so its subject
+/// may name a Group relatively. Resolution happens at normalization, where the
+/// parent is known — parsing a subject never becomes context-sensitive.
+#[test]
+fn a_relative_group_subject_resolves_against_the_parent_organization() {
+    let relative: RoleBindingSpec = serde_json::from_value(json!({
+        "subject": "group:platform",
+        "roleRef": { "kind": "Role", "name": "viewer" }
+    }))
+    .unwrap();
+    assert_eq!(
+        relative.normalize("acme").unwrap().subject().to_string(),
+        "group:acme/platform"
+    );
+
+    // Absolute subjects and the closed templates pass through untouched, so the
+    // short form is an addition to the grammar rather than a reinterpretation.
+    for subject in [
+        "group:beta/platform",
+        "user:alice",
+        "serviceaccount:acme/ci",
+        "org:acme",
+        "system:authenticated",
+        "controller:builder",
+    ] {
+        let spec: RoleBindingSpec = serde_json::from_value(json!({
+            "subject": subject,
+            "roleRef": { "kind": "Role", "name": "viewer" }
+        }))
+        .unwrap();
+        assert_eq!(
+            spec.normalize("acme").unwrap().subject().to_string(),
+            subject
+        );
+    }
+
+    let template: RoleBindingSpec = serde_json::from_value(json!({
+        "subject": "group:${ref.name}",
+        "labelSelector": { "key": "rise.dev/owner", "value": "x" },
+        "roleRef": { "kind": "Role", "name": "viewer" }
+    }))
+    .unwrap();
+    assert_eq!(
+        template.normalize("acme").unwrap().subject().to_string(),
+        "group:${ref.name}"
+    );
+
+    // The relative form is still a resource name, and the platform binding's
+    // subject grammar is unchanged.
+    assert!(serde_json::from_value::<RoleBindingSpec>(json!({
+        "subject": "group:Not A Name",
+        "roleRef": { "kind": "Role", "name": "viewer" }
+    }))
+    .is_err());
+    assert!(
+        serde_json::from_value::<PlatformRoleBindingSpec>(platform_binding("group:platform"))
+            .is_err()
+    );
+}
+
+/// The write-time half of ADR-0001 §1's recipient boundary: a subject that names
+/// its own organization decides membership from the identifier alone, so a
+/// mismatch is permanent. Every other kind stays contingent and admissible.
+#[test]
+fn subject_organization_membership_is_decidable_only_when_the_subject_names_one() {
+    use rise_resource_api::SubjectId;
+
+    for subject in ["group:acme/platform", "serviceaccount:acme/ci", "org:acme"] {
+        let subject: SubjectId = subject.parse().unwrap();
+        assert!(subject.may_belong_to("acme"));
+        assert!(!subject.may_belong_to("beta"));
+    }
+
+    for subject in [
+        "user:alice",
+        "system:authenticated",
+        "system:operators",
+        "controller:builder",
+    ] {
+        let subject: SubjectId = subject.parse().unwrap();
+        assert!(subject.may_belong_to("acme"));
+        assert!(subject.may_belong_to("beta"));
+    }
 }
 
 #[test]

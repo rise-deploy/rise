@@ -70,6 +70,16 @@ Editing `org-admin` changes what administrators may do in every organization, ne
 
 `system:operators` is reserved: no binding of either kind may name it except the seeded root `PlatformRoleBinding/system-admin`, and only carrying its shipped body.
 
+An org `RoleBinding`'s subject must belong to the Organization the binding sits in. A subject that names its own organization — `group:`, `serviceaccount:`, `org:` — is checked at write time and refused on a mismatch: both organizations are fixed once the row exists, so such a binding would read as a cross-org grant while granting nothing, forever. `user:` and `system:authenticated` subjects are accepted, because their affiliation is a live membership question rather than a property of the identifier.
+
+Because the Organization is implied by placement, that subject also accepts the relative form `group:<name>`, expanded against the parent before the row is stored:
+
+```json
+{ "subject": "group:platform", "roleRef": { "kind": "Role", "name": "viewer" } }
+```
+
+under `acme` stores `group:acme/platform`. `PlatformRoleBinding` has no parent Organization and so takes absolute subjects only.
+
 Resource lifecycle operations are audit-logged on the `rise::audit` target. Records include `resource.created`, `resource.updated`, `resource.deleted`, `resource.deletion_cascaded`, `resource.controller_status_updated`, `resource.controller_finalizers_updated`, `resource.operator_status_updated`, `resource.operator_finalizers_updated`, `resource.pending_deletion_listed`, and `resource.deletion_blockers_listed`. Cascade records are best-effort after commit; durable delivery would require a transactional outbox or Event resource.
 
 ### Controller authorization
