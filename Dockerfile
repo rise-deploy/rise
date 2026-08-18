@@ -69,7 +69,9 @@ COPY docs/engineering/package.json ./engineering/
 RUN npm ci
 
 COPY docs/ ./
-RUN npm run build --workspace=rise-user-docs
+COPY skills/rise-app-builder /usr/src/skills/rise-app-builder
+RUN RISE_USER_DOCS_URL=/docs node scripts/generate-llms.mjs && \
+    npm run build --workspace=rise-user-docs
 
 # Stage 3: Build dependencies (cached separately from source code)
 FROM chef AS builder
