@@ -34,7 +34,7 @@ Rise simplifies container deployment by providing:
 
 ```bash
 # Download the latest pre-built binary from GitHub Releases
-mise use -g ubi:rise-deploy/rise
+mise use -g github:rise-deploy/rise
 
 # Verify installation
 rise --version

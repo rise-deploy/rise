@@ -20,7 +20,7 @@ This guide walks you through everything you need to deploy your first applicatio
 **With mise (preferred)** — downloads a pre-built binary from GitHub releases, no Rust toolchain required:
 
 ```bash
-mise use -g ubi:rise-deploy/rise
+mise use -g github:rise-deploy/rise
 ```
 
 Your platform team may also distribute the `rise` binary directly — check your internal tooling documentation.

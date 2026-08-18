@@ -40,6 +40,7 @@ uuid = { version = "1.18.1", features = ["v4", "serde"] }
 [package]
 name = "rise-deploy"
 version = "0.23.0-rc5"
+publish = false
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/rise-deploy/rise"
@@ -80,12 +81,12 @@ cli = [
 ]
 backend = [
     # Server core (former "server" feature)
-    "dep:rise-backend-auth", # strip-on-publish
-    "dep:rise-backend-core", # strip-on-publish
-    "dep:rise-backend-docker", # strip-on-publish
-    "dep:rise-resource-api", # strip-on-publish
-    "dep:rise-resource-store-postgres", # strip-on-publish
-    "dep:rise-runtime-sync", # strip-on-publish
+    "dep:rise-backend-auth",
+    "dep:rise-backend-core",
+    "dep:rise-backend-docker",
+    "dep:rise-resource-api",
+    "dep:rise-resource-store-postgres",
+    "dep:rise-runtime-sync",
     "dep:config",
     "dep:openssl",
     "dep:rsa",
@@ -129,7 +130,6 @@ backend = [
 ]
 
 [dependencies]
-# --- BEGIN BACKEND (stripped before `cargo publish` in CI; see .github/workflows/ci.yml) ---
 # Workspace crates (backend only)
 rise-backend-auth = { path = "crates/rise-backend-auth", optional = true }
 rise-backend-core = { path = "crates/rise-backend-core", optional = true }
@@ -137,7 +137,6 @@ rise-backend-docker = { path = "crates/rise-backend-docker", optional = true }
 rise-resource-api = { path = "crates/rise-resource-api", optional = true }
 rise-resource-store-postgres = { path = "crates/rise-resource-store-postgres", optional = true }
 rise-runtime-sync = { path = "crates/rise-runtime-sync", optional = true }
-# --- END BACKEND ---
 
 # Common (always enabled - shared across features)
 anyhow = "1.0.100"

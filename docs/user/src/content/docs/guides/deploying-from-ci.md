@@ -87,7 +87,7 @@ jobs:
       - uses: jdx/mise-action@v4
 
       - name: Install Rise CLI
-        run: mise use -g ubi:rise-deploy/rise
+        run: mise use -g github:rise-deploy/rise
 
       - name: Deploy
         env:
@@ -130,7 +130,7 @@ jobs:
       - uses: jdx/mise-action@v4
 
       - name: Install Rise CLI
-        run: mise use -g ubi:rise-deploy/rise
+        run: mise use -g github:rise-deploy/rise
 
       - name: Deploy preview
         env:
