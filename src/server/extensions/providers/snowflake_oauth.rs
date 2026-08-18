@@ -290,6 +290,61 @@ impl SnowflakeOAuthProvisioner {
         }
     }
 
+    /// Keep the generated Generic OAuth extension's scopes aligned with the
+    /// effective Snowflake provisioner configuration. This is called both from
+    /// the spec update hook (for immediate propagation) and from steady-state
+    /// reconciliation (to repair drift).
+    async fn sync_oauth_extension_scopes(
+        &self,
+        project_id: Uuid,
+        oauth_extension_name: &str,
+        current_oauth_spec: &Value,
+        provisioner_spec: &SnowflakeOAuthProvisionerSpec,
+    ) -> Result<bool> {
+        let effective_config = self.get_effective_config(provisioner_spec);
+        let Some(updated_spec) =
+            oauth_spec_with_synced_scopes(current_oauth_spec, &effective_config.scopes)?
+        else {
+            return Ok(false);
+        };
+
+        if let Some(oauth_provider) = &self.oauth_provider {
+            oauth_provider
+                .validate_spec(&updated_spec)
+                .await
+                .context("Generated OAuth extension spec is invalid after syncing scopes")?;
+        }
+
+        db_extensions::update_spec(
+            &self.db_pool,
+            project_id,
+            oauth_extension_name,
+            &updated_spec,
+        )
+        .await
+        .context("Failed to sync scopes to generated OAuth extension")?;
+
+        if let Some(oauth_provider) = &self.oauth_provider {
+            oauth_provider
+                .on_spec_updated(
+                    current_oauth_spec,
+                    &updated_spec,
+                    project_id,
+                    oauth_extension_name,
+                    &self.db_pool,
+                )
+                .await
+                .context("Failed to reconcile generated OAuth extension after syncing scopes")?;
+        }
+
+        info!(
+            "Synced OAuth scopes for generated extension {}: {:?}",
+            oauth_extension_name, effective_config.scopes
+        );
+
+        Ok(true)
+    }
+
     /// Get the finalizer name for this extension instance
     fn finalizer_name(&self, extension_name: &str) -> String {
         format!(
@@ -927,7 +982,7 @@ impl SnowflakeOAuthProvisioner {
         project_id: Uuid,
         project_name: &str,
         _extension_name: &str,
-        _spec: &SnowflakeOAuthProvisionerSpec,
+        spec: &SnowflakeOAuthProvisionerSpec,
     ) -> Result<()> {
         let integration_name = status
             .integration_name
@@ -987,6 +1042,13 @@ impl SnowflakeOAuthProvisioner {
             status.error = None;
             return Ok(());
         }
+
+        // The provisioner remains the source of truth for OAuth scopes after
+        // initial creation. Reconcile the generated extension here as a drift
+        // repair path in addition to the immediate spec update hook.
+        let oauth_ext = oauth_ext.expect("checked above");
+        self.sync_oauth_extension_scopes(project_id, oauth_extension_name, &oauth_ext.spec, spec)
+            .await?;
 
         let expected_redirect_uri = format!(
             "{}/oidc/{}/{}/callback",
@@ -1367,6 +1429,38 @@ Deletion removes all resources: Snowflake integration and OAuth extension.
         Ok(())
     }
 
+    async fn on_spec_updated(
+        &self,
+        _old_spec: &Value,
+        new_spec: &Value,
+        project_id: Uuid,
+        extension_name: &str,
+        db_pool: &sqlx::PgPool,
+    ) -> Result<()> {
+        let provisioner_spec: SnowflakeOAuthProvisionerSpec =
+            serde_json::from_value(new_spec.clone())
+                .context("Invalid Snowflake OAuth provisioner spec")?;
+        let oauth_extension_name = self.generate_oauth_extension_name(extension_name);
+
+        // During initial creation the child does not exist yet; the normal
+        // provisioning lifecycle will create it with the effective scopes.
+        if let Some(oauth_ext) =
+            db_extensions::find_by_project_and_name(db_pool, project_id, &oauth_extension_name)
+                .await?
+                .filter(|extension| extension.deleted_at.is_none())
+        {
+            self.sync_oauth_extension_scopes(
+                project_id,
+                &oauth_extension_name,
+                &oauth_ext.spec,
+                &provisioner_spec,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
     fn format_status(&self, status: &Value) -> String {
         match serde_json::from_value::<SnowflakeOAuthProvisionerStatus>(status.clone()) {
             Ok(status) => {
@@ -1481,5 +1575,79 @@ Deletion removes all resources: Snowflake integration and OAuth extension.
                 );
             }
         })
+    }
+}
+
+fn oauth_spec_with_synced_scopes(
+    current_spec: &Value,
+    desired_scopes: &[String],
+) -> Result<Option<Value>> {
+    let desired_scopes = serde_json::to_value(desired_scopes)
+        .context("Failed to serialize effective OAuth scopes")?;
+
+    if current_spec.get("scopes") == Some(&desired_scopes) {
+        return Ok(None);
+    }
+
+    let mut updated_spec = current_spec.clone();
+    let object = updated_spec
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("Generated OAuth extension spec must be a JSON object"))?;
+    object.insert("scopes".to_string(), desired_scopes);
+
+    Ok(Some(updated_spec))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::oauth_spec_with_synced_scopes;
+    use serde_json::json;
+
+    #[test]
+    fn oauth_scope_sync_updates_scopes_and_preserves_other_fields() {
+        let current = json!({
+            "provider_name": "Snowflake",
+            "client_id": "client-id",
+            "scopes": ["refresh_token"]
+        });
+        let desired = vec![
+            "refresh_token".to_string(),
+            "session:role:DATA_VIEWER".to_string(),
+        ];
+
+        let updated = oauth_spec_with_synced_scopes(&current, &desired)
+            .expect("scope sync should succeed")
+            .expect("different scopes should produce an update");
+
+        assert_eq!(updated["scopes"], json!(desired));
+        assert_eq!(updated["provider_name"], "Snowflake");
+        assert_eq!(updated["client_id"], "client-id");
+    }
+
+    #[test]
+    fn oauth_scope_sync_is_noop_when_scopes_match() {
+        let current = json!({
+            "provider_name": "Snowflake",
+            "scopes": ["refresh_token", "session:role:DATA_VIEWER"]
+        });
+        let desired = vec![
+            "refresh_token".to_string(),
+            "session:role:DATA_VIEWER".to_string(),
+        ];
+
+        let updated =
+            oauth_spec_with_synced_scopes(&current, &desired).expect("scope sync should succeed");
+
+        assert!(updated.is_none());
+    }
+
+    #[test]
+    fn oauth_scope_sync_rejects_non_object_specs() {
+        let error = oauth_spec_with_synced_scopes(&json!([]), &["refresh_token".to_string()])
+            .expect_err("non-object specs should be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("Generated OAuth extension spec must be a JSON object"));
     }
 }
