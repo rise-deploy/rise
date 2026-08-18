@@ -23,12 +23,6 @@ This guide walks you through everything you need to deploy your first applicatio
 mise use -g ubi:rise-deploy/rise
 ```
 
-**With cargo** — builds from source (requires Rust):
-
-```bash
-cargo install rise-deploy
-```
-
 Your platform team may also distribute the `rise` binary directly — check your internal tooling documentation.
 
 ## Logging In
