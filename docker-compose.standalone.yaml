@@ -295,6 +295,9 @@ services:
       - RISE_JWT_SIGNING_SECRET
       - RISE_ENCRYPTION_KEY
       - OIDC_CLIENT_SECRET
+      # Optional ID-token claim containing group names. Defaults to `groups`;
+      # AWS Cognito users can set OIDC_GROUP_CLAIM=cognito:groups.
+      - OIDC_GROUP_CLAIM
       - ADMIN_EMAIL
       # Operator access to the generic resource API (/api/v1/resources). Defaults
       # to none — set RISE_OPERATOR_EMAIL to grant a single operator (mount a

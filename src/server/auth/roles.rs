@@ -7,7 +7,7 @@
 //! `auth.platform_access.allowed_idp_groups`). Both forms match
 //! case-insensitively.
 //!
-//! Rise never sees the IdP's `groups` claim outside of login: `sync_user_groups`
+//! Rise never sees the configured IdP group claim outside of login: `sync_user_groups`
 //! (and the Entra active sync) mirror it into `idp_managed` teams, which is the
 //! record consulted here. Teams a user created themselves are not IdP-managed
 //! and therefore never grant a group-derived role.

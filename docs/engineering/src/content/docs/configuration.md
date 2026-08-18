@@ -223,6 +223,8 @@ auth:
                                 # offline_access is omitted by default (the CLI
                                 # does not use refresh tokens, and some providers
                                 # such as Google reject it); add it here if needed.
+  idp_group_claim: "groups"     # ID-token claim containing group names (default shown)
+                                # Use "cognito:groups" for AWS Cognito.
   admin_users: ["email@..."]    # Default-organization admin emails (array)
   admin_idp_groups: ["..."]     # IdP groups whose members are admins (array, optional)
   operator_users: ["ops@..."]   # Operator role allowlist (array, optional)
@@ -251,10 +253,11 @@ A user holds the role if their email is on the allowlist **or** they are in one
 of the listed groups. Group names match case-insensitively. Users granted a role
 by group bypass `platform_access` exactly as email-listed users do.
 
-**How group membership is resolved.** Rise sees the IdP's `groups` claim at
-login and mirrors it into IdP-managed teams (`sync_user_groups`, and the Entra
-active sync when enabled); those teams are what the group checks read. Two
-consequences:
+**How group membership is resolved.** Rise reads the ID-token claim configured
+by `auth.idp_group_claim` (default: `groups`) at login and mirrors it into
+IdP-managed teams (`sync_user_groups`, and the Entra active sync when enabled).
+For AWS Cognito, set `idp_group_claim: "cognito:groups"`. Those teams are what
+the group checks read. Two consequences:
 
 - Only **IdP-managed** teams count. A team a user creates themselves never
   grants a role, even if its name matches a configured group — otherwise

@@ -67,8 +67,9 @@ Merged to `develop`:
   the groups; group names match case-insensitively.
 
   All group matching — including the existing `auth.platform_access.allowed_idp_groups`
-  — now resolves against the **IdP-managed** teams Rise syncs from the IdP's
-  `groups` claim, rather than against every team the user belongs to. **Action
+  — now resolves against the **IdP-managed** teams Rise syncs from the configured
+  group claim (`auth.idp_group_claim`, default `groups`), rather than against
+  every team the user belongs to. **Action
   required only if** you granted platform access through `allowed_idp_groups`
   naming a team that Rise did not create from the IdP (i.e. `idp_managed = false`);
   those users lose platform access until the group comes from the IdP. This closes
@@ -76,6 +77,11 @@ Merged to `develop`:
   allowed group and grant themselves access. Group membership refreshes at login,
   so revoking a group in the IdP takes effect on the user's next login (or the next
   Entra active sync).
+- **Config change — custom IdP group claim**. `auth.idp_group_claim` selects the
+  ID-token claim Rise uses for IdP-managed team synchronization. It defaults to
+  `groups`, preserving existing behavior. AWS Cognito operators can set it to
+  `cognito:groups` (or set `OIDC_GROUP_CLAIM=cognito:groups` in the standalone
+  Docker deployment).
 - **Action required if conflicts exist — policy resource activation** ([#430](https://github.com/rise-deploy/rise/pull/430)).
   Rise activates the four reserved `rise.dev/v1alpha1` policy resource kinds —
   `Role` and `RoleBinding` under an Organization, `PlatformRole` and

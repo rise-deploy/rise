@@ -139,9 +139,14 @@
           },
           "type": "array"
         },
+        "idp_group_claim": {
+          "default": "groups",
+          "description": "Claim in the IdP ID token that contains group names (default: \"groups\").\nFor example, AWS Cognito commonly exposes groups as \"cognito:groups\".",
+          "type": "string"
+        },
         "idp_group_sync_enabled": {
           "default": true,
-          "description": "Enable IdP group synchronization (default: true)\nWhen enabled, user team memberships are automatically synced from IdP groups claim on login",
+          "description": "Enable IdP group synchronization (default: true).\nWhen enabled, user team memberships are synchronized from the configured\nIdP group claim on login.",
           "type": "boolean"
         },
         "issuer": {

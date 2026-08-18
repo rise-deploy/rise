@@ -67,6 +67,8 @@ auth:
   issuer: "${DEX_ISSUER:-http://rise-dex:5556/dex}"
   client_id: "${OIDC_CLIENT_ID:-rise-backend}"
   client_secret: "${OIDC_CLIENT_SECRET:-rise-backend-secret}"
+  # ID-token claim containing group names. AWS Cognito uses "cognito:groups".
+  idp_group_claim: "${OIDC_GROUP_CLAIM:-groups}"
   admin_users: ["${ADMIN_EMAIL:-admin@example.com}"]
   # Grant the admin role to everyone in an IdP group instead of listing emails.
   # Blank entries are filtered out, so an unset var collapses to an empty list.

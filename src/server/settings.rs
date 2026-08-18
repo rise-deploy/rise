@@ -522,6 +522,10 @@ fn default_idp_group_sync_enabled() -> bool {
     true
 }
 
+fn default_idp_group_claim() -> String {
+    "groups".to_string()
+}
+
 fn default_active_sync_interval_secs() -> u64 {
     300 // 5 minutes
 }
@@ -625,10 +629,15 @@ pub struct AuthSettings {
     /// or default to {issuer}/token
     #[serde(default)]
     pub token_url: Option<String>,
-    /// Enable IdP group synchronization (default: true)
-    /// When enabled, user team memberships are automatically synced from IdP groups claim on login
+    /// Enable IdP group synchronization (default: true).
+    /// When enabled, user team memberships are synchronized from the configured
+    /// IdP group claim on login.
     #[serde(default = "default_idp_group_sync_enabled")]
     pub idp_group_sync_enabled: bool,
+    /// Claim in the IdP ID token that contains group names (default: "groups").
+    /// For example, AWS Cognito commonly exposes groups as "cognito:groups".
+    #[serde(default = "default_idp_group_claim")]
+    pub idp_group_claim: String,
     /// Optional active sync source for pulling users and groups from an external IdP.
     /// When configured, Rise will periodically query the IdP for users and groups
     /// assigned to the app and sync them as Rise teams.
@@ -1816,6 +1825,12 @@ impl Settings {
             ));
         }
 
+        if settings.auth.idp_group_claim.trim().is_empty() {
+            return Err(ConfigError::Message(
+                "auth.idp_group_claim must not be empty".to_string(),
+            ));
+        }
+
         // A password without a username would be silently treated by the CLI as
         // client-managed auth, while a username without a password would cause a
         // confusing login failure. Keep static registry auth explicitly paired.
@@ -2076,6 +2091,23 @@ mod tests {
         let settings: Settings = serde_json::from_value(json).unwrap();
 
         assert_eq!(settings.reserved_project_names, ["grafana", "prometheus"]);
+    }
+
+    #[test]
+    fn idp_group_claim_defaults_to_groups() {
+        let settings: Settings = serde_json::from_value(minimal_settings_json()).unwrap();
+
+        assert_eq!(settings.auth.idp_group_claim, "groups");
+    }
+
+    #[test]
+    fn idp_group_claim_can_be_customized() {
+        let mut json = minimal_settings_json();
+        json["auth"]["idp_group_claim"] = serde_json::json!("cognito:groups");
+
+        let settings: Settings = serde_json::from_value(json).unwrap();
+
+        assert_eq!(settings.auth.idp_group_claim, "cognito:groups");
     }
 
     #[test]
