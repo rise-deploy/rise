@@ -353,28 +353,33 @@ jobs:
 # Stage 2 · Build — image builds in parallel with Quality; chart gated on Quality
 # ==========================================================================
 
-  package-image:
-    name: Build / Image
-    runs-on: ubuntu-latest
+  package-image-arch:
+    name: Build / Image (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     # Builds in parallel with the quality gates to keep the image (and therefore
     # all e2e) off the critical path. It only *publishes* when should_publish,
-    # tagged by sha/ci-version (never a release/latest tag), so building before
-    # the tests finish is safe — the chart publish and the e2e jobs stay gated on
-    # the quality jobs below.
+    # using architecture-specific SHA tags, so building before the tests finish
+    # is safe. The package-image job combines those images into the public
+    # multi-platform tags before the chart and e2e jobs consume them.
     needs:
       - prepare
-    # The arm64 build runs through QEMU on GitHub's amd64 runner and can take
-    # substantially longer than the native-only image build.
-    timeout-minutes: 90
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
     permissions:
       contents: read
       packages: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -394,12 +399,10 @@ jobs:
           file: ./Dockerfile
           target: rise
           push: ${{ needs.prepare.outputs.should_publish == 'true' }}
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.image_tag }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ needs.prepare.outputs.short_sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          platforms: linux/amd64,linux/arm64
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ needs.prepare.outputs.short_sha }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=rise-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=rise-${{ matrix.arch }}
+          platforms: ${{ matrix.platform }}
           provenance: false
 
       - name: Build and optionally push builder image
@@ -409,13 +412,63 @@ jobs:
           file: ./Dockerfile
           target: rise-builder
           push: ${{ needs.prepare.outputs.should_publish == 'true' }}
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.BUILDER_IMAGE_NAME }}:${{ needs.prepare.outputs.image_tag }}
-            ${{ env.REGISTRY }}/${{ env.BUILDER_IMAGE_NAME }}:sha-${{ needs.prepare.outputs.short_sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          platforms: linux/amd64,linux/arm64
+          tags: ${{ env.REGISTRY }}/${{ env.BUILDER_IMAGE_NAME }}:sha-${{ needs.prepare.outputs.short_sha }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=rise-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=rise-${{ matrix.arch }}
+          platforms: ${{ matrix.platform }}
           provenance: false
+
+  package-image:
+    name: Build / Image manifest
+    runs-on: ubuntu-24.04
+    needs:
+      - prepare
+      - package-image-arch
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Set up Docker Buildx
+        if: needs.prepare.outputs.should_publish == 'true'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        if: needs.prepare.outputs.should_publish == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and verify multi-platform manifests
+        if: needs.prepare.outputs.should_publish == 'true'
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
+          SHORT_SHA: ${{ needs.prepare.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+
+          publish_manifest() {
+            local image="$1"
+
+            docker buildx imagetools create \
+              --tag "${image}:${IMAGE_TAG}" \
+              --tag "${image}:sha-${SHORT_SHA}" \
+              "${image}:sha-${SHORT_SHA}-amd64" \
+              "${image}:sha-${SHORT_SHA}-arm64"
+
+            docker buildx imagetools inspect --raw "${image}:${IMAGE_TAG}" \
+              | jq -e '[.manifests[].platform | "\(.os)/\(.architecture)"] | sort == ["linux/amd64", "linux/arm64"]'
+          }
+
+          publish_manifest "${REGISTRY}/${IMAGE_NAME}"
+          publish_manifest "${REGISTRY}/${BUILDER_IMAGE_NAME}"
+
+      - name: Skip manifest publishing
+        if: needs.prepare.outputs.should_publish != 'true'
+        run: echo "Images were built without publishing for this untrusted pull request."
 
   package-helm:
     name: Build / Helm chart
