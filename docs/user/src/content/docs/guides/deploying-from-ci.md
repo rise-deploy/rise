@@ -84,8 +84,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: jdx/mise-action@v4
+
       - name: Install Rise CLI
-        run: cargo install rise-deploy
+        run: mise use -g github:rise-deploy/rise
 
       - name: Deploy
         env:
@@ -125,8 +127,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: jdx/mise-action@v4
+
       - name: Install Rise CLI
-        run: cargo install rise-deploy
+        run: mise use -g github:rise-deploy/rise
 
       - name: Deploy preview
         env:

@@ -30,17 +30,18 @@ Rise simplifies container deployment by providing:
 - **Automatic OCI repository provisioning**: Push images to AWS ACR with secure temporary credentials without per-project infrastructure setup
 - **Service Accounts**: Workload identity for GitHub Actions, GitLab CI, etc. to deploy from CI/CD
 
-## Install CLI from crates.io
+## Install CLI
 
 ```bash
-# Install the CLI and backend from crates.io
-cargo install rise-deploy
+# Download the latest pre-built binary from GitHub Releases
+mise use -g github:rise-deploy/rise
 
 # Verify installation
 rise --version
 ```
 
-Note that this does not include server code unless you use `--features cli,server`.
+You can also download a binary directly from the
+[GitHub Releases](https://github.com/rise-deploy/rise/releases) page.
 
 ## Local Development
 
@@ -180,7 +181,7 @@ rise deploy
 ./scripts/tag-version.sh 0.14.0
 ```
 
-The script validates prerequisites, generates release notes, shows a plan, and after confirmation performs all git operations (commit, tag, push) and creates a GitHub release. CI then publishes to crates.io and builds Docker images.
+The script validates prerequisites, generates release notes, shows a plan, and after confirmation performs all git operations (commit, tag, push) and creates a GitHub release. CI then builds release binaries and Docker images.
 
 ## License
 
