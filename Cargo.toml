@@ -39,7 +39,7 @@ uuid = { version = "1.18.1", features = ["v4", "serde"] }
 
 [package]
 name = "rise-deploy"
-version = "0.23.0-rc7"
+version = "0.23.0-rc8"
 publish = false
 edition = "2021"
 license = "MIT OR Apache-2.0"
