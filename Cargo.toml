@@ -51,6 +51,7 @@ description = "A simple and powerful CLI for deploying containerized application
 always_include_features = ["cli"]
 
 [package.metadata.dist]
+dist = true
 cargo-dist-version = "0.31.0"
 ci = []
 installers = []
