@@ -1615,11 +1615,21 @@
               "default": "",
               "type": "string"
             },
+            "password": {
+              "default": "",
+              "description": "Optional static registry password. Intended for small trusted-user setups.",
+              "type": "string"
+            },
             "registry_url": {
               "type": "string"
             },
             "type": {
               "const": "oci-client-auth",
+              "type": "string"
+            },
+            "username": {
+              "default": "",
+              "description": "Optional static registry username. When set with `password`, Rise returns\nthe credentials to authorized clients instead of relying on prior docker login.",
               "type": "string"
             }
           },
