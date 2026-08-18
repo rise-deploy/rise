@@ -314,7 +314,16 @@ auto_remove = true
 type = "oci-client-auth"
 registry_url = "registry.example.com"
 namespace = "rise-apps"
+# Optional: automatically authenticate trusted Rise users during deploy.
+username = "${RISE_REGISTRY_USERNAME}"
+password = "${RISE_REGISTRY_PASSWORD}"
 ```
+
+When `username` and `password` are omitted or empty, users must authenticate the
+container CLI themselves with `docker login`. When set, Rise returns these static
+credentials from the authenticated, deployment-scoped credentials endpoint and
+uses them for controller-side pulls. Anyone allowed to deploy can receive the
+credentials, so use this only where all Rise users are trusted.
 
 #### GitLab Container Registry
 
