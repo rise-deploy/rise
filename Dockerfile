@@ -77,6 +77,7 @@ FROM chef AS builder
 COPY --from=planner /usr/src/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/usr/src/target \
     cargo chef cook --release --all-features --recipe-path recipe.json
 
 # Copy project files
@@ -91,6 +92,7 @@ COPY .sqlx ./.sqlx
 # Build the application with server features
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/usr/src/target \
     SQLX_OFFLINE=true cargo build --release --all-features --bin rise && \
     cp target/release/rise /usr/local/bin/rise
 
