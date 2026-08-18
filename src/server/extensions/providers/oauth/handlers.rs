@@ -401,7 +401,8 @@ fn redirect_uri_is_allowed(redirect: &Url, public_url: &Url, app_origins: &[Url]
         return false;
     }
 
-    let loopback_redirect_allowed = redirect.host_str().is_some_and(is_loopback_host)
+    let loopback_redirect_allowed = redirect.scheme() == public_url.scheme()
+        && redirect.host_str().is_some_and(is_loopback_host)
         && public_url.host_str().is_some_and(is_loopback_host);
 
     loopback_redirect_allowed
