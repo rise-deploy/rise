@@ -166,7 +166,7 @@ rise deploy
 
 **Prerequisites:**
 - [GitHub CLI (`gh`)](https://cli.github.com/) - authenticated via `gh auth login`
-- [Claude CLI](https://github.com/anthropics/anthropic-tools) - for AI-generated release notes (optional)
+- [Claude Code](https://github.com/anthropics/claude-code) or [Codex CLI](https://github.com/openai/codex) - for AI-generated release notes (optional)
 
 **Create a new release:**
 
@@ -174,8 +174,11 @@ rise deploy
 # Preview release notes
 ./scripts/tag-version.sh --dry-run 0.14.0
 
-# Preview release notes with extra Claude guidance
-./scripts/tag-version.sh --dry-run --claude-guidance "Emphasize operator-facing changes" 0.14.0
+# Preview release notes with extra AI guidance
+./scripts/tag-version.sh --dry-run --ai-guidance "Emphasize operator-facing changes" 0.14.0
+
+# Explicitly use Codex (otherwise Claude, then Codex, is auto-detected)
+./scripts/tag-version.sh --dry-run --ai-cli codex 0.14.0
 
 # Create and publish release
 ./scripts/tag-version.sh 0.14.0
