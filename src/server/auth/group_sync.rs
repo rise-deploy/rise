@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use crate::db::{models::TeamRole, teams};
 
-/// Synchronize user's team memberships based on IdP groups claim
+/// Synchronize a user's team memberships from the configured IdP group claim.
 ///
 /// This function implements the complete IdP group synchronization algorithm:
 /// 1. Creates teams that don't exist in Rise
@@ -19,7 +19,7 @@ use crate::db::{models::TeamRole, teams};
 /// # Arguments
 /// * `pool` - Database connection pool
 /// * `user_id` - UUID of the user logging in
-/// * `idp_groups` - List of group names from the IdP's "groups" claim
+/// * `idp_groups` - List of group names from the configured IdP group claim
 ///
 /// # Errors
 /// Returns an error if database operations fail. The transaction will be rolled back.
@@ -107,7 +107,7 @@ pub async fn sync_user_groups(pool: &PgPool, user_id: Uuid, idp_groups: &[String
         .context("Failed to list IdP-managed teams")?;
 
     for team in all_idp_teams {
-        // Case-insensitive check if team is in IdP groups claim
+        // Case-insensitive check if team is in the IdP group claim
         let in_claim = idp_groups
             .iter()
             .any(|g| g.eq_ignore_ascii_case(&team.name));
@@ -120,7 +120,7 @@ pub async fn sync_user_groups(pool: &PgPool, user_id: Uuid, idp_groups: &[String
 
             if is_member {
                 tracing::info!(
-                    "Removing user from IdP-managed team '{}' (not in groups claim)",
+                    "Removing user from IdP-managed team '{}' (not in IdP group claim)",
                     team.name
                 );
                 teams::remove_all_user_roles(&mut *tx, team.id, user_id)

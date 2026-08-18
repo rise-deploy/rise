@@ -87,6 +87,7 @@ export ACME_CA_SERVER=https://acme-staging-v02.api.letsencrypt.org/directory
 | `RISE_JWT_SIGNING_SECRET` | insecure repo placeholder | **Set it.** Overrides the demo secret baked into `config/docker.yaml`. `openssl rand -base64 32`. |
 | `RISE_ENCRYPTION_KEY` | insecure repo placeholder | **Set it.** Overrides the demo AES key. `openssl rand -base64 32`. |
 | `OIDC_CLIENT_SECRET` | `rise-backend-secret` | **Set it.** Keep in sync with the Dex client secret in `dev/dex/config.yaml`. |
+| `OIDC_GROUP_CLAIM` | `groups` | ID-token claim containing group names. Set to `cognito:groups` for AWS Cognito. |
 | `ADMIN_EMAIL` | `admin@example.com` | Initial admin user. |
 | `RISE_PLATFORM_ACCESS_POLICY` | `allow_all` | Who may use the CLI/API/dashboard. `allow_all` = any authenticated user; `restrictive` = allowlist only (see [Platform access](#platform-access)). |
 | `RISE_PLATFORM_ALLOWED_EMAIL` | empty | A single email granted platform access when the policy is `restrictive`. For several users, mount a config override. |
@@ -153,6 +154,7 @@ env var.
 
 Group-based grants — `allowed_idp_groups`, `admin_idp_groups`,
 `operator_idp_groups` — match against the IdP-managed teams Rise syncs from the
-IdP's `groups` claim at login. Teams users create themselves never match, and a
-group removal in the IdP takes effect on the user's next login. See
+ID-token claim selected by `auth.idp_group_claim` (`OIDC_GROUP_CLAIM`, default
+`groups`) at login. Teams users create themselves never match, and a group
+removal in the IdP takes effect on the user's next login. See
 [Roles](/operator-docs/configuration/#authentication-auth) for details.

@@ -281,14 +281,17 @@ async fn sync_groups_after_login(
         })?;
 
     // Parse claims
-    let claims: crate::server::auth::jwt::Claims =
-        serde_json::from_value(claims_value).map_err(|e| {
-            tracing::warn!("Failed to parse claims for group sync: {:#}", e);
-            (
-                StatusCode::UNAUTHORIZED,
-                format!("Invalid token claims: {}", e),
-            )
-        })?;
+    let claims = crate::server::auth::jwt::Claims::from_value_with_group_claim(
+        claims_value,
+        &state.auth_settings.idp_group_claim,
+    )
+    .map_err(|e| {
+        tracing::warn!("Failed to parse claims for group sync: {:#}", e);
+        (
+            StatusCode::UNAUTHORIZED,
+            format!("Invalid token claims: {}", e),
+        )
+    })?;
 
     // Get or create user. Always pairs the user row with a default-Org
     // membership so bootstrap validation never observes a half-created user.

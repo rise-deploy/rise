@@ -254,6 +254,8 @@ config:
     issuer: "http://dex:5556/dex"
     client_id: "rise-backend"
     client_secret: ""  # Override with Secret or environment variable
+    # ID-token claim containing group names. AWS Cognito uses "cognito:groups".
+    idp_group_claim: "groups"
     # admin_users: []  # Optional: List of admin user emails with full permissions
     # admin_idp_groups: []  # Optional: IdP groups whose members are admins
     # operator_idp_groups: []  # Optional: IdP groups whose members hold the Operator role
