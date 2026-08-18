@@ -5950,3 +5950,107 @@ async fn an_org_role_binding_subject_is_bounded_to_its_own_organization(
 
     Ok(())
 }
+
+/// The update path, which is what an install holding a pre-existing foreign
+/// subject actually meets.
+///
+/// Admission runs on create and update alike, so the boundary is not a
+/// create-time gate a later edit slips past. The two remediations the operator
+/// upgrade note offers — re-point the subject, or delete the row — both have to
+/// keep working on a row the check itself would now refuse, which is why this
+/// plants one directly rather than through the store.
+#[sqlx::test]
+async fn a_foreign_subject_survives_reads_and_blocks_only_its_own_replay(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool.clone());
+    let acme = create_org(&store, "acme").await;
+    create_org(&store, "beta").await;
+    create_role(&store, acme.uid, "viewer").await;
+    create_builtin_resource(
+        &store,
+        GROUP_KIND,
+        "platform",
+        Some(acme.uid),
+        json!({}),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    let spec = |subject: &str| {
+        json!({
+            "subject": subject,
+            "roleRef": {"kind": "Role", "name": "viewer"}
+        })
+    };
+
+    // The relative form is expanded once and stays put when the stored spec is
+    // replayed, which is the shape a read-modify-write client sends back.
+    let relative = create_binding(
+        &store,
+        ROLE_BINDING_KIND,
+        "relative",
+        Some(acme.uid),
+        spec("group:platform"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(relative.spec["subject"], json!("group:acme/platform"));
+    let replayed = store
+        .update(relative.uid, update_spec(relative.revision, relative.spec))
+        .await
+        .unwrap();
+    assert_eq!(replayed.spec["subject"], json!("group:acme/platform"));
+
+    // A row from before the check exists only by direct write.
+    let legacy = create_binding(
+        &store,
+        ROLE_BINDING_KIND,
+        "legacy",
+        Some(acme.uid),
+        spec("group:acme/platform"),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE resource_store.resources SET spec = $1 WHERE uid = $2")
+        .bind(spec("group:beta/team-leads"))
+        .bind(legacy.uid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let legacy = store.get(legacy.uid).await.unwrap().unwrap();
+    assert_eq!(legacy.spec["subject"], json!("group:beta/team-leads"));
+
+    // Reading it back is unaffected; only an update carrying that subject fails.
+    let replay = store
+        .update(legacy.uid, update_spec(legacy.revision, legacy.spec))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&replay, StoreError::Validation(message)
+            if message.contains("belongs to Organization 'beta', not 'acme'")),
+        "replaying a foreign subject should fail, got {replay:?}"
+    );
+
+    // Re-pointing it is the documented fix, and the subject is not immutable.
+    let fixed = store
+        .update(
+            legacy.uid,
+            update_spec(legacy.revision, spec("group:platform")),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fixed.spec["subject"], json!("group:acme/platform"));
+
+    // Deleting is the other documented fix, and works while the row is foreign.
+    sqlx::query("UPDATE resource_store.resources SET spec = $1 WHERE uid = $2")
+        .bind(spec("org:beta"))
+        .bind(fixed.uid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    store.delete(fixed.uid).await.unwrap();
+
+    Ok(())
+}

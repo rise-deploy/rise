@@ -309,10 +309,16 @@ fn require_subject_within_organization(
     if literal.may_belong_to(organization) {
         return Ok(());
     }
+    // Only a subject naming an organization reaches this arm today, but the
+    // message is written for both shapes rather than unwrapping: whichever
+    // subject kinds `may_belong_to` refuses, none can render an empty name.
+    let mismatch = match literal.organization() {
+        Some(own) => format!("belongs to Organization '{own}', not '{organization}'"),
+        None => format!("belongs to no Organization, so it cannot belong to '{organization}'"),
+    };
     Err(StoreError::Validation(format!(
-        "subject '{literal}' belongs to Organization '{}', not '{organization}'; \
-         an org {ROLE_BINDING_KIND}'s subject must belong to its own Organization",
-        literal.organization().unwrap_or_default()
+        "subject '{literal}' {mismatch}; an org {ROLE_BINDING_KIND}'s subject \
+         must belong to its own Organization"
     )))
 }
 

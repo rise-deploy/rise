@@ -50,10 +50,12 @@ impl SubjectId {
     /// caller is affiliated, which only the evaluator can decide. Those report
     /// `true` and leave the live question open.
     ///
-    /// `controller:` is the one kind that belongs to no organization yet still
-    /// reports `true`. Making that a write-time error would collide with the
-    /// org opt-in enablement design tracked in rise-deploy/rise#437, under
-    /// which an org-parented binding naming a controller becomes meaningful.
+    /// Two subjects belong to no organization at all and still report `true`,
+    /// because neither is a write-time error worth raising here. `controller:`
+    /// would collide with the org opt-in enablement design tracked in
+    /// rise-deploy/rise#437, under which an org-parented binding naming a
+    /// controller becomes meaningful. `system:operators` is refused earlier, by
+    /// the reservation that admits it only on the seeded bootstrap binding.
     pub fn may_belong_to(&self, organization: &str) -> bool {
         match self.organization() {
             Some(own) => own == organization,

@@ -646,6 +646,10 @@ async fn membership_facts_outside_the_seam_contract_fail_closed() {
     ));
 }
 
+/// Admission refuses this row on the way in, so the state built here reaches a
+/// live database only by direct write, restore, or an install predating that
+/// check. The evaluator is the layer that has to stay correct anyway: it is
+/// what makes the boundary a guarantee rather than a write-path convention.
 #[tokio::test]
 async fn a_foreign_subject_is_inert_and_reported() {
     let mut builder = StoreBuilder::new();

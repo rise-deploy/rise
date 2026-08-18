@@ -943,3 +943,28 @@ asserted only on an org-contained resource. The other half — live on a
 root-scoped resource, because the clamp's guard requires the resource to have an
 organization — is what keeps the platform-binding combination legitimate, and it
 is now pinned rather than derived.
+
+Adversarial review of this change found no escalation or fail-open path. The
+attack worth recording is the one that failed: §1's wildcard-replacement rule
+keys on the *authored* subject, so a foreign-subject org binding looked like it
+could be load-bearing precisely by granting nothing — suppressing a platform
+wildcard Allow for its own scope. It cannot. The engine drops a binding to
+`inert` before it enters the applicable set, and `apply_wildcard_replacement`
+consumes only applicable bindings, so an inert binding is never a replacement
+candidate. Rejecting these rows removes no expressible policy.
+
+Three smaller findings were fixed rather than noted. The rejection message read
+the subject's organization through a second, independent `unwrap_or_default()`,
+which would render an empty name the moment `may_belong_to` starts refusing a
+kind that carries no organization — the exact change #437 is expected to make.
+`may_belong_to`'s doc claimed `controller:` was the only such kind, overlooking
+`system:operators`. And `a_foreign_subject_is_inert_and_reported` builds a row
+admission now refuses, which needs saying: the evaluator is what makes the
+boundary a guarantee rather than a write-path convention, and legacy rows,
+restores, and direct writes all still reach it.
+
+The operator-facing claims are covered rather than asserted:
+`a_foreign_subject_survives_reads_and_blocks_only_its_own_replay` pins that
+admission runs on update too, that a foreign row stays readable and deletable,
+that re-pointing its subject is accepted, and that the relative form is
+idempotent when a read-modify-write client replays the stored spec.
