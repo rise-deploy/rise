@@ -461,7 +461,53 @@ Roughly one workstream per phase, each independently reviewable:
 5. **Multi-container** — per-spec services, Cloud Map discovery, routes.
 6. **Logs** — the `CloudWatch` logs backend variant.
 7. **Operator surface** — Terraform ECS section, operator docs page, feature
-   matrix column, upgrade notes, e2e coverage.
+   matrix column, upgrade notes.
+
+Testing is not a phase. Tier-1 contract tests land with the phase whose calls
+they cover; the tier-3 sandbox account and its `Backend` driver are stood up
+during phase 2, because phase 2 is where the design's AWS assumptions are first
+falsifiable. See [Testing](#testing).
+
+## Testing
+
+The e2e harness (`tests/e2e`) already has the right shape for this: scenarios are
+written once against the `Backend` driver seam, each backend self-provisions its
+own stack, and a capability a backend lacks surfaces as a **declared skip with a
+reason** rather than silent drift. An ECS driver is an additive
+`tests/e2e/src/backend/ecs.rs`, not a second suite.
+
+What to run it against is three tiers, because no single environment covers both
+"the reconciler emits the right AWS objects" and "the app actually serves
+traffic":
+
+| Tier | Environment | Runs | Proves | Cost |
+|---|---|---|---|---|
+| 1. Contract | Fake ECS/SSM/Cloud Map API (`moto` server or an in-crate stub) | Every PR | The reconciler emits the intended task definitions, services, tags, Traefik labels, SSM parameters; drift detection and GC converge | Free, seconds |
+| 2. Emulated | LocalStack ECS (runs tasks as local Docker containers) | Every PR, if viable | The above **plus** Traefik discovering real containers and routing to them — most existing scenarios run unchanged | Paid license; minutes |
+| 3. Real | AWS sandbox account, GitHub OIDC → IAM role | Nightly / pre-release | Fargate sizing and cold start, IAM and `PassRole` scoping, ECS `secrets` injection, Cloud Map DNS, ALB/ACM, API throttling | Real AWS spend; slow |
+
+Tier 1 is an ordinary workspace integration test in `rise-backend-ecs`, not an e2e
+scenario: `moto` implements the ECS surface this backend uses
+(`RegisterTaskDefinition`, `Create`/`Update`/`DeleteService`,
+`Describe`/`ListTasks`, `Describe`/`ListServices`, resource tagging) but **runs no
+containers**, so it can only assert API-call shape. That is still the highest
+value-per-second test available: most reconciler bugs are "we sent the wrong
+thing", and this catches them on every PR for free.
+
+Tier 3 is gated exactly like the existing `E2E / Docker` and `E2E / Minikube`
+jobs — `push` to `develop` or a trusted PR — which is also what makes federated
+AWS credentials safe to expose. Cost is managed by keeping the expensive standing
+pieces (VPC, NAT, ALB, Traefik service) long-lived in the sandbox account and
+churning only ECS services, task definitions and SSM parameters per run, with a
+tag-scoped sweeper that deletes anything the harness left behind.
+
+**The load-bearing caveat:** tiers 1 and 2 do not de-risk this design. Every
+question in [Open questions](#open-questions) — Cloud Map multi-registration,
+quota ceilings, `PassRole` scoping, Fargate cold-start against
+`DEPLOYING_TIMEOUT_MINUTES` — is a fact about real AWS, and an emulator that
+answers them "yes" is not evidence. Tier 3 must therefore exist **before** the
+design is settled, not after: the phase-2 spike runs against a real account, and
+tiers 1 and 2 are what keep it regression-tested afterwards.
 
 ## Open questions
 
@@ -489,9 +535,12 @@ verification against AWS, not choices.
 5. **Task role granularity.** One shared task role per install, per project, or
    per deployment? Per-project is the useful unit for app-level AWS access, but
    it multiplies IAM objects and complicates `iam:PassRole` scoping (D14).
-6. **Standalone/local development.** How is this backend exercised without an AWS
-   account — LocalStack, a `moto`-backed fake, or e2e against a real sandbox
-   account only? This determines how much of the reconciler is testable in CI.
+6. **LocalStack viability for tier 2 (see [Testing](#testing)).** Two blockers,
+   both cheap to spike: (a) does Traefik's ECS provider work against a LocalStack
+   endpoint (`AWS_ENDPOINT_URL`), and are the task IPs LocalStack reports in
+   `DescribeTasks` reachable from the Traefik container? (b) ECS is in
+   LocalStack's paid plans — the free Hobby plan is non-commercial — so tier 2
+   needs a licensing answer before it can run in CI.
 7. **Shared-logic promotion.** Which of `rise-backend-docker`'s modules
    (`labels`, `pod_status`, `diff`, `rolling`) move to `rise-backend-core` versus
    staying Docker-specific — decided per module during phase 3, not up front.
@@ -508,3 +557,5 @@ verification against AWS, not choices.
 - `crates/rise-backend-docker/` — the reference implementation this backend
   mirrors (reconcile loop, Traefik labels, cutover, identity delivery).
 - `modules/rise-aws/` — the Terraform module extended by D14.
+- `tests/e2e/README.md` — the `Backend` driver seam, the scenario matrix, and the
+  declared-skip convention an ECS driver plugs into.
