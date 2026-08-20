@@ -52,6 +52,34 @@ Operators have unrestricted access to subresources. When an operator writes fina
 
 `auth.admin_users` are admins within the default Organization for typed APIs only; they do **not** receive Operator and cannot access the generic API unless also listed in `auth.operator_users`.
 
+### Seeded baseline policy
+
+Startup seeds five root policy resources described by [ADR-0001](../adr/0001-unified-permission-model). They exist and are readable today; nothing consults them for access, because the tiers above are still the whole authorization model.
+
+| Resource | Grants | Mutability |
+|---|---|---|
+| `PlatformRole/system-admin` | every verb on every kind and subresource | immutable |
+| `PlatformRoleBinding/system-admin` | `system-admin` to `system:operators` | immutable |
+| `PlatformRole/org-admin` | the global org-admin baseline | operator-editable |
+| `PlatformRole/resource-owner` | `get`, `list`, `update`, `delete` — no `create`, no subresources | operator-editable |
+| `PlatformRoleBinding/resource-owner` | `resource-owner` to whoever `rise.dev/owner` names | operator-editable |
+
+The two immutable rows are not the source of operator authority — the evaluator hardcodes that, so the guarantee survives a bad restore or a direct database write. They are its only inspectable record, which is why the store rejects `PUT` and `DELETE` on both, and why a startup finding either diverged from its shipped definition fails with the row named and remediation instructions rather than silently rewriting it. Seeding never overwrites the three editable rows, so an operator edit survives every restart and a deleted one is re-created on the next.
+
+Editing `org-admin` changes what administrators may do in every organization, never *who* they are: admin standing comes from an exact org-root, scope-only `RoleBinding`, so no label or Group name can confer it. Editing `resource-owner` changes what ownership means platform-wide; an organization can instead override the default for itself with its own binding on the same `(subject, label key)` pair.
+
+`system:operators` is reserved: no binding of either kind may name it except the seeded root `PlatformRoleBinding/system-admin`, and only carrying its shipped body.
+
+An org `RoleBinding`'s subject must belong to the Organization the binding sits in. A subject that names its own organization — `group:`, `serviceaccount:`, `org:` — is checked at write time and refused on a mismatch: both organizations are fixed once the row exists, so such a binding would read as a cross-org grant while granting nothing, forever. `user:` and `system:authenticated` subjects are accepted, because their affiliation is a live membership question rather than a property of the identifier.
+
+Because the Organization is implied by placement, that subject also accepts the relative form `group:<name>`, expanded against the parent before the row is stored:
+
+```json
+{ "subject": "group:platform", "roleRef": { "kind": "Role", "name": "viewer" } }
+```
+
+under `acme` stores `group:acme/platform`. `PlatformRoleBinding` has no parent Organization and so takes absolute subjects only.
+
 Resource lifecycle operations are audit-logged on the `rise::audit` target. Records include `resource.created`, `resource.updated`, `resource.deleted`, `resource.deletion_cascaded`, `resource.controller_status_updated`, `resource.controller_finalizers_updated`, `resource.operator_status_updated`, `resource.operator_finalizers_updated`, `resource.pending_deletion_listed`, and `resource.deletion_blockers_listed`. Cascade records are best-effort after commit; durable delivery would require a transactional outbox or Event resource.
 
 ### Controller authorization

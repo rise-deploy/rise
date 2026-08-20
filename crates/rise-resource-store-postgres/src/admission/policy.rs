@@ -1,7 +1,9 @@
 use rise_resource_api::{
+    is_immutable_policy_seed, system_admin_binding_spec, system_admin_role_spec,
     PlatformRoleBindingSpec, PlatformRoleRefKind, RoleBindingSpec, RoleRefKind, RoleSpec,
-    StoreError, API_VERSION_V1ALPHA1, ORGANIZATION_KIND, PLATFORM_ROLE_BINDING_KIND,
-    PLATFORM_ROLE_KIND, ROLE_BINDING_KIND, ROLE_KIND,
+    StoreError, API_VERSION_V1ALPHA1, OPERATORS_SUBJECT, ORGANIZATION_KIND,
+    PLATFORM_ROLE_BINDING_KIND, PLATFORM_ROLE_KIND, ROLE_BINDING_KIND, ROLE_KIND,
+    SYSTEM_ADMIN_PLATFORM_ROLE,
 };
 use sqlx::PgConnection;
 use uuid::Uuid;
@@ -73,18 +75,26 @@ impl PolicyAdmission {
         conn: &mut PgConnection,
         builtins: &BuiltInRegistry,
         parent_uid: Option<Uuid>,
+        name: &str,
         spec: &serde_json::Value,
     ) -> Result<serde_json::Value, StoreError> {
         match self {
             // A Role body references nothing and grants nothing until a binding
             // names it, so canonicalization already left it complete.
-            Self::Role | Self::PlatformRole => Ok(spec.clone()),
+            Self::Role => Ok(spec.clone()),
+            Self::PlatformRole => {
+                require_shipped_seed(PLATFORM_ROLE_KIND, name, parent_uid, spec, || {
+                    serde_json::to_value(system_admin_role_spec()).map_err(StoreError::backend)
+                })?;
+                Ok(spec.clone())
+            }
             Self::RoleBinding => {
-                self.admit_role_binding(conn, builtins, parent_uid, spec)
+                self.admit_role_binding(conn, builtins, parent_uid, name, spec)
                     .await
             }
             Self::PlatformRoleBinding => {
-                self.admit_platform_role_binding(conn, builtins, spec).await
+                self.admit_platform_role_binding(conn, builtins, parent_uid, name, spec)
+                    .await
             }
         }
     }
@@ -94,6 +104,7 @@ impl PolicyAdmission {
         conn: &mut PgConnection,
         builtins: &BuiltInRegistry,
         parent_uid: Option<Uuid>,
+        name: &str,
         spec: &serde_json::Value,
     ) -> Result<serde_json::Value, StoreError> {
         let organization = self.parent_organization(conn, parent_uid).await?;
@@ -102,6 +113,8 @@ impl PolicyAdmission {
             .normalize(&organization.name)
             .map_err(|error| StoreError::Validation(error.to_string()))?;
 
+        require_authorable_subject(normalized.subject(), parent_uid, name)?;
+        require_subject_within_organization(normalized.subject(), &organization.name)?;
         resolve_binding_subject(conn, normalized.subject()).await?;
 
         // Reference direction (ADR-0001 §4): an org binding reaches its own
@@ -137,12 +150,33 @@ impl PolicyAdmission {
         self,
         conn: &mut PgConnection,
         builtins: &BuiltInRegistry,
+        parent_uid: Option<Uuid>,
+        name: &str,
         spec: &serde_json::Value,
     ) -> Result<serde_json::Value, StoreError> {
         let parsed: PlatformRoleBindingSpec = parse_existing(spec, PLATFORM_ROLE_BINDING_KIND)?;
         let normalized = parsed
             .normalize()
             .map_err(|error| StoreError::Validation(error.to_string()))?;
+
+        require_authorable_subject(normalized.subject(), parent_uid, name)?;
+        // Compare the *normalized* forms: the spec that reaches the row has its
+        // contextual defaults applied, so comparing the caller's pre-normalized
+        // input against a normalized default would never match.
+        let normalized_value = serde_json::to_value(&normalized).map_err(StoreError::backend)?;
+        require_shipped_seed(
+            PLATFORM_ROLE_BINDING_KIND,
+            name,
+            parent_uid,
+            &normalized_value,
+            || {
+                let shipped: rise_resource_api::LocallyNormalizedPlatformRoleBindingSpec =
+                    system_admin_binding_spec()
+                        .normalize()
+                        .map_err(|error| StoreError::Validation(error.to_string()))?;
+                serde_json::to_value(shipped).map_err(StoreError::backend)
+            },
+        )?;
 
         let subject_organization = resolve_binding_subject(conn, normalized.subject()).await?;
 
@@ -217,4 +251,104 @@ impl PolicyAdmission {
             ))
         })
     }
+}
+
+/// Hold an immutable seed to its shipped body on the way in.
+///
+/// ADR-0001 §5 ships `PlatformRole/system-admin` and its binding as fixed data.
+/// Admission is the only writer that can enforce that, and it enforces it as
+/// equality against the shipped default rather than as "reserved name, any
+/// content": a reserved row whose body drifted would be the most misleading
+/// possible artifact, since the guarantee it appears to express lives in the
+/// evaluator instead.
+///
+/// Non-seed names pass straight through.
+fn require_shipped_seed<F>(
+    kind: &str,
+    name: &str,
+    parent_uid: Option<Uuid>,
+    spec: &serde_json::Value,
+    shipped: F,
+) -> Result<(), StoreError>
+where
+    F: FnOnce() -> Result<serde_json::Value, StoreError>,
+{
+    // Placement is part of the identity: only the root rows are reserved.
+    if parent_uid.is_some() || !is_immutable_policy_seed(kind, name) {
+        return Ok(());
+    }
+    let shipped = shipped()?;
+    if spec == &shipped {
+        return Ok(());
+    }
+    Err(StoreError::Validation(format!(
+        "{kind} '{name}' is seeded and immutable; its spec must be the shipped default"
+    )))
+}
+
+/// Hold an org `RoleBinding`'s subject to its own Organization.
+///
+/// ADR-0001 §1's recipient boundary makes an org-tier binding grant nothing
+/// unless the subject belongs to the binding's own Organization. For a subject
+/// that names its organization in its own identifier — `group:`,
+/// `serviceaccount:`, `org:` — both sides of that comparison are frozen at
+/// write time, so a mismatch is inert on every resource forever: policy that
+/// reads as a cross-org grant and can never become one.
+///
+/// §6.7 keeps *contingently* inert policy admissible, and this respects that
+/// line. `user:alice` and `system:authenticated` are live exactly while the
+/// caller is affiliated with this organization, so `SubjectId::may_belong_to`
+/// passes them through untouched.
+fn require_subject_within_organization(
+    subject: &rise_resource_api::BindingSubject,
+    organization: &str,
+) -> Result<(), StoreError> {
+    let Some(literal) = subject.literal() else {
+        return Ok(());
+    };
+    if literal.may_belong_to(organization) {
+        return Ok(());
+    }
+    // Only a subject naming an organization reaches this arm today, but the
+    // message is written for both shapes rather than unwrapping: whichever
+    // subject kinds `may_belong_to` refuses, none can render an empty name.
+    let mismatch = match literal.organization() {
+        Some(own) => format!("belongs to Organization '{own}', not '{organization}'"),
+        None => format!("belongs to no Organization, so it cannot belong to '{organization}'"),
+    };
+    Err(StoreError::Validation(format!(
+        "subject '{literal}' {mismatch}; an org {ROLE_BINDING_KIND}'s subject \
+         must belong to its own Organization"
+    )))
+}
+
+/// Reject the one subject nobody may author.
+///
+/// The recovery tier is hardcoded in the evaluator, so a binding naming
+/// `system:operators` would look like the source of that authority without being
+/// it. Exactly one row may carry it — the seeded root `PlatformRoleBinding` named
+/// `system-admin` — and this applies to *both* binding kinds: an org
+/// `RoleBinding` naming it is inert under §1's recipient boundary today, and
+/// admitting misleading policy on the strength of it being currently inert is how
+/// it stops being inert later.
+///
+/// This lives here rather than in context-free `normalize()` because it needs the
+/// resource's name and placement, and because admission is authoritative for
+/// direct store calls that supply no validator.
+fn require_authorable_subject(
+    subject: &rise_resource_api::BindingSubject,
+    parent_uid: Option<Uuid>,
+    name: &str,
+) -> Result<(), StoreError> {
+    let names_operators = subject
+        .literal()
+        .is_some_and(|subject| subject.as_ref() == OPERATORS_SUBJECT);
+    let is_reserved_seed = parent_uid.is_none() && name == SYSTEM_ADMIN_PLATFORM_ROLE;
+    if names_operators && !is_reserved_seed {
+        return Err(StoreError::Validation(format!(
+            "{OPERATORS_SUBJECT} is reserved for the seeded root \
+             {PLATFORM_ROLE_BINDING_KIND} '{SYSTEM_ADMIN_PLATFORM_ROLE}'"
+        )));
+    }
+    Ok(())
 }

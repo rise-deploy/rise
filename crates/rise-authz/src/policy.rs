@@ -246,6 +246,56 @@ pub fn selector_covers(covering: Option<&LabelSelector>, covered: Option<&LabelS
     }
 }
 
+/// Whether two domains provably share no resource.
+///
+/// This is the complement the grant gate needs on the *restricting* side: an
+/// Allow only counts when its domain demonstrably covers the target, while a
+/// Deny counts unless its domain demonstrably misses it. Both directions
+/// therefore have to be positively provable, and everything unproven is treated
+/// as overlapping — dropping a Deny that might apply would turn an unprovable
+/// scope relationship into extra authority.
+///
+/// Only two facts prove disjointness: same-key selectors pinned to different
+/// values, and two concrete scopes neither of which covers the other. The
+/// callback answers the latter for the caller's registry, exactly as in
+/// [`domain_covers_with`]; a wildcard scope is never disjoint from anything.
+pub fn domains_provably_disjoint_with<F>(
+    left: &PolicyDomain,
+    right: &PolicyDomain,
+    concrete_scope_covers: &F,
+) -> bool
+where
+    F: Fn(&Scope, &Scope) -> bool + ?Sized,
+{
+    if selectors_provably_disjoint(left.selector.as_ref(), right.selector.as_ref()) {
+        return true;
+    }
+    if left.scope.is_wildcard() || right.scope.is_wildcard() {
+        return false;
+    }
+    !concrete_scope_covers(&left.scope, &right.scope)
+        && !concrete_scope_covers(&right.scope, &left.scope)
+}
+
+/// Two selectors that provably never match the same resource.
+///
+/// A resource holds one effective value per key, so the same key pinned to two
+/// different values cannot both match. Different keys are independent and are
+/// never assumed disjoint, matching [`selector_covers`]'s fail-closed ordering.
+fn selectors_provably_disjoint(
+    left: Option<&LabelSelector>,
+    right: Option<&LabelSelector>,
+) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            left.key == right.key
+                && matches!((&left.value, &right.value),
+                    (Some(left), Some(right)) if left != right)
+        }
+        _ => false,
+    }
+}
+
 /// Test the tuple-level implication `(after - before) ⊆ writer` exactly over
 /// the closed matcher grammar. The implementation uses one representative for
 /// every equivalence class induced by exact/group/global kind patterns and
@@ -255,12 +305,53 @@ pub fn newly_allowed_is_subset(
     after: &[PolicyStatement],
     writer: &[PolicyStatement],
 ) -> bool {
-    let representatives = tuple_representatives([before, after, writer]);
-    representatives.into_iter().all(|tuple| {
-        evaluate(after, &tuple) != Decision::Allow
-            || evaluate(before, &tuple) == Decision::Allow
-            || evaluate(writer, &tuple) == Decision::Allow
-    })
+    unjustified_new_tuples(before, after, writer).is_empty()
+}
+
+/// The tuples `after` newly allows that neither `before` already allowed nor
+/// `writer` holds — the witnesses of a failed grant-gate check.
+///
+/// [`newly_allowed_is_subset`] is this emptied of its evidence. The gate reports
+/// these back so a rejection can name the authority the writer is missing
+/// instead of only that the write was refused. One representative per
+/// equivalence class means the list identifies every distinct class that
+/// failed, not every concrete kind the platform happens to have registered.
+pub fn unjustified_new_tuples(
+    before: &[PolicyStatement],
+    after: &[PolicyStatement],
+    writer: &[PolicyStatement],
+) -> Vec<PermissionTuple> {
+    unjustified_new_tuples_under_ceiling(before, after, writer, None)
+}
+
+/// The delta check with the writer's credential ceiling applied.
+///
+/// A ceiling intersects with the writer's RBAC authority rather than adding to
+/// it (ADR-0001 §7), and an intersection is not expressible as a flat statement
+/// list — so it is applied here, tuple-wise, where the comparison already
+/// enumerates one representative per equivalence class. `None` is an
+/// unrestricted credential.
+///
+/// Omitting the ceiling from a grant comparison would let a capped writer
+/// delegate authority their own token cannot exercise, so every gate comparison
+/// goes through this.
+pub fn unjustified_new_tuples_under_ceiling(
+    before: &[PolicyStatement],
+    after: &[PolicyStatement],
+    writer: &[PolicyStatement],
+    ceiling: Option<&[PolicyStatement]>,
+) -> Vec<PermissionTuple> {
+    let policies = [before, after, writer, ceiling.unwrap_or(&[])];
+    tuple_representatives(policies)
+        .into_iter()
+        .filter(|tuple| {
+            let writer_holds = evaluate(writer, tuple) == Decision::Allow
+                && ceiling.is_none_or(|ceiling| evaluate(ceiling, tuple) == Decision::Allow);
+            evaluate(after, tuple) == Decision::Allow
+                && evaluate(before, tuple) != Decision::Allow
+                && !writer_holds
+        })
+        .collect()
 }
 
 pub fn policy_is_subset(candidate: &[PolicyStatement], covering: &[PolicyStatement]) -> bool {

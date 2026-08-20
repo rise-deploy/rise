@@ -86,15 +86,21 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
   token-cap hash, epoch, and resource identity. A write path that forgets to
   bump the epoch is a stale-authorization bug no test will surface, which is
   why the measurement comes first.
-- [ ] Implement the write-time grant gate for Roles, bindings, membership,
+- [~] Implement the write-time grant gate for Roles, bindings, membership,
   identity mappings, and access-driving labels. All authorization-changing
-  writes use serializable transactions with bounded retry.
-- [ ] Seed immutable/healable `system-admin` and platform `resource-owner`
+  writes use serializable transactions with bounded retry. The gate itself is
+  in place as `rise-authz::engine::gate`, including §6.6's label diff over the
+  K-inheriting subtree and the credential-ceiling intersection; the serializable
+  write path arrives with the choke point that opens a transaction around it.
+- [~] Seed immutable/healable `system-admin` and platform `resource-owner`
   Roles, plus an operator-editable global `PlatformRole/org-admin` baseline.
   Organization creation atomically creates an exact org-root, scope-only
   `RoleBinding` from that role to an operator-selected existing User. That
   direct binding is the first admin's bootstrap affiliation; no pre-existing
-  Group is required and no Group name has implicit authorization meaning.
+  Group is required and no Group name has implicit authorization meaning. The
+  five baseline resources are seeded at startup and the operator pair is
+  immutable through the store; atomic Organization-plus-admin-binding creation
+  remains open.
 - [ ] Add conformance coverage for every applicable ADR-0001 acceptance
   scenario, including multi-org admins, membership removal, UID-bound token
   invalidation, token caps, and grant/revocation races.

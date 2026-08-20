@@ -933,6 +933,16 @@ mod tests {
             self.inner.ancestors(uid).await
         }
 
+        async fn label_inheriting_descendants(
+            &self,
+            uid: Uuid,
+            label_key: &str,
+        ) -> Result<Vec<ResourceRow>, StoreError> {
+            self.inner
+                .label_inheriting_descendants(uid, label_key)
+                .await
+        }
+
         async fn get_by_name(
             &self,
             api_version: &str,
@@ -1114,6 +1124,16 @@ mod tests {
 
         async fn ancestors(&self, uid: Uuid) -> Result<Vec<ResourceRow>, StoreError> {
             self.inner.ancestors(uid).await
+        }
+
+        async fn label_inheriting_descendants(
+            &self,
+            uid: Uuid,
+            label_key: &str,
+        ) -> Result<Vec<ResourceRow>, StoreError> {
+            self.inner
+                .label_inheriting_descendants(uid, label_key)
+                .await
         }
 
         async fn get_by_name(

@@ -63,6 +63,34 @@ impl AuthorizationCap {
                 .collect(),
         )
     }
+
+    /// The ceiling that applies across a whole policy domain, for the grant
+    /// gate's before/after comparison.
+    ///
+    /// An entry counts only when its own Scope covers the domain outright. One
+    /// that covers part of it does not license the writer throughout, and the
+    /// gate compares authority over domains rather than over the resources that
+    /// happen to exist — so a partial entry is dropped, leaving a restricted
+    /// credential with no covering entry holding nothing there.
+    pub(crate) fn statements_covering(
+        &self,
+        scope: &Scope,
+        scope_covers: &dyn Fn(&Scope, &Scope) -> bool,
+    ) -> Option<Vec<PolicyStatement>> {
+        let Self::Restricted(entries) = self else {
+            return None;
+        };
+        Some(
+            entries
+                .iter()
+                .filter(|entry| {
+                    entry.scope.is_wildcard()
+                        || (!scope.is_wildcard() && scope_covers(&entry.scope, scope))
+                })
+                .flat_map(|entry| entry.permissions.iter().map(CapPermission::to_statement))
+                .collect(),
+        )
+    }
 }
 
 /// The only identity the engine accepts.
