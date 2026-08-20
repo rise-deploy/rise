@@ -1071,7 +1071,15 @@ idempotent when a read-modify-write client replays the stored spec.
     authority; the algebra's synthetic probe kinds — which stand for "every
     other kind" — are rendered as that rather than echoed as invented resource
     kinds, and a long witness list is truncated because it is a symptom rather
-    than information.
+    than information. The half 9a also asked for — *who* can perform the write
+    instead — is not here: answering it means searching policy for principals
+    who hold the missing authority, which is the policy-auditing work
+    `ROADMAP.md` §1 still tracks, not something the gate's verdict carries.
+  - **A denial returns no `Explanation`.** Both `Explanation` and
+    `GateRejection` name bindings and Roles the refused caller may hold no read
+    access to. The 403 names the verb, the kind, and the resource; the
+    provenance goes to the audit log, where a reader with access to it can find
+    it.
   - **The operator short-circuit is audited.** An operator produces no claims,
     so `resource.grant_gate` is the only evidence the write was gated at all;
     it records the operator flag, the claim count, and the rejection count.
@@ -1088,12 +1096,33 @@ idempotent when a read-modify-write client replays the stored spec.
     because failing the whole listing would hide every other draining resource
     behind one anomaly.
 - Verification:
-  - `cargo fmt --all`, `cargo clippy --workspace --all-features --all-targets --
-    -D warnings`, and `cargo test --workspace --all-features` pass.
-  - The generic resource API's dispatch suite covers the new behavior: masked
+  - `cargo fmt --all` and `cargo clippy --workspace --all-features --all-targets
+    -- -D warnings` pass.
+  - `cargo test --workspace --all-features` passes: 1,252 tests, with two
+    ignored documentation examples.
+  - Generated resource, backend-settings, `rise.toml`, and CRD artifacts were
+    regenerated; only the resource schemas changed, by the one additive
+    `effectiveLabels` field. `cargo audit` and `helm lint` were not run locally
+    (neither tool is available in this environment); no dependency was added
+    beyond promoting `tokio` from a dev-dependency of
+    `rise-resource-store-postgres`, and the chart is untouched, so CI covers
+    both.
+  - The generic resource API's dispatch suite is at 85 tests, adding masked
     collections, refused items, the list-only projection and its expansion under
-    `get`, inherited `effectiveLabels` and their shadowing, and the grant gate
-    refusing and permitting a delegation by the same non-operator writer.
+    `get`, inherited `effectiveLabels` and their shadowing, the grant gate
+    refusing and permitting a delegation by the same non-operator writer, and
+    §6.6's three label cases: the creation exception carrying a new resource's
+    own ownership label, a non-owner refused both spellings of a redirect, and
+    an owner transferring ownership on.
+  - The PostgreSQL-backed store suite is at 97 tests, adding the transaction
+    seam: a transaction-scoped store reading its own uncommitted write while the
+    pool cannot see it, a dropped transaction rolling back, and two conflicting
+    transactions producing exactly one `StoreError::Serialization` at commit.
+  - Coverage follows ADR-0001 scenarios 33, 37, 38, 39, 41, and 42. Scenario 33
+    is covered at the store — the mechanism is the isolation level and the
+    error's classification, and the retry loop above it turns that classification
+    into a replay; driving a grant and a revocation concurrently through the HTTP
+    surface is left to the conformance suite in increment 11.
 - Follow-ups this increment deliberately leaves open:
   - **Atomic Organization creation with its org-admin binding** (ADR-0001 §5)
     stays open, and is now blocked rather than deferred: the binding names an

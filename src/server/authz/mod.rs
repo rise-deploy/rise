@@ -113,15 +113,16 @@ impl ResourceAuthorizer {
         &self,
         auth: &AuthContext,
     ) -> Result<AuthorizationContext, ServerError> {
-        self.context(auth, self.store.session()).await
+        let (principal, user) = Self::principal(auth)?;
+        self.context(principal, user, self.store.session()).await
     }
 
     async fn context(
         &self,
-        auth: &AuthContext,
+        principal: AuthenticatedPrincipal,
+        user: User,
         session: PgSession,
     ) -> Result<AuthorizationContext, ServerError> {
-        let (principal, user) = Self::principal(auth)?;
         let store: Arc<dyn ResourceStore> = Arc::new(self.store.in_session(session.clone()));
         let engine = AuthorizationEngine::new(
             store.clone(),
@@ -155,10 +156,14 @@ impl ResourceAuthorizer {
     /// commits against. A concurrent revocation either precedes the check or
     /// forces the attempt to be replayed.
     pub async fn begin_write(&self, auth: &AuthContext) -> Result<WriteAttempt, ServerError> {
+        // Resolved before the transaction opens: a credential this API does not
+        // accept should not cost one, and on a retry loop it would cost one per
+        // attempt.
+        let (principal, user) = Self::principal(auth)?;
         let transaction = SerializableTransaction::begin(&self.pool)
             .await
             .map_err(store_error_to_server_error)?;
-        let context = self.context(auth, transaction.session()).await?;
+        let context = self.context(principal, user, transaction.session()).await?;
         Ok(WriteAttempt {
             transaction,
             context,
@@ -581,4 +586,126 @@ pub fn node_for_new(
         name: name.to_owned(),
         labels: labels.clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rise_authz::policy::PermissionTuple;
+    use rise_resource_api::BindingSubject;
+
+    fn tuple(verb: Verb, kind: &str, subresource: Option<&str>) -> PermissionTuple {
+        PermissionTuple {
+            verb,
+            kind: kind.parse().expect("kind"),
+            subresource: subresource.map(|name| name.parse().expect("subresource")),
+        }
+    }
+
+    /// Tier 0 enumerates equivalence classes, so a witness can be a synthetic
+    /// kind or subresource standing for "any other". Echoing one at a caller
+    /// would point them at a resource kind that does not exist.
+    #[test]
+    fn probe_witnesses_render_as_any_other() {
+        let rendered = render_tuples(&[
+            tuple(
+                Verb::Get,
+                "policy-subset-probe.invalid/PolicySubsetProbe",
+                None,
+            ),
+            tuple(
+                Verb::Update,
+                "example.dev/Widget",
+                Some("policy-subset-probe"),
+            ),
+            tuple(Verb::Delete, "example.dev/Widget", None),
+        ]);
+        assert!(
+            rendered.contains("get on any other resource kind"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("update on any other subresource of example.dev/Widget"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("delete on example.dev/Widget"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("PolicySubsetProbe"), "{rendered}");
+    }
+
+    /// A long witness list is a symptom rather than information: the first few
+    /// name the shape of what is missing and the rest repeat it across kinds.
+    #[test]
+    fn a_long_witness_list_is_truncated_with_a_count() {
+        let kinds = [
+            "a.example/One",
+            "b.example/Two",
+            "c.example/Three",
+            "d.example/Four",
+            "e.example/Five",
+            "f.example/Six",
+        ];
+        let tuples: Vec<_> = kinds
+            .iter()
+            .map(|kind| tuple(Verb::Delete, kind, None))
+            .collect();
+        let rendered = render_tuples(&tuples);
+        assert!(rendered.ends_with("(and 2 more)"), "{rendered}");
+    }
+
+    /// A refusal names the operation, the recipient, the domain, and what is
+    /// missing — not a `(scope, selector)` pair and a tuple list.
+    #[test]
+    fn a_rejection_names_the_recipient_and_the_domain() {
+        let outcome = GateOutcome {
+            claims: Vec::new(),
+            rejections: vec![GateRejection {
+                recipient: BindingSubject::Literal("group:acme/platform".parse().expect("subject")),
+                domain: Some(rise_authz::engine::GateDomain {
+                    domain: rise_authz::policy::PolicyDomain {
+                        scope: "rise.dev/Organization/acme".parse().expect("scope"),
+                        selector: None,
+                    },
+                    organization_clamped: false,
+                }),
+                reason: RejectionReason::InsufficientAuthority(vec![tuple(
+                    Verb::Delete,
+                    "example.dev/Widget",
+                    None,
+                )]),
+            }],
+            creation_exception: false,
+        };
+        let error = gate_rejection_to_server_error("creating RoleBinding 'x'", &outcome);
+        assert_eq!(error.status, axum::http::StatusCode::FORBIDDEN);
+        assert!(error
+            .message
+            .starts_with("creating RoleBinding 'x' would grant"));
+        assert!(error.message.contains("group:acme/platform"));
+        assert!(error.message.contains("rise.dev/Organization/acme"));
+        assert!(error.message.contains("delete on example.dev/Widget"));
+    }
+
+    /// Only an operator may confer operator standing, and the refusal says so
+    /// rather than listing tuples nobody can satisfy.
+    #[test]
+    fn an_operator_standing_refusal_says_what_it_is() {
+        let outcome = GateOutcome {
+            claims: Vec::new(),
+            rejections: vec![GateRejection {
+                recipient: BindingSubject::Literal("user:u-1".parse().expect("subject")),
+                domain: None,
+                reason: RejectionReason::OperatorStandingRequired,
+            }],
+            creation_exception: false,
+        };
+        let error = gate_rejection_to_server_error("mapping an identity", &outcome);
+        assert!(
+            error.message.contains("only an operator may confer"),
+            "{}",
+            error.message
+        );
+    }
 }

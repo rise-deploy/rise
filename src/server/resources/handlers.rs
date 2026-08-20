@@ -2217,6 +2217,191 @@ mod dispatch_tests {
     // The write-time grant gate
     // -------------------------------------------------------------------------
 
+    /// §6.6's creation exception: a genuinely new resource may name its creator
+    /// as owner without the general gate, because there is no prior owner to
+    /// displace and nothing is delegated to anyone else.
+    #[sqlx::test]
+    async fn creation_may_label_a_new_resource_for_its_creator(pool: sqlx::PgPool) {
+        let ctx = ctx(pool.clone()).await;
+        register_widget_rd(&ctx, &[]).await;
+        grant_authenticated(
+            &ctx,
+            "widget-author",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["example.dev/Widget"],
+                "verbs": ["create", "get", "list"],
+            }]),
+        )
+        .await;
+        let caller = auth(PLAIN_USER);
+        let subject = format!("user:{}", caller.user().unwrap().id);
+
+        let resp = dispatch_post_inner(
+            &ctx,
+            "example.dev/v1/widgets".to_string(),
+            caller.clone(),
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {"name": "mine", "labels": {"rise.dev/owner": subject}},
+                "spec": {"size": "large"},
+            }),
+        )
+        .await
+        .expect("the creation exception carries this write");
+        let (status, created) = read(resp).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            created["metadata"]["effectiveLabels"]["rise.dev/owner"],
+            subject
+        );
+
+        // And the seeded ownership binding now reaches them: `resource-owner`
+        // grants delete, which their own binding does not.
+        let resp = dispatch_delete_inner(&ctx, "example.dev/v1/widgets/mine".to_string(), caller)
+            .await
+            .expect("ownership grants delete");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Scenario 41: an editor who would not hold the resulting grant cannot
+    /// relabel ownership — to themselves or to anyone else. The refusal is the
+    /// gate's and happens before the store resolves the named subject, so it is
+    /// not an existence oracle for that subject either.
+    #[sqlx::test]
+    async fn relabelling_ownership_without_holding_it_is_refused(pool: sqlx::PgPool) {
+        let ctx = ctx(pool.clone()).await;
+        register_widget_rd(&ctx, &[]).await;
+        // An editor: they may write the resource, but hold none of the
+        // `resource-owner` set that owning it would confer (no `delete`).
+        grant_authenticated(
+            &ctx,
+            "widget-editor",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["example.dev/Widget"],
+                "verbs": ["create", "get", "list", "update"],
+            }]),
+        )
+        .await;
+        let caller = auth(PLAIN_USER);
+        let subject = format!("user:{}", caller.user().unwrap().id);
+
+        // Unowned, so the editor's access does not arrive through the label.
+        let resp = dispatch_post_inner(
+            &ctx,
+            "example.dev/v1/widgets".to_string(),
+            caller.clone(),
+            widget_body("example.dev/v1", "unowned"),
+        )
+        .await
+        .expect("create an unowned widget");
+        let (_, created) = read(resp).await;
+
+        for value in [subject.as_str(), "user:u-someone-else"] {
+            let err = dispatch_put_inner(
+                &ctx,
+                "example.dev/v1/widgets/unowned".to_string(),
+                AnyAuth::User(caller.clone()),
+                json!({
+                    "apiVersion": "example.dev/v1",
+                    "kind": "Widget",
+                    "metadata": {
+                        "name": "unowned",
+                        "revision": created["metadata"]["revision"],
+                        "labels": {"rise.dev/owner": value},
+                    },
+                    "spec": {"size": "large"},
+                }),
+            )
+            .await
+            .expect_err("the gate must refuse the redirect");
+            assert_eq!(err.status, StatusCode::FORBIDDEN);
+            assert!(
+                err.message
+                    .contains("would grant authority you do not hold"),
+                "unexpected message for '{value}': {}",
+                err.message
+            );
+        }
+
+        // The label is unchanged: each refusal rolled its transaction back.
+        let resp = dispatch_get_inner(
+            &ctx,
+            "example.dev/v1/widgets/unowned".to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("operator read");
+        let (_, body) = read(resp).await;
+        assert!(body["metadata"].get("labels").is_none());
+    }
+
+    /// The other half of §6.6: the resource's *current* owner may hand ownership
+    /// on, even though their own access arrives through the very label they are
+    /// replacing. The writer's side of the comparison is pinned to the old
+    /// value, which is what makes a transfer expressible at all.
+    #[sqlx::test]
+    async fn an_owner_may_transfer_ownership(pool: sqlx::PgPool) {
+        let ctx = ctx(pool.clone()).await;
+        register_widget_rd(&ctx, &[]).await;
+        grant_authenticated(
+            &ctx,
+            "widget-author",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["example.dev/Widget"],
+                "verbs": ["create", "get", "list"],
+            }]),
+        )
+        .await;
+        let caller = auth(PLAIN_USER);
+        let subject = format!("user:{}", caller.user().unwrap().id);
+
+        let resp = dispatch_post_inner(
+            &ctx,
+            "example.dev/v1/widgets".to_string(),
+            caller.clone(),
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {"name": "mine", "labels": {"rise.dev/owner": subject}},
+                "spec": {"size": "large"},
+            }),
+        )
+        .await
+        .expect("create with own ownership");
+        let (_, created) = read(resp).await;
+
+        // `update` here comes from ownership, not from the authenticated
+        // binding, which grants only create/get/list.
+        let resp = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/mine".to_string(),
+            AnyAuth::User(caller),
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {
+                    "name": "mine",
+                    "revision": created["metadata"]["revision"],
+                    "labels": {"rise.dev/owner": "user:u-successor"},
+                },
+                "spec": {"size": "large"},
+            }),
+        )
+        .await
+        .expect("an owner may hand ownership on");
+        let (status, updated) = read(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            updated["metadata"]["effectiveLabels"]["rise.dev/owner"],
+            "user:u-successor"
+        );
+    }
+
     /// A writer who may create bindings still cannot hand out more than they
     /// hold: the delta the binding would confer is compared against their own
     /// effective policy over the same domain (ADR-0001 §5).

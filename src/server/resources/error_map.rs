@@ -115,6 +115,22 @@ mod tests {
         assert_eq!(err.status, StatusCode::NOT_FOUND);
     }
 
+    /// A serialization failure must arrive as retryable, and must not be
+    /// confused with any other 503: the write path replays on this flag alone.
+    #[test]
+    fn maps_serialization_failure_to_a_retryable_service_unavailable() {
+        let err = store_error_to_server_error(StoreError::Serialization);
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(err.retryable);
+        assert!(err.expected);
+
+        // Nothing else is replayable — a discriminator exhaustion is also a 503
+        // and must not be replayed as if it were a lost race.
+        let other = store_error_to_server_error(StoreError::DiscriminatorExhausted);
+        assert_eq!(other.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!other.retryable);
+    }
+
     #[test]
     fn maps_opaque_backend_errors_to_internal_server_error() {
         let err = store_error_to_server_error(StoreError::backend(std::io::Error::other(
