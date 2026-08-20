@@ -447,7 +447,10 @@ pub async fn get_team_names_for_user(pool: &PgPool, user_id: Uuid) -> Result<Vec
 /// `idp_managed` teams. Teams users create themselves are excluded, so a
 /// self-service team named after a privileged group cannot grant that group's
 /// permissions.
-pub async fn list_idp_group_names_for_user(pool: &PgPool, user_id: Uuid) -> Result<Vec<String>> {
+pub async fn list_idp_group_names_for_user<'e, E>(executor: E, user_id: Uuid) -> Result<Vec<String>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let records = sqlx::query!(
         r#"
         SELECT DISTINCT t.name
@@ -458,7 +461,7 @@ pub async fn list_idp_group_names_for_user(pool: &PgPool, user_id: Uuid) -> Resu
         "#,
         user_id
     )
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
     .context("Failed to get IdP group names for user")?;
 

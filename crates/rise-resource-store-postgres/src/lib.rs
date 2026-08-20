@@ -2,6 +2,7 @@ mod admission;
 pub mod builtin;
 mod lookup;
 pub mod pg_store;
+pub mod session;
 pub mod validation;
 
 mod discriminator;
@@ -14,6 +15,7 @@ pub use lookup::{
     SERVICE_ACCOUNT_TRUST_POLICIES_SQL, USER_IDENTITY_BY_EXTERNAL_IDENTITY_SQL,
 };
 pub use pg_store::PgResourceStore;
+pub use session::{PgSession, PgSessionConnection, SerializableTransaction};
 pub use validation::{JsonSchemaValidator, OrganizationValidator, ResourceDefinitionValidator};
 
 /// Run resource-store migrations in their own Postgres schema (`resource_store`),

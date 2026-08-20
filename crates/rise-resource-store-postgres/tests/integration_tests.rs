@@ -9,7 +9,7 @@ use rise_resource_api::{
 };
 use rise_resource_store_postgres::{
     BuiltInRegistration, BuiltInRegistry, IdentityLookup, MembershipLookup, OrganizationValidator,
-    PgResourceStore, TrustPolicyLookup,
+    PgResourceStore, SerializableTransaction, TrustPolicyLookup,
 };
 use serde_json::json;
 use sqlx::Executor;
@@ -6053,4 +6053,97 @@ async fn a_foreign_subject_survives_reads_and_blocks_only_its_own_replay(
     store.delete(fixed.uid).await.unwrap();
 
     Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// The serializable transaction seam (ADR-0001 §5)
+// -----------------------------------------------------------------------------
+
+fn organization(name: &str) -> CreateResourceParams {
+    CreateResourceParams {
+        labels: Default::default(),
+        api_version: API_VERSION_V1ALPHA1.to_string(),
+        kind: ORGANIZATION_KIND.to_string(),
+        name: name.to_string(),
+        parent_uid: None,
+        annotations: BTreeMap::new(),
+        finalizers: vec![],
+        owner_references: vec![],
+        spec: json!({"displayName": name}),
+        validator: None,
+    }
+}
+
+/// A store bound to a transaction reads and writes inside it: the row is
+/// invisible outside until the commit, and visible to the transaction's own
+/// reads immediately. This is what makes the grant gate's simulated delta and
+/// the committed row agree.
+#[sqlx::test]
+async fn a_transaction_scoped_store_reads_its_own_uncommitted_write(pool: sqlx::PgPool) {
+    let store = PgResourceStore::new(pool.clone());
+    let transaction = SerializableTransaction::begin(&pool).await.unwrap();
+    let scoped = store.in_session(transaction.session());
+
+    let row = scoped.create(organization("in-flight")).await.unwrap();
+    assert!(scoped.get(row.uid).await.unwrap().is_some());
+    assert!(
+        store.get(row.uid).await.unwrap().is_none(),
+        "an uncommitted write must not be visible outside its transaction"
+    );
+
+    transaction.commit().await.unwrap();
+    assert!(store.get(row.uid).await.unwrap().is_some());
+}
+
+/// Dropping without committing rolls back, which is how a refused write leaves
+/// nothing behind.
+#[sqlx::test]
+async fn dropping_a_transaction_rolls_its_writes_back(pool: sqlx::PgPool) {
+    let store = PgResourceStore::new(pool.clone());
+    let uid = {
+        let transaction = SerializableTransaction::begin(&pool).await.unwrap();
+        let scoped = store.in_session(transaction.session());
+        scoped.create(organization("abandoned")).await.unwrap().uid
+    };
+    assert!(store.get(uid).await.unwrap().is_none());
+}
+
+/// Two transactions that each read a predicate the other then writes into have
+/// no serial order, and PostgreSQL refuses one of the commits. The refusal
+/// arrives as `StoreError::Serialization` rather than an opaque backend error,
+/// because the caller's correct response is to replay the whole unit of work
+/// (ADR-0001 §5, scenario 33).
+#[sqlx::test]
+async fn a_serialization_conflict_is_reported_as_retryable(pool: sqlx::PgPool) {
+    let store = PgResourceStore::new(pool.clone());
+    let first = SerializableTransaction::begin(&pool).await.unwrap();
+    let second = SerializableTransaction::begin(&pool).await.unwrap();
+    let first_store = store.in_session(first.session());
+    let second_store = store.in_session(second.session());
+
+    // Both read the same predicate — every Organization — before writing into
+    // it. Each write invalidates the other's read.
+    first_store
+        .list(API_VERSION_V1ALPHA1, ORGANIZATION_KIND, None)
+        .await
+        .unwrap();
+    second_store
+        .list(API_VERSION_V1ALPHA1, ORGANIZATION_KIND, None)
+        .await
+        .unwrap();
+    first_store
+        .create(organization("from-first"))
+        .await
+        .unwrap();
+    second_store
+        .create(organization("from-second"))
+        .await
+        .unwrap();
+
+    first.commit().await.expect("the first commit wins");
+    let outcome = second.commit().await;
+    assert!(
+        matches!(outcome, Err(StoreError::Serialization)),
+        "expected a serialization failure, got {outcome:?}"
+    );
 }

@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use rise_resource_api::{DeleteOutcome, ResourceStore, StoreError};
-use sqlx::PgPool;
+use rise_resource_store_postgres::PgSession;
 use uuid::Uuid;
 
 use crate::db::organization_links;
@@ -39,24 +39,30 @@ pub(crate) enum OrganizationDeleteError {
 /// and will orphan rows in `user_organization_memberships`, `teams`, and
 /// `projects`.
 ///
-/// TODO(multi-org): the count and the delete run in separate statements
-/// with no surrounding transaction, so a typed-row insert (team, project,
+/// The count and the delete run on the same `session`, which on the resource
+/// API's delete path is the request's own `SERIALIZABLE` transaction — the
+/// count's predicate read participates, so a typed-row insert (team, project,
 /// or `user_organization_memberships`) that races between the two steps
-/// will be orphaned. Acceptable today because (a) the install is
-/// single-default-Org so any racing insert re-links on the next bootstrap
-/// pass, and (b) Org deletes are a rare admin action. Before a second Org
-/// can be created in production, serialize delete vs. typed insert by
-/// taking `pg_advisory_xact_lock` keyed on the Org UID in this function
-/// *and* in every `set_team_organization` / `set_project_organization` /
-/// `ensure_user_membership` call site.
+/// aborts one of the two transactions rather than being orphaned.
+///
+/// `store` must be built over that same session, or the two halves land in
+/// different transactions and the guarantee above is lost.
 pub(crate) async fn delete_organization_guarded(
     store: &Arc<dyn ResourceStore>,
-    pool: &PgPool,
+    session: &PgSession,
     uid: Uuid,
 ) -> Result<DeleteOutcome, OrganizationDeleteError> {
-    let count = organization_links::count_typed_children_for_organization(pool, uid)
-        .await
-        .map_err(OrganizationDeleteError::Db)?;
+    let count = {
+        // Scoped: a transaction-scoped session lends out one connection, and
+        // `store.delete` below needs it back.
+        let mut connection = session
+            .acquire()
+            .await
+            .map_err(OrganizationDeleteError::Store)?;
+        organization_links::count_typed_children_for_organization(&mut *connection, uid)
+            .await
+            .map_err(OrganizationDeleteError::Db)?
+    };
     if count > 0 {
         return Err(OrganizationDeleteError::HasChildren { count });
     }

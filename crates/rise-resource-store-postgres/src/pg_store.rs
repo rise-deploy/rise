@@ -16,15 +16,23 @@ use crate::admission::BuiltInAdmission;
 use crate::builtin::{BuiltInRegistration, BuiltInRegistry};
 use crate::discriminator;
 use crate::models::PgResourceRow;
+use crate::session::{PgSession, PgSessionConnection};
 use crate::validation::{
     validate_new_resource_definition_identity, JsonSchemaValidator, ResourceDefinitionValidator,
 };
 
 pub struct PgResourceStore {
-    pool: PgPool,
+    db: PgSession,
     /// Cache of compiled JSON schema validators keyed by collection plural name.
     /// Populated on first resolve_collection call; invalidated on register/update.
-    schema_cache: RwLock<HashMap<String, Arc<dyn SpecValidator>>>,
+    ///
+    /// Shared with every transaction-scoped clone so an invalidation reaches the
+    /// process-wide store. A transaction-scoped clone reads the cache but never
+    /// fills it (`caches_schemas`): a validator compiled from a definition that
+    /// the transaction then rolls back would otherwise outlive the row it came
+    /// from and validate a later definition of the same name.
+    schema_cache: Arc<RwLock<HashMap<String, Arc<dyn SpecValidator>>>>,
+    caches_schemas: bool,
     /// Routing table for the typed built-in kinds. Built-ins have no
     /// `resource_definitions` row, so resolution for them goes through this
     /// registry rather than the database. See [`crate::builtin`].
@@ -86,10 +94,40 @@ impl PgResourceStore {
     /// [`Self::new`], which threads through [`BuiltInRegistry::defaults`].
     pub fn with_builtin_registry(pool: PgPool, builtins: Arc<BuiltInRegistry>) -> Self {
         Self {
-            pool,
-            schema_cache: RwLock::new(HashMap::new()),
+            db: PgSession::pool(pool),
+            schema_cache: Arc::new(RwLock::new(HashMap::new())),
+            caches_schemas: true,
             builtins,
         }
+    }
+
+    /// The same store, with every statement running inside `session`.
+    ///
+    /// This is how ADR-0001 §5's grant gate reads the facts it compares from
+    /// inside the transaction that performs the write: the gate takes an
+    /// ordinary `&dyn ResourceStore`, and this is that store bound to one
+    /// transaction. The built-in registry and the compiled-schema cache are
+    /// shared with the process-wide store; the transaction-scoped clone reads
+    /// the cache and invalidates it, but never fills it.
+    pub fn in_session(&self, session: PgSession) -> Self {
+        let transactional = session.is_transactional();
+        Self {
+            db: session,
+            schema_cache: self.schema_cache.clone(),
+            caches_schemas: !transactional,
+            builtins: self.builtins.clone(),
+        }
+    }
+
+    /// The session this store runs on, for callers that need to run their own
+    /// statements in the same transaction.
+    pub fn session(&self) -> PgSession {
+        self.db.clone()
+    }
+
+    /// Borrow a connection for one statement or nested transaction.
+    async fn connection(&self) -> Result<PgSessionConnection<'_>, StoreError> {
+        self.db.acquire().await
     }
 
     fn is_name_conflict(err: &sqlx::Error) -> bool {
@@ -111,6 +149,13 @@ impl PgResourceStore {
     /// before the write keeps the cost on the error path and covers every
     /// statement, including ones added later.
     fn db_error(err: sqlx::Error) -> StoreError {
+        // A statement inside a `SERIALIZABLE` transaction can fail the race
+        // before the commit does. The caller's only correct response is to
+        // replay the whole unit of work, so it must not arrive as an opaque
+        // backend error (ADR-0001 §5).
+        if crate::session::is_serialization_failure(&err) {
+            return StoreError::Serialization;
+        }
         if let sqlx::Error::Database(db) = &err {
             // 22021 character_not_in_repertoire — a NUL byte in a text value.
             // 22P05 untranslatable_character — an escaped NUL in a jsonb value.
@@ -880,7 +925,8 @@ impl ResourceStore for PgResourceStore {
             validator.validate_spec(&params.spec)?;
         }
 
-        let mut tx = self.pool.begin().await.map_err(Self::db_error)?;
+        let mut connection = self.connection().await?;
+        let mut tx = connection.begin().await.map_err(Self::db_error)?;
 
         // Allocate the dependent UID before insertion so owner validation
         // happens before the dependent row is created. A fresh UID cannot
@@ -926,11 +972,12 @@ impl ResourceStore for PgResourceStore {
     }
 
     async fn get(&self, uid: Uuid) -> Result<Option<ResourceRow>, StoreError> {
+        let mut connection = self.connection().await?;
         let row = sqlx::query_as::<_, PgResourceRow>(
             "SELECT * FROM resource_store.resources WHERE uid = $1",
         )
         .bind(uid)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *connection)
         .await
         .map_err(Self::db_error)?;
         Ok(row.map(Into::into))
@@ -947,6 +994,7 @@ impl ResourceStore for PgResourceStore {
         // `api_version`: a resource's identity is unique per `(group, kind,
         // name)` within a parent, so a lookup resolves the row regardless of
         // which declared version it is stored at.
+        let mut connection = self.connection().await?;
         let row =
             match parent_uid {
                 None => sqlx::query_as::<_, PgResourceRow>(
@@ -955,7 +1003,7 @@ impl ResourceStore for PgResourceStore {
                 .bind(api_version)
                 .bind(kind)
                 .bind(name)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *connection)
                 .await
                 .map_err(Self::db_error)?,
                 Some(pid) => {
@@ -966,7 +1014,7 @@ impl ResourceStore for PgResourceStore {
                     .bind(kind)
                     .bind(name)
                     .bind(pid)
-                    .fetch_optional(&self.pool)
+                    .fetch_optional(&mut *connection)
                     .await
                     .map_err(Self::db_error)?
                 }
@@ -982,6 +1030,7 @@ impl ResourceStore for PgResourceStore {
     ) -> Result<Vec<ResourceRow>, StoreError> {
         // Match on the API *group*, not the full `api_version` — list spans
         // every declared version of the kind (see `get_by_name`).
+        let mut connection = self.connection().await?;
         let rows =
             match parent_uid {
                 None => sqlx::query_as::<_, PgResourceRow>(
@@ -989,7 +1038,7 @@ impl ResourceStore for PgResourceStore {
                 )
                 .bind(api_version)
                 .bind(kind)
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *connection)
                 .await
                 .map_err(Self::db_error)?,
                 Some(pid) => {
@@ -999,7 +1048,7 @@ impl ResourceStore for PgResourceStore {
                     .bind(api_version)
                     .bind(kind)
                     .bind(pid)
-                    .fetch_all(&self.pool)
+                    .fetch_all(&mut *connection)
                     .await
                     .map_err(Self::db_error)?
                 }
@@ -1013,6 +1062,7 @@ impl ResourceStore for PgResourceStore {
         kind: &str,
         parent_uid: Option<Uuid>,
     ) -> Result<Vec<ResourceRow>, StoreError> {
+        let mut connection = self.connection().await?;
         let rows =
             match parent_uid {
                 None => sqlx::query_as::<_, PgResourceRow>(
@@ -1020,7 +1070,7 @@ impl ResourceStore for PgResourceStore {
                 )
                 .bind(api_versions)
                 .bind(kind)
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *connection)
                 .await
                 .map_err(Self::db_error)?,
                 Some(pid) => {
@@ -1030,7 +1080,7 @@ impl ResourceStore for PgResourceStore {
                     .bind(api_versions)
                     .bind(kind)
                     .bind(pid)
-                    .fetch_all(&self.pool)
+                    .fetch_all(&mut *connection)
                     .await
                     .map_err(Self::db_error)?
                 }
@@ -1047,13 +1097,17 @@ impl ResourceStore for PgResourceStore {
         // opening the mutation transaction or taking advisory/row locks. Only
         // the routing identity is needed here; the transaction below reads the
         // full row and is authoritative for every admission decision.
-        let preflight: PgResourceIdentity =
+        // Scoped: the mutation below takes its own connection, which on a
+        // transaction-scoped session is this same one.
+        let preflight: PgResourceIdentity = {
+            let mut connection = self.connection().await?;
             sqlx::query_as("SELECT api_version, kind FROM resource_store.resources WHERE uid = $1")
                 .bind(uid)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *connection)
                 .await
                 .map_err(Self::db_error)?
-                .ok_or(StoreError::NotFound)?;
+                .ok_or(StoreError::NotFound)?
+        };
         if preflight.kind == RESOURCE_DEFINITION_KIND {
             return Err(StoreError::Validation(
                 "ResourceDefinitions must be updated through update_resource_definition".into(),
@@ -1089,7 +1143,8 @@ impl ResourceStore for PgResourceStore {
             validator.validate_spec(&params.spec)?;
         }
 
-        let mut tx = self.pool.begin().await.map_err(Self::db_error)?;
+        let mut connection = self.connection().await?;
+        let mut tx = connection.begin().await.map_err(Self::db_error)?;
         if !params.owner_references.is_empty() {
             Self::lock_owner_reference_graph(&mut tx).await?;
         }
@@ -1263,7 +1318,8 @@ impl ResourceStore for PgResourceStore {
     }
 
     async fn delete(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError> {
-        let mut tx = self.pool.begin().await.map_err(Self::db_error)?;
+        let mut connection = self.connection().await?;
+        let mut tx = connection.begin().await.map_err(Self::db_error)?;
 
         // Lock the row inside the transaction so a concurrent update_controller_finalizers()
         // can't add a finalizer between our read and the hard-delete branch below.
@@ -1357,7 +1413,8 @@ impl ResourceStore for PgResourceStore {
     }
 
     async fn try_collect(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError> {
-        let mut tx = self.pool.begin().await.map_err(Self::db_error)?;
+        let mut connection = self.connection().await?;
+        let mut tx = connection.begin().await.map_err(Self::db_error)?;
 
         let row = sqlx::query_as::<_, PgResourceRow>(
             "SELECT * FROM resource_store.resources WHERE uid = $1 FOR UPDATE",
@@ -1449,6 +1506,7 @@ impl ResourceStore for PgResourceStore {
     }
 
     async fn list_pending_collection(&self, limit: i64) -> Result<Vec<ResourceRow>, StoreError> {
+        let mut connection = self.connection().await?;
         let rows = sqlx::query_as::<_, PgResourceRow>(
             r#"
             SELECT * FROM resource_store.resources
@@ -1458,14 +1516,15 @@ impl ResourceStore for PgResourceStore {
             "#,
         )
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *connection)
         .await
         .map_err(Self::db_error)?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
     async fn list_deletion_blockers(&self, uid: Uuid) -> Result<DeletionBlockerReport, StoreError> {
-        let mut tx = self.pool.begin().await.map_err(Self::db_error)?;
+        let mut connection = self.connection().await?;
+        let mut tx = connection.begin().await.map_err(Self::db_error)?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
             .execute(&mut *tx)
             .await
@@ -1543,6 +1602,7 @@ impl ResourceStore for PgResourceStore {
         // exceeds it is truncated at the root end rather than looping, and
         // parent_uid's foreign key plus the write-time cycle checks keep real
         // ancestry acyclic.
+        let mut connection = self.connection().await?;
         let rows = sqlx::query_as::<_, PgResourceRow>(
             r#"
             WITH RECURSIVE chain AS (
@@ -1564,7 +1624,7 @@ impl ResourceStore for PgResourceStore {
         )
         .bind(uid)
         .bind(MAX_PARENT_CHAIN_DEPTH as i32)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *connection)
         .await
         .map_err(Self::db_error)?;
 
@@ -1586,6 +1646,7 @@ impl ResourceStore for PgResourceStore {
         // the walk at the same bound as `ancestors` so a structure that somehow
         // exceeds the registered parent-chain depth cannot make this read
         // unbounded.
+        let mut connection = self.connection().await?;
         let rows = sqlx::query_as::<_, PgResourceRow>(
             r#"
             WITH RECURSIVE subtree AS (
@@ -1611,7 +1672,7 @@ impl ResourceStore for PgResourceStore {
         .bind(uid)
         .bind(label_key)
         .bind(MAX_PARENT_CHAIN_DEPTH as i32)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *connection)
         .await
         .map_err(Self::db_error)?;
 
@@ -1623,7 +1684,8 @@ impl ResourceStore for PgResourceStore {
             return Err(StoreError::EmptyPath);
         }
 
-        let mut tx = self.pool.begin().await.map_err(Self::db_error)?;
+        let mut connection = self.connection().await?;
+        let mut tx = connection.begin().await.map_err(Self::db_error)?;
         let mut chain: Vec<ResourceRow> = Vec::with_capacity(segments.len());
         let mut current_parent: Option<Uuid> = None;
 
@@ -1708,6 +1770,7 @@ impl ResourceStore for PgResourceStore {
     ) -> Result<ResourceRow, StoreError> {
         validate_controller_id(controller_id).map_err(|e| StoreError::Validation(e.to_string()))?;
 
+        let mut connection = self.connection().await?;
         let row = sqlx::query_as::<_, PgResourceRow>(
             r#"
             UPDATE resource_store.resources
@@ -1725,7 +1788,7 @@ impl ResourceStore for PgResourceStore {
         .bind(uid)
         .bind(controller_id)
         .bind(status_value)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *connection)
         .await
         .map_err(Self::db_error)?
         .ok_or(StoreError::NotFound)?;
@@ -1756,7 +1819,8 @@ impl ResourceStore for PgResourceStore {
 
         // Use SELECT FOR UPDATE inside a transaction to serialise concurrent finalizer
         // mutations from different controllers on the same resource, preventing lost updates.
-        let mut tx = self.pool.begin().await.map_err(Self::db_error)?;
+        let mut connection = self.connection().await?;
+        let mut tx = connection.begin().await.map_err(Self::db_error)?;
 
         let current = sqlx::query_as::<_, PgResourceRow>(
             "SELECT * FROM resource_store.resources WHERE uid = $1 FOR UPDATE",
@@ -1808,6 +1872,7 @@ impl ResourceStore for PgResourceStore {
         // Store under `status.controllers.operator:<operator>` — same nested
         // structure as update_controller_status but with the operator key.
         let operator_key = format!("operator:{operator}");
+        let mut connection = self.connection().await?;
         let row = sqlx::query_as::<_, PgResourceRow>(
             r#"
             UPDATE resource_store.resources
@@ -1825,7 +1890,7 @@ impl ResourceStore for PgResourceStore {
         .bind(uid)
         .bind(&operator_key)
         .bind(status_value)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *connection)
         .await
         .map_err(Self::db_error)?
         .ok_or(StoreError::NotFound)?;
@@ -1850,7 +1915,8 @@ impl ResourceStore for PgResourceStore {
 
         let _ = operator; // operator identity is recorded in the audit log by the handler
 
-        let mut tx = self.pool.begin().await.map_err(Self::db_error)?;
+        let mut connection = self.connection().await?;
+        let mut tx = connection.begin().await.map_err(Self::db_error)?;
 
         let current = sqlx::query_as::<_, PgResourceRow>(
             "SELECT * FROM resource_store.resources WHERE uid = $1 FOR UPDATE",
@@ -1902,6 +1968,7 @@ impl ResourceStore for PgResourceStore {
             return Ok(Some(info));
         }
 
+        let mut connection = self.connection().await?;
         let row = sqlx::query(
             r#"
             SELECT rd.uid, rd.group_name, rd.kind, rd.versions,
@@ -1912,9 +1979,13 @@ impl ResourceStore for PgResourceStore {
             "#,
         )
         .bind(collection)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *connection)
         .await
         .map_err(Self::db_error)?;
+        // This method finishes through `resolve_collection_version`, which takes
+        // its own connection. On a transaction-scoped session that is the same
+        // connection, so the borrow has to end before the call.
+        drop(connection);
 
         let Some(row) = row else {
             return Ok(None);
@@ -1973,6 +2044,7 @@ impl ResourceStore for PgResourceStore {
             .ok()
             .and_then(|c| c.get(&cache_key).cloned());
 
+        let mut connection = self.connection().await?;
         let row = sqlx::query(
             r#"
             SELECT rd.uid, rd.group_name, rd.kind, rd.versions,
@@ -1984,7 +2056,7 @@ impl ResourceStore for PgResourceStore {
         )
         .bind(group)
         .bind(collection)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *connection)
         .await
         .map_err(Self::db_error)?;
 
@@ -2054,8 +2126,14 @@ impl ResourceStore for PgResourceStore {
                     })?) as Arc<dyn SpecValidator>,
                     None => Arc::new(NoOpValidator),
                 };
-                if let Ok(mut cache) = self.schema_cache.write() {
-                    cache.insert(cache_key, v.clone());
+                // A transaction-scoped store compiles the validator but does not
+                // publish it: the definition it came from is uncommitted, and a
+                // rollback would leave the cache answering for a row that never
+                // existed.
+                if self.caches_schemas {
+                    if let Ok(mut cache) = self.schema_cache.write() {
+                        cache.insert(cache_key, v.clone());
+                    }
                 }
                 v
             }
@@ -2087,6 +2165,7 @@ impl ResourceStore for PgResourceStore {
         }
 
         // `(group_name, kind)` is unique (resource_definitions_group_kind_unique).
+        let mut connection = self.connection().await?;
         let row = sqlx::query(
             r#"
             SELECT plural, versions
@@ -2096,9 +2175,12 @@ impl ResourceStore for PgResourceStore {
         )
         .bind(group)
         .bind(kind)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *connection)
         .await
         .map_err(Self::db_error)?;
+        // Released before `resolve_collection_version` below acquires its own —
+        // the same connection on a transaction-scoped session.
+        drop(connection);
 
         let Some(row) = row else {
             return Ok(None);
@@ -2167,7 +2249,8 @@ impl ResourceStore for PgResourceStore {
         // fail only when that version is first used.
         Self::validate_version_schemas(&spec, &format!("'{}'", params.name))?;
 
-        let mut tx = self.pool.begin().await.map_err(Self::db_error)?;
+        let mut connection = self.connection().await?;
+        let mut tx = connection.begin().await.map_err(Self::db_error)?;
         if !params.owner_references.is_empty() {
             Self::lock_owner_reference_graph(&mut tx).await?;
         }
@@ -2233,7 +2316,8 @@ impl ResourceStore for PgResourceStore {
         // Validate every declared JSON schema compiles. Symmetric with register.
         Self::validate_version_schemas(&new_spec, "")?;
 
-        let mut tx = self.pool.begin().await.map_err(Self::db_error)?;
+        let mut connection = self.connection().await?;
+        let mut tx = connection.begin().await.map_err(Self::db_error)?;
         if !params.owner_references.is_empty() {
             Self::lock_owner_reference_graph(&mut tx).await?;
         }

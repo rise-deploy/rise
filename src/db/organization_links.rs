@@ -150,10 +150,13 @@ pub async fn count_projects_missing_organization(pool: &PgPool) -> Result<i64> {
 /// `crate::server::resources::organization::delete_organization_guarded`.
 /// Calling `ResourceStore::delete` directly on an Organization UID is unsafe
 /// and will orphan typed rows.
-pub async fn count_typed_children_for_organization(
-    pool: &PgPool,
+pub async fn count_typed_children_for_organization<'e, E>(
+    executor: E,
     organization_resource_uid: Uuid,
-) -> Result<i64> {
+) -> Result<i64>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let row = sqlx::query!(
         r#"
         SELECT
@@ -164,7 +167,7 @@ pub async fn count_typed_children_for_organization(
         "#,
         organization_resource_uid
     )
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
     .context("Failed to count typed children for organization")?;
     Ok(row.count)

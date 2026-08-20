@@ -13,7 +13,6 @@
 //! and therefore never grant a group-derived role.
 
 use crate::db::models::User;
-use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Check whether an email appears in a configured allowlist (case-insensitive).
@@ -42,27 +41,33 @@ pub fn matches_any_group(configured_groups: &[String], user_groups: &[String]) -
 /// one of the groups. The allowlist is checked first, and the groups are only
 /// looked up when the role actually configures them, so an install that grants
 /// roles by email alone never pays for a query.
-pub async fn has_role(
-    pool: &PgPool,
+pub async fn has_role<'e, E>(
+    executor: E,
     allowed_emails: &[String],
     allowed_groups: &[String],
     user: &User,
-) -> bool {
+) -> bool
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     if matches_any_email(allowed_emails, &user.email) {
         return true;
     }
     if allowed_groups.is_empty() {
         return false;
     }
-    matches_any_group(allowed_groups, &resolve_idp_groups(pool, user.id).await)
+    matches_any_group(allowed_groups, &resolve_idp_groups(executor, user.id).await)
 }
 
 /// Resolve the IdP groups a user belongs to.
 ///
 /// Fails closed: a database error yields no groups (and is logged), so a
 /// transient failure can only deny a group-derived role, never grant one.
-pub async fn resolve_idp_groups(pool: &PgPool, user_id: Uuid) -> Vec<String> {
-    match crate::db::teams::list_idp_group_names_for_user(pool, user_id).await {
+pub async fn resolve_idp_groups<'e, E>(executor: E, user_id: Uuid) -> Vec<String>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    match crate::db::teams::list_idp_group_names_for_user(executor, user_id).await {
         Ok(groups) => groups,
         Err(e) => {
             tracing::error!(
@@ -79,6 +84,7 @@ pub async fn resolve_idp_groups(pool: &PgPool, user_id: Uuid) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::db::{models::TeamRole, teams, users};
+    use sqlx::PgPool;
 
     #[test]
     fn test_matches_any_group_case_insensitive() {

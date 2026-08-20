@@ -1,5 +1,7 @@
 pub mod auth;
 #[cfg(feature = "backend")]
+pub mod authz;
+#[cfg(feature = "backend")]
 pub mod bootstrap;
 pub mod custom_domains;
 pub mod deployment;

@@ -131,6 +131,13 @@
             "null"
           ]
         },
+        "effectiveLabels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Every label key in force on this resource, resolved nearest-wins down its\nancestry (ADR-0001 §6.1).\n\nComputed on read from the ancestor chain, never stored: this is the same\nwalk authorization performs, so the value a client sees and the value a\n`labelSelector` matches can never disagree. Responses built without an\nancestor chain leave it empty rather than repeating `labels`, which would\nclaim an inheritance answer nobody resolved.",
+          "type": "object"
+        },
         "finalizers": {
           "default": [],
           "items": {

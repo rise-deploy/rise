@@ -53,14 +53,15 @@ scope and avoiding dead-end compatibility layers.
    filtering, request-local snapshots, and explain/audit foundations. Split into
    8a (generic label and ancestry store surface) and 8b (the engine itself).
 9. **Split into 9a and 9b — mutation grant gate, seeded policy, and the choke
-   point.** 9a (implemented) is the gate itself plus the shipped baseline
+   point.** 9a (merged in PR #435) is the gate itself plus the shipped baseline
    policy: ADR-0001 §5's effective-delta subset check over policy domains,
    §6.6's label gate and its K-inheriting subtree store read, and the seeded
-   `system-admin`/`resource-owner`/`org-admin` data. Nothing consults it yet,
-   mirroring 8b. 9b is the centralized choke point replacing `require_operator`,
-   the `SERIALIZABLE` write path with bounded retry, and list projection — plus
-   the live `MembershipResolver`, pulled forward from increment 10 so the choke
-   point has a real principal to build a snapshot from.
+   `system-admin`/`resource-owner`/`org-admin` data. Nothing consulted it yet,
+   mirroring 8b. 9b (implemented) is the centralized choke point replacing
+   `require_operator`, the `SERIALIZABLE` write path with bounded retry, and
+   list projection — plus the live `MembershipResolver`, pulled forward from
+   increment 10 so the choke point has a real principal to build a snapshot
+   from.
 10. **Planned — identity authentication and token convergence.** Add live
    User/UserIdentity resolution, operator selection/JIT, target-bound workload
    exchange, delegated `/token`, UID checks, caps, and actor-chain handling.
@@ -968,3 +969,143 @@ The operator-facing claims are covered rather than asserted:
 admission runs on update too, that a foreign row stays readable and deletable,
 that re-pointing its subject is accepted, and that the relative form is
 idempotent when a read-modify-write client replays the stored spec.
+
+## Increment 9b — the authorization choke point and the serializable write path
+
+- State: implemented on this branch; not yet reviewed.
+- Branch: `claude/milestone-9b-lpncl5`.
+- Second half of increment 9: the generic resource API stops being
+  operator-gated and starts being *authorized*. Every request runs ADR-0001 §4's
+  algorithm against the resource it names, every authorization-changing write
+  runs 9a's grant gate inside the `SERIALIZABLE` transaction that performs it,
+  and `list` gains the two read granularities §4 defines.
+- Acceptance criteria:
+  - `require_operator` is gone. `crate::server::authz` resolves one
+    `AuthenticatedPrincipal`, builds one request-local `AuthorizationSnapshot`,
+    and answers one `(verb, ResourceKind, subresource?)` tuple per resource.
+    Operator standing is a subject in the model, not a gate in front of it.
+  - The store gained a transaction seam. `PgSession` decides where a statement
+    runs — the pool, or one caller-owned transaction — and
+    `SerializableTransaction` opens the unit of work ADR-0001 §5 requires. The
+    gate reads through an ordinary `&dyn ResourceStore` that happens to be bound
+    to that transaction, so the facts it compares are the facts the write
+    commits against.
+  - `StoreError::Serialization` is its own variant, mapped from SQLSTATE 40001
+    and 40P01 at both the statement and the commit, and carried up as a
+    `retryable` `ServerError`. The write path replays the whole operation — new
+    transaction, new snapshot — up to three attempts.
+  - `RiseMembershipResolver` implements the engine's one product seam: live
+    Group ties from `GroupMembership` resources, and operator standing from the
+    configured selectors, both read through the request's own session.
+  - `list` returns per-item decisions. An item the caller cannot `list` is
+    omitted and its existence masked; one they can `list` but not `get` is
+    projected onto `apiVersion`, `kind`, and the documented `metadata` fields.
+  - `metadata.effectiveLabels` is on every response, resolved from the same
+    ancestor walk authorization performs.
+- Decisions:
+  - **The transaction seam is a property of the store instance, not a parameter
+    on its methods.** The gate takes `&dyn ResourceStore` and calls ordinary
+    reads; threading a transaction handle through every signature would have put
+    a database concept into the Tier-1 contract that deliberately has none.
+    `PgResourceStore::in_session` instead returns the same store bound to one
+    transaction, and the existing write paths' nested `begin()` calls become
+    `SAVEPOINT`s, so none of them changed.
+  - **A borrowed transaction connection fails rather than waits.** A transaction
+    has one connection; asking for it while it is already lent out can only mean
+    a caller held a guard across a call back into the store, and waiting on a
+    guard you hold yourself is a deadlock that presents as a hung request. The
+    borrow is a `try_lock` with a message naming the mistake. Two places had it —
+    `update`'s preflight and the two collection resolvers that finish by calling
+    each other — and both now scope or drop the guard first.
+  - **The schema cache is shared but not written from a transaction.** Compiled
+    validators are keyed by collection, and an invalidation must reach the
+    process-wide store or a committed `ResourceDefinition` edit would go
+    unnoticed. Filling it from a transaction is the unsafe direction: a rolled
+    back definition would leave a validator behind for a name that never
+    existed, so a transaction-scoped store reads and invalidates but never
+    inserts.
+  - **The principal is the typed user's UID, not their email.** `user:<uid>` is
+    opaque, immutable, and already what the credential's `rise_uid` carries;
+    ADR-0001 §1's generated `User` resource name replaces it when identity
+    resources go live, with nothing above the principal builder changing. Email
+    stays what audit records are keyed by and what policy never matches on.
+  - **Operator standing is derived from the configuration that governs it
+    today.** ADR-0001 §1 defines an operator as an active User with a matching
+    live `UserIdentity`; no login path writes those resources yet, so the
+    resolver answers from `auth.operator_users` / `auth.operator_idp_groups`
+    through the existing `auth::roles` path. The seam is what this increment
+    owes the engine — one question, one live answer — and the derivation moves
+    without changing anything above it.
+  - **The membership resolver is handed the authenticated User rather than
+    re-resolving it.** Authentication already resolved the credential to that
+    row; what has to be live is the *membership*, which is read inside the
+    transaction. It also refuses to answer for a principal other than the one it
+    was built for, so a resolver can never attribute one caller's ties to
+    another.
+  - **A collection is masked; a named item is refused.** §4 requires a caller
+    with no applicable `list` grant to receive an empty collection rather than a
+    403 confirming the scope is populated. It says nothing about an item the
+    caller named exactly, and Kubernetes answers that with a 403 — so a `get`,
+    `update`, or `delete` without the grant is a 403 here too. The one masking
+    §6.6 does require is preserved by ordering: the gate runs before the store's
+    referential-integrity checks, so a refused relabel never reveals whether the
+    subject it named exists.
+  - **Which collections exist is visible to any authenticated caller.**
+    `require_operator` used to run before path classification, so collection
+    existence was operator-only. Discovery is a property of the registry rather
+    than of any one resource (§8), and Kubernetes serves it to every
+    authenticated caller; what a collection *contains* is authorized per item.
+  - **The gate is handed the binding that will be stored, not the one that was
+    posted.** A binding's `scope` and `subject` are contextually normalized
+    against the parent Organization before persistence, so the change set calls
+    the same `normalize()` admission calls inside the same transaction. Gating a
+    different binding than the one written would be a hole rather than a
+    mismatch.
+  - **Undecidable means gated.** Where the change set cannot tell whether a
+    write delegates authority — any changed label key, for instance — it
+    produces a change and lets the gate answer. The gate returns no claims
+    cheaply for a write that delegates nothing, and the alternative is a
+    second, weaker applicability test living outside the engine.
+  - **Refusals are rendered in the caller's terms.** 9a left this open. A
+    rejection names the operation, the recipient, the domain, and the missing
+    authority; the algebra's synthetic probe kinds — which stand for "every
+    other kind" — are rendered as that rather than echoed as invented resource
+    kinds, and a long witness list is truncated because it is a symptom rather
+    than information.
+  - **The operator short-circuit is audited.** An operator produces no claims,
+    so `resource.grant_gate` is the only evidence the write was gated at all;
+    it records the operator flag, the claim count, and the rejection count.
+- Verification:
+  - `cargo fmt --all`, `cargo clippy --workspace --all-features --all-targets --
+    -D warnings`, and `cargo test --workspace --all-features` pass.
+  - The generic resource API's dispatch suite covers the new behavior: masked
+    collections, refused items, the list-only projection and its expansion under
+    `get`, inherited `effectiveLabels` and their shadowing, and the grant gate
+    refusing and permitting a delegation by the same non-operator writer.
+- Follow-ups this increment deliberately leaves open:
+  - **Atomic Organization creation with its org-admin binding** (ADR-0001 §5)
+    stays open, and is now blocked rather than deferred: the binding names an
+    "operator-selected existing User", and admission resolves a literal `user:`
+    subject against a live `User` resource. None exist until increment 10
+    activates identity resolution. The transaction that makes the pair atomic is
+    in place; the subject it would name is not.
+  - For the same reason, the subjects that can reach an ordinary caller today
+    are `system:authenticated`, `org:<name>`, and whoever a `rise.dev/owner`
+    label names. A binding naming a `user:` or `group:` subject is writable only
+    once those resources exist.
+  - A cascading delete of an Organization tombstones the Roles and bindings
+    beneath it, and the gate diffs only the resource named by the request. That
+    is a grant the gate does not see. It needs `delete` on the Organization,
+    which is operator or org-admin authority, so nothing escalates through it
+    today; closing it properly means diffing the policy resources a cascade
+    would take with it.
+  - `ResourceDefinition.allowedStatusControllerIds` still gates controller
+    status and finalizer writes. Controllers become ordinary principals when
+    their identity resources go live, which is when that allowlist can go.
+  - A user's `status` write still lands in the slot named `operator:<actor>`.
+    The name is now wrong for a non-operator writer; ADR-0002's subresource
+    execution model owns the field separation and is where the naming is
+    settled.
+  - Cross-request authorization caching stays measured rather than assumed, per
+    `ROADMAP.md` §1: the request-local snapshot already removes the repeated
+    cost inside one request.

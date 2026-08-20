@@ -5,6 +5,8 @@ use rise_resource_api::{
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::session::PgSession;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserIdentityFact {
     pub identity_uid: Uuid,
@@ -30,6 +32,9 @@ pub struct GroupMembershipFact {
     pub group_uid: Uuid,
     pub group_name: String,
     pub organization_uid: Uuid,
+    /// The owning Organization's canonical name, which is what a
+    /// `group:<org>/<name>` subject carries.
+    pub organization_name: String,
 }
 
 /// Exposed so tests can assert the query planner uses the identity projection
@@ -107,7 +112,8 @@ SELECT membership.uid AS membership_uid,
        membership.name AS membership_name,
        parent.uid AS group_uid,
        parent.name AS group_name,
-       organization.uid AS organization_uid
+       organization.uid AS organization_uid,
+       organization.name AS organization_name
 FROM resource_store.resources membership
 JOIN resource_store.resources member
   ON member.uid = $1
@@ -212,12 +218,23 @@ impl TrustPolicyLookup {
 
 #[derive(Clone)]
 pub struct MembershipLookup {
-    pool: PgPool,
+    db: PgSession,
 }
 
 impl MembershipLookup {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            db: PgSession::pool(pool),
+        }
+    }
+
+    /// The same lookup, reading through `session`.
+    ///
+    /// ADR-0001 §5 requires an authorization-changing write to re-read the
+    /// relevant memberships inside its own transaction; this is how the
+    /// membership seam joins it.
+    pub fn in_session(session: PgSession) -> Self {
+        Self { db: session }
     }
 
     pub async fn groups_for_user(
@@ -225,12 +242,13 @@ impl MembershipLookup {
         user_uid: Uuid,
         user_name: &str,
     ) -> Result<Vec<GroupMembershipFact>, StoreError> {
+        let mut connection = self.db.acquire().await?;
         let rows = sqlx::query_as::<_, MembershipFactRow>(GROUPS_FOR_USER_SQL)
             .bind(user_uid)
             .bind(user_name)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *connection)
             .await
-            .map_err(StoreError::backend)?;
+            .map_err(crate::session::map_sqlx_error)?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
 }
@@ -291,6 +309,7 @@ struct MembershipFactRow {
     group_uid: Uuid,
     group_name: String,
     organization_uid: Uuid,
+    organization_name: String,
 }
 
 impl From<MembershipFactRow> for GroupMembershipFact {
@@ -301,6 +320,7 @@ impl From<MembershipFactRow> for GroupMembershipFact {
             group_uid: row.group_uid,
             group_name: row.group_name,
             organization_uid: row.organization_uid,
+            organization_name: row.organization_name,
         }
     }
 }

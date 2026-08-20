@@ -31,6 +31,54 @@ version section at tag time._
 
 Merged to `develop`:
 
+- **Action required if you granted generic resource API access by adding people
+  to `auth.operator_users` — the API is now authorized, not operator-gated.**
+  `/api/v1/resources` no longer refuses everyone but operators. Every request is
+  authorized by the ADR-0001 engine against the resource it names, and
+  authorization-changing writes additionally pass the write-time grant gate
+  inside a `SERIALIZABLE` transaction.
+
+  **Operators are unaffected**: an operator expands to `system:operators`, whose
+  seeded `system-admin` binding allows every verb on every kind and subresource,
+  and an operator's request ignores every `Deny`. Nothing an operator could do
+  before is refused now.
+
+  What changed for everyone else is that they are *evaluated* rather than
+  refused outright. Shipped policy grants a non-operator nothing, so an install
+  that has authored no bindings sees no access change — but if you were relying
+  on "non-operator ⇒ 403" as the whole authorization story, that is no longer
+  what the code says. Two visible differences even without any binding:
+
+  - A collection listing by a caller with no `list` grant returns an **empty
+    `200`**, not a `403`. This is deliberate existence masking: a `403` would
+    confirm the scope is populated. Naming one resource exactly is still a
+    `403`.
+  - Which *collections* exist is now visible to any authenticated caller, since
+    the path is classified before any per-resource decision. What a collection
+    contains is authorized per item.
+
+  Three response-shape changes come with it, all additive:
+
+  - `metadata.effectiveLabels` is present on every resource response, resolved
+    live from the ancestor chain (nearest value wins per key).
+  - An item a caller can `list` but not `get` is returned projected onto
+    `apiVersion`, `kind`, and the `metadata` fields `name`, `labels`,
+    `effectiveLabels`, and `deletionTimestamp` — no `spec`, `status`, `uid`,
+    `revision`, or `discriminator`. Operators always hold `get`, so their list
+    responses are unchanged apart from `effectiveLabels`.
+  - A write that loses a serialization race after three attempts returns `503`
+    with a retryable message instead of committing on stale facts.
+
+  Two audit record names changed: `resource.operator_status_updated` and
+  `resource.operator_finalizers_updated` are now `resource.user_status_updated`
+  and `resource.user_finalizers_updated`, because the caller need not be an
+  operator. Two records are new: `resource.access_denied` and
+  `resource.grant_gate`. Update any log-based alerting that matches the old
+  names.
+
+  No migration and no backfill runs, and no configuration changes.
+  `auth.operator_users` and `auth.operator_idp_groups` keep their meaning.
+
 - **Action required if you author org `RoleBinding`s — subject bounded to its own
   Organization**. An org `RoleBinding` whose `subject` names a *different*
   organization — `group:<other>/x`, `serviceaccount:<other>/x`, `org:<other>` —
@@ -75,8 +123,11 @@ Merged to `develop`:
   overwrites the three editable rows, so an operator edit survives every restart
   and a deleted one is re-created on the next.
 
-  Nothing consults them yet — the generic resource API is still operator-gated —
-  so this changes no access. Two of the five are immutable through the API: the
+  These are the whole of the shipped policy: with the choke point live (above),
+  an install that authors no bindings of its own grants nothing to anyone but
+  operators and the subjects a `rise.dev/owner` label names.
+
+  Two of the five are immutable through the API: the
   resource store refuses to update or delete `PlatformRole/system-admin` or its
   binding, because they are the inspectable record of operator authority rather
   than its source (the evaluator hardcodes that, so it survives a bad restore).
@@ -90,9 +141,8 @@ Merged to `develop`:
   migration adds a column with an empty default, so existing rows and clients
   are unaffected and no backfill runs. Label keys use the Kubernetes-shaped
   grammar that policy `labelSelector` keys already use; values are capped at 63
-  bytes. Nothing consults labels for access yet — a key becomes access-relevant
-  only once a policy binding selects on it, and the write-time gate for such
-  keys lands with the authorization choke point.
+  bytes. A key becomes access-relevant only once a policy binding selects on it,
+  and writing such a key then passes the write-time grant gate.
 - **Action required if conflicts exist — identity resource activation** ([#421](https://github.com/rise-deploy/rise/pull/421)).
   Rise now activates the eight reserved `rise.dev/v1alpha1` identity resource
   kinds in the PostgreSQL resource store. Before upgrading, remove any legacy

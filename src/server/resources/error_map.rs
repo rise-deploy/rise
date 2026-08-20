@@ -34,6 +34,13 @@ pub fn store_error_to_server_error(err: StoreError) -> ServerError {
             ServerError::bad_request("path resolution requires at least one segment")
         }
         StoreError::Validation(msg) => ServerError::bad_request(msg),
+        // The write path's retry loop replays this; it only reaches a client if
+        // every attempt lost the race, which is a genuine "try again".
+        StoreError::Serialization => ServerError::service_unavailable(
+            "the write lost a concurrent-update race; please retry",
+        )
+        .retryable()
+        .expected(),
         StoreError::Backend { source } => ServerError::internal_anyhow(
             anyhow::Error::from_boxed(source),
             "resource store backend error",
