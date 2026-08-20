@@ -47,7 +47,11 @@ Merged to `develop`:
   refused outright. Shipped policy grants a non-operator nothing, so an install
   that has authored no bindings sees no access change — but if you were relying
   on "non-operator ⇒ 403" as the whole authorization story, that is no longer
-  what the code says. Two visible differences even without any binding:
+  what the code says. Who reaches the evaluation at all is unchanged: the
+  resource routes still sit behind the platform-access middleware, so
+  `auth.platform_access.policy: restrictive` keeps its allowlist in front of
+  everything below. Under the default `allow_all` that is every authenticated
+  user. Two visible differences even without any binding:
 
   - A collection listing by a caller with no `list` grant returns an **empty
     `200`**, not a `403`. This is deliberate existence masking: a `403` would

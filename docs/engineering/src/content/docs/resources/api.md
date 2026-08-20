@@ -72,8 +72,11 @@ Items the caller cannot `list` are omitted, and their existence is masked: a
 caller with no applicable grant receives an empty collection, never a `403`
 confirming the scope is populated. Addressing one resource by name is different —
 a `get`, `update`, or `delete` the caller does not hold is a `403`. Which
-*collections* exist stays visible to any authenticated caller, matching discovery
-being a property of the registry rather than of any one resource.
+*collections* exist stays visible to every caller who reaches the API at all,
+matching discovery being a property of the registry rather than of any one
+resource. Who reaches it is the platform-access policy's question rather than
+authorization's: these routes sit behind `auth.platform_access`, which under its
+default `allow_all` admits every authenticated user.
 
 `metadata.effectiveLabels` is on every response, resolved live by walking the
 ancestor chain nearest-wins: a child with no value of its own reports the one it
