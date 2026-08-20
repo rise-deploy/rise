@@ -26,7 +26,7 @@ mod change;
 mod membership;
 mod projection;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rise_authz::engine::{
     AuthenticatedPrincipal, AuthorizationCap, AuthorizationEngine, AuthorizationError,
@@ -142,6 +142,7 @@ impl ResourceAuthorizer {
             store,
             session,
             actor: user.email,
+            deferred_audit: Mutex::new(Vec::new()),
         })
     }
 
@@ -196,14 +197,19 @@ impl WriteAttempt {
         &self.context
     }
 
-    /// Commit. A serialization failure here is the ordinary case — PostgreSQL
-    /// detects most conflicts at commit rather than at the statement — and
-    /// arrives as a retryable error.
+    /// Commit, then emit the audit records the attempt deferred.
+    ///
+    /// A serialization failure here is the ordinary case — PostgreSQL detects
+    /// most conflicts at commit rather than at the statement — and arrives as a
+    /// retryable error, in which case the deferred records are dropped along
+    /// with the writes they describe.
     pub async fn commit(self) -> Result<(), ServerError> {
         self.transaction
             .commit()
             .await
-            .map_err(store_error_to_server_error)
+            .map_err(store_error_to_server_error)?;
+        self.context.flush_audit();
+        Ok(())
     }
 }
 
@@ -218,6 +224,14 @@ pub struct AuthorizationContext {
     store: Arc<dyn ResourceStore>,
     session: PgSession,
     actor: String,
+    /// Audit records for writes this attempt made, held until it commits.
+    ///
+    /// Emitting them inline would claim writes that a serialization retry then
+    /// rolled back — and a record of a create that never happened is worse than
+    /// no record, because the whole point of the trail is that it is true.
+    /// Decisions are different and stay inline: a refusal and a gate comparison
+    /// both happened, whatever the transaction goes on to do.
+    deferred_audit: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
 }
 
 impl AuthorizationContext {
@@ -246,6 +260,26 @@ impl AuthorizationContext {
 
     pub fn subject(&self) -> &SubjectId {
         self.snapshot.principal().subject()
+    }
+
+    /// Record a completed write, to be emitted once the transaction commits.
+    ///
+    /// The closure owns everything it prints, so nothing borrowed from the
+    /// attempt outlives it.
+    pub fn audit(&self, record: impl FnOnce() + Send + 'static) {
+        self.deferred_audit
+            .lock()
+            .expect("deferred audit records")
+            .push(Box::new(record));
+    }
+
+    /// Emit every deferred record. Called by [`WriteAttempt::commit`].
+    fn flush_audit(&self) {
+        let records =
+            std::mem::take(&mut *self.deferred_audit.lock().expect("deferred audit records"));
+        for record in records {
+            record();
+        }
     }
 
     pub fn is_operator(&self) -> bool {

@@ -589,7 +589,24 @@ async fn dispatch_get_inner(
             // caller cannot `list` is omitted rather than refused.
             let mut items = Vec::new();
             for row in &rows {
-                let target = authz.tree(row.uid).await?;
+                // A row whose ancestry cannot be resolved cannot be authorized
+                // either, and defaulting to visible would be the fail-open
+                // direction. It is skipped and named in the log rather than
+                // failing the whole listing, which would hide every other
+                // draining resource behind one anomaly.
+                let target = match authz.tree(row.uid).await {
+                    Ok(target) => target,
+                    Err(error) => {
+                        tracing::warn!(
+                            uid = %row.uid,
+                            kind = %row.kind,
+                            "Skipping a tombstoned resource whose ancestry could not be \
+                             resolved: {}",
+                            error.message
+                        );
+                        continue;
+                    }
+                };
                 if !authz.allows(&target, Verb::List, None).await? {
                     continue;
                 }
@@ -1048,6 +1065,38 @@ fn resource_response(
     Ok(resource)
 }
 
+/// Queue one write's audit record, to be emitted when the transaction commits.
+///
+/// The record is deferred rather than logged inline because a serialization
+/// retry rolls the write back: a `resource.created` line for a create that never
+/// happened would make the trail worse than useless.
+fn audit_write(
+    authz: &AuthorizationContext,
+    row: &ResourceRow,
+    event: &'static str,
+    revision: Option<i64>,
+) {
+    let actor = authz.actor().to_owned();
+    let uid = row.uid;
+    let api_version = row.api_version.clone();
+    let kind = row.kind.clone();
+    let name = row.name.clone();
+    let parent_uid = row.parent_uid;
+    authz.audit(move || {
+        tracing::info!(
+            target: "rise::audit",
+            actor = %actor,
+            uid = %uid,
+            api_version = %api_version,
+            kind = %kind,
+            name = %name,
+            parent_uid = ?parent_uid,
+            revision = ?revision,
+            "{event}"
+        );
+    });
+}
+
 fn read_granularity(readable: bool) -> ReadGranularity {
     if readable {
         ReadGranularity::Full
@@ -1184,16 +1233,7 @@ async fn create_resource(
             .map_err(store_error_to_server_error)?
     };
 
-    tracing::info!(
-        target: "rise::audit",
-        actor = %authz.actor(),
-        uid = %row.uid,
-        api_version = %row.api_version,
-        kind = %row.kind,
-        name = %row.name,
-        parent_uid = ?row.parent_uid,
-        "resource.created"
-    );
+    audit_write(authz, &row, "resource.created", None);
     let _ = ctx;
     Ok((
         StatusCode::CREATED,
@@ -1295,16 +1335,7 @@ async fn update_resource(
             .map_err(store_error_to_server_error)?
     };
 
-    tracing::info!(
-        target: "rise::audit",
-        actor = %authz.actor(),
-        uid = %updated.uid,
-        api_version = %updated.api_version,
-        kind = %updated.kind,
-        name = %updated.name,
-        revision = updated.revision,
-        "resource.updated"
-    );
+    audit_write(authz, &updated, "resource.updated", Some(updated.revision));
     let _ = ctx;
     // The written labels are the resource's own after this update, so the
     // response reports the value the next request will evaluate against.
@@ -1367,15 +1398,7 @@ async fn delete_resource(
 
     // A single static event message keeps this audit log consistent with
     // `resource.created` / `resource.updated`.
-    tracing::info!(
-        target: "rise::audit",
-        actor = %authz.actor(),
-        uid = %row.uid,
-        api_version = %row.api_version,
-        kind = %row.kind,
-        name = %row.name,
-        "resource.deleted"
-    );
+    audit_write(authz, row, "resource.deleted", None);
     let _ = ctx;
 
     match outcome {
@@ -1466,15 +1489,7 @@ async fn apply_user_status(
         .operator_update_status(row.uid, authz.actor(), body.status)
         .await
         .map_err(store_error_to_server_error)?;
-    tracing::info!(
-        target: "rise::audit",
-        actor = %authz.actor(),
-        uid = %row.uid,
-        api_version = %row.api_version,
-        kind = %row.kind,
-        name = %row.name,
-        "resource.user_status_updated"
-    );
+    audit_write(authz, row, "resource.user_status_updated", None);
     Ok(Json(resource_response(
         &updated,
         response_api_version,
@@ -1499,15 +1514,7 @@ async fn apply_user_finalizers(
         .operator_update_finalizers(row.uid, authz.actor(), &body.add, &body.remove)
         .await
         .map_err(store_error_to_server_error)?;
-    tracing::info!(
-        target: "rise::audit",
-        actor = %authz.actor(),
-        uid = %row.uid,
-        api_version = %row.api_version,
-        kind = %row.kind,
-        name = %row.name,
-        "resource.user_finalizers_updated"
-    );
+    audit_write(authz, row, "resource.user_finalizers_updated", None);
     Ok(Json(resource_response(
         &updated,
         response_api_version,

@@ -85,8 +85,8 @@ Merged to `develop`:
   is now refused at write time. Such a binding never granted anything: ADR-0001
   §1's recipient boundary already required the subject to belong to the binding's
   own Organization, so the row read as a cross-org grant while being permanently
-  dead. Only the generic resource API is affected, and only for operators, who
-  are its only writers.
+  dead. Only the generic resource API is affected, and only for callers who may
+  write policy resources there.
 
   Existing rows keep being readable and keep granting exactly what they granted
   before (nothing), but **an update to such a row now fails**. To find them:
@@ -198,9 +198,8 @@ Merged to `develop`:
   database unchanged, so clean up under the previous Rise version and retry.
   Installations with no reported conflicts require no action.
 
-  Nothing yet consults these resources: writing a `RoleBinding` grants no
-  access, and `/api/v1/resources` remains operator-gated. Bindings are
-  validated at write time, so creating one requires its `roleRef` target, its
+  These resources are what the choke point (above) evaluates: writing a
+  `RoleBinding` now grants access. Bindings are validated at write time, so creating one requires its `roleRef` target, its
   `scope` target, and any literal `subject` it names to already exist — create
   the Role before the RoleBinding that references it.
 

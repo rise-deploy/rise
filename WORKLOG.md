@@ -1075,6 +1075,18 @@ idempotent when a read-modify-write client replays the stored spec.
   - **The operator short-circuit is audited.** An operator produces no claims,
     so `resource.grant_gate` is the only evidence the write was gated at all;
     it records the operator flag, the claim count, and the rejection count.
+  - **Write audit records are deferred to the commit.** A retry rolls its
+    attempt back, and a `resource.created` line for a create that never happened
+    makes the trail worse than useless. Records for writes are queued on the
+    context and emitted after the commit succeeds. Decisions stay inline: a
+    refusal and a gate comparison both happened, whatever the transaction goes
+    on to do.
+  - **An unresolvable ancestry skips one item rather than failing a listing.**
+    The `pending-deletion` diagnostic spans every kind, and a tombstoned row
+    whose chain does not reach a root cannot be authorized — defaulting it to
+    visible is the fail-open direction. It is skipped and named in the log,
+    because failing the whole listing would hide every other draining resource
+    behind one anomaly.
 - Verification:
   - `cargo fmt --all`, `cargo clippy --workspace --all-features --all-targets --
     -D warnings`, and `cargo test --workspace --all-features` pass.
@@ -1109,3 +1121,13 @@ idempotent when a read-modify-write client replays the stored spec.
   - Cross-request authorization caching stays measured rather than assumed, per
     `ROADMAP.md` §1: the request-local snapshot already removes the repeated
     cost inside one request.
+  - Two lifecycle levers are now reachable by a non-operator holding ordinary
+    write access, and neither is an authorization escalation — both are
+    availability ones, and both predate this increment. A caller who may
+    `update` resource X can attach an owner reference to Y with
+    `blockOwnerDeletion: true`, which makes Y's deletion wait for X to be
+    collected; and a caller who may `create` can attach arbitrary non-reserved
+    finalizers. Neither grants access to anything, and the second only affects
+    the caller's own resource. The owner-reference case affects a resource the
+    caller may hold nothing on, so it wants either an admission rule (an owner
+    reference the caller cannot `use`) or policy auditing surfacing it.
