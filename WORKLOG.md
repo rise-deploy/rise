@@ -1123,6 +1123,34 @@ idempotent when a read-modify-write client replays the stored spec.
     error's classification, and the retry loop above it turns that classification
     into a replay; driving a grant and a revocation concurrently through the HTTP
     surface is left to the conformance suite in increment 11.
+- Review — adversarial pass over the choke point and the transaction seam,
+  fixed in the same increment:
+  - **Three re-entrant borrows of the transaction's single connection.** Each
+    presented as a hung request rather than an error: `update`'s preflight query
+    shadowed its guard instead of dropping it, the two collection resolvers
+    finish by calling each other while still holding one, and the Organization
+    delete guard held one across `store.delete`. All three are fixed, and the
+    borrow itself changed from a wait to a `try_lock` that names the mistake —
+    waiting on a guard the caller holds is a deadlock, and a deadlock in a
+    request path is the worst failure mode available.
+  - **Audit records claimed writes a retry could roll back.** `resource.created`
+    was emitted inside the transaction, so a lost race left a record of a create
+    that never happened. Write records are deferred to the commit; decisions
+    stay inline.
+  - **One unresolvable row failed a whole diagnostic.** A tombstoned resource
+    whose ancestry does not reach a root cannot be authorized, and the
+    `pending-deletion` listing propagated that as an error, hiding every other
+    draining resource. It is skipped and logged instead — visible without being
+    fail-open.
+  - **A transaction opened before the credential was checked.** `begin_write`
+    now resolves the principal first, so a credential this API does not accept
+    costs no transaction, and a retry loop does not open one per attempt.
+  - Corrected rather than found: the first version of the relabel test asserted
+    that handing ownership to another subject is refused. It is not, and should
+    not be — the writer was the resource's *current owner*, so the authority
+    being delegated is authority they hold. §6.6 requires that transfer to work,
+    and it is what pinning the writer's side to the old label value is for. The
+    test now covers both halves: a non-owner refused, an owner permitted.
 - Follow-ups this increment deliberately leaves open:
   - **Atomic Organization creation with its org-admin binding** (ADR-0001 §5)
     stays open, and is now blocked rather than deferred: the binding names an
