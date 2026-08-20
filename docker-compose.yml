@@ -80,7 +80,7 @@ services:
   # Traefik labels the Rise controller stamps on each app container. Only used when
   # deployment_controller.type = "docker" (see config/development.yaml).
   traefik:
-    image: traefik:v3.7.10
+    image: traefik:v3.7.11
     container_name: rise-traefik
     restart: unless-stopped
     command:
