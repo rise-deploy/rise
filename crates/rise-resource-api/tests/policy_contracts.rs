@@ -266,16 +266,26 @@ fn shipped_policy_defaults_parse_and_normalize() {
 
     // Only the operator pair is reserved.
     assert!(is_immutable_policy_seed(
+        API_VERSION_V1ALPHA1,
         PLATFORM_ROLE_KIND,
         SYSTEM_ADMIN_PLATFORM_ROLE
     ));
     assert!(is_immutable_policy_seed(
+        API_VERSION_V1ALPHA1,
         PLATFORM_ROLE_BINDING_KIND,
         SYSTEM_ADMIN_PLATFORM_ROLE
     ));
     assert!(!is_immutable_policy_seed(
+        API_VERSION_V1ALPHA1,
         PLATFORM_ROLE_KIND,
         RESOURCE_OWNER_PLATFORM_ROLE
+    ));
+    // The API group is part of the identity, and the cascade's SQL exemption
+    // pins it too. A kind registered under another group is ordinary data.
+    assert!(!is_immutable_policy_seed(
+        "example.dev/v1",
+        PLATFORM_ROLE_KIND,
+        SYSTEM_ADMIN_PLATFORM_ROLE
     ));
 }
 

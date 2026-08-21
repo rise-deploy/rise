@@ -273,8 +273,11 @@ fn require_shipped_seed<F>(
 where
     F: FnOnce() -> Result<serde_json::Value, StoreError>,
 {
-    // Placement is part of the identity: only the root rows are reserved.
-    if parent_uid.is_some() || !is_immutable_policy_seed(kind, name) {
+    // Placement is part of the identity: only the root rows are reserved. The
+    // API group is fixed here rather than threaded in — `for_policy` only
+    // resolves a `PolicyAdmission` for the built-in group, so nothing reaches
+    // this function under another one.
+    if parent_uid.is_some() || !is_immutable_policy_seed(API_VERSION_V1ALPHA1, kind, name) {
         return Ok(());
     }
     let shipped = shipped()?;

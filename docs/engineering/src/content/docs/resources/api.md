@@ -300,9 +300,10 @@ whether `system.rise.dev/cascade-deletion` is currently present. This
 subresource is authorized by `(get, Kind, deletion-blockers)` on the resource
 being blocked, and computed from the canonical resource rows; it does not
 maintain a separate blocker table. The blockers are filtered per item like any
-other collection: one the caller cannot `list` is counted in `hiddenBlockers`
-rather than named, so the report never reads as "nothing is blocking this" while
-something is.
+other collection, on `get` rather than `list` because each item carries more
+than list granularity projects (its UID and its finalizers): one the caller
+cannot `get` is counted in `hiddenBlockers` rather than named, so the report
+never reads as "nothing is blocking this" while something is.
 
 ## Status codes
 

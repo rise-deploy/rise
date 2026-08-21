@@ -1303,6 +1303,46 @@ idempotent when a read-modify-write client replays the stored spec.
     deliberately, and scenario 29 depends on it; revising it is a change to the
     gate's model, not to its wiring, and belongs with the conformance work in
     increment 11 where the scenario suite can hold it.
+- Fourth review — a third adversarial round, aimed at the previous round's own
+  fixes on the theory that the newest code has had the least scrutiny. Four
+  findings, all fixed here:
+  - **A refused label write still named a stored binding's subject.** The
+    previous round marked label changes recipient-only on the reasoning that the
+    recipient is the ownership rule's authored *template*. It is not: the gate
+    resolves the recipient through the selecting binding, and for a
+    literal-subject binding that subject is read straight out of stored policy —
+    another organization's Group or ServiceAccount, named to a caller who may
+    read none of it. Label refusals now disclose neither side. The test that was
+    supposed to cover this hand-built a template recipient, a shape the gate
+    cannot produce, which is why the classification survived two rounds; it now
+    pins the literal shape and calls the production classifier rather than
+    restating a constant.
+  - **`deletion-blockers` filtered on the wrong verb.** The previous round
+    filtered per item on `list`, but each item carries more than list
+    granularity projects — a UID and the item's finalizers — so a caller holding
+    only `list` on the children received both. The per-item verb is now `get`,
+    which is the grant that confers item detail.
+  - **The two immutable-seed predicates disagreed on the API group.** The
+    cascade's SQL exemption pins `api_version`; `is_immutable_policy_seed` did
+    not, so a row one treats as a seed the other would collect. The API group is
+    part of a seed's identity — a kind registered under another group is not
+    made reserved by borrowing the name — so the predicate takes it too, and the
+    two now compare the same three fields.
+  - **The owner-reference refusal named the owner.** Its comment claimed the
+    refusal tells a caller nothing about a resource they cannot see; it went
+    through the ordinary `require`, which names the kind and the name. A UID
+    travels further than the standing to read what it points at, so the refusal
+    now names only the UID the caller supplied — and reads identically for a UID
+    that resolves to nothing, so it is not an existence oracle. Only "no such
+    resource" is folded in; a store failure or a lost `SERIALIZABLE` race still
+    propagates to the retry loop.
+  - Found in the same pass and fixed alongside: *removing* an owner reference
+    was not authorized at all. Attaching one is gated because it borrows the
+    owner's lifecycle; detaching escapes a lifecycle that someone with standing
+    over the owner put the dependent under, which would let anyone holding
+    `update` on a dependent outlive the cascade meant to collect it. Both
+    directions now require `use` on the owner. `delete` on the dependent stays
+    an attach-only requirement, because detaching confers deletion on nobody.
 - Follow-ups this increment deliberately leaves open:
   - **Group-targeted policy is dark until identity resources exist.** Ties
     resolve against `User` and `Group` resources that no login path writes yet,
@@ -1337,13 +1377,9 @@ idempotent when a read-modify-write client replays the stored spec.
   - Cross-request authorization caching stays measured rather than assumed, per
     `ROADMAP.md` §1: the request-local snapshot already removes the repeated
     cost inside one request.
-  - Two lifecycle levers are now reachable by a non-operator holding ordinary
-    write access, and neither is an authorization escalation — both are
-    availability ones, and both predate this increment. A caller who may
-    `update` resource X can attach an owner reference to Y with
-    `blockOwnerDeletion: true`, which makes Y's deletion wait for X to be
-    collected; and a caller who may `create` can attach arbitrary non-reserved
-    finalizers. Neither grants access to anything, and the second only affects
-    the caller's own resource. The owner-reference case affects a resource the
-    caller may hold nothing on, so it wants either an admission rule (an owner
-    reference the caller cannot `use`) or policy auditing surfacing it.
+  - One lifecycle lever is reachable by a non-operator holding ordinary write
+    access, and it is not an authorization escalation but an availability one:
+    a caller who may `create` can attach arbitrary non-reserved finalizers,
+    which only affects their own resource. The owner-reference half of this —
+    holding another resource's deletion open with `blockOwnerDeletion` — is
+    closed by the `use` requirement on both attaching and detaching an edge.

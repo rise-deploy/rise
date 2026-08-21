@@ -1450,7 +1450,9 @@ impl ResourceStore for PgResourceStore {
         // but it would remove the only inspectable record of it, so the delete is
         // refused rather than silently leaving the platform's most privileged
         // grant undocumented.
-        if row.parent_uid.is_none() && is_immutable_policy_seed(&row.kind, &row.name) {
+        if row.parent_uid.is_none()
+            && is_immutable_policy_seed(&row.api_version, &row.kind, &row.name)
+        {
             return Err(StoreError::Validation(format!(
                 "{} '{}' is seeded and immutable and cannot be deleted",
                 row.kind, row.name

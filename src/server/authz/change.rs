@@ -320,6 +320,18 @@ pub async fn change_for_delete(
 /// resource and its K-inheriting subtree. Keys are compared on the resource's
 /// own labels: an unchanged own value cannot move the effective value on
 /// anything below it.
+/// What a refused label write may say about itself.
+///
+/// Nothing here comes from the request. The recipient is whatever subject the
+/// *stored* binding resolves to under the new value — always a literal, and for
+/// a literal-subject binding read straight out of policy, so it can name another
+/// organization's Group or ServiceAccount. The domains are the written resource
+/// *and every descendant inheriting the key*, which would enumerate a subtree
+/// the caller may see none of. So: neither.
+pub fn label_disclosure() -> Disclosure {
+    Disclosure::NONE
+}
+
 pub fn label_changes(
     target: &ResourceTree,
     target_uid: Option<Uuid>,
@@ -345,11 +357,7 @@ pub fn label_changes(
                 Some(value) => format!("setting label '{key}' to '{value}'"),
                 None => format!("removing label '{key}'"),
             },
-            // The recipient is the binding's authored subject — a template for
-            // the ownership rule, so nothing stored leaks. The domains are the
-            // written resource *and every descendant inheriting the key*, which
-            // would enumerate a subtree the caller may see none of.
-            disclosure: Disclosure::RECIPIENT_ONLY,
+            disclosure: label_disclosure(),
             change: AuthorizationChange::Label(LabelChange {
                 target: target.clone(),
                 target_uid,

@@ -821,15 +821,18 @@ mod tests {
         );
     }
 
-    /// A label write may name the recipient (a binding's authored template) but
-    /// never the domains, which are the written resource and every descendant
-    /// inheriting the key.
+    /// A label write discloses neither side. The gate resolves the recipient
+    /// out of a *stored* binding — always a `Literal`, never anything echoed
+    /// from the request — and the domains are the written resource and every
+    /// descendant inheriting the key.
     #[test]
-    fn a_label_rejection_discloses_the_recipient_but_not_the_subtree() {
+    fn a_label_rejection_discloses_neither_recipient_nor_subtree() {
         let outcome = GateOutcome {
             claims: Vec::new(),
             rejections: vec![GateRejection {
-                recipient: BindingSubject::SubjectRefTemplate,
+                recipient: BindingSubject::Literal(
+                    "group:acme/platform-admins".parse().expect("subject"),
+                ),
                 domain: Some(rise_authz::engine::GateDomain {
                     domain: rise_authz::policy::PolicyDomain {
                         scope: "rise.dev/Environment/acme/app/env-prod"
@@ -850,11 +853,16 @@ mod tests {
         let error = gate_rejection_to_server_error(
             "setting label 'rise.dev/owner' to 'user:x'",
             &outcome,
-            Disclosure::RECIPIENT_ONLY,
+            change::label_disclosure(),
         );
         assert!(!error.message.contains("env-prod"), "{}", error.message);
         assert!(
-            error.message.contains("subjects matching"),
+            !error.message.contains("platform-admins"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("another subject"),
             "{}",
             error.message
         );

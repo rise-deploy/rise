@@ -741,14 +741,16 @@ async fn dispatch_get_inner(
             // per item (ADR-0001 §4) — this subresource is a separate grant from
             // `list` on the kinds beneath, and a caller holding only the former
             // must not receive a complete inventory of an Organization's
-            // children by name and UID. What is withheld is still counted: a
-            // report that silently omits blockers would read as "nothing is
+            // children by name and UID. The per-item verb is `get`, not `list`,
+            // because each item carries more than list granularity projects: a
+            // UID and the item's finalizers. What is withheld is still counted:
+            // a report that silently omits blockers would read as "nothing is
             // blocking this", which is worse than saying how many are hidden.
             let mut blockers = Vec::new();
             let mut hidden = 0usize;
             for blocker in report.blockers {
                 let visible = match authz.tree(blocker.uid).await {
-                    Ok(target) => authz.allows(&target, Verb::List, None).await?,
+                    Ok(target) => authz.allows(&target, Verb::Get, None).await?,
                     // A blocker whose ancestry will not resolve cannot be
                     // authorized; it is counted, never named.
                     Err(_) => false,
@@ -1230,17 +1232,45 @@ async fn authorize_owner_references(
         .iter()
         .filter(|reference| !before.contains(reference))
         .collect();
-    if added.is_empty() {
+    let removed: Vec<_> = before
+        .iter()
+        .filter(|reference| !after.contains(reference))
+        .collect();
+    if added.is_empty() && removed.is_empty() {
         return Ok(());
     }
-    if let Some(dependent) = dependent {
-        authz.require(dependent, Verb::Delete, None).await?;
+    if !added.is_empty() {
+        // Attaching an owner makes the dependent collectable by whoever can
+        // delete that owner, so the writer must already hold that themselves.
+        // Detaching does not confer deletion on anyone, so it is not gated here.
+        if let Some(dependent) = dependent {
+            authz.require(dependent, Verb::Delete, None).await?;
+        }
     }
-    for reference in added {
-        // The owner is addressed by UID, so a refusal tells a caller who cannot
-        // see it only that they may not use it.
-        let target = authz.tree(reference.uid()).await?;
-        authz.require(&target, Verb::Use, None).await?;
+    // Both directions need `use` on the owner. Attaching borrows the owner's
+    // lifecycle; detaching escapes one the owner's controller put the dependent
+    // under, which would otherwise let anyone holding `update` on a dependent
+    // outlive the cascade that was meant to collect it.
+    for reference in added.into_iter().chain(removed) {
+        // Refusals name neither the owner's kind nor its name, and read the same
+        // whether or not the UID resolves: the caller addressed it by UID, and a
+        // UID can travel further than the standing to read what it points at.
+        // Only the "no such resource" answer is folded in — a store failure or a
+        // lost `SERIALIZABLE` race still propagates, so the retry loop sees it.
+        let refusal = || {
+            ServerError::forbidden(format!(
+                "not authorized to use the owner referenced by uid {}",
+                reference.uid()
+            ))
+        };
+        let target = match authz.tree(reference.uid()).await {
+            Ok(target) => target,
+            Err(error) if error.status == StatusCode::NOT_FOUND => return Err(refusal()),
+            Err(error) => return Err(error),
+        };
+        if !authz.allows(&target, Verb::Use, None).await? {
+            return Err(refusal());
+        }
     }
     Ok(())
 }
@@ -2746,6 +2776,117 @@ mod dispatch_tests {
         assert_eq!(resp.status(), StatusCode::CREATED);
     }
 
+    /// Detaching is gated the same way as attaching. An owner reference is the
+    /// edge a cascade travels, so a caller holding only `update` on a dependent
+    /// must not be able to step it out of a lifecycle someone with standing over
+    /// the owner put it under.
+    ///
+    /// The refusal names neither the owner's kind nor its name — the caller
+    /// addressed it by UID, and a UID travels further than the standing to read
+    /// what it points at — and reads identically for a UID that resolves to
+    /// nothing at all.
+    #[sqlx::test]
+    async fn detaching_an_owner_reference_needs_use_on_the_owner(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx, &[]).await;
+        let owner = create_widget(&ctx, "example.dev/v1", "owner").await;
+        let owner_reference = json!({
+            "apiVersion": "example.dev/v1",
+            "kind": "Widget",
+            "name": "owner",
+            "uid": owner["metadata"]["uid"],
+        });
+        let dependent = create_at(
+            &ctx,
+            "example.dev/v1/widgets",
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {"name": "dependent", "ownerReferences": [owner_reference.clone()]},
+                "spec": {},
+            }),
+        )
+        .await;
+        // Everything except `use` on the owner.
+        grant_authenticated(
+            &ctx,
+            "widget-admin",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["example.dev/Widget"],
+                "verbs": ["get", "list", "create", "update", "delete"],
+            }]),
+        )
+        .await;
+
+        let err = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/dependent".to_string(),
+            any_user(PLAIN_USER),
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {
+                    "name": "dependent",
+                    "revision": dependent["metadata"]["revision"],
+                    "ownerReferences": [],
+                },
+                "spec": {},
+            }),
+        )
+        .await
+        .expect_err("dropping the edge needs `use` on the owner");
+        assert_eq!(err.status, StatusCode::FORBIDDEN, "{}", err.message);
+        assert!(!err.message.contains("Widget"), "{}", err.message);
+        assert!(!err.message.contains("'owner'"), "{}", err.message);
+
+        // A UID pointing at nothing is refused in the same words, so the
+        // refusal is not an existence oracle.
+        let missing = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/dependent".to_string(),
+            any_user(PLAIN_USER),
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {
+                    "name": "dependent",
+                    "revision": dependent["metadata"]["revision"],
+                    "ownerReferences": [owner_reference, {
+                        "apiVersion": "example.dev/v1",
+                        "kind": "Widget",
+                        "name": "ghost",
+                        "uid": Uuid::new_v4(),
+                    }],
+                },
+                "spec": {},
+            }),
+        )
+        .await
+        .expect_err("an unresolvable owner is refused, not reported missing");
+        assert_eq!(missing.status, StatusCode::FORBIDDEN);
+
+        // An operator holds every verb, so the same detach succeeds.
+        let resp = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/dependent".to_string(),
+            any_user(OPERATOR),
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {
+                    "name": "dependent",
+                    "revision": dependent["metadata"]["revision"],
+                    "ownerReferences": [],
+                },
+                "spec": {},
+            }),
+        )
+        .await
+        .expect("an operator may drop the edge");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     /// The blockers are a collection, so they are filtered per item — a caller
     /// holding the subresource but no `list` on the children below must not
     /// receive an inventory of them by name and UID. What is withheld is
@@ -2766,7 +2907,7 @@ mod dispatch_tests {
             }),
         )
         .await;
-        // The subresource, and nothing else — no `list` on Gadgets.
+        // The subresource, and nothing else — no `get` on Gadgets.
         grant_authenticated(
             &ctx,
             "blocker-reader",
@@ -2792,7 +2933,7 @@ mod dispatch_tests {
         assert_eq!(body["blockers"].as_array().expect("blockers").len(), 0);
         assert_eq!(body["hiddenBlockers"], 1);
 
-        // An operator holds `list`, so the same call names the blocker.
+        // An operator holds `get`, so the same call names the blocker.
         let resp = dispatch_get_inner(
             &ctx,
             "rise.dev/v1alpha1/organizations/acme/deletion-blockers".to_string(),

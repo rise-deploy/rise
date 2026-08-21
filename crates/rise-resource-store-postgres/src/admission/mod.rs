@@ -137,7 +137,7 @@ impl BuiltInAdmission {
             // "this is what operators hold" is content too.
             Self::Policy(_) => {
                 if current.parent_uid.is_none()
-                    && is_immutable_policy_seed(&current.kind, &current.name)
+                    && is_immutable_policy_seed(&current.api_version, &current.kind, &current.name)
                 {
                     return Err(StoreError::Validation(format!(
                         "{} '{}' is seeded and immutable and cannot be updated",
