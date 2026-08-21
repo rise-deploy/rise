@@ -1379,23 +1379,32 @@ idempotent when a read-modify-write client replays the stored spec.
 - Verification:
   - `cargo fmt --all` and `cargo clippy --workspace --all-features --all-targets
     -- -D warnings` pass.
-  - `cargo test --workspace --all-features` passes: 1,252 tests, with two
-    ignored documentation examples.
+  - `cargo test --workspace --all-features` passes: 1,275 tests, with two
+    ignored documentation examples. (Counts here and below are as of the last
+    review round; earlier drafts of this entry stated a dispatch-suite figure
+    that counted the whole `server::resources` module rather than the dispatch
+    tests alone.)
   - Generated resource, backend-settings, `rise.toml`, and CRD artifacts were
     regenerated; only the resource schemas changed, by the one additive
-    `effectiveLabels` field. `cargo audit` and `helm lint` were not run locally
-    (neither tool is available in this environment); no dependency was added
-    beyond promoting `tokio` from a dev-dependency of
-    `rise-resource-store-postgres`, and the chart is untouched, so CI covers
-    both.
-  - The generic resource API's dispatch suite is at 85 tests, adding masked
+    `effectiveLabels` field, and re-checked clean after every review round.
+    `cargo audit` and `helm lint` were not run locally (neither tool is
+    available in this environment); the only dependency change on the branch is
+    the in-workspace `rise-authz` path dep, and the chart is untouched, so CI
+    covers both — both jobs are green on the branch.
+  - Also verified per-crate rather than only through the workspace, since
+    `--all-features` at the root unifies features and can hide a crate that no
+    longer builds alone: `cargo clippy --all-targets -- -D warnings` passes for
+    each of the six support crates, and for the CLI-only
+    (`--no-default-features --features cli`) and default builds.
+  - The generic resource API's dispatch suite is at 65 tests — 107 across the
+    whole `server::resources` module — adding masked
     collections, refused items, the list-only projection and its expansion under
     `get`, inherited `effectiveLabels` and their shadowing, the grant gate
     refusing and permitting a delegation by the same non-operator writer, and
     §6.6's three label cases: the creation exception carrying a new resource's
     own ownership label, a non-owner refused both spellings of a redirect, and
     an owner transferring ownership on.
-  - The PostgreSQL-backed store suite is at 97 tests, adding the transaction
+  - The PostgreSQL-backed store suite is at 111 tests, adding the transaction
     seam: a transaction-scoped store reading its own uncommitted write while the
     pool cannot see it, a dropped transaction rolling back, and two conflicting
     transactions producing exactly one `StoreError::Serialization` at commit.
