@@ -305,10 +305,23 @@ pub async fn change_for_delete(
     // on liveness, not on collection. So an Organization delete is a delete of
     // its whole policy tier, Denies included, and has to be diffed as one.
     //
-    // Only this parent needs it. The other structural cascades over policy
-    // rows — a Group taking its GroupMemberships, a User its UserIdentities, a
-    // ServiceAccount its trust policies — only ever remove authority, which
-    // ADR-0001 §4 does not gate.
+    // Only this parent gets it. The other structural cascades over policy rows —
+    // a Group taking its GroupMemberships, a User its UserIdentities, a
+    // ServiceAccount its trust policies — remove a *subject's* reach rather
+    // than a resource's protection, and ADR-0001 §4 puts membership removal
+    // outside the gate deliberately.
+    //
+    // With one caveat worth stating rather than hiding: a platform-tier `Deny`
+    // whose subject is `org:<name>` or `group:<org>/<name>` stops matching a
+    // caller who drops the affiliation, because subject matching consults live
+    // standing. So dropping your own membership can lift such a cap while
+    // leaving your grants in *other* organizations intact. §4's own wording —
+    // "escaping an org ceiling while retaining a platform grant is an explicit
+    // operator-governance case" — reads as though it should not be reachable
+    // without an operator. Closing it means either gating a membership removal
+    // against platform Denies delivered through those subjects, or confining
+    // `org:`-subject bindings the way `group:` ones are confined; both change
+    // the permission model rather than its wiring, so neither is done here.
     if row.api_version == API_VERSION_V1ALPHA1 && row.kind == ORGANIZATION_KIND {
         return cascaded_policy_deletions(ctx, row).await;
     }
@@ -369,6 +382,13 @@ async fn cascaded_policy_deletions(
     ctx: &AuthorizationContext,
     organization: &ResourceRow,
 ) -> Result<AuthorizationChangeSet, ServerError> {
+    // An operator's every claim is permitted, so building the set would be
+    // work whose only output the gate discards. This mirrors the gate's own
+    // short-circuit rather than adding a second one: if that short-circuit ever
+    // goes, this must go with it.
+    if ctx.is_operator() {
+        return Ok(Vec::new());
+    }
     let mut changes = Vec::new();
     for kind in [ROLE_KIND, ROLE_BINDING_KIND] {
         let rows = ctx
@@ -377,10 +397,61 @@ async fn cascaded_policy_deletions(
             .await
             .map_err(crate::server::resources::error_map::store_error_to_server_error)?;
         for row in rows {
-            changes.extend(policy_row_deletion(ctx, &row).await?);
+            // A tombstoned row stopped applying when it was tombstoned — the
+            // engine filters bindings on liveness, not on collection — so
+            // removing it delegates nothing. Diffing it would charge the writer
+            // for authority that is already gone and make an Organization
+            // holding one undeletable.
+            if row.deletion_timestamp.is_some() {
+                continue;
+            }
+            changes.push(cascade_operation(
+                organization,
+                policy_row_deletion(ctx, &row).await?,
+            ));
+        }
+        // Each change costs the gate a full load of the binding universe, so a
+        // large Organization is refused rather than allowed to degrade into a
+        // statement timeout inside a `SERIALIZABLE` transaction — which would
+        // make the Organization undeletable *and* cost every concurrent policy
+        // write its serialization race.
+        if changes.len() > MAX_CASCADED_POLICY_ROWS {
+            return Err(ServerError::conflict(format!(
+                "deleting Organization '{}' would delete more than {MAX_CASCADED_POLICY_ROWS} \
+                 policy resources beneath it, which is more than one write can weigh; \
+                 remove them first",
+                organization.name
+            )));
         }
     }
-    Ok(changes)
+    Ok(changes.into_iter().flatten().collect())
+}
+
+/// How many policy rows an Organization delete may cascade over before it is
+/// refused rather than weighed. See [`cascaded_policy_deletions`].
+const MAX_CASCADED_POLICY_ROWS: usize = 64;
+
+/// Re-word a cascaded row's refusal so it names the Organization the caller
+/// addressed rather than a policy row they may never have been able to read.
+///
+/// The operation phrase is prepended to every refusal outside any `Disclosure`
+/// check, so a per-row phrase here would hand back the canonical name of stored
+/// policy to a caller holding `delete` on the Organization and no read on what
+/// is inside it. The per-row detail stays in the audit record.
+fn cascade_operation(
+    organization: &ResourceRow,
+    changes: AuthorizationChangeSet,
+) -> AuthorizationChangeSet {
+    changes
+        .into_iter()
+        .map(|gated| GatedChange {
+            operation: format!(
+                "deleting Organization '{}', which deletes the policy beneath it",
+                organization.name
+            ),
+            ..gated
+        })
+        .collect()
 }
 
 /// The gated change a write that *schedules* a policy row's deletion produces.

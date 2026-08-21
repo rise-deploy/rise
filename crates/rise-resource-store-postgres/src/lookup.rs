@@ -251,7 +251,60 @@ impl MembershipLookup {
             .map_err(crate::session::map_sqlx_error)?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
+
+    /// The ties bound to a User name, independent of whether a live, active
+    /// `User` resource carries it. See [`GROUP_TIES_BY_USER_NAME_SQL`].
+    pub async fn group_ties_by_user_name(
+        &self,
+        user_name: &str,
+    ) -> Result<Vec<GroupMembershipFact>, StoreError> {
+        let mut connection = self.db.acquire().await?;
+        let rows = sqlx::query_as::<_, MembershipFactRow>(GROUP_TIES_BY_USER_NAME_SQL)
+            .bind(user_name)
+            .fetch_all(&mut *connection)
+            .await
+            .map_err(crate::session::map_sqlx_error)?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
 }
+
+/// The Group ties bound to a User *name*, whether or not a live, active `User`
+/// resource currently carries it.
+///
+/// A `GroupMembership` is a name-bound marker (ADR-0001 §1): deleting the User
+/// leaves it in place, and recreating or reactivating the name makes it deliver
+/// again. `GROUPS_FOR_USER_SQL` answers "what does this User reach *now*", which
+/// is right for a caller's own snapshot. This answers "what would this name
+/// reach once it is live", which is the question the grant gate has to ask about
+/// a write that is bringing the name into existence or switching it on — at that
+/// moment the row does not exist or is still inactive, and the first query
+/// necessarily returns nothing.
+#[doc(hidden)]
+pub const GROUP_TIES_BY_USER_NAME_SQL: &str = r#"
+SELECT membership.uid AS membership_uid,
+       membership.name AS membership_name,
+       parent.uid AS group_uid,
+       parent.name AS group_name,
+       organization.uid AS organization_uid,
+       organization.name AS organization_name
+FROM resource_store.resources membership
+JOIN resource_store.resources parent
+  ON parent.uid = membership.parent_uid
+ AND parent.api_version = 'rise.dev/v1alpha1'
+ AND parent.kind = 'Group'
+ AND parent.deletion_timestamp IS NULL
+JOIN resource_store.resources organization
+  ON organization.uid = parent.parent_uid
+ AND organization.api_version = 'rise.dev/v1alpha1'
+ AND organization.kind = 'Organization'
+ AND organization.parent_uid IS NULL
+ AND organization.deletion_timestamp IS NULL
+WHERE membership.api_version = 'rise.dev/v1alpha1'
+  AND membership.kind = 'GroupMembership'
+  AND membership.deletion_timestamp IS NULL
+  AND membership.name COLLATE "C" = $1 COLLATE "C"
+ORDER BY parent.name, parent.uid, membership.uid
+"#;
 
 #[derive(sqlx::FromRow)]
 struct IdentityFactRow {

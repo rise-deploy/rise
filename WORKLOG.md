@@ -810,6 +810,61 @@ scope and avoiding dead-end compatibility layers.
     role lookup that reports a lost `SERIALIZABLE` race instead of failing
     closed to "not an operator" — inside a write transaction, that answer is
     decided from a transaction already doomed.
+- Ninth review — an eighth adversarial round, pointed past the recently-worked
+  code on the theory that it is now the hardest part. Four findings, the first of
+  them in the previous round's own fix:
+  - **The `User` gate was blind to exactly what it was built to catch.** Both the
+    new create arm and the activation arm it copied emit an `IdentityMapping`
+    change, and `identity_mapping_claims` is the one place a recipient's Groups
+    are expanded — through `groups_for_user`, which resolved ties by finding a
+    live, *active* `User` row of that name. At the moment either write is gated
+    there is no such row: the create has not happened yet and the activation's
+    stored spec still says `false`. So the tie set was empty for precisely the
+    two writes whose effect is to make those ties deliver again, and the claim
+    collapsed to bindings naming the User directly. A helpdesk principal holding
+    Users and nothing in an organization could reactivate an offboarded name and
+    hand it back its org-admin Group. The seam now resolves ties by *name*,
+    which is what a name-bound marker means; the caller's own snapshot keeps the
+    strict lookup, since there the question really is what they reach now.
+  - Corrected while fixing it: the first test written for this passed against
+    the unfixed code. It refused, but for an unrelated reason — the seeded
+    ownership binding credits any recipient with `resource-owner` over the
+    domains it templates, so a writer lacking `delete` is refused every
+    activation whatever the ties say. The test now gives the writer every verb
+    on every main resource and puts the Group's grant on a *subresource*, so the
+    tie is the only thing in the delta, and it was checked to fail against the
+    unfixed seam before being kept.
+  - **The Organization cascade was quadratic.** Each change costs the gate two
+    full loads of the binding universe, so an Organization with a few hundred
+    policy rows turned one delete into hundreds of thousands of queries inside a
+    `SERIALIZABLE` transaction — undeletable in practice, and holding a snapshot
+    open long enough to cost concurrent policy writes their races. An operator's
+    claims are all permitted, so that path skips construction entirely (mirroring
+    the gate's own short-circuit, not adding a second one), and a cascade past 64
+    policy rows is refused with a 409 rather than allowed to degrade into a
+    timeout.
+  - **A refused Organization delete named the policy rows inside it.** The
+    operation phrase is prepended to every refusal outside any `Disclosure`
+    check — fine when the caller addressed that row by name, a disclosure when
+    the row came from a cascade they may hold no read on. Cascaded refusals now
+    name the Organization.
+  - **The cascade enumerated tombstoned rows.** `ResourceStore::list` returns
+    them, and a tombstoned binding is already not applying, so diffing one
+    charged the writer for authority that was gone and made an Organization
+    containing a draining `Deny` undeletable. Fail-closed, but wrong.
+  - **Raised, not changed — a platform `Deny` can be escaped by dropping a
+    membership.** Subject matching consults *live* standing, so a platform-tier
+    `Deny` whose subject is `org:<name>` or `group:<org>/<name>` stops matching a
+    caller who leaves that organization — while their grants elsewhere survive.
+    Deleting your own `GroupMembership` is ungated by ADR-0001 §4's explicit
+    decision, and the equivalent move through a *binding* is correctly caught
+    (`provable_affiliations` sees it). §4 also says escaping an org ceiling while
+    retaining a platform grant is "an explicit operator-governance case", which
+    reads as though this should not be reachable without one. Closing it means
+    either gating membership removal against such Denies or confining
+    `org:`-subject bindings the way `group:` ones are confined — both changes to
+    the permission model rather than its wiring, and a decision for the ADR
+    rather than for a review. The comment at the cascade says so at the seam.
 - Follow-ups this increment deliberately leaves open:
   - The centralized choke point replacing `require_operator`, the write-time
     grant gate, and seeded `system-admin`/`resource-owner`/`org-admin` data are

@@ -113,7 +113,13 @@ Merged to `develop`:
     grant gate as an activation, matching the existing gate on flipping
     `active` from false to true. Policy binds to the User *name*, so recreating
     a name that stale bindings or `GroupMembership` markers still refer to makes
-    that policy reachable again.
+    that policy reachable again. Both gates now measure the name's Group ties as
+    well as the bindings naming it directly, so reactivating an offboarded
+    identity requires holding whatever its Groups grant.
+  - Deleting an `Organization` with more than 64 `Role`/`RoleBinding` resources
+    beneath it is refused with `409` for a non-operator: each one has to be
+    weighed against the writer's authority, and more than that cannot be done in
+    one transaction. Remove them first, or have an operator perform the delete.
   - A write response for a caller holding a write verb and neither `get` nor
     `list` is now `apiVersion`, `kind`, and `metadata.name` only — previously it
     carried labels and inherited `effectiveLabels`, which are org-wide and are

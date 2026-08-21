@@ -225,8 +225,36 @@ impl MembershipResolver for RiseMembershipResolver {
                 "{user} is not a User subject"
             )));
         }
-        // A name with no live User resource has no ties — the mapping's parent
-        // identity is whatever the name means once such a resource exists.
-        self.group_ties(user).await
+        // Resolved by *name*, not through a live, active `User` row — unlike
+        // `group_ties`, which answers for a caller's own snapshot and must stay
+        // strict.
+        //
+        // The gate asks this about a write that makes a credential path to this
+        // name work: a new identity mapping, an activation, a create. At the
+        // moment it asks, the row is absent or still inactive by construction,
+        // so a lookup that required one would answer "no ties" for precisely
+        // the writes whose whole effect is to make those ties deliver again. A
+        // `GroupMembership` is a name-bound marker (ADR-0001 §1) that outlives
+        // the User; what the write reaches is what the name reaches once live.
+        //
+        // For a mapping onto an already-live User the two forms agree, and
+        // where they differ this one is the larger set — which is the direction
+        // this seam is documented to fail in.
+        let facts = self
+            .memberships
+            .group_ties_by_user_name(user.name())
+            .await?;
+        facts
+            .iter()
+            .map(|fact| {
+                format!("group:{}/{}", fact.organization_name, fact.group_name)
+                    .parse::<SubjectId>()
+                    .map_err(|error| {
+                        AuthorizationError::CorruptPolicy(format!(
+                            "stored Group tie is not a valid subject: {error}"
+                        ))
+                    })
+            })
+            .collect()
     }
 }

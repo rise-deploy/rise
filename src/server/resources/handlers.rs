@@ -3865,6 +3865,15 @@ mod dispatch_tests {
         .await
         .expect_err("the cascade would lift a Deny the caller may not lift");
         assert_eq!(err.status, StatusCode::FORBIDDEN, "{}", err.message);
+        // The refusal names the Organization the caller addressed, never the
+        // policy rows inside it — which they may hold no read on at all.
+        assert!(!err.message.contains("the-cap"), "{}", err.message);
+        assert!(!err.message.contains("capped"), "{}", err.message);
+        assert!(
+            err.message.contains("Organization 'acme'"),
+            "{}",
+            err.message
+        );
 
         // An operator, who may lift it, is not blocked.
         let resp = dispatch_delete_inner(
@@ -3977,6 +3986,152 @@ mod dispatch_tests {
         .await
         .expect("an inactive User reaches none of the name's policy");
         assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    /// The activation gate has to measure the name's *Group ties*, not just the
+    /// bindings that name it directly. A `GroupMembership` is a name-bound
+    /// marker that outlives the User, so at the moment of the gate the row it
+    /// belongs to is inactive by construction — a tie lookup that required a
+    /// live, active User would answer "no ties" for precisely the write whose
+    /// effect is to make those ties deliver again.
+    #[sqlx::test]
+    async fn activation_is_gated_on_the_names_group_ties(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx, &[]).await;
+        create_org(&ctx, "acme").await;
+        create_at(
+            &ctx,
+            "rise.dev/v1alpha1/groups/acme",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "Group",
+                "metadata": {"name": "admins"},
+                "spec": {},
+            }),
+        )
+        .await;
+        // Everything on Widgets, for that Group — nothing names the User.
+        create_at(
+            &ctx,
+            "rise.dev/v1alpha1/roles/acme",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "Role",
+                "metadata": {"name": "widget-admin"},
+                "spec": {"statements": [{
+                    "effect": "Allow",
+                    "kinds": ["example.dev/Widget"],
+                    "verbs": ["update"],
+                    "subresources": ["status"],
+                }]},
+            }),
+        )
+        .await;
+        create_at(
+            &ctx,
+            "rise.dev/v1alpha1/rolebindings/acme",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "RoleBinding",
+                "metadata": {"name": "admins-grant"},
+                "spec": {
+                    "subject": "group:acme/admins",
+                    "roleRef": {"kind": "Role", "name": "widget-admin"},
+                },
+            }),
+        )
+        .await;
+        let ghost = create_at(
+            &ctx,
+            "rise.dev/v1alpha1/users",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "User",
+                "metadata": {"name": "ghost"},
+                "spec": {},
+            }),
+        )
+        .await;
+        create_at(
+            &ctx,
+            "rise.dev/v1alpha1/groupmemberships/acme/admins",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "GroupMembership",
+                "metadata": {"name": "ghost"},
+                "spec": {},
+            }),
+        )
+        .await;
+        // Offboarded: the marker stays, the identity goes dark.
+        let deactivated = dispatch_put_inner(
+            &ctx,
+            "rise.dev/v1alpha1/users/ghost".to_string(),
+            any_user(OPERATOR),
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "User",
+                "metadata": {"name": "ghost", "revision": ghost["metadata"]["revision"]},
+                "spec": {"active": false},
+            }),
+        )
+        .await
+        .expect("deactivation removes authority and is not gated");
+        let (_, deactivated) = read(deactivated).await;
+
+        // A helpdesk principal holding every verb on every *main* resource, but
+        // no subresource — and the Group's Role carries exactly one subresource
+        // grant. That isolates the tie: everything else the name could reach,
+        // including what the seeded ownership binding confers, the writer
+        // already holds, so with the ties invisible the gate sees nothing to
+        // refuse.
+        grant_authenticated(
+            &ctx,
+            "user-admin",
+            json!([{
+                "effect": "Allow",
+                "kinds": "*",
+                "verbs": ["get", "list", "create", "update", "delete", "use"],
+            }]),
+        )
+        .await;
+
+        let err = dispatch_put_inner(
+            &ctx,
+            "rise.dev/v1alpha1/users/ghost".to_string(),
+            any_user(PLAIN_USER),
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "User",
+                "metadata": {
+                    "name": "ghost",
+                    "revision": deactivated["metadata"]["revision"],
+                },
+                "spec": {"active": true},
+            }),
+        )
+        .await
+        .expect_err("reactivation hands back what the name's Groups grant");
+        assert_eq!(err.status, StatusCode::FORBIDDEN, "{}", err.message);
+
+        // The same write from an operator, who holds it all, is permitted.
+        let resp = dispatch_put_inner(
+            &ctx,
+            "rise.dev/v1alpha1/users/ghost".to_string(),
+            any_user(OPERATOR),
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "User",
+                "metadata": {
+                    "name": "ghost",
+                    "revision": deactivated["metadata"]["revision"],
+                },
+                "spec": {"active": true},
+            }),
+        )
+        .await
+        .expect("an operator may reactivate");
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     /// The same writer may delegate authority they *do* hold: the delta is a
