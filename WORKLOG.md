@@ -995,6 +995,37 @@ scope and avoiding dead-end compatibility layers.
   - Reported clean and worth recording: the hand-written `.sqlx` cache entries
     were checked field by field against generated entries for the same queries
     and match exactly, and CI's offline build accepts them.
+- Thirteenth review — a twelfth adversarial round, scoped to the newest commit
+  after two review agents were lost to this environment mid-run. It found that
+  the previous round's fix contained a release blocker:
+  - **`update_member_role`'s new predicate broke every team update.** The
+    eleventh round offered two fixes for its dual-role collision and reasoned
+    that the branch's intent was "promote the member row". It is not: the branch
+    is the `else` of `!current_owner_ids.contains(owner_id)`, so it fires
+    precisely when the user *already* holds an owner row. Scoping the `UPDATE` to
+    `role = 'member'` therefore matched zero rows for the ordinary case, and
+    `fetch_one` turned that into a 500 that rolled back the whole handler. The
+    CLI always sends `owners` as current-owners-plus-delta, so `rise team update`
+    was broken for every team — including the payload that *removes* a co-owner,
+    which now failed after the removal and rolled it back. The right fix was the
+    round's other option: an existing owner needs no write at all. The branch is
+    gone, and the helper with it — its only caller was that branch, and a
+    role-blind `UPDATE` against a `(team_id, user_id, role)` key is a trap for
+    whoever writes the next one.
+  - **The test for the lock still did not test the lock.** The twelfth round
+    caught that the previous round's "fix" moved the hand-rolled sequence into
+    the test body and then claimed in its docstring to drive the handler —
+    reverting `update_team`'s lock still left it green. The guard is now one
+    function, `lock_and_guard_team`, called by both handlers and by the test, so
+    the coupling is structural rather than asserted. Verified by weakening the
+    lock *inside that function* and watching the test fail.
+  - Raised and not taken here: the same pool-read-inside-a-transaction shape
+    exists in `create_project` / `update_project`, once per caller-supplied
+    `app_users` / `app_teams` entry, and `create_team` does not apply the
+    service-account guard that `update_team` enforces. Both are pre-existing,
+    both are outside this increment, and both are now cheap because the executor
+    plumbing exists — but widening a resource-API increment into the project
+    handlers on a review's say-so is the author's call, not the reviewer's.
 - Follow-ups this increment deliberately leaves open:
   - The centralized choke point replacing `require_operator`, the write-time
     grant gate, and seeded `system-admin`/`resource-owner`/`org-admin` data are

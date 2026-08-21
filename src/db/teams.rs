@@ -280,37 +280,6 @@ where
     Ok(())
 }
 
-/// Update member role
-pub async fn update_member_role<'a, E>(
-    executor: E,
-    team_id: Uuid,
-    user_id: Uuid,
-    role: TeamRole,
-) -> Result<TeamMember>
-where
-    E: sqlx::Executor<'a, Database = sqlx::Postgres>,
-{
-    let role_str = role.to_string();
-
-    let member = sqlx::query_as!(
-        TeamMember,
-        r#"
-        UPDATE team_members
-        SET role = $3
-        WHERE team_id = $1 AND user_id = $2 AND role = 'member'
-        RETURNING team_id, user_id, role as "role: TeamRole", created_at
-        "#,
-        team_id,
-        user_id,
-        role_str
-    )
-    .fetch_one(executor)
-    .await
-    .context("Failed to update member role")?;
-
-    Ok(member)
-}
-
 /// Check if user is team owner
 pub async fn is_owner(pool: &PgPool, team_id: Uuid, user_id: Uuid) -> Result<bool> {
     let result = sqlx::query!(

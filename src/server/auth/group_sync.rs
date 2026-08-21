@@ -215,11 +215,11 @@ mod tests {
     /// read can land between the takeover's purge and its commit. Postgres takes
     /// no gap lock, so an insert would survive a delete it never saw.
     ///
-    /// This drives the handler's own sequence — lock, re-read, evaluate the
-    /// guard — rather than a hand-rolled read, so reverting the lock in
-    /// `update_team` fails it. Asserting only that *some* locked read saw the
-    /// takeover would pass against the unlocked handler, which is the bar this
-    /// test previously missed.
+    /// It calls `lock_and_guard_team` — the function the handlers themselves
+    /// call — rather than reproducing its steps, so reverting the lock inside
+    /// that function fails this test. An earlier version hand-rolled the
+    /// sequence and stayed green when the handler changed, which is the whole
+    /// failure mode being guarded against here.
     #[sqlx::test]
     async fn a_takeover_blocks_the_membership_api_guard(pool: PgPool) {
         let squatter = users::create(&pool, "squatter@example.com").await.unwrap();
@@ -244,16 +244,17 @@ mod tests {
         let team_id = team.id;
         let squatter_id = squatter.id;
         let writer_pool = pool.clone();
-        // `update_team`'s sequence for a non-admin caller: begin, lock, re-read,
-        // evaluate the guard. It must refuse, which it can only do by having
-        // seen the committed takeover.
+        // The membership API's own guard — `lock_and_guard_team`, the function
+        // both `update_team` and `delete_team` call — not a copy of it. Revert
+        // the lock inside that function and this fails.
         let writer = async move {
             let mut tx = writer_pool.begin().await.unwrap();
-            let locked = teams::find_by_id_for_update(&mut *tx, team_id)
-                .await
-                .unwrap()
-                .expect("the team exists");
-            let refused = locked.idp_managed; // `&& !is_admin`, and the squatter is not one
+            let refused = crate::server::team::handlers::lock_and_guard_team(
+                &mut tx, team_id, false, // the squatter is not an admin
+                "modify",
+            )
+            .await
+            .is_err();
             if !refused {
                 teams::add_member(&mut *tx, team_id, squatter_id, TeamRole::Member)
                     .await

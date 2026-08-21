@@ -15,6 +15,39 @@ use axum::{
 };
 use uuid::Uuid;
 
+/// Take the team's row lock, re-read it, and apply the IdP-managed guard.
+///
+/// Both `update_team` and `delete_team` decide on `idp_managed`, and an IdP
+/// takeover is three statements long (purge, flag, commit). Read without the
+/// lock, either guard passes against the pre-takeover row while the takeover is
+/// still uncommitted, and the write that follows lands on a row the takeover has
+/// already changed — an insert PostgreSQL takes no gap lock against, or a delete
+/// that re-evaluates its predicate against the updated tuple.
+///
+/// It lives here, called by both handlers *and* by the race test, so that a
+/// change to the locking rule cannot leave a test asserting a copy of the old
+/// one — which is exactly what happened when the test hand-rolled this sequence.
+pub(crate) async fn lock_and_guard_team(
+    tx: &mut sqlx::PgConnection,
+    team_id: Uuid,
+    is_admin: bool,
+    verb: &str,
+) -> Result<crate::db::models::Team, ServerError> {
+    let team = db_teams::find_by_id_for_update(&mut *tx, team_id)
+        .await
+        .internal_err("Failed to lock team")?
+        .ok_or_else(|| ServerError::not_found("Team not found"))?;
+
+    if team.idp_managed && !is_admin {
+        return Err(ServerError::forbidden(format!(
+            "This team is managed by your Identity Provider. Only administrators can {verb} \
+             IdP-managed teams."
+        )));
+    }
+
+    Ok(team)
+}
+
 pub async fn create_team(
     State(state): State<AppState>,
     auth: AuthContext,
@@ -208,16 +241,7 @@ pub async fn update_team(
         .begin()
         .await
         .internal_err("Failed to start transaction")?;
-    let team = db_teams::find_by_id_for_update(&mut *tx, team.id)
-        .await
-        .internal_err("Failed to lock team")?
-        .ok_or_else(|| ServerError::not_found("Team not found"))?;
-    // Check if team is IdP-managed (only admins can modify)
-    if team.idp_managed && !is_admin {
-        return Err(ServerError::forbidden(
-            "This team is managed by your Identity Provider. Only administrators can modify IdP-managed teams.",
-        ));
-    }
+    let team = lock_and_guard_team(&mut tx, team.id, is_admin, "modify").await?;
 
     // Update name if provided
     let updated_team = if let Some(_name) = payload.name {
@@ -312,17 +336,16 @@ pub async fn update_team(
             }
         }
 
-        // Add new owners
+        // Add new owners. Someone already in `current_owner_ids` needs no write
+        // at all — they hold the owner row this loop would create. Their
+        // *member* row, if they also have one, belongs to the members block
+        // above: the roles are separate rows under the
+        // `(team_id, user_id, role)` key, and a user may deliberately hold both.
         for owner_id in owner_ids {
             if !current_owner_ids.contains(&owner_id) {
                 db_teams::add_member(&mut *tx, team.id, owner_id, TeamRole::Owner)
                     .await
                     .internal_err("Failed to add owner")?;
-            } else {
-                // Update role if already a member but not an owner
-                db_teams::update_member_role(&mut *tx, team.id, owner_id, TeamRole::Owner)
-                    .await
-                    .internal_err("Failed to update member role")?;
             }
         }
     }
@@ -388,17 +411,7 @@ pub async fn delete_team(
         .begin()
         .await
         .internal_err("Failed to start transaction")?;
-    let team = db_teams::find_by_id_for_update(&mut *tx, team.id)
-        .await
-        .internal_err("Failed to lock team")?
-        .ok_or_else(|| ServerError::not_found("Team not found"))?;
-
-    // Check if team is IdP-managed (only admins can delete)
-    if team.idp_managed && !is_admin {
-        return Err(ServerError::forbidden(
-            "This team is managed by your Identity Provider. Only administrators can delete IdP-managed teams.",
-        ));
-    }
+    let team = lock_and_guard_team(&mut tx, team.id, is_admin, "delete").await?;
 
     // Check if team owns any projects
     let owned_project_count = db_projects::count_owned_by_team(&mut *tx, team.id)
