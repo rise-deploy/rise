@@ -865,6 +865,56 @@ scope and avoiding dead-end compatibility layers.
     `org:`-subject bindings the way `group:` ones are confined — both changes to
     the permission model rather than its wiring, and a decision for the ADR
     rather than for a review. The comment at the cascade says so at the seam.
+- Tenth review — a ninth adversarial round, half aimed at the previous round's
+  fix and half sent outside every area the earlier rounds had covered. Both
+  halves found something, and the second found a privilege escalation that has
+  nothing to do with this increment.
+  - **The by-name tie lookup de-indexed itself.** The previous round's new SQL
+    dropped a clause that reads as redundant beside `api_version =
+    'rise.dev/v1alpha1'` — `split_part(api_version, '/', 1) = 'rise.dev'` — but
+    that expression is the *predicate of the partial index*, and PostgreSQL's
+    implication prover cannot derive it from the equality. Without it the lookup
+    sequentially scans `resource_store.resources`, which under `SERIALIZABLE`
+    takes a relation-wide `SIReadLock` and puts every gated identity write in
+    conflict with every other resource write in the install. The existing
+    plan-regression test says in its own comment that it exists so an edit
+    "cannot silently drop to a sequential scan" — the new constant was never
+    added to it. It is now, and the assertion was checked to fail against the
+    de-indexed form.
+  - **A self-service team survived an IdP takeover with its members.** Outside
+    this increment entirely, in the login path: `sync_user_groups` adopts a
+    pre-existing team whose name matches an IdP group, and removed only its
+    *owners*. Team names are first-come, first-served while
+    `allow_team_creation` is on (the default), and an IdP-managed team's
+    membership is what `list_idp_group_names_for_user` reads to grant operator,
+    admin, and platform access by group. So: create the team named after
+    `auth.operator_idp_groups` before anyone in that group has signed in, list
+    yourself as a member, wait for one genuine login, and you hold operator —
+    which on this API means the gate short-circuits and the seeded `system-admin`
+    binding applies to you. Both takeover paths (`group_sync` and the Entra
+    sync) now drop every pre-existing membership; the IdP re-adds its real
+    members as they log in. Reproduced as a test before the fix and after.
+  - **The Organization cascade's cap did not bound the work it exists to bound.**
+    It was tested after the per-kind row loop, and each row in that loop costs a
+    database round-trip, so an Organization with a hundred thousand bindings did
+    all of it before refusing. The cap now runs on the live row count before any
+    per-row work, and the per-row parent fetch is gone — the parent is the
+    Organization, already in hand.
+  - **The cascade's refusal message was the only thing identifying its rows.**
+    Generalizing the phrase to hide stored policy names (previous round) left
+    every record of one cascade reading identically in the audit log. A gated
+    change now carries a `detail` field that `record_gate` logs and the renderer
+    never reads.
+  - **An operator's Organization delete produced no gate record.** Skipping
+    construction for an operator also skipped `record_gate`, whose own doc calls
+    it the only evidence an operator's write was gated at all. The short-circuit
+    logs explicitly now.
+  - Raised, not changed: a typed **admin** can edit an IdP-managed team's
+    membership (`is_admin` bypasses the `idp_managed` guard in the team update
+    handler), which is a second path from admin to operator standing. Admins are
+    documented as bypassing the typed APIs' own checks but *not* as reaching the
+    generic resource API; this route does reach it. Whether an admin should be
+    able to confer operator standing is a product decision, not a review one.
 - Follow-ups this increment deliberately leaves open:
   - The centralized choke point replacing `require_operator`, the write-time
     grant gate, and seeded `system-admin`/`resource-owner`/`org-admin` data are

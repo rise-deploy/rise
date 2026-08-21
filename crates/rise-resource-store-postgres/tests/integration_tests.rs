@@ -4109,6 +4109,26 @@ async fn maximum_identity_index_keys_fit_and_projection_queries_use_their_indexe
     assert!(membership_plan
         .join("\n")
         .contains("group_memberships_user_name"));
+
+    // The by-name form the grant gate uses. It matches the same partial index,
+    // and only because it repeats the index predicate's `split_part` expression
+    // verbatim: PostgreSQL cannot derive that from `api_version = '...'`, so
+    // dropping the seemingly-redundant line de-indexes the lookup entirely and
+    // puts a relation-wide `SIReadLock` on every gated identity write.
+    let by_name_plan: Vec<String> = sqlx::query_scalar(&format!(
+        "EXPLAIN (COSTS OFF) {}",
+        rise_resource_store_postgres::GROUP_TIES_BY_USER_NAME_SQL
+    ))
+    .bind("member")
+    .fetch_all(&mut *connection)
+    .await?;
+    assert!(
+        by_name_plan
+            .join("\n")
+            .contains("group_memberships_user_name"),
+        "{}",
+        by_name_plan.join("\n")
+    );
     Ok(())
 }
 

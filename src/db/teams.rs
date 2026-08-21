@@ -381,25 +381,6 @@ where
     Ok(())
 }
 
-/// Remove all owners from a team (for IdP takeover)
-pub async fn remove_all_owners<'a, E>(executor: E, team_id: Uuid) -> Result<()>
-where
-    E: sqlx::Executor<'a, Database = sqlx::Postgres>,
-{
-    sqlx::query!(
-        r#"
-        DELETE FROM team_members
-        WHERE team_id = $1 AND role = 'owner'
-        "#,
-        team_id
-    )
-    .execute(executor)
-    .await
-    .context("Failed to remove all owners")?;
-
-    Ok(())
-}
-
 /// Get all IdP-managed teams
 pub async fn list_idp_managed<'a, E>(executor: E) -> Result<Vec<Team>>
 where
@@ -468,7 +449,22 @@ where
     Ok(records.into_iter().map(|r| r.name).collect())
 }
 
-/// Remove all members from a team (all roles)
+/// Remove every membership from a team, whatever the role, and report how many
+/// went.
+///
+/// Also used when the IdP takes over a team that already existed. Removing only
+/// the owners is not enough there: an IdP-managed team's membership is *defined*
+/// by the IdP claim, and `list_idp_group_names_for_user` reads that membership
+/// to grant operator, admin, and platform access by group. A member row that
+/// predates the takeover is a group membership nobody in the IdP asserted — and
+/// since anyone may create a team under any unused name while
+/// `allow_team_creation` is on, a surviving row is a self-asserted claim to
+/// whatever that group name confers.
+///
+/// Genuine members are re-added by the sync on their next login, so the purge is
+/// self-healing in the direction that matters: it can cost a real member their
+/// group-derived role until they sign in again, and it cannot give anyone one
+/// they were not granted.
 pub async fn remove_all_team_members<'a, E>(executor: E, team_id: Uuid) -> Result<u64>
 where
     E: sqlx::Executor<'a, Database = sqlx::Postgres>,

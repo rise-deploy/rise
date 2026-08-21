@@ -116,6 +116,19 @@ Merged to `develop`:
     that policy reachable again. Both gates now measure the name's Group ties as
     well as the bindings naming it directly, so reactivating an offboarded
     identity requires holding whatever its Groups grant.
+  - **Security fix, outside the resource API.** When the IdP takes over a team
+    that already existed in Rise — `sync_user_groups` on login, and the Entra
+    sync — every pre-existing membership is now removed, not just the owners.
+    An IdP-managed team's membership grants operator, admin, and platform access
+    by group (`auth.operator_idp_groups` and friends), and team names are
+    first-come, first-served while `teams.allow_team_creation` is on (the
+    default): a user who created a team named after a privileged IdP group and
+    listed themselves in it kept that membership through the takeover and
+    inherited the group's authority. **Operator impact:** if you pre-created
+    teams that later became IdP-managed and relied on their Rise-side
+    memberships, those members lose their group-derived roles until their next
+    login, when the IdP re-asserts them. Members the IdP does not assert are
+    not restored — that is the point.
   - Deleting an `Organization` with more than 64 `Role`/`RoleBinding` resources
     beneath it is refused with `409` for a non-operator: each one has to be
     weighed against the writer's authority, and more than that cannot be done in

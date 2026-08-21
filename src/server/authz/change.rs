@@ -40,6 +40,11 @@ use crate::server::error::ServerError;
 /// a refusal may be shown to the caller.
 pub struct GatedChange {
     pub operation: String,
+    /// Extra identification for the audit record only, never rendered to the
+    /// caller. Set where the caller-facing `operation` had to be generalized to
+    /// avoid naming stored data — without it, every record of one cascade reads
+    /// identically.
+    pub detail: Option<String>,
     pub change: AuthorizationChange,
     /// Whether this change's recipients and domains were reconstructed from the
     /// request or read out of stored policy. See [`Disclosure`].
@@ -107,6 +112,7 @@ pub async fn change_for_create(
         // policy, in any organization.
         ROLE_KIND | PLATFORM_ROLE_KIND => vec![GatedChange {
             operation: format!("creating {kind} '{name}'"),
+            detail: None,
             disclosure: Disclosure::NONE,
             change: AuthorizationChange::RoleBody(RoleBodyChange {
                 kind: role_ref_kind(kind),
@@ -120,6 +126,7 @@ pub async fn change_for_create(
         // spec the caller just sent.
         ROLE_BINDING_KIND | PLATFORM_ROLE_BINDING_KIND => vec![GatedChange {
             operation: format!("creating {kind} '{name}'"),
+            detail: None,
             disclosure: Disclosure::FROM_REQUEST,
             change: AuthorizationChange::Binding(BindingChange {
                 before: None,
@@ -137,6 +144,7 @@ pub async fn change_for_create(
             let (user, group) = membership_edge(ctx, name, parent).await?;
             vec![GatedChange {
                 operation: format!("adding {user} to {group}"),
+                detail: None,
                 // The recipient is the User the request named, but the domains
                 // are every stored binding that names the Group — their scopes
                 // and selectors are policy the caller may hold no read on.
@@ -155,6 +163,7 @@ pub async fn change_for_create(
             } else {
                 vec![GatedChange {
                     operation: format!("mapping an external identity onto {identity}"),
+                    detail: None,
                     // A User's claims are expanded over its live Group ties, so
                     // even the recipients are read out of the store.
                     disclosure: Disclosure::NONE,
@@ -169,6 +178,7 @@ pub async fn change_for_create(
             let identity = parent_identity(ctx, kind, parent).await?;
             vec![GatedChange {
                 operation: format!("trusting an external issuer for {identity}"),
+                detail: None,
                 // A Controller or ServiceAccount holds no Group ties, so the
                 // recipient is the identity the request addressed — but the
                 // domains still come from stored bindings.
@@ -193,6 +203,7 @@ pub async fn change_for_create(
                 let identity: SubjectId = subject("user", None, name)?;
                 vec![GatedChange {
                     operation: format!("creating {identity}"),
+                    detail: None,
                     disclosure: Disclosure::NONE,
                     change: AuthorizationChange::IdentityMapping(IdentityMappingChange {
                         identity,
@@ -222,6 +233,7 @@ pub async fn change_for_update(
     Ok(match kind {
         ROLE_KIND | PLATFORM_ROLE_KIND => vec![GatedChange {
             operation: format!("editing {kind} '{}'", row.name),
+            detail: None,
             disclosure: Disclosure::NONE,
             change: AuthorizationChange::RoleBody(RoleBodyChange {
                 kind: role_ref_kind(kind),
@@ -235,6 +247,7 @@ pub async fn change_for_update(
         // a rejection cannot say which universe it came from.
         ROLE_BINDING_KIND | PLATFORM_ROLE_BINDING_KIND => vec![GatedChange {
             operation: format!("editing {kind} '{}'", row.name),
+            detail: None,
             disclosure: Disclosure::NONE,
             change: AuthorizationChange::Binding(BindingChange {
                 before: Some(Box::new(binding_state(
@@ -256,6 +269,7 @@ pub async fn change_for_update(
                 let identity: SubjectId = subject("user", None, &row.name)?;
                 vec![GatedChange {
                     operation: format!("activating {identity}"),
+                    detail: None,
                     disclosure: Disclosure::NONE,
                     change: AuthorizationChange::IdentityMapping(IdentityMappingChange {
                         identity,
@@ -273,6 +287,7 @@ pub async fn change_for_update(
                 let identity = parent_identity(ctx, kind, parent.as_ref()).await?;
                 vec![GatedChange {
                     operation: format!("activating an external identity mapping onto {identity}"),
+                    detail: None,
                     disclosure: Disclosure::NONE,
                     change: AuthorizationChange::IdentityMapping(IdentityMappingChange {
                         identity,
@@ -325,7 +340,7 @@ pub async fn change_for_delete(
     if row.api_version == API_VERSION_V1ALPHA1 && row.kind == ORGANIZATION_KIND {
         return cascaded_policy_deletions(ctx, row).await;
     }
-    policy_row_deletion(ctx, row).await
+    policy_row_deletion(ctx, row, None).await
 }
 
 /// The gated change deleting one policy row produces, or nothing for a row that
@@ -334,16 +349,24 @@ pub async fn change_for_delete(
 async fn policy_row_deletion(
     ctx: &AuthorizationContext,
     row: &ResourceRow,
+    known_parent: Option<&ResourceRow>,
 ) -> Result<AuthorizationChangeSet, ServerError> {
     if !is_policy_kind(&row.api_version, &row.kind) {
         return Ok(Vec::new());
     }
-    let parent = parent_row(ctx, row).await?;
-    let organization = organization_of(ctx, parent.as_ref()).await?;
+    // The cascade already holds the parent; fetching it again would be one
+    // round-trip per row on the transaction's single connection for a value
+    // that cannot differ.
+    let fetched = match known_parent {
+        Some(_) => None,
+        None => parent_row(ctx, row).await?,
+    };
+    let organization = organization_of(ctx, known_parent.or(fetched.as_ref())).await?;
     let kind = row.kind.as_str();
     Ok(match kind {
         ROLE_KIND | PLATFORM_ROLE_KIND => vec![GatedChange {
             operation: format!("deleting {kind} '{}'", row.name),
+            detail: None,
             disclosure: Disclosure::NONE,
             change: AuthorizationChange::RoleBody(RoleBodyChange {
                 kind: role_ref_kind(kind),
@@ -355,6 +378,7 @@ async fn policy_row_deletion(
         }],
         ROLE_BINDING_KIND | PLATFORM_ROLE_BINDING_KIND => vec![GatedChange {
             operation: format!("deleting {kind} '{}'", row.name),
+            detail: None,
             disclosure: Disclosure::NONE,
             change: AuthorizationChange::Binding(BindingChange {
                 before: Some(Box::new(binding_state(
@@ -382,63 +406,90 @@ async fn cascaded_policy_deletions(
     ctx: &AuthorizationContext,
     organization: &ResourceRow,
 ) -> Result<AuthorizationChangeSet, ServerError> {
-    // An operator's every claim is permitted, so building the set would be
-    // work whose only output the gate discards. This mirrors the gate's own
+    // An operator's every claim is permitted, so building the set would be work
+    // whose only output the gate discards. This mirrors the gate's own
     // short-circuit rather than adding a second one: if that short-circuit ever
-    // goes, this must go with it.
+    // goes, this must go with it. It is logged because skipping construction
+    // also skips `record_gate`, and an operator delete that produced no
+    // evidence of having been weighed would be the one gap in the trail.
     if ctx.is_operator() {
+        tracing::info!(
+            target: "rise::audit",
+            actor = %ctx.actor(),
+            subject = %ctx.subject(),
+            operation = %format!("deleting Organization '{}'", organization.name),
+            operator = true,
+            "resource.grant_gate_skipped"
+        );
         return Ok(Vec::new());
     }
-    let mut changes = Vec::new();
+
+    // Both listings first, and the cap before any per-row work. `list` has no
+    // `LIMIT`, and each row the loop below touches costs the gate a full load of
+    // the binding universe — so a cap tested after the loop would let a large
+    // Organization run the whole cost before refusing, which is the statement
+    // timeout inside a `SERIALIZABLE` transaction that the cap exists to avoid.
+    let mut live = Vec::new();
     for kind in [ROLE_KIND, ROLE_BINDING_KIND] {
         let rows = ctx
             .store()
             .list(API_VERSION_V1ALPHA1, kind, Some(organization.uid))
             .await
             .map_err(crate::server::resources::error_map::store_error_to_server_error)?;
-        for row in rows {
-            // A tombstoned row stopped applying when it was tombstoned — the
-            // engine filters bindings on liveness, not on collection — so
-            // removing it delegates nothing. Diffing it would charge the writer
-            // for authority that is already gone and make an Organization
-            // holding one undeletable.
-            if row.deletion_timestamp.is_some() {
-                continue;
-            }
-            changes.push(cascade_operation(
-                organization,
-                policy_row_deletion(ctx, &row).await?,
-            ));
-        }
-        // Each change costs the gate a full load of the binding universe, so a
-        // large Organization is refused rather than allowed to degrade into a
-        // statement timeout inside a `SERIALIZABLE` transaction — which would
-        // make the Organization undeletable *and* cost every concurrent policy
-        // write its serialization race.
-        if changes.len() > MAX_CASCADED_POLICY_ROWS {
-            return Err(ServerError::conflict(format!(
-                "deleting Organization '{}' would delete more than {MAX_CASCADED_POLICY_ROWS} \
-                 policy resources beneath it, which is more than one write can weigh; \
-                 remove them first",
-                organization.name
-            )));
-        }
+        // A tombstoned row stopped applying when it was tombstoned — the engine
+        // filters bindings on liveness, not on collection — so removing it
+        // delegates nothing. Diffing it would charge the writer for authority
+        // that is already gone and make an Organization holding a draining Deny
+        // undeletable.
+        live.extend(
+            rows.into_iter()
+                .filter(|row| row.deletion_timestamp.is_none()),
+        );
     }
-    Ok(changes.into_iter().flatten().collect())
+    if live.len() > MAX_CASCADED_POLICY_ROWS {
+        return Err(ServerError::conflict(format!(
+            "deleting Organization '{}' would delete {} policy resources beneath it, more than \
+             the {MAX_CASCADED_POLICY_ROWS} one write can weigh against your own authority; \
+             delete them first, or have an operator perform this delete",
+            organization.name,
+            live.len()
+        )));
+    }
+
+    let mut changes = Vec::new();
+    for row in &live {
+        // The parent is `organization`, already in hand: re-fetching it per row
+        // would be a database round-trip each, on the transaction's one
+        // connection, for a value that cannot differ.
+        changes.extend(cascade_detail(
+            row,
+            organization,
+            policy_row_deletion(ctx, row, Some(organization)).await?,
+        ));
+    }
+    Ok(changes)
 }
 
 /// How many policy rows an Organization delete may cascade over before it is
 /// refused rather than weighed. See [`cascaded_policy_deletions`].
+///
+/// The bound is the gate's, not the listing's: each change costs two full loads
+/// of the binding universe, so this is a few hundred queries rather than a few
+/// hundred thousand. An operator is never subject to it.
 const MAX_CASCADED_POLICY_ROWS: usize = 64;
 
 /// Re-word a cascaded row's refusal so it names the Organization the caller
-/// addressed rather than a policy row they may never have been able to read.
+/// addressed rather than a policy row they may never have been able to read,
+/// and put the row's identity where only the audit record can reach it.
 ///
 /// The operation phrase is prepended to every refusal outside any `Disclosure`
 /// check, so a per-row phrase here would hand back the canonical name of stored
 /// policy to a caller holding `delete` on the Organization and no read on what
-/// is inside it. The per-row detail stays in the audit record.
-fn cascade_operation(
+/// is inside it. But the phrase was also the only thing distinguishing one
+/// cascaded record from another, so the identity moves to `detail`, which
+/// `record_gate` logs and the renderer never reads.
+fn cascade_detail(
+    row: &ResourceRow,
     organization: &ResourceRow,
     changes: AuthorizationChangeSet,
 ) -> AuthorizationChangeSet {
@@ -449,6 +500,7 @@ fn cascade_operation(
                 "deleting Organization '{}', which deletes the policy beneath it",
                 organization.name
             ),
+            detail: Some(format!("{} '{}'", row.kind, row.name)),
             ..gated
         })
         .collect()
@@ -538,6 +590,7 @@ pub fn label_changes(
                 Some(value) => format!("setting label '{key}' to '{value}'"),
                 None => "removing an access-driving label".to_owned(),
             },
+            detail: Some(format!("label '{key}'")),
             disclosure: label_disclosure(),
             change: AuthorizationChange::Label(LabelChange {
                 target: target.clone(),

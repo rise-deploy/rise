@@ -477,6 +477,7 @@ impl AuthorizationContext {
     pub async fn gate(
         &self,
         operation: &str,
+        detail: Option<&str>,
         change: &rise_authz::engine::AuthorizationChange,
         disclosure: Disclosure,
     ) -> Result<(), ServerError> {
@@ -485,7 +486,7 @@ impl AuthorizationContext {
             .evaluate_grant(&self.snapshot, change)
             .await
             .map_err(authorization_error_to_server_error)?;
-        self.record_gate(operation, &outcome);
+        self.record_gate(operation, detail, &outcome);
         if outcome.permitted() {
             return Ok(());
         }
@@ -502,12 +503,13 @@ impl AuthorizationContext {
     /// facts about *stored* policy and topology, so this is where they belong:
     /// legible to a reader with access to the audit stream, and not echoed back
     /// to a caller who may hold no read access to any of it.
-    fn record_gate(&self, operation: &str, outcome: &GateOutcome) {
+    fn record_gate(&self, operation: &str, detail: Option<&str>, outcome: &GateOutcome) {
         tracing::info!(
             target: "rise::audit",
             actor = %self.actor,
             subject = %self.subject(),
             operation,
+            detail,
             operator = self.is_operator(),
             attempt = self.attempt,
             claims = outcome.claims.len(),

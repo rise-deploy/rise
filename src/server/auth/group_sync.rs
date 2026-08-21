@@ -10,7 +10,7 @@ use crate::db::{models::TeamRole, teams};
 /// 1. Creates teams that don't exist in Rise
 /// 2. Marks teams as IdP-managed
 /// 3. Updates team names to match IdP case (IdP is source of truth)
-/// 4. Removes all owners when a team becomes IdP-managed
+/// 4. Removes every pre-existing membership when a team becomes IdP-managed
 /// 5. Adds user to all groups in the IdP claim
 /// 6. Removes user from IdP-managed teams NOT in the claim
 ///
@@ -55,21 +55,33 @@ pub async fn sync_user_groups(pool: &PgPool, user_id: Uuid, idp_groups: &[String
                     .context("Failed to update team name")?;
             }
 
-            // If team wasn't IdP-managed before, convert it
+            // If team wasn't IdP-managed before, convert it.
+            //
+            // Every existing membership goes, not just the owners. An
+            // IdP-managed team's membership is what grants operator, admin, and
+            // platform access by group (`auth.operator_idp_groups` and friends,
+            // via `list_idp_group_names_for_user`) — and any authenticated user
+            // may create a team under any unused name while
+            // `allow_team_creation` is on. So a member row that survives the
+            // takeover is a claim to that group's authority that nobody in the
+            // IdP ever asserted: create `rise-operators` before anyone in it
+            // signs in, list yourself as a member, and the first genuine login
+            // hands you operator standing. Real members are re-added on their
+            // own next login.
             if !team.idp_managed {
-                tracing::info!(
-                    "Converting team '{}' to IdP-managed (removing all owners)",
-                    group_name
-                );
+                let dropped = teams::remove_all_team_members(&mut *tx, team.id)
+                    .await
+                    .context("Failed to clear pre-existing team members")?;
+                if dropped > 0 {
+                    tracing::warn!(
+                        team = %group_name,
+                        dropped_memberships = dropped,
+                        "Converting a self-service team to IdP-managed; dropping its                          pre-existing memberships, which the IdP never asserted"
+                    );
+                }
                 teams::set_idp_managed(&mut *tx, team.id, true)
                     .await
                     .context("Failed to mark team as IdP-managed")?;
-
-                // Remove all owners when team becomes IdP-managed
-                // This ensures IdP has full control over the team
-                teams::remove_all_owners(&mut *tx, team.id)
-                    .await
-                    .context("Failed to remove owners")?;
             }
 
             team.id
@@ -136,4 +148,61 @@ pub async fn sync_user_groups(pool: &PgPool, user_id: Uuid, idp_groups: &[String
     tracing::debug!("Successfully synced IdP groups for user {}", user_id);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::users;
+
+    /// Taking over a self-service team must not leave its members behind.
+    ///
+    /// Team names are first-come, first-served while `allow_team_creation` is
+    /// on, and an IdP-managed team's membership is what grants operator, admin,
+    /// and platform access by group. So a member row that survives the takeover
+    /// is a claim to that group's authority asserted by whoever got to the name
+    /// first — create the team named after `auth.operator_idp_groups` before
+    /// anyone in that group signs in, list yourself in it, and the first genuine
+    /// login makes you an operator.
+    #[sqlx::test]
+    async fn taking_over_a_self_service_team_drops_its_pre_existing_members(pool: PgPool) {
+        let squatter = users::create(&pool, "squatter@example.com").await.unwrap();
+        let genuine = users::create(&pool, "genuine@example.com").await.unwrap();
+
+        // The squatter gets to the name first, as owner and as member.
+        let team = teams::create(&pool, "rise-operators").await.unwrap();
+        teams::add_member(&pool, team.id, squatter.id, TeamRole::Owner)
+            .await
+            .unwrap();
+        teams::add_member(&pool, team.id, squatter.id, TeamRole::Member)
+            .await
+            .unwrap();
+        assert_eq!(
+            teams::list_idp_group_names_for_user(&pool, squatter.id)
+                .await
+                .unwrap(),
+            Vec::<String>::new(),
+            "a self-service team is not an IdP group yet"
+        );
+
+        // A real member of the IdP group logs in, and the team is taken over.
+        sync_user_groups(&pool, genuine.id, &["rise-operators".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            teams::list_idp_group_names_for_user(&pool, genuine.id)
+                .await
+                .unwrap(),
+            vec!["rise-operators".to_string()],
+            "the IdP's own member holds the group"
+        );
+        assert_eq!(
+            teams::list_idp_group_names_for_user(&pool, squatter.id)
+                .await
+                .unwrap(),
+            Vec::<String>::new(),
+            "the squatter must not inherit the group by having claimed the name"
+        );
+    }
 }

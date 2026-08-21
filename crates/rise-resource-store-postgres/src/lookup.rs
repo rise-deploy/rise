@@ -300,6 +300,7 @@ JOIN resource_store.resources organization
  AND organization.parent_uid IS NULL
  AND organization.deletion_timestamp IS NULL
 WHERE membership.api_version = 'rise.dev/v1alpha1'
+  AND split_part(membership.api_version, '/', 1) = 'rise.dev'
   AND membership.kind = 'GroupMembership'
   AND membership.deletion_timestamp IS NULL
   AND membership.name COLLATE "C" = $1 COLLATE "C"

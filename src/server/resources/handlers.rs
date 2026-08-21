@@ -1419,7 +1419,12 @@ async fn run_gate(
 ) -> Result<(), ServerError> {
     for gated in changes {
         authz
-            .gate(&gated.operation, &gated.change, gated.disclosure)
+            .gate(
+                &gated.operation,
+                gated.detail.as_deref(),
+                &gated.change,
+                gated.disclosure,
+            )
             .await?;
     }
     Ok(())
