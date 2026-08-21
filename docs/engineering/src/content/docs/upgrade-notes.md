@@ -121,14 +121,16 @@ Merged to `develop`:
     sync — every pre-existing membership is now removed, not just the owners.
     An IdP-managed team's membership grants operator, admin, and platform access
     by group (`auth.operator_idp_groups` and friends), and team names are
-    first-come, first-served while `teams.allow_team_creation` is on (the
+    first-come, first-served while `auth.allow_team_creation` is on (the
     default): a user who created a team named after a privileged IdP group and
     listed themselves in it kept that membership through the takeover and
     inherited the group's authority. **Operator impact:** if you pre-created
     teams that later became IdP-managed and relied on their Rise-side
     memberships, those members lose their group-derived roles until their next
     login, when the IdP re-asserts them. Members the IdP does not assert are
-    not restored — that is the point.
+    not restored — that is the point. The takeover and the team-membership API
+    now take a row lock on the team, so a membership write cannot slip into the
+    window between the purge and its commit.
   - Deleting an `Organization` with more than 64 `Role`/`RoleBinding` resources
     beneath it is refused with `409` for a non-operator: each one has to be
     weighed against the writer's authority, and more than that cannot be done in

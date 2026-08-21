@@ -465,7 +465,10 @@ async fn sync_group(
     default_organization_uid: Uuid,
 ) -> Result<()> {
     // Find or create the team
-    let existing = teams::find_by_name(&mut **tx, &group.team_name)
+    // Locked for the rest of the transaction — see
+    // `teams::find_by_name_for_update`. The Entra sync's window is the whole
+    // multi-group transaction, so this is the wider of the two races.
+    let existing = teams::find_by_name_for_update(&mut **tx, &group.team_name)
         .await
         .context("Failed to look up team")?;
 
@@ -490,7 +493,8 @@ async fn sync_group(
                 tracing::warn!(
                     team = %group.team_name,
                     dropped_memberships = dropped,
-                    "Converting a self-service team to IdP-managed; dropping its                      pre-existing memberships, which the IdP never asserted"
+                    "Converting a self-service team to IdP-managed; dropping pre-existing \
+                     memberships the IdP never asserted"
                 );
             }
             teams::set_idp_managed(&mut **tx, team.id, true)

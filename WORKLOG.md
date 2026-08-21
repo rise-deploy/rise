@@ -915,6 +915,37 @@ scope and avoiding dead-end compatibility layers.
     documented as bypassing the typed APIs' own checks but *not* as reaching the
     generic resource API; this route does reach it. Whether an admin should be
     able to confer operator standing is a product decision, not a review one.
+- Eleventh review — a tenth adversarial round, asked explicitly to return clean
+  if the work had converged rather than manufacture a finding. It did not
+  converge: the previous round's fix was atomic but not serialized.
+  - **The IdP takeover raced the membership API.** Purging a self-service team's
+    members closes the deterministic path; it does not close the concurrent one.
+    `update_team` read `idp_managed`, decided whether the caller could write, and
+    inserted — three separate autocommit statements against a pool. At
+    `READ COMMITTED` the guard read can land between the takeover's purge and its
+    commit, seeing `idp_managed = false`; PostgreSQL takes no gap lock, so the
+    insert lands on a row the takeover already deleted and survives its commit.
+    The squatter is then a member of an IdP-managed team named after
+    `auth.operator_idp_groups`, which is operator standing, which short-circuits
+    the whole gate. The Entra sync is the practical window — it is scheduled, and
+    its transaction spans every group in the sync rather than milliseconds. Both
+    sides now take a row lock on the team: the takeover through
+    `find_by_name_for_update`, the membership API through
+    `find_by_id_for_update` with every membership write moved onto that
+    transaction. Whichever arrives second blocks and then reads the other's
+    committed state. Reproduced as a failing test — an unlocked read passes the
+    guard against a mid-flight takeover — before the fix and after.
+  - The upgrade note pointed operators at `teams.allow_team_creation`. The
+    setting lives under `auth:`. It is the one actionable knob in a
+    security-impact note, so the wrong stanza would have read as "not present".
+  - Both takeover warnings carried a 20-space run mid-message: `cargo fmt`
+    collapsed a `\`-continued literal and baked the indentation into the string.
+    That warning is the only signal an operator has that memberships were
+    dropped, and the mangling defeats a literal grep.
+  - The round confirmed all four of the previous round's fixes correct as
+    written, and reported the areas it re-checked clean — among them that the
+    diff touches no migration, chart, CRD, config default, CLI, or frontend file,
+    so those angles are vacuous on this branch.
 - Follow-ups this increment deliberately leaves open:
   - The centralized choke point replacing `require_operator`, the write-time
     grant gate, and seeded `system-admin`/`resource-owner`/`org-admin` data are

@@ -35,8 +35,11 @@ pub async fn sync_user_groups(pool: &PgPool, user_id: Uuid, idp_groups: &[String
 
     // Phase 1: Process each group in the IdP claim
     for group_name in idp_groups {
-        // Find existing team (case-insensitive lookup)
-        let existing_team = teams::find_by_name(&mut *tx, group_name)
+        // Locked for the rest of the transaction: the membership API decides
+        // whether a caller may write to a team by reading `idp_managed`, and at
+        // `READ COMMITTED` that read can land between this takeover's purge and
+        // its commit. See `teams::find_by_name_for_update`.
+        let existing_team = teams::find_by_name_for_update(&mut *tx, group_name)
             .await
             .context("Failed to find team by name")?;
 
@@ -76,7 +79,8 @@ pub async fn sync_user_groups(pool: &PgPool, user_id: Uuid, idp_groups: &[String
                     tracing::warn!(
                         team = %group_name,
                         dropped_memberships = dropped,
-                        "Converting a self-service team to IdP-managed; dropping its                          pre-existing memberships, which the IdP never asserted"
+                        "Converting a self-service team to IdP-managed; dropping pre-existing \
+                     memberships the IdP never asserted"
                     );
                 }
                 teams::set_idp_managed(&mut *tx, team.id, true)
@@ -203,6 +207,72 @@ mod tests {
                 .unwrap(),
             Vec::<String>::new(),
             "the squatter must not inherit the group by having claimed the name"
+        );
+    }
+
+    /// The purge alone is not enough: the membership API decides whether a
+    /// caller may write by reading `idp_managed`, and at `READ COMMITTED` that
+    /// read can land between the takeover's purge and its commit. Postgres takes
+    /// no gap lock, so an insert would survive a delete it never saw. Both sides
+    /// take a row lock, so the second one blocks and then sees the first's
+    /// committed state.
+    #[sqlx::test]
+    async fn a_takeover_blocks_a_concurrent_membership_write(pool: PgPool) {
+        let squatter = users::create(&pool, "squatter@example.com").await.unwrap();
+        let genuine = users::create(&pool, "genuine@example.com").await.unwrap();
+        let team = teams::create(&pool, "rise-operators").await.unwrap();
+        teams::add_member(&pool, team.id, squatter.id, TeamRole::Owner)
+            .await
+            .unwrap();
+
+        // A takeover in flight: purged and flagged, not yet committed.
+        let mut takeover = pool.begin().await.unwrap();
+        let locked = teams::find_by_name_for_update(&mut *takeover, "rise-operators")
+            .await
+            .unwrap()
+            .expect("the team exists");
+        teams::remove_all_team_members(&mut *takeover, locked.id)
+            .await
+            .unwrap();
+        teams::set_idp_managed(&mut *takeover, locked.id, true)
+            .await
+            .unwrap();
+
+        // The membership write the API would make, taking the same lock first.
+        // It must not proceed while the takeover holds the row.
+        let writer = async {
+            let mut tx = pool.begin().await.unwrap();
+            let seen = teams::find_by_id_for_update(&mut *tx, team.id)
+                .await
+                .unwrap()
+                .expect("the team exists");
+            // Whatever it does next, it must have seen the committed takeover.
+            assert!(
+                seen.idp_managed,
+                "the writer read a pre-takeover snapshot and would have passed its guard"
+            );
+            tx.rollback().await.unwrap();
+        };
+
+        // The writer cannot make progress until the takeover commits, so
+        // committing is what releases it.
+        tokio::join!(
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                teams::add_member(&mut *takeover, locked.id, genuine.id, TeamRole::Member)
+                    .await
+                    .unwrap();
+                takeover.commit().await.unwrap();
+            },
+            writer
+        );
+
+        assert_eq!(
+            teams::list_idp_group_names_for_user(&pool, squatter.id)
+                .await
+                .unwrap(),
+            Vec::<String>::new(),
+            "the squatter must not have slipped a membership through the window"
         );
     }
 }

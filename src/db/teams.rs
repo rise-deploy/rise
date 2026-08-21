@@ -62,6 +62,54 @@ where
     Ok(team)
 }
 
+/// Find a team by name and hold its row until the caller's transaction ends.
+///
+/// The IdP takeover in `sync_user_groups` / the Entra sync reads a team, purges
+/// its memberships, and sets `idp_managed` — three statements. The membership
+/// API reads `idp_managed`, decides whether the caller may write, and inserts —
+/// also three. At `READ COMMITTED` those interleave: the writer's guard read can
+/// see `idp_managed = false` while the takeover is mid-transaction, and its
+/// insert lands on a row the takeover has already deleted. Postgres takes no gap
+/// lock, so nothing stops it, and the membership survives the commit — which on
+/// an IdP-managed team named after `auth.operator_idp_groups` is operator
+/// standing.
+///
+/// Both sides take this lock, so whichever arrives second blocks and then reads
+/// the other's committed state.
+pub async fn find_by_name_for_update<'a, E>(executor: E, name: &str) -> Result<Option<Team>>
+where
+    E: sqlx::Executor<'a, Database = sqlx::Postgres>,
+{
+    let team = sqlx::query_as!(
+        Team,
+        r#"SELECT id, name, idp_managed, created_at, updated_at FROM teams WHERE LOWER(name) = LOWER($1) FOR UPDATE"#,
+        name
+    )
+    .fetch_optional(executor)
+    .await
+    .context("Failed to lock team by name")?;
+
+    Ok(team)
+}
+
+/// Find a team by id and hold its row until the caller's transaction ends. See
+/// [`find_by_name_for_update`].
+pub async fn find_by_id_for_update<'a, E>(executor: E, id: Uuid) -> Result<Option<Team>>
+where
+    E: sqlx::Executor<'a, Database = sqlx::Postgres>,
+{
+    let team = sqlx::query_as!(
+        Team,
+        r#"SELECT id, name, idp_managed, created_at, updated_at FROM teams WHERE id = $1 FOR UPDATE"#,
+        id
+    )
+    .fetch_optional(executor)
+    .await
+    .context("Failed to lock team by id")?;
+
+    Ok(team)
+}
+
 /// Find team by ID
 pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Team>> {
     let team = sqlx::query_as!(
@@ -224,12 +272,15 @@ where
 }
 
 /// Update member role
-pub async fn update_member_role(
-    pool: &PgPool,
+pub async fn update_member_role<'a, E>(
+    executor: E,
     team_id: Uuid,
     user_id: Uuid,
     role: TeamRole,
-) -> Result<TeamMember> {
+) -> Result<TeamMember>
+where
+    E: sqlx::Executor<'a, Database = sqlx::Postgres>,
+{
     let role_str = role.to_string();
 
     let member = sqlx::query_as!(
@@ -244,7 +295,7 @@ pub async fn update_member_role(
         user_id,
         role_str
     )
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
     .context("Failed to update member role")?;
 

@@ -185,6 +185,26 @@ pub async fn update_team(
         ));
     }
 
+    // From here the team row is locked and every membership write runs on this
+    // one transaction.
+    //
+    // The `idp_managed` guard below and the writes it guards used to be separate
+    // autocommit statements, which let an IdP takeover interleave: the guard
+    // read `false` while `sync_user_groups` was mid-transaction, and the insert
+    // landed on a row the takeover had already purged. Postgres takes no gap
+    // lock, so the membership survived — and on a team named after
+    // `auth.operator_idp_groups`, a membership is operator standing. Both sides
+    // now lock the row, so whichever arrives second reads the other's committed
+    // state.
+    let mut tx = state
+        .db_pool
+        .begin()
+        .await
+        .internal_err("Failed to start transaction")?;
+    let team = db_teams::find_by_id_for_update(&mut *tx, team.id)
+        .await
+        .internal_err("Failed to lock team")?
+        .ok_or_else(|| ServerError::not_found("Team not found"))?;
     // Check if team is IdP-managed (only admins can modify)
     if team.idp_managed && !is_admin {
         return Err(ServerError::forbidden(
@@ -219,14 +239,9 @@ pub async fn update_team(
         // Remove members that are no longer in the list
         for current_member_id in &current_member_ids {
             if !member_ids.contains(current_member_id) {
-                db_teams::remove_member(
-                    &state.db_pool,
-                    team.id,
-                    *current_member_id,
-                    TeamRole::Member,
-                )
-                .await
-                .internal_err("Failed to remove member")?;
+                db_teams::remove_member(&mut *tx, team.id, *current_member_id, TeamRole::Member)
+                    .await
+                    .internal_err("Failed to remove member")?;
             }
         }
 
@@ -246,7 +261,7 @@ pub async fn update_team(
         // Add new members
         for member_id in member_ids {
             if !current_member_ids.contains(&member_id) {
-                db_teams::add_member(&state.db_pool, team.id, member_id, TeamRole::Member)
+                db_teams::add_member(&mut *tx, team.id, member_id, TeamRole::Member)
                     .await
                     .internal_err("Failed to add member")?;
             }
@@ -271,14 +286,9 @@ pub async fn update_team(
         // Remove owners that are no longer in the list
         for current_owner_id in &current_owner_ids {
             if !owner_ids.contains(current_owner_id) {
-                db_teams::remove_member(
-                    &state.db_pool,
-                    team.id,
-                    *current_owner_id,
-                    TeamRole::Owner,
-                )
-                .await
-                .internal_err("Failed to remove owner")?;
+                db_teams::remove_member(&mut *tx, team.id, *current_owner_id, TeamRole::Owner)
+                    .await
+                    .internal_err("Failed to remove owner")?;
             }
         }
 
@@ -298,12 +308,12 @@ pub async fn update_team(
         // Add new owners
         for owner_id in owner_ids {
             if !current_owner_ids.contains(&owner_id) {
-                db_teams::add_member(&state.db_pool, team.id, owner_id, TeamRole::Owner)
+                db_teams::add_member(&mut *tx, team.id, owner_id, TeamRole::Owner)
                     .await
                     .internal_err("Failed to add owner")?;
             } else {
                 // Update role if already a member but not an owner
-                db_teams::update_member_role(&state.db_pool, team.id, owner_id, TeamRole::Owner)
+                db_teams::update_member_role(&mut *tx, team.id, owner_id, TeamRole::Owner)
                     .await
                     .internal_err("Failed to update member role")?;
             }
@@ -311,6 +321,10 @@ pub async fn update_team(
     }
 
     // Fetch updated members and owners
+    tx.commit()
+        .await
+        .internal_err("Failed to commit team update")?;
+
     let members = db_teams::get_members(&state.db_pool, updated_team.id)
         .await
         .internal_err("Failed to get team members")?;
