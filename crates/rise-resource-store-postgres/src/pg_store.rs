@@ -492,6 +492,16 @@ impl PgResourceStore {
     /// entered deletion. Structural children are updated first, so a resource
     /// that is both a structural child and an owner-reference dependent emits
     /// one event with the structural relationship.
+    /// The immutable seeds, as the `Kind/name` identities the cascade's SQL
+    /// compares against. Derived from the one declaration so a third seed cannot
+    /// be added without the cascade learning about it.
+    fn immutable_seed_identities() -> Vec<String> {
+        rise_resource_api::IMMUTABLE_POLICY_SEEDS
+            .iter()
+            .map(|(kind, name)| format!("{kind}/{name}"))
+            .collect()
+    }
+
     async fn tombstone_immediate_dependents(
         conn: &mut sqlx::PgConnection,
         owner_uid: Uuid,
@@ -512,6 +522,13 @@ impl PgResourceStore {
         .await
         .map_err(Self::db_error)?;
 
+        // A root-parented immutable seed is exempt. `delete` refuses to remove
+        // one directly (ADR-0001 §5 fixes the operator pair), and an
+        // owner-reference edge must not become the way around that: the edge is
+        // attached by an ordinary write, so honouring it here would let the one
+        // row with no recovery authority above it be collected through a
+        // resource someone else controls. A structural child cannot be a seed —
+        // both seeds are root-parented — so only this arm needs the exemption.
         let referenced = sqlx::query_as::<_, TombstonedDependentRow>(
             r#"
             UPDATE resource_store.resources
@@ -521,6 +538,11 @@ impl PgResourceStore {
                     jsonb_build_object('uid', $1::text)
                 )
               AND deletion_timestamp IS NULL
+              AND NOT (
+                    parent_uid IS NULL
+                AND api_version = $2
+                AND (kind || '/' || name) = ANY($3)
+              )
             RETURNING uid, api_version, kind, name,
                       owner_references @> jsonb_build_array(
                           jsonb_build_object(
@@ -531,6 +553,8 @@ impl PgResourceStore {
             "#,
         )
         .bind(owner_uid)
+        .bind(API_VERSION_V1ALPHA1)
+        .bind(Self::immutable_seed_identities())
         .fetch_all(&mut *conn)
         .await
         .map_err(Self::db_error)?;
@@ -2340,6 +2364,8 @@ impl ResourceStore for PgResourceStore {
         // fail only when that version is first used.
         Self::validate_version_schemas(&spec, &format!("'{}'", params.name))?;
 
+        Self::reject_reserved_finalizer_change(&[], &params.finalizers)?;
+
         let mut connection = self.connection().await?;
         let mut tx = connection.begin().await.map_err(Self::db_error)?;
         if !params.owner_references.is_empty() {
@@ -2428,6 +2454,7 @@ impl ResourceStore for PgResourceStore {
                 "resource is not a ResourceDefinition".to_string(),
             ));
         }
+        Self::reject_reserved_finalizer_change(&current.finalizers, &params.finalizers)?;
 
         // Enforce immutability of identity fields
         let old_spec: ResourceDefinitionSpec = serde_json::from_value(current.spec.clone())

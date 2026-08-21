@@ -92,6 +92,14 @@ here. Access for anyone other than an operator comes from a binding.
 
 ### Authorization-changing writes
 
+Attaching a `metadata.ownerReferences` entry is authorized separately, because
+the edge is not inert: deleting the owner starts deletion of the dependent. A
+*new* reference requires `use` on the owner — §2's verb for referencing a
+resource from another resource's fields — and, when the dependent already
+exists, `delete` on the dependent, since the edge is what makes it deletable
+through someone else's resource. Re-sending references that are already stored
+is an ordinary read-modify-write.
+
 A write that changes who can do what — a `Role` or `PlatformRole` body, a
 binding, a `GroupMembership`, an identity or trust mapping, or a label some
 binding selects on — additionally passes ADR-0001 §5's **grant gate**: the
@@ -291,9 +299,10 @@ including its deletion timestamp and finalizers. The response also reports
 whether `system.rise.dev/cascade-deletion` is currently present. This
 subresource is authorized by `(get, Kind, deletion-blockers)` on the resource
 being blocked, and computed from the canonical resource rows; it does not
-maintain a separate blocker table. Naming the blockers is the whole point of it,
-so the response identifies them whether or not the caller could `list` or `get`
-those children individually — grant the subresource with that in mind.
+maintain a separate blocker table. The blockers are filtered per item like any
+other collection: one the caller cannot `list` is counted in `hiddenBlockers`
+rather than named, so the report never reads as "nothing is blocking this" while
+something is.
 
 ## Status codes
 

@@ -1239,6 +1239,70 @@ idempotent when a read-modify-write client replays the stored spec.
     Naming them is the whole content of the grant; the alternative is a
     subresource that reports "something blocks this" and nothing more. Now
     documented at the grant.
+- Third review — a second adversarial round, over the fixed code and treating
+  the fixes themselves as unreviewed surface. Seven findings, all fixed here;
+  two of them were in the previous round's fixes:
+  - **An owner reference turned `update` into `delete`.** Attaching one grants
+    the dependent nothing (ADR-0001 §1), but deleting the owner starts deletion
+    of the dependent and the collector finishes it. So `update` on a resource
+    plus `delete` on anything the caller owns composed into `delete` on that
+    resource: attach the victim as a dependent of something you own, delete
+    your own resource, and the victim goes with it — no gate, no `delete` check
+    on the victim, and an audit trail that never names it. A `Deny` on `delete`
+    was bypassable this way, and so was the write-time gate on a Deny-bearing
+    binding, whose spec never changed. Attaching a *new* owner reference now
+    requires `use` on the owner — §2's verb for referencing a resource from
+    another's fields — and, when the dependent already exists, `delete` on the
+    dependent, which is the authority the edge actually confers.
+  - **The cascade did not honour the immutable seeds.** `delete` refuses to
+    remove `PlatformRole/system-admin` or its binding, but the owner-reference
+    cascade tombstoned by UID with no such check — so the one pair with no
+    recovery authority above it was collectable through a resource someone else
+    controls. The cascade now exempts them, from the same
+    `IMMUTABLE_POLICY_SEEDS` declaration rather than a second copy of the names.
+  - **The disclosure classification was wrong for two change shapes.** A
+    `GroupMembership` gate's domains come from `authored_domains` — every stored
+    binding naming the Group — and a `UserIdentity` gate's *recipients* are
+    expanded from the User's live ties. Both were marked as coming from the
+    request, so the refusal rendered exactly the stored topology the previous
+    round's fix existed to suppress. Membership and trust-policy writes are now
+    recipient-only; identity mappings and activations disclose neither.
+  - **The `ResourceDefinition` write paths bypassed the reserved-finalizer
+    screen.** It was wired into `create` and `update`, and an RD goes through
+    `register_resource_definition` / `update_resource_definition` instead. A
+    `create` could plant `system.rise.dev/*` on a definition and freeze its
+    schema, parent, and controller allowlist permanently — every removal route,
+    operators included, refuses a reserved name. Both entry points now screen it.
+  - **The create response was the one write not projected.** Every other write
+    path answers at the granularity the caller may read; `create` returned the
+    full envelope, disclosing the server-assigned UID (the input the owner
+    reference attack needs), inherited `effectiveLabels`, and — for a policy
+    kind — the contextual normalization admission applied to the spec.
+  - **`deletion-blockers` returned an unfiltered child inventory.** Because §3
+    makes a subresource statement grant *only* subresources, a Role written for
+    subresource work confers `(get, Organization, deletion-blockers)` while
+    conferring no `list` on anything — and the response named every child by
+    kind, name, and UID, both directly addressable. Every other collection-shaped
+    response in this increment is filtered per item; this one now is too, and
+    what is withheld is counted rather than silently dropped, because a report
+    that omits blockers reads as "nothing is blocking this".
+  - **An inactive `User` still yielded live Group ties.** The lookup filtered
+    only on the tombstone. ADR-0001 §1 makes an inactive User unable to log in
+    and fails every token already issued for them, and it is the premise the
+    activation gate rests on, so the tie path has to agree.
+  - Recorded rather than fixed, with reasons: a refusal still names the *tuples*
+    the writer cannot justify even when the recipient and domain are suppressed,
+    so a caller can learn which of a Role's statements exceed their own
+    authority. That is a verb and a kind, never an identity or a path, and it is
+    what makes a refusal actionable at all; if Role bodies are ever meant to be
+    confidential, `Disclosure` needs a third axis rather than a special case.
+  - Raised against increment 9a's algebra and deliberately not changed here:
+    `aggregate` credits a recipient's `before` policy with org-tier bindings
+    that §1's recipient boundary makes inert for a non-member, which shrinks the
+    delta a membership write has to justify. 9a chose provable-reach aggregation
+    deliberately, and scenario 29 depends on it; revising it is a change to the
+    gate's model, not to its wiring, and belongs with the conformance work in
+    increment 11 where the scenario suite can hold it.
 - Follow-ups this increment deliberately leaves open:
   - **Group-targeted policy is dark until identity resources exist.** Ties
     resolve against `User` and `Group` resources that no login path writes yet,

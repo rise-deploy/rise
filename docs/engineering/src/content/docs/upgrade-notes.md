@@ -79,6 +79,12 @@ Merged to `develop`:
   - A listing under an ancestor that does not exist returns an empty collection
     rather than `404`, so the ancestor path is not enumerable by name. Item
     paths and creates under a missing ancestor still fail.
+  - Attaching a new `metadata.ownerReferences` entry now requires `use` on the
+    owner, and — when the dependent already exists — `delete` on the dependent.
+    Deleting an owner starts deletion of its dependents, so attaching the edge
+    confers that; re-sending already-stored references is unaffected.
+  - `deletion-blockers` filters its blockers per item and reports a
+    `hiddenBlockers` count for those the caller cannot `list`.
   - An item a caller can `list` but not `get` is returned projected onto
     `apiVersion`, `kind`, and the `metadata` fields `name`, `labels`,
     `effectiveLabels`, and `deletionTimestamp` — no `spec`, `status`, `uid`,

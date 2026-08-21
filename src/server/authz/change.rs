@@ -137,8 +137,10 @@ pub async fn change_for_create(
             let (user, group) = membership_edge(ctx, name, parent).await?;
             vec![GatedChange {
                 operation: format!("adding {user} to {group}"),
-                // Both halves of the edge are named by the request's own path.
-                disclosure: Disclosure::FROM_REQUEST,
+                // The recipient is the User the request named, but the domains
+                // are every stored binding that names the Group — their scopes
+                // and selectors are policy the caller may hold no read on.
+                disclosure: Disclosure::RECIPIENT_ONLY,
                 change: AuthorizationChange::GroupMembership(GroupMembershipChange { user, group }),
             }]
         }
@@ -153,8 +155,9 @@ pub async fn change_for_create(
             } else {
                 vec![GatedChange {
                     operation: format!("mapping an external identity onto {identity}"),
-                    // The identity is the parent the request addressed.
-                    disclosure: Disclosure::FROM_REQUEST,
+                    // A User's claims are expanded over its live Group ties, so
+                    // even the recipients are read out of the store.
+                    disclosure: Disclosure::NONE,
                     change: AuthorizationChange::IdentityMapping(IdentityMappingChange {
                         identity,
                         confers_operator: confers_operator_standing(&parsed),
@@ -166,7 +169,10 @@ pub async fn change_for_create(
             let identity = parent_identity(ctx, kind, parent).await?;
             vec![GatedChange {
                 operation: format!("trusting an external issuer for {identity}"),
-                disclosure: Disclosure::FROM_REQUEST,
+                // A Controller or ServiceAccount holds no Group ties, so the
+                // recipient is the identity the request addressed — but the
+                // domains still come from stored bindings.
+                disclosure: Disclosure::RECIPIENT_ONLY,
                 change: AuthorizationChange::IdentityMapping(IdentityMappingChange {
                     identity,
                     confers_operator: false,
@@ -228,7 +234,7 @@ pub async fn change_for_update(
                 let identity: SubjectId = subject("user", None, &row.name)?;
                 vec![GatedChange {
                     operation: format!("activating {identity}"),
-                    disclosure: Disclosure::FROM_REQUEST,
+                    disclosure: Disclosure::NONE,
                     change: AuthorizationChange::IdentityMapping(IdentityMappingChange {
                         identity,
                         confers_operator: false,
@@ -245,7 +251,7 @@ pub async fn change_for_update(
                 let identity = parent_identity(ctx, kind, parent.as_ref()).await?;
                 vec![GatedChange {
                     operation: format!("activating an external identity mapping onto {identity}"),
-                    disclosure: Disclosure::FROM_REQUEST,
+                    disclosure: Disclosure::NONE,
                     change: AuthorizationChange::IdentityMapping(IdentityMappingChange {
                         identity,
                         confers_operator: confers_operator_standing(&after),

@@ -38,7 +38,7 @@ use async_trait::async_trait;
 use rise_authz::engine::{
     AuthenticatedPrincipal, AuthorizationError, MembershipResolver, PrincipalMembership,
 };
-use rise_resource_api::{ResourceStore, SubjectId, API_VERSION_V1ALPHA1, USER_KIND};
+use rise_resource_api::{ResourceStore, SubjectId, UserSpec, API_VERSION_V1ALPHA1, USER_KIND};
 use rise_resource_store_postgres::{MembershipLookup, PgSession};
 
 use crate::db::models::User;
@@ -142,17 +142,35 @@ impl RiseMembershipResolver {
         .await)
     }
 
-    /// The UID of the live root `User` resource with this canonical name.
+    /// The UID of the live, active root `User` resource with this canonical
+    /// name.
+    ///
+    /// `spec.active` is part of the answer, not a detail: ADR-0001 §1 makes an
+    /// inactive User unable to log in and fails every token already issued for
+    /// them. A tie that still resolved through one would be authority reachable
+    /// by an identity the platform has switched off — and it is the premise the
+    /// activation gate rests on, so the two have to agree.
     async fn lookup_user_resource(
         &self,
         name: &str,
     ) -> Result<Option<uuid::Uuid>, AuthorizationError> {
-        Ok(self
+        let Some(row) = self
             .store
             .get_by_name(API_VERSION_V1ALPHA1, USER_KIND, name, None)
             .await?
             .filter(|row| row.deletion_timestamp.is_none())
-            .map(|row| row.uid))
+        else {
+            return Ok(None);
+        };
+        // A stored User whose spec will not parse is corrupt policy data, not an
+        // active identity: fail closed rather than assume the default.
+        let spec: UserSpec = serde_json::from_value(row.spec.clone()).map_err(|error| {
+            AuthorizationError::CorruptPolicy(format!(
+                "stored User '{}' ({}) is not valid: {error}",
+                row.name, row.uid
+            ))
+        })?;
+        Ok(spec.active.then_some(row.uid))
     }
 }
 

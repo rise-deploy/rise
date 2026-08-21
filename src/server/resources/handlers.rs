@@ -331,6 +331,9 @@ struct DeletionBlockersResponse {
     resource_uid: Uuid,
     cascade_finalizer_present: bool,
     blockers: Vec<DeletionBlockerResponse>,
+    /// Blockers the caller may not `list`. Counted rather than named, so the
+    /// report never reads as "nothing is blocking this" when something is.
+    hidden_blockers: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -734,30 +737,45 @@ async fn dispatch_get_inner(
                 .await
                 .map_err(store_error_to_server_error)?;
             let row = report.resource;
-            let blockers = report
-                .blockers
-                .into_iter()
-                .map(|blocker| {
-                    let (relationship, block_owner_deletion) = match blocker.relationship {
-                        rise_resource_api::DeletionBlockerRelationship::StructuralChild => {
-                            ("structuralChild", None)
-                        }
-                        rise_resource_api::DeletionBlockerRelationship::OwnerReference => {
-                            ("ownerReference", Some(true))
-                        }
-                    };
-                    DeletionBlockerResponse {
-                        relationship,
-                        api_version: blocker.api_version,
-                        kind: blocker.kind,
-                        name: blocker.name,
-                        uid: blocker.uid,
-                        block_owner_deletion,
-                        deletion_timestamp: blocker.deletion_timestamp,
-                        finalizers: blocker.finalizers,
+            // The blockers are a collection like any other, so they are filtered
+            // per item (ADR-0001 §4) — this subresource is a separate grant from
+            // `list` on the kinds beneath, and a caller holding only the former
+            // must not receive a complete inventory of an Organization's
+            // children by name and UID. What is withheld is still counted: a
+            // report that silently omits blockers would read as "nothing is
+            // blocking this", which is worse than saying how many are hidden.
+            let mut blockers = Vec::new();
+            let mut hidden = 0usize;
+            for blocker in report.blockers {
+                let visible = match authz.tree(blocker.uid).await {
+                    Ok(target) => authz.allows(&target, Verb::List, None).await?,
+                    // A blocker whose ancestry will not resolve cannot be
+                    // authorized; it is counted, never named.
+                    Err(_) => false,
+                };
+                if !visible {
+                    hidden += 1;
+                    continue;
+                }
+                let (relationship, block_owner_deletion) = match blocker.relationship {
+                    rise_resource_api::DeletionBlockerRelationship::StructuralChild => {
+                        ("structuralChild", None)
                     }
-                })
-                .collect::<Vec<_>>();
+                    rise_resource_api::DeletionBlockerRelationship::OwnerReference => {
+                        ("ownerReference", Some(true))
+                    }
+                };
+                blockers.push(DeletionBlockerResponse {
+                    relationship,
+                    api_version: blocker.api_version,
+                    kind: blocker.kind,
+                    name: blocker.name,
+                    uid: blocker.uid,
+                    block_owner_deletion,
+                    deletion_timestamp: blocker.deletion_timestamp,
+                    finalizers: blocker.finalizers,
+                });
+            }
             tracing::info!(
                 target: "rise::audit",
                 actor = %authz.actor(),
@@ -766,6 +784,7 @@ async fn dispatch_get_inner(
                 kind = %row.kind,
                 name = %row.name,
                 blocker_count = blockers.len(),
+                hidden_blocker_count = hidden,
                 "resource.deletion_blockers_listed"
             );
             Ok(Json(DeletionBlockersResponse {
@@ -775,6 +794,7 @@ async fn dispatch_get_inner(
                     .iter()
                     .any(|finalizer| finalizer == CASCADE_DELETION_FINALIZER),
                 blockers,
+                hidden_blockers: hidden,
             })
             .into_response())
         }
@@ -1175,6 +1195,57 @@ fn subresource_name(subresource: Subresource) -> Result<SubresourceName, ServerE
     })
 }
 
+/// Authorize the owner references a write newly attaches.
+///
+/// An owner reference grants the dependent no access (ADR-0001 §1), but it is
+/// not inert: deleting the owner starts deletion of the dependent, and the
+/// garbage collector finishes it. Attaching one therefore does two things that
+/// need authority.
+///
+/// It *references* the owner from another resource's fields, which is ADR-0001
+/// §2's `use` verb, checked at write time of the referencing resource. And when
+/// the dependent already exists, the new edge makes it deletable through a
+/// resource the caller may control — so attaching it to something is
+/// indistinguishable from holding `delete` on it, and is refused unless the
+/// caller actually does. Without that second half, `update` on a resource plus
+/// `delete` on anything the caller owns compose into `delete` on the resource,
+/// which is how a `Deny` on `delete` gets around.
+///
+/// A create is different: the dependent is the resource being brought into
+/// being, and tying its lifetime to an owner is the creator's own choice.
+///
+/// Only *newly added* references are checked. Re-sending the ones already stored
+/// is an ordinary read-modify-write, and re-authorizing them would make an
+/// unrelated update fail because of an edge someone else attached.
+async fn authorize_owner_references(
+    authz: &AuthorizationContext,
+    dependent: Option<&ResourceTree>,
+    before: &[rise_resource_api::OwnerReference],
+    after: &[rise_resource_api::OwnerReference],
+) -> Result<(), ServerError> {
+    let added: Vec<_> = after
+        .iter()
+        .filter(|reference| {
+            !before
+                .iter()
+                .any(|existing| existing.uid() == reference.uid())
+        })
+        .collect();
+    if added.is_empty() {
+        return Ok(());
+    }
+    if let Some(dependent) = dependent {
+        authz.require(dependent, Verb::Delete, None).await?;
+    }
+    for reference in added {
+        // The owner is addressed by UID, so a refusal tells a caller who cannot
+        // see it only that they may not use it.
+        let target = authz.tree(reference.uid()).await?;
+        authz.require(&target, Verb::Use, None).await?;
+    }
+    Ok(())
+}
+
 /// `allowedStatusControllerIds` is an authorization decision, and the only one
 /// the grant gate cannot express.
 ///
@@ -1231,7 +1302,7 @@ async fn create_resource(
     resolved: &ResolvedCollection,
     parent: Option<&ResourceRow>,
     body: CreateResourceRequest,
-) -> Result<(StatusCode, Json<rise_resource_api::Resource>), ServerError> {
+) -> Result<(StatusCode, Json<serde_json::Value>), ServerError> {
     // Reject writes to non-storage versions until version conversion is implemented.
     if resolved.info.api_version != resolved.info.storage_api_version {
         return Err(ServerError::new(
@@ -1283,6 +1354,7 @@ async fn create_resource(
     if resolved.info.kind == rise_resource_api::RESOURCE_DEFINITION_KIND {
         require_operator_for_controller_allowlist(authz, &serde_json::Value::Null, &spec)?;
     }
+    authorize_owner_references(authz, None, &[], &body.metadata.owner_references).await?;
 
     let mut changes = change_for_create(
         authz,
@@ -1336,13 +1408,13 @@ async fn create_resource(
 
     audit_write(authz, &row, "resource.created", None);
     let _ = ctx;
+    // Projected like every other write: a `create` grant is not a read grant,
+    // and the stored row carries more than the caller sent — the server-assigned
+    // UID, and for a policy kind the contextual normalization admission applied
+    // to the spec.
     Ok((
         StatusCode::CREATED,
-        Json(resource_response(
-            &row,
-            &resolved.info.api_version,
-            &target,
-        )?),
+        Json(write_response(authz, &row, &resolved.info.api_version, &target).await?),
     ))
 }
 
@@ -1417,6 +1489,13 @@ async fn update_resource(
     if resolved.info.kind == rise_resource_api::RESOURCE_DEFINITION_KIND {
         require_operator_for_controller_allowlist(authz, &row.spec, &spec)?;
     }
+    authorize_owner_references(
+        authz,
+        Some(&target),
+        &row.owner_references,
+        &body.metadata.owner_references,
+    )
+    .await?;
 
     let mut changes = change_for_update(authz, row, &spec).await?;
     changes.extend(label_changes(
@@ -2544,6 +2623,188 @@ mod dispatch_tests {
             "{}",
             err.message
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Owner references are a lifecycle edge, and attaching one needs authority
+    // -------------------------------------------------------------------------
+
+    /// An owner reference grants no access, but deleting the owner starts
+    /// deletion of the dependent. Attaching one to an *existing* resource is
+    /// therefore indistinguishable from holding `delete` on it: without the
+    /// check, `update` on a resource plus `delete` on anything the caller owns
+    /// compose into `delete` on the resource, which is how a `Deny` on `delete`
+    /// gets around.
+    #[sqlx::test]
+    async fn attaching_an_owner_reference_needs_delete_on_the_dependent(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx, &[]).await;
+        let owner = create_widget(&ctx, "example.dev/v1", "owner").await;
+        let victim = create_widget(&ctx, "example.dev/v1", "victim").await;
+        // The caller may edit widgets and use the owner, but may not delete.
+        grant_authenticated(
+            &ctx,
+            "widget-editor",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["example.dev/Widget"],
+                "verbs": ["get", "list", "update", "use"],
+            }]),
+        )
+        .await;
+
+        let err = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/victim".to_string(),
+            any_user(PLAIN_USER),
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {
+                    "name": "victim",
+                    "revision": victim["metadata"]["revision"],
+                    "ownerReferences": [{
+                        "apiVersion": "example.dev/v1",
+                        "kind": "Widget",
+                        "name": "owner",
+                        "uid": owner["metadata"]["uid"],
+                    }],
+                },
+                "spec": {"size": "large"},
+            }),
+        )
+        .await
+        .expect_err("attaching the edge needs delete on the dependent");
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        assert!(err.message.contains("delete"), "{}", err.message);
+    }
+
+    /// Referencing a resource from another resource's fields is ADR-0001 §2's
+    /// `use` verb, checked at write time of the referencing resource.
+    #[sqlx::test]
+    async fn attaching_an_owner_reference_needs_use_on_the_owner(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx, &[]).await;
+        let owner = create_widget(&ctx, "example.dev/v1", "owner").await;
+        // Everything except `use` on the owner.
+        grant_authenticated(
+            &ctx,
+            "widget-admin",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["example.dev/Widget"],
+                "verbs": ["get", "list", "create", "update", "delete"],
+            }]),
+        )
+        .await;
+
+        let err = dispatch_post_inner(
+            &ctx,
+            "example.dev/v1/widgets".to_string(),
+            auth(PLAIN_USER),
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {
+                    "name": "dependent",
+                    "ownerReferences": [{
+                        "apiVersion": "example.dev/v1",
+                        "kind": "Widget",
+                        "name": "owner",
+                        "uid": owner["metadata"]["uid"],
+                    }],
+                },
+                "spec": {},
+            }),
+        )
+        .await
+        .expect_err("referencing the owner needs `use` on it");
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        assert!(err.message.contains("use"), "{}", err.message);
+
+        // An operator holds every verb, so the same create succeeds.
+        let resp = dispatch_post_inner(
+            &ctx,
+            "example.dev/v1/widgets".to_string(),
+            auth(OPERATOR),
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {
+                    "name": "dependent",
+                    "ownerReferences": [{
+                        "apiVersion": "example.dev/v1",
+                        "kind": "Widget",
+                        "name": "owner",
+                        "uid": owner["metadata"]["uid"],
+                    }],
+                },
+                "spec": {},
+            }),
+        )
+        .await
+        .expect("an operator may attach the edge");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    /// The blockers are a collection, so they are filtered per item — a caller
+    /// holding the subresource but no `list` on the children below must not
+    /// receive an inventory of them by name and UID. What is withheld is
+    /// counted, so the report never reads as "nothing is blocking this".
+    #[sqlx::test]
+    async fn deletion_blockers_are_filtered_per_item(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_gadget_rd(&ctx, &[]).await;
+        create_org(&ctx, "acme").await;
+        create_at(
+            &ctx,
+            "example.dev/v1/gadgets/acme",
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Gadget",
+                "metadata": {"name": "child"},
+                "spec": {},
+            }),
+        )
+        .await;
+        // The subresource, and nothing else — no `list` on Gadgets.
+        grant_authenticated(
+            &ctx,
+            "blocker-reader",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["rise.dev/Organization"],
+                "verbs": ["get"],
+                "subresources": ["deletion-blockers"],
+            }]),
+        )
+        .await;
+
+        let resp = dispatch_get_inner(
+            &ctx,
+            "rise.dev/v1alpha1/organizations/acme/deletion-blockers".to_string(),
+            auth(PLAIN_USER),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("the subresource grant permits the read");
+        let (status, body) = read(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["blockers"].as_array().expect("blockers").len(), 0);
+        assert_eq!(body["hiddenBlockers"], 1);
+
+        // An operator holds `list`, so the same call names the blocker.
+        let resp = dispatch_get_inner(
+            &ctx,
+            "rise.dev/v1alpha1/organizations/acme/deletion-blockers".to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("operator read");
+        let (_, body) = read(resp).await;
+        assert_eq!(body["blockers"][0]["name"], "child");
+        assert_eq!(body["hiddenBlockers"], 0);
     }
 
     // -------------------------------------------------------------------------
