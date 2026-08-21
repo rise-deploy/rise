@@ -123,8 +123,9 @@ legal write at all. Re-sending references that are already stored is an ordinary
 read-modify-write.
 
 A write that changes who can do what — a `Role` or `PlatformRole` body, a
-binding, a `GroupMembership`, an identity or trust mapping, or a label some
-binding selects on — additionally passes ADR-0001 §5's **grant gate**: the
+binding, a `GroupMembership`, an identity or trust mapping, a `User` create or
+activation, or a label some binding selects on — additionally passes ADR-0001
+§5's **grant gate**: the
 authority the change would confer must already be held by the writer, over the
 same domain. Holding `create` on `PlatformRoleBinding` therefore does not let a
 caller bind a Role granting more than they have; the refusal is a `403`.
@@ -141,7 +142,15 @@ the domain, so a witness tuple can come from any binding delivering policy to th
 
 The check and the mutation are one `SERIALIZABLE` transaction with bounded
 retry, so a concurrent revocation either precedes the check or forces the write
-to be replayed against fresh facts. A write that keeps losing that race returns
+to be replayed against fresh facts.
+
+Two writes reach the gate because of what they *schedule* rather than what they
+say. Attaching an owner reference to a policy resource is a scheduled delete of
+it — the cascade tombstones the dependent, and a tombstoned binding stops
+applying at once — so it is diffed as that delete. Deleting an Organization is
+diffed as the deletion of every `Role` and `RoleBinding` beneath it, for the
+same reason. In both cases removing a `Deny` is a grant, and routing it through
+a cascade must not be cheaper than asking for it directly. A write that keeps losing that race returns
 `503` with a retryable message rather than committing on stale assumptions.
 
 Two consequences worth knowing:

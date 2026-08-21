@@ -101,6 +101,23 @@ Merged to `develop`:
     whole effective policy over the domain and a witness can come from any
     binding delivering policy to them. The full comparison is in the
     `rise::audit` `resource.grant_gate` record.
+  - Attaching a `metadata.ownerReferences` entry to a `Role`, `RoleBinding`,
+    `PlatformRole`, or `PlatformRoleBinding` now passes the grant gate as
+    though the row were being deleted, and deleting an `Organization` passes it
+    for every `Role` and `RoleBinding` beneath it. Both were routes around the
+    gate: the cascade tombstones the row, and a tombstoned binding stops
+    applying immediately, so removing a `Deny` this way was ungated. An
+    operator is unaffected; a non-operator who could delete an Organization
+    containing policy they cannot lift is now refused.
+  - Creating a `rise.dev/User` with `spec.active` true (the default) passes the
+    grant gate as an activation, matching the existing gate on flipping
+    `active` from false to true. Policy binds to the User *name*, so recreating
+    a name that stale bindings or `GroupMembership` markers still refer to makes
+    that policy reachable again.
+  - A write response for a caller holding a write verb and neither `get` nor
+    `list` is now `apiVersion`, `kind`, and `metadata.name` only — previously it
+    carried labels and inherited `effectiveLabels`, which are org-wide and are
+    what a `list` grant pays for.
   - Every `404` from these routes now carries the same body,
     `{"error": "resource not found"}`. Clients that matched on the old wording
     ("resource 'x' not found", "parent path segment not found") need updating.

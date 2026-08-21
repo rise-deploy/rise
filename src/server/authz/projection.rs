@@ -16,6 +16,11 @@ use crate::server::error::ServerError;
 /// How much of one item the caller may see.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadGranularity {
+    /// Neither `get` nor `list`: the caller's own input echoed back, nothing
+    /// read out of the row. This is what a write response looks like for a
+    /// caller who holds a write verb and no read verb at all — `(update, Kind)`
+    /// or `(update, Kind, status)` with no `get` and no `list`.
+    Echo,
     /// `list` without `get`: existence, name, and targeting metadata.
     ListOnly,
     /// `list` and `get`: the full stored object.
@@ -41,6 +46,17 @@ pub fn project_list_item(
                 "failed to serialize a resource",
             )
         }),
+        // `effectiveLabels` is the reason this tier exists separately from
+        // `ListOnly`. Inherited label values are org-wide by construction, and
+        // §4's justification for putting them in a listing is that `list` is
+        // the grant that says "you may survey this scope". A write verb says no
+        // such thing, so a writer with neither read verb gets back what they
+        // sent and the identity the server assigned it, and nothing else.
+        ReadGranularity::Echo => Ok(json!({
+            "apiVersion": resource.api_version,
+            "kind": resource.kind,
+            "metadata": { "name": resource.metadata.name },
+        })),
         ReadGranularity::ListOnly => {
             let mut metadata = json!({ "name": resource.metadata.name });
             let object = metadata

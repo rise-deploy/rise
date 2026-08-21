@@ -179,8 +179,30 @@ pub async fn change_for_create(
                 }),
             }]
         }
-        // A `User` create brings an identity with no policy into being; it
-        // delegates nothing until something binds or maps to it.
+        // A `User` create is an activation, not a blank identity. ADR-0001 §1
+        // binds a `GroupMembership` and a `user:` subject to the *name*, and
+        // says so deliberately: deleting a User leaves the markers in place and
+        // recreating the name reactivates them. So a create under a name that
+        // stale policy still refers to makes that policy reachable again — the
+        // same event the update path gates when `active` goes false → true, and
+        // reachable without holding `update` at all. `active` also defaults to
+        // true, so an empty spec is the interesting case.
+        USER_KIND => {
+            let parsed: UserSpec = parse_spec(spec, kind)?;
+            if parsed.active {
+                let identity: SubjectId = subject("user", None, name)?;
+                vec![GatedChange {
+                    operation: format!("creating {identity}"),
+                    disclosure: Disclosure::NONE,
+                    change: AuthorizationChange::IdentityMapping(IdentityMappingChange {
+                        identity,
+                        confers_operator: false,
+                    }),
+                }]
+            } else {
+                Vec::new()
+            }
+        }
         _ => Vec::new(),
     })
 }
@@ -278,6 +300,28 @@ pub async fn change_for_delete(
     ctx: &AuthorizationContext,
     row: &ResourceRow,
 ) -> Result<AuthorizationChangeSet, ServerError> {
+    // Deleting an Organization tombstones every Role and RoleBinding beneath
+    // it, and a tombstoned binding stops applying at once — the engine filters
+    // on liveness, not on collection. So an Organization delete is a delete of
+    // its whole policy tier, Denies included, and has to be diffed as one.
+    //
+    // Only this parent needs it. The other structural cascades over policy
+    // rows — a Group taking its GroupMemberships, a User its UserIdentities, a
+    // ServiceAccount its trust policies — only ever remove authority, which
+    // ADR-0001 §4 does not gate.
+    if row.api_version == API_VERSION_V1ALPHA1 && row.kind == ORGANIZATION_KIND {
+        return cascaded_policy_deletions(ctx, row).await;
+    }
+    policy_row_deletion(ctx, row).await
+}
+
+/// The gated change deleting one policy row produces, or nothing for a row that
+/// carries no policy. Split out from [`change_for_delete`] so the Organization
+/// cascade can reach it without recursing back through the cascade arm.
+async fn policy_row_deletion(
+    ctx: &AuthorizationContext,
+    row: &ResourceRow,
+) -> Result<AuthorizationChangeSet, ServerError> {
     if !is_policy_kind(&row.api_version, &row.kind) {
         return Ok(Vec::new());
     }
@@ -311,6 +355,67 @@ pub async fn change_for_delete(
         }],
         _ => Vec::new(),
     })
+}
+
+/// The gated changes deleting an Organization produces: one per policy row the
+/// cascade would take with it.
+///
+/// The rows are diffed individually rather than as one aggregate change so the
+/// gate compares each against the writer's authority the same way a direct
+/// delete of that row would. A caller who may delete every one of them
+/// individually may delete the Organization; a caller who may not is refused
+/// here rather than through the back door.
+async fn cascaded_policy_deletions(
+    ctx: &AuthorizationContext,
+    organization: &ResourceRow,
+) -> Result<AuthorizationChangeSet, ServerError> {
+    let mut changes = Vec::new();
+    for kind in [ROLE_KIND, ROLE_BINDING_KIND] {
+        let rows = ctx
+            .store()
+            .list(API_VERSION_V1ALPHA1, kind, Some(organization.uid))
+            .await
+            .map_err(crate::server::resources::error_map::store_error_to_server_error)?;
+        for row in rows {
+            changes.extend(policy_row_deletion(ctx, &row).await?);
+        }
+    }
+    Ok(changes)
+}
+
+/// The gated change a write that *schedules* a policy row's deletion produces.
+///
+/// Attaching an owner reference is not a spec edit, so nothing in
+/// `change_for_update` sees it — but the edge is a scheduled delete: when the
+/// owner goes, the store tombstones the dependent, and a tombstoned Deny stops
+/// applying. Without this, a caller refused a direct delete of a Deny that caps
+/// them could attach it to a resource they own, delete that, and have the cap
+/// removed with no gate anywhere in the sequence.
+///
+/// Only *introduced* references produce a change; the caller has already been
+/// held to `delete` on the dependent and `use` on the owner by
+/// `authorize_owner_references`, which is ordinary authority rather than the
+/// delegation question this answers.
+pub async fn change_for_scheduled_deletion(
+    ctx: &AuthorizationContext,
+    row: &ResourceRow,
+    before: &[rise_resource_api::OwnerReference],
+    after: &[rise_resource_api::OwnerReference],
+) -> Result<AuthorizationChangeSet, ServerError> {
+    if after.iter().all(|reference| before.contains(reference)) {
+        return Ok(Vec::new());
+    }
+    Ok(change_for_delete(ctx, row)
+        .await?
+        .into_iter()
+        .map(|gated| GatedChange {
+            operation: format!(
+                "making {} '{}' a dependent of another resource, which schedules its deletion",
+                row.kind, row.name
+            ),
+            ..gated
+        })
+        .collect())
 }
 
 /// The gated changes an access-driving label write produces (ADR-0001 §6.6).

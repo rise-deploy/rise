@@ -59,6 +59,35 @@ where
     matches_any_group(allowed_groups, &resolve_idp_groups(executor, user.id).await)
 }
 
+/// [`has_role`], but reporting the group lookup's failure instead of failing
+/// closed.
+///
+/// The fail-closed form is right where a transient error should cost a role
+/// rather than the request — an ingress subrequest, a typed API check. It is
+/// wrong inside a `SERIALIZABLE` transaction: a lost race there is not a
+/// failure to answer but an instruction to replay, and swallowing it decides
+/// the caller's standing from a transaction that is already doomed. The
+/// resource API's membership resolver uses this form so the classification
+/// reaches its retry loop.
+pub async fn has_role_checked<'e, E>(
+    executor: E,
+    allowed_emails: &[String],
+    allowed_groups: &[String],
+    user: &User,
+) -> Result<bool, anyhow::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    if matches_any_email(allowed_emails, &user.email) {
+        return Ok(true);
+    }
+    if allowed_groups.is_empty() {
+        return Ok(false);
+    }
+    let groups = crate::db::teams::list_idp_group_names_for_user(executor, user.id).await?;
+    Ok(matches_any_group(allowed_groups, &groups))
+}
+
 /// Resolve the IdP groups a user belongs to.
 ///
 /// Fails closed: a database error yields no groups (and is logged), so a

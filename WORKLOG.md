@@ -760,6 +760,56 @@ scope and avoiding dead-end compatibility layers.
     are identical; wall-clock is not. Closing that means padding every masked
     answer to the slow path, which is a real cost for a real but weak signal —
     worth stating rather than pretending the masking is perfect.
+- Eighth review — a seventh adversarial round, ranging past the masking work
+  into the change-set construction. Three findings, one of them the most serious
+  of the whole increment and one of them a follow-up this log had already
+  recorded as harmless:
+  - **An owner reference was an ungated delete of any policy row.** `Role` and
+    `RoleBinding` accept owner references — only `ResourceDefinition` and
+    `Organization` are excluded at the store — and `change_for_update` diffs
+    only the spec, so attaching one is invisible to the gate. But the edge is a
+    scheduled delete: when the owner goes, the store tombstones the dependent,
+    and the engine filters bindings on liveness rather than on collection, so a
+    tombstoned Deny stops applying immediately. A caller refused a direct delete
+    of a Deny that caps them could therefore attach it to a resource they own,
+    delete that, and have the cap lifted with no gate anywhere in the sequence —
+    the ordinary-authority checks on the attachment (`delete` on the dependent,
+    `use` on the owner) are exactly the authority the gate exists to look past.
+    Introducing a reference onto a policy row now runs the same change the
+    delete would, so the two routes are refused identically.
+  - **The Organization cascade was the same hole with a different lever**, and
+    this log had recorded it as safe on the grounds that it needs `delete` on
+    the Organization. That is the wrong test: the question is not how privileged
+    the delete is but whether the resulting policy change is one the writer
+    could have made directly. `load_organization_bindings` short-circuits on a
+    tombstoned Organization, so the delete drops the *entire* org policy tier at
+    once, Denies included, while every resource beneath it stays addressable
+    until the collector drains. An Organization delete is now diffed as the
+    deletion of each Role and RoleBinding beneath it — individually, so each is
+    compared the way a direct delete of that row would be.
+  - **Creating a `User` was an ungated activation.** The change set gated
+    `active: false → true` on the update path and treated a create as bringing a
+    blank identity into being. ADR-0001 §1 says the opposite in as many words: a
+    `GroupMembership` and a `user:` subject bind to the *name*, deleting the
+    User leaves the markers, and recreating the name reactivates them. So
+    delete-and-recreate reached, ungated, exactly what the update path refuses —
+    and `active` defaults to true, so an empty spec is the payload. A create
+    with `active` now produces the same `IdentityMapping` change the activation
+    does.
+  - Also fixed, smaller: a write response gave list-granularity metadata —
+    including org-wide inherited `effectiveLabels` — to a caller holding a write
+    verb and *neither* read verb, on the reasoning that §4 puts those in a
+    listing; §4 puts them there because `list` is the grant that says "you may
+    survey this scope", which `update` does not say. There is now a third
+    granularity that echoes back the caller's own input. The name-mismatch `400`
+    on a `uid:` URL likewise stopped quoting the stored name. `mask_not_found`
+    folds `ResourceTree`'s malformed-ancestry `400` as well, since only a row
+    that exists can produce it. `record_gate` carries the attempt number, so a
+    replayed write's inline gate records no longer read as separate attempts to
+    delegate. And the membership resolver's operator check uses a form of the
+    role lookup that reports a lost `SERIALIZABLE` race instead of failing
+    closed to "not an operator" — inside a write transaction, that answer is
+    decided from a transaction already doomed.
 - Follow-ups this increment deliberately leaves open:
   - The centralized choke point replacing `require_operator`, the write-time
     grant gate, and seeded `system-admin`/`resource-owner`/`org-admin` data are
@@ -1528,10 +1578,9 @@ idempotent when a read-modify-write client replays the stored spec.
     once those resources exist.
   - A cascading delete of an Organization tombstones the Roles and bindings
     beneath it, and the gate diffs only the resource named by the request. That
-    is a grant the gate does not see. It needs `delete` on the Organization,
-    which is operator or org-admin authority, so nothing escalates through it
-    today; closing it properly means diffing the policy resources a cascade
-    would take with it.
+    is a grant the gate does not see. Recorded here as needing only `delete` on
+    the Organization and therefore escalating nothing today — the seventh review
+    shows that reasoning was too comfortable, and it is closed there.
   - `ResourceDefinition.allowedStatusControllerIds` still gates controller
     status and finalizer writes. Controllers become ordinary principals when
     their identity resources go live, which is when that allowlist can go.

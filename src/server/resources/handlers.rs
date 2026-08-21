@@ -44,9 +44,9 @@ use super::path::{
 use crate::server::auth::context::{AnyAuth, AuthContext};
 use crate::server::auth::controller::ControllerAuthContext;
 use crate::server::authz::{
-    change_for_create, change_for_delete, change_for_update, label_changes, node_for, node_for_new,
-    project_list_item, AuthorizationChangeSet, AuthorizationContext, ReadGranularity,
-    ResourceAuthorizer,
+    change_for_create, change_for_delete, change_for_scheduled_deletion, change_for_update,
+    label_changes, node_for, node_for_new, project_list_item, AuthorizationChangeSet,
+    AuthorizationContext, ReadGranularity, ResourceAuthorizer,
 };
 use crate::server::error::ServerError;
 use crate::server::state::AppState;
@@ -566,7 +566,13 @@ async fn resolve_leaf(
 /// The single body every item-path 404 carries. See [`resolve_leaf`].
 fn mask_not_found(error: ServerError) -> ServerError {
     match error.status {
-        StatusCode::NOT_FOUND => ServerError::not_found(RESOURCE_NOT_FOUND),
+        // The 400 is `ResourceTree`'s: an ancestor chain that does not reach a
+        // root, which only a row that *exists* can produce. Left as a 400 it
+        // would answer "this resource is here and its stored ancestry is
+        // broken" to a caller entitled to neither fact.
+        StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST => {
+            ServerError::not_found(RESOURCE_NOT_FOUND)
+        }
         _ => error,
     }
 }
@@ -862,7 +868,7 @@ async fn dispatch_post_inner(
     parse_resource_path(&raw)?;
     let mut attempt = 1;
     loop {
-        let write = ctx.authz.begin_write(&auth).await?;
+        let write = ctx.authz.begin_write(&auth, attempt).await?;
         let outcome = match create_once(ctx, write.context(), &raw, body.clone()).await {
             Ok(response) => write.commit().await.map(|()| response),
             Err(error) => Err(error),
@@ -932,7 +938,7 @@ async fn dispatch_put_inner(
 
     let mut attempt = 1;
     loop {
-        let write = ctx.authz.begin_write(&user_auth).await?;
+        let write = ctx.authz.begin_write(&user_auth, attempt).await?;
         let outcome = match update_once(ctx, write.context(), &raw, body.clone()).await {
             Ok(response) => write.commit().await.map(|()| response),
             Err(error) => Err(error),
@@ -1109,7 +1115,7 @@ async fn dispatch_delete_inner(
     parse_resource_path(&raw)?;
     let mut attempt = 1;
     loop {
-        let write = ctx.authz.begin_write(&auth).await?;
+        let write = ctx.authz.begin_write(&auth, attempt).await?;
         let outcome = match delete_once(ctx, write.context(), &raw).await {
             Ok(response) => write.commit().await.map(|()| response),
             Err(error) => Err(error),
@@ -1219,13 +1225,27 @@ async fn write_response(
     response_api_version: &str,
     target: &ResourceTree,
 ) -> Result<serde_json::Value, ServerError> {
-    let readable = authz.allows(target, Verb::Get, None).await?;
+    // A write verb is not a read grant, and it is not a *list* grant either.
+    // The list-only shape carries inherited `effectiveLabels`, which §4 puts in
+    // a listing because `list` is the grant that says "you may survey this
+    // scope"; `update` says nothing of the kind. So the response is graded
+    // against both read verbs, not just `get`.
+    let granularity = if authz.allows(target, Verb::Get, None).await? {
+        ReadGranularity::Full
+    } else if authz.allows(target, Verb::List, None).await? {
+        ReadGranularity::ListOnly
+    } else {
+        ReadGranularity::Echo
+    };
     project_list_item(
         &resource_response(row, response_api_version, target)?,
-        read_granularity(readable),
+        granularity,
     )
 }
 
+/// The granularity for an item reached through a *listing*, where `list` is
+/// already established by the filter that put the item in the response. Only
+/// `get` is left to decide.
 fn read_granularity(readable: bool) -> ReadGranularity {
     if readable {
         ReadGranularity::Full
@@ -1596,11 +1616,14 @@ async fn update_resource(
         }
     }
 
+    // Named form has already been checked against the URL, which the caller
+    // wrote. The `uid:` form has not, and the stored name is not the caller's to
+    // read — a `update`-without-`get` caller would learn it from the refusal.
     if body.metadata.name != row.name {
-        return Err(ServerError::bad_request(format!(
-            "body metadata.name '{}' does not match stored name '{}'; resources cannot be renamed via PUT",
-            body.metadata.name, row.name
-        )));
+        return Err(ServerError::bad_request(
+            "body metadata.name does not match the addressed resource; \
+             resources cannot be renamed via PUT",
+        ));
     }
 
     // A main write preserves finalizers (ADR-0001 §2): only
@@ -1645,6 +1668,17 @@ async fn update_resource(
     .await?;
 
     let mut changes = change_for_update(authz, row, &spec).await?;
+    // An owner reference is a scheduled delete of this row, and for a policy
+    // row a scheduled delete is a grant.
+    changes.extend(
+        change_for_scheduled_deletion(
+            authz,
+            row,
+            &row.owner_references,
+            &body.metadata.owner_references,
+        )
+        .await?,
+    );
     changes.extend(label_changes(
         &target,
         Some(row.uid),
@@ -3667,6 +3701,282 @@ mod dispatch_tests {
             resp.expect_err("binding must not exist").status,
             StatusCode::NOT_FOUND
         );
+    }
+
+    /// Attaching an owner reference to a policy row is a scheduled delete of
+    /// it, and deleting a Deny is a grant (ADR-0001 §5, scenario 31). Without
+    /// gating the attachment, a caller refused a direct delete could route
+    /// around the gate: attach the Deny to something they own, delete that, and
+    /// the cascade removes the cap with no gate anywhere in the sequence.
+    #[sqlx::test]
+    async fn attaching_a_policy_row_to_an_owner_is_gated_as_a_delete(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx, &[]).await;
+        // A platform Deny nobody may lift, capping every authenticated caller.
+        create_at(
+            &ctx,
+            "rise.dev/v1alpha1/platformroles",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "PlatformRole",
+                "metadata": {"name": "capped"},
+                "spec": {"statements": [{
+                    "effect": "Deny",
+                    "kinds": ["example.dev/Widget"],
+                    "verbs": ["delete"],
+                }]},
+            }),
+        )
+        .await;
+        let cap = create_at(
+            &ctx,
+            "rise.dev/v1alpha1/platformrolebindings",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "PlatformRoleBinding",
+                "metadata": {"name": "the-cap"},
+                "spec": {
+                    "subject": "system:authenticated",
+                    "roleRef": {"kind": "PlatformRole", "name": "capped"},
+                },
+            }),
+        )
+        .await;
+        // The attacker may edit and delete platform bindings, and owns a Widget
+        // they may `use` and `delete`.
+        grant_authenticated(
+            &ctx,
+            "binding-admin",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["rise.dev/PlatformRoleBinding", "example.dev/Widget"],
+                "verbs": ["get", "list", "create", "update", "delete", "use"],
+            }]),
+        )
+        .await;
+        let owned = create_widget(&ctx, "example.dev/v1", "mine").await;
+
+        // A direct delete of the cap is refused by the gate. So is attaching it
+        // to the Widget, which schedules exactly that delete.
+        let direct = dispatch_delete_inner(
+            &ctx,
+            "rise.dev/v1alpha1/platformrolebindings/the-cap".to_string(),
+            auth(PLAIN_USER),
+        )
+        .await
+        .expect_err("deleting a Deny that caps you is a grant");
+        assert_eq!(direct.status, StatusCode::FORBIDDEN, "{}", direct.message);
+
+        let scheduled = dispatch_put_inner(
+            &ctx,
+            "rise.dev/v1alpha1/platformrolebindings/the-cap".to_string(),
+            any_user(PLAIN_USER),
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "PlatformRoleBinding",
+                "metadata": {
+                    "name": "the-cap",
+                    "revision": cap["metadata"]["revision"],
+                    "ownerReferences": [{
+                        "apiVersion": "example.dev/v1",
+                        "kind": "Widget",
+                        "name": "mine",
+                        "uid": owned["metadata"]["uid"],
+                    }],
+                },
+                "spec": {
+                    "subject": "system:authenticated",
+                    "roleRef": {"kind": "PlatformRole", "name": "capped"},
+                },
+            }),
+        )
+        .await
+        .expect_err("scheduling the same delete must be refused the same way");
+        assert_eq!(
+            scheduled.status,
+            StatusCode::FORBIDDEN,
+            "{}",
+            scheduled.message
+        );
+        assert!(
+            scheduled
+                .message
+                .contains("would grant authority you do not hold"),
+            "{}",
+            scheduled.message
+        );
+    }
+
+    /// Deleting an Organization tombstones every Role and RoleBinding beneath
+    /// it, and a tombstoned binding stops applying at once. So the delete is a
+    /// delete of the whole org policy tier and is diffed as one.
+    #[sqlx::test]
+    async fn deleting_an_organization_is_gated_on_the_policy_it_would_take(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx, &[]).await;
+        create_org(&ctx, "acme").await;
+        create_at(
+            &ctx,
+            "rise.dev/v1alpha1/roles/acme",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "Role",
+                "metadata": {"name": "capped"},
+                "spec": {"statements": [{
+                    "effect": "Deny",
+                    "kinds": ["example.dev/Widget"],
+                    "verbs": ["delete"],
+                }]},
+            }),
+        )
+        .await;
+        create_at(
+            &ctx,
+            "rise.dev/v1alpha1/rolebindings/acme",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "RoleBinding",
+                "metadata": {"name": "the-cap"},
+                "spec": {
+                    "subject": "system:authenticated",
+                    "roleRef": {"kind": "Role", "name": "capped"},
+                },
+            }),
+        )
+        .await;
+        // Ordinary authority to delete the Organization, and nothing that would
+        // let the caller lift the Deny beneath it.
+        grant_authenticated(
+            &ctx,
+            "org-deleter",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["rise.dev/Organization"],
+                "verbs": ["get", "list", "delete"],
+            }]),
+        )
+        .await;
+
+        let err = dispatch_delete_inner(
+            &ctx,
+            "rise.dev/v1alpha1/organizations/acme".to_string(),
+            auth(PLAIN_USER),
+        )
+        .await
+        .expect_err("the cascade would lift a Deny the caller may not lift");
+        assert_eq!(err.status, StatusCode::FORBIDDEN, "{}", err.message);
+
+        // An operator, who may lift it, is not blocked.
+        let resp = dispatch_delete_inner(
+            &ctx,
+            "rise.dev/v1alpha1/organizations/acme".to_string(),
+            auth(OPERATOR),
+        )
+        .await
+        .expect("an operator may delete the Organization");
+        assert!(resp.status().is_success(), "{:?}", resp.status());
+    }
+
+    /// A `User` create is an activation: ADR-0001 §1 binds memberships and
+    /// `user:` subjects to the *name*, so recreating a name stale policy still
+    /// refers to makes that policy reachable again. Gating only the
+    /// `active: false → true` update would leave delete-and-recreate open.
+    #[sqlx::test]
+    async fn creating_an_active_user_is_gated_like_an_activation(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        // Stale policy bound to the name: everything, for `user:ghost`.
+        create_at(
+            &ctx,
+            "rise.dev/v1alpha1/platformroles",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "PlatformRole",
+                "metadata": {"name": "everything"},
+                "spec": {"statements": [{
+                    "effect": "Allow",
+                    "kinds": "*",
+                    "verbs": ["get", "list", "create", "update", "delete", "use"],
+                }]},
+            }),
+        )
+        .await;
+        // The binding has to be authored while the User is live — admission
+        // refuses a `user:` subject that names nothing. Deleting the User
+        // afterwards is what leaves the policy stale and name-bound, which is
+        // the state ADR-0001 §1 describes and this test is about.
+        let ghost = create_at(
+            &ctx,
+            "rise.dev/v1alpha1/users",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "User",
+                "metadata": {"name": "ghost"},
+                "spec": {},
+            }),
+        )
+        .await;
+        create_at(
+            &ctx,
+            "rise.dev/v1alpha1/platformrolebindings",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "PlatformRoleBinding",
+                "metadata": {"name": "ghosts-grant"},
+                "spec": {
+                    "subject": "user:ghost",
+                    "roleRef": {"kind": "PlatformRole", "name": "everything"},
+                },
+            }),
+        )
+        .await;
+        ctx.store
+            .delete(uid_of(&ghost))
+            .await
+            .expect("the operator disables the identity by removing it");
+
+        // A "user admin" who may create Users and nothing else.
+        grant_authenticated(
+            &ctx,
+            "user-admin",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["rise.dev/User"],
+                "verbs": ["get", "list", "create", "delete"],
+            }]),
+        )
+        .await;
+
+        // `active` defaults to true, so an empty spec is the interesting case.
+        let err = dispatch_post_inner(
+            &ctx,
+            "rise.dev/v1alpha1/users".to_string(),
+            auth(PLAIN_USER),
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "User",
+                "metadata": {"name": "ghost"},
+                "spec": {},
+            }),
+        )
+        .await
+        .expect_err("reviving a name stale policy names is an activation");
+        assert_eq!(err.status, StatusCode::FORBIDDEN, "{}", err.message);
+
+        // Inactive is inert, so it is not gated.
+        let resp = dispatch_post_inner(
+            &ctx,
+            "rise.dev/v1alpha1/users".to_string(),
+            auth(PLAIN_USER),
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "User",
+                "metadata": {"name": "ghost"},
+                "spec": {"active": false},
+            }),
+        )
+        .await
+        .expect("an inactive User reaches none of the name's policy");
+        assert_eq!(resp.status(), StatusCode::CREATED);
     }
 
     /// The same writer may delegate authority they *do* hold: the delta is a

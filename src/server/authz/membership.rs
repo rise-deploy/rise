@@ -133,13 +133,28 @@ impl RiseMembershipResolver {
     /// commit on a stale answer.
     async fn is_operator(&self) -> Result<bool, AuthorizationError> {
         let mut connection = self.session.acquire().await?;
-        Ok(crate::server::auth::roles::has_role(
+        // The checked form: inside the write path this runs on the
+        // transaction's own connection, where a lost race is an instruction to
+        // replay rather than a reason to answer "not an operator" from a
+        // transaction that is already doomed.
+        crate::server::auth::roles::has_role_checked(
             &mut *connection,
             &self.operators.users,
             &self.operators.idp_groups,
             &self.user,
         )
-        .await)
+        .await
+        .map_err(|error| {
+            match error
+                .downcast_ref::<sqlx::Error>()
+                .is_some_and(rise_resource_store_postgres::is_serialization_failure)
+            {
+                true => AuthorizationError::Store(rise_resource_api::StoreError::Serialization),
+                false => AuthorizationError::Membership(format!(
+                    "failed to resolve operator standing: {error:?}"
+                )),
+            }
+        })
     }
 
     /// The UID of the live, active root `User` resource with this canonical

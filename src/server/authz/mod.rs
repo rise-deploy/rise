@@ -47,7 +47,8 @@ use crate::server::error::ServerError;
 use crate::server::resources::error_map::{store_error_to_server_error, RESOURCE_NOT_FOUND};
 
 pub use change::{
-    change_for_create, change_for_delete, change_for_update, label_changes, AuthorizationChangeSet,
+    change_for_create, change_for_delete, change_for_scheduled_deletion, change_for_update,
+    label_changes, AuthorizationChangeSet,
 };
 pub use membership::{OperatorSelectors, RiseMembershipResolver};
 pub use projection::{project_list_item, ReadGranularity};
@@ -143,6 +144,7 @@ impl ResourceAuthorizer {
             store,
             session,
             actor: user.email,
+            attempt: 1,
             deferred_audit: Mutex::new(Vec::new()),
         })
     }
@@ -155,7 +157,17 @@ impl ResourceAuthorizer {
     /// transaction, so the facts the gate compared are the facts the write
     /// commits against. A concurrent revocation either precedes the check or
     /// forces the attempt to be replayed.
-    pub async fn begin_write(&self, auth: &AuthContext) -> Result<WriteAttempt, ServerError> {
+    ///
+    /// `attempt` is the 1-based replay counter, carried only so the audit
+    /// record can say which try it is: gate comparisons and refusals are logged
+    /// inline (a comparison happened, whatever the transaction goes on to do),
+    /// so a replayed write emits the line more than once and an unmarked
+    /// duplicate would read as two separate attempts to delegate.
+    pub async fn begin_write(
+        &self,
+        auth: &AuthContext,
+        attempt: u32,
+    ) -> Result<WriteAttempt, ServerError> {
         // Resolved before the transaction opens: a credential this API does not
         // accept should not cost one, and on a retry loop it would cost one per
         // attempt.
@@ -163,7 +175,8 @@ impl ResourceAuthorizer {
         let transaction = SerializableTransaction::begin(&self.pool)
             .await
             .map_err(store_error_to_server_error)?;
-        let context = self.context(principal, user, transaction.session()).await?;
+        let mut context = self.context(principal, user, transaction.session()).await?;
+        context.attempt = attempt;
         Ok(WriteAttempt {
             transaction,
             context,
@@ -229,6 +242,9 @@ pub struct AuthorizationContext {
     store: Arc<dyn ResourceStore>,
     session: PgSession,
     actor: String,
+    /// Which replay of the write this context belongs to, 1-based. Read-path
+    /// contexts are always 1.
+    attempt: u32,
     /// Audit records for writes this attempt made, held until it commits.
     ///
     /// Emitting them inline would claim writes that a serialization retry then
@@ -493,6 +509,7 @@ impl AuthorizationContext {
             subject = %self.subject(),
             operation,
             operator = self.is_operator(),
+            attempt = self.attempt,
             claims = outcome.claims.len(),
             rejected = outcome.rejections.len(),
             creation_exception = outcome.creation_exception,
