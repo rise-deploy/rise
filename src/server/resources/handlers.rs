@@ -1214,9 +1214,12 @@ fn subresource_name(subresource: Subresource) -> Result<SubresourceName, ServerE
 /// A create is different: the dependent is the resource being brought into
 /// being, and tying its lifetime to an owner is the creator's own choice.
 ///
-/// Only *newly added* references are checked. Re-sending the ones already stored
-/// is an ordinary read-modify-write, and re-authorizing them would make an
-/// unrelated update fail because of an edge someone else attached.
+/// Only references the write *introduces* are checked. Re-sending one already
+/// stored, byte for byte, is an ordinary read-modify-write, and re-authorizing
+/// it would make an unrelated update fail because of an edge someone else
+/// attached. The comparison is on the whole reference rather than its UID:
+/// raising `blockOwnerDeletion` on a stored edge strengthens it into a hold on
+/// the owner's deletion, which is a change and has to be authorized like one.
 async fn authorize_owner_references(
     authz: &AuthorizationContext,
     dependent: Option<&ResourceTree>,
@@ -1225,11 +1228,7 @@ async fn authorize_owner_references(
 ) -> Result<(), ServerError> {
     let added: Vec<_> = after
         .iter()
-        .filter(|reference| {
-            !before
-                .iter()
-                .any(|existing| existing.uid() == reference.uid())
-        })
+        .filter(|reference| !before.contains(reference))
         .collect();
     if added.is_empty() {
         return Ok(());
