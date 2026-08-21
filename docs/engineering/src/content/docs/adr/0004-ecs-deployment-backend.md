@@ -595,7 +595,10 @@ verification against AWS, not choices.
 1. **Cloud Map multi-registration (D10).** Can two ECS services register into one
    Cloud Map service simultaneously? AWS docs constrain only the reverse
    direction (one registry per ECS service) and are silent on sharing; a
-   two-service spike against a real account settles it. If sharing fails, the
+   two-service spike against a real account settles it — a runnable,
+   self-cleaning version lives at `scripts/spikes/adr-0004-cloudmap-sharing.sh`
+   (verdicts: `SHARED_REGISTRATION_SUPPORTED`/`_REJECTED`, plus a drain
+   assertion; cents of Fargate spend, ~10 minutes). If sharing fails, the
    fallbacks are, in order: (a) the **reconciler registers instances itself**
    via the Cloud Map `RegisterInstance` API into the shared per-(project,
    group, container) service — it already observes task IPs each tick via
