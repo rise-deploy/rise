@@ -213,13 +213,16 @@ mod tests {
     /// The purge alone is not enough: the membership API decides whether a
     /// caller may write by reading `idp_managed`, and at `READ COMMITTED` that
     /// read can land between the takeover's purge and its commit. Postgres takes
-    /// no gap lock, so an insert would survive a delete it never saw. Both sides
-    /// take a row lock, so the second one blocks and then sees the first's
-    /// committed state.
+    /// no gap lock, so an insert would survive a delete it never saw.
+    ///
+    /// This drives the handler's own sequence — lock, re-read, evaluate the
+    /// guard — rather than a hand-rolled read, so reverting the lock in
+    /// `update_team` fails it. Asserting only that *some* locked read saw the
+    /// takeover would pass against the unlocked handler, which is the bar this
+    /// test previously missed.
     #[sqlx::test]
-    async fn a_takeover_blocks_a_concurrent_membership_write(pool: PgPool) {
+    async fn a_takeover_blocks_the_membership_api_guard(pool: PgPool) {
         let squatter = users::create(&pool, "squatter@example.com").await.unwrap();
-        let genuine = users::create(&pool, "genuine@example.com").await.unwrap();
         let team = teams::create(&pool, "rise-operators").await.unwrap();
         teams::add_member(&pool, team.id, squatter.id, TeamRole::Owner)
             .await
@@ -238,35 +241,42 @@ mod tests {
             .await
             .unwrap();
 
-        // The membership write the API would make, taking the same lock first.
-        // It must not proceed while the takeover holds the row.
-        let writer = async {
-            let mut tx = pool.begin().await.unwrap();
-            let seen = teams::find_by_id_for_update(&mut *tx, team.id)
+        let team_id = team.id;
+        let squatter_id = squatter.id;
+        let writer_pool = pool.clone();
+        // `update_team`'s sequence for a non-admin caller: begin, lock, re-read,
+        // evaluate the guard. It must refuse, which it can only do by having
+        // seen the committed takeover.
+        let writer = async move {
+            let mut tx = writer_pool.begin().await.unwrap();
+            let locked = teams::find_by_id_for_update(&mut *tx, team_id)
                 .await
                 .unwrap()
                 .expect("the team exists");
-            // Whatever it does next, it must have seen the committed takeover.
-            assert!(
-                seen.idp_managed,
-                "the writer read a pre-takeover snapshot and would have passed its guard"
-            );
-            tx.rollback().await.unwrap();
-        };
-
-        // The writer cannot make progress until the takeover commits, so
-        // committing is what releases it.
-        tokio::join!(
-            async {
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                teams::add_member(&mut *takeover, locked.id, genuine.id, TeamRole::Member)
+            let refused = locked.idp_managed; // `&& !is_admin`, and the squatter is not one
+            if !refused {
+                teams::add_member(&mut *tx, team_id, squatter_id, TeamRole::Member)
                     .await
                     .unwrap();
+                tx.commit().await.unwrap();
+            } else {
+                tx.rollback().await.unwrap();
+            }
+            refused
+        };
+
+        let (_, refused) = tokio::join!(
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                 takeover.commit().await.unwrap();
             },
             writer
         );
 
+        assert!(
+            refused,
+            "the membership API read a pre-takeover snapshot and would have written through it"
+        );
         assert_eq!(
             teams::list_idp_group_names_for_user(&pool, squatter.id)
                 .await

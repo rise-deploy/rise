@@ -134,11 +134,20 @@ impl RiseMembershipResolver {
 
     /// Whether the User behind this principal currently holds operator standing.
     ///
-    /// The group half reads through the request's own session, so a write
-    /// transaction measures the writer against the same facts it commits
-    /// against: revoking an operator's IdP group concurrently with their write
-    /// forces one of the two transactions to retry rather than letting the write
-    /// commit on a stale answer.
+    /// The group half reads through the request's own session, so the answer is
+    /// consistent with everything else that transaction reads.
+    ///
+    /// It is *not* serialized against a concurrent revocation, and the comment
+    /// here used to claim it was. PostgreSQL checks a serializable
+    /// transaction's predicate reads only against writers that are themselves
+    /// serializable, and every writer of `team_members` — the team API, the
+    /// login sync, the Entra sync — runs at `READ COMMITTED`. So a revocation
+    /// committing alongside this read neither aborts the transaction nor is
+    /// seen by it, and a just-revoked operator lands one more write. That is
+    /// ordinary revocation latency rather than an escalation, and closing it
+    /// would take an advisory lock on the user id here and in every
+    /// `team_members` writer — the same remedy, and the same reasoning, as the
+    /// `TODO(multi-org)` in `resources/organization.rs`.
     async fn is_operator(&self) -> Result<bool, AuthorizationError> {
         let mut connection = self.session.acquire().await?;
         // The checked form: inside the write path this runs on the

@@ -150,9 +150,12 @@ where
 }
 
 /// Delete team by ID
-pub async fn delete(pool: &PgPool, id: Uuid) -> Result<()> {
+pub async fn delete<'a, E>(executor: E, id: Uuid) -> Result<()>
+where
+    E: sqlx::Executor<'a, Database = sqlx::Postgres>,
+{
     sqlx::query!("DELETE FROM teams WHERE id = $1", id)
-        .execute(pool)
+        .execute(executor)
         .await
         .context("Failed to delete team")?;
 
@@ -160,7 +163,10 @@ pub async fn delete(pool: &PgPool, id: Uuid) -> Result<()> {
 }
 
 /// Get team members (users with member role only, not owners)
-pub async fn get_members(pool: &PgPool, team_id: Uuid) -> Result<Vec<User>> {
+pub async fn get_members<'a, E>(executor: E, team_id: Uuid) -> Result<Vec<User>>
+where
+    E: sqlx::Executor<'a, Database = sqlx::Postgres>,
+{
     let members = sqlx::query_as!(
         User,
         r#"
@@ -172,7 +178,7 @@ pub async fn get_members(pool: &PgPool, team_id: Uuid) -> Result<Vec<User>> {
         "#,
         team_id
     )
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
     .context("Failed to get team members")?;
 
@@ -180,7 +186,10 @@ pub async fn get_members(pool: &PgPool, team_id: Uuid) -> Result<Vec<User>> {
 }
 
 /// Get team owners
-pub async fn get_owners(pool: &PgPool, team_id: Uuid) -> Result<Vec<User>> {
+pub async fn get_owners<'a, E>(executor: E, team_id: Uuid) -> Result<Vec<User>>
+where
+    E: sqlx::Executor<'a, Database = sqlx::Postgres>,
+{
     let owners = sqlx::query_as!(
         User,
         r#"
@@ -192,7 +201,7 @@ pub async fn get_owners(pool: &PgPool, team_id: Uuid) -> Result<Vec<User>> {
         "#,
         team_id
     )
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
     .context("Failed to get team owners")?;
 
@@ -288,7 +297,7 @@ where
         r#"
         UPDATE team_members
         SET role = $3
-        WHERE team_id = $1 AND user_id = $2
+        WHERE team_id = $1 AND user_id = $2 AND role = 'member'
         RETURNING team_id, user_id, role as "role: TeamRole", created_at
         "#,
         team_id,

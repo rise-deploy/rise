@@ -185,8 +185,15 @@ pub async fn update_team(
         ));
     }
 
-    // From here the team row is locked and every membership write runs on this
-    // one transaction.
+    // From here the team row is locked and every membership read *and* write
+    // runs on this one transaction.
+    //
+    // The reads matter as much as the writes, for a different reason: the pool
+    // is capped, so a handler that holds a transaction's connection and then
+    // asks the pool for a second one deadlocks against itself once enough
+    // requests do it at once — and with an `is_service_account` call per member
+    // in the payload, "enough" is a handful of ordinary team edits. Every read
+    // below therefore goes through `tx`.
     //
     // The `idp_managed` guard below and the writes it guards used to be separate
     // autocommit statements, which let an IdP takeover interleave: the guard
@@ -230,7 +237,7 @@ pub async fn update_team(
             .server_err(StatusCode::BAD_REQUEST, "Invalid member ID")?;
 
         // Get current members
-        let current_members = db_teams::get_members(&state.db_pool, team.id)
+        let current_members = db_teams::get_members(&mut *tx, team.id)
             .await
             .internal_err("Failed to get current members")?;
 
@@ -247,7 +254,7 @@ pub async fn update_team(
 
         // Validate that none of the new members are service accounts
         for member_id in &member_ids {
-            let is_sa = service_accounts::is_service_account(&state.db_pool, *member_id)
+            let is_sa = service_accounts::is_service_account(&mut *tx, *member_id)
                 .await
                 .internal_err("Failed to check service account status")?;
 
@@ -277,7 +284,7 @@ pub async fn update_team(
             .server_err(StatusCode::BAD_REQUEST, "Invalid owner ID")?;
 
         // Get current owners
-        let current_owners = db_teams::get_owners(&state.db_pool, team.id)
+        let current_owners = db_teams::get_owners(&mut *tx, team.id)
             .await
             .internal_err("Failed to get current owners")?;
 
@@ -294,7 +301,7 @@ pub async fn update_team(
 
         // Validate that none of the new owners are service accounts
         for owner_id in &owner_ids {
-            let is_sa = service_accounts::is_service_account(&state.db_pool, *owner_id)
+            let is_sa = service_accounts::is_service_account(&mut *tx, *owner_id)
                 .await
                 .internal_err("Failed to check service account status")?;
 
@@ -367,6 +374,25 @@ pub async fn delete_team(
         ));
     }
 
+    // Locked and re-read, for the same reason `update_team` is: the guard below
+    // reads `idp_managed`, and an IdP takeover is three statements long. On the
+    // unlocked read this guard passed against the pre-takeover row while the
+    // takeover was mid-transaction, and the DELETE then blocked on the row lock
+    // and re-evaluated `id = $1` against the *updated* tuple — deleting the
+    // now-IdP-managed team and cascading its members. No standing was gained,
+    // but every genuine member of that group lost their group-derived admin or
+    // operator role until the next sync. Both handlers behind this guard have
+    // to take the lock; fixing only one of them fixed only one of them.
+    let mut tx = state
+        .db_pool
+        .begin()
+        .await
+        .internal_err("Failed to start transaction")?;
+    let team = db_teams::find_by_id_for_update(&mut *tx, team.id)
+        .await
+        .internal_err("Failed to lock team")?
+        .ok_or_else(|| ServerError::not_found("Team not found"))?;
+
     // Check if team is IdP-managed (only admins can delete)
     if team.idp_managed && !is_admin {
         return Err(ServerError::forbidden(
@@ -375,7 +401,7 @@ pub async fn delete_team(
     }
 
     // Check if team owns any projects
-    let owned_project_count = db_projects::count_owned_by_team(&state.db_pool, team.id)
+    let owned_project_count = db_projects::count_owned_by_team(&mut *tx, team.id)
         .await
         .internal_err("Failed to check projects owned by team")?;
     if owned_project_count > 0 {
@@ -385,9 +411,13 @@ pub async fn delete_team(
         )));
     }
 
-    db_teams::delete(&state.db_pool, team.id)
+    db_teams::delete(&mut *tx, team.id)
         .await
         .internal_err("Failed to delete team")?;
+
+    tx.commit()
+        .await
+        .internal_err("Failed to commit team deletion")?;
 
     Ok(StatusCode::NO_CONTENT)
 }

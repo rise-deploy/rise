@@ -946,6 +946,55 @@ scope and avoiding dead-end compatibility layers.
     written, and reported the areas it re-checked clean — among them that the
     diff touches no migration, chart, CRD, config default, CLI, or frontend file,
     so those angles are vacuous on this branch.
+- Twelfth review — an eleventh adversarial round. Three of its five findings are
+  in the tenth round's own fix, and the first is a defect that round introduced:
+  - **The team-row lock deadlocked the connection pool against itself.** Moving
+    the membership *writes* onto the transaction was right; leaving the reads on
+    the pool was not. The handler holds one connection for its transaction and
+    then asks the pool for a second — once for the member list, once for the
+    owner list, and once *per member in the payload* for the service-account
+    check. With a small pool, a handful of concurrent team edits take every
+    connection for their transactions and then block forever waiting for one
+    more, starving login, ingress auth, the resource API and the controllers for
+    the acquire timeout. Any authenticated user who owns a team can do it on
+    purpose, and ordinary concurrent edits do it by accident. Every read in that
+    span now goes through the transaction. Recorded plainly because the previous
+    round's note explicitly reasoned that pool reads were "fine for correctness
+    of the guard" — which was true and beside the point.
+  - **`delete_team` was behind the same guard and was never locked.** The tenth
+    round fixed one of the two handlers that read `idp_managed` and decide on it.
+    On the unlocked read the guard passed against a pre-takeover row while the
+    takeover was mid-transaction; the `DELETE` then blocked on the row lock and
+    re-evaluated `id = $1` against the *updated* tuple, deleting a now
+    IdP-managed team and cascading its members. No standing is gained, but every
+    genuine member of that group loses their group-derived admin or operator role
+    until the next sync — an unprivileged user revoking the platform's
+    group-derived roles on demand. Both handlers take the lock now.
+  - **The test written for the lock did not exercise the handler.** It
+    hand-rolled the writer as a locked read plus a rollback, so reverting the
+    lock in `update_team` left it green — the exact failure mode this log has now
+    recorded twice. It drives the handler's own sequence (begin, lock, re-read,
+    evaluate the guard) and asserts the guard *refuses*; verified failing against
+    an unlocked read before being kept.
+  - **A comment claimed an invariant PostgreSQL does not provide.** The operator
+    check said reading through the request's session forces a concurrent
+    revocation to retry. It does not: SSI only checks predicate reads against
+    writers that are themselves serializable, and every `team_members` writer
+    runs at `READ COMMITTED`. The exposure is one extra write by a just-revoked
+    operator — revocation latency, not escalation — but the comment is the kind a
+    future change reads before deciding to skip a lock, and it contradicted the
+    correct statement of the same mechanism forty lines away in
+    `resources/organization.rs`. Corrected to match it.
+  - **`update_member_role` could 500 a team permanently.** Its `UPDATE` matched
+    on `(team_id, user_id)` while the primary key is `(team_id, user_id, role)`
+    and a user may deliberately hold both roles — so promoting an existing owner
+    rewrote their `member` row onto the `owner` key and failed the whole
+    transaction with a unique violation. Pre-existing, and reachable through the
+    call site this increment moved onto the transaction. The predicate is scoped
+    to the `member` row.
+  - Reported clean and worth recording: the hand-written `.sqlx` cache entries
+    were checked field by field against generated entries for the same queries
+    and match exactly, and CI's offline build accepts them.
 - Follow-ups this increment deliberately leaves open:
   - The centralized choke point replacing `require_operator`, the write-time
     grant gate, and seeded `system-admin`/`resource-owner`/`org-admin` data are
