@@ -12,14 +12,22 @@
 //! with process configuration, which the engine deliberately knows nothing
 //! about.
 //!
-//! **Group policy is dark until identity resources exist.** Ties resolve
-//! against `User` and `Group` resources, and no login path writes them yet, so
-//! every principal currently has an empty tie set. That direction is safe for
-//! an Allow — a group binding simply grants nothing — but it is *not* safe for
-//! a Deny: a cap expressed as a group-targeted Deny is never collected, so it
-//! does not bite. Until identity resolution lands, a restriction has to be
-//! expressed against a subject that resolves today (`system:authenticated`,
-//! `org:<name>`, or the principal itself) to actually be a restriction.
+//! **Group policy is dark until identity resources exist.** A *principal's* own
+//! ties resolve through a live, active `User` resource of their name, and no
+//! login path writes one yet, so every principal currently has an empty tie
+//! set. That direction is safe for an Allow — a group binding simply grants
+//! nothing — but it is *not* safe for a Deny: a cap expressed as a
+//! group-targeted Deny is never collected, so it does not bite. Until identity
+//! resolution lands, a restriction has to be expressed against a subject that
+//! resolves today (`system:authenticated`, `org:<name>`, or the principal
+//! itself) to actually be a restriction.
+//!
+//! The gate's question is the exception, and deliberately so: `groups_for_user`
+//! resolves by *name* and does not require the row to exist or be active, since
+//! every write that asks it is one that is about to bring the name into
+//! existence or switch it on. So a `GroupMembership` marker written today is
+//! already weighed when someone tries to activate the name it points at, even
+//! though it grants that name nothing yet.
 //!
 //! **Transitional operator derivation.** ADR-0001 §1 defines an operator as an
 //! active User with a live, active `UserIdentity` matching the restart-loaded

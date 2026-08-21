@@ -1704,13 +1704,18 @@ idempotent when a read-modify-write client replays the stored spec.
     it the owner of another. Widening shipped policy is a product decision, not a
     review one; the operator note says so.
 - Follow-ups this increment deliberately leaves open:
-  - **Group-targeted policy is dark until identity resources exist.** Ties
-    resolve against `User` and `Group` resources that no login path writes yet,
-    so every principal has an empty tie set. Harmless for an Allow — a group
-    binding grants nothing — but a cap expressed as a group-targeted `Deny` is
-    never collected and therefore does not bite. Until increment 10, a
-    restriction has to name a subject that resolves today. The resolver's module
-    doc says so at the seam, and the upgrade notes say so to operators.
+  - **Group-targeted policy is dark until identity resources exist.** A
+    *principal's own* ties resolve through a live, active `User` resource of
+    their name, and no login path writes one yet, so every principal has an
+    empty tie set. Harmless for an Allow — a group binding grants nothing — but
+    a cap expressed as a group-targeted `Deny` is never collected and therefore
+    does not bite. Until increment 10, a restriction has to name a subject that
+    resolves today. The resolver's module doc says so at the seam, and the
+    upgrade notes say so to operators. Note the one path that is *not* dark,
+    added by the eighth review: the gate resolves a recipient's ties by name
+    without requiring the row, so a `GroupMembership` marker is weighed when
+    someone tries to activate the name it points at — which is the whole reason
+    that write is gated at all.
   - **Atomic Organization creation with its org-admin binding** (ADR-0001 §5)
     stays open, and is now blocked rather than deferred: the binding names an
     "operator-selected existing User", and admission resolves a literal `user:`

@@ -153,13 +153,20 @@ Merged to `develop`:
   - A write that loses a serialization race after three attempts returns `503`
     with a retryable message instead of committing on stale facts.
 
-  **A restriction must name a subject that resolves today.** Group ties are read
-  from `User` and `Group` resources, which no login path writes yet, so every
-  principal currently has an empty tie set. A group-targeted binding therefore
-  grants nothing — harmless — but a *cap* expressed as a group-targeted `Deny`
-  is equally never collected, so it does not restrict anyone either. Until
-  identity resolution lands, express a restriction against `system:authenticated`,
-  `org:<name>`, or the principal itself.
+  **A restriction must name a subject that resolves today.** A principal's own
+  Group ties are read through a live, active `User` resource of their name, and
+  no login path writes one yet, so every principal currently has an empty tie
+  set. A group-targeted binding therefore grants nothing — harmless — but a
+  *cap* expressed as a group-targeted `Deny` is equally never collected, so it
+  does not restrict anyone either. Until identity resolution lands, express a
+  restriction against `system:authenticated`, `org:<name>`, or the principal
+  itself.
+
+  A `GroupMembership` you write now is not inert in one respect: the grant gate
+  resolves a name's ties without requiring the `User` row, so the marker is
+  weighed against whoever later tries to create or activate that name. That is
+  deliberate — it is what stops a deleted-and-recreated identity from silently
+  reclaiming its old groups.
 
   Two audit record names changed: `resource.operator_status_updated` and
   `resource.operator_finalizers_updated` are now `resource.user_status_updated`
