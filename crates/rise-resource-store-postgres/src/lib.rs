@@ -15,7 +15,9 @@ pub use lookup::{
     SERVICE_ACCOUNT_TRUST_POLICIES_SQL, USER_IDENTITY_BY_EXTERNAL_IDENTITY_SQL,
 };
 pub use pg_store::PgResourceStore;
-pub use session::{PgSession, PgSessionConnection, SerializableTransaction};
+pub use session::{
+    is_serialization_failure, PgSession, PgSessionConnection, SerializableTransaction,
+};
 pub use validation::{JsonSchemaValidator, OrganizationValidator, ResourceDefinitionValidator};
 
 /// Run resource-store migrations in their own Postgres schema (`resource_store`),

@@ -33,13 +33,17 @@ use rise_resource_api::{
 };
 use uuid::Uuid;
 
-use super::AuthorizationContext;
+use super::{AuthorizationContext, Disclosure};
 use crate::server::error::ServerError;
 
-/// One gated change, with the phrase a refusal is worded around.
+/// One gated change, with the phrase a refusal is worded around and how much of
+/// a refusal may be shown to the caller.
 pub struct GatedChange {
     pub operation: String,
     pub change: AuthorizationChange,
+    /// Whether this change's recipients and domains were reconstructed from the
+    /// request or read out of stored policy. See [`Disclosure`].
+    pub disclosure: Disclosure,
 }
 
 /// Every gated change a single write produces.
@@ -99,8 +103,11 @@ pub async fn change_for_create(
     }
     let organization = organization_of(ctx, parent).await?;
     Ok(match kind {
+        // A Role body's claims name every binding that references it — stored
+        // policy, in any organization.
         ROLE_KIND | PLATFORM_ROLE_KIND => vec![GatedChange {
             operation: format!("creating {kind} '{name}'"),
+            disclosure: Disclosure::NONE,
             change: AuthorizationChange::RoleBody(RoleBodyChange {
                 kind: role_ref_kind(kind),
                 name: name.to_owned(),
@@ -109,8 +116,11 @@ pub async fn change_for_create(
                 after: statements(spec)?,
             }),
         }],
+        // A create has no before-state, so every claim is reconstructed from the
+        // spec the caller just sent.
         ROLE_BINDING_KIND | PLATFORM_ROLE_BINDING_KIND => vec![GatedChange {
             operation: format!("creating {kind} '{name}'"),
+            disclosure: Disclosure::FROM_REQUEST,
             change: AuthorizationChange::Binding(BindingChange {
                 before: None,
                 // A create has no row yet, and the gate uses the UID only to
@@ -127,6 +137,8 @@ pub async fn change_for_create(
             let (user, group) = membership_edge(ctx, name, parent).await?;
             vec![GatedChange {
                 operation: format!("adding {user} to {group}"),
+                // Both halves of the edge are named by the request's own path.
+                disclosure: Disclosure::FROM_REQUEST,
                 change: AuthorizationChange::GroupMembership(GroupMembershipChange { user, group }),
             }]
         }
@@ -141,6 +153,8 @@ pub async fn change_for_create(
             } else {
                 vec![GatedChange {
                     operation: format!("mapping an external identity onto {identity}"),
+                    // The identity is the parent the request addressed.
+                    disclosure: Disclosure::FROM_REQUEST,
                     change: AuthorizationChange::IdentityMapping(IdentityMappingChange {
                         identity,
                         confers_operator: confers_operator_standing(&parsed),
@@ -152,6 +166,7 @@ pub async fn change_for_create(
             let identity = parent_identity(ctx, kind, parent).await?;
             vec![GatedChange {
                 operation: format!("trusting an external issuer for {identity}"),
+                disclosure: Disclosure::FROM_REQUEST,
                 change: AuthorizationChange::IdentityMapping(IdentityMappingChange {
                     identity,
                     confers_operator: false,
@@ -179,6 +194,7 @@ pub async fn change_for_update(
     Ok(match kind {
         ROLE_KIND | PLATFORM_ROLE_KIND => vec![GatedChange {
             operation: format!("editing {kind} '{}'", row.name),
+            disclosure: Disclosure::NONE,
             change: AuthorizationChange::RoleBody(RoleBodyChange {
                 kind: role_ref_kind(kind),
                 name: row.name.clone(),
@@ -187,8 +203,11 @@ pub async fn change_for_update(
                 after: statements(spec)?,
             }),
         }],
+        // The before-state is a stored row the caller may hold no `get` on, and
+        // a rejection cannot say which universe it came from.
         ROLE_BINDING_KIND | PLATFORM_ROLE_BINDING_KIND => vec![GatedChange {
             operation: format!("editing {kind} '{}'", row.name),
+            disclosure: Disclosure::NONE,
             change: AuthorizationChange::Binding(BindingChange {
                 before: Some(Box::new(binding_state(
                     row.uid,
@@ -209,6 +228,7 @@ pub async fn change_for_update(
                 let identity: SubjectId = subject("user", None, &row.name)?;
                 vec![GatedChange {
                     operation: format!("activating {identity}"),
+                    disclosure: Disclosure::FROM_REQUEST,
                     change: AuthorizationChange::IdentityMapping(IdentityMappingChange {
                         identity,
                         confers_operator: false,
@@ -225,6 +245,7 @@ pub async fn change_for_update(
                 let identity = parent_identity(ctx, kind, parent.as_ref()).await?;
                 vec![GatedChange {
                     operation: format!("activating an external identity mapping onto {identity}"),
+                    disclosure: Disclosure::FROM_REQUEST,
                     change: AuthorizationChange::IdentityMapping(IdentityMappingChange {
                         identity,
                         confers_operator: confers_operator_standing(&after),
@@ -260,6 +281,7 @@ pub async fn change_for_delete(
     Ok(match kind {
         ROLE_KIND | PLATFORM_ROLE_KIND => vec![GatedChange {
             operation: format!("deleting {kind} '{}'", row.name),
+            disclosure: Disclosure::NONE,
             change: AuthorizationChange::RoleBody(RoleBodyChange {
                 kind: role_ref_kind(kind),
                 name: row.name.clone(),
@@ -270,6 +292,7 @@ pub async fn change_for_delete(
         }],
         ROLE_BINDING_KIND | PLATFORM_ROLE_BINDING_KIND => vec![GatedChange {
             operation: format!("deleting {kind} '{}'", row.name),
+            disclosure: Disclosure::NONE,
             change: AuthorizationChange::Binding(BindingChange {
                 before: Some(Box::new(binding_state(
                     row.uid,
@@ -316,6 +339,11 @@ pub fn label_changes(
                 Some(value) => format!("setting label '{key}' to '{value}'"),
                 None => format!("removing label '{key}'"),
             },
+            // The recipient is the binding's authored subject — a template for
+            // the ownership rule, so nothing stored leaks. The domains are the
+            // written resource *and every descendant inheriting the key*, which
+            // would enumerate a subtree the caller may see none of.
+            disclosure: Disclosure::RECIPIENT_ONLY,
             change: AuthorizationChange::Label(LabelChange {
                 target: target.clone(),
                 target_uid,

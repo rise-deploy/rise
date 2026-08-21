@@ -392,6 +392,7 @@ impl AuthorizationContext {
         &self,
         operation: &str,
         change: &rise_authz::engine::AuthorizationChange,
+        disclosure: Disclosure,
     ) -> Result<(), ServerError> {
         let outcome = self
             .engine
@@ -402,12 +403,19 @@ impl AuthorizationContext {
         if outcome.permitted() {
             return Ok(());
         }
-        Err(gate_rejection_to_server_error(operation, &outcome))
+        Err(gate_rejection_to_server_error(
+            operation, &outcome, disclosure,
+        ))
     }
 
     /// Audit what the gate compared, including the operator short-circuit — an
     /// operator produces no claims, so the record is the only evidence the write
     /// was gated at all.
+    ///
+    /// A rejection's recipients and domains are recorded here in full. They are
+    /// facts about *stored* policy and topology, so this is where they belong:
+    /// legible to a reader with access to the audit stream, and not echoed back
+    /// to a caller who may hold no read access to any of it.
     fn record_gate(&self, operation: &str, outcome: &GateOutcome) {
         tracing::info!(
             target: "rise::audit",
@@ -418,9 +426,53 @@ impl AuthorizationContext {
             claims = outcome.claims.len(),
             rejected = outcome.rejections.len(),
             creation_exception = outcome.creation_exception,
+            rejections = ?outcome.rejections,
             "resource.grant_gate"
         );
     }
+}
+
+/// What of a gate refusal may be echoed back to the caller.
+///
+/// A rejection carries a recipient and a policy domain, and where those come
+/// from decides whether the caller may see them. When they are reconstructed
+/// from the request — the subject and scope of a binding the caller just
+/// wrote — echoing them tells the caller nothing they did not send. When they
+/// are read out of *stored* policy or topology, they are not the caller's to
+/// see: a Role edit's recipients are the subjects of every binding referencing
+/// it, across organizations, and a label write's domains are the full paths of
+/// every descendant inheriting the key. Rendering those would turn a refusal
+/// into the enumeration oracle ADR-0001 §4 masks collections to prevent.
+///
+/// Suppressed detail is not lost; it goes to the `rise::audit` record.
+#[derive(Debug, Clone, Copy)]
+pub struct Disclosure {
+    /// The recipient is a subject the caller named in this request.
+    pub recipient: bool,
+    /// The domain is one the caller supplied, rather than one derived from
+    /// stored policy or the resource tree.
+    pub domain: bool,
+}
+
+impl Disclosure {
+    /// Everything in the rejection came from the request body.
+    pub const FROM_REQUEST: Self = Self {
+        recipient: true,
+        domain: true,
+    };
+    /// The recipient is the caller's own, but the domains are derived — a label
+    /// write, whose domains are the written resource and its inheriting
+    /// subtree.
+    pub const RECIPIENT_ONLY: Self = Self {
+        recipient: true,
+        domain: false,
+    };
+    /// Everything is read out of stored policy: a Role body edit, or a binding
+    /// edit or delete whose before-state the caller may hold no `get` on.
+    pub const NONE: Self = Self {
+        recipient: false,
+        domain: false,
+    };
 }
 
 fn verb_name(verb: Verb) -> &'static str {
@@ -438,26 +490,47 @@ fn verb_name(verb: Verb) -> &'static str {
 ///
 /// The gate answers in policy algebra: a recipient, a domain, and the tuples the
 /// writer cannot justify. A caller needs to know what they were trying to
-/// delegate and to whom, so the message names the operation, the recipient, the
-/// domain, and the missing authority — and translates the algebra's synthetic
-/// probe kinds, which stand for "every other kind", rather than echoing an
-/// invented resource kind at someone.
-fn gate_rejection_to_server_error(operation: &str, outcome: &GateOutcome) -> ServerError {
-    let details: Vec<String> = outcome
+/// delegate, so the message names the operation and the missing authority, adds
+/// the recipient and domain only where [`Disclosure`] says they came from the
+/// request, and translates the algebra's synthetic probe kinds — which stand for
+/// "every other kind" — rather than echoing an invented resource kind.
+///
+/// The list of rejections is capped. One refusal can produce one claim per
+/// inheriting descendant, and a caller does not need the count to learn the
+/// answer; the whole set is in the audit record.
+fn gate_rejection_to_server_error(
+    operation: &str,
+    outcome: &GateOutcome,
+    disclosure: Disclosure,
+) -> ServerError {
+    const MAX_REJECTIONS: usize = 3;
+    let mut details: Vec<String> = outcome
         .rejections
         .iter()
-        .map(render_rejection)
-        .collect::<Vec<_>>();
+        .map(|rejection| render_rejection(rejection, disclosure))
+        .collect();
+    details.sort();
+    details.dedup();
+    let elided = details.len().saturating_sub(MAX_REJECTIONS);
+    details.truncate(MAX_REJECTIONS);
+    let more = if elided > 0 {
+        format!(" (and {elided} more)")
+    } else {
+        String::new()
+    };
     ServerError::forbidden(format!(
-        "{operation} would grant authority you do not hold: {}",
+        "{operation} would grant authority you do not hold: {}{more}",
         details.join("; ")
     ))
 }
 
-fn render_rejection(rejection: &GateRejection) -> String {
-    let recipient = match &rejection.recipient {
-        rise_resource_api::BindingSubject::Literal(subject) => subject.to_string(),
-        template => format!("subjects matching {template}"),
+fn render_rejection(rejection: &GateRejection, disclosure: Disclosure) -> String {
+    let recipient = match (disclosure.recipient, &rejection.recipient) {
+        (true, rise_resource_api::BindingSubject::Literal(subject)) => subject.to_string(),
+        (true, template) => format!("subjects matching {template}"),
+        // Named vaguely on purpose: the recipient is a stored binding's subject,
+        // which can be another organization's Group or ServiceAccount.
+        (false, _) => "another subject".to_owned(),
     };
     match &rejection.reason {
         RejectionReason::OperatorStandingRequired => {
@@ -467,6 +540,7 @@ fn render_rejection(rejection: &GateRejection) -> String {
             let scope = rejection
                 .domain
                 .as_ref()
+                .filter(|_| disclosure.domain)
                 .map(|domain| {
                     let selector = match &domain.domain.selector {
                         None => String::new(),
@@ -678,7 +752,11 @@ mod tests {
             }],
             creation_exception: false,
         };
-        let error = gate_rejection_to_server_error("creating RoleBinding 'x'", &outcome);
+        let error = gate_rejection_to_server_error(
+            "creating RoleBinding 'x'",
+            &outcome,
+            Disclosure::FROM_REQUEST,
+        );
         assert_eq!(error.status, axum::http::StatusCode::FORBIDDEN);
         assert!(error
             .message
@@ -686,6 +764,100 @@ mod tests {
         assert!(error.message.contains("group:acme/platform"));
         assert!(error.message.contains("rise.dev/Organization/acme"));
         assert!(error.message.contains("delete on example.dev/Widget"));
+    }
+
+    /// A rejection whose recipient and domain were read out of stored policy —
+    /// a Role edit, a binding edit — says neither. Rendering them would let a
+    /// refused write enumerate other organizations' subjects and the resource
+    /// tree beneath the target.
+    #[test]
+    fn a_stored_policy_rejection_discloses_neither_recipient_nor_domain() {
+        let outcome = GateOutcome {
+            claims: Vec::new(),
+            rejections: vec![GateRejection {
+                recipient: BindingSubject::Literal(
+                    "group:other-org/secret-team".parse().expect("subject"),
+                ),
+                domain: Some(rise_authz::engine::GateDomain {
+                    domain: rise_authz::policy::PolicyDomain {
+                        scope: "rise.dev/Project/other-org/project-orion"
+                            .parse()
+                            .expect("scope"),
+                        selector: None,
+                    },
+                    organization_clamped: false,
+                }),
+                reason: RejectionReason::InsufficientAuthority(vec![tuple(
+                    Verb::Delete,
+                    "example.dev/Widget",
+                    None,
+                )]),
+            }],
+            creation_exception: false,
+        };
+        let error = gate_rejection_to_server_error(
+            "editing PlatformRole 'shared'",
+            &outcome,
+            Disclosure::NONE,
+        );
+        assert!(!error.message.contains("other-org"), "{}", error.message);
+        assert!(
+            !error.message.contains("project-orion"),
+            "{}",
+            error.message
+        );
+        assert!(!error.message.contains("secret-team"), "{}", error.message);
+        assert!(
+            error.message.contains("another subject"),
+            "{}",
+            error.message
+        );
+        // What is missing is still named: it is a verb and a kind, not an
+        // identity or a path.
+        assert!(
+            error.message.contains("delete on example.dev/Widget"),
+            "{}",
+            error.message
+        );
+    }
+
+    /// A label write may name the recipient (a binding's authored template) but
+    /// never the domains, which are the written resource and every descendant
+    /// inheriting the key.
+    #[test]
+    fn a_label_rejection_discloses_the_recipient_but_not_the_subtree() {
+        let outcome = GateOutcome {
+            claims: Vec::new(),
+            rejections: vec![GateRejection {
+                recipient: BindingSubject::SubjectRefTemplate,
+                domain: Some(rise_authz::engine::GateDomain {
+                    domain: rise_authz::policy::PolicyDomain {
+                        scope: "rise.dev/Environment/acme/app/env-prod"
+                            .parse()
+                            .expect("scope"),
+                        selector: None,
+                    },
+                    organization_clamped: false,
+                }),
+                reason: RejectionReason::InsufficientAuthority(vec![tuple(
+                    Verb::Delete,
+                    "rise.dev/Environment",
+                    None,
+                )]),
+            }],
+            creation_exception: false,
+        };
+        let error = gate_rejection_to_server_error(
+            "setting label 'rise.dev/owner' to 'user:x'",
+            &outcome,
+            Disclosure::RECIPIENT_ONLY,
+        );
+        assert!(!error.message.contains("env-prod"), "{}", error.message);
+        assert!(
+            error.message.contains("subjects matching"),
+            "{}",
+            error.message
+        );
     }
 
     /// Only an operator may confer operator standing, and the refusal says so
@@ -701,7 +873,11 @@ mod tests {
             }],
             creation_exception: false,
         };
-        let error = gate_rejection_to_server_error("mapping an identity", &outcome);
+        let error = gate_rejection_to_server_error(
+            "mapping an identity",
+            &outcome,
+            Disclosure::FROM_REQUEST,
+        );
         assert!(
             error.message.contains("only an operator may confer"),
             "{}",

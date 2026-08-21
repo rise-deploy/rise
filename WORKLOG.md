@@ -1151,7 +1151,102 @@ idempotent when a read-modify-write client replays the stored spec.
     being delegated is authority they hold. §6.6 requires that transfer to work,
     and it is what pinning the writer's side to the old label value is for. The
     test now covers both halves: a non-owner refused, an owner permitted.
+- Second review — three independent adversarial passes over the choke point,
+  the response paths, and the transaction seam. Nine findings, all fixed here:
+  - **A main-resource write could change `metadata.finalizers`.** ADR-0001 §2
+    reserves that for `(update, Kind, finalizers)`, and the reserved-namespace
+    screen lived only on the subresource path. Plain `update` — which any editor
+    holds — could therefore clear a finalizer a controller was holding a
+    deletion with, and `create` could plant a `system.rise.dev/*` name that
+    makes a resource undeletable through every route the API offers, operators
+    included. Inert while the API was operator-only; not inert now. A main write
+    must now carry the stored list back unchanged, and the store refuses any
+    change to the reserved subset on both `create` and `update`, so a direct
+    store caller is held to it too.
+  - **A write returned the full stored object regardless of read access.** A
+    caller holding only `(update, Kind, status)` got the entire `spec` back in
+    the response — a status grant acting as a full read, which is exactly the
+    implicit flow §2 forbids. Write responses now come back at the granularity
+    the caller may read, through the same projector the list path uses. The
+    `update` and soft-delete responses had the same shape.
+  - **A gate refusal enumerated stored policy and topology.** A refused label
+    write named every descendant inheriting the key — full resource paths, for a
+    caller entitled to none of them — and a refused Role edit named the subjects
+    and scopes of every binding referencing it, across organizations. The
+    refusal now carries only what the request itself supplied: a `Disclosure`
+    marks whether a change's recipients and domains were reconstructed from the
+    body or read out of the store, the renderer suppresses the latter, and the
+    full detail goes to the `rise::audit` record where a reader with access to
+    it belongs.
+  - **`allowedStatusControllerIds` was an ungated authorization grant.** Every
+    id on it confers `status` and `finalizers` writes over every resource of the
+    kind, in every organization — but a Controller is not a subject the engine
+    can evaluate, so there is no binding to diff and the gate never saw the
+    change. An ordinary `update` on a `ResourceDefinition` could hand out
+    authority no `RoleBinding` granted. Changing the list now requires operator
+    standing, until Controller identities make it expressible as policy.
+  - **The Organization delete guard's doc claimed a guarantee PostgreSQL does
+    not give.** Predicate locks are only checked against writers that are
+    themselves `SERIALIZABLE`, and every typed link write runs at
+    `READ COMMITTED` — so moving the count inside the transaction bought no
+    mutual exclusion and, by reading an older snapshot, widened the window. The
+    `TODO(multi-org)` that carried the real remedy had been deleted in favour of
+    the false claim. Both are restored, corrected.
+  - **Two effects fired at savepoint release rather than at commit.** Inside a
+    caller's transaction a store method's own `commit()` is a `RELEASE
+    SAVEPOINT`, so the compiled-schema cache was evicted while the new
+    definition was still uncommitted — long enough for a concurrent reader to
+    refill it with the *superseded* validator and leave it in force
+    indefinitely — and cascade-deletion audit records were emitted for
+    deletions a retry could roll back. `PgSession::on_commit` defers both to the
+    real commit, and runs them immediately on a pool-backed session where there
+    is no later one.
+  - **Two paths lost the retryable classification.** A swallowed serialization
+    failure inside `resolve_idp_groups` leaves the transaction aborted, and
+    every statement after it returns `25P02`, which surfaced as a hard 500
+    instead of a replay; and the Organization child count reports `anyhow`,
+    which carries no store classification. `25P02` now maps to
+    `StoreError::Serialization` — an aborted transaction can only be answered by
+    replaying it — and the count's failure is inspected for the SQLSTATE.
+  - **A listing under a nonexistent ancestor answered differently from an
+    unauthorized one.** `404` versus masked-empty made the ancestor path
+    enumerable by name — which organizations exist, which projects they hold —
+    directly beside a per-item filter that carefully masks their contents. A
+    listing now answers empty either way. An *item* under a missing ancestor is
+    still a `404`, and a create under one still fails.
+  - **The membership resolver identified the same User two incompatible ways.**
+    `resolve` passed the credential's UID with the subject's name, while
+    `groups_for_user` resolved the resource by name first. The store assigns its
+    own UID, so the first form could only ever match if two independently
+    generated identifiers coincided — group ties would have stayed empty even
+    after identity resolution lands. Both halves now resolve by name.
+  - Also hardened without a finding behind it: list decisions are matched to
+    rows by UID rather than by position, so a future change to the engine's
+    filter cannot silently pair one item's row with another item's verdict; the
+    unused `PgSession::pool_handle` escape hatch is gone; and
+    `list_deletion_blockers` no longer issues `SET TRANSACTION` when it runs
+    inside a caller's transaction, where the statement is a subtransaction and
+    PostgreSQL would abort the whole thing.
+  - Reviewed and kept as-is: an item `get`/`update`/`delete` the caller does not
+    hold answers `403` on an existing resource and `404` on a missing one, which
+    confirms existence by name. Authorization here depends on the resource's own
+    labels, so it cannot be decided before the lookup; ADR-0001 §4 requires
+    masking for *collections*, which is implemented, and says nothing about a
+    caller who already names one resource exactly. Kubernetes answers the same
+    way. Recorded here because it is a decision rather than an oversight.
+  - Reviewed and kept as-is: the `deletion-blockers` subresource names the
+    blocking children whether or not the caller could `list` them individually.
+    Naming them is the whole content of the grant; the alternative is a
+    subresource that reports "something blocks this" and nothing more. Now
+    documented at the grant.
 - Follow-ups this increment deliberately leaves open:
+  - **Group-targeted policy is dark until identity resources exist.** Ties
+    resolve against `User` and `Group` resources that no login path writes yet,
+    so every principal has an empty tie set. Harmless for an Allow — a group
+    binding grants nothing — but a cap expressed as a group-targeted `Deny` is
+    never collected and therefore does not bite. Until increment 10, a
+    restriction has to name a subject that resolves today. The resolver's module
+    doc says so at the seam, and the upgrade notes say so to operators.
   - **Atomic Organization creation with its org-admin binding** (ADR-0001 §5)
     stays open, and is now blocked rather than deferred: the binding names an
     "operator-selected existing User", and admission resolves a literal `user:`

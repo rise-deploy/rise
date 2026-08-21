@@ -22,7 +22,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use rise_authz::engine::{ListCandidate, ResourceTree};
+use rise_authz::engine::{ListCandidate, ListDecision, ResourceTree};
 #[cfg(test)]
 use rise_resource_api::NoOpValidator;
 use rise_resource_api::{
@@ -628,9 +628,25 @@ async fn dispatch_get_inner(
             resolved,
             ancestor_segs,
         } => {
-            let parent_uid = resolve_parent_row(&ctx.store, &ancestor_segs)
-                .await?
-                .map(|r| r.uid);
+            // A collection under a scope that does not exist answers the same
+            // way as one the caller may see nothing in: empty. Answering 404
+            // here would make the ancestor path itself enumerable by name —
+            // which organizations exist, which projects they contain — while
+            // the per-item filter below carefully masks their contents
+            // (ADR-0001 §4).
+            let parent = match resolve_parent_row(&ctx.store, &ancestor_segs).await {
+                Ok(parent) => parent,
+                Err(error) if error.status == StatusCode::NOT_FOUND => {
+                    return Ok(Json(ResourceList {
+                        api_version: resolved.info.api_version.clone(),
+                        kind: resolved.info.kind,
+                        items: Vec::new(),
+                    })
+                    .into_response());
+                }
+                Err(error) => return Err(error),
+            };
+            let parent_uid = parent.map(|r| r.uid);
             let ancestors = match parent_uid {
                 None => Vec::new(),
                 Some(uid) => authz.tree(uid).await?.nodes().to_vec(),
@@ -657,12 +673,23 @@ async fn dispatch_get_inner(
             // (ADR-0001 §4). Items the caller cannot `list` are omitted and
             // their existence masked: no applicable grant yields an empty
             // collection, never a 403 confirming the scope is populated.
-            let decisions = authz.filter_list(&ancestors, &candidates).await?;
+            let decisions: BTreeMap<Uuid, ListDecision> = authz
+                .filter_list(&ancestors, &candidates)
+                .await?
+                .into_iter()
+                .map(|decision| (decision.uid, decision))
+                .collect();
             let mut items = Vec::new();
-            for ((row, candidate), decision) in rows.iter().zip(&candidates).zip(&decisions) {
-                if !decision.listable {
+            for (row, candidate) in rows.iter().zip(&candidates) {
+                // Matched by UID rather than by position: a decision that does
+                // not name this row is no decision at all, and the item is
+                // omitted. Positional alignment holds today, but reading it
+                // back from the answer is what keeps a future change to the
+                // engine's filter from silently pairing one item's row with
+                // another item's verdict.
+                let Some(decision) = decisions.get(&row.uid).filter(|d| d.listable) else {
                     continue;
-                }
+                };
                 let target = ResourceTree::with_leaf(&ancestors, candidate.node.clone());
                 items.push(project_list_item(
                     &resource_response(row, &resolved.info.api_version, &target)?,
@@ -1065,6 +1092,23 @@ fn resource_response(
     Ok(resource)
 }
 
+/// Report an `anyhow` failure from inside the write transaction, preserving a
+/// lost serialization race as retryable.
+///
+/// Helpers that predate the store contract report `anyhow::Error`, which has no
+/// place to carry "replay me". Recovering the SQLSTATE keeps the retry loop
+/// working for statements that do not speak `StoreError`.
+fn serialization_aware_internal(error: anyhow::Error, message: &str) -> ServerError {
+    if error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<sqlx::Error>())
+        .any(rise_resource_store_postgres::is_serialization_failure)
+    {
+        return store_error_to_server_error(rise_resource_api::StoreError::Serialization);
+    }
+    ServerError::internal_anyhow(error, message.to_owned())
+}
+
 /// Queue one write's audit record, to be emitted when the transaction commits.
 ///
 /// The record is deferred rather than logged inline because a serialization
@@ -1097,6 +1141,26 @@ fn audit_write(
     });
 }
 
+/// The body a write returns, at the granularity the caller may read.
+///
+/// A write verb is not a read grant: ADR-0001 §2 keeps main-resource and
+/// subresource permissions separate, so a caller who may set `status` has not
+/// thereby been given the `spec`. Anything the caller cannot `get` comes back
+/// projected onto the same allowlist a `list`-only item uses — which still
+/// echoes everything they just sent, because a write body is their own input.
+async fn write_response(
+    authz: &AuthorizationContext,
+    row: &ResourceRow,
+    response_api_version: &str,
+    target: &ResourceTree,
+) -> Result<serde_json::Value, ServerError> {
+    let readable = authz.allows(target, Verb::Get, None).await?;
+    project_list_item(
+        &resource_response(row, response_api_version, target)?,
+        read_granularity(readable),
+    )
+}
+
 fn read_granularity(readable: bool) -> ReadGranularity {
     if readable {
         ReadGranularity::Full
@@ -1111,6 +1175,37 @@ fn subresource_name(subresource: Subresource) -> Result<SubresourceName, ServerE
     })
 }
 
+/// `allowedStatusControllerIds` is an authorization decision, and the only one
+/// the grant gate cannot express.
+///
+/// Every id on a `ResourceDefinition`'s list grants that controller `status` and
+/// `finalizers` writes over every resource of the kind, in every organization —
+/// but a controller is not a subject the engine can evaluate until its identity
+/// resource exists, so there is no binding to diff and no recipient to compare a
+/// writer against. Until then, changing the list stays operator authority:
+/// otherwise an ordinary `update` on a `ResourceDefinition` would confer
+/// authority no `RoleBinding` granted and no gate ever weighed. The allowlist
+/// goes away entirely once Controller identities are live (`ROADMAP.md` §1).
+fn require_operator_for_controller_allowlist(
+    authz: &AuthorizationContext,
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+) -> Result<(), ServerError> {
+    let ids = |spec: &serde_json::Value| -> Vec<serde_json::Value> {
+        spec.get("allowedStatusControllerIds")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
+    if ids(before) == ids(after) || authz.is_operator() {
+        return Ok(());
+    }
+    Err(ServerError::forbidden(
+        "changing allowedStatusControllerIds requires operator standing: it grants \
+         controllers status and finalizer writes outside the authorization model",
+    ))
+}
+
 /// Run the grant gate over every authorization-changing effect of one write.
 ///
 /// The caller has already established ordinary write authority; this is the
@@ -1123,7 +1218,9 @@ async fn run_gate(
     changes: AuthorizationChangeSet,
 ) -> Result<(), ServerError> {
     for gated in changes {
-        authz.gate(&gated.operation, &gated.change).await?;
+        authz
+            .gate(&gated.operation, &gated.change, gated.disclosure)
+            .await?;
     }
     Ok(())
 }
@@ -1182,6 +1279,10 @@ async fn create_resource(
     let annotations: BTreeMap<String, String> = body.metadata.annotations.clone();
     let spec = serde_json::to_value(&body.spec)
         .map_err(|e| ServerError::bad_request(format!("invalid spec: {e}")))?;
+
+    if resolved.info.kind == rise_resource_api::RESOURCE_DEFINITION_KIND {
+        require_operator_for_controller_allowlist(authz, &serde_json::Value::Null, &spec)?;
+    }
 
     let mut changes = change_for_create(
         authz,
@@ -1252,7 +1353,7 @@ async fn update_resource(
     row: &ResourceRow,
     leaf: &LeafRef,
     body: UpdateResourceRequest,
-) -> Result<Json<rise_resource_api::Resource>, ServerError> {
+) -> Result<Json<serde_json::Value>, ServerError> {
     // Reject writes to non-storage versions until version conversion is implemented.
     if resolved.info.api_version != resolved.info.storage_api_version {
         return Err(ServerError::new(
@@ -1290,6 +1391,19 @@ async fn update_resource(
         )));
     }
 
+    // A main write preserves finalizers (ADR-0001 §2): only
+    // `(update, Kind, finalizers)` may change them, and permissions never flow
+    // implicitly between the main resource and a subresource. A
+    // read-modify-write client carries the stored list back unchanged and is
+    // unaffected; anything else is refused here rather than silently ignored,
+    // so a client that meant to drop a finalizer learns it did not.
+    if body.metadata.finalizers != row.finalizers {
+        return Err(ServerError::forbidden(
+            "a main-resource write cannot change metadata.finalizers; use the \
+             finalizers subresource, which is a separate grant",
+        ));
+    }
+
     // The target carries the resource's *stored* labels: a label diff is
     // measured against the world as it stands, which is also the world the
     // writer's own authority is measured in (ADR-0001 §6.6).
@@ -1299,6 +1413,10 @@ async fn update_resource(
     let annotations: BTreeMap<String, String> = body.metadata.annotations.clone();
     let spec = serde_json::to_value(&body.spec)
         .map_err(|e| ServerError::bad_request(format!("invalid spec: {e}")))?;
+
+    if resolved.info.kind == rise_resource_api::RESOURCE_DEFINITION_KIND {
+        require_operator_for_controller_allowlist(authz, &row.spec, &spec)?;
+    }
 
     let mut changes = change_for_update(authz, row, &spec).await?;
     changes.extend(label_changes(
@@ -1340,11 +1458,9 @@ async fn update_resource(
     // The written labels are the resource's own after this update, so the
     // response reports the value the next request will evaluate against.
     let updated_target = authz.tree(updated.uid).await?;
-    Ok(Json(resource_response(
-        &updated,
-        &resolved.info.api_version,
-        &updated_target,
-    )?))
+    Ok(Json(
+        write_response(authz, &updated, &resolved.info.api_version, &updated_target).await?,
+    ))
 }
 
 async fn delete_resource(
@@ -1379,7 +1495,12 @@ async fn delete_resource(
                 ));
             }
             Err(OrganizationDeleteError::Db(e)) => {
-                return Err(ServerError::internal_anyhow(
+                // The count runs inside the request's serializable transaction,
+                // so it can lose the race like any other statement in it. It
+                // reports `anyhow`, which carries no store classification, so
+                // the SQLSTATE is recovered here rather than surfacing a lost
+                // race as a hard 500 the caller cannot act on.
+                return Err(serialization_aware_internal(
                     e,
                     "Failed to count typed children for organization",
                 ));
@@ -1408,7 +1529,7 @@ async fn delete_resource(
         )
             .into_response()),
         DeleteOutcome::MarkedForDeletion(marked) => {
-            let resource = resource_response(&marked, response_api_version, &target)?;
+            let resource = write_response(authz, &marked, response_api_version, &target).await?;
             Ok((
                 StatusCode::ACCEPTED,
                 Json(serde_json::json!({
@@ -1483,18 +1604,20 @@ async fn apply_user_status(
     body: ControllerStatusUpdate,
     response_api_version: &str,
     target: &ResourceTree,
-) -> Result<Json<rise_resource_api::Resource>, ServerError> {
+) -> Result<Json<serde_json::Value>, ServerError> {
+    // Keyed on the caller's stable subject, never their email: the slot is
+    // stored inside the resource document and served to every reader of it,
+    // which makes it product data rather than an audit record (ADR-0001 §1 —
+    // user identity is not email).
     let updated = authz
         .store()
-        .operator_update_status(row.uid, authz.actor(), body.status)
+        .operator_update_status(row.uid, authz.subject().as_ref(), body.status)
         .await
         .map_err(store_error_to_server_error)?;
     audit_write(authz, row, "resource.user_status_updated", None);
-    Ok(Json(resource_response(
-        &updated,
-        response_api_version,
-        target,
-    )?))
+    Ok(Json(
+        write_response(authz, &updated, response_api_version, target).await?,
+    ))
 }
 
 /// A user's `finalizers` write, authorized by `(update, Kind, finalizers)`.
@@ -1508,18 +1631,16 @@ async fn apply_user_finalizers(
     body: ControllerFinalizerUpdate,
     response_api_version: &str,
     target: &ResourceTree,
-) -> Result<Json<rise_resource_api::Resource>, ServerError> {
+) -> Result<Json<serde_json::Value>, ServerError> {
     let updated = authz
         .store()
-        .operator_update_finalizers(row.uid, authz.actor(), &body.add, &body.remove)
+        .operator_update_finalizers(row.uid, authz.subject().as_ref(), &body.add, &body.remove)
         .await
         .map_err(store_error_to_server_error)?;
     audit_write(authz, row, "resource.user_finalizers_updated", None);
-    Ok(Json(resource_response(
-        &updated,
-        response_api_version,
-        target,
-    )?))
+    Ok(Json(
+        write_response(authz, &updated, response_api_version, target).await?,
+    ))
 }
 
 #[cfg(test)]
@@ -2210,6 +2331,218 @@ mod dispatch_tests {
         assert_eq!(
             created["metadata"]["effectiveLabels"]["rise.dev/owner"],
             "group:devops"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Subresource boundaries a main write must not cross
+    // -------------------------------------------------------------------------
+
+    /// ADR-0001 §2: main writes preserve finalizers, and only
+    /// `(update, Kind, finalizers)` may change them. Permissions never flow
+    /// implicitly between the main resource and a subresource, so plain
+    /// `update` — which every editor holds — must not be able to clear a
+    /// finalizer another controller is holding a deletion with.
+    #[sqlx::test]
+    async fn a_main_write_cannot_change_finalizers(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx, &["controller.example.com"]).await;
+        let created = create_widget(&ctx, "example.dev/v1", "held").await;
+        let uid = uid_of(&created);
+        ctx.store
+            .update_controller_finalizers(
+                uid,
+                "controller.example.com",
+                &["controller.example.com/cleanup".to_string()],
+                &[],
+            )
+            .await
+            .expect("controller adds its finalizer");
+
+        let fetched = dispatch_get_inner(
+            &ctx,
+            "example.dev/v1/widgets/held".to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("read back");
+        let (_, fetched) = read(fetched).await;
+
+        // Omitting `finalizers` is not "leave unchanged" — the field defaults to
+        // an empty list, so this request would clear the controller's hold.
+        let err = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/held".to_string(),
+            any_user(OPERATOR),
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {"name": "held", "revision": fetched["metadata"]["revision"]},
+                "spec": {"size": "large"},
+            }),
+        )
+        .await
+        .expect_err("a main write must not drop finalizers");
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        assert!(
+            err.message.contains("finalizers subresource"),
+            "{}",
+            err.message
+        );
+
+        // Carrying the stored list back unchanged is an ordinary
+        // read-modify-write and is accepted.
+        let resp = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/held".to_string(),
+            any_user(OPERATOR),
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {
+                    "name": "held",
+                    "revision": fetched["metadata"]["revision"],
+                    "finalizers": ["controller.example.com/cleanup"],
+                },
+                "spec": {"size": "small"},
+            }),
+        )
+        .await
+        .expect("an unchanged finalizer list is fine");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A reserved `system.rise.dev/*` finalizer is lifecycle bookkeeping the
+    /// store owns. Planting one through a create would make the resource
+    /// undeletable through every route the API offers — the `finalizers`
+    /// subresource refuses to remove a reserved name even for an operator.
+    #[sqlx::test]
+    async fn a_create_cannot_plant_a_reserved_finalizer(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx, &[]).await;
+
+        let err = dispatch_post_inner(
+            &ctx,
+            "example.dev/v1/widgets".to_string(),
+            auth(OPERATOR),
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {
+                    "name": "undeletable",
+                    "finalizers": ["system.rise.dev/cascade-deletion"],
+                },
+                "spec": {},
+            }),
+        )
+        .await
+        .expect_err("a reserved finalizer must be refused");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("reserved"), "{}", err.message);
+    }
+
+    /// A write verb is not a read grant (ADR-0001 §2). A caller who may set
+    /// `status` has not been given the `spec`, so the response comes back at the
+    /// granularity they may read.
+    #[sqlx::test]
+    async fn a_status_write_does_not_return_the_spec(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx, &[]).await;
+        create_widget(&ctx, "example.dev/v1", "w1").await;
+        grant_authenticated(
+            &ctx,
+            "status-writer",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["example.dev/Widget"],
+                "verbs": ["update"],
+                "subresources": ["status"],
+            }]),
+        )
+        .await;
+
+        let resp = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/w1/status".to_string(),
+            any_user(PLAIN_USER),
+            json!({"status": {"phase": "Ready"}}),
+        )
+        .await
+        .expect("the status grant permits the write");
+        let (status, body) = read(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["metadata"]["name"], "w1");
+        assert!(
+            body.get("spec").is_none(),
+            "a status writer must not read the spec back: {body}"
+        );
+        assert!(body.get("status").is_none(), "{body}");
+
+        // An operator holds `get`, so the same call returns the whole object.
+        let resp = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/w1/status".to_string(),
+            any_user(OPERATOR),
+            json!({"status": {"phase": "Ready"}}),
+        )
+        .await
+        .expect("operator status write");
+        let (_, body) = read(resp).await;
+        assert_eq!(body["spec"]["size"], "large");
+    }
+
+    /// `allowedStatusControllerIds` grants controllers status and finalizer
+    /// writes outside the authorization model, so changing it stays operator
+    /// authority until Controller identities make it expressible as policy.
+    #[sqlx::test]
+    async fn changing_the_controller_allowlist_requires_an_operator(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx, &[]).await;
+        grant_authenticated(
+            &ctx,
+            "rd-editor",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["rise.dev/ResourceDefinition"],
+                "verbs": ["get", "list", "update"],
+            }]),
+        )
+        .await;
+
+        let fetched = dispatch_get_inner(
+            &ctx,
+            "rise.dev/v1alpha1/resourcedefinitions/widgets.example.dev".to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("read the RD");
+        let (_, fetched) = read(fetched).await;
+        let mut spec = fetched["spec"].clone();
+        spec["allowedStatusControllerIds"] = json!(["ci.example.com"]);
+
+        let err = dispatch_put_inner(
+            &ctx,
+            "rise.dev/v1alpha1/resourcedefinitions/widgets.example.dev".to_string(),
+            any_user(PLAIN_USER),
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "ResourceDefinition",
+                "metadata": {
+                    "name": "widgets.example.dev",
+                    "revision": fetched["metadata"]["revision"],
+                },
+                "spec": spec,
+            }),
+        )
+        .await
+        .expect_err("only an operator may widen the controller allowlist");
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        assert!(
+            err.message.contains("allowedStatusControllerIds"),
+            "{}",
+            err.message
         );
     }
 
@@ -3033,22 +3366,59 @@ mod dispatch_tests {
     // Parent-chain classification through the dispatch layer
     // -------------------------------------------------------------------------
 
+    /// A *listing* under an ancestor that does not exist answers exactly as one
+    /// the caller may see nothing in: empty. Distinguishing the two would make
+    /// the ancestor path enumerable by name — which organizations exist, which
+    /// projects they hold — right next to a per-item filter that carefully masks
+    /// their contents (ADR-0001 §4).
     #[sqlx::test]
-    async fn nested_ancestor_name_not_found_yields_404(pool: sqlx::PgPool) {
+    async fn a_listing_under_a_missing_ancestor_is_masked_empty(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
         register_gadget_rd(&ctx, &[]).await;
 
-        // `gadgets` is Organization-scoped (depth 1). The ancestor *type* is now
+        // `gadgets` is Organization-scoped (depth 1). The ancestor *type* is
         // derived from the ResourceDefinition graph and cannot be mistyped in
         // the URL, so the only failure mode is an ancestor *name* with no row.
-        let err = dispatch_get_inner(
+        let resp = dispatch_get_inner(
             &ctx,
             "example.dev/v1/gadgets/no-such-org".to_string(),
             auth(OPERATOR),
             PendingDeletionQuery::default(),
         )
         .await
-        .expect_err("a missing ancestor organization must be a 404");
+        .expect("a listing is never a 404 for the ancestor");
+        let (status, body) = read(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["items"].as_array().expect("items").len(), 0);
+
+        // An *item* under the same missing ancestor is still a 404: the caller
+        // named one resource exactly, and there is nothing to mask a collection
+        // of.
+        let err = dispatch_get_inner(
+            &ctx,
+            "example.dev/v1/gadgets/no-such-org/gadget".to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect_err("a missing ancestor on an item path is a 404");
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+
+        // And a create under it still fails: you cannot write into a scope that
+        // does not exist.
+        let err = dispatch_post_inner(
+            &ctx,
+            "example.dev/v1/gadgets/no-such-org".to_string(),
+            auth(OPERATOR),
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Gadget",
+                "metadata": {"name": "orphan"},
+                "spec": {},
+            }),
+        )
+        .await
+        .expect_err("a create under a missing ancestor must fail");
         assert_eq!(err.status, StatusCode::NOT_FOUND);
     }
 

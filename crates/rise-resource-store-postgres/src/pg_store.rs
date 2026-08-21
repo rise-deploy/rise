@@ -156,6 +156,17 @@ impl PgResourceStore {
         if crate::session::is_serialization_failure(&err) {
             return StoreError::Serialization;
         }
+        // 25P02 in_failed_sql_transaction: an earlier statement in this
+        // transaction failed and its error was discarded, so this one never
+        // ran. The transaction is unusable and nothing it read can be trusted;
+        // replaying the whole unit of work is the only correct response, which
+        // is what `Serialization` asks the caller to do. Reporting a backend
+        // error instead would turn a swallowed lost race into a hard failure.
+        if let sqlx::Error::Database(db) = &err {
+            if db.code().as_deref() == Some("25P02") {
+                return StoreError::Serialization;
+            }
+        }
         if let sqlx::Error::Database(db) = &err {
             // 22021 character_not_in_repertoire — a NUL byte in a text value.
             // 22P05 untranslatable_character — an escaped NUL in a jsonb value.
@@ -166,6 +177,34 @@ impl PgResourceStore {
             }
         }
         StoreError::backend(err)
+    }
+
+    /// Reject a reserved finalizer the caller is trying to add or remove
+    /// through a main-resource write.
+    ///
+    /// `system.rise.dev/*` names are lifecycle bookkeeping the store and the
+    /// garbage collector own (ADR-0001 §2): only the `finalizers` subresource
+    /// may change finalizers at all, and not even that may touch a reserved
+    /// one. A main write carrying the reserved set back unchanged is an
+    /// ordinary read-modify-write and is accepted; changing that set is not,
+    /// because planting `system.rise.dev/cascade-deletion` makes a resource
+    /// undeletable through every route the API offers.
+    fn reject_reserved_finalizer_change(
+        before: &[String],
+        after: &[String],
+    ) -> Result<(), StoreError> {
+        let reserved = |finalizers: &[String]| -> std::collections::BTreeSet<String> {
+            finalizers
+                .iter()
+                .filter(|finalizer| finalizer.starts_with(SYSTEM_FINALIZER_PREFIX))
+                .cloned()
+                .collect()
+        };
+        let (before, after) = (reserved(before), reserved(after));
+        if let Some(changed) = after.symmetric_difference(&before).next() {
+            return Err(StoreError::ReservedFinalizer(changed.clone()));
+        }
+        Ok(())
     }
 
     fn is_discriminator_conflict(err: &sqlx::Error) -> bool {
@@ -548,6 +587,26 @@ impl PgResourceStore {
 
     /// Best-effort emit one structured lifecycle log after the transaction that
     /// first tombstoned each dependent has committed.
+    /// Record a cascade once it is durable.
+    ///
+    /// The cascade is stamped inside a savepoint, so emitting the records at
+    /// savepoint release would claim deletions that the outer transaction can
+    /// still roll back — and a serialization retry would emit them again, once
+    /// per attempt. This is the same rule the resource API applies to its own
+    /// write records.
+    fn log_tombstoned_dependents_on_commit(
+        &self,
+        owner: &PgResourceRow,
+        dependents: Vec<TombstonedDependent>,
+    ) {
+        if dependents.is_empty() {
+            return;
+        }
+        let owner = owner.clone();
+        self.db
+            .on_commit(move || Self::log_tombstoned_dependents(&owner, dependents));
+    }
+
     fn log_tombstoned_dependents(owner: &PgResourceRow, dependents: Vec<TombstonedDependent>) {
         for dependent in dependents {
             let (reason, relationship, block_owner_deletion) = match dependent.relationship {
@@ -778,8 +837,28 @@ impl PgResourceStore {
         api_version.split_once('/').map_or(api_version, |(g, _)| g)
     }
 
-    fn invalidate_schema_cache(&self, group: &str, plural: &str) {
-        if let Ok(mut cache) = self.schema_cache.write() {
+    /// Evict this collection's compiled validators once the write that changed
+    /// them is durable.
+    ///
+    /// Evicting at savepoint release would be worse than not evicting at all: a
+    /// concurrent pool-backed reader would miss the cache, read the *pre-write*
+    /// definition (this transaction has not committed), compile a validator from
+    /// it, and publish that — leaving the superseded schema in force
+    /// indefinitely, because nothing invalidates again.
+    fn invalidate_schema_cache_on_commit(&self, group: &str, plural: &str) {
+        let cache = self.schema_cache.clone();
+        let group = group.to_owned();
+        let plural = plural.to_owned();
+        self.db
+            .on_commit(move || Self::evict_schema_cache(&cache, &group, &plural));
+    }
+
+    fn evict_schema_cache(
+        cache: &RwLock<HashMap<String, Arc<dyn SpecValidator>>>,
+        group: &str,
+        plural: &str,
+    ) {
+        if let Ok(mut cache) = cache.write() {
             cache.retain(|key, _| {
                 // Cache keys are formatted as "{group}/{version}/{plural}" by
                 // resolve_collection_version. Split into exactly three parts so that
@@ -924,6 +1003,8 @@ impl ResourceStore for PgResourceStore {
         if let Some(validator) = &params.validator {
             validator.validate_spec(&params.spec)?;
         }
+
+        Self::reject_reserved_finalizer_change(&[], &params.finalizers)?;
 
         let mut connection = self.connection().await?;
         let mut tx = connection.begin().await.map_err(Self::db_error)?;
@@ -1245,6 +1326,7 @@ impl ResourceStore for PgResourceStore {
                 found: current.revision,
             });
         }
+        Self::reject_reserved_finalizer_change(&current.finalizers, &params.finalizers)?;
         if current.api_version != snapshot.api_version
             || current.kind != snapshot.kind
             || current.parent_uid != snapshot.parent_uid
@@ -1376,7 +1458,7 @@ impl ResourceStore for PgResourceStore {
             .await
             .map_err(Self::db_error)?;
             tx.commit().await.map_err(Self::db_error)?;
-            Self::log_tombstoned_dependents(&row, tombstoned);
+            self.log_tombstoned_dependents_on_commit(&row, tombstoned);
             return Ok(DeleteOutcome::MarkedForDeletion(Box::new(marked.into())));
         }
 
@@ -1396,7 +1478,7 @@ impl ResourceStore for PgResourceStore {
             .await
             .map_err(Self::db_error)?;
             tx.commit().await.map_err(Self::db_error)?;
-            Self::log_tombstoned_dependents(&row, tombstoned);
+            self.log_tombstoned_dependents_on_commit(&row, tombstoned);
             return Ok(DeleteOutcome::MarkedForDeletion(Box::new(marked.into())));
         }
         // Deleting the `resources` row also removes it from the
@@ -1407,7 +1489,7 @@ impl ResourceStore for PgResourceStore {
             .await
             .map_err(Self::db_error)?;
         tx.commit().await.map_err(Self::db_error)?;
-        Self::log_tombstoned_dependents(&row, tombstoned);
+        self.log_tombstoned_dependents_on_commit(&row, tombstoned);
 
         Ok(DeleteOutcome::Deleted)
     }
@@ -1457,7 +1539,7 @@ impl ResourceStore for PgResourceStore {
             .await
             .map_err(Self::db_error)?;
             tx.commit().await.map_err(Self::db_error)?;
-            Self::log_tombstoned_dependents(&row, tombstoned);
+            self.log_tombstoned_dependents_on_commit(&row, tombstoned);
             return Ok(DeleteOutcome::MarkedForDeletion(Box::new(row.into())));
         }
 
@@ -1483,7 +1565,7 @@ impl ResourceStore for PgResourceStore {
 
         if !row.finalizers.is_empty() {
             tx.commit().await.map_err(Self::db_error)?;
-            Self::log_tombstoned_dependents(&row, tombstoned);
+            self.log_tombstoned_dependents_on_commit(&row, tombstoned);
             return Ok(DeleteOutcome::MarkedForDeletion(Box::new(row.into())));
         }
 
@@ -1500,7 +1582,7 @@ impl ResourceStore for PgResourceStore {
             .await
             .map_err(Self::db_error)?;
         tx.commit().await.map_err(Self::db_error)?;
-        Self::log_tombstoned_dependents(&row, tombstoned);
+        self.log_tombstoned_dependents_on_commit(&row, tombstoned);
 
         Ok(DeleteOutcome::Deleted)
     }
@@ -1524,11 +1606,20 @@ impl ResourceStore for PgResourceStore {
 
     async fn list_deletion_blockers(&self, uid: Uuid) -> Result<DeletionBlockerReport, StoreError> {
         let mut connection = self.connection().await?;
+        let transactional = self.db.is_transactional();
         let mut tx = connection.begin().await.map_err(Self::db_error)?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-            .execute(&mut *tx)
-            .await
-            .map_err(Self::db_error)?;
+        // The report must see one consistent snapshot of the resource and its
+        // dependents. On the pool that means asking for one; inside a caller's
+        // transaction the snapshot is already fixed and at least as strong, and
+        // `begin()` there is a `SAVEPOINT` — PostgreSQL rejects `SET
+        // TRANSACTION` in a subtransaction, which would abort the caller's whole
+        // transaction rather than tighten anything.
+        if !transactional {
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                .execute(&mut *tx)
+                .await
+                .map_err(Self::db_error)?;
+        }
 
         let resource = sqlx::query_as::<_, PgResourceRow>(
             "SELECT * FROM resource_store.resources WHERE uid = $1",
@@ -2290,7 +2381,7 @@ impl ResourceStore for PgResourceStore {
 
         tx.commit().await.map_err(Self::db_error)?;
 
-        self.invalidate_schema_cache(&spec.group, &spec.plural);
+        self.invalidate_schema_cache_on_commit(&spec.group, &spec.plural);
 
         let mut resource_row = resource_row;
         resource_row.owner_references = owner_references;
@@ -2454,7 +2545,7 @@ impl ResourceStore for PgResourceStore {
         // `resource_definitions` view reflects it with no separate sync.
         tx.commit().await.map_err(Self::db_error)?;
 
-        self.invalidate_schema_cache(&new_spec.group, &new_spec.plural);
+        self.invalidate_schema_cache_on_commit(&new_spec.group, &new_spec.plural);
 
         Ok(row.into())
     }

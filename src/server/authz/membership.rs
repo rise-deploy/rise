@@ -12,6 +12,15 @@
 //! with process configuration, which the engine deliberately knows nothing
 //! about.
 //!
+//! **Group policy is dark until identity resources exist.** Ties resolve
+//! against `User` and `Group` resources, and no login path writes them yet, so
+//! every principal currently has an empty tie set. That direction is safe for
+//! an Allow — a group binding simply grants nothing — but it is *not* safe for
+//! a Deny: a cap expressed as a group-targeted Deny is never collected, so it
+//! does not bite. Until identity resolution lands, a restriction has to be
+//! expressed against a subject that resolves today (`system:authenticated`,
+//! `org:<name>`, or the principal itself) to actually be a restriction.
+//!
 //! **Transitional operator derivation.** ADR-0001 §1 defines an operator as an
 //! active User with a live, active `UserIdentity` matching the restart-loaded
 //! `operatorIdentities` selector set. Those identity resources are not yet
@@ -73,21 +82,29 @@ impl RiseMembershipResolver {
         }
     }
 
-    /// Live `group:<org>/<name>` ties of the User named by `subject`.
+    /// Live `group:<org>/<name>` ties of the User this subject names.
     ///
     /// The lookup is UID- *and* name-bound: a `GroupMembership` names its User
     /// (ADR-0001 §1), and the User resource must still carry that name under
     /// that UID. A name-bound marker left behind by a deleted User therefore
     /// confers nothing until a User of that name exists again, which is the
     /// reactivation §1 describes rather than a live tie.
+    ///
+    /// The UID is the *resource's*, resolved from the canonical name — never the
+    /// credential's `rise_uid`. Those are the same value only once identity
+    /// resolution assigns a principal its User resource's UID; passing the
+    /// credential's would make a tie resolvable only when two independently
+    /// generated identifiers happened to coincide, which is to say never.
     async fn group_ties(
         &self,
         subject: &SubjectId,
-        subject_uid: uuid::Uuid,
     ) -> Result<BTreeSet<SubjectId>, AuthorizationError> {
+        let Some(user_uid) = self.lookup_user_resource(subject.name()).await? else {
+            return Ok(BTreeSet::new());
+        };
         let facts = self
             .memberships
-            .groups_for_user(subject_uid, subject.name())
+            .groups_for_user(user_uid, subject.name())
             .await?;
         facts
             .iter()
@@ -161,9 +178,7 @@ impl MembershipResolver for RiseMembershipResolver {
             )));
         }
         Ok(PrincipalMembership {
-            groups: self
-                .group_ties(principal.subject(), principal.subject_uid())
-                .await?,
+            groups: self.group_ties(principal.subject()).await?,
             is_operator: self.is_operator().await?,
         })
     }
@@ -177,17 +192,8 @@ impl MembershipResolver for RiseMembershipResolver {
                 "{user} is not a User subject"
             )));
         }
-        // The lookup is UID-bound and this caller has only a name, so resolve
-        // the User resource first. A name with no live User resource has no
-        // ties — the mapping's parent identity is whatever the name means once
-        // such a resource exists.
-        let Some(row) = self
-            .lookup_user_resource(user.name())
-            .await?
-            .map(|uid| (uid, user.clone()))
-        else {
-            return Ok(BTreeSet::new());
-        };
-        self.group_ties(&row.1, row.0).await
+        // A name with no live User resource has no ties — the mapping's parent
+        // identity is whatever the name means once such a resource exists.
+        self.group_ties(user).await
     }
 }

@@ -28,6 +28,9 @@ use tokio::sync::{Mutex, MutexGuard};
 /// A live transaction, or `None` once it has been committed.
 type SharedTransaction = Arc<Mutex<Option<Transaction<'static, Postgres>>>>;
 
+/// Work that must not happen until the transaction it belongs to commits.
+type DeferredEffects = Arc<std::sync::Mutex<Vec<Box<dyn FnOnce() + Send>>>>;
+
 /// A database handle for the store: the pool, or one shared transaction.
 #[derive(Clone)]
 pub struct PgSession(Backend);
@@ -35,7 +38,7 @@ pub struct PgSession(Backend);
 #[derive(Clone)]
 enum Backend {
     Pool(PgPool),
-    Transaction(SharedTransaction),
+    Transaction(SharedTransaction, DeferredEffects),
 }
 
 impl PgSession {
@@ -46,18 +49,27 @@ impl PgSession {
 
     /// Whether this session runs inside a caller-owned transaction.
     pub fn is_transactional(&self) -> bool {
-        matches!(self.0, Backend::Transaction(_))
+        matches!(self.0, Backend::Transaction(..))
     }
 
-    /// The pool this session draws from, if it is pool-backed.
+    /// Run `effect` once the work it describes is durable.
     ///
-    /// A transaction-scoped session deliberately answers `None`: reaching around
-    /// it to the pool would run the statement outside the caller's transaction,
-    /// which is the one mistake this type exists to prevent.
-    pub fn pool_handle(&self) -> Option<&PgPool> {
+    /// A store method's own `begin()`/`commit()` pair is a `SAVEPOINT` inside a
+    /// caller's transaction, so anything it does *after* releasing that
+    /// savepoint — evicting a cache entry, emitting an audit record — happens
+    /// while the outer transaction can still roll back or lose a serialization
+    /// race. Both are effects the world outside the transaction can observe, so
+    /// both have to wait for the real commit.
+    ///
+    /// On a pool-backed session there is no later commit and the statement is
+    /// already durable, so the effect runs immediately.
+    pub fn on_commit(&self, effect: impl FnOnce() + Send + 'static) {
         match &self.0 {
-            Backend::Pool(pool) => Some(pool),
-            Backend::Transaction(_) => None,
+            Backend::Pool(_) => effect(),
+            Backend::Transaction(_, deferred) => deferred
+                .lock()
+                .expect("deferred transaction effects")
+                .push(Box::new(effect)),
         }
     }
 
@@ -73,7 +85,7 @@ impl PgSession {
             Backend::Pool(pool) => Ok(PgSessionConnection::Pooled(
                 pool.acquire().await.map_err(map_sqlx_error)?,
             )),
-            Backend::Transaction(shared) => {
+            Backend::Transaction(shared, _) => {
                 let guard = shared.try_lock().map_err(|_| {
                     StoreError::backend(std::io::Error::other(
                         "the transaction's connection is already borrowed; release it before \
@@ -141,6 +153,7 @@ impl DerefMut for PgSessionConnection<'_> {
 /// nothing behind.
 pub struct SerializableTransaction {
     shared: SharedTransaction,
+    deferred: DeferredEffects,
 }
 
 impl SerializableTransaction {
@@ -157,24 +170,39 @@ impl SerializableTransaction {
             .map_err(map_sqlx_error)?;
         Ok(Self {
             shared: Arc::new(Mutex::new(Some(transaction))),
+            deferred: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
     }
 
     /// A session every store and lookup built from it shares.
     pub fn session(&self) -> PgSession {
-        PgSession(Backend::Transaction(self.shared.clone()))
+        PgSession(Backend::Transaction(
+            self.shared.clone(),
+            self.deferred.clone(),
+        ))
     }
 
     /// Commit. Returns [`StoreError::Serialization`] when PostgreSQL refuses the
     /// commit because the transaction's reads and writes admit no serial order —
     /// the caller retries the whole unit of work.
+    /// Commit, then run every effect deferred by [`PgSession::on_commit`].
+    ///
+    /// Deferred effects are dropped, unrun, if the commit fails or the
+    /// transaction is abandoned — which is the point: they describe work that
+    /// did not survive.
     pub async fn commit(&self) -> Result<(), StoreError> {
         let transaction = self.shared.lock().await.take().ok_or_else(|| {
             StoreError::backend(std::io::Error::other(
                 "the transaction has already been committed",
             ))
         })?;
-        transaction.commit().await.map_err(map_sqlx_error)
+        transaction.commit().await.map_err(map_sqlx_error)?;
+        let effects =
+            std::mem::take(&mut *self.deferred.lock().expect("deferred transaction effects"));
+        for effect in effects {
+            effect();
+        }
+        Ok(())
     }
 }
 
@@ -191,7 +219,12 @@ pub(crate) fn map_sqlx_error(error: sqlx::Error) -> StoreError {
 }
 
 /// Whether this error is PostgreSQL telling the caller to retry.
-pub(crate) fn is_serialization_failure(error: &sqlx::Error) -> bool {
+///
+/// Public because a statement inside the transaction can be issued through a
+/// helper that reports something other than a `StoreError` — the typed-table
+/// reads a resource write still depends on — and the retry loop has to
+/// recognize a lost race wherever it surfaces.
+pub fn is_serialization_failure(error: &sqlx::Error) -> bool {
     let sqlx::Error::Database(database) = error else {
         return false;
     };

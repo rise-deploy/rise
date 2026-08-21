@@ -65,6 +65,20 @@ Merged to `develop`:
 
   - `metadata.effectiveLabels` is present on every resource response, resolved
     live from the ancestor chain (nearest value wins per key).
+  - A write returns the object at the granularity the caller may *read*. A
+    caller holding `(update, Kind, status)` but not `get` gets the projected
+    metadata shape back, not the `spec` — a write verb is not a read grant.
+  - A main-resource `PUT` may no longer change `metadata.finalizers`; carrying
+    the stored list back unchanged is fine, and changing them is the
+    `finalizers` subresource's separate grant. A create carrying a reserved
+    `system.rise.dev/*` finalizer is rejected.
+  - Changing a `ResourceDefinition`'s `allowedStatusControllerIds` now requires
+    operator standing: it grants controllers status and finalizer writes
+    outside the authorization model, so it is not something an ordinary
+    `update` on the definition should confer.
+  - A listing under an ancestor that does not exist returns an empty collection
+    rather than `404`, so the ancestor path is not enumerable by name. Item
+    paths and creates under a missing ancestor still fail.
   - An item a caller can `list` but not `get` is returned projected onto
     `apiVersion`, `kind`, and the `metadata` fields `name`, `labels`,
     `effectiveLabels`, and `deletionTimestamp` — no `spec`, `status`, `uid`,
@@ -72,6 +86,14 @@ Merged to `develop`:
     responses are unchanged apart from `effectiveLabels`.
   - A write that loses a serialization race after three attempts returns `503`
     with a retryable message instead of committing on stale facts.
+
+  **A restriction must name a subject that resolves today.** Group ties are read
+  from `User` and `Group` resources, which no login path writes yet, so every
+  principal currently has an empty tie set. A group-targeted binding therefore
+  grants nothing — harmless — but a *cap* expressed as a group-targeted `Deny`
+  is equally never collected, so it does not restrict anyone either. Until
+  identity resolution lands, express a restriction against `system:authenticated`,
+  `org:<name>`, or the principal itself.
 
   Two audit record names changed: `resource.operator_status_updated` and
   `resource.operator_finalizers_updated` are now `resource.user_status_updated`

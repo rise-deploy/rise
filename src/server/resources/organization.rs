@@ -39,14 +39,24 @@ pub(crate) enum OrganizationDeleteError {
 /// and will orphan rows in `user_organization_memberships`, `teams`, and
 /// `projects`.
 ///
-/// The count and the delete run on the same `session`, which on the resource
-/// API's delete path is the request's own `SERIALIZABLE` transaction — the
-/// count's predicate read participates, so a typed-row insert (team, project,
-/// or `user_organization_memberships`) that races between the two steps
-/// aborts one of the two transactions rather than being orphaned.
+/// The count and the delete run on the same `session`, so they cannot see
+/// different states of the world, and `store` must be built over that same
+/// session or even that much is lost.
 ///
-/// `store` must be built over that same session, or the two halves land in
-/// different transactions and the guarantee above is lost.
+/// TODO(multi-org): that is *not* mutual exclusion against the typed writers.
+/// PostgreSQL only checks a serializable transaction's predicate reads against
+/// writers that are themselves serializable, and every typed link write —
+/// `set_team_organization`, `set_project_organization`, `ensure_user_membership`
+/// — runs at `READ COMMITTED`. A typed insert committing after this
+/// transaction's snapshot is therefore invisible to the count and aborts
+/// nothing, and the row is orphaned. Acceptable today because (a) the install
+/// is single-default-Org, so any racing insert re-links on the next bootstrap
+/// pass, and (b) Org deletes are a rare admin action. Before a second Org can
+/// be created in production, serialize delete vs. typed insert by taking
+/// `pg_advisory_xact_lock` keyed on the Org UID in this function *and* in every
+/// `set_team_organization` / `set_project_organization` / `ensure_user_membership`
+/// call site — an advisory lock blocks regardless of isolation level, which is
+/// what predicate locking cannot do here.
 pub(crate) async fn delete_organization_guarded(
     store: &Arc<dyn ResourceStore>,
     session: &PgSession,

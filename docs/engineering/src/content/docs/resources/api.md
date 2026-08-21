@@ -289,8 +289,11 @@ owner-reference dependents appear only when their matching reference carries
 `blockOwnerDeletion: true`. Each item identifies the relationship and resource,
 including its deletion timestamp and finalizers. The response also reports
 whether `system.rise.dev/cascade-deletion` is currently present. This
-subresource is authorized by `(get, Kind, deletion-blockers)` and computed from
-the canonical resource rows; it does not maintain a separate blocker table.
+subresource is authorized by `(get, Kind, deletion-blockers)` on the resource
+being blocked, and computed from the canonical resource rows; it does not
+maintain a separate blocker table. Naming the blockers is the whole point of it,
+so the response identifies them whether or not the caller could `list` or `get`
+those children individually — grant the subresource with that in mind.
 
 ## Status codes
 
