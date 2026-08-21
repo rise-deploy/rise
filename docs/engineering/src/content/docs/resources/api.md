@@ -73,7 +73,14 @@ body `{"error": "resource not found"}`, whether the resource is absent, an
 ancestor is absent, the row belongs to another collection, or the caller simply
 may not read it. Authorization runs before the request body is inspected, so a
 malformed body against an invisible resource is masked too rather than answered
-with a `400`.
+with a `400`. On the create path the body checks run *first* instead — they read
+only the request and the collection registry, so the same `400` comes back
+whether or not the parent exists, and the parent is reached only once the answer
+can no longer depend on the body.
+
+The masking is on status and body, not on timing: an existing-but-invisible
+resource costs an ancestry walk and a policy evaluation that an absent one does
+not. Treat the difference as observable by anyone who can measure it.
 
 Items the caller cannot `list` are omitted, and their existence is masked: a
 caller with no applicable grant receives an empty collection, never a `403`

@@ -723,6 +723,43 @@ scope and avoiding dead-end compatibility layers.
     to a bare UID. It runs only after the `use` check has passed, so the caller
     has already established they may reference that owner — but the asymmetry is
     easy to widen by accident and is worth keeping in view.
+- Seventh review — a sixth adversarial round, over the masking funnel and the
+  reordering the fifth round did. Four findings, all fixed here; the first two
+  are the fifth round's own fix, applied to update but not to create:
+  - **The create path answered three body questions before authorizing.**
+    Exactly the defect the previous round fixed on update: the non-storage
+    422 and both body-identity 400s ran after the parent was resolved, so a
+    body naming the wrong kind returned `400` under a real parent and a masked
+    `404` under an absent one. Reachable on every built-in parented collection —
+    `useridentities/<user>` enumerates Users, `groupmemberships/<org>/<group>`
+    enumerates an organization's Groups — by a caller holding nothing. The
+    checks read only the request and the collection registry, so they now run
+    *before* the parent is touched at all: the same 400 comes back either way,
+    and the parent is only reached once the answer can no longer depend on the
+    body. The previous round's test passed because it only ever sent a
+    well-formed body.
+  - **Two more 404 bodies were outside the funnel.** `resolve_parent_row` maps
+    `ParentNotFound` to "parent path segment not found" and has its own
+    "parent resource not found", neither routed through `mask_not_found`. On a
+    depth-1 create the wording coincided with the constant by luck; at depth 2
+    it did not, so an Organization's existence was readable off a create under
+    `groupmemberships/<org>/<group>`. Both now carry the constant, and the
+    remaining five `authz.tree()` call sites that can 404 are masked too — one
+    of them echoed the UID of a resource the caller was never authorized for.
+  - **The finalizer screen still leaked one bit.** Authorization now precedes
+    it, which closed the no-grant leak — but `update` without `get` is a real
+    combination, and the screen compares against the stored list while that
+    caller's write response is projected to a shape that deliberately omits
+    finalizers. So 403-versus-success reported whether the resource carries any
+    finalizer at all. The mismatch is now reported only to a caller who may read
+    them; for anyone else the stored list is preserved silently, which is the
+    only non-leaking answer and changes nothing about what persists.
+  - Recorded rather than fixed: a masked 404 for an absent resource returns
+    after one path query, while one for an existing-but-invisible resource also
+    runs the ancestry walk and one or two policy evaluations. Status and body
+    are identical; wall-clock is not. Closing that means padding every masked
+    answer to the slow path, which is a real cost for a real but weak signal —
+    worth stating rather than pretending the masking is perfect.
 - Follow-ups this increment deliberately leaves open:
   - The centralized choke point replacing `require_operator`, the write-time
     grant gate, and seeded `system-admin`/`resource-owner`/`org-admin` data are

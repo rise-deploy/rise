@@ -534,7 +534,7 @@ async fn resolve_parent_row(
         .await
         .map_err(store_error_to_server_error)?;
     if chain.is_empty() {
-        return Err(ServerError::not_found("parent resource not found"));
+        return Err(ServerError::not_found(RESOURCE_NOT_FOUND));
     }
     Ok(chain.into_iter().last())
 }
@@ -669,7 +669,20 @@ async fn dispatch_get_inner(
             let parent_uid = parent.map(|r| r.uid);
             let ancestors = match parent_uid {
                 None => Vec::new(),
-                Some(uid) => authz.tree(uid).await?.nodes().to_vec(),
+                // A parent that vanished between the two reads answers the way
+                // one that was never there answers, a few lines above: empty.
+                Some(uid) => match authz.tree(uid).await {
+                    Ok(tree) => tree.nodes().to_vec(),
+                    Err(error) if error.status == StatusCode::NOT_FOUND => {
+                        return Ok(Json(ResourceList {
+                            api_version: resolved.info.api_version.clone(),
+                            kind: resolved.info.kind,
+                            items: Vec::new(),
+                        })
+                        .into_response());
+                    }
+                    Err(error) => return Err(error),
+                },
             };
             let rows = ctx
                 .store
@@ -725,7 +738,7 @@ async fn dispatch_get_inner(
         }
         ResolvedPath::Item { resolved, leaf } => {
             let row = resolve_leaf(&ctx.store, &resolved, &leaf).await?;
-            let target = authz.tree(row.uid).await?;
+            let target = authz.tree(row.uid).await.map_err(mask_not_found)?;
             authz.require_visible(&target, Verb::Get, None).await?;
             Ok(Json(resource_response(
                 &row,
@@ -740,7 +753,7 @@ async fn dispatch_get_inner(
             subresource: Subresource::DeletionBlockers,
         } => {
             let row = resolve_leaf(&ctx.store, &resolved, &leaf).await?;
-            let target = authz.tree(row.uid).await?;
+            let target = authz.tree(row.uid).await.map_err(mask_not_found)?;
             authz
                 .require_visible(
                     &target,
@@ -876,9 +889,10 @@ async fn create_once(
         } => {
             let body: CreateResourceRequest = serde_json::from_value(body)
                 .map_err(|e| ServerError::bad_request(format!("invalid request body: {e}")))?;
-            let parent = resolve_parent_row(authz.store(), &ancestor_segs).await?;
+            // The parent is resolved inside, after the body-only validation:
+            // reaching a 400 at all is itself an answer about the parent.
             let (status, resource) =
-                create_resource(ctx, authz, &resolved, parent.as_ref(), body).await?;
+                create_resource(ctx, authz, &resolved, &ancestor_segs, body).await?;
             Ok((status, resource).into_response())
         }
         _ => Err(ServerError::new(
@@ -952,7 +966,7 @@ async fn update_once(
             subresource,
         } => {
             let row = resolve_leaf(authz.store(), &resolved, &leaf).await?;
-            let target = authz.tree(row.uid).await?;
+            let target = authz.tree(row.uid).await.map_err(mask_not_found)?;
             let name = subresource_name(subresource.clone())?;
             match subresource {
                 Subresource::Status => {
@@ -1395,9 +1409,15 @@ async fn create_resource(
     ctx: &ResourceApiCtx,
     authz: &AuthorizationContext,
     resolved: &ResolvedCollection,
-    parent: Option<&ResourceRow>,
+    ancestor_segs: &[PathSegment],
     body: CreateResourceRequest,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ServerError> {
+    // Everything down to `require_create` reads only the request and the
+    // collection registry, never the parent — deliberately, because *reaching*
+    // one of these answers is itself a fact about the parent. A 400 for a
+    // malformed body under a real parent and a masked 404 under an absent one
+    // would enumerate the ancestor tree just as loudly as a 403 would.
+    //
     // Reject writes to non-storage versions until version conversion is implemented.
     if resolved.info.api_version != resolved.info.storage_api_version {
         return Err(ServerError::new(
@@ -1439,6 +1459,11 @@ async fn create_resource(
         &body.metadata.name,
         &body.metadata.labels,
     )?;
+    // From here on the parent is in play, so every failure is masked.
+    let parent = resolve_parent_row(authz.store(), ancestor_segs)
+        .await
+        .map_err(mask_not_found)?;
+    let parent = parent.as_ref();
     let parent_tree = match parent {
         None => None,
         Some(row) => Some(authz.tree(row.uid).await.map_err(mask_not_found)?),
@@ -1582,14 +1607,27 @@ async fn update_resource(
     // `(update, Kind, finalizers)` may change them, and permissions never flow
     // implicitly between the main resource and a subresource. A
     // read-modify-write client carries the stored list back unchanged and is
-    // unaffected; anything else is refused here rather than silently ignored,
-    // so a client that meant to drop a finalizer learns it did not.
-    if body.metadata.finalizers != row.finalizers {
+    // unaffected.
+    //
+    // Whether the mismatch is *reported* turns on `get`, because the comparison
+    // is against the stored list. `update` without `get` is a real combination,
+    // and the write response for such a caller is projected down to a shape
+    // that omits finalizers — so refusing here would hand back, through the
+    // difference between a 403 and a success, the one bit that projection
+    // exists to withhold: whether this resource carries any finalizer at all.
+    // A caller who may read them is told they did not change them, which is
+    // what makes the refusal worth having; a caller who may not has the field
+    // preserved instead. Either way the stored list is what persists.
+    let finalizers = if body.metadata.finalizers == row.finalizers {
+        body.metadata.finalizers.clone()
+    } else if authz.allows(&target, Verb::Get, None).await? {
         return Err(ServerError::forbidden(
             "a main-resource write cannot change metadata.finalizers; use the \
              finalizers subresource, which is a separate grant",
         ));
-    }
+    } else {
+        row.finalizers.clone()
+    };
 
     let annotations: BTreeMap<String, String> = body.metadata.annotations.clone();
     let spec = serde_json::to_value(&body.spec)
@@ -1621,7 +1659,7 @@ async fn update_resource(
         api_version: Some(resolved.info.storage_api_version.clone()),
         revision: body.metadata.revision,
         annotations,
-        finalizers: body.metadata.finalizers,
+        finalizers,
         owner_references: body.metadata.owner_references,
         spec,
         validator: Some(resolved.info.spec_validator.clone()),
@@ -1645,7 +1683,7 @@ async fn update_resource(
     let _ = ctx;
     // The written labels are the resource's own after this update, so the
     // response reports the value the next request will evaluate against.
-    let updated_target = authz.tree(updated.uid).await?;
+    let updated_target = authz.tree(updated.uid).await.map_err(mask_not_found)?;
     Ok(Json(
         write_response(authz, &updated, &resolved.info.api_version, &updated_target).await?,
     ))
@@ -1657,7 +1695,7 @@ async fn delete_resource(
     row: &ResourceRow,
     response_api_version: &str,
 ) -> Result<Response, ServerError> {
-    let target = authz.tree(row.uid).await?;
+    let target = authz.tree(row.uid).await.map_err(mask_not_found)?;
     authz.require_visible(&target, Verb::Delete, None).await?;
     // Deleting policy is a grant: removing a Deny can enlarge what another
     // binding allows (ADR-0001 §5, scenario 31).
@@ -4759,6 +4797,164 @@ mod dispatch_tests {
         .await
         .expect_err("a caller holding neither the subresource nor `get` is masked");
         assert_eq!(err.status, StatusCode::NOT_FOUND, "{}", err.message);
+    }
+
+    /// A malformed body under a parent the caller cannot read is masked too.
+    /// The body checks read nothing but the request and the collection
+    /// registry — but *reaching* one of them is itself an answer about the
+    /// parent, so they run before the parent is resolved at all.
+    #[sqlx::test]
+    async fn a_malformed_create_under_an_invisible_parent_is_masked(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_gadget_rd(&ctx, &[]).await;
+        create_org(&ctx, "acme").await;
+        let bogus = json!({
+            "apiVersion": "example.dev/v1",
+            "kind": "Bogus",
+            "metadata": {"name": "g1"},
+            "spec": {},
+        });
+
+        let under_real = dispatch_post_inner(
+            &ctx,
+            "example.dev/v1/gadgets/acme".to_string(),
+            auth(PLAIN_USER),
+            bogus.clone(),
+        )
+        .await
+        .expect_err("no create grant");
+        let under_absent = dispatch_post_inner(
+            &ctx,
+            "example.dev/v1/gadgets/no-such-org".to_string(),
+            auth(PLAIN_USER),
+            bogus,
+        )
+        .await
+        .expect_err("no such parent");
+        // Identical either way. Which answer it is matters less than that it is
+        // the same one: the body error depends on nothing but the body, so
+        // giving it before the parent is touched reveals nothing about the
+        // parent — while giving it *after* would have made a malformed body a
+        // probe for which ancestors exist.
+        assert_eq!(
+            under_real.status,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            under_real.message
+        );
+        assert_eq!(under_real.status, under_absent.status);
+        assert_eq!(under_real.message, under_absent.message);
+
+        // And a well-formed body under the same two parents is masked, which is
+        // the sibling case: there the answer *does* depend on the parent.
+        let well_formed = json!({
+            "apiVersion": "example.dev/v1",
+            "kind": "Gadget",
+            "metadata": {"name": "g1"},
+            "spec": {},
+        });
+        let real = dispatch_post_inner(
+            &ctx,
+            "example.dev/v1/gadgets/acme".to_string(),
+            auth(PLAIN_USER),
+            well_formed.clone(),
+        )
+        .await
+        .expect_err("no create grant");
+        let absent = dispatch_post_inner(
+            &ctx,
+            "example.dev/v1/gadgets/no-such-org".to_string(),
+            auth(PLAIN_USER),
+            well_formed,
+        )
+        .await
+        .expect_err("no such parent");
+        assert_eq!(real.status, StatusCode::NOT_FOUND, "{}", real.message);
+        assert_eq!(real.message, absent.message);
+    }
+
+    /// A caller holding `update` but not `get` has finalizers preserved rather
+    /// than refused. The comparison is against the stored list, and their write
+    /// response is projected to a shape that omits finalizers — so a refusal
+    /// would hand back through 403-versus-success the one bit the projection
+    /// exists to withhold.
+    #[sqlx::test]
+    async fn a_writer_without_get_has_finalizers_preserved_not_reported(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx, &[]).await;
+        create_at(
+            &ctx,
+            "example.dev/v1/widgets",
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {"name": "held", "finalizers": ["example.dev/cleanup"]},
+                "spec": {},
+            }),
+        )
+        .await;
+        // Update, and nothing else — no `get`.
+        grant_authenticated(
+            &ctx,
+            "widget-writer",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["example.dev/Widget"],
+                "verbs": ["update"],
+            }]),
+        )
+        .await;
+
+        let write = |name: &str| {
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {"name": name, "revision": 1},
+                "spec": {"size": "small"},
+            })
+        };
+        let resp = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/held".to_string(),
+            any_user(PLAIN_USER),
+            write("held"),
+        )
+        .await
+        .expect("the write succeeds; the omitted finalizers are preserved");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let (_, body) = read(resp).await;
+        // The projection withholds them, which is the whole point.
+        assert!(body["metadata"]["finalizers"].is_null(), "{body}");
+        // And they are still stored.
+        let stored = ctx
+            .store
+            .get_by_name("example.dev/v1", "Widget", "held", None)
+            .await
+            .expect("read back")
+            .expect("still there");
+        assert_eq!(stored.finalizers, vec!["example.dev/cleanup".to_string()]);
+
+        // A reader who submits a different list is still told so.
+        grant_authenticated(
+            &ctx,
+            "widget-reader",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["example.dev/Widget"],
+                "verbs": ["get"],
+            }]),
+        )
+        .await;
+        let err = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/held".to_string(),
+            any_user(PLAIN_USER),
+            write("held"),
+        )
+        .await
+        .expect_err("a reader is told they did not change them");
+        assert_eq!(err.status, StatusCode::FORBIDDEN, "{}", err.message);
+        assert!(err.message.contains("finalizers"), "{}", err.message);
     }
 
     /// The masking fallback is keyed on the *main-resource* read, not on the
